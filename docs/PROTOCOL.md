@@ -530,7 +530,7 @@ configuration error, not a negotiation position.
 | `10` | `array` of `uint` | `report` | no | 16 items, strictly ascending | levels the sender **orders** a report for; an order, not a guarantee |
 | `11` | `uint` | `report_mode` | no | one of §6.2's `report_mode` values | `0` `progress` (default, never written), `1` `final-only` |
 | `12` | `uint` | `delivery_attempt` | no | — | how often an L2 queue has handed this message out, first attempt included; **absent means `1`**. A count rather than a flag: a repeat is visible, and a poison message is countable. **Reserved and written by nobody today** — the number is spent so it cannot be spent twice, and B-203 is the slice that writes it |
-| `13` | `uint` | `segment` | no | — | RADIO segment number per (radio path, topic), from 0; **written by a radio only** ([decisions/0034](decisions/0034-late-is-lost.md) §4.6) |
+| `13` | `uint` | `segment` | no | — | segment number per (sender, path, topic), from 0; **written by a radio, or by a dialling peer's `Peer::segment` toward a bound path** ([decisions/0034](decisions/0034-late-is-lost.md) §4.6) |
 
 **Every key is optional at the decoder, and that is deliberate.** A decoder sees a byte
 slice, not a stream: it cannot tell an initiating half from a reply half, so it cannot
@@ -1079,7 +1079,7 @@ FLOW   {endpoint:"/v", flow:7}
 DATAGRAM flow 7, payload "hi"                (a DATAGRAM payload, not a frame: no preamble)
        07 68 69
 
-DATA   {endpoint:"/t", segment:5}            (key 13, written by a radio)
+DATA   {endpoint:"/t", segment:5}            (key 13, written by a radio or Peer::segment)
        57 01 07  A2 00 62 2F 74 0D 05
 
 SUB    {endpoint:"/t", filter:"a", max_age_ms:150}   (key 2, a dish's latency budget)
@@ -1214,7 +1214,8 @@ optional keys are omitted when absent (§6.8).
 one-byte varint of flow id `7`, and `68 69` is the opaque payload `"hi"` (§6.9).
 
 **Segment DATA vector** — `header_len = 0x07`, CBOR map of 2 entries: key `0` `endpoint = "/t"`,
-key `13` `segment = 5` (`0D 05`). Only a radio writes key `13`.
+key `13` `segment = 5` (`0D 05`). Key `13` is written by a radio, or by a dialling peer's
+`Peer::segment` toward a bound path.
 
 **SUBSCRIBE with `max_age_ms` vector** — `header_len = 0x0B` (11 bytes), CBOR map of 3 entries:
 key `0` `endpoint = "/t"`, key `1` `filter = "a"`, key `2` `max_age_ms = 150`, which needs the

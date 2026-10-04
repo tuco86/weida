@@ -160,7 +160,7 @@ impl DishEntry {
 
 /// One copy's control: how its segment's successor or its end reach it.
 #[derive(Default)]
-struct CopyCtl {
+pub(crate) struct CopyCtl {
     superseded: AtomicBool,
     acked: AtomicBool,
     ended: AtomicBool,
@@ -199,13 +199,80 @@ struct TopicState {
     live: Vec<Arc<CopyCtl>>,
 }
 
+/// The segment numbers of one sender — a radio path or a dialling peer —
+/// per topic, and the copies still in flight on each: what the next segment
+/// on a topic supersedes.
+pub(crate) struct SegmentTopics {
+    /// Per-topic state, and the number a topic created after an eviction
+    /// starts from.
+    topics: Mutex<(HashMap<Arc<str>, TopicState>, u64)>,
+    max_scopes: usize,
+}
+
+impl SegmentTopics {
+    /// A table of at most `max_scopes` topics.
+    pub(crate) fn new(max_scopes: usize) -> SegmentTopics {
+        SegmentTopics {
+            topics: Mutex::new((HashMap::new(), 0)),
+            max_scopes,
+        }
+    }
+
+    /// Takes the next number on `topic` and resets every unacknowledged copy
+    /// of the previous segment there.
+    pub(crate) fn next(&self, topic: &Arc<str>) -> Result<u64, Error> {
+        let mut guard = lock(&self.topics);
+        let (topics, floor) = &mut *guard;
+        if !topics.contains_key(topic) && topics.len() >= self.max_scopes {
+            // The table is the application's, but still bounded: a topic
+            // with no copy in flight has nothing to supersede and can go.
+            let idle = topics.iter_mut().find_map(|(topic, state)| {
+                state.live.retain(|c| c.live());
+                state
+                    .live
+                    .is_empty()
+                    .then(|| (Arc::clone(topic), state.next))
+            });
+            match idle {
+                Some((idle, next)) => {
+                    topics.remove(&idle);
+                    // A topic that comes back must not restart below what a
+                    // dish already delivered on it, or the dish would
+                    // discard it as stale: numbering resumes above every
+                    // number an evicted topic reached.
+                    *floor = (*floor).max(next);
+                }
+                None => return Err(Error::LimitExceeded),
+            }
+        }
+        let state = topics
+            .entry(Arc::clone(topic))
+            .or_insert_with(|| TopicState {
+                next: *floor,
+                live: Vec::new(),
+            });
+        let number = state.next;
+        state.next += 1;
+        for copy in state.live.drain(..) {
+            copy.supersede();
+        }
+        Ok(number)
+    }
+
+    /// Records `copy` as in flight on `topic`, for the next segment there to
+    /// supersede.
+    pub(crate) fn track(&self, topic: &Arc<str>, copy: &Arc<CopyCtl>) {
+        if let Some(state) = lock(&self.topics).0.get_mut(topic) {
+            state.live.push(Arc::clone(copy));
+        }
+    }
+}
+
 /// Everything a radio path holds: its dishes, its topics and its drops.
 pub(crate) struct RadioHub {
     path: Arc<str>,
     dishes: Mutex<Vec<DishEntry>>,
-    /// Per-topic state, and the number a topic created after an eviction
-    /// starts from.
-    topics: Mutex<(HashMap<Arc<str>, TopicState>, u64)>,
+    topics: SegmentTopics,
     drops: Arc<DropTable>,
     limits: Limits,
     /// The admission policy and its generation, which moves with every
@@ -219,7 +286,7 @@ impl RadioHub {
         RadioHub {
             path: Arc::from(path),
             dishes: Mutex::new(Vec::new()),
-            topics: Mutex::new((HashMap::new(), 0)),
+            topics: SegmentTopics::new(limits.max_sequence_scopes),
             drops: Arc::new(DropTable::new(limits.max_sequence_scopes)),
             limits,
             admission: Mutex::new((0, None)),
@@ -364,53 +431,6 @@ impl RadioHub {
         }
         dishes.retain(|d| !d.filters.is_empty());
     }
-
-    /// Takes the next number on `topic` and resets every unacknowledged copy
-    /// of the previous segment there.
-    fn next_segment(&self, topic: &Arc<str>) -> Result<u64, Error> {
-        let mut guard = lock(&self.topics);
-        let (topics, floor) = &mut *guard;
-        if !topics.contains_key(topic) && topics.len() >= self.limits.max_sequence_scopes {
-            // The table is the application's, but still bounded: a topic
-            // with no copy in flight has nothing to supersede and can go.
-            let idle = topics.iter_mut().find_map(|(topic, state)| {
-                state.live.retain(|c| c.live());
-                state
-                    .live
-                    .is_empty()
-                    .then(|| (Arc::clone(topic), state.next))
-            });
-            match idle {
-                Some((idle, next)) => {
-                    topics.remove(&idle);
-                    // A topic that comes back must not restart below what a
-                    // dish already delivered on it, or the dish would
-                    // discard it as stale: numbering resumes above every
-                    // number an evicted topic reached.
-                    *floor = (*floor).max(next);
-                }
-                None => return Err(Error::LimitExceeded),
-            }
-        }
-        let state = topics
-            .entry(Arc::clone(topic))
-            .or_insert_with(|| TopicState {
-                next: *floor,
-                live: Vec::new(),
-            });
-        let number = state.next;
-        state.next += 1;
-        for copy in state.live.drain(..) {
-            copy.supersede();
-        }
-        Ok(number)
-    }
-
-    fn track(&self, topic: &Arc<str>, copy: &Arc<CopyCtl>) {
-        if let Some(state) = lock(&self.topics).0.get_mut(topic) {
-            state.live.push(Arc::clone(copy));
-        }
-    }
 }
 
 /// State of a radio.
@@ -469,7 +489,7 @@ impl Radio {
         }
         let hub = self.hub();
         let topic: Arc<str> = Arc::from(topic);
-        let number = hub.next_segment(&topic)?;
+        let number = hub.topics.next(&topic)?;
         let mut copies = Vec::new();
         for entry in hub.dishes().iter() {
             let Some(max_age) = entry.matching(&topic) else {
@@ -477,7 +497,7 @@ impl Radio {
             };
             let (tx, rx) = mpsc::channel(COPY_QUEUE);
             let ctl = Arc::new(CopyCtl::default());
-            hub.track(&topic, &ctl);
+            hub.topics.track(&topic, &ctl);
             let deadline = max_age.map(|age| Box::pin(entry.conn.exec.sleep(age)));
             entry.conn.exec.spawn(segment_copy(
                 ConnHandle::clone(&entry.conn),
@@ -524,7 +544,7 @@ impl Radio {
         }
         let hub = self.hub();
         let topic: Arc<str> = Arc::from(topic);
-        let number = hub.next_segment(&topic)?;
+        let number = hub.topics.next(&topic)?;
         let payload = payload.into();
         let mut body = Vec::with_capacity(8 + payload.len());
         encode_varint(number, &mut body).expect("segment numbers stay below 2^62");
@@ -638,15 +658,15 @@ impl Radio {
 }
 
 /// What a copy's writer task is told.
-enum SegItem {
+pub(crate) enum SegItem {
     Chunk(Bytes),
     Finish,
 }
 
 /// The sending side of one copy, kept by the [`Segment`].
-struct CopyTx {
-    tx: mpsc::Sender<SegItem>,
-    budget: Arc<Semaphore>,
+pub(crate) struct CopyTx {
+    pub(crate) tx: mpsc::Sender<SegItem>,
+    pub(crate) budget: Arc<Semaphore>,
 }
 
 /// One segment, open on every dish that was joined when it opened.
@@ -655,10 +675,10 @@ struct CopyTx {
 /// the segment, counted. Dropping a segment without [`Segment::finish`]
 /// resets every copy, so no dish mistakes a partial segment for a whole one.
 pub struct Segment {
-    number: u64,
-    topic: Arc<str>,
-    copies: Vec<CopyTx>,
-    drops: Arc<DropTable>,
+    pub(crate) number: u64,
+    pub(crate) topic: Arc<str>,
+    pub(crate) copies: Vec<CopyTx>,
+    pub(crate) drops: Arc<DropTable>,
 }
 
 impl Segment {
@@ -733,13 +753,13 @@ impl fmt::Debug for Segment {
 }
 
 /// What a copy's task needs besides its channel and deadline.
-struct Copy {
-    path: Arc<str>,
-    topic: Arc<str>,
-    number: u64,
-    ctl: Arc<CopyCtl>,
-    budget: Arc<Semaphore>,
-    drops: Arc<DropTable>,
+pub(crate) struct Copy {
+    pub(crate) path: Arc<str>,
+    pub(crate) topic: Arc<str>,
+    pub(crate) number: u64,
+    pub(crate) ctl: Arc<CopyCtl>,
+    pub(crate) budget: Arc<Semaphore>,
+    pub(crate) drops: Arc<DropTable>,
 }
 
 /// How a copy's race ended.
@@ -757,7 +777,7 @@ async fn expiry(deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
 
 /// Writes one dish's copy of one segment, racing every step against
 /// supersession and the dish's deadline.
-async fn segment_copy(
+pub(crate) async fn segment_copy(
     conn: ConnHandle,
     copy: Copy,
     mut rx: mpsc::Receiver<SegItem>,

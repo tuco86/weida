@@ -17,8 +17,8 @@ use common::{Certs, Server};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
-    ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Identity, Limits, PeerIdentity,
-    Radio, Received, Runtime, RuntimeConfig, Trust,
+    ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, Identity, Incoming,
+    Limits, PeerIdentity, Radio, Received, Runtime, RuntimeConfig, Trust,
 };
 
 /// Generous ceiling: every assertion below should settle well inside it.
@@ -198,6 +198,84 @@ async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
     let superseded = radio.dropped_on("v").map_or(0, |d| d.superseded);
     assert_eq!(superseded, 0);
     runtime.shutdown().await;
+}
+
+// --- segments from a dialling peer ---------------------------------------------
+
+fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {
+    match incoming {
+        Incoming::Stream(transfer) => transfer,
+        other => panic!("expected a stream, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_peer_segment_reaches_an_acceptor_with_its_number() {
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let client = server.client_runtime();
+    let peer = client.peer(server.trust());
+    within(peer.connect(&server.url("/up")))
+        .await
+        .expect("connect");
+
+    for n in 0..2u64 {
+        let mut segment = within(peer.segment("t", None)).await.expect("segment");
+        assert_eq!(segment.number(), n);
+        segment.write(vec![n as u8; 1000]).expect("write");
+        segment.finish();
+        let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+        assert_eq!(transfer.meta().segment, Some(n));
+        assert_eq!(transfer.meta().topic.as_deref(), Some("t"));
+        let body = within(transfer.collect(4096))
+            .await
+            .expect("a whole segment");
+        assert_eq!(&body[..], &[n as u8; 1000][..]);
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_peer_segment_supersedes_the_previous_one_on_its_topic() {
+    let server = Server::start_with(Limits {
+        stream_receive_window: 64 * 1024,
+        ..Limits::default()
+    })
+    .await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let client = server.client_runtime();
+    let peer = client.peer(server.trust());
+    within(peer.connect(&server.url("/up")))
+        .await
+        .expect("connect");
+
+    // Segment 0 is four windows long and never read: it cannot finish.
+    let mut first = within(peer.segment("t", None)).await.expect("segment 0");
+    for _ in 0..16 {
+        first.write(vec![0x42; 16 * 1024]).expect("write");
+    }
+    first.finish();
+    let held = stream_of(within(acceptor.accept()).await.expect("accept 0"));
+    assert_eq!(held.meta().segment, Some(0));
+
+    let mut second = within(peer.segment("t", None)).await.expect("segment 1");
+    second.write(vec![0x43; 1000]).expect("write");
+    second.finish();
+    let read = within(held.collect(1 << 20)).await;
+    assert!(matches!(read, Err(Error::Canceled)), "{read:?}");
+    within(async {
+        while peer.segment_drops("t").map_or(0, |d| d.superseded) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(peer.segment_drops("t").map(|d| d.superseded), Some(1));
+
+    let next = stream_of(within(acceptor.accept()).await.expect("accept 1"));
+    assert_eq!(next.meta().segment, Some(1));
+    let body = within(next.collect(4096)).await.expect("a whole segment");
+    assert_eq!(body.len(), 1000);
+    client.shutdown().await;
 }
 
 #[tokio::test]

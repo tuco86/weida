@@ -319,8 +319,9 @@ pub(crate) fn data_header(
         report_id,
         report: meta.report.clone(),
         report_mode: meta.report_mode,
-        // Key 13 is written by a radio only, which sets it on the header it
-        // builds from this one.
+        // Key 13 is written by a radio, or by a dialling peer's
+        // `Peer::segment` toward a bound path; each sets it on the header it
+        // builds itself.
         segment: None,
     };
     Ok((header, trace))

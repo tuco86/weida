@@ -840,6 +840,7 @@ raw preview frame, a video GOP — and it is the join point. `Listener::radio` b
 | Backpressure | never blocks: `write` hands a chunk to every copy with room in its dish's `subscriber_buffer_bytes` and its 64-chunk queue, and a copy without room loses the segment | a full receive queue discards on arrival and never blocks the connection |
 | Delivery | `BestEffort`; a lost segment is a gap in the numbers the dish sees, counted per topic and cause in `dropped_on`: budget, queue, no parked connection, superseded, expired, too large, no datagrams | `stale()` and `overflow()` count the dish's own discards |
 | Late joiner | receives the next segment; nothing is retained for it | |
+| From a dialling peer | `Peer::segment(topic, max_age)` opens one copy toward the bound path it dialled — an uplink into a relay that is itself a radio. Numbering, supersession with the finish grace, `max_age` and the never-blocking `write` are the radio's, budgeted by the peer's `subscriber_buffer_bytes`; `Peer::segment_drops(topic)` counts the losses | the bound side's `Acceptor` receives `Incoming::Stream` with `topic` and `segment` set |
 
 Five rules a caller can get wrong. **Supersession holds nothing**: it discards bytes already in
 flight, which is why it is not the coalescer [0016](decisions/0016-conflation.md) §4.2 refused.
@@ -875,7 +876,9 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 `a_datagram_larger_than_the_dish_carries_is_counted_too_large`,
 `admission_refuses_a_join_silently_and_records_nothing`,
 `evict_withdraws_a_join_and_frees_its_subscription_slot`,
-`installing_an_admission_screens_joins_already_recorded`
+`installing_an_admission_screens_joins_already_recorded`,
+`a_peer_segment_reaches_an_acceptor_with_its_number`,
+`a_peer_segment_supersedes_the_previous_one_on_its_topic`
 (`crates/weida/tests/radio.rs`).*
 
 ---

@@ -19,13 +19,17 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, watch};
 use weida_core::{Address, Error, LossCause, PeerIdentity};
+use weida_protocol::header::limits::MAX_TOPIC_BYTES;
 
 use crate::config::ClientTls;
 use crate::conn::ConnHandle;
+use crate::pubsub::{DropTable, TopicDrops};
+use crate::radio::{COPY_QUEUE, Copy, CopyCtl, CopyTx, SegmentTopics, segment_copy};
 use crate::reconnect::{EVENT_QUEUE, GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 use crate::runtime::RuntimeInner;
 use crate::transfer::{
@@ -104,6 +108,14 @@ pub(crate) struct PeerShared {
     events: broadcast::Sender<PeerEvent>,
     attach: Option<Arc<dyn Attach>>,
     outbox: Outbox,
+    /// Segment numbers per topic for [`Peer::segment`], and the copies the
+    /// next segment on a topic supersedes.
+    segment_topics: SegmentTopics,
+    /// What [`Peer::segment`] copies lost, by topic and cause.
+    segment_drops: Arc<DropTable>,
+    /// Chunk bytes [`Peer::segment`] copies may hold unwritten, over all
+    /// topics.
+    segment_budget: Arc<Semaphore>,
 }
 
 impl PeerShared {
@@ -345,6 +357,7 @@ impl Peer {
     ) -> Peer {
         let (events, _) = broadcast::channel(EVENT_QUEUE);
         let (alive, _) = watch::channel(());
+        let limits = runtime.config.limits;
         Peer {
             shared: Arc::new(PeerShared {
                 runtime,
@@ -363,6 +376,9 @@ impl Peer {
                     draining: AtomicBool::new(false),
                     dropped: AtomicU64::new(0),
                 },
+                segment_topics: SegmentTopics::new(limits.max_sequence_scopes),
+                segment_drops: Arc::new(DropTable::new(limits.max_sequence_scopes)),
+                segment_budget: Arc::new(Semaphore::new(limits.subscriber_buffer_bytes)),
             }),
             alive,
         }
@@ -462,6 +478,70 @@ impl Peer {
     /// a stream, which would deliver the units late.
     pub async fn open_flow(&self, meta: crate::FlowMeta) -> Result<crate::Flow, Error> {
         crate::flow::open_flow_via(&self.shared, meta).await
+    }
+
+    /// Opens segment *n+1* on `topic` as one stream to the next peer,
+    /// round-robin, and resets the copy of segment *n* on that topic if the
+    /// peer has not acknowledged it — the radio's supersession
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.6), from the dialling side toward a bound path.
+    ///
+    /// The DATA header carries `topic` and the segment number (keys `12`
+    /// and `13`), so the bound side reads them from
+    /// [`crate::IncomingMeta::topic`] and [`crate::IncomingMeta::segment`].
+    /// `max_age` resets the copy once it is that old, unfinished or
+    /// unacknowledged. [`crate::Segment::write`] never waits: a copy without
+    /// room for a chunk — `Limits::subscriber_buffer_bytes` over all of this
+    /// peer's segments — is lost, counted in [`Peer::segment_drops`].
+    ///
+    /// Waits for a peer exactly as [`Peer::open`] does. Fails with
+    /// [`Error::LimitExceeded`] for a topic above 256 bytes, or when
+    /// `max_sequence_scopes` topics all have a copy in flight.
+    pub async fn segment(
+        &self,
+        topic: &str,
+        max_age: Option<Duration>,
+    ) -> Result<crate::Segment, Error> {
+        if topic.len() > MAX_TOPIC_BYTES {
+            return Err(Error::LimitExceeded);
+        }
+        let (conn, path) = self.shared.pick().await?;
+        let shared = &self.shared;
+        let topic: Arc<str> = Arc::from(topic);
+        let number = shared.segment_topics.next(&topic)?;
+        let (tx, rx) = mpsc::channel(COPY_QUEUE);
+        let ctl = Arc::new(CopyCtl::default());
+        shared.segment_topics.track(&topic, &ctl);
+        let deadline = max_age.map(|age| Box::pin(conn.exec.sleep(age)));
+        conn.exec.clone().spawn(segment_copy(
+            conn,
+            Copy {
+                path,
+                topic: Arc::clone(&topic),
+                number,
+                ctl,
+                budget: Arc::clone(&shared.segment_budget),
+                drops: Arc::clone(&shared.segment_drops),
+            },
+            rx,
+            deadline,
+        ));
+        Ok(crate::Segment {
+            number,
+            topic,
+            copies: vec![CopyTx {
+                tx,
+                budget: Arc::clone(&shared.segment_budget),
+            }],
+            drops: Arc::clone(&shared.segment_drops),
+        })
+    }
+
+    /// What [`Peer::segment`] lost on `topic`, by cause, or `None` if
+    /// nothing was. The table holds at most `Limits::max_sequence_scopes`
+    /// topics.
+    pub fn segment_drops(&self, topic: &str) -> Option<TopicDrops> {
+        self.shared.segment_drops.on_topic(topic)
     }
 
     /// Opens a bidirectional stream — an exchange — to the next peer.

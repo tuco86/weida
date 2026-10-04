@@ -1459,9 +1459,10 @@ pub struct DataHeader {
     ///
     /// [`ReportMode::Progress`] is the default and is never written.
     pub report_mode: ReportMode,
-    /// RADIO segment number per `(radio path, topic)`, from 0 (key `13`).
+    /// Segment number per `(sender, path, topic)`, from 0 (key `13`).
     ///
-    /// Written by a radio only
+    /// Written by a radio, or by a dialling peer's `Peer::segment` toward a
+    /// bound path
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
     /// §4.6). It is not a `PerProducer` sequence: it is written whatever
     /// ordering was negotiated, and a dish uses it to discard a segment older
