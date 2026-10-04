@@ -200,6 +200,35 @@ async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_segment_finished_right_before_its_successor_still_arrives_whole() {
+    // A GOP ends where the next keyframe begins: the successor opens the
+    // moment the segment is finished, while its last chunks and its FIN are
+    // still queued for the copy's task.
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server.client_runtime();
+    let dish = joined(&server, &runtime, "v", None).await;
+    dishes(&radio, 1).await;
+
+    const SEGMENTS: u64 = 5;
+    for _ in 0..SEGMENTS {
+        let mut segment = radio.segment("v").expect("segment");
+        for _ in 0..8 {
+            segment.write(vec![0x42; 4096]).expect("write");
+        }
+        segment.finish();
+    }
+    for _ in 0..SEGMENTS {
+        let body = within(segment_of(within(dish.recv()).await.expect("recv")).collect(1 << 20))
+            .await
+            .expect("a whole segment");
+        assert_eq!(body.len(), 8 * 4096);
+    }
+    assert_eq!(radio.dropped_on("v").map_or(0, |d| d.superseded), 0);
+    runtime.shutdown().await;
+}
+
 // --- segments from a dialling peer ---------------------------------------------
 
 fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {

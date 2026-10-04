@@ -835,7 +835,7 @@ raw preview frame, a video GOP — and it is the join point. `Listener::radio` b
 | Topics | Pub/Sub's namespace and filter grammar, unchanged — ZeroMQ's "group" is weida's topic | |
 | Outgoing routing | every dish whose filter matches, one copy each; the dish set is fixed when a segment opens | — |
 | Carrier | a stream segment: one uni DATA stream per dish, numbered in DATA key `13`; a datagram segment: a flow per `(dish, topic)`, opened lazily on the connection the join arrived on, its payload `varint segment` + bytes | |
-| Supersession | opening segment *n+1* on a topic **resets every copy of segment *n* on that topic still unacknowledged**, with `CANCELED`, and no other topic's; a copy already finished first gets the time its path needs to carry its bytes at the congestion window plus one round trip and 50 ms, so a whole copy is not reset while its acknowledgement is on the way | a segment not newer than the newest it delivered on that topic is discarded on arrival, so segments never go backwards |
+| Supersession | opening segment *n+1* on a topic **resets every copy of segment *n* on that topic still unacknowledged**, with `CANCELED`, and no other topic's. A copy whose segment was finished before *n+1* opened is whole on the radio's side: it still hands its queued chunks to the transport if the transport takes them at once (a write the dish's flow control holds back is a stalled dish, reset at once), and after its FIN it gets the time its path needs to carry its bytes at the congestion window plus one round trip and 50 ms | a segment not newer than the newest it delivered on that topic is discarded on arrival, so segments never go backwards |
 | Expiry | per dish: its `max_age` on the radio's clock from the segment's open; the smallest among the dish's matching filters applies | states `max_age` when it joins (SUBSCRIBE key `2`) |
 | Backpressure | never blocks: `write` hands a chunk to every copy with room in its dish's `subscriber_buffer_bytes` and its 64-chunk queue, and a copy without room loses the segment | a full receive queue discards on arrival and never blocks the connection |
 | Delivery | `BestEffort`; a lost segment is a gap in the numbers the dish sees, counted per topic and cause in `dropped_on`: budget, queue, no parked connection, superseded, expired, too large, no datagrams | `stale()` and `overflow()` count the dish's own discards |
@@ -869,6 +869,7 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 
 *`a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one`,
 `a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole`,
+`a_segment_finished_right_before_its_successor_still_arrives_whole`,
 `a_segment_supersedes_only_its_own_topic`,
 `a_joiner_receives_the_next_segment_and_nothing_earlier`,
 `a_dish_max_age_expires_its_copy`, `a_datagram_segment_reaches_every_joined_dish`,
