@@ -14,6 +14,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Certs, Server};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
     ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Identity, Limits, PeerIdentity,
@@ -127,6 +128,76 @@ async fn a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one() {
     assert!(whole <= 1, "{whole} whole segments at the stalled dish");
     fast_rt.shutdown().await;
     stalled_rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
+    // Frames of a 30 fps video, ten to a segment, the next segment opening
+    // one frame interval after the previous one's last frame: the dish reads
+    // everything at once, but its acknowledgement of a finished segment is a
+    // round trip away when the successor opens.
+    const SEGMENTS: usize = 6;
+    const FRAMES: usize = 10;
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let front = common::delay_proxy(server.addr, Duration::from_millis(100)).await;
+    let runtime = server.client_runtime();
+    let dish = runtime.dish(server.trust());
+    within(dish.join("v", None)).await.expect("join");
+    within(dish.connect(&format!("weida://127.0.0.1:{}/r", front.port())))
+        .await
+        .expect("connect");
+    dishes(&radio, 1).await;
+
+    let reader = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        for _ in 0..SEGMENTS {
+            let mut transfer = segment_of(within(dish.recv()).await.expect("recv"));
+            let number = transfer.meta().segment.expect("a segment number");
+            let mut frames = 0;
+            let whole = loop {
+                let mut len = [0u8; 4];
+                match within(transfer.read_exact(&mut len)).await {
+                    Ok(_) => {}
+                    Err(e) => break e.kind() == std::io::ErrorKind::UnexpectedEof,
+                }
+                let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+                if within(transfer.read_exact(&mut body)).await.is_err() {
+                    break false;
+                }
+                frames += 1;
+            };
+            seen.push((number, frames, whole));
+        }
+        seen
+    });
+
+    let mut tick = tokio::time::interval(Duration::from_millis(1000 / 30));
+    for _ in 0..SEGMENTS {
+        tick.tick().await;
+        let mut segment = radio.segment("v").expect("segment");
+        for f in 0..FRAMES {
+            if f > 0 {
+                tick.tick().await;
+            }
+            let size: usize = if f == 0 { 60_000 } else { 5_000 };
+            let mut frame = (size as u32).to_le_bytes().to_vec();
+            frame.resize(4 + size, 0x5a);
+            segment.write(frame).expect("write");
+        }
+        segment.finish();
+    }
+    let seen = within(reader).await.expect("reader");
+    for (number, frames, whole) in &seen {
+        assert!(
+            *whole && *frames == FRAMES,
+            "segment {number}: {seen:?} {:?}",
+            radio.dropped_on("v")
+        );
+    }
+    let superseded = radio.dropped_on("v").map_or(0, |d| d.superseded);
+    assert_eq!(superseded, 0);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]

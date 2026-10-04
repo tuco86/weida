@@ -7,10 +7,17 @@
 // Each test binary uses a different subset of this harness.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 use weida::{
     Binding, ClientTls, Fingerprint, Identity, Limits, Listener, Runtime, RuntimeConfig, ServerTls,
     Trust,
@@ -180,6 +187,78 @@ impl Server {
     pub fn trust(&self) -> ClientTls {
         self.certs.client_tls()
     }
+}
+
+/// A UDP forwarder in front of `server` that releases every packet
+/// `one_way` late, in both directions and in the order it arrived: a slow
+/// path on loopback that neither loses nor reorders. One front socket faces
+/// the clients; each client address gets its own back socket toward the
+/// server.
+pub async fn delay_proxy(server: SocketAddr, one_way: Duration) -> SocketAddr {
+    let front = Arc::new(
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind the proxy's front"),
+    );
+    let addr = front.local_addr().expect("the proxy's address");
+    tokio::spawn(async move {
+        let mut backs: HashMap<SocketAddr, mpsc::UnboundedSender<(Instant, Vec<u8>)>> =
+            HashMap::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let (n, from) = front
+                .recv_from(&mut buf)
+                .await
+                .expect("receive at the proxy's front");
+            let release = Instant::now() + one_way;
+            let packet = buf[..n].to_vec();
+            let up = match backs.entry(from) {
+                Entry::Occupied(known) => known.into_mut(),
+                Entry::Vacant(new) => {
+                    let back = Arc::new(
+                        UdpSocket::bind("127.0.0.1:0")
+                            .await
+                            .expect("bind a proxy back socket"),
+                    );
+                    back.connect(server)
+                        .await
+                        .expect("point the back socket at the server");
+                    // Toward the server.
+                    let (up, mut up_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+                    let sender = Arc::clone(&back);
+                    tokio::spawn(async move {
+                        while let Some((at, packet)) = up_rx.recv().await {
+                            tokio::time::sleep_until(at).await;
+                            let _ = sender.send(&packet).await;
+                        }
+                    });
+                    // Back toward the client.
+                    let (down, mut down_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+                    let to_client = Arc::clone(&front);
+                    tokio::spawn(async move {
+                        while let Some((at, packet)) = down_rx.recv().await {
+                            tokio::time::sleep_until(at).await;
+                            let _ = to_client.send_to(&packet, from).await;
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65536];
+                        while let Ok(n) = back.recv(&mut buf).await {
+                            if down
+                                .send((Instant::now() + one_way, buf[..n].to_vec()))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                    new.insert(up)
+                }
+            };
+            let _ = up.send((release, packet));
+        }
+    });
+    addr
 }
 
 /// Which transport a parametrized test runs over.

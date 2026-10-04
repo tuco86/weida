@@ -23,7 +23,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore, mpsc};
@@ -48,6 +48,24 @@ use crate::transport::SendHalf;
 /// the dish's byte budget; this keeps the channel from growing on tiny
 /// chunks.
 pub(crate) const COPY_QUEUE: usize = 64;
+
+/// What a finished copy waits beyond one round trip before a successor
+/// supersedes it: quinn's default `max_ack_delay` of 25 ms (the transport
+/// parameter default, quinn-proto `transport_parameters.rs`; weida's
+/// `transport_config` in `tls.rs` keeps it) plus scheduling margin.
+const SUPERSEDE_SLACK: Duration = Duration::from_millis(50);
+
+/// How long a finished copy of `sent` bytes may still take to be
+/// acknowledged on a path with smoothed round trip `rtt` and congestion
+/// window `cwnd`: the time the window needs to carry every byte, one round
+/// trip for the receipt and [`SUPERSEDE_SLACK`]. `sent` bounds what is still
+/// unsent from above, so a copy whose bytes are already out gets more than
+/// it needs, never less.
+fn finish_grace(rtt: Duration, cwnd: u64, sent: u64) -> Duration {
+    let carry = Duration::try_from_secs_f64(rtt.as_secs_f64() * sent as f64 / cwnd.max(1) as f64)
+        .unwrap_or(Duration::MAX);
+    rtt.saturating_add(SUPERSEDE_SLACK).saturating_add(carry)
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -787,6 +805,8 @@ async fn run_copy(
             return None;
         }
     };
+    // Bytes handed to the stream: what the finish grace has to carry.
+    let mut sent: u64 = 0;
     loop {
         let item = tokio::select! {
             biased;
@@ -804,7 +824,7 @@ async fn run_copy(
                 };
                 copy.budget.add_permits(chunk.len());
                 match written {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => sent += chunk.len() as u64,
                     // The dish refused the stream or went away.
                     Ok(Err(_)) => return None,
                     Err(stop) => return reset(&mut stream, stop),
@@ -814,19 +834,33 @@ async fn run_copy(
                 if stream.finish().is_err() {
                     return None;
                 }
+                let finished = Instant::now();
                 // Until the dish's transport holds every byte, the copy can
                 // still be superseded or expire: a reset is accepted after
                 // FIN until then.
-                let stopped = stream.stopped();
+                let mut stopped = stream.stopped();
+                tokio::select! {
+                    biased;
+                    () = expiry(deadline) => return reset(&mut stream, Stop::Expired),
+                    receipt = &mut stopped => return acked(ctl, receipt),
+                    () = ctl.superseded() => {}
+                }
+                // A whole copy that is only waiting for its acknowledgement
+                // is not stalled. Its bytes may still be on their way at the
+                // pace of the congestion window, and the receipt follows the
+                // last of them by a round trip: a successor opened meanwhile
+                // would reset a copy the dish is about to hold whole. It gets
+                // that time before the supersession takes it.
+                let grace = conn
+                    .conn
+                    .path_stats()
+                    .map_or(Duration::ZERO, |p| finish_grace(p.rtt, p.cwnd, sent));
                 return tokio::select! {
                     biased;
-                    () = ctl.superseded() => reset(&mut stream, Stop::Superseded),
                     () = expiry(deadline) => reset(&mut stream, Stop::Expired),
-                    receipt = stopped => {
-                        if matches!(receipt, Ok(None)) {
-                            ctl.acked.store(true, Ordering::Release);
-                        }
-                        None
+                    receipt = &mut stopped => acked(ctl, receipt),
+                    () = conn.exec.sleep(grace.saturating_sub(finished.elapsed())) => {
+                        reset(&mut stream, Stop::Superseded)
                     }
                 };
             }
@@ -885,6 +919,15 @@ async fn open_datagram_flow(
 fn reset(stream: &mut SendHalf, stop: Stop) -> Option<Stop> {
     stream.reset(codes::CANCELED);
     Some(stop)
+}
+
+/// Records a finished copy's receipt: delivered means acknowledged, which no
+/// successor supersedes any more.
+fn acked(ctl: &CopyCtl, receipt: Result<Option<u64>, Error>) -> Option<Stop> {
+    if matches!(receipt, Ok(None)) {
+        ctl.acked.store(true, Ordering::Release);
+    }
+    None
 }
 
 /// Moves a radio's datagram segments from one flow into its dish's queue:
