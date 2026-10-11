@@ -9,7 +9,7 @@ kind: spec | size: 15 | status: done 7ced5ff | needs: []
 acceptance: [0038](decisions/0038-restart-handoff.md) §4.2: [PROTOCOL.md](PROTOCOL.md) §7's table has the row `10` `RESTARTING` and a paragraph saying it is used only in `CONNECTION_CLOSE` and that no capability negotiates it; `weida_protocol::codes::RESTARTING` is `10` and `codes::name` names it; `stop_reason` is unchanged. `codes_match_the_protocol_document` covers `10`, and `names_are_defined_for_known_codes` asserts `name(RESTARTING) == "RESTARTING"` and `name(11) == "UNKNOWN"`.
 
 ### B-317 — Serve QUIC on a socket the process received
-kind: code | size: 30 | status: ready | needs: [B-318]
+kind: code | size: 30 | status: done b0ea5cb | needs: [B-318]
 acceptance: [0038](decisions/0038-restart-handoff.md) §4.5: `Listener::bind_quic_socket(socket: std::net::UdpSocket, tls)` and `bind_quic` share one private `serve_quic`, built on `quinn::Endpoint::new`, and TLS material is still validated before any socket is used. Test in `crates/weida/tests/reconnect.rs`: `a_restart_hands_the_socket_over_and_is_redialled_at_once` — a second runtime serves `try_clone` of the first runtime's socket after the first one's `restart` returned, `local_addr()` is the same address, and a pusher under `stop_on_peer_closed: true` is `Connected` again and its next send is pulled.
 
 ### B-318 — Binding::restart, a bounded close, PeerRestarting and the immediate redial
