@@ -3592,7 +3592,7 @@ dependencies = [
 
 [[package]]
 name = "weida"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "bytes",
  "criterion",
@@ -3615,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "weida-amqp"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "fe2o3-amqp",
  "rcgen",
@@ -3629,11 +3629,11 @@ dependencies = [
 
 [[package]]
 name = "weida-amqp-codec"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "weida-amqp-py"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "futures",
  "pyo3",
@@ -3646,7 +3646,7 @@ dependencies = [
 
 [[package]]
 name = "weida-broker"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "tokio",
  "tracing",
@@ -3657,11 +3657,11 @@ dependencies = [
 
 [[package]]
 name = "weida-core"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "weida-mqtt"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "futures",
  "rcgen",
@@ -3675,11 +3675,11 @@ dependencies = [
 
 [[package]]
 name = "weida-mqtt-codec"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "weida-mqtt-py"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "pyo3",
  "tokio",
@@ -3689,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "weida-nats"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "async-nats",
  "futures-util",
@@ -3704,11 +3704,11 @@ dependencies = [
 
 [[package]]
 name = "weida-nats-codec"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "weida-nats-py"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "futures",
  "pyo3",
@@ -3720,7 +3720,7 @@ dependencies = [
 
 [[package]]
 name = "weida-nng"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "futures",
  "nng",
@@ -3738,7 +3738,7 @@ dependencies = [
 
 [[package]]
 name = "weida-nng-py"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "pyo3",
  "tokio",
@@ -3749,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "weida-openbao"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "rcgen",
  "reqwest",
@@ -3765,7 +3765,7 @@ dependencies = [
 
 [[package]]
 name = "weida-protocol"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "criterion",
  "minicbor",
@@ -3774,7 +3774,7 @@ dependencies = [
 
 [[package]]
 name = "weida-py"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "pyo3",
  "tokio",
@@ -3785,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "weida-py-core"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "criterion",
  "pyo3",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "weida-raft"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "openraft",
  "tokio",
@@ -3805,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "weida-runtime"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "futures",
  "tokio",
@@ -3815,11 +3815,11 @@ dependencies = [
 
 [[package]]
 name = "weida-sp"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "weida-winpipe"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",
@@ -3827,7 +3827,7 @@ dependencies = [
 
 [[package]]
 name = "weida-zmq"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -3844,7 +3844,7 @@ dependencies = [
 
 [[package]]
 name = "weida-zmq-py"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "pyo3",
  "tokio",
@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "weida-zmtp"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "win_uds"

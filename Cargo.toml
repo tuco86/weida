@@ -45,7 +45,7 @@ members = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 # Dual, in the Rust ecosystem's own form: the MIT arm is the permissive
 # minimum every downstream already accepts, and the Apache-2.0 arm is the one
 # that carries an explicit patent grant, which is what a corporate reviewer
@@ -61,30 +61,30 @@ keywords = ["messaging", "quic", "broker", "async", "protocol"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
-weida-core = { path = "crates/core", version = "0.1.0-alpha.4" }
-weida-protocol = { path = "crates/protocol", version = "0.1.0-alpha.4" }
-weida-runtime = { path = "crates/runtime", version = "0.1.0-alpha.4" }
-weida-winpipe = { path = "crates/winpipe", version = "0.1.0-alpha.4" }
-weida = { path = "crates/weida", version = "0.1.0-alpha.4" }
-weida-broker = { path = "crates/broker", version = "0.1.0-alpha.4" }
-weida-raft = { path = "crates/raft/weida-raft", version = "0.1.0-alpha.4" }
-weida-zmtp = { path = "crates/zmq/weida-zmtp", version = "0.1.0-alpha.4" }
-weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0-alpha.4" }
-weida-sp = { path = "crates/nng/weida-sp", version = "0.1.0-alpha.4" }
-weida-nng = { path = "crates/nng/weida-nng", version = "0.1.0-alpha.4" }
-weida-py-core = { path = "crates/py/weida-py-core", version = "0.1.0-alpha.4" }
-weida-amqp-codec = { path = "crates/amqp/weida-amqp-codec", version = "0.1.0-alpha.4" }
-weida-zmq-py = { path = "crates/zmq/weida-zmq-py", version = "0.1.0-alpha.4" }
-weida-nng-py = { path = "crates/nng/weida-nng-py", version = "0.1.0-alpha.4" }
-weida-mqtt-codec = { path = "crates/mqtt/weida-mqtt-codec", version = "0.1.0-alpha.4" }
-weida-mqtt = { path = "crates/mqtt/weida-mqtt", version = "0.1.0-alpha.4" }
-weida-mqtt-py = { path = "crates/mqtt/weida-mqtt-py", version = "0.1.0-alpha.4" }
-weida-amqp = { path = "crates/amqp/weida-amqp", version = "0.1.0-alpha.4" }
-weida-amqp-py = { path = "crates/amqp/weida-amqp-py", version = "0.1.0-alpha.4" }
-weida-nats-codec = { path = "crates/nats/weida-nats-codec", version = "0.1.0-alpha.4" }
-weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0-alpha.4" }
-weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0-alpha.4" }
-weida-openbao = { path = "crates/openbao/weida-openbao", version = "0.1.0-alpha.4" }
+weida-core = { path = "crates/core", version = "0.1.0-alpha.5" }
+weida-protocol = { path = "crates/protocol", version = "0.1.0-alpha.5" }
+weida-runtime = { path = "crates/runtime", version = "0.1.0-alpha.5" }
+weida-winpipe = { path = "crates/winpipe", version = "0.1.0-alpha.5" }
+weida = { path = "crates/weida", version = "0.1.0-alpha.5" }
+weida-broker = { path = "crates/broker", version = "0.1.0-alpha.5" }
+weida-raft = { path = "crates/raft/weida-raft", version = "0.1.0-alpha.5" }
+weida-zmtp = { path = "crates/zmq/weida-zmtp", version = "0.1.0-alpha.5" }
+weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0-alpha.5" }
+weida-sp = { path = "crates/nng/weida-sp", version = "0.1.0-alpha.5" }
+weida-nng = { path = "crates/nng/weida-nng", version = "0.1.0-alpha.5" }
+weida-py-core = { path = "crates/py/weida-py-core", version = "0.1.0-alpha.5" }
+weida-amqp-codec = { path = "crates/amqp/weida-amqp-codec", version = "0.1.0-alpha.5" }
+weida-zmq-py = { path = "crates/zmq/weida-zmq-py", version = "0.1.0-alpha.5" }
+weida-nng-py = { path = "crates/nng/weida-nng-py", version = "0.1.0-alpha.5" }
+weida-mqtt-codec = { path = "crates/mqtt/weida-mqtt-codec", version = "0.1.0-alpha.5" }
+weida-mqtt = { path = "crates/mqtt/weida-mqtt", version = "0.1.0-alpha.5" }
+weida-mqtt-py = { path = "crates/mqtt/weida-mqtt-py", version = "0.1.0-alpha.5" }
+weida-amqp = { path = "crates/amqp/weida-amqp", version = "0.1.0-alpha.5" }
+weida-amqp-py = { path = "crates/amqp/weida-amqp-py", version = "0.1.0-alpha.5" }
+weida-nats-codec = { path = "crates/nats/weida-nats-codec", version = "0.1.0-alpha.5" }
+weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0-alpha.5" }
+weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0-alpha.5" }
+weida-openbao = { path = "crates/openbao/weida-openbao", version = "0.1.0-alpha.5" }
 # The two dependencies `weida-openbao` alone carries, and the reason the
 # OpenBao client is its own crate ([decisions/0032](docs/decisions/0032-identity-sources-and-the-handoff.md)
 # §3): the OpenBao API is JSON over HTTPS, and nothing else in the workspace
