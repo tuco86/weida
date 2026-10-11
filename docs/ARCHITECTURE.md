@@ -1223,8 +1223,12 @@ impl Listener {
 pub struct Binding;
 impl Binding { pub fn local_addr(&self) -> SocketAddr;
     pub async fn close(&self);                                 // SHUTDOWN, idle wait bounded by shutdown_timeout [0038 §4.6]
-    pub async fn restart(&self);                               // the same with RESTARTING: diallers see PeerRestarting, redial at once
+    pub async fn hand_over(self) -> Handoff;                   // holds every RESTARTING close; socket and held closes for the successor [0039 §4]
+    pub async fn take_over(&self, held: &[u8]) -> Result<usize, Error>; // the successor sends them once it serves: one immediate redial each [0039 §4]
     pub fn disconnect(&self, peer: Fingerprint) -> usize; }  // closes with REJECTED; not a ban [0035 §4.4]
+pub struct Handoff;                                          // the socket and the held closes, for the successor [0039 §4.2]
+impl Handoff { pub fn held(&self) -> usize; pub fn local_addr(&self) -> SocketAddr;
+    pub fn into_parts(self) -> (std::net::UdpSocket, Vec<u8>); } // descriptor over SCM_RIGHTS, bytes in any channel
 pub struct LocalBinding;                                     // unbinds the bus when dropped
 impl LocalBinding { pub fn bus(&self) -> &str; }
 #[cfg(unix)]
@@ -1360,10 +1364,14 @@ Type by type:
 - **`Binding`** — one concrete QUIC binding; exposes its resolved local address, which is how
   tests learn an ephemeral port, and `disconnect(fingerprint)`, which closes every live
   connection of one proved key with `REJECTED` — the dialler redials, so it is not a ban.
-  `close` and `restart` close every connection with `SHUTDOWN` and `RESTARTING` and wait for
-  the socket to go idle for at most `shutdown_timeout`; `restart` is the predecessor's half of a
-  handoff whose successor serves the same socket through `Listener::bind_quic_socket`
-  ([decisions/0038](decisions/0038-restart-handoff.md)).
+  `close` closes every connection with `SHUTDOWN` and waits for the socket to go idle for at
+  most `shutdown_timeout`. `hand_over` is the predecessor's half of a handoff: it stops reading
+  the socket, closes every connection with `RESTARTING` but holds the close packets, and returns
+  them with the socket in a `Handoff`; the successor serves the same socket through
+  `Listener::bind_quic_socket` and replays the held closes with `take_over` once its endpoints
+  are registered, so each client redials once, at once, into a binding that already reads
+  ([decisions/0038](decisions/0038-restart-handoff.md),
+  [0039](decisions/0039-handover-says-when.md)).
 - **`Peer`** — the L0 dialling side: a set of connections, the terms they were authenticated
   on (`ClientTls`, plus whatever each address named), and the two open calls. `peer_count`
   reports live peers only — a closed connection leaves the set when the next `connect()` adds

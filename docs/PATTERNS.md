@@ -203,10 +203,11 @@ is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3)
   `PeerRestarting`, `LocallyClosed`, `Reset` or `TransportError`. It is not a second outcome —
   the failure is definite whichever it is — but it is what a `PeerEvent::Lost` carries and what
   decides whether the redial policy continues. `PeerRestarting` is a peer that closed with
-  `RESTARTING` (`Binding::restart`): a successor serves, or is about to serve, the same address,
-  so the first redial waits for nothing and is made even under `stop_on_peer_closed`
-  ([decisions/0038](decisions/0038-restart-handoff.md)). `Peer::peer_count` stops counting the
-  dead peer.
+  `RESTARTING` (sent by the successor through `Binding::take_over`): the successor already
+  serves the same address, so the first redial waits for nothing and is made even under
+  `stop_on_peer_closed` ([decisions/0038](decisions/0038-restart-handoff.md),
+  [0039](decisions/0039-handover-says-when.md)). `Peer::peer_count` stops counting the dead
+  peer.
 - **The address reconnects; the connection does not.** `connect` records a slot the runtime
   redials under `ReconnectPolicy` (100 ms doubling to 30 s with jitter by default;
   `ReconnectPolicy::never()` for the old behaviour) until the endpoint is dropped or the address

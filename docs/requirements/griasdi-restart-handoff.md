@@ -4,11 +4,15 @@ Written by the griasdi side against weida `e8a6403` (0.1.0-alpha.4), the rev
 griasdi pins.
 
 **Answered by [decisions/0038](../decisions/0038-restart-handoff.md) (accepted; shipped in
-B-316 to B-318).** (a) is `Listener::bind_quic_socket(socket, tls)`, which shares one serve path
-with `bind_quic`; the socket is taken as it is, and a successor should serve it only once its
-predecessor's `restart` has returned. (b) is `Binding::restart`, a close with the new protocol
-code `10` `RESTARTING`, and `Binding::close` is now bounded by `RuntimeConfig::shutdown_timeout`
-like `restart`; there is no `close_with(code, reason, drain)`. (c) is
+B-316 to B-318), with (b) amended by [decisions/0039](../decisions/0039-handover-says-when.md)
+(shipped in B-320).** (a) is `Listener::bind_quic_socket(socket, tls)`, which shares one serve
+path with `bind_quic`; the socket is taken as it is. (b) is `Binding::hand_over` plus
+`Binding::take_over` per 0039: the predecessor's `hand_over` stops reading the socket, closes
+every connection with the new protocol code `10` `RESTARTING` but holds the close packets, and
+returns them with a duplicate of the socket in a `Handoff`; the successor serves the socket and
+sends the held closes with `take_over` once its endpoints are registered, so every client redials
+once, at once, into a server that already reads. `Binding::close` and `hand_over` are bounded
+by `RuntimeConfig::shutdown_timeout`; there is no `close_with(code, reason, drain)`. (c) is
 `LossCause::PeerRestarting`, which `conn_error` maps from `RESTARTING` and which reaches
 operations as well as `PeerEvent::Lost`; `ReconnectPolicy` redials it with no first delay,
 whatever `stop_on_peer_closed` says. Not taken: application close codes, so the dialler learns a
