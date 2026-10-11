@@ -1204,6 +1204,10 @@ impl Listener {
     // interfaces of one service may present different identities.
     pub async fn bind_quic(&self, addr: SocketAddr, tls: impl Into<ServerTls>)
         -> Result<Binding, Error>;                           // a bare Identity works
+    // The same, on a UDP socket this process received (from its predecessor over
+    // SCM_RIGHTS, or by socket activation) instead of one it binds [0038 §4.5].
+    pub async fn bind_quic_socket(&self, socket: std::net::UdpSocket, tls: impl Into<ServerTls>)
+        -> Result<Binding, Error>;
     // The same endpoints on the in-process transport: no socket, no TLS, no
     // credentials, bus name ≤ 256 B and unique in the process [0010 §4.1, §4.8].
     pub fn bind_inproc(&self, bus: &str) -> Result<LocalBinding, Error>;
@@ -1217,7 +1221,9 @@ impl Listener {
     pub fn acceptor(&self, path: &str) -> Result<Acceptor, Error>; // L0: both stream kinds, one queue
 }
 pub struct Binding;
-impl Binding { pub fn local_addr(&self) -> SocketAddr; pub async fn close(&self);
+impl Binding { pub fn local_addr(&self) -> SocketAddr;
+    pub async fn close(&self);                                 // SHUTDOWN, idle wait bounded by shutdown_timeout [0038 §4.6]
+    pub async fn restart(&self);                               // the same with RESTARTING: diallers see PeerRestarting, redial at once
     pub fn disconnect(&self, peer: Fingerprint) -> usize; }  // closes with REJECTED; not a ban [0035 §4.4]
 pub struct LocalBinding;                                     // unbinds the bus when dropped
 impl LocalBinding { pub fn bus(&self) -> &str; }
@@ -1354,6 +1360,10 @@ Type by type:
 - **`Binding`** — one concrete QUIC binding; exposes its resolved local address, which is how
   tests learn an ephemeral port, and `disconnect(fingerprint)`, which closes every live
   connection of one proved key with `REJECTED` — the dialler redials, so it is not a ban.
+  `close` and `restart` close every connection with `SHUTDOWN` and `RESTARTING` and wait for
+  the socket to go idle for at most `shutdown_timeout`; `restart` is the predecessor's half of a
+  handoff whose successor serves the same socket through `Listener::bind_quic_socket`
+  ([decisions/0038](decisions/0038-restart-handoff.md)).
 - **`Peer`** — the L0 dialling side: a set of connections, the terms they were authenticated
   on (`ClientTls`, plus whatever each address named), and the two open calls. `peer_count`
   reports live peers only — a closed connection leaves the set when the next `connect()` adds
