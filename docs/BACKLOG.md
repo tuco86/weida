@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-320 — Hand a QUIC binding over: hold the closes, replay them in the successor
-kind: code | size: 90 | status: ready | needs: []
+kind: code | size: 90 | status: done 2b5cda7 | needs: []
 acceptance: [0039](decisions/0039-handover-says-when.md) §4.2-§4.6: `crates/weida/src/handoff.rs` with `HandoverSocket` (`LIVE`/`HOLDING`/`DISCARDING`, held datagrams split by `segment_size`, `poll_recv` pending once held, the four capability methods delegated, `send_raw` waiting for writability), the exported `Handoff` (`held`, `local_addr`, `into_parts`) and the `WDHO` version-1 byte format with its `InvalidData` refusals; `serve_quic` on `Endpoint::new_with_abstract_socket` over a `HandoverSocket`, `Binding` holding the decorator, a `try_clone` of the socket and an `OpenConns` that `accept_connections` fills and empties; `Binding::hand_over(self) -> Handoff` bounded by `shutdown_timeout`, `Binding::take_over(&self, &[u8]) -> Result<usize, Error>` refusing another address with `InvalidInput`; `restart` and `close_with` removed, `close` bounded as before; the rustdoc of `shutdown_timeout`, `stop_on_peer_closed` and `bind_quic_socket` names `hand_over` and `take_over`. Tests: `a_handed_over_binding_tells_its_clients_once_the_successor_serves` (`Lost { PeerRestarting }`, `Retrying { attempt: 1, delay: ZERO }`, then at once `Connected`, passing 15 runs in a row), `a_send_after_a_handover_names_the_restart`, `a_handoff_is_refused_where_it_does_not_belong` in `crates/weida/tests/reconnect.rs`, and the `handoff.rs` round-trip and refusal unit tests.
 
 ### B-321 — Documents for 0039
