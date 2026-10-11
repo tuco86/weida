@@ -778,7 +778,7 @@ async fn watch_slot(
                 );
                 return;
             }
-            let delay = policy.delay(attempt);
+            let delay = policy.delay_after(cause, attempt);
             shared.emit(PeerEvent::Retrying {
                 url: Arc::clone(&url),
                 attempt,

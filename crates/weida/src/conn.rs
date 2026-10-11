@@ -301,6 +301,7 @@ pub(crate) fn conn_error(e: quinn::ConnectionError) -> Error {
                 Error::Protocol("peer closed the connection: protocol violation".into())
             }
             codes::LIMIT_EXCEEDED => Error::LimitExceeded,
+            codes::RESTARTING => Error::ConnectionLost(LossCause::PeerRestarting),
             // Any other application close code is the peer saying goodbye in
             // its own words: a shutdown, or a code this version does not map.
             _ => Error::ConnectionLost(LossCause::PeerClosed),

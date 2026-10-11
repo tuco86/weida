@@ -41,8 +41,10 @@ pub struct ReconnectPolicy {
     pub max_attempts: Option<u32>,
     /// Give the slot up when the peer closed the connection deliberately
     /// (`LossCause::PeerClosed`) rather than redialling it: ZeroMQ's
-    /// `ZMQ_RECONNECT_STOP_AFTER_DISCONNECT`. Off by default, because a
-    /// server that restarts closes deliberately on its way down.
+    /// `ZMQ_RECONNECT_STOP_AFTER_DISCONNECT`. A restart that says so
+    /// (`LossCause::PeerRestarting`, from `Binding::restart`) is redialled
+    /// regardless. Off by default, because a server that restarts by closing
+    /// and binding again still looks like a deliberate close.
     pub stop_on_peer_closed: bool,
 }
 
@@ -106,6 +108,18 @@ impl ReconnectPolicy {
         }
         let half = base / 2;
         half + rand::random_range(Duration::ZERO..=half)
+    }
+
+    /// The delay before `attempt` (1-based) after a loss with `cause`. A
+    /// restart skips the first wait and only that one: the successor is
+    /// expected to serve already, and if it does not, the schedule continues
+    /// from its own first step.
+    pub(crate) fn delay_after(&self, cause: LossCause, attempt: u32) -> Duration {
+        match cause {
+            LossCause::PeerRestarting if attempt <= 1 => Duration::ZERO,
+            LossCause::PeerRestarting => self.delay(attempt - 1),
+            _ => self.delay(attempt),
+        }
     }
 }
 
@@ -281,5 +295,41 @@ mod tests {
             }
             .allows(4)
         );
+    }
+
+    #[test]
+    fn a_restart_skips_the_first_wait_and_only_that() {
+        let policy = ReconnectPolicy {
+            initial: Duration::from_millis(100),
+            max: Duration::from_secs(1),
+            jitter: false,
+            ..ReconnectPolicy::default()
+        };
+        assert_eq!(
+            policy.delay_after(LossCause::PeerRestarting, 1),
+            Duration::ZERO
+        );
+        assert_eq!(
+            policy.delay_after(LossCause::PeerRestarting, 2),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            policy.delay_after(LossCause::PeerRestarting, 3),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            policy.delay_after(LossCause::PeerClosed, 1),
+            Duration::from_millis(100)
+        );
+
+        // A restart is redialled even where a deliberate close is not, and
+        // a policy that never redials still does not.
+        let stopping = ReconnectPolicy {
+            stop_on_peer_closed: true,
+            ..ReconnectPolicy::default()
+        };
+        assert!(stopping.redials_after(LossCause::PeerRestarting));
+        assert!(!stopping.redials_after(LossCause::PeerClosed));
+        assert!(!ReconnectPolicy::never().redials_after(LossCause::PeerRestarting));
     }
 }

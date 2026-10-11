@@ -110,7 +110,9 @@ pub struct RuntimeConfig {
     /// periods last about three times the path's probe timeout, so the default
     /// of one second is generous on any network where a clean close was
     /// possible at all, and it is not a deadline anything waits for twice:
-    /// every endpoint is closed first, and only the idle wait is capped.
+    /// every endpoint is closed first, and only the idle wait is capped. The
+    /// same bound caps [`crate::Binding::close`] and
+    /// [`crate::Binding::restart`].
     pub shutdown_timeout: Duration,
     /// Guarantee set this runtime offers **and** requires of its peers
     /// (`docs/PROTOCOL.md` §6.1, §6.5).

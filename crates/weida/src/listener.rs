@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
+use std::time::Duration;
 
 use quinn::VarInt;
 use tokio::sync::{mpsc, watch};
@@ -361,6 +362,8 @@ impl Listener {
             endpoint,
             local_addr,
             peers,
+            close_timeout: self.inner.runtime.config.shutdown_timeout,
+            exec,
         })
     }
 
@@ -627,11 +630,20 @@ impl std::fmt::Debug for Listener {
 }
 
 /// One concrete transport binding of a [`Listener`].
-#[derive(Debug)]
 pub struct Binding {
     endpoint: quinn::Endpoint,
     local_addr: SocketAddr,
     peers: Arc<PeerConns>,
+    exec: Exec,
+    close_timeout: Duration,
+}
+
+impl std::fmt::Debug for Binding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Binding")
+            .field("local_addr", &self.local_addr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Binding {
@@ -640,10 +652,47 @@ impl Binding {
         self.local_addr
     }
 
-    /// Stops accepting and closes this binding's connections.
+    /// Stops accepting and closes this binding's connections with
+    /// `SHUTDOWN`, then waits for the socket to go idle for at most
+    /// [`RuntimeConfig::shutdown_timeout`](crate::RuntimeConfig::shutdown_timeout).
     pub async fn close(&self) {
-        self.endpoint.close(shutdown_code(), b"binding closed");
-        self.endpoint.wait_idle().await;
+        self.close_with(codes::SHUTDOWN, b"binding closed").await;
+    }
+
+    /// Stops accepting and closes every connection of this binding with
+    /// `RESTARTING`, for a server that hands its socket over to a successor
+    /// ([decisions/0038](../../../docs/decisions/0038-restart-handoff.md)).
+    ///
+    /// Diallers see [`LossCause::PeerRestarting`](crate::LossCause::PeerRestarting)
+    /// and redial at once, whatever their
+    /// [`stop_on_peer_closed`](crate::ReconnectPolicy::stop_on_peer_closed)
+    /// says. The wait for the socket to go idle is bounded like
+    /// [`Binding::close`]'s.
+    ///
+    /// A closed endpoint keeps reading its socket and refuses new connections
+    /// until this binding and its runtime are gone, so drop the runtime (or
+    /// exit) as soon as `restart` returns. A client whose immediate redial
+    /// was refused in that window retries on its normal schedule.
+    pub async fn restart(&self) {
+        self.close_with(codes::RESTARTING, b"server restarting")
+            .await;
+    }
+
+    /// Closes the endpoint with `code` and waits, for at most the close
+    /// timeout, for its socket to go idle.
+    async fn close_with(&self, code: u64, reason: &[u8]) {
+        self.endpoint.close(VarInt::from_u32(code as u32), reason);
+        if self
+            .exec
+            .within(self.close_timeout, self.endpoint.wait_idle())
+            .await
+            .is_none()
+        {
+            tracing::debug!(
+                timeout_ms = self.close_timeout.as_millis(),
+                "timeout reached before the binding's socket went idle"
+            );
+        }
     }
 
     /// Closes every live connection this binding holds from `peer`, with
@@ -925,10 +974,6 @@ async fn accept_local(
             tracing::debug!(%reason, "local connection closed");
         });
     }
-}
-
-fn shutdown_code() -> VarInt {
-    VarInt::from_u32(codes::SHUTDOWN as u32)
 }
 
 /// Live connections per proved peer identity, for `max_connections_per_peer`

@@ -105,6 +105,10 @@ pub enum LossCause {
     /// The peer closed the connection deliberately, with a code this side
     /// does not map to a more specific outcome — a shutdown, typically.
     PeerClosed,
+    /// The peer closed with `RESTARTING`: its server is being replaced, and a
+    /// successor serves, or is about to serve, the same address. A redial is
+    /// due at once.
+    PeerRestarting,
     /// This side closed it: `Runtime::shutdown`, or a dropped runtime.
     LocallyClosed,
     /// A stateless reset: the peer has forgotten the connection, usually
@@ -120,6 +124,7 @@ impl fmt::Display for LossCause {
         f.write_str(match self {
             LossCause::IdleTimeout => "idle timeout",
             LossCause::PeerClosed => "closed by the peer",
+            LossCause::PeerRestarting => "the peer is restarting",
             LossCause::LocallyClosed => "closed locally",
             LossCause::Reset => "stateless reset",
             LossCause::TransportError => "transport error",

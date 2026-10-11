@@ -665,6 +665,58 @@ mod tests {
         );
     }
 
+    /// Claim: `Binding::close` waits for its socket to go idle for at most
+    /// `shutdown_timeout`, so closing one binding is not held up by its
+    /// connections' closing periods.
+    ///
+    /// The client stays connected and answers the close, but the binding's
+    /// side of the connection still runs out QUIC's closing period, about
+    /// three times the path's probe timeout. The assertion is relative for
+    /// the reason `the_wait_for_idle_sockets_is_bounded` gives.
+    #[tokio::test]
+    async fn a_binding_close_is_bounded_by_the_shutdown_timeout() {
+        async fn close_with(cap: Duration) -> Duration {
+            let identity = Identity::generate().expect("identity");
+            let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
+
+            let server = Runtime::new(RuntimeConfig {
+                shutdown_timeout: cap,
+                ..RuntimeConfig::default()
+            })
+            .expect("server runtime");
+            let listener = server.listener();
+            let binding = listener
+                .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+                .await
+                .expect("bind");
+            let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
+            let puller = listener.puller("/sink").expect("puller");
+
+            let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+            let pusher = client.pusher(trust);
+            pusher.connect(&url).await.expect("connect");
+
+            let start = std::time::Instant::now();
+            binding.close().await;
+            let elapsed = start.elapsed();
+
+            drop(pusher);
+            drop(puller);
+            drop(binding);
+            drop(listener);
+            client.shutdown().await;
+            server.shutdown().await;
+            elapsed
+        }
+
+        let capped = close_with(Duration::from_millis(1)).await;
+        let uncapped = close_with(Duration::from_secs(10)).await;
+        assert!(
+            capped * 2 < uncapped,
+            "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_binding_with_unreadable_tls_material_fails_before_serving() {
         let rt = Runtime::new(RuntimeConfig::default()).unwrap();

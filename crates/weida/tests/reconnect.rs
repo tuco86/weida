@@ -845,3 +845,68 @@ async fn a_unix_socket_that_is_rebound_is_redialled() {
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- B-318: restart handoff -------------------------------------------------
+
+/// Claim: a restart reaches the operation, not only the event stream. Under
+/// `ReconnectPolicy::never()` nothing redials a restart either, and the next
+/// send fails with `ConnectionLost(PeerRestarting)`, which a caller tells
+/// apart from a plain shutdown's `PeerClosed`.
+#[tokio::test]
+async fn a_send_after_a_restart_names_the_restart() {
+    let certs = Certs::generate();
+    let server = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+
+    let client = Runtime::new(RuntimeConfig {
+        reconnect: ReconnectPolicy::never(),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
+    let pusher = client.pusher(certs.client_tls());
+    let mut events = pusher.events();
+    within(pusher.connect(&server.url("/jobs")))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        next_transition(&mut events).await,
+        PeerEvent::Connected { .. }
+    ));
+    within(pusher.send(b"before")).await.expect("send");
+    assert_eq!(pulled(&puller).await, b"before");
+
+    drop(puller);
+    within(server.binding.restart()).await;
+    drop(server);
+    let lost = next_transition(&mut events).await;
+    assert!(
+        matches!(
+            lost,
+            PeerEvent::Lost {
+                cause: LossCause::PeerRestarting,
+                ..
+            }
+        ),
+        "a restart is reported as one, got {lost:?}"
+    );
+    let gave_up = next_transition(&mut events).await;
+    assert!(
+        matches!(
+            gave_up,
+            PeerEvent::GaveUp {
+                why: GiveUp::Policy { attempts: 0 },
+                ..
+            }
+        ),
+        "no attempt is made, got {gave_up:?}"
+    );
+    let err = within(pusher.send(b"orphan"))
+        .await
+        .expect_err("a given-up peer fails the send");
+    assert!(
+        matches!(err, Error::ConnectionLost(LossCause::PeerRestarting)),
+        "the restart survives as the cause, got {err:?}"
+    );
+
+    client.shutdown().await;
+}
