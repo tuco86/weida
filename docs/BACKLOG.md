@@ -4,6 +4,22 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-316 — PROTOCOL: code 10 RESTARTING
+kind: spec | size: 15 | status: ready | needs: []
+acceptance: [0038](decisions/0038-restart-handoff.md) §4.2: [PROTOCOL.md](PROTOCOL.md) §7's table has the row `10` `RESTARTING` and a paragraph saying it is used only in `CONNECTION_CLOSE` and that no capability negotiates it; `weida_protocol::codes::RESTARTING` is `10` and `codes::name` names it; `stop_reason` is unchanged. `codes_match_the_protocol_document` covers `10`, and `names_are_defined_for_known_codes` asserts `name(RESTARTING) == "RESTARTING"` and `name(11) == "UNKNOWN"`.
+
+### B-317 — Serve QUIC on a socket the process received
+kind: code | size: 30 | status: ready | needs: [B-318]
+acceptance: [0038](decisions/0038-restart-handoff.md) §4.5: `Listener::bind_quic_socket(socket: std::net::UdpSocket, tls)` and `bind_quic` share one private `serve_quic`, built on `quinn::Endpoint::new`, and TLS material is still validated before any socket is used. Test in `crates/weida/tests/reconnect.rs`: `a_restart_hands_the_socket_over_and_is_redialled_at_once` — a second runtime serves `try_clone` of the first runtime's socket after the first one's `restart` returned, `local_addr()` is the same address, and a pusher under `stop_on_peer_closed: true` is `Connected` again and its next send is pulled.
+
+### B-318 — Binding::restart, a bounded close, PeerRestarting and the immediate redial
+kind: code | size: 60 | status: ready | needs: [B-316]
+acceptance: [0038](decisions/0038-restart-handoff.md) §4.3, §4.4 and §4.6: `LossCause::PeerRestarting` with its `Display`, mapped from `codes::RESTARTING` in `conn_error`; `ReconnectPolicy::delay_after`, used by `watch_slot`, and the rewritten documentation of `stop_on_peer_closed`; `Binding::restart`, and `Binding::close` bounded by `RuntimeConfig::shutdown_timeout` through one `close_with`, `shutdown_code` removed, the `shutdown_timeout` documentation extended; `restart`'s rustdoc carries §4.6's handoff order. Tests: `a_send_after_a_restart_names_the_restart` in `crates/weida/tests/reconnect.rs` (`Lost { cause: PeerRestarting }`, `GaveUp { why: GiveUp::Policy { attempts: 0 } }` under `never()`, and the next send fails with `ConnectionLost(PeerRestarting)`), `a_restart_skips_the_first_wait_and_only_that` in `crates/weida/src/reconnect.rs`, and `a_binding_close_is_bounded_by_the_shutdown_timeout` in `crates/weida/src/runtime.rs` (a 1 ms cap returns in less than half the time of a 10 s cap against a client that stays connected). `a_pusher_delivers_again_after_the_server_restarts` and `the_never_policy_reports_the_loss_and_stops` stay green: `close` still reports `PeerClosed`.
+
+### B-319 — Documents for 0038
+kind: spec | size: 30 | status: ready | needs: [B-317, B-318]
+acceptance: [0038](decisions/0038-restart-handoff.md) §5's edits: [FAILURE_MODEL.md](FAILURE_MODEL.md)'s idle-timeout and reset row (`docs/FAILURE_MODEL.md:158`) lists `PeerRestarting` among the causes; [PATTERNS.md](PATTERNS.md) §1's loss paragraph (`docs/PATTERNS.md:201-205`) lists `PeerRestarting`; [ARCHITECTURE.md](ARCHITECTURE.md)'s API sketch names `Listener::bind_quic_socket` and `Binding::restart`; [IMPLEMENTATION.md](IMPLEMENTATION.md)'s loss-cause row (`docs/IMPLEMENTATION.md:1673`) lists the sixth cause; [requirements/griasdi-restart-handoff.md](requirements/griasdi-restart-handoff.md) points at what shipped.
+
 ### B-298 — Connection statistics types and the quinn floor
 kind: code | size: 45 | status: done 5f13941 | needs: []
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.1: `crates/weida/src/stats.rs` holds `PathStats` (now `#[non_exhaustive]`, plus `min_rtt`, `lost_bytes`, `current_mtu`), `UdpCounts`, `TransportStats` and `ConnectionStats`, re-exported from the crate root; `Link::transport_stats` fills `TransportStats` from one `quinn` `stats()` call, `None` locally, and `Flow::path_stats`/`IncomingFlow::path_stats` read its `path`; the workspace requires `quinn = "0.11.12"`. §4.4's `statistics_types_carry_no_address` compiles only with every field of every statistics type named and bounded by `NoAddress`.
