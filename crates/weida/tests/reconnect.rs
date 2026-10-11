@@ -846,7 +846,96 @@ async fn a_unix_socket_that_is_rebound_is_redialled() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- B-318: restart handoff -------------------------------------------------
+// --- B-317, B-318: restart handoff ------------------------------------------
+
+/// Claim: a server that hands its socket to a successor and closes with
+/// `Binding::restart` is redialled at once. The dialler reports
+/// `Lost { PeerRestarting }` and a first `Retrying` with no delay, even
+/// under `stop_on_peer_closed`, and delivers to the successor that serves
+/// the same socket.
+///
+/// The socket is handed over the way `SCM_RIGHTS` would hand it: a second
+/// descriptor of the same socket, kept while the first server closes and
+/// its runtime goes away.
+#[tokio::test]
+async fn a_restart_hands_the_socket_over_and_is_redialled_at_once() {
+    let certs = Certs::generate();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind socket");
+    let addr = socket.local_addr().expect("socket address");
+    let handed = socket.try_clone().expect("second descriptor");
+
+    let old = Runtime::new(RuntimeConfig::default()).expect("old runtime");
+    let old_listener = old.listener();
+    let old_binding = within(old_listener.bind_quic_socket(socket, certs.server_tls()))
+        .await
+        .expect("serve the socket");
+    assert_eq!(old_binding.local_addr(), addr);
+    let puller = old_listener.puller("/jobs").expect("puller");
+
+    let client = Runtime::new(RuntimeConfig {
+        reconnect: ReconnectPolicy {
+            initial: Duration::from_millis(200),
+            max: Duration::from_millis(200),
+            jitter: false,
+            stop_on_peer_closed: true,
+            ..ReconnectPolicy::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
+    let pusher = client.pusher(certs.client_tls());
+    let mut events = pusher.events();
+    within(pusher.connect(&format!("weida://127.0.0.1:{}/jobs", addr.port())))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        next_transition(&mut events).await,
+        PeerEvent::Connected { .. }
+    ));
+    within(pusher.send(b"before")).await.expect("send before");
+    assert_eq!(pulled(&puller).await, b"before");
+
+    drop(puller);
+    within(old_binding.restart()).await;
+    drop(old_binding);
+    drop(old_listener);
+    within(old.shutdown()).await;
+
+    let lost = within(events.recv()).await.expect("event stream open");
+    assert!(
+        matches!(
+            lost,
+            PeerEvent::Lost {
+                cause: LossCause::PeerRestarting,
+                ..
+            }
+        ),
+        "a restart is reported as one, got {lost:?}"
+    );
+    let retrying = within(events.recv()).await.expect("event stream open");
+    let PeerEvent::Retrying { attempt, delay, .. } = retrying else {
+        panic!("a restart is redialled, got {retrying:?}");
+    };
+    assert_eq!(attempt, 1);
+    assert_eq!(delay, Duration::ZERO, "the first redial does not wait");
+
+    let new = Runtime::new(RuntimeConfig::default()).expect("new runtime");
+    let new_listener = new.listener();
+    let new_binding = within(new_listener.bind_quic_socket(handed, certs.server_tls()))
+        .await
+        .expect("serve the handed socket");
+    assert_eq!(new_binding.local_addr(), addr);
+    let puller = new_listener.puller("/jobs").expect("puller");
+    let connected = next_transition(&mut events).await;
+    assert!(
+        matches!(connected, PeerEvent::Connected { .. }),
+        "stop_on_peer_closed does not stop a restart, got {connected:?}"
+    );
+    within(pusher.send(b"after")).await.expect("send after");
+    assert_eq!(pulled(&puller).await, b"after");
+
+    client.shutdown().await;
+}
 
 /// Claim: a restart reaches the operation, not only the event stream. Under
 /// `ReconnectPolicy::never()` nothing redials a restart either, and the next

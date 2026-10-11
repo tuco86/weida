@@ -336,16 +336,54 @@ impl Listener {
         addr: SocketAddr,
         tls: impl Into<ServerTls>,
     ) -> Result<Binding, Error> {
-        let tls = tls.into();
-        let limits = self.inner.runtime.config.limits;
-        let server_config = tls::server_config(&tls, &limits)?;
+        let server_config = tls::server_config(&tls.into(), &self.inner.runtime.config.limits)?;
+        let socket = std::net::UdpSocket::bind(addr).map_err(Error::Io)?;
+        self.serve_quic(socket, server_config)
+    }
+
+    /// Adds a native QUIC binding on a socket that is already bound.
+    ///
+    /// For a process that received its socket rather than binding it: from
+    /// its predecessor over `SCM_RIGHTS` during a restart
+    /// ([`Binding::restart`]), or through socket activation. Otherwise it is
+    /// exactly [`Listener::bind_quic`].
+    ///
+    /// The socket is taken as it is: weida neither binds it nor sets options
+    /// on it, and [`Binding::local_addr`] reports the address it is bound to.
+    ///
+    /// While another process still reads the same socket, each datagram
+    /// reaches only one of the two, so a successor should start serving only
+    /// once its predecessor's `restart` has returned.
+    pub async fn bind_quic_socket(
+        &self,
+        socket: std::net::UdpSocket,
+        tls: impl Into<ServerTls>,
+    ) -> Result<Binding, Error> {
+        let server_config = tls::server_config(&tls.into(), &self.inner.runtime.config.limits)?;
+        self.serve_quic(socket, server_config)
+    }
+
+    /// Serves this Listener's endpoints over QUIC on `socket`.
+    fn serve_quic(
+        &self,
+        socket: std::net::UdpSocket,
+        server_config: quinn::ServerConfig,
+    ) -> Result<Binding, Error> {
         let exec = self.inner.runtime.exec.clone();
 
         // Inside the runtime context: `quinn` registers the socket with the
         // reactor as it is constructed, and the calling thread may have none.
         let endpoint = {
             let _guard = exec.enter();
-            quinn::Endpoint::server(server_config, addr).map_err(Error::Io)?
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| Error::Runtime("no async runtime for the QUIC endpoint".into()))?;
+            quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                socket,
+                runtime,
+            )
+            .map_err(Error::Io)?
         };
         let local_addr = endpoint.local_addr().map_err(Error::Io)?;
         self.inner.runtime.track_endpoint(endpoint.clone());
@@ -667,7 +705,8 @@ impl Binding {
     /// and redial at once, whatever their
     /// [`stop_on_peer_closed`](crate::ReconnectPolicy::stop_on_peer_closed)
     /// says. The wait for the socket to go idle is bounded like
-    /// [`Binding::close`]'s.
+    /// [`Binding::close`]'s. The successor takes the socket over through
+    /// [`Listener::bind_quic_socket`].
     ///
     /// A closed endpoint keeps reading its socket and refuses new connections
     /// until this binding and its runtime are gone, so drop the runtime (or
