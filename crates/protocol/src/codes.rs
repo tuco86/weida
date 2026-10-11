@@ -26,6 +26,8 @@ pub const REJECTED: u64 = 7;
 pub const UNKNOWN_ENDPOINT: u64 = 8;
 /// The endpoint exists but does not serve this stream kind.
 pub const UNSUPPORTED: u64 = 9;
+/// The binding closes because its server is being replaced; the address is served again at once.
+pub const RESTARTING: u64 = 10;
 
 /// Human-readable name for a code, for logs and close reasons.
 pub const fn name(code: u64) -> &'static str {
@@ -40,6 +42,7 @@ pub const fn name(code: u64) -> &'static str {
         REJECTED => "REJECTED",
         UNKNOWN_ENDPOINT => "UNKNOWN_ENDPOINT",
         UNSUPPORTED => "UNSUPPORTED",
+        RESTARTING => "RESTARTING",
         _ => "UNKNOWN",
     }
 }
@@ -74,9 +77,10 @@ mod tests {
                 SHUTDOWN,
                 REJECTED,
                 UNKNOWN_ENDPOINT,
-                UNSUPPORTED
+                UNSUPPORTED,
+                RESTARTING
             ],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
     }
 
@@ -85,7 +89,8 @@ mod tests {
         assert_eq!(name(PROTOCOL_VIOLATION), "PROTOCOL_VIOLATION");
         assert_eq!(name(NEGOTIATION_FAILED), "NEGOTIATION_FAILED");
         assert_eq!(name(UNSUPPORTED), "UNSUPPORTED");
-        assert_eq!(name(10), "UNKNOWN");
+        assert_eq!(name(RESTARTING), "RESTARTING");
+        assert_eq!(name(11), "UNKNOWN");
     }
 
     #[test]

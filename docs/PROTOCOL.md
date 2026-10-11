@@ -1056,10 +1056,14 @@ distinct from the ERROR frame codes of §6.3.
 | `7` | `REJECTED` | receiver declines the inbound payload |
 | `8` | `UNKNOWN_ENDPOINT` | requested endpoint path is not registered |
 | `9` | `UNSUPPORTED` | endpoint exists but does not serve this stream kind |
+| `10` | `RESTARTING` | binding closed because its server is being replaced; redial at once |
 
 `UNSUPPORTED` is new in this revision. A misrouted uni stream has no reply half to carry an
 ERROR frame, so the refusal has to be a stop code; without a distinct code, "wrong pattern"
 would be indistinguishable from "declined".
+
+`RESTARTING` is used only in `CONNECTION_CLOSE`. A peer that does not know code `10` treats it
+as any other close code it does not map, a deliberate close, so no capability negotiates it.
 
 ---
 
