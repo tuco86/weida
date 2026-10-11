@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-316 — PROTOCOL: code 10 RESTARTING
-kind: spec | size: 15 | status: ready | needs: []
+kind: spec | size: 15 | status: done 7ced5ff | needs: []
 acceptance: [0038](decisions/0038-restart-handoff.md) §4.2: [PROTOCOL.md](PROTOCOL.md) §7's table has the row `10` `RESTARTING` and a paragraph saying it is used only in `CONNECTION_CLOSE` and that no capability negotiates it; `weida_protocol::codes::RESTARTING` is `10` and `codes::name` names it; `stop_reason` is unchanged. `codes_match_the_protocol_document` covers `10`, and `names_are_defined_for_known_codes` asserts `name(RESTARTING) == "RESTARTING"` and `name(11) == "UNKNOWN"`.
 
 ### B-317 — Serve QUIC on a socket the process received
