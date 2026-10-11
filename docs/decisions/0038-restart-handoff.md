@@ -8,6 +8,8 @@
 - **Related:** [0009](0009-drain.md) §4.4 (bounded wait),
   [0031](0031-transparent-redial-and-the-sender-outbox.md) (redial),
   [0035](0035-keys-proved-not-judged.md) §4.4 (`disconnect` closes with `REJECTED`)
+- **Amended by:** [0039](0039-handover-says-when.md) (`Binding::restart` replaced by
+  `Binding::hand_over` and `Binding::take_over`)
 
 ## 1. The question
 
