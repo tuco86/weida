@@ -846,30 +846,36 @@ async fn a_unix_socket_that_is_rebound_is_redialled() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- B-317, B-318: restart handoff ------------------------------------------
+// --- B-317, B-318, B-320: restart handoff -----------------------------------
 
-/// Claim: a server that hands its socket to a successor and closes with
-/// `Binding::restart` is redialled at once. The dialler reports
-/// `Lost { PeerRestarting }` and a first `Retrying` with no delay, even
-/// under `stop_on_peer_closed`, and delivers to the successor that serves
-/// the same socket.
+/// Claim: a binding handed over tells its clients nothing until the
+/// successor serves, and then each client reconnects exactly once and at
+/// once. The dialler reports `Lost { PeerRestarting }`, a first `Retrying`
+/// with no delay, even under `stop_on_peer_closed`, and the very next event
+/// is `Connected`: the redial was not refused, so no backoff followed.
+/// `hand_over` returns as soon as the closes are held, well inside its
+/// bound.
 ///
-/// The socket is handed over the way `SCM_RIGHTS` would hand it: a second
-/// descriptor of the same socket, kept while the first server closes and
-/// its runtime goes away.
+/// The socket is handed over the way `SCM_RIGHTS` would hand it: the
+/// duplicate descriptor in the `Handoff`. The old runtime stays alive until
+/// the end, so the successor's delivery also shows that a held socket is no
+/// longer read.
 #[tokio::test]
-async fn a_restart_hands_the_socket_over_and_is_redialled_at_once() {
+async fn a_handed_over_binding_tells_its_clients_once_the_successor_serves() {
+    const HANDOVER_TIMEOUT: Duration = Duration::from_secs(10);
     let certs = Certs::generate();
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind socket");
-    let addr = socket.local_addr().expect("socket address");
-    let handed = socket.try_clone().expect("second descriptor");
-
-    let old = Runtime::new(RuntimeConfig::default()).expect("old runtime");
+    let old = Runtime::new(RuntimeConfig {
+        shutdown_timeout: HANDOVER_TIMEOUT,
+        ..RuntimeConfig::default()
+    })
+    .expect("old runtime");
     let old_listener = old.listener();
-    let old_binding = within(old_listener.bind_quic_socket(socket, certs.server_tls()))
-        .await
-        .expect("serve the socket");
-    assert_eq!(old_binding.local_addr(), addr);
+    let old_binding = within(
+        old_listener.bind_quic("127.0.0.1:0".parse().expect("loopback"), certs.server_tls()),
+    )
+    .await
+    .expect("bind");
+    let addr = old_binding.local_addr();
     let puller = old_listener.puller("/jobs").expect("puller");
 
     let client = Runtime::new(RuntimeConfig {
@@ -896,10 +902,36 @@ async fn a_restart_hands_the_socket_over_and_is_redialled_at_once() {
     assert_eq!(pulled(&puller).await, b"before");
 
     drop(puller);
-    within(old_binding.restart()).await;
-    drop(old_binding);
-    drop(old_listener);
-    within(old.shutdown()).await;
+    let started = std::time::Instant::now();
+    let handoff = within(old_binding.hand_over()).await;
+    assert!(
+        started.elapsed() < HANDOVER_TIMEOUT / 2,
+        "hand_over returns once the closes are held, not at its timeout"
+    );
+    assert!(
+        handoff.held() >= 1,
+        "the pusher's close is held, got {handoff:?}"
+    );
+    assert_eq!(handoff.local_addr(), addr);
+    let (socket, held) = handoff.into_parts();
+    assert!(
+        timeout(Duration::from_millis(300), events.recv())
+            .await
+            .is_err(),
+        "the client is told nothing before the successor serves"
+    );
+
+    let new = Runtime::new(RuntimeConfig::default()).expect("new runtime");
+    let new_listener = new.listener();
+    let puller = new_listener.puller("/jobs").expect("puller");
+    let new_binding = within(new_listener.bind_quic_socket(socket, certs.server_tls()))
+        .await
+        .expect("serve the handed socket");
+    assert_eq!(new_binding.local_addr(), addr);
+    let sent = within(new_binding.take_over(&held))
+        .await
+        .expect("take over");
+    assert!(sent >= 1, "the held close is sent, got {sent}");
 
     let lost = within(events.recv()).await.expect("event stream open");
     assert!(
@@ -910,7 +942,7 @@ async fn a_restart_hands_the_socket_over_and_is_redialled_at_once() {
                 ..
             }
         ),
-        "a restart is reported as one, got {lost:?}"
+        "a handover is reported as a restart, got {lost:?}"
     );
     let retrying = within(events.recv()).await.expect("event stream open");
     let PeerEvent::Retrying { attempt, delay, .. } = retrying else {
@@ -918,31 +950,24 @@ async fn a_restart_hands_the_socket_over_and_is_redialled_at_once() {
     };
     assert_eq!(attempt, 1);
     assert_eq!(delay, Duration::ZERO, "the first redial does not wait");
-
-    let new = Runtime::new(RuntimeConfig::default()).expect("new runtime");
-    let new_listener = new.listener();
-    let new_binding = within(new_listener.bind_quic_socket(handed, certs.server_tls()))
-        .await
-        .expect("serve the handed socket");
-    assert_eq!(new_binding.local_addr(), addr);
-    let puller = new_listener.puller("/jobs").expect("puller");
-    let connected = next_transition(&mut events).await;
+    let connected = within(events.recv()).await.expect("event stream open");
     assert!(
         matches!(connected, PeerEvent::Connected { .. }),
-        "stop_on_peer_closed does not stop a restart, got {connected:?}"
+        "the first redial is accepted, so one reconnect and no backoff, got {connected:?}"
     );
     within(pusher.send(b"after")).await.expect("send after");
     assert_eq!(pulled(&puller).await, b"after");
 
     client.shutdown().await;
+    within(old.shutdown()).await;
 }
 
-/// Claim: a restart reaches the operation, not only the event stream. Under
-/// `ReconnectPolicy::never()` nothing redials a restart either, and the next
-/// send fails with `ConnectionLost(PeerRestarting)`, which a caller tells
-/// apart from a plain shutdown's `PeerClosed`.
+/// Claim: a handover reaches the operation, not only the event stream.
+/// Under `ReconnectPolicy::never()` nothing redials a restart either, and
+/// the next send fails with `ConnectionLost(PeerRestarting)`, which a caller
+/// tells apart from a plain shutdown's `PeerClosed`.
 #[tokio::test]
-async fn a_send_after_a_restart_names_the_restart() {
+async fn a_send_after_a_handover_names_the_restart() {
     let certs = Certs::generate();
     let server = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
     let puller = server.listener.puller("/jobs").expect("puller");
@@ -965,8 +990,19 @@ async fn a_send_after_a_restart_names_the_restart() {
     assert_eq!(pulled(&puller).await, b"before");
 
     drop(puller);
-    within(server.binding.restart()).await;
-    drop(server);
+    let Server {
+        _runtime, binding, ..
+    } = server;
+    let (socket, held) = within(binding.hand_over()).await.into_parts();
+    let successor = Runtime::new(RuntimeConfig::default()).expect("successor runtime");
+    let successor_listener = successor.listener();
+    let successor_binding = within(successor_listener.bind_quic_socket(socket, certs.server_tls()))
+        .await
+        .expect("serve the handed socket");
+    within(successor_binding.take_over(&held))
+        .await
+        .expect("take over");
+
     let lost = next_transition(&mut events).await;
     assert!(
         matches!(
@@ -976,7 +1012,7 @@ async fn a_send_after_a_restart_names_the_restart() {
                 ..
             }
         ),
-        "a restart is reported as one, got {lost:?}"
+        "a handover is reported as a restart, got {lost:?}"
     );
     let gave_up = next_transition(&mut events).await;
     assert!(
@@ -998,4 +1034,33 @@ async fn a_send_after_a_restart_names_the_restart() {
     );
 
     client.shutdown().await;
+}
+
+/// Claim: a handoff is taken over only by a binding on the address it was
+/// made for, and bytes that are not a handoff are refused as such.
+#[tokio::test]
+async fn a_handoff_is_refused_where_it_does_not_belong() {
+    let certs = Certs::generate();
+    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let listener = runtime.listener();
+    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+    let first = within(listener.bind_quic(loopback, certs.server_tls()))
+        .await
+        .expect("first binding");
+    let second = within(listener.bind_quic(loopback, certs.server_tls()))
+        .await
+        .expect("second binding");
+
+    let handoff = within(first.hand_over()).await;
+    assert_eq!(handoff.held(), 0, "no connection, nothing held");
+    let (_, held) = handoff.into_parts();
+
+    match within(second.take_over(&held)).await {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
+        other => panic!("another address's handoff is refused, got {other:?}"),
+    }
+    match within(second.take_over(b"garbage")).await {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}"),
+        other => panic!("garbage is refused, got {other:?}"),
+    }
 }

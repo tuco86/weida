@@ -42,9 +42,10 @@ pub struct ReconnectPolicy {
     /// Give the slot up when the peer closed the connection deliberately
     /// (`LossCause::PeerClosed`) rather than redialling it: ZeroMQ's
     /// `ZMQ_RECONNECT_STOP_AFTER_DISCONNECT`. A restart that says so
-    /// (`LossCause::PeerRestarting`, from `Binding::restart`) is redialled
-    /// regardless. Off by default, because a server that restarts by closing
-    /// and binding again still looks like a deliberate close.
+    /// (`LossCause::PeerRestarting`, sent for a binding handed over with
+    /// `Binding::hand_over`) is redialled regardless. Off by default,
+    /// because a server that restarts by closing and binding again still
+    /// looks like a deliberate close.
     pub stop_on_peer_closed: bool,
 }
 

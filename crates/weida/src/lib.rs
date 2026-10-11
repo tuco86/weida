@@ -60,6 +60,7 @@ mod endpoint;
 mod flow;
 #[cfg(any(unix, windows))]
 mod grouped;
+mod handoff;
 mod identity;
 mod inproc;
 mod listener;
@@ -92,6 +93,7 @@ pub use endpoint::{
     Survey, SurveyRun, Surveyor, Tune,
 };
 pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow};
+pub use handoff::Handoff;
 pub use identity::{
     FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, PeerChain, TrustSource,
 };

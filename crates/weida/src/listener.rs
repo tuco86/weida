@@ -5,6 +5,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
@@ -22,6 +23,7 @@ use crate::endpoint::{
     BusMember, BusState, Endpoint, PairState, Paired, PubState, Publisher, PullState, Puller,
     RepState, Replier, RespondState, Respondent,
 };
+use crate::handoff::{self, Handoff, HandoverSocket};
 use crate::inproc;
 use crate::pubsub::SubRegistry;
 use crate::runtime::{Exec, RuntimeInner, Shared};
@@ -344,16 +346,16 @@ impl Listener {
     /// Adds a native QUIC binding on a socket that is already bound.
     ///
     /// For a process that received its socket rather than binding it: from
-    /// its predecessor over `SCM_RIGHTS` during a restart
-    /// ([`Binding::restart`]), or through socket activation. Otherwise it is
-    /// exactly [`Listener::bind_quic`].
+    /// its predecessor over `SCM_RIGHTS` after [`Binding::hand_over`], or
+    /// through socket activation. Otherwise it is exactly
+    /// [`Listener::bind_quic`].
     ///
     /// The socket is taken as it is: weida neither binds it nor sets options
     /// on it, and [`Binding::local_addr`] reports the address it is bound to.
     ///
-    /// While another process still reads the same socket, each datagram
-    /// reaches only one of the two, so a successor should start serving only
-    /// once its predecessor's `restart` has returned.
+    /// A predecessor that called `hand_over` no longer reads the socket, so
+    /// the successor may serve it at once; it calls [`Binding::take_over`]
+    /// once its endpoints are registered.
     pub async fn bind_quic_socket(
         &self,
         socket: std::net::UdpSocket,
@@ -370,29 +372,37 @@ impl Listener {
         server_config: quinn::ServerConfig,
     ) -> Result<Binding, Error> {
         let exec = self.inner.runtime.exec.clone();
+        // The duplicate a handover passes on; the endpoint gets the original.
+        let handed = socket.try_clone().map_err(Error::Io)?;
 
         // Inside the runtime context: `quinn` registers the socket with the
         // reactor as it is constructed, and the calling thread may have none.
-        let endpoint = {
+        let (endpoint, socket) = {
             let _guard = exec.enter();
             let runtime = quinn::default_runtime()
                 .ok_or_else(|| Error::Runtime("no async runtime for the QUIC endpoint".into()))?;
-            quinn::Endpoint::new(
+            let socket = Arc::new(HandoverSocket::new(
+                runtime.wrap_udp_socket(socket).map_err(Error::Io)?,
+            ));
+            let endpoint = quinn::Endpoint::new_with_abstract_socket(
                 quinn::EndpointConfig::default(),
                 Some(server_config),
-                socket,
+                Arc::clone(&socket) as Arc<dyn quinn::AsyncUdpSocket>,
                 runtime,
             )
-            .map_err(Error::Io)?
+            .map_err(Error::Io)?;
+            (endpoint, socket)
         };
         let local_addr = endpoint.local_addr().map_err(Error::Io)?;
         self.inner.runtime.track_endpoint(endpoint.clone());
 
         let peers = Arc::new(PeerConns::default());
+        let open = Arc::new(OpenConns::default());
         exec.spawn(accept_connections(
             endpoint.clone(),
             Arc::clone(&self.inner),
             Arc::clone(&peers),
+            Arc::clone(&open),
         ));
 
         tracing::info!(%local_addr, "quic binding listening");
@@ -400,6 +410,9 @@ impl Listener {
             endpoint,
             local_addr,
             peers,
+            socket,
+            handed,
+            open,
             close_timeout: self.inner.runtime.config.shutdown_timeout,
             exec,
         })
@@ -672,6 +685,11 @@ pub struct Binding {
     endpoint: quinn::Endpoint,
     local_addr: SocketAddr,
     peers: Arc<PeerConns>,
+    /// The decorator under the endpoint, which `hand_over` makes hold.
+    socket: Arc<HandoverSocket>,
+    /// A duplicate of the bound socket, for the successor.
+    handed: std::net::UdpSocket,
+    open: Arc<OpenConns>,
     exec: Exec,
     close_timeout: Duration,
 }
@@ -694,33 +712,8 @@ impl Binding {
     /// `SHUTDOWN`, then waits for the socket to go idle for at most
     /// [`RuntimeConfig::shutdown_timeout`](crate::RuntimeConfig::shutdown_timeout).
     pub async fn close(&self) {
-        self.close_with(codes::SHUTDOWN, b"binding closed").await;
-    }
-
-    /// Stops accepting and closes every connection of this binding with
-    /// `RESTARTING`, for a server that hands its socket over to a successor
-    /// ([decisions/0038](../../../docs/decisions/0038-restart-handoff.md)).
-    ///
-    /// Diallers see [`LossCause::PeerRestarting`](crate::LossCause::PeerRestarting)
-    /// and redial at once, whatever their
-    /// [`stop_on_peer_closed`](crate::ReconnectPolicy::stop_on_peer_closed)
-    /// says. The wait for the socket to go idle is bounded like
-    /// [`Binding::close`]'s. The successor takes the socket over through
-    /// [`Listener::bind_quic_socket`].
-    ///
-    /// A closed endpoint keeps reading its socket and refuses new connections
-    /// until this binding and its runtime are gone, so drop the runtime (or
-    /// exit) as soon as `restart` returns. A client whose immediate redial
-    /// was refused in that window retries on its normal schedule.
-    pub async fn restart(&self) {
-        self.close_with(codes::RESTARTING, b"server restarting")
-            .await;
-    }
-
-    /// Closes the endpoint with `code` and waits, for at most the close
-    /// timeout, for its socket to go idle.
-    async fn close_with(&self, code: u64, reason: &[u8]) {
-        self.endpoint.close(VarInt::from_u32(code as u32), reason);
+        self.endpoint
+            .close(VarInt::from_u32(codes::SHUTDOWN as u32), b"binding closed");
         if self
             .exec
             .within(self.close_timeout, self.endpoint.wait_idle())
@@ -732,6 +725,115 @@ impl Binding {
                 "timeout reached before the binding's socket went idle"
             );
         }
+    }
+
+    /// Hands this binding's socket over to a successor process, which tells
+    /// the clients to redial once it serves
+    /// ([decisions/0039](../../../docs/decisions/0039-handover-says-when.md)).
+    ///
+    /// From the call on, this process neither reads nor sends on the socket.
+    /// The successor may serve it, through [`Listener::bind_quic_socket`], as
+    /// soon as `hand_over` returns, and this process may keep its runtime as
+    /// long as it likes.
+    ///
+    /// Every connection is closed with `RESTARTING`, but the close packets
+    /// are held in the [`Handoff`] and not sent. Clients learn of the restart
+    /// only when the successor calls [`Binding::take_over`]: they see
+    /// [`LossCause::PeerRestarting`](crate::LossCause::PeerRestarting) and
+    /// redial at once, whatever their
+    /// [`stop_on_peer_closed`](crate::ReconnectPolicy::stop_on_peer_closed)
+    /// says, into a binding that already reads.
+    ///
+    /// The wait for the closes is bounded by
+    /// [`RuntimeConfig::shutdown_timeout`](crate::RuntimeConfig::shutdown_timeout),
+    /// and a connection still in its handshake is not waited for. If the
+    /// successor never calls `take_over`, or a datagram is lost, a client
+    /// notices through [`Limits::idle_timeout`] and redials on its normal
+    /// schedule.
+    pub async fn hand_over(self) -> Handoff {
+        self.socket.hold();
+        let pending: Vec<quinn::Connection> = self
+            .open
+            .snapshot()
+            .into_iter()
+            .filter(|conn| conn.close_reason().is_none())
+            .collect();
+        self.endpoint.close(
+            VarInt::from_u32(codes::RESTARTING as u32),
+            b"server restarting",
+        );
+        // The endpoint's close reaches each connection as an event its driver
+        // applies, and the same driver poll then passes the close packet to
+        // the socket, all under the lock `closed()` takes to read the reason.
+        // A connection that was open above and is now closed has therefore
+        // handed its close to the held socket.
+        let all_held = self
+            .exec
+            .within(self.close_timeout, async {
+                for conn in &pending {
+                    conn.closed().await;
+                }
+            })
+            .await
+            .is_some();
+        if !all_held {
+            tracing::debug!(
+                timeout_ms = self.close_timeout.as_millis(),
+                "timeout reached before every close was held"
+            );
+        }
+        let held = self.socket.release();
+        tracing::info!(
+            local_addr = %self.local_addr,
+            connections = pending.len(),
+            datagrams = held.len(),
+            "binding handed over"
+        );
+        Handoff {
+            socket: self.handed,
+            local_addr: self.local_addr,
+            held,
+        }
+    }
+
+    /// Sends the close packets a predecessor held in its [`Handoff`], so its
+    /// clients redial into this binding
+    /// ([decisions/0039](../../../docs/decisions/0039-handover-says-when.md)).
+    ///
+    /// `held` is the second half of [`Handoff::into_parts`]. Call this after
+    /// the Listener's endpoints the clients use are registered: a client
+    /// redials within one round trip, and a path not yet registered refuses
+    /// it. Each datagram is sent once; the return value is how many were.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] of kind `InvalidData` for bytes that are not a handoff,
+    /// and of kind `InvalidInput` for a handoff of a socket bound to another
+    /// address than this binding's.
+    pub async fn take_over(&self, held: &[u8]) -> Result<usize, Error> {
+        let (from, datagrams) = handoff::decode(held)?;
+        if from != self.local_addr {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "handoff for {from} offered to a binding on {}",
+                    self.local_addr
+                ),
+            )));
+        }
+        let mut sent = 0;
+        for datagram in &datagrams {
+            match self.socket.send_raw(datagram).await {
+                Ok(()) => sent += 1,
+                Err(e) => tracing::debug!(
+                    destination = %datagram.destination,
+                    error = %e,
+                    "handed-over datagram not sent"
+                ),
+            }
+        }
+        tracing::info!(local_addr = %self.local_addr, sent, "binding took over");
+        Ok(sent)
     }
 
     /// Closes every live connection this binding holds from `peer`, with
@@ -1092,6 +1194,39 @@ impl std::fmt::Debug for PeerConns {
     }
 }
 
+/// Every handshaken connection of a binding, anonymous ones included, so
+/// [`Binding::hand_over`] can wait for each one's close.
+///
+/// [`PeerConns`] cannot serve here: it holds proved peers only. Keyed by
+/// `stable_id()` and bounded by `max_connections`.
+#[derive(Default)]
+struct OpenConns(std::sync::Mutex<HashMap<usize, quinn::Connection>>);
+
+impl OpenConns {
+    fn insert(&self, conn: &quinn::Connection) {
+        self.0
+            .lock()
+            .expect("open connections poisoned")
+            .insert(conn.stable_id(), conn.clone());
+    }
+
+    fn remove(&self, conn_id: usize) {
+        self.0
+            .lock()
+            .expect("open connections poisoned")
+            .remove(&conn_id);
+    }
+
+    fn snapshot(&self) -> Vec<quinn::Connection> {
+        self.0
+            .lock()
+            .expect("open connections poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
 /// Accepts connections until the endpoint is closed.
 ///
 /// Everything it needs is already on the listener it serves: the namespace to
@@ -1103,6 +1238,7 @@ async fn accept_connections(
     endpoint: quinn::Endpoint,
     listener: Arc<ListenerInner>,
     peers: Arc<PeerConns>,
+    open: Arc<OpenConns>,
 ) {
     let config = &listener.runtime.config;
     let limits = config.limits;
@@ -1144,9 +1280,11 @@ async fn accept_connections(
         let exec_for_conn = exec.clone();
         let shared = Arc::clone(&shared);
         let peers = Arc::clone(&peers);
+        let open = Arc::clone(&open);
         exec.spawn(async move {
             match incoming.await {
                 Ok(conn) => {
+                    open.insert(&conn);
                     let remote = conn.remote_address();
                     let conn_id = conn.stable_id();
                     // The per-peer ceiling can only be applied here: the
@@ -1188,6 +1326,7 @@ async fn accept_connections(
                         peers.release(peer, conn_id);
                         tracing::debug!(%remote, %reason, "connection closed");
                     }
+                    open.remove(conn_id);
                 }
                 Err(e) => tracing::debug!(error = %e, "handshake failed"),
             }

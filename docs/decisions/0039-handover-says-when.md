@@ -24,7 +24,8 @@ So the question is: **how does a close reach the clients only once the successor
 
 ## 2. The evidence, condensed
 
-Verified at `61e872e`, against quinn 0.11.12 and quinn-udp 0.5.16:
+Verified at `61e872e`, against quinn 0.11.12, quinn-proto 0.11.19 (the locked version) and
+quinn-udp 0.5.16:
 
 **2.1 An endpoint can sit on any socket.** `Endpoint::new_with_abstract_socket(EndpointConfig,
 Option<ServerConfig>, Arc<dyn AsyncUdpSocket>, Arc<dyn Runtime>)`
@@ -37,11 +38,17 @@ meta)`, `local_addr`, and the defaulted `max_transmit_segments`, `max_receive_se
 (`quinn-udp-0.5.16/src/lib.rs:134-147`). quinn re-exports `AsyncUdpSocket`, `UdpPoller` and
 `udp` (`quinn-0.11.12/src/lib.rs:75,90`).
 
-**2.3 A counted close has reached the socket.** A connection transmits inside
-`ConnectionDriver::poll` while holding its state lock: `drive_transmit` calls `poll_transmit` and
-then `socket.try_send` (`quinn-0.11.12/src/connection.rs:260, 1016-1060`). `Connection::stats()`
-takes the same lock (`:554-556`). So once `stats().frame_tx.connection_close >= 1` is observed,
-the datagram carrying that close has already been passed to `try_send`.
+**2.3 A closed connection has passed its close to the socket.** `Endpoint::close` reaches each
+connection as a `ConnectionEvent::Close` (`quinn-0.11.12/src/endpoint.rs:299-308`).
+`ConnectionDriver::poll` takes the connection's state lock, applies the event, which sets the
+close reason, and then, still under that lock, `drive_transmit` calls `poll_transmit` and
+`socket.try_send` (`quinn-0.11.12/src/connection.rs:259-267, 1016-1060, 1107-1108, 1228-1229`).
+`Connection::closed()` reads the reason under the same lock (`:376-395`). So once `closed()`
+returns for a connection that was open before `Endpoint::close`, the datagram carrying its close
+has been passed to `try_send`, unless the socket was not writable and quinn buffered it. The
+counter that would say so directly, `stats().frame_tx.connection_close`, is never incremented on
+send by the locked `quinn-proto` 0.11.19: `FrameStats::record` is called for received frames only
+(`quinn-proto-0.11.19/src/connection/mod.rs:2460, 2706, 2764`).
 
 **2.4 An endpoint cannot be told to stop reading.** `Endpoint::rebind` keeps reading the old
 socket until a connection packet arrives on the new one (`quinn-0.11.12/src/endpoint.rs:475-518`),
@@ -133,9 +140,8 @@ path alike. `PeerConns` cannot serve here: it holds proved peers only.
 1. The decorator holds: from here on this process neither reads nor sends on the socket.
 2. The open connections not yet closed are snapshotted.
 3. The endpoint closes with `RESTARTING` and the reason `server restarting`.
-4. It waits until every snapshotted connection counts a sent `CONNECTION_CLOSE` frame (§2.3),
-   polling every millisecond, for at most `RuntimeConfig::shutdown_timeout`. A timeout is logged
-   at `debug` and is not an error.
+4. It awaits `closed()` of every snapshotted connection (§2.3), for at most
+   `RuntimeConfig::shutdown_timeout`. A timeout is logged at `debug` and is not an error.
 5. The decorator releases: the held datagrams are taken, and anything sent later is dropped.
 6. It returns the `Handoff`.
 
@@ -167,11 +173,12 @@ successor's, once its endpoints are registered.
 `crates/weida/tests/reconnect.rs` replaces 0038's two tests:
 
 - `a_handed_over_binding_tells_its_clients_once_the_successor_serves`: a pusher on an old runtime
-  is `Connected` and delivers; `hand_over` holds at least one datagram; the client hears nothing
-  for 300 ms; a new runtime registers the puller, serves the socket at the same address and
-  `take_over` sends at least one datagram; the raw event stream is `Lost { PeerRestarting }`,
-  `Retrying { attempt: 1, delay: ZERO }`, and the very next event `Connected`; the next send is
-  pulled by the new puller while the old runtime is still alive.
+  is `Connected` and delivers; `hand_over` returns in less than half its 10 s bound and holds at
+  least one datagram; the client hears nothing for 300 ms; a new runtime registers the puller,
+  serves the socket at the same address and `take_over` sends at least one datagram; the raw
+  event stream is `Lost { PeerRestarting }`, `Retrying { attempt: 1, delay: ZERO }`, and the very
+  next event `Connected`; the next send is pulled by the new puller while the old runtime is still
+  alive.
 - `a_send_after_a_handover_names_the_restart`: under `ReconnectPolicy::never()`, after
   `hand_over` and the successor's `take_over`, `Lost { PeerRestarting }`,
   `GaveUp { Policy { attempts: 0 } }`, and the next send fails with
@@ -217,5 +224,6 @@ weida documents: decision [0038](0038-restart-handoff.md);
 Code read for this note, at `61e872e`: `crates/weida/src/listener.rs:344-406, 670-751,
 1102-1198`; `crates/weida/src/config.rs:113-115`; `crates/weida/src/reconnect.rs:44-47`;
 `crates/core/src/limits.rs:173-174`; `crates/weida/tests/reconnect.rs:849-1001`. `quinn` 0.11.12
-`src/endpoint.rs:136-141, 475-518`, `src/runtime.rs:24, 42-89`, `src/connection.rs:260, 554-556,
-1016-1060`, `src/lib.rs:75,90`; `quinn-udp` 0.5.16 `src/lib.rs:134-147`.
+`src/endpoint.rs:136-141, 299-308, 475-518`, `src/runtime.rs:24, 42-89`, `src/connection.rs:259-267,
+376-395, 1016-1060, 1107-1108, 1228-1229`, `src/lib.rs:75,90`; `quinn-proto` 0.11.19
+`src/connection/mod.rs:491-507, 794-852`; `quinn-udp` 0.5.16 `src/lib.rs:134-147`.
