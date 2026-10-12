@@ -1628,7 +1628,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | ALPN token | `weida/0` | Couples the TLS-level protocol identity to the wire protocol version, so a version-0 peer cannot silently talk to a future version. |
 | Stream magic | `0x57` (ASCII `W`) | Cheap first-byte rejection of non-weida streams. |
 | Wire protocol version | `0` | Experimental per master doc §15; independent of the library version. |
-| Library version | `0.1.0` pre-releases (`0.1.0-alpha.N`, `0.1.0-dev` between them) | Independent of the wire version. |
+| Library version | `0.1.0` pre-releases (`0.1.0-alpha.N`; between releases the next one with `-dev`, e.g. `0.1.0-alpha.6-dev`) | Independent of the wire version. |
 | Client trust | pinned public keys **or** configured anchors | A peer is accepted for a pinned fingerprint or for a chain to an explicitly configured anchor that names the host dialled. No platform root store and no insecure-skip mode ships in v0, and `Trust::by_address()` trusts nothing beyond what an address names. |
 | TLS material source | file **or** in-memory PEM (`Pem`) | Requiring a path would force callers holding a key from a secret store to write it to disk first. Both sources are first class; `Identity::from_pem` and `Trust::anchor` never touch the filesystem. |
 | Credential placement | identity per **binding**, trust per **dialling endpoint** | Credentials are transport-specific, so they belong neither on the Listener (a namespace) nor on the Runtime (a resource container). Consequence: the connection pool keys on `(host, port, ClientTls, address fingerprint)` — sharing on authority alone would hand one endpoint a peer authenticated on another endpoint's terms. |

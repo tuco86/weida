@@ -37,7 +37,7 @@ pyo3.workspace = true
 # not configure would be linking it for nothing. `default-features = false`
 # cannot override an inherited default, so the path is named here rather than
 # through `workspace = true`.
-weida-mqtt = { path = "../weida-mqtt", version = "0.1.0-alpha.5", default-features = false, features = [
+weida-mqtt = { path = "../weida-mqtt", version = "0.1.0-alpha.6-dev", default-features = false, features = [
     # `weida_mqtt.sync` is the facade over the library's own `blocking`
     # module: one `block_on` per method over the asynchronous client, and no
     # second implementation of any protocol behaviour (0013 §4.4 item 3).
