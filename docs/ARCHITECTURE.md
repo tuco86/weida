@@ -587,8 +587,11 @@ no declare frame and never creates a queue as a side effect
 
 openraft plus the I/O openraft deliberately leaves out. The engine is the Raft mechanics, the
 clock and the task driving; what it asks for as traits is a **transport** and a **store**, and
-this crate fills the first with weida — one exchange per RPC on its own ALPN, TLS-proved node
-identity, and a snapshot that travels as a stream rather than as chunked calls. A service that
+this crate fills the first with weida — one exchange per RPC on its own ALPN (`weida-raft/0`) and
+its own QUIC binding, TLS-proved node identity, and a snapshot that travels as one streamed
+exchange rather than as chunked calls. The log carries opaque bytes (`Request`/`Response`), the
+application hands in its log store and state machine (`MemoryStore` is the reference), and
+followers forward writes, read barriers and membership changes to the leader. A service that
 wants replication then writes a state machine instead of a network layer
 ([decisions/0021](decisions/0021-consensus-openraft.md) §4.1).
 
@@ -618,7 +621,7 @@ protocol   runtime
 weida ──────┘     weida-zmq ──→ weida-zmtp   (the codec, which depends on nothing)
 
 weida-broker        →  weida + weida-raft     L2; cluster support is optional
-weida-raft          →  weida + openraft       consensus with I/O
+weida-raft          →  weida + weida-protocol + openraft   consensus with I/O
 ```
 
 `weida-core` MUST NOT depend on `weida-protocol` or `weida`. `weida-protocol` MUST NOT

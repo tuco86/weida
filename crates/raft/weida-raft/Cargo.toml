@@ -15,10 +15,15 @@ categories.workspace = true
 # for MyApp`, so it needs openraft's own types, and two versions of them in one
 # binary do not compose. `weida_raft::openraft` is the one this crate was built
 # against (0021 §4.1).
-openraft = { workspace = true }
+# `generic-snapshot-data` removes the chunked `install_snapshot` from
+# `RaftNetwork`: a snapshot is one streamed exchange (`full_snapshot`).
+openraft = { workspace = true, features = ["generic-snapshot-data"] }
 # The I/O half: connections, exchanges and streamed transfers.
 weida.workspace = true
 weida-core.workspace = true
+# The bounded CBOR skip of PROTOCOL.md §5, shared rather than copied.
+weida-protocol.workspace = true
+minicbor.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

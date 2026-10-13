@@ -3796,11 +3796,13 @@ dependencies = [
 name = "weida-raft"
 version = "0.1.0-alpha.6-dev"
 dependencies = [
+ "minicbor",
  "openraft",
  "tokio",
  "tracing",
  "weida",
  "weida-core",
+ "weida-protocol",
 ]
 
 [[package]]

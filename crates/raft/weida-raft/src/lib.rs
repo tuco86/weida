@@ -1,41 +1,42 @@
 //! openraft plus the I/O it deliberately leaves out.
 //!
 //! openraft is the Raft mechanics, the clock and the task driving; what it
-//! does **not** have is a transport and a store, and it says so by asking for
-//! them as traits. This crate fills the first half with weida — QUIC
-//! connections, exchanges, TLS-proved node identity and a streamed snapshot
-//! channel — so that building a replicated service is writing a state machine
-//! rather than writing a network layer
+//! does **not** have is a transport, and it says so by asking for one as a
+//! trait. This crate fills that half with weida — QUIC connections, one
+//! exchange per RPC, TLS-proved node identity and a streamed snapshot — so
+//! that building a replicated service is writing a state machine rather than
+//! writing a network layer
 //! ([0021](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)).
-//!
-//! # What exists today, stated before the table below promises anything
-//!
-//! **The transport is not written yet** (B-224). What is here is the engine
-//! wired to our types, a reference in-memory store, and a single-node group
-//! that elects itself and commits — the verified go/no-go of B-222. The table
-//! below is what the crate is *for*; the row that is missing is the one that
-//! makes it useful to anyone but a test.
-//!
-//! One design question is still open and belongs to that slice: this crate's
-//! [`TypeConfig`] fixes `D` and `R` to the example [`Command`] and [`Applied`],
-//! which is right for a probe and wrong for a library. An application must be
-//! able to declare its own request and response types while keeping **our**
-//! `NodeId`, `Node`, `Entry` and `SnapshotData`; whether that is a macro here
-//! or a documented call to openraft's own `declare_raft_types!` is decided
-//! with the transport, because the transport has to be generic over it anyway.
 //!
 //! # What this crate provides, and what is left to you
 //!
 //! | Provided here | Yours |
 //! | --- | --- |
-//! | the transport: one exchange per RPC on the ALPN `weida-raft/0` | the **state machine**: `apply`, and what a committed entry means |
-//! | node identity: the fingerprint a peer proves in the handshake ([0020](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md) §4.4) | the request and response types (`D` and `R`) |
-//! | membership bootstrap, and the two-node configuration refused by name | the **log store**, until this crate ships the segmented one `docs/STORE.md` §7 specifies |
-//! | the snapshot channel as a stream, not a chunked RPC | what a snapshot of your state machine *is* |
+//! | the transport: one exchange per RPC on the ALPN `weida-raft/0`, on its own port | the **state machine**: `apply`, and what a committed entry means |
+//! | node identity: the fingerprint a peer proves in the handshake ([0020](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md) §4.4) | what the bytes of a [`Request`] and a [`Response`] mean |
+//! | follower writes forwarded to the leader, membership changes, the two-voter configuration refused by name | the **log store**; [`MemoryStore`] is the reference it has to match |
+//! | the snapshot as one streamed exchange, not a chunked RPC | what a snapshot of your state machine *is* |
+//! | a public minicbor codec for openraft's persisted types ([`codec`]) | where those bytes are stored |
+//!
+//! # Its own port and its own ALPN
+//!
+//! Consensus traffic runs on a second QUIC binding, on
+//! [`ConsensusConfig::listen`], which offers only `weida-raft/0`
+//! ([0021](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)
+//! §4.4). A heartbeat therefore never waits behind application payload in a
+//! shared receive window, and a client dialling `weida/0` fails the handshake
+//! there instead of reaching a consensus endpoint.
+//!
+//! # Opaque payloads
+//!
+//! The log carries bytes: [`Request`] in, [`Response`] out. One concrete
+//! [`TypeConfig`] fixes everything else — [`NodeId`], [`Node`], the entry and
+//! the snapshot type — so the transport and the codec are written once and an
+//! application encodes its own commands however it likes.
 //!
 //! # openraft is re-exported, on purpose
 //!
-//! A user of this crate implements openraft's own traits, so it needs
+//! A user of this crate implements openraft's own storage traits, so it needs
 //! openraft's own types — and two versions of them in one binary do not
 //! compose. [`openraft`] is therefore re-exported and **is** the version this
 //! crate was built against. The coupling is stated rather than hidden:
@@ -51,558 +52,299 @@
 //! implementing the trait. What decides which runtime openraft's tasks land on
 //! is the **ambient** one at the construction site.
 //!
-//! So the rule this crate follows is: a [`Consensus`] is built and driven from
-//! inside its runtime's own `Exec`, which makes the ambient runtime the
-//! caller's runtime, which is where every task openraft spawns ends up. That
-//! is an invariant of *where* it is called, verified by a test, rather than a
-//! property of a type.
+//! So the rule this crate follows is: [`Consensus::start`] is called and the
+//! [`Consensus`] driven from inside its runtime's own `Exec`, which makes the
+//! ambient runtime the caller's runtime, which is where every task openraft
+//! spawns ends up. That is an invariant of *where* it is called, verified by a
+//! test, rather than a property of a type.
 
+pub mod codec;
+mod consensus;
+mod memory;
+mod network;
+mod server;
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use weida_core::{EndpointAddr, Fingerprint};
+
+pub use codec::DecodeError;
+pub use consensus::Consensus;
+pub use memory::MemoryStore;
 pub use openraft;
 
-use std::collections::BTreeMap;
-use std::fmt;
-use std::io::Cursor;
-use std::sync::Arc;
+/// The endpoint path every node serves its RPCs on, inside the raft binding.
+pub const RAFT_PATH: &str = "/raft";
 
-use openraft::error::{InstallSnapshotError, RPCError, RaftError};
-use openraft::network::{RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
-};
-use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
-use openraft::{
-    Entry, EntryPayload, LogId, RaftLogId, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
-    StorageError, StoredMembership, Vote,
-};
-
-/// What the replicated state machine of a broker is asked to do.
+/// A node's id: the fingerprint of the key it proves in every handshake.
 ///
-/// One variant for now, because this slice is the go/no-go for openraft rather
-/// than the broker's state machine: 0021 §4.5 lists what the log will hold —
-/// queue registry, membership, leadership, the per-message commit record and
-/// consumer state — and B-225 is the slice that puts it there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Command {
-    /// A no-op entry, which is what a leader commits to prove it leads.
-    Noop,
+/// The all-zero id is openraft's required `Default`: it appears legitimately
+/// in `Vote::default()` and in the first log id, and it is refused as the id
+/// of a real node.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(pub [u8; 32]);
+
+impl NodeId {
+    /// True for the all-zero placeholder, which names no node.
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0; 32]
+    }
 }
 
-/// What applying a [`Command`] answers.
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&Fingerprint::from_bytes(self.0), f)
+    }
+}
+
+impl fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&Fingerprint::from_bytes(self.0), f)
+    }
+}
+
+impl From<Fingerprint> for NodeId {
+    fn from(fp: Fingerprint) -> NodeId {
+        NodeId(*fp.as_bytes())
+    }
+}
+
+impl From<NodeId> for Fingerprint {
+    fn from(id: NodeId) -> Fingerprint {
+        Fingerprint::from_bytes(id.0)
+    }
+}
+
+/// Where a node is reached: `weida://<fingerprint>@<host>:<port>/raft`.
+///
+/// The fingerprint in the URL **is** the node's [`NodeId`], so an address
+/// cannot point at a node other than the one it names: the dial pins it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Applied {
-    /// How many commands this state machine has applied, including this one.
-    pub count: u64,
+pub struct Node {
+    /// The URL as written.
+    pub url: String,
 }
 
-/// The node id type.
-///
-/// `u64` here, and **not** the proved fingerprint 0021 §4.4 names as the real
-/// id: a fingerprint is 32 bytes and `NodeId` carries trait bounds that a
-/// newtype has to satisfy, which is work that belongs to the slice adding the
-/// transport (B-224) rather than to the go/no-go. Truncating a digest into a
-/// `u64` would be the wrong shortcut — etcd's rule is that an id identifies a
-/// node *for all time*, and a truncated digest collides.
-pub type NodeId = u64;
+impl Node {
+    /// Validates `url` as a node address.
+    ///
+    /// Refused: a URL that does not parse, names no fingerprint or the
+    /// all-zero one, writes no port (consensus peers are dialled exactly, not
+    /// discovered), or has a path other than [`RAFT_PATH`].
+    pub fn new(url: impl Into<String>) -> Result<Node, Error> {
+        let node = Node { url: url.into() };
+        node.id()?;
+        Ok(node)
+    }
+
+    /// The id the URL names, after the same validation as [`Node::new`].
+    ///
+    /// The `Default` node (an empty URL) fails here.
+    pub fn id(&self) -> Result<NodeId, Error> {
+        let addr = EndpointAddr::parse(&self.url)
+            .map_err(|e| Error::InvalidNode(format!("{}: {e}", self.url)))?;
+        let invalid = |reason: &str| Error::InvalidNode(format!("{}: {reason}", self.url));
+        let id = NodeId::from(
+            addr.peer
+                .ok_or_else(|| invalid("the URL names no fingerprint"))?,
+        );
+        if id.is_zero() {
+            return Err(invalid("the all-zero fingerprint names no node"));
+        }
+        if addr.port.is_none() {
+            return Err(invalid("a consensus peer needs an explicit port"));
+        }
+        if addr.path != RAFT_PATH {
+            return Err(invalid("the path must be /raft"));
+        }
+        Ok(id)
+    }
+}
+
+/// An application command, as opaque bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Request(pub Vec<u8>);
+
+/// What applying a [`Request`] answered, as opaque bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Response(pub Vec<u8>);
+
+/// What [`Consensus::add_node`] made of a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The node votes.
+    Voter,
+    /// The node replicates and does not vote: it is parked there because
+    /// promoting it would have made a two-voter group.
+    Learner,
+}
 
 openraft::declare_raft_types!(
-    /// The type configuration of a broker's consensus group.
+    /// The one type configuration of a weida consensus group.
     pub TypeConfig:
-        D = Command,
-        R = Applied,
+        D = Request,
+        R = Response,
         NodeId = NodeId,
-        Node = openraft::BasicNode,
-        Entry = Entry<TypeConfig>,
-        SnapshotData = Cursor<Vec<u8>>,
+        Node = Node,
+        Entry = openraft::Entry<TypeConfig>,
+        SnapshotData = std::io::Cursor<Vec<u8>>,
         AsyncRuntime = openraft::TokioRuntime,
 );
 
-/// An in-memory log and state machine.
-///
-/// Deliberately not the Phase 5 store: this is the reference the store has to
-/// match, and writing it is how the thirteen-method requirement list of
-/// 0021 §4.3 was checked against the actual traits. What it proved, and what
-/// B-223 must carry: the v2 traits are `RaftLogStorage` — `get_log_state`,
-/// `get_log_reader`, `save_vote`/`read_vote`, `save_committed`/
-/// `read_committed`, `append` **with a flush callback**, `truncate` backwards
-/// and `purge` forwards — plus `RaftStateMachine`: `applied_state`, `apply`,
-/// `get_snapshot_builder`, `begin_receiving_snapshot`, `install_snapshot`,
-/// `get_current_snapshot`. The flush callback is the persist-before-send rule
-/// of the Raft thesis made explicit in a signature, which is the part a
-/// hand-rolled store gets wrong.
-#[derive(Clone, Default)]
-pub struct MemoryStore {
-    inner: Arc<tokio::sync::Mutex<StoreState>>,
+/// Everything a [`Consensus`] operation can fail with.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// Binding, dialling, or an RPC the peer refused or that failed.
+    Weida(weida::Error),
+    /// A peer's bytes did not decode.
+    Decode(DecodeError),
+    /// A [`Node`] URL that names no node; carries the reason.
+    InvalidNode(String),
+    /// [`ConsensusConfig`] or the openraft configuration built from it was
+    /// refused; carries the reason.
+    Config(String),
+    /// The change would leave exactly two voters.
+    TwoVoters,
+    /// The node to remove is the last voter.
+    LastVoter,
+    /// No leader is known, or it moved more often than a request follows.
+    NoLeader,
+    /// A forwarded request or a read barrier waited longer than
+    /// [`ConsensusConfig::forward_timeout`].
+    Timeout,
+    /// The engine stopped or failed; carries openraft's text.
+    Raft(String),
 }
 
-#[derive(Default)]
-struct StoreState {
-    log: BTreeMap<u64, Entry<TypeConfig>>,
-    last_purged: Option<LogId<NodeId>>,
-    vote: Option<Vote<NodeId>>,
-    committed: Option<LogId<NodeId>>,
-    applied: Option<LogId<NodeId>>,
-    membership: StoredMembership<NodeId, openraft::BasicNode>,
-    state: Applied,
-    snapshot: Option<(SnapshotMeta<NodeId, openraft::BasicNode>, Vec<u8>)>,
-    snapshot_index: u64,
-}
-
-impl fmt::Debug for MemoryStore {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MemoryStore").finish_non_exhaustive()
+        match self {
+            Error::Weida(e) => write!(f, "consensus transport: {e}"),
+            Error::Decode(e) => write!(f, "undecodable consensus message: {e}"),
+            Error::InvalidNode(reason) => write!(f, "invalid node: {reason}"),
+            Error::Config(reason) => write!(f, "invalid consensus configuration: {reason}"),
+            Error::TwoVoters => f.write_str(
+                "a two-voter group is refused: it tolerates no failure and doubles the quorum (0021 §4.6)",
+            ),
+            Error::LastVoter => f.write_str("the last voter cannot be removed"),
+            Error::NoLeader => f.write_str("no leader is known"),
+            Error::Timeout => f.write_str("the consensus operation timed out"),
+            Error::Raft(text) => write!(f, "consensus engine: {text}"),
+        }
     }
 }
 
-impl MemoryStore {
-    /// Seeds entries without the flush callback `append` requires.
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Weida(e) => Some(e),
+            Error::Decode(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<weida::Error> for Error {
+    fn from(e: weida::Error) -> Error {
+        Error::Weida(e)
+    }
+}
+
+impl From<DecodeError> for Error {
+    fn from(e: DecodeError) -> Error {
+        Error::Decode(e)
+    }
+}
+
+/// How a [`Consensus`] binds, ticks, snapshots and bounds what it accepts.
+#[derive(Clone, Debug)]
+pub struct ConsensusConfig {
+    /// openraft's cluster name, used in its logs. Default `"weida"`.
+    pub cluster_name: String,
+    /// The address the raft binding listens on.
+    pub listen: SocketAddr,
+    /// The `host:port` authority written into this node's URL. `None` uses
+    /// the bound address, which must then not be unspecified.
+    pub advertise: Option<String>,
+    /// How often a leader sends heartbeats. Default 500 ms.
     ///
-    /// Test-only, and it exists because `LogFlushed::new` is `pub(crate)` in
-    /// openraft: a third-party store cannot construct the callback its own
-    /// `append` is handed.
-    #[cfg(test)]
-    async fn seed(&self, indexes: std::ops::RangeInclusive<u64>) {
-        let mut inner = self.inner.lock().await;
-        for index in indexes {
-            inner.log.insert(
-                index,
-                Entry {
-                    log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
-                    payload: EntryPayload::Normal(Command::Noop),
-                },
-            );
-        }
-    }
+    /// openraft also uses it as the AppendEntries timeout, so it bounds the
+    /// time one batch of [`ConsensusConfig::max_payload_entries`] may take
+    /// to reach a follower and be answered.
+    pub heartbeat_interval: Duration,
+    /// Lower bound of the randomized election timeout. Default 1500 ms.
+    pub election_timeout_min: Duration,
+    /// Upper bound of the randomized election timeout. Default 3000 ms.
+    pub election_timeout_max: Duration,
+    /// How long sending one whole snapshot may take. Default 30 s.
+    pub install_snapshot_timeout: Duration,
+    /// Entries per AppendEntries, at most [`codec::MAX_ENTRIES`]. Default 64.
+    pub max_payload_entries: u64,
+    /// Applied entries since the last snapshot that trigger a new one.
+    /// Default 5000.
+    pub snapshot_logs_since_last: u64,
+    /// Entries kept in the log behind a snapshot. Default 1000.
+    pub max_in_snapshot_log_to_keep: u64,
+    /// Largest RPC message, excluding snapshot data, sent or accepted.
+    /// Default 16 MiB.
+    pub max_rpc_bytes: usize,
+    /// Largest snapshot accepted from a leader. Default 256 MiB.
+    pub max_snapshot_bytes: usize,
+    /// How long a forwarded request or a read barrier may take.
+    /// Default 10 s.
+    pub forward_timeout: Duration,
 }
 
-impl RaftLogReader<TypeConfig> for MemoryStore {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug>(
-        &mut self,
-        range: RB,
-    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
-        let inner = self.inner.lock().await;
-        Ok(inner.log.range(range).map(|(_, e)| e.clone()).collect())
-    }
-}
-
-impl RaftLogStorage<TypeConfig> for MemoryStore {
-    type LogReader = Self;
-
-    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let inner = self.inner.lock().await;
-        let last = inner.log.iter().next_back().map(|(_, e)| *e.get_log_id());
-        Ok(LogState {
-            last_purged_log_id: inner.last_purged,
-            last_log_id: last.or(inner.last_purged),
-        })
-    }
-
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
-    }
-
-    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().await.vote = Some(*vote);
-        Ok(())
-    }
-
-    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().await.vote)
-    }
-
-    async fn save_committed(
-        &mut self,
-        committed: Option<LogId<NodeId>>,
-    ) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().await.committed = committed;
-        Ok(())
-    }
-
-    async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().await.committed)
-    }
-
-    async fn append<I>(
-        &mut self,
-        entries: I,
-        callback: LogFlushed<TypeConfig>,
-    ) -> Result<(), StorageError<NodeId>>
-    where
-        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
-    {
-        {
-            let mut inner = self.inner.lock().await;
-            for entry in entries {
-                inner.log.insert(entry.get_log_id().index, entry);
-            }
-        }
-        // In memory the write is already durable by the time this returns, so
-        // the callback fires immediately. A real store fires it **after** the
-        // bytes are on the medium, and nothing may be sent to a peer before
-        // that: this callback is where that ordering lives.
-        callback.log_io_completed(Ok(()));
-        Ok(())
-    }
-
-    async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut inner = self.inner.lock().await;
-        let keys: Vec<u64> = inner.log.range(log_id.index..).map(|(k, _)| *k).collect();
-        for key in keys {
-            inner.log.remove(&key);
-        }
-        Ok(())
-    }
-
-    async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut inner = self.inner.lock().await;
-        let keys: Vec<u64> = inner.log.range(..=log_id.index).map(|(k, _)| *k).collect();
-        for key in keys {
-            inner.log.remove(&key);
-        }
-        inner.last_purged = Some(log_id);
-        Ok(())
-    }
-}
-
-impl RaftSnapshotBuilder<TypeConfig> for MemoryStore {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let mut inner = self.inner.lock().await;
-        inner.snapshot_index += 1;
-        let meta = SnapshotMeta {
-            last_log_id: inner.applied,
-            last_membership: inner.membership.clone(),
-            snapshot_id: format!("{}", inner.snapshot_index),
-        };
-        let data = inner.state.count.to_be_bytes().to_vec();
-        inner.snapshot = Some((meta.clone(), data.clone()));
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        })
-    }
-}
-
-impl RaftStateMachine<TypeConfig> for MemoryStore {
-    type SnapshotBuilder = Self;
-
-    async fn applied_state(
-        &mut self,
-    ) -> Result<
-        (
-            Option<LogId<NodeId>>,
-            StoredMembership<NodeId, openraft::BasicNode>,
-        ),
-        StorageError<NodeId>,
-    > {
-        let inner = self.inner.lock().await;
-        Ok((inner.applied, inner.membership.clone()))
-    }
-
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Applied>, StorageError<NodeId>>
-    where
-        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
-    {
-        let mut inner = self.inner.lock().await;
-        let mut answers = Vec::new();
-        for entry in entries {
-            inner.applied = Some(*entry.get_log_id());
-            match entry.payload {
-                EntryPayload::Blank => {}
-                EntryPayload::Normal(Command::Noop) => inner.state.count += 1,
-                EntryPayload::Membership(membership) => {
-                    inner.membership = StoredMembership::new(inner.applied, membership);
-                }
-            }
-            answers.push(inner.state.clone());
-        }
-        Ok(answers)
-    }
-
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<NodeId>> {
-        let data = snapshot.into_inner();
-        let mut inner = self.inner.lock().await;
-        let mut count = [0u8; 8];
-        if data.len() == 8 {
-            count.copy_from_slice(&data);
-            inner.state.count = u64::from_be_bytes(count);
-        }
-        inner.applied = meta.last_log_id;
-        inner.membership = meta.last_membership.clone();
-        inner.snapshot = Some((meta.clone(), data));
-        Ok(())
-    }
-
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        let inner = self.inner.lock().await;
-        Ok(inner.snapshot.as_ref().map(|(meta, data)| Snapshot {
-            meta: meta.clone(),
-            snapshot: Box::new(Cursor::new(data.clone())),
-        }))
-    }
-}
-
-/// The peer transport, which this slice does not have.
-///
-/// B-224 implements it as one weida exchange per RPC on the separate ALPN
-/// `weida-raft/0` (0021 §4.4). Until then a single-node group needs a factory
-/// that is never called, and "never called" is asserted rather than assumed:
-/// every method here is unreachable for a one-member membership.
-#[derive(Clone, Debug, Default)]
-pub struct NoNetwork;
-
-impl RaftNetworkFactory<TypeConfig> for NoNetwork {
-    type Network = NoNetwork;
-
-    async fn new_client(&mut self, _target: NodeId, _node: &openraft::BasicNode) -> Self::Network {
-        NoNetwork
-    }
-}
-
-impl RaftNetwork<TypeConfig> for NoNetwork {
-    async fn append_entries(
-        &mut self,
-        _rpc: AppendEntriesRequest<TypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<
-        AppendEntriesResponse<NodeId>,
-        RPCError<NodeId, openraft::BasicNode, RaftError<NodeId>>,
-    > {
-        unreachable!("a single-node group replicates to nobody (B-224 adds the transport)")
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        _rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, openraft::BasicNode, RaftError<NodeId, InstallSnapshotError>>,
-    > {
-        unreachable!("a single-node group replicates to nobody (B-224 adds the transport)")
-    }
-
-    async fn vote(
-        &mut self,
-        _rpc: VoteRequest<NodeId>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, openraft::BasicNode, RaftError<NodeId>>>
-    {
-        unreachable!("a single-node group votes for itself without asking")
-    }
-}
-
-/// One broker's consensus group.
-///
-/// Holds the engine and nothing else; the broker's own state lives in its
-/// queues until B-225 moves the replicated part into the log.
-pub struct Consensus {
-    raft: openraft::Raft<TypeConfig>,
-    store: MemoryStore,
-}
-
-impl Consensus {
-    /// Starts a single-node group and makes it lead.
-    ///
-    /// **Call this from inside the broker's own `Exec`**: openraft's
-    /// `AsyncRuntime::spawn` is an associated function with no handle to
-    /// carry, so the tasks it spawns land on the *ambient* runtime. That is
-    /// the construction-site invariant this module's header states.
-    pub async fn single_node(id: NodeId) -> Result<Consensus, String> {
-        let config = openraft::Config {
+impl ConsensusConfig {
+    /// The defaults, listening on `listen`.
+    pub fn new(listen: SocketAddr) -> ConsensusConfig {
+        ConsensusConfig {
             cluster_name: "weida".to_owned(),
-            // Ticks are cheap in a test and this is not a tuning decision:
-            // B-224 chooses the real numbers once there is a network to
-            // measure them against.
-            heartbeat_interval: 50,
-            election_timeout_min: 150,
-            election_timeout_max: 300,
-            ..Default::default()
-        };
-        let config = Arc::new(config.validate().map_err(|e| e.to_string())?);
-        let store = MemoryStore::default();
-        let raft = openraft::Raft::new(id, config, NoNetwork, store.clone(), store.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut members = BTreeMap::new();
-        members.insert(id, openraft::BasicNode::default());
-        raft.initialize(members).await.map_err(|e| e.to_string())?;
-        Ok(Consensus { raft, store })
-    }
-
-    /// Proposes one command and returns once it is committed and applied.
-    pub async fn propose(&self, command: Command) -> Result<Applied, String> {
-        let answer = self
-            .raft
-            .client_write(command)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(answer.data)
-    }
-
-    /// Who this group believes leads it.
-    pub async fn leader(&self) -> Option<NodeId> {
-        self.raft.current_leader().await
-    }
-
-    /// How many commands the state machine has applied.
-    pub async fn applied_count(&self) -> u64 {
-        self.store.inner.lock().await.state.count
-    }
-
-    /// Stops the engine.
-    pub async fn shutdown(self) {
-        let _ = self.raft.shutdown().await;
+            listen,
+            advertise: None,
+            heartbeat_interval: Duration::from_millis(500),
+            election_timeout_min: Duration::from_millis(1500),
+            election_timeout_max: Duration::from_millis(3000),
+            install_snapshot_timeout: Duration::from_secs(30),
+            max_payload_entries: 64,
+            snapshot_logs_since_last: 5000,
+            max_in_snapshot_log_to_keep: 1000,
+            max_rpc_bytes: 16 << 20,
+            max_snapshot_bytes: 256 << 20,
+            forward_timeout: Duration::from_secs(10),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
-    /// The go/no-go of [0021](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md):
-    /// the engine runs on our types, elects itself and commits.
-    #[tokio::test]
-    async fn a_single_node_group_elects_itself_and_commits() {
-        let consensus = Consensus::single_node(1).await.expect("start");
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while consensus.leader().await != Some(1) {
-            assert!(Instant::now() < deadline, "the group never elected itself");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let applied = consensus.propose(Command::Noop).await.expect("commit");
-        assert_eq!(applied.count, 1, "the state machine applied the command");
-        assert_eq!(consensus.applied_count().await, 1);
-
-        // A second proposal goes through the same log, so the count is the
-        // state machine's rather than the response's.
-        consensus
-            .propose(Command::Noop)
-            .await
-            .expect("commit again");
-        assert_eq!(consensus.applied_count().await, 2);
-
-        consensus.shutdown().await;
-    }
-
-    /// The construction-site invariant of this module's header: the engine is
-    /// built and driven inside the broker's own `Exec`, so the tasks openraft
-    /// spawns land on that runtime. There is no ambient runtime at this call
-    /// site — a plain `#[test]` — so if the engine did not inherit weida's,
-    /// `spawn` would panic and the channel would never receive.
     #[test]
-    fn the_engine_runs_on_the_runtime_that_built_it() {
-        // `owned`, not `new`: there is deliberately no ambient runtime at this
-        // call site, which is the whole point of the test — the engine must
-        // inherit the runtime weida owns.
-        let runtime =
-            weida::Runtime::owned(weida::RuntimeConfig::default()).expect("weida runtime");
-        let (tx, rx) = std::sync::mpsc::channel();
-        runtime.exec().spawn(async move {
-            let consensus = Consensus::single_node(7).await.expect("start");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while consensus.leader().await != Some(7) {
-                if Instant::now() >= deadline {
-                    let _ = tx.send(Err("never elected".to_owned()));
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let applied = consensus.propose(Command::Noop).await;
-            let _ = tx.send(applied.map(|a| a.count).map_err(|e| e.to_string()));
-            consensus.shutdown().await;
-        });
-
-        let outcome = rx
-            .recv_timeout(Duration::from_secs(15))
-            .expect("the engine reported nothing: it never ran");
-        assert_eq!(outcome, Ok(1));
-    }
-
-    /// `truncate` discards a suffix and `purge` a prefix — the two operations
-    /// an append-only store cannot do, and the reason B-223 exists before the
-    /// store.
-    ///
-    /// The entries are seeded directly rather than through
-    /// [`RaftLogStorage::append`], and that is a finding rather than a
-    /// shortcut: `LogFlushed::new` is `pub(crate)` in openraft, so a
-    /// third-party store **cannot construct the flush callback** its own
-    /// `append` receives. A store's trait conformance is therefore only
-    /// exercisable through a live `Raft`, which is what the first test does;
-    /// what a unit test can reach is everything else.
-    #[tokio::test]
-    async fn the_log_truncates_backwards_and_purges_forwards() {
-        let mut store = MemoryStore::default();
-        store.seed(1..=5).await;
-        assert_eq!(last_index(&mut store).await, Some(5));
-
-        store.truncate(log_id(4)).await.expect("truncate");
+    fn a_node_url_must_name_a_pinned_exact_raft_endpoint() {
+        let fp = Fingerprint::from_bytes([7; 32]);
+        let good = format!("weida://{fp}@127.0.0.1:9000/raft");
         assert_eq!(
-            last_index(&mut store).await,
-            Some(3),
-            "truncate discards the suffix from the given index on"
+            Node::new(good).expect("valid node").id().expect("id"),
+            NodeId([7; 32])
         );
-
-        store.purge(log_id(2)).await.expect("purge");
-        let left = store.try_get_log_entries(..).await.expect("read");
-        assert_eq!(left.len(), 1, "1 and 2 are gone, 3 remains");
-        assert_eq!(
-            store
-                .get_log_state()
-                .await
-                .expect("state")
-                .last_purged_log_id
-                .map(|id| id.index),
-            Some(2),
-            "a purged prefix is remembered, or a restart would replay it"
-        );
-    }
-
-    /// A purged log still reports the last log id it had, which is what lets a
-    /// restarted node answer a vote request about entries it no longer holds.
-    #[tokio::test]
-    async fn a_fully_purged_log_still_knows_where_it_ended() {
-        let mut store = MemoryStore::default();
-        store.seed(1..=3).await;
-        store.purge(log_id(3)).await.expect("purge everything");
-
-        let state = store.get_log_state().await.expect("state");
-        assert_eq!(state.last_purged_log_id.map(|id| id.index), Some(3));
-        assert_eq!(
-            state.last_log_id.map(|id| id.index),
-            Some(3),
-            "an empty log whose prefix was purged is not an empty history"
-        );
-    }
-
-    fn log_id(index: u64) -> LogId<NodeId> {
-        LogId::new(openraft::CommittedLeaderId::new(1, 1), index)
-    }
-
-    async fn last_index(store: &mut MemoryStore) -> Option<u64> {
-        store
-            .get_log_state()
-            .await
-            .expect("state")
-            .last_log_id
-            .map(|id| id.index)
+        for bad in [
+            "weida://127.0.0.1:9000/raft".to_owned(),
+            format!("weida://{fp}@127.0.0.1/raft"),
+            format!("weida://{fp}@127.0.0.1:9000/other"),
+            format!(
+                "weida://{}@127.0.0.1:9000/raft",
+                Fingerprint::from_bytes([0; 32])
+            ),
+            String::new(),
+        ] {
+            assert!(
+                matches!(Node::new(bad.clone()), Err(Error::InvalidNode(_))),
+                "{bad:?} was accepted"
+            );
+        }
     }
 }
