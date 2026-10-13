@@ -21,8 +21,8 @@ producer gets a reliable `Accepted` without an exchange, a reader learns how far
 got rather than only whether it finished, and no pattern changes shape to gain any of it.
 
 **Status:** alpha. Published on crates.io: `weida`, `weida-core`, `weida-protocol`,
-`weida-runtime` and `weida-winpipe` at `0.1.0-alpha.1` to `0.1.0-alpha.5`, and
-`weida-broker`, `weida-raft` and `weida-openbao` at `0.1.0-alpha.2` to `0.1.0-alpha.5`. The other seventeen
+`weida-runtime` and `weida-winpipe` at `0.1.0-alpha.1` to `0.1.0-alpha.6`, and
+`weida-broker`, `weida-raft` and `weida-openbao` at `0.1.0-alpha.2` to `0.1.0-alpha.6`. The other seventeen
 members are not published: `weida-py-core`, every Python binding and all five protocol
 libraries with their codecs. Nothing is on PyPI and there are no prebuilt binaries.
 Wire protocol version `0` is experimental and breaking changes are permitted within `0.x`.
