@@ -83,7 +83,7 @@ mod transport;
 mod unix;
 
 pub use config::{
-    ClientTls, ClientTrust, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust,
+    Alpn, ClientTls, ClientTrust, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust,
 };
 pub use cursor::{CursorSet, Cursors, Reported, Reporter};
 pub use drain::Drained;
@@ -111,7 +111,7 @@ pub use weida_core::{
     WindowsPrincipal,
 };
 pub use weida_core::{Congestion, DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT};
-pub use weida_protocol::{ALPN, VERSION, codes, filter};
+pub use weida_protocol::{ALPN, RAFT_ALPN, VERSION, codes, filter};
 pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 // `Delivery` keeps its transfer-receipt meaning at this level, so the
 // dimension of the same name is re-exported under the name the guarantee

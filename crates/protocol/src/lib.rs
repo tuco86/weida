@@ -25,7 +25,7 @@ pub use frame::{
 pub use header::{
     CreditHeader, CursorHeader, CursorLevel, DataHeader, ErrorHeader, FlowHeader, HeaderError,
     Hello, PathRecord, ReportHead, ReportMode, SubscriptionHeader, decode_cursor_record,
-    encode_cursor_record, filter, limits as header_limits,
+    encode_cursor_record, filter, limits as header_limits, skip_value,
 };
 pub use negotiate::{
     Agreed, CAPABILITY_DATAGRAM, CAPABILITY_PATH_REPORT, NegotiateError, negotiate,
@@ -37,6 +37,9 @@ pub const VERSION: u64 = 0;
 
 /// TLS ALPN token identifying the weida native QUIC protocol.
 pub const ALPN: &[u8] = b"weida/0";
+
+/// TLS ALPN token of a consensus connection (weida-raft); same protocol, separate connections.
+pub const RAFT_ALPN: &[u8] = b"weida-raft/0";
 
 #[cfg(test)]
 mod tests {

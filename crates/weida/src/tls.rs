@@ -668,7 +668,7 @@ pub(crate) fn server_config(
         }
     };
     let mut crypto = builder.with_cert_resolver(Arc::new(key));
-    crypto.alpn_protocols = vec![weida_protocol::ALPN.to_vec()];
+    crypto.alpn_protocols = vec![tls.alpn.token().to_vec()];
 
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|e| tls_err("building the QUIC server crypto", e))?;
@@ -729,7 +729,7 @@ pub(crate) fn client_config(
             builder.with_client_cert_resolver(Arc::new(key))
         }
     };
-    crypto.alpn_protocols = vec![weida_protocol::ALPN.to_vec()];
+    crypto.alpn_protocols = vec![tls.alpn.token().to_vec()];
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|e| tls_err("building the QUIC client crypto", e))?;

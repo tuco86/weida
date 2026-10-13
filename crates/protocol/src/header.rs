@@ -958,7 +958,7 @@ fn encode_into_with(
 /// `minicbor` has its own `skip`, but the protocol requires a specific,
 /// auditable bound on hostile nesting; a value that nests deeper is rejected
 /// rather than tolerated.
-fn skip_value(d: &mut Decoder<'_>, max_depth: usize) -> Result<(), HeaderError> {
+pub fn skip_value(d: &mut Decoder<'_>, max_depth: usize) -> Result<(), HeaderError> {
     // `stack` holds the outstanding item counts of enclosing containers; its
     // length is the current nesting depth and is bounded by `max_depth`.
     let mut stack: Vec<u64> = Vec::new();

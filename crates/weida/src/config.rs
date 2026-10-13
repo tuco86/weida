@@ -414,6 +414,32 @@ impl Trust {
     }
 }
 
+/// The TLS ALPN token a binding offers or a dial asks for.
+///
+/// A binding serves exactly one token and a dial offers exactly one, so a
+/// connection of one kind can never carry traffic of the other: a mismatch
+/// fails the TLS handshake (PROTOCOL.md §2.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Alpn {
+    /// `weida/0`: application connections.
+    #[default]
+    Weida,
+    /// `weida-raft/0`: consensus connections of `weida-raft`
+    /// ([decisions/0021](../../../docs/decisions/0021-consensus-openraft.md) §4.4).
+    Raft,
+}
+
+impl Alpn {
+    /// The token as it goes on the wire.
+    pub const fn token(self) -> &'static [u8] {
+        match self {
+            Alpn::Weida => weida_protocol::ALPN,
+            Alpn::Raft => weida_protocol::RAFT_ALPN,
+        }
+    }
+}
+
 /// TLS configuration of a dialling endpoint: what it trusts and, optionally,
 /// who it is.
 ///
@@ -436,6 +462,10 @@ pub struct ClientTls {
     /// that requires clients ([`ServerTls::require_client`]) refuses, under
     /// [`ClientTrust::AnyKey`] as under a trust.
     pub identity: Option<IdentitySource>,
+    /// The ALPN token to ask for; [`Alpn::Weida`] unless changed with
+    /// [`ClientTls::with_alpn`]. Part of the pool key, so a dial under one
+    /// token never reuses a connection negotiated under the other.
+    pub alpn: Alpn,
 }
 
 impl ClientTls {
@@ -444,12 +474,19 @@ impl ClientTls {
         ClientTls {
             trust: trust.into(),
             identity: None,
+            alpn: Alpn::Weida,
         }
     }
 
     /// Presents `identity` — a value or a source — to every peer.
     pub fn with_identity(mut self, identity: impl Into<IdentitySource>) -> ClientTls {
         self.identity = Some(identity.into());
+        self
+    }
+
+    /// Asks for `alpn` instead of [`Alpn::Weida`].
+    pub fn with_alpn(mut self, alpn: Alpn) -> ClientTls {
+        self.alpn = alpn;
         self
     }
 }
@@ -509,6 +546,9 @@ pub struct ServerTls {
     /// refuses none. When `None`, peers are anonymous and
     /// [`crate::IncomingMeta::peer`] is `None`.
     pub client_trust: Option<ClientTrust>,
+    /// The one ALPN token this binding offers; [`Alpn::Weida`] unless
+    /// changed with [`ServerTls::with_alpn`].
+    pub alpn: Alpn,
 }
 
 impl ServerTls {
@@ -518,6 +558,7 @@ impl ServerTls {
         ServerTls {
             identity: identity.into(),
             client_trust: None,
+            alpn: Alpn::Weida,
         }
     }
 
@@ -526,6 +567,12 @@ impl ServerTls {
     /// any key the peer proves it holds.
     pub fn require_client(mut self, trust: impl Into<ClientTrust>) -> ServerTls {
         self.client_trust = Some(trust.into());
+        self
+    }
+
+    /// Offers `alpn` instead of [`Alpn::Weida`].
+    pub fn with_alpn(mut self, alpn: Alpn) -> ServerTls {
+        self.alpn = alpn;
         self
     }
 }

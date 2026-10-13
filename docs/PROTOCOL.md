@@ -75,9 +75,12 @@ marked *spec ahead of code*.
 
 **The network transport is QUIC.** The reference implementation uses `quinn`.
 
-The TLS ALPN token MUST be exactly `weida/0`. A peer MUST offer this token and MUST NOT
-accept a connection that negotiated any other token. An ALPN mismatch MUST fail the TLS
-handshake; it is not signalled at the weida protocol layer.
+The TLS ALPN token MUST be exactly `weida/0` on an application connection and exactly
+`weida-raft/0` on a consensus connection (the peer transport of `weida-raft`). Both tokens
+carry the same protocol (§2.2-§9); they only keep the two kinds of connection apart. A binding
+offers exactly one token, a peer MUST offer the token of the connection kind it dials, and a
+peer MUST NOT accept a connection that negotiated a token other than the one it offered. An
+ALPN mismatch MUST fail the TLS handshake; it is not signalled at the weida protocol layer.
 
 **A local transport carries the same protocol without TLS**
 ([decisions/0010](decisions/0010-local-transport.md)). In-process channels, `AF_UNIX`
