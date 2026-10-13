@@ -278,8 +278,14 @@ pub struct ConsensusConfig {
     /// Lower bound of the randomized election timeout. Default 1500 ms.
     pub election_timeout_min: Duration,
     /// Upper bound of the randomized election timeout. Default 3000 ms.
+    ///
+    /// Also how long a peer has to deliver an RPC's envelope and to take its
+    /// reply.
     pub election_timeout_max: Duration,
     /// How long sending one whole snapshot may take. Default 30 s.
+    ///
+    /// Also how long a received snapshot may take to arrive, envelope
+    /// included.
     pub install_snapshot_timeout: Duration,
     /// Entries per AppendEntries, at most [`codec::MAX_ENTRIES`]. Default 64.
     pub max_payload_entries: u64,
@@ -296,6 +302,11 @@ pub struct ConsensusConfig {
     /// How long a forwarded request or a read barrier may take.
     /// Default 10 s.
     pub forward_timeout: Duration,
+    /// How many raft RPCs this node serves at once; one more is refused with
+    /// `Rejected` before any of its bytes are read. With the envelope
+    /// allocated as it arrives, the raft port holds at most this many times
+    /// [`ConsensusConfig::max_rpc_bytes`] of envelopes. Default 64.
+    pub max_concurrent_rpcs: usize,
 }
 
 impl ConsensusConfig {
@@ -315,6 +326,7 @@ impl ConsensusConfig {
             max_rpc_bytes: 16 << 20,
             max_snapshot_bytes: 256 << 20,
             forward_timeout: Duration::from_secs(10),
+            max_concurrent_rpcs: 64,
         }
     }
 }

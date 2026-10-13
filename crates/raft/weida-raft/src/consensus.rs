@@ -6,10 +6,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, Fatal, InitializeError, RaftError};
 use openraft::metrics::WaitError;
 use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{ChangeMembers, Membership, Raft, SnapshotPolicy};
+use tokio::sync::Semaphore;
 use weida::{
     Alpn, Binding, ClientTls, ClientTrust, Fingerprint, IdentitySource, Listener, Runtime,
     ServerTls, Trust,
@@ -86,8 +87,8 @@ impl Consensus {
 
         let listener = runtime.listener();
         let replier = listener.replier(RAFT_PATH)?;
-        // `AnyKey` proves possession; who may say what is the identity rule
-        // the server applies per RPC.
+        // `AnyKey` proves possession; the server admits by membership plus
+        // the identity rule.
         let binding = listener
             .bind_quic(
                 config.listen,
@@ -143,6 +144,9 @@ impl Consensus {
     ///
     /// Idempotent: a node that is already initialized — a restarted one, or
     /// one another member added — answers `Ok(())` and changes nothing.
+    ///
+    /// A node that is to join an existing group must not bootstrap: once it
+    /// is a group of its own it refuses every other group's leader.
     pub async fn bootstrap(&self) -> Result<(), Error> {
         let raft = &self.ops.raft;
         if raft.is_initialized().await.map_err(raft_error)? {
@@ -216,6 +220,25 @@ impl Consensus {
         self.ops.raft.metrics().borrow().current_leader
     }
 
+    /// Resolves once the engine has stopped on its own: a storage error openraft
+    /// treats as fatal, or a panic in its core task. Never resolves while it runs;
+    /// `shutdown` consumes the handle, so a caller only sees an engine that ended
+    /// unasked. Select it against the application's work and exit on it, so a
+    /// supervisor restarts the process.
+    pub async fn stopped(&self) -> Error {
+        let mut metrics = self.ops.raft.metrics();
+        loop {
+            if let Err(fatal) = &metrics.borrow_and_update().running_state {
+                return Error::Raft(fatal.to_string());
+            }
+            if metrics.changed().await.is_err() {
+                return Error::Raft(
+                    "the engine's core task ended without reporting why".to_owned(),
+                );
+            }
+        }
+    }
+
     /// This node's id.
     pub fn id(&self) -> NodeId {
         self.ops.id
@@ -263,6 +286,17 @@ impl Consensus {
     }
 }
 
+/// Where a proved key stands with this node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// In the effective membership, as a voter or a learner.
+    Member,
+    /// Not in it, and the membership is not empty.
+    Outsider,
+    /// The membership is empty: this node is in no group yet.
+    Uninitialized,
+}
+
 /// What the server task and the [`Consensus`] handle share.
 pub(crate) struct Ops {
     pub(crate) raft: Raft<TypeConfig>,
@@ -270,15 +304,29 @@ pub(crate) struct Ops {
 }
 
 impl Ops {
-    /// True when `id` is a voter or learner of the effective membership.
-    pub(crate) fn is_member(&self, id: &NodeId) -> bool {
+    /// Where `id` stands with this node, read from the engine's own state.
+    ///
+    /// Not from the metrics channel: on a restarted node it starts with
+    /// `RaftMetrics::new_initial`, an empty membership, until the core first
+    /// reports, so a metrics-based check would admit everyone in that window.
+    /// And not openraft's own notion of "initialized": `RaftState::is_initialized`
+    /// is crate-private and also counts a node that merely saw a vote, which
+    /// would make a fresh joiner refuse the leader that adds it. Here a node
+    /// is uninitialized exactly while its effective membership is empty.
+    pub(crate) async fn admission(&self, id: NodeId) -> Result<Admission, Box<Fatal<NodeId>>> {
         self.raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .get_node(id)
-            .is_some()
+            .with_raft_state(move |st| {
+                let membership = st.membership_state.effective();
+                if membership.get_node(&id).is_some() {
+                    Admission::Member
+                } else if membership.nodes().next().is_none() {
+                    Admission::Uninitialized
+                } else {
+                    Admission::Outsider
+                }
+            })
+            .await
+            .map_err(Box::new)
     }
 
     fn membership(&self) -> Membership<NodeId, Node> {
@@ -412,6 +460,12 @@ fn engine_config(config: &ConsensusConfig) -> Result<openraft::Config, Error> {
             codec::MAX_ENTRIES
         )));
     }
+    if config.max_concurrent_rpcs == 0 || config.max_concurrent_rpcs > Semaphore::MAX_PERMITS {
+        return Err(Error::Config(format!(
+            "max_concurrent_rpcs must be between 1 and {}",
+            Semaphore::MAX_PERMITS
+        )));
+    }
     openraft::Config {
         cluster_name: config.cluster_name.clone(),
         heartbeat_interval: millis(config.heartbeat_interval)?,
@@ -437,4 +491,143 @@ fn raft_error(e: impl fmt::Display) -> Error {
 
 fn unexpected(done: Done) -> Error {
     Error::Raft(format!("unexpected answer from the leader: {done:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Debug;
+    use std::ops::RangeBounds;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
+    use openraft::{Entry, LogId, RaftLogReader, StorageError, StorageIOError, Vote};
+    use tokio::time::timeout;
+    use weida::{Identity, Runtime, RuntimeConfig};
+
+    use crate::{Consensus, ConsensusConfig, Error, MemoryStore, NodeId, Request, TypeConfig};
+
+    /// A log that fails every `append` once `fail` is set.
+    #[derive(Clone)]
+    struct FailingLog {
+        store: MemoryStore,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl RaftLogReader<TypeConfig> for FailingLog {
+        async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
+            &mut self,
+            range: RB,
+        ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
+            self.store.try_get_log_entries(range).await
+        }
+    }
+
+    impl RaftLogStorage<TypeConfig> for FailingLog {
+        type LogReader = MemoryStore;
+
+        async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
+            self.store.get_log_state().await
+        }
+
+        async fn get_log_reader(&mut self) -> Self::LogReader {
+            self.store.get_log_reader().await
+        }
+
+        async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
+            self.store.save_vote(vote).await
+        }
+
+        async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
+            self.store.read_vote().await
+        }
+
+        async fn save_committed(
+            &mut self,
+            committed: Option<LogId<NodeId>>,
+        ) -> Result<(), StorageError<NodeId>> {
+            self.store.save_committed(committed).await
+        }
+
+        async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+            self.store.read_committed().await
+        }
+
+        async fn append<I>(
+            &mut self,
+            entries: I,
+            callback: LogFlushed<TypeConfig>,
+        ) -> Result<(), StorageError<NodeId>>
+        where
+            I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+            I::IntoIter: Send,
+        {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(StorageError::from(StorageIOError::write_logs(
+                    openraft::AnyError::new(&std::io::Error::other("injected")),
+                )));
+            }
+            self.store.append(entries, callback).await
+        }
+
+        async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+            self.store.truncate(log_id).await
+        }
+
+        async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+            self.store.purge(log_id).await
+        }
+    }
+
+    /// `stopped` stays pending while the engine runs and fires with
+    /// `Error::Raft` once a storage failure ends it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_failure_stops_the_engine_and_stopped_fires() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let store = MemoryStore::default();
+        let fail = Arc::new(AtomicBool::new(false));
+        let log = FailingLog {
+            store: store.clone(),
+            fail: Arc::clone(&fail),
+        };
+        let consensus = Consensus::start(
+            &runtime,
+            Identity::generate().expect("identity"),
+            log,
+            store,
+            ConsensusConfig::new("127.0.0.1:0".parse().expect("loopback address")),
+        )
+        .await
+        .expect("start");
+        consensus.bootstrap().await.expect("bootstrap");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while consensus.leader() != Some(consensus.id()) {
+            assert!(Instant::now() < deadline, "the node never led");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        consensus
+            .write(Request(b"before".to_vec()))
+            .await
+            .expect("a write on a healthy engine");
+        assert!(
+            timeout(Duration::from_millis(200), consensus.stopped())
+                .await
+                .is_err(),
+            "stopped fired while the engine was healthy"
+        );
+
+        fail.store(true, Ordering::SeqCst);
+        let _ = timeout(
+            Duration::from_secs(5),
+            consensus.write(Request(b"doomed".to_vec())),
+        )
+        .await;
+        let stopped = timeout(Duration::from_secs(10), consensus.stopped())
+            .await
+            .expect("stopped must fire after a store failure");
+        assert!(matches!(stopped, Error::Raft(_)), "got {stopped:?}");
+
+        consensus.shutdown().await;
+    }
 }
