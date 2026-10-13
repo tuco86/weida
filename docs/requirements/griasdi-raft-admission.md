@@ -4,6 +4,22 @@ Status: proposal from griasdi, for tuco86 to take over into weida.
 Read against: the uncommitted B-224 work in this checkout (`crates/raft/weida-raft/src/{server,consensus}.rs`,
 2026-10-13), openraft 0.9.25.
 
+**Answered by B-322 (shipped in `57ad19e`).** All three behaviors of §2 are there. *Admission:* a
+node is "uninitialized" while its effective membership is empty, read from the engine's own state
+and not from the metrics channel; once it is non-empty, every RPC whose proved key is not in it is
+refused `Rejected` before a byte of it is read. The accepted cost: until a group adds it, any key
+can make itself that node's first leader. A node that is to join a group must therefore not call
+`bootstrap`, because once it is a group of its own it refuses every other group's leader. *Bounded
+reads:* `ConsensusConfig::election_timeout_max` is the deadline for the length prefix, the
+envelope and its end, and for the peer taking the reply, instead of the proposal's "heartbeat times
+a factor", because one deadline has to cover every kind before the kind is known; a snapshot body
+runs under `install_snapshot_timeout` counted from admission, and the envelope is allocated as it
+arrives. `ConsensusConfig::max_concurrent_rpcs` (default 64) caps the handlers, and one more is
+refused with `Rejected`, so the raft port holds at most that many times `max_rpc_bytes` of
+envelopes. *Engine end:* `Consensus::stopped()` is an `async fn` that resolves with `Error::Raft`
+when the engine ended on its own and never while it runs. griasdi can go back to the public
+`raft_listen`.
+
 ## 1. What griasdi found
 
 griasdi-august runs `weida_raft::Consensus` as a single node. A review of the raft binding found

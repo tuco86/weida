@@ -5,9 +5,10 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-322 — Raft admission by membership, bounded RPC reads, and a stopped signal
-kind: code | size: 90 | status: ready | needs: [B-224]
+kind: code | size: 90 | status: done 57ad19e | needs: [B-224]
 acceptance: [requirements/griasdi-raft-admission.md](requirements/griasdi-raft-admission.md) §5: once a node's effective membership is non-empty, every raft RPC whose proved key is not in it is refused with `Rejected` before a byte of it is read, and an uninitialized node still accepts engine RPCs from anyone; the length prefix, envelope and end-of-envelope check are read under `election_timeout_max`, a snapshot body under `install_snapshot_timeout`, the envelope allocated as it arrives, and `ConsensusConfig::max_concurrent_rpcs` handlers at most, one more refused; `Consensus::stopped()` resolves when the engine ended on its own. Tests in `server.rs` and `consensus.rs` named in the item's note.
 note: filed from griasdi's proposal; griasdi-august binds its raft port on loopback until this ships.
+note: done. `Ops::admission` reads `membership_state.effective()` through `with_raft_state` (`Member`, `Outsider`, `Uninitialized`); `server::handle` checks it before reading, bounds the envelope, snapshot body, forwarded operation and reply by deadlines, allocates the envelope as it arrives, and `serve` caps handlers with a semaphore and refuses the surplus inline; `ConsensusConfig::max_concurrent_rpcs` (1 to `Semaphore::MAX_PERMITS`); `Consensus::stopped()`. `admission` returns `Box<Fatal<_>>` because clippy's `result_large_err` refuses the 280-byte variant. Tests: `an_outsider_cannot_unseat_or_write_to_an_initialized_node`, `a_stalled_envelope_ends_at_its_deadline_and_the_cap_refuses_more` (`server.rs`), `a_store_failure_stops_the_engine_and_stopped_fires` (`consensus.rs`), and the rewritten `an_rpc_claiming_another_sender_is_refused`, now against an uninitialized node; acceptance 2 is covered by the existing `tests/cluster.rs` joiner and snapshot tests, which go through admission.
 
 ### B-320 — Hand a QUIC binding over: hold the closes, replay them in the successor
 kind: code | size: 90 | status: done 2b5cda7 | needs: []
