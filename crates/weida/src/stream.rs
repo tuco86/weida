@@ -40,8 +40,8 @@ use crate::transfer::{
 /// and redial alike.
 ///
 /// A subscriber registers its route and re-sends its filters; a dialling
-/// pair registers its route. Both used to do it inline in `connect`, which
-/// left a redialled connection with no route and no filters. One
+/// pair registers its route. Both do it here rather than inline in `connect`,
+/// so a redialled connection gets its route and filters too. One
 /// implementation, called from one place
 /// ([0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md)
 /// §4.6).
@@ -312,7 +312,7 @@ impl PeerShared {
     ) -> Result<(ConnHandle, Arc<str>), Error> {
         let (conn, path) = match address {
             Address::Quic(addr) => {
-                // B-017: the pool keys on the dialled path as well as the
+                // The pool keys on the dialled path as well as the
                 // authority, and checks the fingerprint it gets back.
                 let path = addr.path.as_str();
                 let pinned;
@@ -1071,7 +1071,7 @@ impl std::fmt::Debug for Peer {
 /// subscription events exist because an L2 queue is served on such a path
 /// (`weida-broker`): a consumer registers with SUBSCRIBE like a subscriber,
 /// grants credit with the frame of
-/// [0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+/// [0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
 /// §4.2, and its subscription ends with UNSUBSCRIBE or with its connection.
 /// They arrive **in the order the peer caused them** per connection, which is
 /// what lets a queue apply a grant to a subscription it has already seen.

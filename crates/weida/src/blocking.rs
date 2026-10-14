@@ -3,12 +3,11 @@
 //! Behind the `blocking` feature, which is **not** default. Everything else
 //! in this crate is `async`, because the transport is, and that is right for
 //! an application that already has a reactor. It is wrong for a script, a
-//! test harness, a CLI or a thread pool that has none — and this repository's
-//! four protocol libraries all learned that, one facade each
-//! (`weida_zmq::blocking`, `weida_mqtt::blocking`, `weida_nng::blocking`).
-//! This is the same shape for weida's own patterns (B-194, B-244) — for
-//! **every role of every pattern**: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY
-//! and BUS — and, since B-243, for the cursor surface of
+//! test harness, a CLI or a thread pool that has none — which is why
+//! `weida_zmq::blocking`, `weida_mqtt::blocking` and `weida_nng::blocking`
+//! exist. This is the same shape for weida's own patterns — for **every role
+//! of every pattern**: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS —
+//! and for the cursor surface of
 //! [0023](../../../docs/decisions/0023-completion-is-a-cursor.md) as well:
 //! [`Cursors`] is a report read by its caller, [`Reporter`] one written by it.
 //! RADIO/DISH of [0034](../../../docs/decisions/0034-late-is-lost.md) is here

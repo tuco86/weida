@@ -380,8 +380,7 @@ async fn canceled_resolves_when_the_requester_walks_away() {
 ///
 /// The pair with `trace_propagation` below is the claim: the same two peers,
 /// the same calls, and the only difference is whether the caller supplied a
-/// context. A runtime that minted one — as this one did until B-246 — passes
-/// that test and fails this one.
+/// context. A runtime that minted one passes that test and fails this one.
 #[tokio::test]
 async fn a_transfer_carries_no_trace_context_unless_the_sender_supplied_one() {
     let server = Server::start().await;

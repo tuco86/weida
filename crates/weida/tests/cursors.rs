@@ -127,8 +127,8 @@ async fn a_push_transfer_that_orders_cursors_stays_one_unidirectional_stream() {
             body.extend_from_slice(&chunk[..n]);
         }
 
-        // No bidirectional stream was opened for the report: that is the
-        // property the earlier draft of 0024 got wrong.
+        // No bidirectional stream was opened for the report: a report must
+        // not turn a push into an exchange.
         assert!(
             tokio::time::timeout(Duration::from_millis(300), conn.accept_bi())
                 .await

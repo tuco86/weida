@@ -4,7 +4,7 @@
 //! the in-process transport of
 //! [decision 0010](../../docs/decisions/0010-local-transport.md), `AF_UNIX`
 //! and, on Windows, a named pipe. That is
-//! what the transport boundary introduced in B-037 is for — above it, the
+//! what the transport boundary is for — above it, the
 //! frames, the HELLO exchange, the negotiation and the patterns are the same
 //! (`docs/PROTOCOL.md` §2.1) — and running the *same* body is the only way to
 //! check that claim rather than restate it.
@@ -842,16 +842,17 @@ async fn an_abandoned_request_over_a_pipe_is_a_named_cancellation() {
     h.shutdown().await;
 }
 /// Claim: over `AF_UNIX` a cancelled transfer is reported as a cancellation,
-/// and **never** as a payload that looks complete (B-245).
+/// and **never** as a payload that looks complete.
 ///
-/// This is the shape the transport silently did not have. A unix socket has a
+/// This is the guarantee a plain socket cannot give. A unix socket has a
 /// half-close and no abort — `SO_LINGER` with a zero timeout plus `close` is
 /// byte-for-byte a plain close at the reader, which was measured rather than
-/// assumed — so `finish` and `reset` used to be the same call and a reader
-/// took half a message for a whole one. [PATTERNS.md](../../../docs/PATTERNS.md)
-/// §1.5, [GUARANTEES.md](../../../docs/GUARANTEES.md) §6 and
-/// [FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4 all carried a
-/// qualification for it; this test is what lets them be unqualified.
+/// assumed — so without the chunk framing `finish` and `reset` would be the
+/// same call and a reader would take half a message for a whole one.
+/// [PATTERNS.md](../../../docs/PATTERNS.md) §1.5,
+/// [GUARANTEES.md](../../../docs/GUARANTEES.md) §6 and
+/// [FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4 state it for every
+/// transport; this test holds the unix socket to it.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_abandoned_transfer_over_a_socket_is_a_named_cancellation() {
@@ -885,11 +886,11 @@ async fn an_abandoned_transfer_over_a_socket_is_a_named_cancellation() {
 
 /// Claim: over `AF_UNIX` a transfer **dropped** without `finish` is a
 /// cancellation too, which is the case an application hits by accident rather
-/// than on purpose (B-245).
+/// than on purpose.
 ///
 /// The drop path is the one that matters in production: a task that panics or
 /// a future that is cancelled mid-write leaves exactly this. `Drop` resets the
-/// stream, and before the chunk framing that reset was a clean close.
+/// stream, and without the chunk framing that reset would be a clean close.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_dropped_transfer_over_a_socket_is_a_cancellation_and_not_a_short_payload() {
@@ -1024,12 +1025,12 @@ async fn pub_sub_over_inproc() {
 /// Claim: a long run of local exchanges reclaims its stream slots, so the
 /// only thing `max_local_streams` bounds is what is really live.
 ///
-/// The bug this pins, found by measuring in B-059 rather than by reading:
+/// What this pins (`docs/IMPLEMENTATION.md` §4.13):
 /// locally a stream **is** an OS object counted against `max_local_streams`
 /// (255), and a receipt parked for the drain holds its send half — so a
-/// parked set sized by QUIC's stream budgets held every descriptor and a
-/// sequential run failed with `LimitExceeded` part way through, with nothing
-/// in flight and nothing wrong. A thousand exchanges is four times the
+/// parked set sized by QUIC's stream budgets would hold every descriptor and a
+/// sequential run would fail with `LimitExceeded` part way through, with
+/// nothing in flight and nothing wrong. A thousand exchanges is four times the
 /// ceiling, so any per-transfer leak fails this well before the end.
 async fn sequential_exchanges_reclaim_their_slots(h: &Harness) {
     const EXCHANGES: u32 = 1000;
@@ -1093,16 +1094,15 @@ async fn sequential_exchanges_reclaim_their_slots_over_pipe() {
 /// sender that outruns its puller is slowed down and every message still
 /// arrives.
 ///
-/// What this pins, the second thing B-059 found by measuring: locally a
+/// What this pins (`docs/IMPLEMENTATION.md` §4.13): locally a
 /// stream **is** an OS object counted against `max_local_streams` (255) —
 /// one socket on `AF_UNIX`, one channel pair in process — and a transfer
 /// holds its slot until both ends are done with it. A sender that outruns
-/// its puller therefore reaches the ceiling with nothing wrong, and `open`
-/// used to refuse there with `LimitExceeded`: `Reject` where
-/// `docs/GUARANTEES.md` §6 promises `Block`, and on inproc a slow puller hit
-/// it after 256 sequential sends. The local open now parks on a slot exactly
-/// as QUIC's parks on the peer's stream budget, so the run completes at the
-/// puller's pace.
+/// its puller therefore reaches the ceiling with nothing wrong, and an `open`
+/// that refused there with `LimitExceeded` would be `Reject` where
+/// `docs/GUARANTEES.md` §6 promises `Block`. The local open parks on a slot
+/// exactly as QUIC's parks on the peer's stream budget, so the run completes
+/// at the puller's pace.
 ///
 /// The sends are concurrent because that is what a fire-and-forget sender
 /// does and what reaches the ceiling on both transports: `AF_UNIX` frees a
@@ -1231,7 +1231,7 @@ async fn a_local_address_is_checked_before_it_is_dialled() {
 /// links it registered, and the dialling side sees the same
 /// `ConnectionLost` a QUIC peer's close produces
 /// ([decisions/0010](../../docs/decisions/0010-local-transport.md) §4.2,
-/// B-028's `LossCause`). Under `ReconnectPolicy::never()`, so that the loss
+/// `LossCause`). Under `ReconnectPolicy::never()`, so that the loss
 /// reaches the caller; with the default policy the runtime would wait for
 /// the bus to be bound again instead (`tests/reconnect.rs`).
 #[tokio::test]

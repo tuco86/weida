@@ -1,9 +1,9 @@
 //! W3C Trace Context propagation.
 //!
 //! v0 propagates `traceparent`/`tracestate` in transfer metadata and logs the
-//! ids through `tracing` (master doc §58); the OpenTelemetry SDK is wired up in
-//! the observability phase. This module is the codec only: it never generates
-//! identifiers, because randomness belongs to the runtime, not to the model.
+//! ids through `tracing` (master doc §58); an OpenTelemetry SDK is outside this
+//! crate. This module is the codec only: it never generates identifiers,
+//! because randomness belongs to the runtime, not to the model.
 
 use std::fmt;
 

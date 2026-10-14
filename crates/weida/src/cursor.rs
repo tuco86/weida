@@ -2,7 +2,7 @@
 //!
 //! A completion is a **cursor** — a level plus an absolute byte offset — not a
 //! verdict
-//! ([decisions/0023](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)).
+//! ([decisions/0023](https://github.com/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)).
 //! Three properties follow, and all three are structural here rather than
 //! promised:
 //!
@@ -131,7 +131,7 @@ impl Drop for ReportGuard {
 /// Absolute offsets, so this is a complete picture however many records were
 /// coalesced away: a reader that misses every intermediate record still ends
 /// at the same numbers
-/// ([0023](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
+/// ([0023](https://github.com/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
 /// §4.3b). Levels are ordered by their wire value, weida's own below the
 /// application floor and the application's above it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -287,7 +287,7 @@ impl Cursors {
     /// interrupted by nothing — which is why the timer lives here, where the
     /// runtime is: `weida::blocking::Cursors::changed` is this call, written
     /// as text rather than as a link because a link to a feature-gated item
-    /// is a hard rustdoc error in the configuration that lacks it (B-184).
+    /// is a hard rustdoc error in the configuration that lacks it.
     pub async fn changed_within(&mut self, deadline: Duration) -> Reported {
         let exec = self.guard.conn.exec.clone();
         match exec.within(deadline, self.changed()).await {
@@ -313,7 +313,7 @@ impl std::fmt::Debug for ReportGuard {
 /// side.
 ///
 /// **The granularity is the reporter's own number and is never negotiated**
-/// ([0023](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
+/// ([0023](https://github.com/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
 /// §4.5): more often is always allowed, less often never. The default is
 /// [`Reporter::DEFAULT_BYTES`] or [`Reporter::DEFAULT_INTERVAL`], whichever
 /// comes first, and [`Reporter::with_granularity`] changes it. Coalescing
@@ -388,7 +388,7 @@ impl Reporter {
     /// "Every `bytes` or every `interval`, **whichever comes first**". The
     /// number is this side's own and is never negotiated: a sender orders
     /// *which* levels it wants, not how finely
-    /// ([0023](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
+    /// ([0023](https://github.com/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
     /// §4.5). It has no effect in [`ReportMode::FinalOnly`], where there is
     /// exactly one record per level whatever the granularity says.
     pub fn with_granularity(mut self, bytes: u64, interval: Duration) -> Reporter {

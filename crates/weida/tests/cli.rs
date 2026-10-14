@@ -1,11 +1,11 @@
-//! The `weida` binary, driven the way a user drives it (B-196).
+//! The `weida` binary, driven the way a user drives it.
 //!
-//! B-060 was verified by hand — four verbs, two transports, four exit codes —
-//! and nothing repeated that. These tests assert what a *caller* observes and
-//! nothing about how the binary is built: the address `serve` prints, the
-//! payload on stdout with nothing else on it, and the exit codes a script
-//! branches on. The binary's path comes from `CARGO_BIN_EXE_weida`, so there
-//! is no new dependency and no assumption about the target directory.
+//! These tests assert what a *caller* observes — across four verbs, two
+//! transports and four exit codes — and nothing about how the binary is
+//! built: the address `serve` prints, the payload on stdout with nothing else
+//! on it, and the exit codes a script branches on. The binary's path comes
+//! from `CARGO_BIN_EXE_weida`, so there is no extra dependency and no
+//! assumption about the target directory.
 //!
 //! Every child is killed when its handle drops and every wait is bounded, so
 //! a binary that hangs fails these tests instead of stalling the suite.
@@ -226,7 +226,7 @@ fn a_send_reaches_a_sink_over_a_unix_socket() {
 
 /// The same claim on the platform whose local transport is a named pipe: the
 /// verbs, the address and the framing are the transport's business and not
-/// the CLI's, which is the property B-039 made true and this asserts.
+/// the CLI's, which is the property this asserts.
 #[cfg(windows)]
 #[test]
 fn a_send_reaches_a_sink_over_a_named_pipe() {

@@ -10,15 +10,14 @@
 //! transport ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
 //! §4.5, `docs/research/ipc.md` §3.1-§3.3).
 //!
-//! **Byte mode, not message mode.** 0010 §4.5 named message mode for the
-//! kernel framing it gives; the grouping that was decided afterwards
-//! ([0012](../../../docs/decisions/0012-local-connection-grouping.md)) makes
-//! a connection carry one stream whose frames are the protocol's own, so
-//! the kernel's framing would go unused — and `mio` reads a message-mode
-//! pipe into a fixed buffer, where a message longer than the buffer is
-//! `ERROR_MORE_DATA` and a read error rather than a partial read. The end of
-//! a stream, which `AF_UNIX` signals by half-close and a pipe cannot, is the
-//! consumer's to mark.
+//! **Byte mode, not message mode.** A connection carries one stream whose
+//! frames are the protocol's own
+//! ([0012](../../../docs/decisions/0012-local-connection-grouping.md)), so the
+//! kernel framing of message mode ([0010](../../../docs/decisions/0010-local-transport.md)
+//! §4.5) would go unused — and `mio` reads a message-mode pipe into a fixed
+//! buffer, where a message longer than the buffer is `ERROR_MORE_DATA` and a
+//! read error rather than a partial read. The end of a stream, which `AF_UNIX`
+//! signals by half-close and a pipe cannot, is the consumer's to mark.
 
 use std::ffi::OsString;
 use std::time::Duration;

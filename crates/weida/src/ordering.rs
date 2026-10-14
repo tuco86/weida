@@ -197,10 +197,10 @@ impl GapDetector {
 pub(crate) struct Reassembler<T> {
     enabled: bool,
     /// Transfers held at once, summed over scopes: the `max_reorder_hold`
-    /// bound of `docs/INVARIANTS.md`. B-010 measured the peak at N − 1 of the
-    /// transfers in flight, and 84 of 256 with no adversarial pattern, so
-    /// this is a configured number and never an assumption about arrival
-    /// order.
+    /// bound of `docs/INVARIANTS.md`. `docs/IMPLEMENTATION.md` §4.7 measures
+    /// the peak at N − 1 of the transfers in flight, and 84 of 256 with no
+    /// adversarial pattern, so this is a configured number and never an
+    /// assumption about arrival order.
     max_hold: usize,
     /// Scopes tracked at once, shared bound with the gap detector.
     max_scopes: usize,

@@ -1,4 +1,4 @@
-//! The blocking facade, from threads with no executor (B-194).
+//! The blocking facade, from threads with no executor.
 //!
 //! These are plain `#[test]` functions: no `#[tokio::test]` anywhere, which
 //! is the point — a synchronous caller has no reactor, and everything below
@@ -200,7 +200,7 @@ fn a_radio_segment_and_datagram_reach_a_blocking_dish() {
 }
 
 /// PAIR over the facade, and the one rule a caller gets wrong: the **first**
-/// peer is kept and a second is refused (B-244).
+/// peer is kept and a second is refused.
 #[test]
 fn a_pair_carries_both_directions_and_refuses_a_second_peer() {
     let (server, binding, url) = served("/link");
@@ -252,7 +252,7 @@ fn a_pair_carries_both_directions_and_refuses_a_second_peer() {
 }
 
 /// SURVEY over the facade, and the one rule a caller gets wrong: the
-/// **deadline** is the caller's and silence is a number (B-244).
+/// **deadline** is the caller's and silence is a number.
 #[test]
 fn a_survey_collects_what_answers_and_counts_what_does_not() {
     let (server, binding, url) = served("/poll");
@@ -302,7 +302,7 @@ fn a_survey_collects_what_answers_and_counts_what_does_not() {
 }
 
 /// BUS over the facade, and the one rule a caller gets wrong: **never your
-/// own message** (B-244).
+/// own message**.
 #[test]
 fn a_bus_message_reaches_every_other_member_and_never_the_sender() {
     let (first_rt, first_binding, first_url) = served("/bus1");
@@ -369,8 +369,7 @@ fn the_facade_refuses_to_block_a_reactor_thread() {
 }
 
 /// The cursor surface, synchronously: a fire-and-forget producer that gets a
-/// **verdict** without an exchange, and a staged receiver that gives it
-/// (B-243).
+/// **verdict** without an exchange, and a staged receiver that gives it.
 #[test]
 fn a_push_gets_a_verdict_from_a_cursor_with_no_exchange() {
     const ACCEPTED: CursorLevel = CursorLevel::Known(Acknowledgement::Accepted);
@@ -453,7 +452,7 @@ fn a_push_gets_a_verdict_from_a_cursor_with_no_exchange() {
 }
 
 /// A send that orders nothing has nothing to read, and a receiver of it has
-/// nothing to report with (B-243).
+/// nothing to report with.
 #[test]
 fn a_transfer_that_orders_no_report_hands_out_no_handles() {
     let (server, binding, url) = served("/plain");

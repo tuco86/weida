@@ -2,9 +2,9 @@
 //!
 //! A publisher does not know its subscribers: they arrive as SUBSCRIBE frames
 //! on whatever connections the listener has accepted. This module owns that
-//! mapping and the one genuinely new selection policy in Phase 3 — fan-out
-//! (`docs/ARCHITECTURE.md`, pattern primitive P3). Everything else a published
-//! message needs is the ordinary one-way transfer path.
+//! mapping and the one genuinely new selection policy of the pattern layer —
+//! fan-out (`docs/ARCHITECTURE.md`, pattern primitive P3). Everything else a
+//! published message needs is the ordinary one-way transfer path.
 //!
 //! **Delivery is per-subscriber best effort.** Each subscriber has a byte
 //! budget; a message that does not fit is dropped for that subscriber, counted,
@@ -53,7 +53,7 @@ struct PubMsg {
 /// What one subscriber's writer is told to do.
 ///
 /// A whole message is one item, which is what [`SubRegistry::publish`] sends.
-/// A **streamed** publish ([`SubRegistry::open`], B-064) is `Begin`, then a
+/// A **streamed** publish ([`SubRegistry::open`]) is `Begin`, then a
 /// `Chunk` per piece, then `Finish` — so a payload the publisher never
 /// materializes still becomes one stream per subscriber, and the per-chunk
 /// byte budget is what bounds this side rather than the payload's size.
@@ -647,7 +647,7 @@ struct Target {
 /// `Limits::subscriber_buffer_bytes`, because a message that large could not
 /// be enqueued for anybody. Here the **chunk** is what the budget bounds, so
 /// the payload is unbounded and a 33 MB frame is an ordinary publish
-/// (B-064, `docs/requirements/zeughaus-video.md` request 1).
+/// (`docs/requirements/zeughaus-video.md` request 1).
 ///
 /// **The drop behaviour of [GUARANTEES](../../../docs/GUARANTEES.md) §6 is
 /// per subscriber, not per publish.** A subscriber whose budget or queue
@@ -1007,8 +1007,8 @@ mod tests {
         assert!(filter::matches("px.eur", "px.eur"));
         assert!(!filter::matches("px.eur", "px.eur.spot"));
         assert!(!filter::matches("fx.usd", "px.eur"));
-        // The boundary a byte prefix could not see: `px.` used to select
-        // everything under `px`, and `sensors.temp` used to select
+        // The boundary a byte prefix could not see: `px.` does not select
+        // everything under `px`, and `sensors.temp` does not select
         // `sensors.temperature`.
         assert!(!filter::matches("px.eur", "px."));
         assert!(!filter::matches("sensors.temperature", "sensors.temp"));

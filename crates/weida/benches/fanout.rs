@@ -1,4 +1,4 @@
-//! What per-subscriber fan-out costs, at a width worth the name (B-247).
+//! What per-subscriber fan-out costs, at a width worth the name.
 //!
 //! weida gives every subscriber its own unidirectional stream per message, so
 //! a stream nobody reads does not delay its siblings ([`PATTERNS.md`] §1.3).
@@ -18,8 +18,8 @@
 //!    `publish` call and the payload arriving in a subscriber's
 //!    `IncomingTransfer`, over every copy of every message.
 //! 3. **Which of the two bounds binds first.** A fan-out node is limited by
-//!    per-connection transport state (B-011 measured 750-850 KiB per
-//!    connection, both ends together) and by
+//!    per-connection transport state (`IMPLEMENTATION.md` §4.8 measures
+//!    750-850 KiB per connection, both ends together) and by
 //!    `Limits::subscriber_buffer_bytes`, the 8 MiB a slow subscriber may hold.
 //!    The second half of this bench stalls every subscriber and publishes
 //!    until the drop counter moves, which is the only way to see what those
@@ -32,9 +32,9 @@
 //! machine and the numbers are in [`IMPLEMENTATION.md`] — read them as one
 //! desktop's shape, not as a portable constant.
 //!
-//! [`PATTERNS.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/PATTERNS.md
-//! [`GUIDE.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/GUIDE.md
-//! [`IMPLEMENTATION.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/IMPLEMENTATION.md
+//! [`PATTERNS.md`]: https://github.com/tuco86/weida/blob/main/docs/PATTERNS.md
+//! [`GUIDE.md`]: https://github.com/tuco86/weida/blob/main/docs/GUIDE.md
+//! [`IMPLEMENTATION.md`]: https://github.com/tuco86/weida/blob/main/docs/IMPLEMENTATION.md
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -123,8 +123,8 @@ fn tokio_runtime() -> tokio::runtime::Runtime {
 
 /// Resident set size of this process in bytes, on Linux.
 ///
-/// `VmRSS` and not `VmHWM`, for B-011's reason: what a set of live subscribers
-/// holds *now* is the quantity a fan-out node is sized by.
+/// `VmRSS` and not `VmHWM`, for the reason `connections.rs` gives: what a set
+/// of live subscribers holds *now* is the quantity a fan-out node is sized by.
 fn current_rss() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -184,8 +184,8 @@ fn quantiles(samples: &mut [u64]) -> [Duration; 3] {
 /// this bench conflated them.** In the *idle* phase the publisher waits until
 /// every copy of a message has arrived before publishing the next, so each
 /// sample is one message's path with nothing queued ahead of it — the
-/// per-subscriber latency B-247 asks for. In the *burst* phase it publishes
-/// `MESSAGES` back to back without waiting, so the samples include the
+/// per-subscriber latency `IMPLEMENTATION.md` §4.11 asks for. In the *burst*
+/// phase it publishes `MESSAGES` back to back without waiting, so the samples include the
 /// queueing behind the burst: that number is a backlog, and at width 256 it
 /// is two orders of magnitude larger than the idle one. Reporting only the
 /// burst figure as "latency" would be the kind of number this repository

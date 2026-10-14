@@ -9,7 +9,7 @@
 //! ambient requirement on every caller.
 //!
 //! The reactor, the resolver and the close budget are not weida's protocol
-//! wearing a runtime's clothes, so they are not weida's code any more: a
+//! wearing a runtime's clothes, so they live in `weida-runtime`: a
 //! standalone implementation of a foreign protocol needs exactly them and
 //! none of the rest
 //! ([decisions/0013](../../../docs/decisions/0013-competitor-libraries.md)

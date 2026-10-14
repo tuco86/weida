@@ -39,7 +39,8 @@ pub struct TransferMeta {
     pub content_type: Option<String>,
     /// Advisory payload length.
     pub content_len: Option<u64>,
-    /// Trace context to propagate. `None` generates a fresh root context.
+    /// Trace context to propagate. `None` propagates none: the runtime never
+    /// mints one ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
     pub trace: Option<TraceContext>,
     /// Topic this transfer is labelled with (DATA key `5`).
     ///
@@ -55,7 +56,7 @@ pub struct TransferMeta {
     ///
     /// Only an L2 hop sets it, and only on a reply: it is the publisher
     /// confirm of
-    /// [decisions/0018](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
+    /// [decisions/0018](https://github.com/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
     /// §4.6. A v0 application leaves it `None`, which claims nothing beyond
     /// the transport receipt.
     pub achieved: Option<Acknowledgement>,
@@ -66,13 +67,13 @@ pub struct TransferMeta {
     /// simply does not report it, and the transfer does not fail for it. A
     /// level a peer must reach is the negotiated `acknowledgement` dimension
     /// of HELLO instead
-    /// ([0006](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
+    /// ([0006](https://github.com/tuco86/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
     /// §4.4).
     ///
     /// Ordering levels changes **nothing** about the transfer's topology: the
     /// report rides a unidirectional stream of its own, so a Push transfer
     /// that orders cursors is still one unidirectional stream
-    /// ([0024](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0024-three-families-one-back-channel.md)
+    /// ([0024](https://github.com/tuco86/weida/blob/main/docs/decisions/0024-three-families-one-back-channel.md)
     /// §4.4a). The cursors arrive on the handle
     /// [`OutgoingTransfer::cursors`] hands out.
     pub report: Vec<CursorLevel>,
@@ -168,7 +169,7 @@ pub struct IncomingMeta {
     /// only proved (master doc §47).
     pub peer: Option<PeerIdentity>,
     /// The certificate chain the peer presented behind `peer`, leaf first
-    /// ([decisions/0035](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0035-keys-proved-not-judged.md)
+    /// ([decisions/0035](https://github.com/tuco86/weida/blob/main/docs/decisions/0035-keys-proved-not-judged.md)
     /// §4.2). `None` when `peer` is not a key, and when the chain exceeded
     /// the bound weida keeps.
     pub peer_chain: Option<PeerChain>,
@@ -180,7 +181,7 @@ pub struct IncomingMeta {
     ///
     /// Detect mode reports the gap and delivers the message that arrived;
     /// nothing is held back and nothing is refetched
-    /// ([decision 0001](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0001-sequence-field.md)
+    /// ([decision 0001](https://github.com/tuco86/weida/blob/main/docs/decisions/0001-sequence-field.md)
     /// §7.5). `None` means either that ordering is off or that nothing is
     /// missing.
     pub gap: Option<Gap>,
@@ -209,12 +210,12 @@ pub struct IncomingMeta {
     pub report_id: Option<u64>,
     /// The segment number (DATA key `13`), when a radio or a
     /// `Peer::segment` sent this transfer as a stream segment
-    /// ([decisions/0034](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0034-late-is-lost.md)
+    /// ([decisions/0034](https://github.com/tuco86/weida/blob/main/docs/decisions/0034-late-is-lost.md)
     /// §4.6).
     pub segment: Option<u64>,
     /// The segment's layer (DATA key `14`): `Some` exactly when
     /// [`IncomingMeta::segment`] is, and `Some(0)` when key `14` was absent
-    /// ([decisions/0037](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0037-layered-segments.md)
+    /// ([decisions/0037](https://github.com/tuco86/weida/blob/main/docs/decisions/0037-layered-segments.md)
     /// §4.3).
     pub layer: Option<u8>,
 }
@@ -1038,10 +1039,9 @@ impl std::fmt::Debug for IncomingRequest {
 /// buffer, and reports where the frame starts in it.
 ///
 /// The frame's length field precedes the header it measures, so the header has
-/// to be encoded first. The previous shape encoded it into a fresh `Vec` —
-/// paying the 8/16/32/64/128 growth chain for a ~70-byte header — then
-/// allocated a second exact-capacity `Vec` and copied the whole thing into it
-/// (B-250).
+/// to be encoded first. Encoding it into a fresh `Vec` would pay the
+/// 8/16/32/64/128 growth chain for a ~70-byte header, and building the frame
+/// in a second exact-capacity `Vec` would copy the whole thing into it.
 ///
 /// Instead the header is encoded **after** a reserved `MAX_PREAMBLE_LEN`, and
 /// the preamble is right-aligned against it: one allocation whose capacity is
@@ -1081,7 +1081,7 @@ pub(crate) async fn write_data_preamble(
 ///
 /// Dropping it before [`ReplyStream::recv`] stops the half with `CANCELED`, so
 /// a responder streaming a long reply learns that nobody is listening. That
-/// stop replaces the CANCEL frame of earlier drafts: the stream carries the
+/// stop is the whole cancellation: the stream carries the
 /// correlation, so cancellation needs no identifier and no control frame.
 pub struct ReplyStream {
     recv: Option<RecvHalf>,
@@ -1256,9 +1256,9 @@ mod tests {
     }
 
     /// The one regression the one-buffer construction can cause: a preamble
-    /// aligned by one byte too many or too few (B-250).
+    /// aligned by one byte too many or too few.
     ///
-    /// Asserted against the shape it replaced — encode the header, then build
+    /// Asserted against the two-buffer form — encode the header, then build
     /// `preamble ++ header` — over headers whose length crosses the varint's
     /// own boundary, because that is where the alignment changes width.
     #[test]

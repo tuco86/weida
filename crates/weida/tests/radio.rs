@@ -6,8 +6,8 @@
 //! starts at the next segment, a dish's `max_age` expires its copy without
 //! touching another dish's, and a datagram segment is a counted drop where
 //! it cannot be a datagram, never a stream. The datagram segments travel on
-//! flows the **bound** side opens toward a peer that dialled it, which is
-//! B-282's bound-side proof.
+//! flows the **bound** side opens toward a peer that dialled it: the
+//! bound-side case.
 
 mod common;
 

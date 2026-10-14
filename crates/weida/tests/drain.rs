@@ -460,14 +460,14 @@ async fn a_drain_closes_a_local_connection_the_way_shutdown_does() {
     harness.shutdown().await;
 }
 
-/// B-249's number: **a fire-and-forget producer at full rate never reaches the
-/// parked set's cap**, so the sweep that walks it never runs.
+/// **A fire-and-forget producer at full rate never reaches the parked set's
+/// cap**, so the sweep that walks it never runs.
 ///
 /// `ConnDrain::park` runs inside `Drop for Delivery`, on the fire-and-forget
 /// path of every pattern, and at its cap it polls **every** parked receipt
 /// while holding a `std::sync::Mutex` — each poll taking `quinn`'s own
 /// connection-state lock. That is O(parked) under a lock on the hot send path,
-/// and the question the item asked was whether it is reachable.
+/// and the question is whether it is reachable.
 ///
 /// It is not, on a healthy connection, and the reason is structural rather
 /// than lucky: a receipt settles when the peer's transport acknowledges the
@@ -517,7 +517,7 @@ async fn a_fire_and_forget_producer_never_fills_the_parked_receipt_set() {
 
     let drained = within(client.clone().drain(Duration::from_secs(5))).await;
     println!(
-        "B-249: {MESSAGES} fire-and-forget sends in {elapsed:?} ({:.1} Kmsg/s), \
+        "{MESSAGES} fire-and-forget sends in {elapsed:?} ({:.1} Kmsg/s), \
          {} delivered, {} outstanding",
         MESSAGES as f64 / elapsed.as_secs_f64() / 1000.0,
         drained.delivered,

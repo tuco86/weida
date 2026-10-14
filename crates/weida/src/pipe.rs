@@ -14,11 +14,10 @@
 //! payload in [`crate::chunked`]'s chunks, and the end of the payload is a
 //! chunk rather than a socket state.
 //!
-//! That framing **used to live here**, and it now lives beside the transport
-//! that borrowed it: a unix socket has the opposite problem — a half-close and
-//! no abort, so a cancelled transfer arrived as a complete one (B-245) — and
-//! the fix was the framing this module already had. One convention, one
-//! reader, two transports.
+//! That framing is [`crate::chunked`]'s, shared with the unix socket
+//! transport: a unix socket has the opposite problem — a half-close and no
+//! abort, so a cancelled transfer would arrive as a complete one — and the
+//! same framing fixes it. One convention, one reader, two transports.
 //!
 //! What the framing cannot carry is the reader's refusal: there is no
 //! `STOP_SENDING`, because the writer's direction is the only one the reader

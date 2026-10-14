@@ -265,9 +265,9 @@ impl ConnCtx {
     /// receipt parked for the drain holds its send half, so it holds a slot
     /// ([0009](../../../docs/decisions/0009-drain.md) §4.2). The parked set is
     /// bounded by the QUIC stream budgets, which have nothing to do with that
-    /// local ceiling, so a long run of local transfers used to exhaust the
-    /// descriptors while the parked set sat below its own cap, quite happy:
-    /// `LimitExceeded` with nothing in flight and nothing wrong. Since the
+    /// local ceiling, so without reaping a long run of local transfers would
+    /// exhaust the descriptors while the parked set sat below its own cap:
+    /// `LimitExceeded` with nothing in flight and nothing wrong. Because the
     /// local open waits instead of failing, not reaping here would turn that
     /// into a wait nobody can end.
     ///
@@ -1101,12 +1101,11 @@ pub(crate) struct Held {
 /// The refusal a stream earns when the path it names cannot serve it —
 /// [PROTOCOL.md](../../../docs/PROTOCOL.md) §9.3's table, as one table.
 ///
-/// Both dispatchers used to decide this themselves, each writing out its own
-/// pairing of `ErrorCode` and stop code at the call site, so §9.3 was enforced
-/// in two places. They agreed; what they could not survive is the next
-/// pattern's registration, because a seventh [`Route`] variant added to one
-/// match and not the other is a silent divergence between what a Push sender
-/// and a Req sender learn about the same misroute (B-251).
+/// Both dispatchers take their refusal from this one table instead of each
+/// writing out its own pairing of `ErrorCode` and stop code at the call site,
+/// so §9.3 is enforced in one place: a seventh [`Route`] variant added to one
+/// match and not the other would be a silent divergence between what a Push
+/// sender and a Req sender learn about the same misroute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Refusal {
     /// What an exchange's ERROR frame carries.
@@ -1183,7 +1182,7 @@ pub(crate) fn refusal_for(route: Option<&Route>, wanted: Wanted) -> Option<Refus
 /// Hands one arrived transfer to whatever is bound at `path`.
 ///
 /// Every refusal here comes from [`refusal_for`] or a [`Refusal`] constant;
-/// no stop code is written out at a call site (B-251).
+/// no stop code is written out at a call site.
 async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
     let route = ctx.namespace.lookup(path);
     if let Some(refusal) = refusal_for(route.as_ref(), Wanted::OneWay) {
@@ -1372,11 +1371,11 @@ mod tests {
 
     /// One row per pairing of [`PROTOCOL.md`] §9.3's table, both stream kinds,
     /// which is the point of having one table: a seventh `Route` variant added
-    /// to one dispatcher and not the other used to be a silent divergence
+    /// to one dispatcher and not the other would be a silent divergence
     /// between what a Push sender and a Req sender learn about the same
-    /// misroute (B-251).
+    /// misroute.
     ///
-    /// [`PROTOCOL.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/PROTOCOL.md
+    /// [`PROTOCOL.md`]: https://github.com/tuco86/weida/blob/main/docs/PROTOCOL.md
     #[test]
     fn every_route_mismatch_earns_the_refusal_the_protocol_names() {
         // Nothing registered: the same answer for both kinds.

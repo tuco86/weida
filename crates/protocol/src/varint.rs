@@ -56,7 +56,7 @@ pub const fn varint_len(value: u64) -> usize {
 ///
 /// The `Vec`-appending form below delegates to this one. A caller with a fixed
 /// buffer — a send path building a preamble it will right-align against an
-/// already-encoded header — allocates nothing (B-250).
+/// already-encoded header — allocates nothing.
 ///
 /// # Errors
 ///

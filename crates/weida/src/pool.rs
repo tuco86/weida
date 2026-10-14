@@ -195,7 +195,7 @@ impl ClientPool {
             // attempt on an unreachable `::1` would reach `127.0.0.1` only
             // after a full handshake timeout. The last one keeps the whole
             // budget, which is also what an IP literal and a single-address
-            // name get — exactly today's behaviour
+            // name get
             // (`RuntimeConfig::connect_attempt_timeout`, RFC 8305's
             // Connection Attempt Delay).
             let joined = if is_last {
@@ -352,7 +352,7 @@ mod tests {
     /// Claim: a written port is used as written, a portless authority is the
     /// discovery form and dials `DEFAULT_PORT`, and a `Single` runtime
     /// **refuses** the portless form rather than resolving it — 0020 §4.2's
-    /// client half, which is the whole of what this slice decides.
+    /// client half.
     #[test]
     fn the_dial_port_follows_the_url_then_the_discovery_mode() {
         assert_eq!(

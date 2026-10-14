@@ -1,15 +1,16 @@
 //! One guard for every crate that allows `unsafe`, and for every crate that
-//! says nothing about it (B-248).
+//! says nothing about it.
 //!
-//! Most crates here set `unsafe_code = "forbid"` and are done. Seven cannot:
+//! Most crates here inherit `unsafe_code = "forbid"` from the workspace lint
+//! table and are done. Seven cannot:
 //! a PyO3 crate's `#[pyclass]`, `#[pymethods]` and `#[pyfunction]` expand to
 //! `unsafe impl`s of PyO3's type-object traits, and the lint does not care
 //! that the code came from a macro. So those manifests set
 //! `unsafe_code = "allow"`, each under a comment asserting that **no `unsafe`
-//! is written by hand in this crate** — and until this file existed, exactly
-//! one of the seven had a test behind that claim
-//! (`crates/py/weida-py-core/tests/no_handwritten_unsafe.rs`, which scanned
-//! its own `src` and nothing else). Six claims with nothing behind them.
+//! is written by hand in this crate**, and this test is what stands behind
+//! that claim for every one of them. (`weida-winpipe`, the Win32 FFI crate,
+//! is the one crate that writes `unsafe` by hand on purpose; its manifest
+//! says so and narrows the lint to `unsafe_op_in_unsafe_fn`.)
 //!
 //! The shape matters more than the coverage. This is **one test that walks the
 //! manifests** rather than seven copies of one test, so a crate that gains the
@@ -33,6 +34,8 @@ use std::path::{Path, PathBuf};
 enum Stance {
     Forbid,
     Allow,
+    /// Forbids only `unsafe_op_in_unsafe_fn`: the Win32 FFI crate.
+    Ffi,
     Silent,
 }
 
@@ -66,20 +69,39 @@ fn manifests(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Whether a manifest opts into the workspace lint table (`[lints]` followed
+/// by `workspace = true`).
+fn inherits_workspace_lints(text: &str) -> bool {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    while let Some(line) = lines.next() {
+        if line == "[lints]" {
+            return lines.next() == Some("workspace = true");
+        }
+    }
+    false
+}
+
 fn stance(manifest: &Path) -> Stance {
     let text = fs::read_to_string(manifest).expect("a readable manifest");
+    let root = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("the root manifest");
     if text.contains(r#"unsafe_code = "allow""#) {
         Stance::Allow
-    } else if text.contains(r#"unsafe_code = "forbid""#) {
+    } else if text.contains(r#"unsafe_code = "forbid""#)
+        || (inherits_workspace_lints(&text) && root.contains(r#"unsafe_code = "forbid""#))
+    {
         Stance::Forbid
+    } else if text.contains(r#"unsafe_op_in_unsafe_fn = "forbid""#) {
+        Stance::Ffi
     } else {
         Stance::Silent
     }
 }
 
-/// Every `.rs` file under `dir`, recursively — which the guard this replaced
-/// did not do: it read one directory level, so a module in a subdirectory was
-/// unchecked.
+/// Every `.rs` file under `dir`, recursively, so a module in a subdirectory is
+/// checked as well.
 fn sources(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];

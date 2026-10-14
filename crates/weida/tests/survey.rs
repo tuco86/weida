@@ -143,18 +143,16 @@ async fn an_answer_that_arrived_in_time_survives_a_caller_that_reads_late() {
     // that surveys, does other work past its own deadline and then drains
     // must still get the answers that came in time.
     //
-    // What makes this worth pinning is how narrowly it held before. `next`
-    // used to consult only `Exec::within`, whose `select!` has no `biased;`,
-    // so an answer already in the channel and an elapsed deadline were both
-    // ready and the winner was a coin flip — except that a `tokio` sleep of
-    // zero duration is *not* ready on its first poll, so the answer won
-    // every time and the contract held by accident. Measured both ways: with
-    // the deadline branch forced first by a `biased;` the old code still
-    // passed, which is what an accident looks like. `next` now takes the
-    // buffer before it consults the deadline, and what the deadline branch
-    // finds there it counts in `late` instead of dropping, so the contract
-    // holds on purpose and the narrow race — an answer landing in the same
-    // poll the timer fires — is counted rather than silent.
+    // What makes this worth pinning is how narrowly it holds. `next` takes
+    // the buffer before it consults the deadline, and what the deadline
+    // branch finds there it counts in `late` instead of dropping. Without
+    // that, `Exec::within`'s `select!` (no `biased;`) would see an answer
+    // already in the channel and an elapsed deadline both ready and the
+    // winner would be a coin flip — in practice hidden by a `tokio` sleep of
+    // zero duration not being ready on its first poll, so the contract would
+    // hold by accident. Here it holds on purpose, and the narrow race — an
+    // answer landing in the same poll the timer fires — is counted rather
+    // than silent.
     let server = Server::start().await;
     let respondent = server.listener.respondent("/poll").expect("respondent");
     let answering = answer_with(respondent, b"prompt");
@@ -188,8 +186,8 @@ async fn a_respondent_that_never_reads_cannot_hold_the_survey_open() {
     // The deadline is the **survey's**, not just the collection's. Asking is
     // two awaits the peer controls — the exchange's stream budget and its
     // flow-control window — so a respondent that accepts a question and
-    // stops reading used to hold `survey()` itself open forever, and every
-    // respondent behind it was never asked at all.
+    // stops reading would otherwise hold `survey()` itself open forever, and every
+    // respondent behind it would never be asked at all.
     let server = Server::start().await;
     let respondent = server.listener.respondent("/poll").expect("respondent");
     let silent = tokio::spawn(async move {

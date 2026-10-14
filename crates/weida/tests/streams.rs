@@ -840,10 +840,9 @@ async fn idle_timeout_reports_loss_within_the_window() {
 
     // The cause, not merely the outcome: an application deciding what an
     // outage means must be able to tell an idle timeout from a peer that
-    // closed deliberately, and peer selection used to flatten both into one
-    // error. Since 0031 the cause is on the event stream, and the loss
-    // itself is the runtime's to repair: the server is still there, so the
-    // next request rides the redialled connection.
+    // closed deliberately. The cause is on the event stream
+    // (0031), and the loss itself is the runtime's to repair: the server is
+    // still there, so the next request rides the redialled connection.
     let lost = within(events.recv()).await;
     assert!(
         matches!(

@@ -206,8 +206,7 @@ pub fn parse_preamble(
 /// that already owns a buffer allocates nothing to write one: the frame's
 /// length field precedes the header it measures, so the header has to be
 /// encoded first, and a caller that encodes it at `MAX_PREAMBLE_LEN` can then
-/// right-align this preamble against it and write **one** contiguous slice
-/// (B-250).
+/// right-align this preamble against it and write **one** contiguous slice.
 pub fn preamble_bytes(kind: FrameKind, header_len: u64) -> ([u8; MAX_PREAMBLE_LEN], usize) {
     let mut bytes = [0u8; MAX_PREAMBLE_LEN];
     bytes[0] = MAGIC;
@@ -340,12 +339,11 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_a_violation() {
-        // Kind `9` is the first free one: `5` became CREDIT with the L2 queue
-        // (`docs/decisions/0018-minimal-broker.md` §4.6), `6` became CURSOR
-        // with the cursor stream
+        // Kind `9` is the first free one: `5` is CREDIT
+        // (`docs/decisions/0018-minimal-broker.md` §4.6), `6` is CURSOR
         // (`docs/decisions/0024-three-families-one-back-channel.md` §4.4),
-        // `7` became FLOW (`docs/decisions/0034-late-is-lost.md` §4.2) and
-        // `8` became REPORT (`docs/decisions/0036-connection-statistics.md`
+        // `7` is FLOW (`docs/decisions/0034-late-is-lost.md` §4.2) and
+        // `8` is REPORT (`docs/decisions/0036-connection-statistics.md`
         // §4.5).
         let err = parse_preamble(&[MAGIC, 0x09, 0x00], CAP).unwrap_err();
         assert_eq!(err, PreambleError::UnknownKind(9));

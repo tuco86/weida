@@ -53,19 +53,19 @@
 //!
 //! # The grep
 //!
-//! `Exec` is the enforcement point, and the enforcement is mechanical. Two
-//! greps, one per crate:
+//! `Exec` is the enforcement point, and the enforcement is mechanical. A grep
+//! over a crate's own `src`:
 //!
 //! ```text
-//! grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src   # no call outside #[cfg(test)]
-//! grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/runtime/src # only exec.rs calls them
+//! grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/runtime/src # exec.rs and resolve.rs
 //! ```
 //!
-//! Every task, timer and name lookup in `weida` goes through an `Exec` from
-//! this crate, and the same grep over a consumer's own `src` is the same
-//! check for it (`docs/ARCHITECTURE.md` §5). The one place those three names
-//! are allowed to appear is [`Exec`]'s own module, which is the entire point
-//! of moving them here.
+//! A library built on this crate sends its tasks, timers and name lookups
+//! through an `Exec`, and the same grep over its own `src` is the check for it
+//! (`docs/ARCHITECTURE.md` §5). In this crate those names appear in
+//! [`Exec`]'s own module and in the system resolver (`resolve.rs`), which
+//! performs the one real lookup; that is the entire point of putting them
+//! here.
 
 mod budget;
 mod exec;

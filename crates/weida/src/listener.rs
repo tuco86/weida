@@ -1025,7 +1025,7 @@ async fn accept_unix(
             continue;
         }
         // The accepted socket carries the runtime its halves write their
-        // end-of-payload marker on (B-245), exactly as a pipe instance does.
+        // end-of-payload marker on, exactly as a pipe instance does.
         let stream = crate::unix::UnixLocal::accepted(stream, serve.exec.clone());
         serve.exec.spawn(serve.clone_for().serve(stream));
     }

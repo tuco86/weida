@@ -475,8 +475,8 @@ impl Publisher {
     ///
     /// This is the fan-out for a payload that is not in memory and need not
     /// be — a video frame read from a capture device, a file, a response body
-    /// being forwarded (B-064,
-    /// [requirements/zeughaus-video.md](../../../docs/requirements/zeughaus-video.md)
+    /// being forwarded
+    /// ([requirements/zeughaus-video.md](../../../docs/requirements/zeughaus-video.md)
     /// request 1). [`Publisher::publish`] refuses a payload above
     /// `Limits::subscriber_buffer_bytes` because such a message could not be
     /// enqueued for anybody; here that limit applies to a **chunk**, so the
@@ -669,7 +669,7 @@ impl Subscriber {
     /// travelling to the publisher, which would answer it by closing the
     /// connection.
     ///
-    /// [`PROTOCOL.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/PROTOCOL.md
+    /// [`PROTOCOL.md`]: https://github.com/tuco86/weida/blob/main/docs/PROTOCOL.md
     pub async fn subscribe(&self, filter: &str) -> Result<(), Error> {
         weida_protocol::filter::validate(filter)?;
         let fresh = self
@@ -719,7 +719,7 @@ impl Subscriber {
     /// subscription `filter`, and sends it to every connected peer.
     ///
     /// This is the L2 credit of
-    /// [0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+    /// [0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
     /// §4.2, and it matters only where a **queue** serves the path: a
     /// publisher fans a message out to every matching subscriber and consults
     /// no credit, while a queue delivers to one consumer and delivers nothing

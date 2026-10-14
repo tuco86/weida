@@ -173,13 +173,13 @@ pub(crate) struct ConnDrain {
     /// while how many receipts can be pending at once is what the peer granted
     /// this side to open. The two are the same number between two default
     /// runtimes and need not be in general, so this cap is a **local
-    /// heuristic** rather than a derived bound, and it is written down as one
-    /// (B-249). Using the peer's number instead would mean reading its
+    /// heuristic** rather than a derived bound, and it is written down as one.
+    /// Using the peer's number instead would mean reading its
     /// transport parameters, which `quinn` does not expose.
     ///
     /// **What that heuristic costs is measured, and it is nothing on a healthy
-    /// connection** (B-249,
-    /// `a_fire_and_forget_producer_never_fills_the_parked_receipt_set`). The
+    /// connection**
+    /// (`a_fire_and_forget_producer_never_fills_the_parked_receipt_set`). The
     /// sweep in [`ConnDrain::park`] is O(parked) under this mutex, with each
     /// poll taking `quinn`'s connection-state lock — but it only runs at the
     /// cap, and the cap is not reachable while the peer is acknowledging: a
@@ -192,16 +192,16 @@ pub(crate) struct ConnDrain {
     /// that stops acknowledging while this side keeps opening streams, which
     /// the stream budget makes a bounded window.
     ///
-    /// **On a local transport the budget is a different quantity**, and using
-    /// the QUIC one was a bug B-059 found by measuring: a parked receipt holds
-    /// its send half, which there is an OS connection counted against
-    /// `max_local_streams`, so a parked set sized 1024+1024 quietly consumed
-    /// all 255 descriptors and the next `open` failed with `LimitExceeded` —
-    /// nothing in flight, nothing wrong, no way for the caller to know.
+    /// **On a local transport the budget is a different quantity**: a parked
+    /// receipt holds its send half, which there is an OS connection counted
+    /// against `max_local_streams` (`docs/IMPLEMENTATION.md` §4.13), so a
+    /// parked set sized 1024+1024 would consume all 255 descriptors and the
+    /// next `open` would fail with `LimitExceeded` — nothing in flight,
+    /// nothing wrong, no way for the caller to know.
     /// Locally the cap is therefore **half** the local ceiling: parked
     /// receipts may hold at most half the descriptors, which leaves the other
     /// half to open with, and a drain still sees every receipt whose outcome
-    /// is open. Since that `open` now waits for a slot instead of failing,
+    /// is open. Because that `open` waits for a slot instead of failing,
     /// this half is also what keeps the wait finite.
     max_parked: usize,
 }

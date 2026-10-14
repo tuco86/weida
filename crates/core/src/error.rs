@@ -310,8 +310,8 @@ impl From<StopReason> for Error {
             // taken, and the peer will not take it later either. It is
             // `Rejected` rather than a variant of its own because the outcome
             // an application must act on is identical — do not retry against
-            // this peer — and a second word for the same outcome is what
-            // `LossCause` was introduced to avoid.
+            // this peer — and a second word for the same outcome would add
+            // nothing.
             StopReason::ShuttingDown => Error::Rejected,
             StopReason::Other(code) => {
                 Error::Transport(format!("peer stopped receiving with code {code}"))

@@ -191,7 +191,8 @@ fn bench_fanout(c: &mut Criterion) {
     rt.block_on(async { harness.runtime.clone().shutdown().await });
 }
 
-/// What the segmented matcher costs in the publisher's fan-out path (B-021).
+/// What the segmented matcher costs in the publisher's fan-out path
+/// (`docs/IMPLEMENTATION.md` §4.10).
 ///
 /// The objection that decision 0007 §4.6 accepted was that a matching language
 /// belongs nowhere near a hot path. This measures the price it actually asked
@@ -210,9 +211,10 @@ fn bench_fanout(c: &mut Criterion) {
 /// * `rest` — a trailing `#`, so the walk fails on a literal segment before
 ///   the wildcard can accept anything.
 ///
-/// `prefix_reference` is the matcher the walk replaced, `topic.starts_with`,
-/// over the same strings. It is a pure function here because it no longer
-/// exists in the library: it is the scale, not a switchable implementation.
+/// `prefix_reference` is the byte-prefix matcher the walk is measured against,
+/// `topic.starts_with`, over the same strings. It is a pure function here
+/// because the library has no such matcher: it is the scale, not a switchable
+/// implementation.
 /// The matched, drained fan-out is the `fanout` group above.
 fn bench_filters(c: &mut Criterion) {
     /// Filters held by one connection; `max_subscriptions` defaults to 256.
@@ -279,7 +281,7 @@ fn bench_filters(c: &mut Criterion) {
 
     let prefix_filters: Vec<String> = (0..FILTERS).map(|i| format!("zz{i}.eur.spot")).collect();
 
-    // The replaced matcher, for scale: 64 byte-prefix comparisons over the
+    // The byte-prefix matcher, for scale: 64 byte-prefix comparisons over the
     // same strings, with no publish around them.
     group.bench_function("prefix_reference", |b| {
         b.iter(|| {
@@ -345,11 +347,10 @@ fn bench_header_cost(c: &mut Criterion) {
     let rich_meta = TransferMeta::default()
         .with_content_len(SEQUENCE)
         .with_content_type(PRODUCER);
-    // A caller-supplied trace context: what key `3` costs now that the
-    // runtime writes it only on propagation (B-246,
-    // [0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
-    // Until then this was every message's cost, and `lean` below is what a
-    // message costs without it.
+    // A caller-supplied trace context: what key `3` costs when the runtime
+    // writes it only on propagation
+    // ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)),
+    // and `lean` below is what a message costs without it.
     let traced_meta = TransferMeta::default().with_trace(weida::new_trace());
 
     // Criterion reports messages per second; the bytes per message are
@@ -395,14 +396,13 @@ fn bench_header_cost(c: &mut Criterion) {
 /// Bytes one DATA frame puts on the wire: preamble, CBOR header, payload.
 ///
 /// **The header is the one the runtime writes**, not a reconstruction of it.
-/// The previous version of this function rebuilt a `DataHeader` by hand and
-/// hardcoded a 55-byte `traceparent` — which was right when `data_header`
-/// minted one on every send and became wrong the day it stopped
+/// A header rebuilt by hand with a hardcoded 55-byte `traceparent` would go
+/// wrong whenever `data_header` stops minting one
 /// ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md),
-/// B-246). A measurement that can disagree with the code is worse than none,
-/// so this builds the header the same way the send path does: same fields,
-/// same optional keys, and a `traceparent` exactly when `meta` carries a
-/// context.
+/// `docs/IMPLEMENTATION.md` §4.5). A measurement that can disagree with the
+/// code is worse than none, so this builds the header the same way the send
+/// path does: same fields, same optional keys, and a `traceparent` exactly
+/// when `meta` carries a context.
 fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
     let header = DataHeader {
         endpoint: Some(endpoint.to_owned()),
@@ -411,9 +411,9 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
         traceparent: meta.trace.map(|t| t.to_traceparent()),
         tracestate: None,
         topic: None,
-        // B-009 simulated keys 6 and 7 with the existing fields whose wire
-        // shape matched; the runtime still writes neither, and key `8` is an
-        // L2 confirm no pattern here sends.
+        // The patterns benched here write neither key `6` nor key `7` (their
+        // cost is measured in `docs/IMPLEMENTATION.md` §4.4), and key `8` is
+        // an L2 confirm no pattern here sends.
         sequence: None,
         producer: None,
         achieved: meta.achieved,
@@ -426,7 +426,7 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
     encode_frame(FrameKind::Data, &header.encode()).len() + payload
 }
 
-/// What the dedup key costs per call (B-040).
+/// What the dedup key costs per call (`docs/IMPLEMENTATION.md` §4.12).
 ///
 /// `DedupWindow::is_duplicate` builds its lookup key with
 /// `scope: scope.into()`, which allocates a `Box<str>` on **every** call —
@@ -438,10 +438,10 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
 /// `pub(crate)` and its only public path is a negotiated connection receiving
 /// DATA, where a loopback message costs microseconds and would bury the
 /// answer — so this measures the two *shapes* as pure functions, the way
-/// B-021 measured the byte prefix it had replaced. What the numbers price is
+/// `bench_filters` measures the byte prefix. What the numbers price is
 /// the difference between the shapes, not weida's code:
 ///
-/// * **owned** — today's shape: one flat `HashMap<Identity, _>` whose key
+/// * **owned** — the library's shape: one flat `HashMap<Identity, _>` whose key
 ///   owns its scope, so every probe allocates.
 /// * **borrowed** — the candidate: `HashMap<Box<str>, HashMap<(producer,
 ///   sequence), _>>`, where the outer lookup borrows `&str` (`Box<str>`

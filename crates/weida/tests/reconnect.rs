@@ -1,7 +1,7 @@
 //! A dialled address outlives its connection
 //! ([0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md)).
 //!
-//! What is asserted is the contract of B-270 to B-273 and nothing about its
+//! What is asserted is the redial, outbox and re-subscribe contract and nothing about its
 //! timing: every server here is restarted on the **same** address, and a
 //! test waits on the events the endpoint reports rather than on a clock.
 //! The redial policy is set to a few milliseconds so the suite runs in
@@ -105,14 +105,14 @@ async fn pulled(puller: &Puller) -> Vec<u8> {
     within(inbound.collect(64 * 1024)).await.expect("collect")
 }
 
-// --- B-270: slots, policy, events -----------------------------------------
+// --- slots, policy and events ---------------------------------------------
 
 /// Claim: a pusher whose server restarts on the same address delivers again
 /// with no second `connect`, and the endpoint reports `Lost`, then
 /// `Retrying`, then `Connected`.
 ///
-/// The body sent during the outage arrives after it — that is B-273's
-/// outbox — and the body that was written before the restart is **not**
+/// The body sent during the outage arrives after it — that is the outbox —
+/// and the body that was written before the restart is **not**
 /// delivered twice: the puller sees exactly the bodies in order.
 #[tokio::test]
 async fn a_pusher_delivers_again_after_the_server_restarts() {
@@ -288,7 +288,7 @@ async fn a_replacement_server_with_a_new_key_is_not_a_reconnect() {
     client.shutdown().await;
 }
 
-// --- B-271: open waits ------------------------------------------------------
+// --- open waits through an outage -------------------------------------------
 
 /// Claim: an `open` during the outage does not fail — it waits for the
 /// redial and completes on the new connection. `NotConnected` is only what
@@ -384,7 +384,7 @@ async fn send_timeout_bounds_the_wait_with_the_loss_cause() {
     client.shutdown().await;
 }
 
-// --- B-272: re-subscribe ----------------------------------------------------
+// --- re-subscribe after redial ----------------------------------------------
 
 /// Claim: a subscriber whose publisher restarts receives the next publish
 /// with no application call, and a filter subscribed *during* the outage
@@ -457,7 +457,7 @@ async fn a_subscriber_is_resubscribed_on_the_redialled_connection() {
     client.shutdown().await;
 }
 
-// --- B-288: a flow outlives a redial -----------------------------------------
+// --- flows across a redial ---------------------------------------------------
 
 fn with_flows(config: RuntimeConfig) -> RuntimeConfig {
     RuntimeConfig {
@@ -568,7 +568,7 @@ async fn a_flow_is_reopened_after_the_server_restarts() {
     client.shutdown().await;
 }
 
-// --- B-273: the outbox ------------------------------------------------------
+// --- the outbox -------------------------------------------------------------
 
 /// Claim: bodies sent during an outage arrive after it, in order, and the
 /// runtime discards nothing under the bound.
@@ -846,7 +846,7 @@ async fn a_unix_socket_that_is_rebound_is_redialled() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- B-317, B-318, B-320: restart handoff -----------------------------------
+// --- restart handoff --------------------------------------------------------
 
 /// Claim: a binding handed over tells its clients nothing until the
 /// successor serves, and then each client reconnects exactly once and at

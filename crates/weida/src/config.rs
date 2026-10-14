@@ -20,7 +20,7 @@ use crate::reconnect::{OutboxFull, ReconnectPolicy};
 /// Whether a dialled authority may name a **set** of nodes.
 ///
 /// The configuration knob of
-/// [0020](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md)
+/// [0020](https://github.com/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md)
 /// §4.1: awareness is a capability, never a requirement, so both values speak
 /// the same wire protocol and a peer behaves identically toward either.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,7 +67,7 @@ pub struct RuntimeConfig {
     /// chooses how many connections it opens, so `max_connections` alone
     /// would let a single peer fill a binding: 64 connections to one peer
     /// measured about 50 MiB of transport state on the pair
-    /// (`docs/IMPLEMENTATION.md` §4, B-011), and the default of 64 is that
+    /// (`docs/IMPLEMENTATION.md` §4.8), and the default of 64 is that
     /// measured number — enough for a control connection plus 63 dialled
     /// paths, and a sixteenth of the default `max_connections`.
     ///
@@ -78,7 +78,7 @@ pub struct RuntimeConfig {
     /// `docs/decisions/0008-session-identity.md` §4.2). A binding that wants
     /// this bound therefore requires a client identity.
     ///
-    /// [`PROTOCOL.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/PROTOCOL.md
+    /// [`PROTOCOL.md`]: https://github.com/tuco86/weida/blob/main/docs/PROTOCOL.md
     pub max_connections_per_peer: usize,
     /// Depth of an endpoint's accept queue. Senders await a free slot, so QUIC
     /// flow control carries the backpressure to the peer.
@@ -244,8 +244,8 @@ impl From<PathBuf> for Pem {
 /// certificate is consulted.
 ///
 // A link to a `#[cfg(feature = "generate")]` item is a hard rustdoc error in
-// the configuration that lacks the item, and no default-features doc run ever
-// shows it (B-184). So the sentence naming it is conditional too.
+// the configuration that lacks the item, so the sentence naming it is
+// conditional too.
 #[cfg_attr(
     feature = "generate",
     doc = "Generated identities ([`Identity::generate`]) are self-signed and made for"

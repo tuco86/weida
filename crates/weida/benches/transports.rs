@@ -7,12 +7,12 @@
 //! is that number: what a local transfer costs against a loopback QUIC one, at
 //! a payload where the overhead dominates and at one where the copies do, plus
 //! what a local connection costs in memory against the ~995 KiB per QUIC
-//! connection B-012 measured.
+//! connection that `docs/IMPLEMENTATION.md` §4.9 measures.
 //!
 //! The honest row is the **round trip**. A one-way send returns when the
 //! transport has taken the bytes, which locally means a kernel buffer or a
 //! channel slot, so a one-way number compares enqueue rates and not delivery
-//! (the same reading B-043 had to apply to the ZMTP bench). Req/Rep is
+//! (the same reading applies to the ZMTP bench). Req/Rep is
 //! therefore the comparison, and Push/Pull is reported beside it with that
 //! caveat rather than left out.
 
@@ -302,8 +302,8 @@ fn bench_one_way(c: &mut Criterion) {
     group.finish();
 }
 
-/// What a *live local connection* costs, against B-012's ~995 KiB per QUIC
-/// connection.
+/// What a *live local connection* costs, against the ~995 KiB per QUIC
+/// connection of `docs/IMPLEMENTATION.md` §4.9.
 ///
 /// Locally a connection is not a pool entry a client reuses: one transfer is
 /// one connection ([0010 §4.2]), so the figure that matters is what holding N

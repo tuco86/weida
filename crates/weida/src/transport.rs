@@ -1,10 +1,10 @@
 //! The transport boundary: what the runtime needs from a transport, and
 //! nothing more.
 //!
-//! Until [decision 0010](../../../docs/decisions/0010-local-transport.md)
-//! there was one transport and the runtime spoke `quinn` directly. The local
-//! transports of that note — in process first, then `AF_UNIX`, then named
-//! pipes — carry the same frames, the same HELLO and the same negotiation
+//! The transports are the variants of three closed enums over QUIC,
+//! in-process links, `AF_UNIX` and named pipes
+//! ([decision 0010](../../../docs/decisions/0010-local-transport.md)). They
+//! carry the same frames, the same HELLO and the same negotiation
 //! (`docs/PROTOCOL.md` §2.1), so what differs is exactly the three types
 //! below: a connection that opens and accepts streams, and the two halves of
 //! a stream.
@@ -13,8 +13,8 @@
 //! closed and small, it is decided in this crate, and the payload path must
 //! stay a direct call: dispatching a `write_all` through a vtable would put
 //! an indirection on exactly the path `docs/INVARIANTS.md` keeps free of task
-//! hops and locks. Adding `AF_UNIX` (B-038) and named pipes (B-039) means
-//! one variant each and no new concept.
+//! hops and locks. Another transport means one variant per type and no new
+//! concept.
 //!
 //! Everything transport-specific lives behind these types: error mapping,
 //! the stream-kind vocabulary, and the two codes that can cross a stream

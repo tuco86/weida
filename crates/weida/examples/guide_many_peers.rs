@@ -411,10 +411,10 @@ pub struct Ceiling {
 /// Both rows below are that sentence: same payload, same queue, one variable.
 /// The 64 KiB budget refuses on the budget; the 8 MiB default refuses on the
 /// queue — which is exactly what `benches/fanout.rs` measured at the defaults
-/// (B-247), and the reason this program exists rather than a paragraph. The
-/// two values are an order of magnitude from the absorption band this machine
-/// shows (0.6-1.5 MiB), because that band is a property of the connection and
-/// not a constant worth pinning.
+/// (`docs/IMPLEMENTATION.md` §4.11), and the reason this program exists rather
+/// than a paragraph. The two values are an order of magnitude from the
+/// absorption band measured there (0.6-1.5 MiB), because that band is a
+/// property of the connection and not a constant worth pinning.
 ///
 /// The operational point is the counter, not the rule: `dropped_on(topic)`
 /// separates `subscriber_budget` from `subscriber_queue`, so a starving
@@ -495,8 +495,9 @@ pub struct Width {
 /// width matcher walks, width queue pushes and width budget reservations. The
 /// interesting half is that the *marginal* cost per subscriber goes down: the
 /// fixed cost of a publish is amortized and the registry walk gets its cache.
-/// B-247 measured 287 ns at width 1 and 22.94 µs at width 256 — 88.8 ns per
-/// subscriber — which is the number the guide's §0.1 width table is built on.
+/// `docs/IMPLEMENTATION.md` §4.11 measured 287 ns at width 1 and 22.94 µs at
+/// width 256 — 88.8 ns per subscriber — which is the number the guide's §0.1
+/// width table is built on.
 ///
 /// # Errors
 ///
@@ -706,7 +707,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cfg!(debug_assertions) {
         println!(
             "     ^ debug build: run with --release to compare with the measured \
-             figures (B-247)"
+             figures (IMPLEMENTATION.md §4.11)"
         );
     }
 

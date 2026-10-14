@@ -6,13 +6,10 @@
 //! answer it: the latency of a cold handshake against a pooled dial that does
 //! none, and the resident-memory delta per established connection.
 //!
-//! The pool keys on `(host, port, ClientTls, address fingerprint)`, so a second
-//! connection to the same server on the same terms cannot be dialled from one
-//! runtime today — which is exactly why 0002 needs a second pool tier. The
-//! memory figures therefore use one client runtime per connection, all against
-//! one server, and both ends live in this process: the delta covers the client
-//! and server state of each connection together, which is what a two-tier pool
-//! would pay for on a loopback deployment.
+//! The memory figures use one client runtime per connection, all against one
+//! server, and both ends live in this process: the delta covers the client
+//! and server state of each connection together, which is what a connection
+//! per path would pay for on a loopback deployment.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -24,7 +21,8 @@ use weida::{Identity, Listener, Puller, Runtime, RuntimeConfig, Trust};
 /// per-path fan of 64.
 const COUNTS: [usize; 3] = [1, 2, 64];
 
-/// Path counts for the per-path fan of decision 0002 (B-012).
+/// Path counts for the per-path fan of decision 0002
+/// (`docs/IMPLEMENTATION.md` §4.9).
 const PATHS: [usize; 2] = [16, 256];
 
 /// Connection ceiling used to find the refusal point, small so the run is short.
@@ -50,7 +48,7 @@ async fn harness() -> Harness {
 }
 
 /// The same server with an explicit configuration, for the refusal point of
-/// B-012.
+/// `report_connection_limit`.
 async fn harness_with(config: RuntimeConfig) -> Harness {
     let identity = Identity::generate().expect("identity");
     let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
@@ -142,8 +140,8 @@ fn bench_connect(c: &mut Criterion) {
     });
 
     // A pooled dial on the same terms: the pool answers and no handshake
-    // happens. This is today's cost of "a second connection to the same peer",
-    // and it is not a connection at all.
+    // happens. This is the cost of dialling the same address again, and it is
+    // not a connection at all.
     group.bench_function("pooled_dial", |b| {
         let trust = harness.trust.clone();
         let url = url.clone();
@@ -178,7 +176,7 @@ fn bench_connect(c: &mut Criterion) {
 ///
 /// The runtimes are built first and measured before anything is dialled,
 /// because one client runtime per connection is the only way to hold two
-/// connections to one peer today (§ module docs) and a runtime carries its own
+/// connections to one peer on the same terms (module docs) and a runtime carries its own
 /// quinn endpoint and UDP socket. Reporting the two deltas separately keeps
 /// that overhead out of the per-connection figure 0002 actually needs.
 fn report_connection_cost(rt: &tokio::runtime::Runtime, harness: &Harness) {
@@ -241,15 +239,13 @@ fn report_connection_cost(rt: &tokio::runtime::Runtime, harness: &Harness) {
     }
 }
 
-/// One connection per dialled path, and what the same paths cost today (B-012).
+/// One connection per dialled path, and what the same paths cost on one
+/// runtime (`docs/IMPLEMENTATION.md` §4.9).
 ///
-/// Two shapes are measured because they are different systems. Today the pool
-/// keys on `(host, port, ClientTls, address fingerprint)` and **not** on the
-/// path, so one runtime dialling `p` paths holds exactly one connection: the
-/// per-path fan does not exist yet. Decision 0002's bulk tier makes it one
-/// connection per path, which is the second shape here, built with one client
-/// runtime per path because that is the only way to hold `p` connections to one
-/// server from this API.
+/// Two shapes are measured because they are different systems: one runtime
+/// dialling `p` paths, and, as decision 0002's bulk tier describes, one
+/// client runtime per path, which is the way to hold `p` separate
+/// connections to one server from this API.
 fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
     for p in PATHS {
         // A path per fan size: dropping a `Puller` leaves its route registered,
@@ -260,7 +256,7 @@ fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
             .map(|path| harness.listener.puller(path).expect("puller"))
             .collect();
 
-        // Today: one runtime, every path on one pooled connection.
+        // One runtime dialling every path.
         let (shared_elapsed, shared_peers) = rt.block_on(async {
             let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
             let pusher = client.pusher(harness.trust.clone());
@@ -276,7 +272,7 @@ fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
             (elapsed, peers)
         });
 
-        // 0002's shape: one connection per path.
+        // One client runtime, and so one connection, per path.
         let baseline = current_rss();
         let (fan_elapsed, per_path, fan_rss) = rt.block_on(async {
             let mut clients = Vec::with_capacity(p);
@@ -307,8 +303,8 @@ fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
             _ => "RSS unavailable on this platform".to_owned(),
         };
         eprintln!(
-            "paths p={p}: pooled today {shared_elapsed:.2?} for {p} dials over \
-             {shared_peers} peer entries on one connection; one connection per path \
+            "paths p={p}: one runtime {shared_elapsed:.2?} for {p} dials over \
+             {shared_peers} peer entries; one runtime per path \
              {fan_elapsed:.2?} total, {per_path:.2?} each, {memory}"
         );
 
@@ -316,7 +312,7 @@ fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
     }
 }
 
-/// Where the server refuses, and with what (B-012).
+/// Where the server refuses, and with what (`docs/IMPLEMENTATION.md` §4.9).
 ///
 /// `max_connections` is checked before the handshake is accepted, but the
 /// refusal is deliberately *not* silent: the server completes the handshake and

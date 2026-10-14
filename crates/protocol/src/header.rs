@@ -13,8 +13,8 @@
 //!
 //! All decode failures are protocol violations that close the connection.
 //!
-//! **No field of a DATA header is required by the decoder.** A header no longer
-//! carries the stream's role, so the decoder cannot know which fields the
+//! **No field of a DATA header is required by the decoder.** A header does not
+//! carry the stream's role, so the decoder cannot know which fields the
 //! context demands; `endpoint`-on-initiating-streams is enforced by the
 //! transport's dispatch, which does know (`docs/PROTOCOL.md` §6.2).
 
@@ -97,8 +97,8 @@ mod data_key {
     pub const REPORT_ID: u64 = 9;
     pub const REPORT: u64 = 10;
     pub const REPORT_MODE: u64 = 11;
-    // Key 12 (`delivery_attempt`) is reserved in docs/PROTOCOL.md §6.2 and
-    // coded by the slice that writes it.
+    // Key 12 (`delivery_attempt`) is reserved in docs/PROTOCOL.md §6.2;
+    // nothing codes it yet.
     pub const SEGMENT: u64 = 13;
     pub const LAYER: u64 = 14;
 }
@@ -148,11 +148,10 @@ mod flow_key {
 /// §4.2). Both halves of the grammar live here: [`filter::validate`], the rule
 /// that says which filters may exist at all — so an illegal one is refused at
 /// the codec boundary rather than reaching a matcher that would have to cope
-/// with it — and [`filter::matches`], the matcher itself. The matcher used to
-/// sit with the fan-out it served, in `weida::pubsub`, and moved when a second
-/// layer needed it: an L2 queue selects a consumer with the same grammar
-/// (B-202), and a second implementation of a wildcard language is exactly the
-/// kind of drift one definition exists to prevent.
+/// with it — and [`filter::matches`], the matcher itself. An L2 queue selects a
+/// consumer with the same grammar as the pub/sub fan-out, and a second
+/// implementation of a wildcard language is exactly the kind of drift one
+/// definition exists to prevent.
 pub mod filter {
     use super::HeaderError;
 
@@ -169,15 +168,14 @@ pub mod filter {
     /// `*` for exactly one whole segment, a trailing `#` for zero or more, every
     /// other byte literal, and the empty filter matching everything.
     ///
-    /// The objection this function used to carry was that treating `*` as a
-    /// wildcard "would make topics with a literal `*` unaddressable and would put
-    /// a matching language in the hot path". Both halves were true and both are
+    /// Treating `*` as a wildcard makes topics with a literal `*`
+    /// unaddressable and puts a matching language in the hot path. Both are
     /// accepted deliberately
     /// ([decisions/0007](../../../../docs/decisions/0007-topic-namespace.md) §4.6): a
-    /// filter can no longer select a segment containing `.`, `*` or `#`
+    /// filter cannot select a segment containing `.`, `*` or `#`
     /// literally — there is no escape character, and no sheet reports a use for
     /// one — while a byte prefix could not express a boundary at all, so
-    /// `sensors.temp` also selected `sensors.temperature`. The hot-path half is
+    /// `sensors.temp` would also select `sensors.temperature`. The hot-path half is
     /// answered by the shape rather than by the choice: `#` is legal only as the
     /// final segment, so this is one left-to-right walk with no backtracking, no
     /// allocation and work bounded by the 256 B filter cap.
@@ -312,7 +310,7 @@ macro_rules! wire_enum {
 wire_enum! {
     /// Delivery dimension ([`GUARANTEES.md`] §3). A ladder: later is stronger.
     ///
-    /// [`GUARANTEES.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/GUARANTEES.md
+    /// [`GUARANTEES.md`]: https://github.com/tuco86/weida/blob/main/docs/GUARANTEES.md
     Delivery {
         /// v0: no retries, losses reported.
         #[default]
@@ -333,13 +331,13 @@ wire_enum! {
         /// v0: QUIC's fin-acknowledgement.
         #[default]
         TransportReceipt = 1,
-        /// Reserved for the L2 broker.
+        /// Reported by the L2 broker on the producer hop.
         Accepted = 2,
-        /// Reserved for the L2 broker.
+        /// Needs a durable store.
         Stored = 3,
-        /// Reserved for the L2 broker.
+        /// Unused.
         Replicated = 4,
-        /// Reserved for the L2 broker.
+        /// The settlement level the L2 broker orders on a delivery.
         Processed = 5,
     }
 }
@@ -718,7 +716,7 @@ impl GuaranteeSet {
         let mut merged = GuaranteeSet {
             delivery: self.delivery.min(other.delivery),
             acknowledgement,
-            // A dimension the weakened acknowledgement can no longer carry is
+            // A dimension the weakened acknowledgement cannot carry is
             // dropped rather than kept: dropping is what "weaker" means here,
             // and keeping it would produce a set §6.5 forbids.
             durability: keeps_durability
@@ -935,11 +933,10 @@ impl From<HeaderError> for Error {
 
 /// Appends an encoded header to a buffer the caller owns.
 ///
-/// Every `encode` in this file is a thin wrapper over an `encode_into` that
-/// goes through here, so a hot send path can reuse one buffer and the
-/// canonical form has exactly one implementation — the property that matters,
-/// because two encoders that can disagree about key order would be a wire
-/// divergence rather than an optimisation (B-250).
+/// Every `encode_into` in this file goes through here, so a hot send path can
+/// reuse one buffer and the canonical form has exactly one implementation —
+/// the property that matters, because two encoders that can disagree about
+/// key order would be a wire divergence rather than an optimisation.
 fn encode_into_with(
     out: &mut Vec<u8>,
     f: impl FnOnce(&mut Encoder<Vec<u8>>) -> Result<(), minicbor::encode::Error<Infallible>>,
@@ -1294,7 +1291,7 @@ impl Hello {
         self.guarantees_required.unwrap_or(GuaranteeSet::CORE)
     }
 
-    /// Encodes the header.
+    /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -1302,8 +1299,7 @@ impl Hello {
     }
 
     /// Appends the encoded header to `out`, for a send path that reuses a
-    /// buffer (B-250). The canonical form has one implementation and this is
-    /// it; [`Self::encode`] is a wrapper.
+    /// buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         encode_into_with(out, |e| {
             // A `core` declaration is never written: an absent key already
@@ -1462,7 +1458,7 @@ pub struct DataHeader {
     /// `Acknowledgement::None`: it says this hop makes no claim beyond the
     /// transport receipt QUIC already gave.
     ///
-    /// [GUARANTEES.md]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/GUARANTEES.md
+    /// [GUARANTEES.md]: https://github.com/tuco86/weida/blob/main/docs/GUARANTEES.md
     pub achieved: Option<Acknowledgement>,
     /// Identifier the sender assigns to the report it orders (key `9`).
     ///
@@ -1534,6 +1530,8 @@ impl DataHeader {
     /// oversized order with `Error::LimitExceeded` and allocates the report
     /// id alongside the order, so no caller reaches this encoder with either
     /// mistake.
+    ///
+    /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -1541,8 +1539,7 @@ impl DataHeader {
     }
 
     /// Appends the encoded header to `out`, for a send path that reuses a
-    /// buffer (B-250). The canonical form has one implementation and this is
-    /// it; [`Self::encode`] is a wrapper.
+    /// buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         // Sorted and deduplicated by wire value, not by the enum's derived
         // order, because the wire value is what ascends on the wire.
@@ -1713,7 +1710,7 @@ impl ErrorHeader {
         weida_core::ErrorCode::from_wire(self.code)
     }
 
-    /// Encodes the header.
+    /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -1721,8 +1718,7 @@ impl ErrorHeader {
     }
 
     /// Appends the encoded header to `out`, for a send path that reuses a
-    /// buffer (B-250). The canonical form has one implementation and this is
-    /// it; [`Self::encode`] is a wrapper.
+    /// buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         let count = 1 + u64::from(self.message.is_some());
         encode_into_with(out, |e| {
@@ -1792,7 +1788,7 @@ impl SubscriptionHeader {
         }
     }
 
-    /// Encodes the header.
+    /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -1800,8 +1796,7 @@ impl SubscriptionHeader {
     }
 
     /// Appends the encoded header to `out`, for a send path that reuses a
-    /// buffer (B-250). The canonical form has one implementation and this is
-    /// it; [`Self::encode`] is a wrapper.
+    /// buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         // Keys 0 and 1 are required, so neither is elided: an absent filter
         // and an empty filter would otherwise be indistinguishable on the
@@ -1901,15 +1896,15 @@ impl FlowHeader {
         }
     }
 
-    /// Encodes the header.
+    /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
         out
     }
 
-    /// Appends the encoded header to `out`. The canonical form has one
-    /// implementation and this is it; [`Self::encode`] is a wrapper.
+    /// Appends the encoded header to `out`, for a send path that reuses a
+    /// buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         let count = 2
             + u64::from(self.content_type.is_some())
@@ -2024,7 +2019,7 @@ impl CreditHeader {
         }
     }
 
-    /// Encodes the header.
+    /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -2032,8 +2027,7 @@ impl CreditHeader {
     }
 
     /// Appends the encoded header to `out`, for a send path that reuses a
-    /// buffer (B-250). The canonical form has one implementation and this is
-    /// it; [`Self::encode`] is a wrapper.
+    /// buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         encode_into_with(out, |e| {
             e.map(3)?;
@@ -2093,7 +2087,7 @@ pub struct CursorHeader {
 }
 
 impl CursorHeader {
-    /// Encodes the header.
+    /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -2101,8 +2095,7 @@ impl CursorHeader {
     }
 
     /// Appends the encoded header to `out`, for a send path that reuses a
-    /// buffer (B-250). The canonical form has one implementation and this is
-    /// it; [`Self::encode`] is a wrapper.
+    /// buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         encode_into_with(out, |e| {
             e.map(1)?;

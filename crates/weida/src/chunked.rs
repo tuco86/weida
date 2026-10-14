@@ -21,14 +21,12 @@
 //!
 //! Five bytes per write and nothing per byte, and it carries what the socket
 //! could not: **a cancelled transfer is `Canceled` at the reader rather than a
-//! short payload that looks complete**. That was the review finding B-245 —
-//! three documents asserted the guarantee for every transport and one
-//! transport silently did not have it, with the failure mode an application
-//! reading half a message as a whole one and nothing anywhere naming it.
+//! short payload that looks complete**. A transport that cannot signal an
+//! abort would otherwise let an application read half a message as a whole
+//! one, with nothing anywhere naming it.
 //! [0012 §4.7(e)](../../../docs/decisions/0012-local-connection-grouping.md)
-//! had already priced the alternative and this is the shape it chose, now
-//! shared by both socket transports rather than implemented once per
-//! transport.
+//! priced the alternative and this is the shape it chose; both socket
+//! transports share it.
 //!
 //! What the framing still cannot carry is the **reader's** refusal: there is
 //! no `STOP_SENDING`, because on a pipe the writer's direction is the only one

@@ -46,7 +46,7 @@
 #[cfg(feature = "blocking")]
 pub mod blocking;
 
-// The chunk framing both socket transports share (B-245): a named pipe has no
+// The chunk framing both socket transports share: a named pipe has no
 // half-close and a unix socket has no abort, so the end of a payload is a
 // frame rather than a socket state.
 #[cfg(any(unix, windows))]
@@ -105,17 +105,6 @@ pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
 pub use pubsub::{DishDrops, FanOut, TopicDrops};
 pub use radio::{Join, JoinTerms, Received};
-pub use weida_core::{
-    Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
-    LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
-    WindowsPrincipal,
-};
-pub use weida_core::{Congestion, DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT};
-pub use weida_protocol::{ALPN, RAFT_ALPN, VERSION, codes, filter};
-pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
-// `Delivery` keeps its transfer-receipt meaning at this level, so the
-// dimension of the same name is re-exported under the name the guarantee
-// documents use for it.
 pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 pub use runtime::Runtime;
 pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
@@ -125,6 +114,16 @@ pub use transfer::{
     Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream,
     TransferMeta, new_trace,
 };
+pub use weida_core::{
+    Address, Congestion, DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT, EndpointAddr, Error,
+    ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal, LossCause, PeerIdentity, PipeAddr,
+    Result, StopReason, TraceContext, UnixAddr, WindowsPrincipal,
+};
+pub use weida_protocol::{ALPN, RAFT_ALPN, VERSION, codes, filter};
+pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
+// `Delivery` keeps its transfer-receipt meaning at this level, so the
+// dimension of the same name is re-exported under the name the guarantee
+// documents use for it.
 pub use weida_protocol::header::{
     Acknowledgement, Backpressure, CursorLevel, Deduplication, Delivery as DeliveryLevel,
     Durability, GuaranteeSet, OrderingMode, ProducerNaming, ReportMode,

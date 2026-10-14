@@ -24,8 +24,8 @@ fn full_request() -> DataHeader {
         tracestate: Some("vendor=value,other=thing".into()),
         topic: Some("px.eur".into()),
         // Keys 6 through 13 stay absent so this bench keeps measuring the
-        // same header as the numbers recorded in IMPLEMENTATION.md §4; their
-        // cost is B-009's separate measurement.
+        // same header as the numbers recorded in IMPLEMENTATION.md §4.2;
+        // their cost is the separate measurement of IMPLEMENTATION.md §4.4.
         sequence: None,
         producer: None,
         achieved: None,

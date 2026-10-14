@@ -5,10 +5,10 @@
 //! the wire codec and the transport share. Everything here is unit-testable
 //! without a socket.
 //!
-//! The correlation and acknowledgement state machines that used to live here
-//! are gone: Req/Rep rides one bidirectional QUIC stream, so the stream *is*
-//! the correlation, and delivery is QUIC's own transport receipt rather than an
-//! application-level ACK (`docs/ARCHITECTURE.md`, layer model).
+//! There are no correlation or acknowledgement state machines here: Req/Rep
+//! rides one bidirectional QUIC stream, so the stream *is* the correlation, and
+//! delivery is QUIC's own transport receipt rather than an application-level
+//! ACK (`docs/ARCHITECTURE.md`, layer model).
 
 pub mod addr;
 pub mod error;

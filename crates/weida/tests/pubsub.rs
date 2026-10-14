@@ -1,7 +1,7 @@
 //! Pub/Sub over real QUIC on loopback.
 //!
-//! Fan-out is the one genuinely new selection policy in Phase 3; everything
-//! else reuses the one-way transfer path. These tests pin the parts that are
+//! Fan-out is the one genuinely new selection policy of the pattern layer;
+//! everything else reuses the one-way transfer path. These tests pin the parts that are
 //! easy to get subtly wrong: prefix filtering, per-subscriber FIFO delivery,
 //! subscribe/unsubscribe bookkeeping, and the drop policy that keeps a slow
 //! subscriber from stalling the publisher.
@@ -94,7 +94,7 @@ async fn subscribe_filters_topics_by_segment() {
         0
     );
     // The boundary a byte prefix over-matched: `sensors.temp` must not select
-    // `sensors.temperature`. This assertion fails on the old matcher.
+    // `sensors.temperature`.
     assert_eq!(
         publisher
             .publish("sensors.temperature", &b"not mine"[..])
@@ -387,8 +387,8 @@ async fn slow_subscriber_drops_not_blocks() {
     fast_rt.shutdown().await;
 }
 
-/// A fan-out copy's metadata, including the half that changed with B-246:
-/// a publisher propagates a trace context and never mints one
+/// A fan-out copy's metadata, including the trace context:
+/// a publisher propagates one and never mints one
 /// ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
 ///
 /// Both directions are asserted on the same subscriber, because the claim is
@@ -444,7 +444,7 @@ async fn a_payload_larger_than_the_budget_is_refused() {
     assert!(matches!(err, Error::LimitExceeded), "{err:?}");
 }
 
-/// B-064: the payload `publish` refuses is an ordinary streamed publish, and
+/// The payload `publish` refuses is an ordinary streamed publish, and
 /// two subscribers both get all of it.
 #[tokio::test]
 async fn a_streamed_publish_carries_a_payload_no_publish_could_take() {
@@ -517,7 +517,7 @@ async fn a_streamed_publish_carries_a_payload_no_publish_could_take() {
     assert_eq!(publisher.dropped(), 0, "nobody was behind");
 }
 
-/// B-064: the drop is per subscriber, not per publish. One subscriber that
+/// The drop is per subscriber, not per publish. One subscriber that
 /// never reads loses the streamed transfer; the other gets every byte, and
 /// the publisher never waits for the one that stalled.
 #[tokio::test]
@@ -596,7 +596,7 @@ async fn a_streamed_publish_drops_the_subscriber_that_stalls_and_keeps_the_other
     assert_eq!(drops.total(), 1, "one copy, counted once: {drops:?}");
 }
 
-/// B-064: `write_now` is fan-out's `Drop` without a wait — the right call
+/// `write_now` is fan-out's `Drop` without a wait — the right call
 /// where a later chunk supersedes an earlier one. A subscriber that is not
 /// keeping up loses the transfer at the budget rather than slowing the
 /// publisher by even a bounded wait.

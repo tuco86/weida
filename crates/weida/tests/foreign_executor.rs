@@ -195,10 +195,10 @@ fn a_pub_sub_fan_out_runs_without_a_tokio_executor() {
 
         let subscriber = runtime.subscriber(certs.client_tls());
         subscriber.connect(&url).await.expect("connect");
-        // The empty filter matches every topic under both the byte-prefix rule
-        // the code implements today and the segmented grammar of
-        // `docs/decisions/0007-topic-namespace.md`, so this test does not move
-        // when the matcher does. Filtering itself is `tests/pubsub.rs`'s job.
+        // The empty filter matches every topic under any filter grammar, so
+        // this test does not move when the matcher does (grammar:
+        // `docs/decisions/0007-topic-namespace.md`). Filtering itself is
+        // `tests/pubsub.rs`'s job.
         subscriber.subscribe("").await.expect("subscribe");
 
         // SUBSCRIBE is a stream of its own, so it may still be in flight when

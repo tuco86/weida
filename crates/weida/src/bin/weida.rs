@@ -1,11 +1,11 @@
 //! `weida` — exercise an endpoint from a shell.
 //!
 //! Every example in this repository is a Rust file, so the shortest way to
-//! find out whether an endpoint is reachable used to be to write and compile a
-//! program. This binary is the first useful slice of the phase-11 tracker row
-//! ([IMPLEMENTATION.md](../../../docs/IMPLEMENTATION.md) §1, B-060): four verbs
-//! over the same library the examples use, with the payload on stdin and
-//! stdout so it composes with everything else in a pipeline.
+//! find out whether an endpoint is reachable would be to write and compile a
+//! program. This binary is four verbs
+//! ([IMPLEMENTATION.md](../../../docs/IMPLEMENTATION.md) §1) over the same
+//! library the examples use, with the payload on stdin and stdout so it
+//! composes with everything else in a pipeline.
 //!
 //! ```text
 //! weida serve --echo   weida://0.0.0.0:7443/echo [--identity PATH] [--cert-out PATH]
@@ -70,7 +70,7 @@ const CHUNK: usize = 64 * 1024;
 /// The default is a newline, because a subscriber's output is usually a log to
 /// look at — and a newline is *not framing*: a payload that contains one is
 /// indistinguishable from two payloads. So the choice is the caller's, stated
-/// rather than assumed (B-197).
+/// rather than assumed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Framing {
     /// A newline after each payload. Unambiguous only for payloads that
@@ -152,7 +152,7 @@ fn usage() -> ! {
 }
 
 /// A help *request*: the text on stdout and exit `0`, because asking for help
-/// is not a mistake (B-195).
+/// is not a mistake.
 fn help() -> ! {
     println!("{USAGE}");
     std::process::exit(0);

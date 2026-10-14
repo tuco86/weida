@@ -18,7 +18,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 
 /// The window: long enough that two frames sent back to back land inside it,
 /// short enough that waiting it out costs a fraction of a second. This is the
-/// smallest interval that demonstrates expiry on this machine; the assertions
+/// smallest interval that demonstrates expiry reliably; the assertions
 /// below never race it, because each one waits for an observable state
 /// change rather than for the clock.
 const WINDOW: Duration = Duration::from_millis(200);

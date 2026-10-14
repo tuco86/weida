@@ -28,8 +28,8 @@ use weida_protocol::header::Deduplication;
 /// every transfer here, so keeping it out of the key costs 32 bytes less per
 /// entry and changes nothing.
 ///
-/// **The key owns its scope, and that was measured rather than argued
-/// (B-040).** `is_duplicate` builds this key on every call, so `scope.into()`
+/// **The key owns its scope, and that is measured rather than argued.**
+/// `is_duplicate` builds this key on every call, so `scope.into()`
 /// allocates a `Box<str>` even on the two paths that insert nothing. The
 /// allocation costs **~10 ns** per call, and the obvious way to avoid it —
 /// a two-level `HashMap<Box<str>, HashMap<(producer, sequence), _>>`, whose
@@ -37,7 +37,7 @@ use weida_protocol::header::Deduplication;
 /// costs what the allocation cost, so the candidate measured 42.0-42.8 ns
 /// against this shape's 41.1-41.3 ns on a miss and the same within noise on a
 /// hit (`cargo bench -p weida --bench patterns -- dedup_key`,
-/// `docs/IMPLEMENTATION.md` §4). Against a 1 KiB push at ~7.9 µs it is
+/// `docs/IMPLEMENTATION.md` §4.12). Against a 1 KiB push at ~7.9 µs it is
 /// 0.13 %, and deduplication is opt-in, so a default connection never pays it
 /// at all. The flat key stays.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

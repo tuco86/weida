@@ -7,20 +7,18 @@
 //! module is only what a unix socket contributes to it: how it is dialled,
 //! how the kernel names its peer, and how its payload ends.
 //!
-//! **A half-close is not an abort, and that used to be a silent loss.** The
-//! kernel ends a socket's write direction one way: a shutdown the reader sees
-//! as EOF. There is no abort to pair with it — `SO_LINGER` with a zero timeout
-//! plus `close` is byte-for-byte a plain close at the reader — so a cancelled
-//! transfer, a dropped `OutgoingTransfer` and a producer that died mid-payload
-//! all arrived as a *complete* payload, and an application read half a message
-//! for a whole one with nothing on the wire to warn it (B-245). Three
-//! documents asserted the guarantee for every transport while this one did not
-//! have it.
+//! **A half-close is not an abort.** The kernel ends a socket's write
+//! direction one way: a shutdown the reader sees as EOF. There is no abort to
+//! pair with it — `SO_LINGER` with a zero timeout plus `close` is
+//! byte-for-byte a plain close at the reader — so without framing a cancelled
+//! transfer, a dropped `OutgoingTransfer` and a producer that died
+//! mid-payload would all arrive as a *complete* payload, and an application
+//! would read half a message for a whole one with nothing on the wire to warn
+//! it.
 //!
 //! So the payload is framed, in [`crate::chunked`]'s chunks — the framing the
-//! named-pipe transport has always used, now shared rather than duplicated, so
-//! the two socket transports have one convention and one reader. The cost is
-//! five bytes per write and the zero-copy read, which
+//! named-pipe transport shares, so the two socket transports have one
+//! convention and one reader. The cost is five bytes per write and the zero-copy read, which
 //! [0012 §4.7(e)](../../../docs/decisions/0012-local-connection-grouping.md)
 //! priced before choosing it.
 
@@ -143,7 +141,7 @@ impl Stream for UnixLocal {
     }
 
     /// A FIN chunk, which is what tells the reader the payload is complete —
-    /// and, since B-245, the *only* thing that does.
+    /// and the *only* thing that does.
     fn finish(writer: Self::Writer) {
         writer.end(Marker::Fin);
     }

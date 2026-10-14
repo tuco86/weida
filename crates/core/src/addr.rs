@@ -546,11 +546,10 @@ mod tests {
     fn rejects_bad_addresses() {
         let cases = [
             "mq://127.0.0.1:7443/x",
-            // `weida://127.0.0.1/x` used to be here, and is now the
-            // discovery form of 0020 §4.2: an authority without a port names
-            // a set, dialled on `DEFAULT_PORT`. For a literal there is
-            // nothing to resolve, so it is one node on the default port —
-            // coherent, and the rule that changed is a rule, not a leniency.
+            // `weida://127.0.0.1/x` is not here: it is the discovery form of
+            // 0020 §4.2. An authority without a port names a set, dialled on
+            // `DEFAULT_PORT`. For a literal there is nothing to resolve, so it
+            // is one node on the default port.
             "weida://127.0.0.1:7443",
             "weida://:7443/x",
             "weida://127.0.0.1:0/x",

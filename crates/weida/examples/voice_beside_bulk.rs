@@ -1,4 +1,4 @@
-//! B-289: what a bulk upload to the same host costs a voice flow, by path and
+//! What a bulk upload to the same host costs a voice flow, by path and
 //! by congestion controller
 //! ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §6).
 //!

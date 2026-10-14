@@ -282,7 +282,7 @@ pub enum Transport {
 /// A server reachable over either transport, so that one test body can be
 /// run over both.
 ///
-/// This is the point of the boundary B-037 introduced: nothing in the bodies
+/// This is the point of the transport boundary: nothing in the bodies
 /// below knows which transport it is on, because above the transport the
 /// frames, the HELLO exchange and the patterns are the same
 /// (`docs/PROTOCOL.md` §2.1).

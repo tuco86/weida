@@ -119,7 +119,7 @@ async fn a_flow_from_a_peer_without_the_datagram_capability_closes_the_connectio
 
 #[tokio::test]
 async fn a_credit_frame_for_a_path_with_no_queue_is_ignored() {
-    // Kind 5 is CREDIT as of B-202. A peer may send one for any path, and a
+    // Kind 5 is CREDIT. A peer may send one for any path, and a
     // path with no queue behind it has nothing to honour — so the frame is
     // dropped and the connection survives. Closing on it would let any peer
     // kill a connection with a legal frame, and there is no reply half to
