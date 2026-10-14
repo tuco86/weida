@@ -10,7 +10,7 @@
       .axis   { stroke:#90a4ae; }
     </style>
   </defs>
-  <text x="20" y="28" class="title">Latency by transport (B-059, loopback for QUIC, release, both ends in one process)</text>
+  <text x="20" y="28" class="title">Latency by transport (IMPLEMENTATION §4.13, loopback for QUIC, release, both ends in one process)</text>
 
   <!-- group 1: Req/Rep 1 KiB, scale 10 px per µs -->
   <text x="20" y="66" class="lbl">Req/Rep, 1 KiB</text>

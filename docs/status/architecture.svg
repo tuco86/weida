@@ -26,7 +26,7 @@
   <rect x="274" y="56" width="128" height="52" rx="4" class="built"/><text x="282" y="74" class="lbl">NNG C library</text><text x="282" y="88" class="sub">1.4.0-rc.0, nng crate</text><text x="282" y="100" class="sub">11 tests, both roles</text>
   <rect x="408" y="56" width="128" height="52" rx="4" class="built"/><text x="416" y="74" class="lbl">MQTT 5 brokers</text><text x="416" y="88" class="sub">rumqttd 0.20.0</text><text x="416" y="100" class="sub">rmqtt 0.23.1</text>
   <rect x="542" y="56" width="128" height="52" rx="4" class="built"/><text x="550" y="74" class="lbl">AMQP 1.0 peer</text><text x="550" y="88" class="sub">fe2o3-amqp 0.17.0</text><text x="550" y="100" class="sub">both roles</text>
-  <rect x="676" y="56" width="128" height="52" rx="4" class="missing"/><text x="684" y="74" class="lbl">nats-server</text><text x="684" y="88" class="sub">not on this machine</text><text x="684" y="100" class="sub">interop written, not run</text>
+  <rect x="676" y="56" width="128" height="52" rx="4" class="missing"/><text x="684" y="74" class="lbl">nats-server</text><text x="684" y="88" class="sub">needed by its interop</text><text x="684" y="100" class="sub">interop written, not run</text>
   <rect x="810" y="56" width="128" height="52" rx="4" class="built"/><text x="818" y="74" class="lbl">Python programs</text><text x="818" y="88" class="sub">six bindings, each</text><text x="818" y="100" class="sub">asyncio + synchronous</text>
 
   <!-- band 2: the competitor libraries -->
@@ -47,7 +47,7 @@
   <rect x="302" y="244" width="118" height="34" rx="4" class="built"/><text x="310" y="259" class="lbl">weida-nng-py</text><text x="310" y="272" class="sub">asyncio + sync</text>
 
   <rect x="464" y="144" width="152" height="38" rx="4" class="built"/><text x="472" y="160" class="lbl">weida-mqtt-codec</text><text x="472" y="174" class="sub">15 packets, empty deps</text>
-  <rect x="464" y="188" width="152" height="50" rx="4" class="built"/><text x="472" y="204" class="lbl">weida-mqtt</text><text x="472" y="218" class="sub">MQTT 5 client, both QoS</text><text x="472" y="231" class="sub">server half is Phase D</text>
+  <rect x="464" y="188" width="152" height="50" rx="4" class="built"/><text x="472" y="204" class="lbl">weida-mqtt</text><text x="472" y="218" class="sub">MQTT 5 client, both QoS</text><text x="472" y="231" class="sub">server half not built</text>
   <rect x="464" y="244" width="118" height="34" rx="4" class="built"/><text x="472" y="259" class="lbl">weida-mqtt-py</text><text x="472" y="272" class="sub">asyncio + sync</text>
 
   <rect x="626" y="144" width="152" height="38" rx="4" class="built"/><text x="634" y="160" class="lbl">weida-amqp-codec</text><text x="634" y="174" class="sub">9 performatives, empty deps</text>
@@ -72,7 +72,7 @@
   <text x="28" y="398" class="sub">its own</text>
   <rect x="140" y="350" width="300" height="58" rx="4" class="built"/><text x="148" y="368" class="lbl">weida-runtime</text><text x="148" y="383" class="sub">Exec · three reactor owners · capped resolver</text><text x="148" y="397" class="sub">AF_UNIX hygiene · NameRegistry · close budget</text>
   <rect x="452" y="350" width="236" height="58" rx="4" class="built"/><text x="460" y="368" class="lbl">weida-py-core</text><text x="460" y="383" class="sub">one exception class per variant</text><text x="460" y="397" class="sub">asyncio bridge · bytes boundary</text>
-  <rect x="700" y="350" width="240" height="58" rx="4" class="built"/><text x="708" y="368" class="lbl">weida-core</text><text x="708" y="383" class="sub">Address (3 schemes) · Limits · errors</text><text x="708" y="397" class="sub">one OS-error vocabulary, not two</text>
+  <rect x="700" y="350" width="240" height="58" rx="4" class="built"/><text x="708" y="368" class="lbl">weida-core</text><text x="708" y="383" class="sub">Address (4 schemes) · Limits · errors</text><text x="708" y="397" class="sub">one OS-error vocabulary, not two</text>
 
   <!-- weida -> shared foundation -->
   <path d="M216,446 L216,426" class="arrow"/>
@@ -92,16 +92,16 @@
   <rect x="464" y="458" width="152" height="40" rx="4" class="built"/><text x="472" y="475" class="lbl">Dedup</text><text x="472" y="489" class="sub">Bounded(window)</text>
   <rect x="626" y="458" width="152" height="40" rx="4" class="built"/><text x="634" y="475" class="lbl">Cursors</text><text x="634" y="489" class="sub">open levels · own stream</text>
   <rect x="788" y="458" width="152" height="40" rx="4" class="built"/><text x="796" y="475" class="lbl">Pool</text><text x="796" y="489" class="sub">one conn per dialled path</text>
-  <rect x="140" y="506" width="380" height="36" rx="4" class="built"/><text x="148" y="522" class="lbl">weida-protocol</text><text x="148" y="536" class="sub">DATA keys 0–11, key 12 reserved; 6 frame kinds, HELLO sets, fuzzed</text>
+  <rect x="140" y="506" width="380" height="36" rx="4" class="built"/><text x="148" y="522" class="lbl">weida-protocol</text><text x="148" y="536" class="sub">DATA keys 0–14, key 12 reserved; 9 frame kinds, HELLO sets, fuzzed</text>
   <rect x="530" y="506" width="410" height="36" rx="4" class="built"/><text x="538" y="522" class="lbl">Guarantee sets</text><text x="538" y="536" class="sub">core + supersets negotiated; Accepted reported as a cursor (kind 6)</text>
-  <rect x="140" y="550" width="380" height="36" rx="4" class="built"/><text x="148" y="566" class="lbl">weida-py</text><text x="148" y="580" class="sub">all six patterns + cursors · asyncio and sync · 32 tests</text>
+  <rect x="140" y="550" width="380" height="36" rx="4" class="built"/><text x="148" y="566" class="lbl">weida-py</text><text x="148" y="580" class="sub">all six patterns + cursors · asyncio and sync</text>
   <rect x="530" y="550" width="410" height="36" rx="4" class="partial"/><text x="538" y="566" class="lbl">weida-broker</text><text x="538" y="580" class="sub">admit · credit · settle/requeue built; attempt · relay · retire next</text>
   <rect x="140" y="594" width="800" height="30" rx="4" class="built"/><text x="148" y="613" class="lbl">Transport boundary — transport.rs: Link / SendHalf / RecvHalf as enums (no vtable on the payload path)</text>
   <rect x="140" y="636" width="192" height="46" rx="4" class="built"/><text x="148" y="652" class="lbl">QUIC (quinn)</text><text x="148" y="665" class="sub">TLS identity = fingerprint</text><text x="148" y="677" class="sub">one connection per path</text>
   <rect x="342" y="636" width="192" height="46" rx="4" class="built"/><text x="350" y="652" class="lbl">inproc</text><text x="350" y="665" class="sub">duplex channel pair per stream</text><text x="350" y="677" class="sub">peer = None</text>
-  <rect x="544" y="636" width="192" height="46" rx="4" class="built"/><text x="552" y="652" class="lbl">AF_UNIX (Linux, macOS)</text><text x="552" y="665" class="sub">control conn + SO_PEERCRED</text><text x="552" y="677" class="sub">shared chunk framing (B-245)</text>
-  <rect x="746" y="636" width="192" height="46" rx="4" class="built"/><text x="754" y="652" class="lbl">Named pipes (Windows)</text><text x="754" y="665" class="sub">B-039 built + Windows-gated</text><text x="754" y="677" class="sub">same grouped transport (0012)</text>
+  <rect x="544" y="636" width="192" height="46" rx="4" class="built"/><text x="552" y="652" class="lbl">AF_UNIX (Linux, macOS)</text><text x="552" y="665" class="sub">control conn + SO_PEERCRED</text><text x="552" y="677" class="sub">shared chunk framing</text>
+  <rect x="746" y="636" width="192" height="46" rx="4" class="built"/><text x="754" y="652" class="lbl">Named pipes (Windows)</text><text x="754" y="665" class="sub">built, Windows-gated</text><text x="754" y="677" class="sub">same grouped transport (0012)</text>
 
-  <text x="20" y="704" class="sub">No foreign-protocol library depends on weida or weida-protocol (0013 §4.2): it names its codec and weida-runtime, while a codec names nothing.</text>
-  <text x="20" y="720" class="sub">Sources: decisions 0013 §4.1–§4.2, 0014 §2; cargo metadata (25 members); docs/STATUS.md §2.</text>
+  <text x="20" y="704" class="sub">No foreign-protocol library depends on weida or weida-protocol (0013 §4.2): it names its codec, weida-runtime and weida-core, while a codec names nothing.</text>
+  <text x="20" y="720" class="sub">Sources: decisions 0013 §4.1–§4.2, 0014 §2; cargo metadata (25 members).</text>
 </svg>

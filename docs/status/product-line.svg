@@ -35,15 +35,15 @@
   <text x="44" y="152" class="sub">core is the floor, and a configured set may only be a superset of it</text>
   <text x="44" y="176" class="lbl">Transports — one variant each, below one boundary</text>
   <text x="44" y="192" class="sub">QUIC (quinn) · inproc · AF_UNIX (Linux, macOS) · named pipes (Windows)</text>
-  <text x="44" y="204" class="sub">Req/Rep 1 KiB: 13 µs inproc, 51 µs unix, 58 µs QUIC (B-059)</text>
-  <rect x="44" y="212" width="362" height="20" rx="3" class="built"/><text x="52" y="226" class="sub">all four transports built; named pipes Windows-gated in B-039</text>
+  <text x="44" y="204" class="sub">Req/Rep 1 KiB: 13 µs inproc, 51 µs unix, 58 µs QUIC (IMPLEMENTATION §4.13)</text>
+  <rect x="44" y="212" width="362" height="20" rx="3" class="built"/><text x="52" y="226" class="sub">all four transports built; named pipes Windows-gated</text>
   <text x="44" y="256" class="lbl">Patterns — transport-blind above the boundary</text>
   <text x="44" y="272" class="sub">Req/Rep · Push/Pull · Pub/Sub · PAIR · SURVEY · BUS</text>
   <text x="44" y="284" class="sub">cursors orthogonal; all six in async Rust, blocking Rust and Python</text>
   <rect x="44" y="292" width="362" height="20" rx="3" class="partial"/><text x="52" y="306" class="sub">broker: admission · credit · settle/requeue; store + cluster pending</text>
   <text x="44" y="336" class="lbl">Proof</text>
   <text x="44" y="352" class="sub">tests/transports.rs runs all six patterns over QUIC, inproc, AF_UNIX</text>
-  <text x="44" y="364" class="sub">and named pipes unchanged; broker settlement has four behavior tests;</text>
+  <text x="44" y="364" class="sub">and named pipes unchanged; broker settlement is proved by behavior tests;</text>
   <text x="44" y="376" class="sub">broker guarantee claims are asserted at the hop that earns them</text>
 
 
@@ -57,7 +57,7 @@
   <rect x="526" y="242" width="402" height="46" rx="4" class="built"/><text x="534" y="258" class="lbl">weida-amqp</text><text x="534" y="272" class="sub">AMQP 1.0 client: 9 performatives, both credit schemes, settle modes</text><text x="534" y="284" class="sub">interop in both roles against fe2o3-amqp 0.17.0</text>
   <rect x="526" y="292" width="402" height="46" rx="4" class="built"/><text x="534" y="308" class="lbl">weida-nats</text><text x="534" y="322" class="sub">Core NATS client: 12 verbs, both wildcards, queue groups, inbox reply</text><text x="534" y="334" class="sub">interop written and not run — no nats-server; its clause 4 says "not met"</text>
   <rect x="526" y="342" width="402" height="48" rx="4" class="built"/><text x="534" y="358" class="lbl">Python — five competitor bindings, one foundation</text><text x="534" y="372" class="sub">weida-zmq-py · weida-nng-py · weida-mqtt-py · weida-amqp-py · weida-nats-py</text><text x="534" y="384" class="sub">asyncio first, then sync; five wheel artifacts plus weida-py on the left</text>
-  <rect x="526" y="394" width="402" height="20" rx="3" class="missing"/><text x="534" y="408" class="sub">pending: MQTT's and AMQP's server halves (Phase D), and a NATS interop run</text>
+  <rect x="526" y="394" width="402" height="20" rx="3" class="missing"/><text x="534" y="408" class="sub">pending: MQTT's and AMQP's server halves, and a NATS interop run</text>
 
   <!-- both halves rest on the shared foundation -->
   <path d="M225,414 L225,426" class="arrow"/>
