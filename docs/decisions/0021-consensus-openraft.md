@@ -1,12 +1,12 @@
-# 0021: Consensus is a dependency, not a subsystem — openraft inside `weida-broker`
+# 0021 — Consensus is a dependency, not a subsystem — openraft inside `weida-broker`
 
-Status: provisional
-Date: 2026-09-13
-Relates to: the owner's Phase 7 direction; [0004](0004-durability-levels.md) §4.2, §4.3;
-[0008](0008-session-identity.md) §4.2; [0013](0013-competitor-libraries.md) §4.1-§4.3;
-[0018](0018-minimal-broker.md) §4.2, §4.7, §4.8; [0020](0020-cluster-and-discovery.md) §4.4-§4.6;
-[ARCHITECTURE.md](../ARCHITECTURE.md) §4; [IMPLEMENTATION.md](../IMPLEMENTATION.md) §1, §6 and
-non-goal 9; [INVARIANTS.md](../INVARIANTS.md); [PROTOCOL.md](../PROTOCOL.md) §2.2, §4, §5.
+- **Status:** provisional
+- **Date:** 2026-09-13
+- **Related:** the owner's Phase 7 direction; [0004](0004-durability-levels.md) §4.2, §4.3;
+  [0008](0008-session-identity.md) §4.2; [0013](0013-competitor-libraries.md) §4.1-§4.3;
+  [0018](0018-minimal-broker.md) §4.2, §4.7, §4.8; [0020](0020-cluster-and-discovery.md) §4.4-§4.6;
+  [ARCHITECTURE.md](../ARCHITECTURE.md) §4; [IMPLEMENTATION.md](../IMPLEMENTATION.md) §1, §6 and
+  non-goal 9; [INVARIANTS.md](../INVARIANTS.md); [PROTOCOL.md](../PROTOCOL.md) §2.2, §4, §5.
 
 ## 1. The question
 

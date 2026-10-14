@@ -1,8 +1,9 @@
-# 0026: The guide, and the question it answers
+# 0026 — The guide, and the question it answers
 
-Status: provisional
-Date: 2026-09-14
-Relates to: research/zeromq.md §1 sources, §9; decisions 0013 §4.7 clause 5, 0025; B-090..B-092
+- **Status:** accepted
+- **Date:** 2026-09-14
+- **Accepted:** 2026-10-13
+- **Related:** research/zeromq.md §1 sources, §9; decisions 0013 §4.7 clause 5, 0025; B-090..B-092
 
 ## 1. The question
 

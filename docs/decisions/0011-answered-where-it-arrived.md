@@ -1,10 +1,10 @@
-# 0011: Server-initiated traffic is answered where the registration arrived
+# 0011 — Server-initiated traffic is answered where the registration arrived
 
-Status: accepted
-Date: 2026-09-11
-Relates to: [0002](0002-control-and-bulk-separation.md) §6.3, §7; [0003](0003-credit-unit.md)
-§4.2; [0008](0008-session-identity.md) §4.2; [PROTOCOL.md](../PROTOCOL.md) §2.5, §6.4, §9.5,
-§11; P4 and P12 of [SYNTHESIS.md](../research/SYNTHESIS.md) §8.2.
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** [0002](0002-control-and-bulk-separation.md) §6.3, §7; [0003](0003-credit-unit.md)
+  §4.2; [0008](0008-session-identity.md) §4.2; [PROTOCOL.md](../PROTOCOL.md) §2.5, §6.4, §9.5,
+  §11; P4 and P12 of [SYNTHESIS.md](../research/SYNTHESIS.md) §8.2.
 
 ## 1. The question
 

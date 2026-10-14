@@ -1,7 +1,8 @@
 # 0032 — Where an identity comes from, and how a process is handed one
 
-- **Status:** provisional
+- **Status:** accepted
 - **Date:** 2026-09-18
+- **Accepted:** 2026-10-13
 - **Items:** B-274, B-275, B-276, B-277, B-278
 - **Supersedes:** nothing
 - **Related:** [0008](0008-session-identity.md) §4.2, [0015](0015-peer-authorization.md),

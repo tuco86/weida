@@ -1,11 +1,11 @@
-# 0014: Four parallel library workstreams, and bindings that follow each library
+# 0014 — Four parallel library workstreams, and bindings that follow each library
 
-Status: accepted
-Date: 2026-09-12
-Relates to: [0013](0013-competitor-libraries.md) §4.1, §4.4;
-[LOOP.md](../LOOP.md) §9 Phase B, Phase C, Phase D;
-[research/nanomsg-nng.md](../research/nanomsg-nng.md); [research/mqtt5.md](../research/mqtt5.md);
-[research/amqp10.md](../research/amqp10.md); [research/nats.md](../research/nats.md)
+- **Status:** accepted
+- **Date:** 2026-09-12
+- **Related:** [0013](0013-competitor-libraries.md) §4.1, §4.4;
+  [LOOP.md](../LOOP.md) §9 Phase B, Phase C, Phase D;
+  [research/nanomsg-nng.md](../research/nanomsg-nng.md); [research/mqtt5.md](../research/mqtt5.md);
+  [research/amqp10.md](../research/amqp10.md); [research/nats.md](../research/nats.md)
 
 ## 1. The question
 

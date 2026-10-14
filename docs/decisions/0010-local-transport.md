@@ -1,8 +1,8 @@
-# 0010: The local transport, per platform
+# 0010 — The local transport, per platform
 
-Status: accepted
-Date: 2026-09-11
-Relates to: SYNTHESIS §8.8; P18, P14; LOOP §9 A9; decisions 0002 §6.2, 0006 §4.6, 0008 §4.1
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** SYNTHESIS §8.8; P18, P14; LOOP §9 A9; decisions 0002 §6.2, 0006 §4.6, 0008 §4.1
 
 ## 1. The question
 

@@ -1,7 +1,8 @@
 # 0031 — Transparent redial, and the outbox that makes a `send` a message
 
-- **Status:** provisional
+- **Status:** accepted
 - **Date:** 2026-09-18
+- **Accepted:** 2026-10-13
 - **Items:** B-270, B-271, B-272, B-273; amends B-259
 - **Supersedes:** [ARCHITECTURE.md](../ARCHITECTURE.md) §6c point 1 ("no mute state"),
   [PATTERNS.md](../PATTERNS.md) §1.8 ("Nothing reconnects")

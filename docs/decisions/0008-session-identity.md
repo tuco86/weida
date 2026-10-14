@@ -1,9 +1,9 @@
-# 0008: Session identity — the proved fingerprint, and nothing else
+# 0008 — Session identity — the proved fingerprint, and nothing else
 
-Status: accepted
-Date: 2026-09-11
-Relates to: the open item of 0001 §8; P2, P6, P14; decisions 0001 §7.3 and §8, 0002 §6.3
-and §7
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** the open item of 0001 §8; P2, P6, P14; decisions 0001 §7.3 and §8, 0002 §6.3
+  and §7
 
 ## 1. The question
 

@@ -1,8 +1,8 @@
-# 0007: The topic namespace — opaque paths, segmented topic filters
+# 0007 — The topic namespace — opaque paths, segmented topic filters
 
-Status: accepted
-Date: 2026-09-11
-Relates to: SYNTHESIS §8.9; P5, P11; decisions 0002 §6.2, 0003 §4.2
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** SYNTHESIS §8.9; P5, P11; decisions 0002 §6.2, 0003 §4.2
 
 ## 1. The question
 

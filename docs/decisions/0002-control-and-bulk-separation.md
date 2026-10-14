@@ -1,8 +1,8 @@
-# 0002: Control and bulk traffic — separation against head-of-line coupling
+# 0002 — Control and bulk traffic — separation against head-of-line coupling
 
-Status: accepted
-Date: 2026-09-10 (drafted), 2026-09-10 (accepted)
-Relates to: SYNTHESIS §8.2; P4, P12; decision 0001 §7.8
+- **Status:** accepted
+- **Date:** 2026-09-10 (drafted), 2026-09-10 (accepted)
+- **Related:** SYNTHESIS §8.2; P4, P12; decision 0001 §7.8
 
 ## 1. The question
 

@@ -1,17 +1,17 @@
-# 0018: The minimal L2 broker — a queue at a path, `Accepted` in, `Processed` out
+# 0018 — The minimal L2 broker — a queue at a path, `Accepted` in, `Processed` out
 
-Status: provisional
-Date: 2026-09-14
-Relates to: B-198; [LOOP.md](../LOOP.md) §5, §9 (Phase D, D2);
-[0003](0003-credit-unit.md) §4.1-§4.4, §5; [0004](0004-durability-levels.md) §4.1-§4.6, §5;
-[0006](0006-guarantee-sets.md) §4.4, §4.7-§4.9; [0007](0007-topic-namespace.md) §4.1, §4.2, §5;
-[0008](0008-session-identity.md) §4.5, §4.6; [0009](0009-drain.md) §4.2-§4.8;
-[0011](0011-answered-where-it-arrived.md) §4.2, §4.3; [0016](0016-conflation.md) §4.1, §4.7,
-§4.10; [GUARANTEES.md](../GUARANTEES.md) §1, §2, §3, §4, §6; [PROTOCOL.md](../PROTOCOL.md) §4,
-§6.4, §6.5, §9.4, §9.5, §10, §11; [ARCHITECTURE.md](../ARCHITECTURE.md) §1, §2, §4;
-[FAILURE_MODEL.md](../FAILURE_MODEL.md) §3; [IMPLEMENTATION.md](../IMPLEMENTATION.md) §1, §6;
-[INVARIANTS.md](../INVARIANTS.md); P3, P7 and P12 of
-[SYNTHESIS.md](../research/SYNTHESIS.md).
+- **Status:** provisional
+- **Date:** 2026-09-14
+- **Related:** B-198; [LOOP.md](../LOOP.md) §5, §9 (Phase D, D2);
+  [0003](0003-credit-unit.md) §4.1-§4.4, §5; [0004](0004-durability-levels.md) §4.1-§4.6, §5;
+  [0006](0006-guarantee-sets.md) §4.4, §4.7-§4.9; [0007](0007-topic-namespace.md) §4.1, §4.2, §5;
+  [0008](0008-session-identity.md) §4.5, §4.6; [0009](0009-drain.md) §4.2-§4.8;
+  [0011](0011-answered-where-it-arrived.md) §4.2, §4.3; [0016](0016-conflation.md) §4.1, §4.7,
+  §4.10; [GUARANTEES.md](../GUARANTEES.md) §1, §2, §3, §4, §6; [PROTOCOL.md](../PROTOCOL.md) §4,
+  §6.4, §6.5, §9.4, §9.5, §10, §11; [ARCHITECTURE.md](../ARCHITECTURE.md) §1, §2, §4;
+  [FAILURE_MODEL.md](../FAILURE_MODEL.md) §3; [IMPLEMENTATION.md](../IMPLEMENTATION.md) §1, §6;
+  [INVARIANTS.md](../INVARIANTS.md); P3, P7 and P12 of
+  [SYNTHESIS.md](../research/SYNTHESIS.md).
 
 ## 1. The question
 

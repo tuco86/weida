@@ -1,8 +1,8 @@
-# 0009: A bounded drain at shutdown
+# 0009 — A bounded drain at shutdown
 
-Status: accepted
-Date: 2026-09-11
-Relates to: SYNTHESIS §8.6; P17; decisions 0005 §4.2, 0006 §4.2
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** SYNTHESIS §8.6; P17; decisions 0005 §4.2, 0006 §4.2
 
 ## 1. The question
 

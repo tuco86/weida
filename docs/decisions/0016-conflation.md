@@ -1,14 +1,14 @@
-# 0016: Conflation — keep the newest, discard the rest
+# 0016 — Conflation — keep the newest, discard the rest
 
-Status: provisional
-Date: 2026-09-13
-Relates to: B-065; [requirements/zeughaus-video.md](../requirements/zeughaus-video.md) request
-2; [0001](0001-sequence-field.md) §7.1, §7.2; [0003](0003-credit-unit.md) §4.2;
-[0006](0006-guarantee-sets.md) §4.1-§4.5; [0007](0007-topic-namespace.md) §4.1;
-[0009](0009-drain.md) §4.4; [0012](0012-local-connection-grouping.md) §4.4;
-[GUARANTEES.md](../GUARANTEES.md) §3, §4, §6; [PROTOCOL.md](../PROTOCOL.md) §4, §5, §6.2,
-§6.4, §6.5, §7, §9.5, §11; [PATTERNS.md](../PATTERNS.md) §4, §4.1;
-[INVARIANTS.md](../INVARIANTS.md); P4 and P5 of [SYNTHESIS.md](../research/SYNTHESIS.md).
+- **Status:** provisional
+- **Date:** 2026-09-13
+- **Related:** B-065; [requirements/zeughaus-video.md](../requirements/zeughaus-video.md) request
+  2; [0001](0001-sequence-field.md) §7.1, §7.2; [0003](0003-credit-unit.md) §4.2;
+  [0006](0006-guarantee-sets.md) §4.1-§4.5; [0007](0007-topic-namespace.md) §4.1;
+  [0009](0009-drain.md) §4.4; [0012](0012-local-connection-grouping.md) §4.4;
+  [GUARANTEES.md](../GUARANTEES.md) §3, §4, §6; [PROTOCOL.md](../PROTOCOL.md) §4, §5, §6.2,
+  §6.4, §6.5, §7, §9.5, §11; [PATTERNS.md](../PATTERNS.md) §4, §4.1;
+  [INVARIANTS.md](../INVARIANTS.md); P4 and P5 of [SYNTHESIS.md](../research/SYNTHESIS.md).
 
 ## 1. The question
 

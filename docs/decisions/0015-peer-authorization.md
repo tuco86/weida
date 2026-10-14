@@ -1,13 +1,14 @@
-# 0015: Peer authorization — no credential in the handshake, a verdict per path
+# 0015 — Peer authorization — no credential in the handshake, a verdict per path
 
-Status: provisional
-Date: 2026-09-13
-Relates to: B-066; [requirements/zeughaus-video.md](../requirements/zeughaus-video.md) request
-3; [0005](0005-refusal-race.md); [0007](0007-topic-namespace.md) §4;
-[0008](0008-session-identity.md) §4.1, §4.2, §4.5, §4.7; [0010](0010-local-transport.md) §4.4;
-[0011](0011-answered-where-it-arrived.md) §4.1-§4.3; [PROTOCOL.md](../PROTOCOL.md) §2.2, §5,
-§6.1, §6.4, §9.4, §11; [INVARIANTS.md](../INVARIANTS.md); P14 and D6 of
-[SYNTHESIS.md](../research/SYNTHESIS.md).
+- **Status:** accepted
+- **Date:** 2026-09-13
+- **Accepted:** 2026-10-13
+- **Related:** B-066; [requirements/zeughaus-video.md](../requirements/zeughaus-video.md) request
+  3; [0005](0005-refusal-race.md); [0007](0007-topic-namespace.md) §4;
+  [0008](0008-session-identity.md) §4.1, §4.2, §4.5, §4.7; [0010](0010-local-transport.md) §4.4;
+  [0011](0011-answered-where-it-arrived.md) §4.1-§4.3; [PROTOCOL.md](../PROTOCOL.md) §2.2, §5,
+  §6.1, §6.4, §9.4, §11; [INVARIANTS.md](../INVARIANTS.md); P14 and D6 of
+  [SYNTHESIS.md](../research/SYNTHESIS.md).
 
 ## 1. The question
 

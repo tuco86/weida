@@ -1,8 +1,8 @@
-# 0006: Guarantee sets and explicit managed-resource boundaries
+# 0006 — Guarantee sets and explicit managed-resource boundaries
 
-Status: accepted
-Date: 2026-09-11
-Relates to: SYNTHESIS §8.7; P1, P7, P9, P14; decisions 0001 §7.3, 0003 §4.2, 0004 §4.4
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** SYNTHESIS §8.7; P1, P7, P9, P14; decisions 0001 §7.3, 0003 §4.2, 0004 §4.4
 
 ## 1. The question
 

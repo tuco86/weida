@@ -1,8 +1,8 @@
-# 0001: Sequence field — scope and layer
+# 0001 — Sequence field — scope and layer
 
-Status: accepted
-Date: 2026-09-10 (drafted), 2026-09-10 (accepted)
-Relates to: SYNTHESIS §8.4; P8, P9, P5, P16
+- **Status:** accepted
+- **Date:** 2026-09-10 (drafted), 2026-09-10 (accepted)
+- **Related:** SYNTHESIS §8.4; P8, P9, P5, P16
 
 ## 1. The question
 

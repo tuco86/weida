@@ -1,8 +1,8 @@
-# 0003: Flow-control credit — unit and layer
+# 0003 — Flow-control credit — unit and layer
 
-Status: accepted
-Date: 2026-09-10
-Relates to: SYNTHESIS §8.1; P3, P4, P12; decisions 0001 §7.8, 0002 §6
+- **Status:** accepted
+- **Date:** 2026-09-10
+- **Related:** SYNTHESIS §8.1; P3, P4, P12; decisions 0001 §7.8, 0002 §6
 
 ## 1. The question
 

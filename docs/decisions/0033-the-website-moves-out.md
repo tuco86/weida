@@ -1,7 +1,8 @@
 # 0033 — The website moves out of the tree, and its rules go with it
 
-- **Status:** provisional
+- **Status:** accepted
 - **Date:** 2026-09-26
+- **Accepted:** 2026-10-13
 - **Items:** closes B-254; retires what B-253 built
 - **Supersedes:** [0025](0025-the-website.md), all of it
 - **Related:** [0025](0025-the-website.md) §2, §4.1-§4.7, §5; [0028](0028-trace-propagation-is-the-callers.md)

@@ -1,12 +1,12 @@
-# 0022: One consensus group for the cluster, one per replicated queue, and payload in neither
+# 0022 — One consensus group for the cluster, one per replicated queue, and payload in neither
 
-Status: provisional
-Date: 2026-09-13
-Relates to: the owner's Phase 7 direction; [0004](0004-durability-levels.md) §4.2, §4.3;
-[0018](0018-minimal-broker.md) §4.5, §4.7, §4.8; [0020](0020-cluster-and-discovery.md) §4.3-§4.6;
-[0021](0021-consensus-openraft.md) §4.3-§4.6; [STORE.md](../STORE.md) §1, §5;
-[GUARANTEES.md](../GUARANTEES.md) §1, §4; [FAILURE_MODEL.md](../FAILURE_MODEL.md) §3;
-[INVARIANTS.md](../INVARIANTS.md); [IMPLEMENTATION.md](../IMPLEMENTATION.md) non-goal 9.
+- **Status:** provisional
+- **Date:** 2026-09-13
+- **Related:** the owner's Phase 7 direction; [0004](0004-durability-levels.md) §4.2, §4.3;
+  [0018](0018-minimal-broker.md) §4.5, §4.7, §4.8; [0020](0020-cluster-and-discovery.md) §4.3-§4.6;
+  [0021](0021-consensus-openraft.md) §4.3-§4.6; [STORE.md](../STORE.md) §1, §5;
+  [GUARANTEES.md](../GUARANTEES.md) §1, §4; [FAILURE_MODEL.md](../FAILURE_MODEL.md) §3;
+  [INVARIANTS.md](../INVARIANTS.md); [IMPLEMENTATION.md](../IMPLEMENTATION.md) non-goal 9.
 
 ## 1. The question
 

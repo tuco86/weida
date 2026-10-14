@@ -1,8 +1,8 @@
-# 0005: The refusal race — closed as documented behaviour
+# 0005 — The refusal race — closed as documented behaviour
 
-Status: accepted
-Date: 2026-09-11
-Relates to: SYNTHESIS §8.5; P1, P16; decisions 0001 §7.2, 0002 §6.5, 0003 §4.1
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** SYNTHESIS §8.5; P1, P16; decisions 0001 §7.2, 0002 §6.5, 0003 §4.1
 
 ## 1. The question
 

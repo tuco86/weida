@@ -1,15 +1,15 @@
-# 0020: A cluster is a set of nodes the client may know about — DNS says who, the protocol says who leads
+# 0020 — A cluster is a set of nodes the client may know about — DNS says who, the protocol says who leads
 
-Status: provisional
-Date: 2026-09-13
-Relates to: the owner's Phase 6/7 direction; [0002](0002-control-and-bulk-separation.md) §6.2;
-[0003](0003-credit-unit.md) §4.2; [0004](0004-durability-levels.md) §4.2, §4.3;
-[0006](0006-guarantee-sets.md) §4.4; [0008](0008-session-identity.md) §4.2-§4.6;
-[0011](0011-answered-where-it-arrived.md) §4.3; [0018](0018-minimal-broker.md) §4.5, §4.7, §4.9;
-[0021](0021-consensus-openraft.md); [ARCHITECTURE.md](../ARCHITECTURE.md) §1, §3, §4;
-[GUARANTEES.md](../GUARANTEES.md) §1, §2, §4; [PROTOCOL.md](../PROTOCOL.md) §2.5, §4, §9.4, §10;
-[FAILURE_MODEL.md](../FAILURE_MODEL.md) §3; [IMPLEMENTATION.md](../IMPLEMENTATION.md) §1, §6 and
-its non-goals 9 and 10; [INVARIANTS.md](../INVARIANTS.md).
+- **Status:** provisional
+- **Date:** 2026-09-13
+- **Related:** the owner's Phase 6/7 direction; [0002](0002-control-and-bulk-separation.md) §6.2;
+  [0003](0003-credit-unit.md) §4.2; [0004](0004-durability-levels.md) §4.2, §4.3;
+  [0006](0006-guarantee-sets.md) §4.4; [0008](0008-session-identity.md) §4.2-§4.6;
+  [0011](0011-answered-where-it-arrived.md) §4.3; [0018](0018-minimal-broker.md) §4.5, §4.7, §4.9;
+  [0021](0021-consensus-openraft.md); [ARCHITECTURE.md](../ARCHITECTURE.md) §1, §3, §4;
+  [GUARANTEES.md](../GUARANTEES.md) §1, §2, §4; [PROTOCOL.md](../PROTOCOL.md) §2.5, §4, §9.4, §10;
+  [FAILURE_MODEL.md](../FAILURE_MODEL.md) §3; [IMPLEMENTATION.md](../IMPLEMENTATION.md) §1, §6 and
+  its non-goals 9 and 10; [INVARIANTS.md](../INVARIANTS.md).
 
 ## 1. The question
 

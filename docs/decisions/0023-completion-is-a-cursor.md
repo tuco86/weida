@@ -1,15 +1,15 @@
-# 0023: A completion is a cursor, and wire state is not one of them
+# 0023 — A completion is a cursor, and wire state is not one of them
 
-Status: provisional
-Date: 2026-09-13
-Relates to: the owner's direction on acknowledgements and on wire state;
-[0003](0003-credit-unit.md) §4.2-§4.4; [0004](0004-durability-levels.md) §4.1-§4.5;
-[0005](0005-refusal-race.md) §4.2; [0006](0006-guarantee-sets.md) §4.4, §4.7;
-[0009](0009-drain.md) §4.2; [0016](0016-conflation.md) §4.10;
-[0018](0018-minimal-broker.md) §4.3, §4.6; [0020](0020-cluster-and-discovery.md) §4.5;
-[STORE.md](../STORE.md) §2.4, §5; [PATTERNS.md](../PATTERNS.md) §1.1, §1.2;
-[PROTOCOL.md](../PROTOCOL.md) §4, §4.1, §6.2, §6.5, §6.6, §9.2;
-[GUARANTEES.md](../GUARANTEES.md) §1, §2, §6; [INVARIANTS.md](../INVARIANTS.md).
+- **Status:** provisional
+- **Date:** 2026-09-13
+- **Related:** the owner's direction on acknowledgements and on wire state;
+  [0003](0003-credit-unit.md) §4.2-§4.4; [0004](0004-durability-levels.md) §4.1-§4.5;
+  [0005](0005-refusal-race.md) §4.2; [0006](0006-guarantee-sets.md) §4.4, §4.7;
+  [0009](0009-drain.md) §4.2; [0016](0016-conflation.md) §4.10;
+  [0018](0018-minimal-broker.md) §4.3, §4.6; [0020](0020-cluster-and-discovery.md) §4.5;
+  [STORE.md](../STORE.md) §2.4, §5; [PATTERNS.md](../PATTERNS.md) §1.1, §1.2;
+  [PROTOCOL.md](../PROTOCOL.md) §4, §4.1, §6.2, §6.5, §6.6, §9.2;
+  [GUARANTEES.md](../GUARANTEES.md) §1, §2, §6; [INVARIANTS.md](../INVARIANTS.md).
 
 ## 1. The question
 

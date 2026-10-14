@@ -1,9 +1,9 @@
-# 0012: Grouping local connections into a peer
+# 0012 — Grouping local connections into a peer
 
-Status: accepted
-Date: 2026-09-11
-Relates to: [0010](0010-local-transport.md) §4.2, §4.4; [0008](0008-session-identity.md) §4.1,
-§4.2, §4.5; [0002](0002-control-and-bulk-separation.md) §6.2; B-038, B-039
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** [0010](0010-local-transport.md) §4.2, §4.4; [0008](0008-session-identity.md) §4.1,
+  §4.2, §4.5; [0002](0002-control-and-bulk-separation.md) §6.2; B-038, B-039
 
 ## 1. The question
 

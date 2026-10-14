@@ -1,8 +1,8 @@
-# 0004: Durability levels for `Stored` and `Replicated`
+# 0004 — Durability levels for `Stored` and `Replicated`
 
-Status: accepted
-Date: 2026-09-11
-Relates to: SYNTHESIS §8.3; P7, P9; decisions 0001 §7.1, 0003 §4.2
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Related:** SYNTHESIS §8.3; P7, P9; decisions 0001 §7.1, 0003 §4.2
 
 ## 1. The question
 

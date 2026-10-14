@@ -1,10 +1,10 @@
-# 0013: Standalone foreign-protocol libraries beside weida
+# 0013 — Standalone foreign-protocol libraries beside weida
 
-Status: revised
-Date: 2026-09-11
-Revised: 2026-09-18
-Relates to: [ARCHITECTURE.md](../ARCHITECTURE.md) §4;
-[LOOP.md](../LOOP.md) §9; [0014](0014-parallel-libraries.md)
+- **Status:** accepted
+- **Date:** 2026-09-11
+- **Revised:** 2026-09-18
+- **Related:** [ARCHITECTURE.md](../ARCHITECTURE.md) §4;
+  [LOOP.md](../LOOP.md) §9; [0014](0014-parallel-libraries.md)
 
 ## 1. The question
 

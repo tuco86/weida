@@ -1,11 +1,12 @@
-# 0024: Three pattern families on one surface, and one back channel
+# 0024 — Three pattern families on one surface, and one back channel
 
-Status: provisional
-Date: 2026-09-13
-Relates to: the owner's restatement of the model; [ARCHITECTURE.md](../ARCHITECTURE.md) §1, §6a, §6b, §7;
-[0018](0018-minimal-broker.md) §4.3, §4.6; [0023](0023-completion-is-a-cursor.md) §4.2-§4.5;
-[PATTERNS.md](../PATTERNS.md) §1.2, §1.11; [PROTOCOL.md](../PROTOCOL.md) §4.1, §6.5;
-[GUARANTEES.md](../GUARANTEES.md) §1, §2; [INVARIANTS.md](../INVARIANTS.md).
+- **Status:** accepted
+- **Date:** 2026-09-13
+- **Accepted:** 2026-10-13
+- **Related:** the owner's restatement of the model; [ARCHITECTURE.md](../ARCHITECTURE.md) §1, §6a, §6b, §7;
+  [0018](0018-minimal-broker.md) §4.3, §4.6; [0023](0023-completion-is-a-cursor.md) §4.2-§4.5;
+  [PATTERNS.md](../PATTERNS.md) §1.2, §1.11; [PROTOCOL.md](../PROTOCOL.md) §4.1, §6.5;
+  [GUARANTEES.md](../GUARANTEES.md) §1, §2; [INVARIANTS.md](../INVARIANTS.md).
 
 ## 1. The question
 

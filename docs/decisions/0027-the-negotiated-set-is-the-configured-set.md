@@ -1,7 +1,8 @@
 # 0027 — A live connection's guarantee set is the one it configured, so nothing reports it
 
-- **Status:** provisional
+- **Status:** accepted
 - **Date:** 2026-09-14
+- **Accepted:** 2026-10-13
 - **Items:** B-262, found by B-256
 - **Supersedes:** nothing
 - **Related:** [0006](0006-guarantee-sets.md), [GUARANTEES.md](../GUARANTEES.md) §4,

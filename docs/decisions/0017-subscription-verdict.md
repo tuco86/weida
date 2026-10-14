@@ -1,14 +1,14 @@
-# 0017: A per-subscription verdict — the silence stays, and it is now defined
+# 0017 — A per-subscription verdict — the silence stays, and it is now defined
 
-Status: provisional
-Date: 2026-09-13
-Relates to: B-193; [0015](0015-peer-authorization.md) §4.3-§4.5, §5;
-[0011](0011-answered-where-it-arrived.md) §3, §4.1-§4.3; [0005](0005-refusal-race.md);
-[0003](0003-credit-unit.md) §4.2; [0007](0007-topic-namespace.md) §4;
-[0012](0012-local-connection-grouping.md) §4.4; [0016](0016-conflation.md) §4.6;
-[PROTOCOL.md](../PROTOCOL.md) §3.2, §4, §4.1, §5, §6.1-§6.5, §7, §9.4, §9.5, §11;
-[PATTERNS.md](../PATTERNS.md) §4, §4.1; [GUARANTEES.md](../GUARANTEES.md) §6;
-[INVARIANTS.md](../INVARIANTS.md); [libraries/zmq.md](../libraries/zmq.md) §9.
+- **Status:** provisional
+- **Date:** 2026-09-13
+- **Related:** B-193; [0015](0015-peer-authorization.md) §4.3-§4.5, §5;
+  [0011](0011-answered-where-it-arrived.md) §3, §4.1-§4.3; [0005](0005-refusal-race.md);
+  [0003](0003-credit-unit.md) §4.2; [0007](0007-topic-namespace.md) §4;
+  [0012](0012-local-connection-grouping.md) §4.4; [0016](0016-conflation.md) §4.6;
+  [PROTOCOL.md](../PROTOCOL.md) §3.2, §4, §4.1, §5, §6.1-§6.5, §7, §9.4, §9.5, §11;
+  [PATTERNS.md](../PATTERNS.md) §4, §4.1; [GUARANTEES.md](../GUARANTEES.md) §6;
+  [INVARIANTS.md](../INVARIANTS.md); [libraries/zmq.md](../libraries/zmq.md) §9.
 
 ## 1. The question
 

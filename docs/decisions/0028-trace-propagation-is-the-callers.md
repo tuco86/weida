@@ -1,7 +1,8 @@
 # 0028 — A trace context is propagated, never minted
 
-- **Status:** provisional
+- **Status:** accepted
 - **Date:** 2026-09-14
+- **Accepted:** 2026-10-13
 - **Items:** B-246
 - **Supersedes:** nothing
 - **Related:** [PROTOCOL.md](../PROTOCOL.md) §6.2, [0001](0001-sequence-field.md),

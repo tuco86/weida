@@ -1,8 +1,8 @@
-# 0025: The website is the document set, rendered
+# 0025 — The website is the document set, rendered
 
-Status: superseded by [0033](0033-the-website-moves-out.md)
-Date: 2026-09-14
-Relates to: B-068 (the publish metadata that named `homepage`); decisions 0013 §5.5, 0014 §2
+- **Status:** superseded by [0033](0033-the-website-moves-out.md)
+- **Date:** 2026-09-14
+- **Related:** B-068 (the publish metadata that named `homepage`); decisions 0013 §5.5, 0014 §2
 
 ## 1. The question
 
