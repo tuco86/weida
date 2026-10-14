@@ -33,7 +33,7 @@ struct Subscription {
     /// arrives late would otherwise lower a limit the consumer has already
     /// raised. Keeping the maximum is what makes a duplicated or reordered
     /// grant change nothing
-    /// ([0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+    /// ([0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
     /// §4.3).
     limit: u64,
     /// Messages delivered on this subscription since it was created.
@@ -83,12 +83,10 @@ pub(crate) struct Consumers {
     subs: HashMap<ConsumerId, HashMap<String, Subscription>>,
     /// Grants whose SUBSCRIBE has not arrived yet, newest last.
     ///
-    /// A grant used to be discarded when its subscription was unknown, on the
-    /// theory that the consumer would restate it — and nothing does:
-    /// `weida::Subscriber::grant` is a one-shot application call, so a grant
-    /// that lost the race left its consumer receiving nothing, forever, with
-    /// no error on either side. It is held here instead, and
-    /// [`Consumers::subscribe`] applies it.
+    /// `weida::Subscriber::grant` is a one-shot application call and nothing
+    /// restates it, so a grant that wins the race against its SUBSCRIBE would
+    /// leave its consumer receiving nothing, forever, with no error on either
+    /// side. It is held here, and [`Consumers::subscribe`] applies it.
     ///
     /// A deque rather than a map, and capped at [`MAX_PENDING_GRANTS`]: the
     /// peer chooses both halves of the key, and a connection that only ever
@@ -112,7 +110,7 @@ impl Consumers {
     /// Zero is the initial value the whole scheme rests on: a consumer that
     /// subscribes and grants nothing receives nothing, which is the only
     /// default that cannot surprise it with a flood (AMQP 1.0's initial link
-    /// credit, [0018](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
+    /// credit, [0018](https://github.com/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
     /// §4.4). A repeated SUBSCRIBE for the same filter keeps the credit and
     /// the delivered count: it is idempotent, and forgetting the count would
     /// hand a consumer free credit by re-subscribing.

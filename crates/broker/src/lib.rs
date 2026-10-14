@@ -1,4 +1,4 @@
-//! The minimal L2 broker: a queue at an endpoint path, `Accepted` in.
+//! The L2 broker: queues at endpoint paths, a confirm in, settlement out.
 //!
 //! A broker is an ordinary weida process that holds messages for a while. It
 //! registers a queue on each endpoint path its configuration names; a producer
@@ -16,15 +16,14 @@
 //! would be a prohibited claim, not an optimistic one: "`Stored` MUST NOT be
 //! reported for an in-memory buffer" (`docs/GUARANTEES.md` §1). The refusal is
 //! in the type rather than in a comment: [`Achieved`] has one variant, so no
-//! code path here can issue a durable certificate, and the variants arrive
-//! with the store that makes them true (Phase 5) and the replication that
-//! makes `Replicated` measurable (Phase 7).
+//! code path here can issue a durable certificate. `Stored` appears with a
+//! durable store, and `Replicated` with replication.
 //!
 //! A certificate is also about **one hop**. `Accepted` says this broker took
 //! responsibility for the message; it says nothing about a consumer, and the
 //! broker never relays a consumer's outcome back to the producer
 //! (`docs/GUARANTEES.md` §2,
-//! [0018](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
+//! [0018](https://github.com/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
 //! §4.3). A producer that needs to know a consumer processed its message uses
 //! an application reply.
 //!
@@ -51,12 +50,31 @@
 //! increments it is willing to receive rather than one large number it means
 //! to withdraw later.
 //!
-//! # What this slice does not do
+//! # Settlement
 //!
-//! **A delivery has no outcome yet.** A delivered message leaves the queue
-//! immediately, because there is nothing to wait for: the consumer
-//! acknowledgement, the redelivery of what was not acknowledged, and
-//! `Broker::drain` are B-203.
+//! A delivery orders `Processed` on its own DATA header, so the consumer
+//! reports on a cursor stream and the delivery stays a one-way transfer. The
+//! message moves from the queue to an `unsettled` table and keeps its charge
+//! against `queue_bytes`: it may come back, so it is memory the queue still
+//! owes. When the consumer reports `Processed` the message is dropped and its
+//! charge released. When the report ends without it (the reporter finishes,
+//! the stream is reset, or the connection goes away) the message is requeued
+//! and any consumer with credit may take it. A subscription with
+//! [`BrokerConfig::max_unsettled`] deliveries outstanding is given no more,
+//! so a consumer that stops reporting stops receiving without starving the
+//! others.
+//!
+//! # Not built yet
+//!
+//! - The redelivery count on the wire. The queue counts attempts per message;
+//!   DATA key `12` (`delivery_attempt`) is reserved for carrying the count,
+//!   and nothing writes it.
+//! - Relaying a consumer's report to the producer
+//!   ([0029](https://github.com/tuco86/weida/blob/main/docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)
+//!   §4.3).
+//! - Retiring a queue
+//!   ([0018](https://github.com/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
+//!   §4.7).
 //!
 //! # Example
 //!

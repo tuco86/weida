@@ -8,58 +8,14 @@
 
 use std::time::Duration;
 
-use weida::{
-    Binding, ClientTls, Identity, Listener, Requester, Runtime, RuntimeConfig, ServerTls,
-    Subscriber, Trust,
-};
-use weida_broker::{Broker, BrokerConfig};
+use weida::{Requester, Runtime, RuntimeConfig, Subscriber};
+use weida_broker::BrokerConfig;
 
-const DEADLINE: Duration = Duration::from_secs(10);
-/// How long "nothing arrives" is given before it counts as nothing. Long
-/// enough that a delivery in flight would have landed on loopback, short
-/// enough to keep the suite quick.
-const SILENCE: Duration = Duration::from_millis(300);
+mod common;
 
-struct Harness {
-    runtime: Runtime,
-    _listener: Listener,
-    _binding: Binding,
-    broker: Broker,
-    client: ClientTls,
-    port: u16,
-}
+use common::{DEADLINE, Harness, SILENCE};
 
 impl Harness {
-    async fn start(config: BrokerConfig) -> Harness {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let listener = runtime.listener();
-        let identity = Identity::generate().expect("identity");
-        let fingerprint = identity.fingerprint().expect("fingerprint");
-        let binding = listener
-            .bind_quic(
-                "127.0.0.1:0".parse().expect("loopback address"),
-                ServerTls::new(identity),
-            )
-            .await
-            .expect("bind");
-        let port = binding.local_addr().port();
-        let broker = Broker::new(&listener, config).expect("broker");
-        let serving = broker.clone();
-        tokio::spawn(async move { serving.serve().await });
-        Harness {
-            runtime,
-            _listener: listener,
-            _binding: binding,
-            broker,
-            client: ClientTls::new(Trust::pin(fingerprint)),
-            port,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("weida://127.0.0.1:{}{}", self.port, path)
-    }
-
     async fn producer(&self, path: &str) -> Requester {
         let requester = self.runtime.requester(self.client.clone());
         requester.connect(&self.url(path)).await.expect("connect");

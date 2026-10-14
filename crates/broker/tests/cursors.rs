@@ -8,18 +8,16 @@
 //!
 //! Three negatives matter as much as that: a refusal reports nothing, a level
 //! this broker cannot reach is absent rather than failed, and an exchange's
-//! confirm is exactly the DATA key `8` reply it always was.
+//! confirm is exactly the DATA key `8` reply.
 
 use std::time::Duration;
 
-use weida::{
-    Acknowledgement, Binding, ClientTls, CursorLevel, Identity, Listener, Pusher, Requester,
-    Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust,
-};
-use weida_broker::{Broker, BrokerConfig, PER_MESSAGE_OVERHEAD};
+use weida::{Acknowledgement, CursorLevel, Pusher, Requester, TransferMeta};
+use weida_broker::{BrokerConfig, PER_MESSAGE_OVERHEAD};
 
-/// Generous ceiling: every assertion below settles in milliseconds.
-const DEADLINE: Duration = Duration::from_secs(10);
+mod common;
+
+use common::{DEADLINE, Harness};
 
 const ACCEPTED: CursorLevel = CursorLevel::Known(Acknowledgement::Accepted);
 const STORED: CursorLevel = CursorLevel::Known(Acknowledgement::Stored);
@@ -30,49 +28,7 @@ async fn within<F: Future>(f: F) -> F::Output {
         .expect("operation timed out")
 }
 
-/// A broker on a loopback port, and what a producer needs to reach it.
-struct Harness {
-    runtime: Runtime,
-    /// Held: dropping the listener stops serving.
-    _listener: Listener,
-    /// Held: dropping the binding closes the port.
-    _binding: Binding,
-    broker: Broker,
-    client: ClientTls,
-    port: u16,
-}
-
 impl Harness {
-    async fn start(config: BrokerConfig) -> Harness {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let listener = runtime.listener();
-        let identity = Identity::generate().expect("identity");
-        let fingerprint = identity.fingerprint().expect("fingerprint");
-        let binding = listener
-            .bind_quic(
-                "127.0.0.1:0".parse().expect("loopback address"),
-                ServerTls::new(identity),
-            )
-            .await
-            .expect("bind");
-        let port = binding.local_addr().port();
-        let broker = Broker::new(&listener, config).expect("broker");
-        let serving = broker.clone();
-        tokio::spawn(async move { serving.serve().await });
-        Harness {
-            runtime,
-            _listener: listener,
-            _binding: binding,
-            broker,
-            client: ClientTls::new(Trust::pin(fingerprint)),
-            port,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("weida://127.0.0.1:{}{}", self.port, path)
-    }
-
     async fn pusher(&self, path: &str) -> Pusher {
         let pusher = self.runtime.pusher(self.client.clone());
         pusher.connect(&self.url(path)).await.expect("connect");
@@ -117,7 +73,7 @@ async fn a_one_way_producer_that_orders_accepted_gets_it() {
 #[tokio::test]
 async fn an_exchange_still_gets_the_key_8_confirm_and_no_cursor_stream() {
     // The reply half stays the application's answer: a producer that orders
-    // nothing sees exactly the confirm it saw before cursors existed.
+    // nothing sees the confirm and no cursor stream.
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.requester("/jobs").await;
 

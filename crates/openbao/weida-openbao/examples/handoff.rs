@@ -1,13 +1,14 @@
 //! The service half of the hand-off
 //! ([0032](../../../docs/decisions/0032-identity-sources-and-the-handoff.md) §2):
-//! redeem the wrapped token the controller left in the credentials
-//! directory — first, before anything else — then live on it: sign an
+//! redeem the wrapped token the controller left in the unit's
+//! `RUNTIME_DIRECTORY` — first, before anything else — then live on it: sign an
 //! identity with the PKI role, bind a weida replier, answer until stopped.
 //!
-//! The controller half is `examples/handoff/weida-handoff.service`, whose
-//! `ExecStartPre=` mints the wrapped token — keeping the child's accessor
-//! from the answer — and `ExecStopPost=` revokes the child by that accessor
-//! at every exit. See `examples/handoff/README.md`.
+//! The controller half is `examples/handoff/weida-handoff.service`. Its
+//! `bao-controller` credential is read by `ExecStartPre=`, which mints the
+//! wrapped token and keeps the child's accessor from the answer, and by
+//! `ExecStopPost=`, which revokes the child by that accessor at every exit.
+//! See `examples/handoff/README.md`.
 //!
 //! Exit codes: `0` stopped; `3` the hand-off was stolen — somebody redeemed
 //! the wrapping token before this process did, which is the alarm the flow

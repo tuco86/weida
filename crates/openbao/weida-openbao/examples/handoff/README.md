@@ -58,7 +58,7 @@ Steal the credential before the service reads it: raise `RestartSec=` or add a
 yourself inside the window:
 
 ```sh
-bao unwrap "$(systemd-creds --user cat bao-handoff)"   # as the service's uid, in the window
+bao unwrap "$(cat "$XDG_RUNTIME_DIR/weida-handoff/bao-handoff")"   # as the service's uid, in the window
 ```
 
 The service then exits with status 3 — `ALARM: the hand-off token was already redeemed` —

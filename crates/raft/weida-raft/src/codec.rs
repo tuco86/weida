@@ -73,8 +73,10 @@ pub const MAX_ENTRIES: u64 = 4096;
 /// The longest failure text a forwarded request's reply may carry, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024;
 
-/// How deep an unknown key's value may nest before the decoder refuses it.
-pub const MAX_SKIP_DEPTH: usize = 8;
+/// How deep an unknown key's value may nest before the decoder refuses it:
+/// the depth bound the header codec of `weida-protocol` uses for the same
+/// skip.
+pub use weida_protocol::header_limits::MAX_SKIP_DEPTH;
 
 /// Why a peer's or a store's bytes did not decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1268,7 +1270,7 @@ fn get_rpc(d: &mut Decoder<'_>) -> Res<Rpc> {
 #[cfg(test)]
 mod tests {
     use openraft::CommittedLeaderId;
-    use weida_core::Fingerprint;
+    use weida::Fingerprint;
 
     use super::*;
 

@@ -1,16 +1,15 @@
 //! A delivery is not a deletion: what settles a message, and what gives it
-//! back (B-203).
+//! back.
 //!
 //! The claim this file exists for is the one that makes the broker a broker
 //! rather than a fan-out with a buffer: **a message a consumer never reports
-//! on comes back**. Before this slice, `Queue::take` deleted it and a consumer
-//! that died between receiving the bytes and finishing its work took the
-//! message with it — RabbitMQ's `no-ack` mode, which its own documentation
-//! calls unsafe.
+//! on comes back**. Were a delivery a deletion, a consumer that died between
+//! receiving the bytes and finishing its work would take the message with
+//! it — RabbitMQ's `no-ack` mode, which its own documentation calls unsafe.
 //!
 //! Settlement is a **cursor**, not a reply: the delivery orders `Processed` on
 //! its own DATA header and the consumer reports it on the cursor stream, so a
-//! delivery keeps the one-way topology a queue delivery always had
+//! delivery keeps the one-way topology of a queue delivery
 //! ([0029](../../../docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)).
 //! Every consumer here therefore reads `transfer.reporter()` — the same
 //! accessor any `Subscriber` has — and nothing in this file uses an
@@ -19,57 +18,18 @@
 use std::time::Duration;
 
 use weida::{
-    Acknowledgement, Binding, ClientTls, CursorLevel, Identity, IncomingTransfer, Listener,
-    Requester, Runtime, RuntimeConfig, ServerTls, Subscriber, Trust,
+    Acknowledgement, CursorLevel, IncomingTransfer, Requester, Runtime, RuntimeConfig, Subscriber,
 };
-use weida_broker::{Broker, BrokerConfig};
+use weida_broker::BrokerConfig;
 
-const DEADLINE: Duration = Duration::from_secs(10);
-/// How long "nothing arrives" is given before it counts as nothing.
-const SILENCE: Duration = Duration::from_millis(300);
+mod common;
+
+use common::{DEADLINE, Harness, SILENCE};
+
 /// The level a delivery orders and a settlement is.
 const PROCESSED: CursorLevel = CursorLevel::Known(Acknowledgement::Processed);
 
-struct Harness {
-    runtime: Runtime,
-    _listener: Listener,
-    _binding: Binding,
-    broker: Broker,
-    client: ClientTls,
-    port: u16,
-}
-
 impl Harness {
-    async fn start(config: BrokerConfig) -> Harness {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let listener = runtime.listener();
-        let identity = Identity::generate().expect("identity");
-        let fingerprint = identity.fingerprint().expect("fingerprint");
-        let binding = listener
-            .bind_quic(
-                "127.0.0.1:0".parse().expect("loopback address"),
-                ServerTls::new(identity),
-            )
-            .await
-            .expect("bind");
-        let port = binding.local_addr().port();
-        let broker = Broker::new(&listener, config).expect("broker");
-        let serving = broker.clone();
-        tokio::spawn(async move { serving.serve().await });
-        Harness {
-            runtime,
-            _listener: listener,
-            _binding: binding,
-            broker,
-            client: ClientTls::new(Trust::pin(fingerprint)),
-            port,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("weida://127.0.0.1:{}{}", self.port, path)
-    }
-
     async fn producer(&self, path: &str) -> Requester {
         let requester = self.runtime.requester(self.client.clone());
         requester.connect(&self.url(path)).await.expect("connect");
@@ -223,7 +183,7 @@ async fn a_reported_delivery_leaves_the_queue_and_frees_its_bytes() {
     );
 }
 
-/// The claim this slice exists for: a consumer that dies without reporting
+/// The claim settlement exists for: a consumer that dies without reporting
 /// gives the message back, and another consumer gets it.
 #[tokio::test]
 async fn a_delivery_nobody_reports_on_comes_back_for_somebody_else() {

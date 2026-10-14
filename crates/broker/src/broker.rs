@@ -24,10 +24,10 @@ use crate::queue::{DeliveryId, Queue, QueueStats, QueuedMessage, Refusal};
 /// rather than an optimistic one —
 /// "`Stored` MUST NOT be reported for an in-memory buffer"
 /// (`docs/GUARANTEES.md` §1,
-/// [0018](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
+/// [0018](https://github.com/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
 /// §4.2). The enum is the enforcement: there is no value of this type that
-/// names a durable level, so no code path here can accidentally issue one, and
-/// the variant appears when Phase 5 gives it a store to survive in.
+/// names a durable level, so no code path here can accidentally issue one.
+/// `Stored` appears with a durable store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Achieved {
     /// The broker has taken responsibility for the message in memory,
@@ -76,18 +76,18 @@ pub struct BrokerConfig {
     ///
     /// An unsettled delivery is one this broker has handed out and not seen a
     /// consumer report on. The bound is **per subscription**, which is what
-    /// the name has always meant: one consumer that stops reporting costs its
+    /// the name says: one consumer that stops reporting costs its
     /// own slots and nobody else's, and its messages stay charged against
     /// [`BrokerConfig::queue_bytes`] until they settle or come back.
     ///
     /// It is not a credit limit. Credit is *cumulative* — the total a
-    /// subscription will ever accept ([0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+    /// subscription will ever accept ([0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
     /// §4.3) — so clamping that would cap a subscription's lifetime delivery
     /// count rather than its outstanding one. This bounds what may be in
-    /// flight without an outcome, and it was named `max_unacked` until
-    /// [0029](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)
-    /// §4.7 pointed out that nothing here is an ack: a consumer reports, it
-    /// does not acknowledge.
+    /// flight without an outcome. Nothing here is an acknowledgement: a
+    /// consumer reports, it does not acknowledge
+    /// ([0029](https://github.com/tuco86/weida/blob/main/docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)
+    /// §4.7).
     ///
     /// `0` is a queue that admits and confirms and never delivers, because no
     /// subscription is ever eligible. That is the literal reading of the bound
@@ -134,7 +134,7 @@ enum Settlement {
     /// No further cursors are coming and the level never arrived: the
     /// reporter finished without it, the stream was reset, or the connection
     /// went away. Three cases deliberately indistinguishable
-    /// ([0023](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)),
+    /// ([0023](https://github.com/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)),
     /// and all three mean the same thing to a queue: nobody has taken
     /// responsibility, so the message is the queue's again.
     Lost(DeliveryId),
@@ -452,19 +452,19 @@ async fn serve_queue(served: Arc<Served>) {
 /// queue is empty or no matching subscription has credit left. That is the
 /// whole scheduling policy: a queue stops at the limit its consumers stated
 /// and resumes when one of them raises it
-/// ([0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+/// ([0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
 /// §4.2).
 ///
 /// **A failed write costs that consumer the rest of the round, and nobody
 /// else anything.** The message goes back to the head of the queue and the
 /// credit is given back, so retrying the same pairing immediately would spin
-/// on it forever; abandoning the whole scan instead — which is what this used
-/// to do — stranded every other message and every other consumer until some
-/// producer happened to admit another message, which on an idle queue is
-/// never. So the failing subscription is excluded for the remainder of this
-/// scan and the scan continues. The exclusion list is the termination
-/// argument: every iteration either delivers a message or removes one
-/// subscription from consideration, and both are finite.
+/// on it forever. Abandoning the whole scan instead would strand every other
+/// message and every other consumer until some producer happened to admit
+/// another message, which on an idle queue is never. So the failing
+/// subscription is excluded for the remainder of this scan and the scan
+/// continues. The exclusion list is the termination argument: every
+/// iteration either delivers a message or removes one subscription from
+/// consideration, and both are finite.
 ///
 /// **Serialized with admission, deliberately and at a cost.** A queue is one
 /// order and one budget, so its events are one loop; the cost is that a
@@ -473,7 +473,7 @@ async fn serve_queue(served: Arc<Served>) {
 /// unresponsive consumer costs its own `max_unsettled` slots and nothing
 /// else, which is the answer 0029 §4.6 settles on.
 ///
-/// **A delivery is not a deletion any more.** Each one orders `Processed` on
+/// **A delivery is not a deletion.** Each one orders `Processed` on
 /// its own DATA header, keeps the cursors that come back, and hands the
 /// message to [`Queue::hold`] — still charged — with a watcher task on the
 /// report. The message leaves this queue only when a consumer says it may.
@@ -505,7 +505,7 @@ async fn pump(served: &Served) {
                 // message in `unsettled` with `attempts == 1` is on its first
                 // delivery. A write that failed above never reached anybody
                 // and must not make the next delivery claim to be a repeat.
-                // B-267 puts the number on the wire; here it is state.
+                // The count is not on the wire yet; here it is state.
                 message.attempts += 1;
                 let delivery = served
                     .queue
@@ -595,7 +595,7 @@ async fn deliver(
 /// The wait is unbounded on purpose and bounded in fact: `changed` resolves
 /// with `None` when the reporter finishes, when the stream is reset **and**
 /// when the connection goes away, so a consumer that vanishes ends this task
-/// without a timer ([0029](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)
+/// without a timer ([0029](https://github.com/tuco86/weida/blob/main/docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)
 /// §4.6).
 fn watch(served: &Served, delivery: DeliveryId, mut cursors: Cursors) {
     let settled = served.settled.clone();
@@ -726,7 +726,7 @@ async fn admit_exchange(served: &Served, mut request: IncomingRequest) {
     let admitted_bytes = queued.body.len() as u64;
     // The producer's trace, logged where it is still available: after the
     // exchange ends nothing can reconstruct which trace a queued message
-    // belongs to, and a delivery continues it (B-202).
+    // belongs to, and a delivery continues it.
     if let Some(trace) = queued.trace {
         tracing::debug!(
             path = served.acceptor.path(),
@@ -761,13 +761,12 @@ async fn admit_exchange(served: &Served, mut request: IncomingRequest) {
 /// Admits a one-way transfer, and reports a cursor if the producer ordered
 /// one.
 ///
-/// This is the shape [0024](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0024-three-families-one-back-channel.md)
+/// This is the shape [0024](https://github.com/tuco86/weida/blob/main/docs/decisions/0024-three-families-one-back-channel.md)
 /// §4.4a exists for: a producer that orders `Accepted` gets a reliable verdict
 /// **on one unidirectional payload stream**, with no exchange and no reply
 /// half. A producer that orders nothing gets the transport receipt and nothing
-/// more — the honest spelling of `acks=0` (0018 §4.6) — and its transfer is
-/// byte-for-byte what it was before cursors existed. A refusal has nowhere to
-/// go on a unidirectional stream, so a queue with no room is a
+/// more — the honest spelling of `acks=0` (0018 §4.6). A refusal has
+/// nowhere to go on a unidirectional stream, so a queue with no room is a
 /// `STOP_SENDING(REJECTED)` — dropping the unread transfer — and no cursor.
 async fn admit_transfer(served: &Served, transfer: IncomingTransfer) {
     let Some(room) = room_for(served, transfer.meta()) else {

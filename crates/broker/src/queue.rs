@@ -5,16 +5,15 @@
 //! room, and what is held — and the broker turns those answers into a confirm
 //! or a refusal. It holds no state a restart could recover, which is why
 //! `Stored` is not expressible anywhere in this crate
-//! ([0018](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
+//! ([0018](https://github.com/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
 //! §4.2).
 //!
 //! **A delivered message is still this queue's.** Until a consumer reports
 //! `Processed`, a message that has gone out lives in the `unsettled` table
 //! and **keeps its charge** against the budget: it may come back, so it is
-//! memory the queue still owes. That is the whole difference between this
-//! queue and the one before B-203, where a delivery was a deletion and a
-//! consumer that died took the message with it — RabbitMQ's `no-ack` mode,
-//! which its own documentation calls unsafe.
+//! memory the queue still owes. A delivery that were a deletion would lose
+//! the message with a consumer that died, which is RabbitMQ's `no-ack` mode
+//! and which its own documentation calls unsafe.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -51,13 +50,9 @@ pub struct QueuedMessage {
     pub content_type: Option<String>,
     /// The producer's trace context, so a delivery is the same trace.
     pub trace: Option<TraceContext>,
-    /// How often this message has been handed to a consumer, the current
-    /// attempt included once it goes out.
-    ///
-    /// `0` until the first delivery. It counts **attempts**, not failures:
-    /// the queue does not know why an earlier one went unsettled, only that
-    /// it did. The wire form is DATA key `12` and is B-267's slice; this
-    /// field is what it will read.
+    /// How often this message has been delivered. DATA key 12
+    /// (`delivery_attempt`, PROTOCOL.md §6.2) is reserved for carrying it;
+    /// nothing writes that key yet.
     pub attempts: u64,
 }
 
@@ -249,7 +244,7 @@ impl Queue {
     /// nothing is copied for a delivery. Its bytes are charged again, and
     /// they are charged **until a consumer reports**: a delivery that may
     /// come back is memory this queue still owes, which is the one accounting
-    /// rule of this slice. [`Queue::stats`] reports held and unsettled
+    /// rule here. [`Queue::stats`] reports held and unsettled
     /// separately so an operator can see which it is.
     ///
     /// It cannot be refused, for [`Queue::push_front`]'s reason: this is the
@@ -331,8 +326,7 @@ impl Queue {
     /// How many deliveries one subscription holds unsettled.
     ///
     /// The number `max_unsettled` bounds, and it is per subscription because
-    /// that is what the name has always meant: one slow consumer costs its own
-    /// slots and nobody else's.
+    /// one slow consumer costs its own slots and nobody else's.
     pub fn unsettled_for(&self, consumer: weida::ConsumerId, filter: &str) -> usize {
         self.unsettled
             .values()
@@ -423,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_message_that_fits_exactly_is_admitted_rather_than_refused() {
-        // The boundary the two authorities used to disagree on: a payload cap
+        // The boundary the two authorities could disagree on: a payload cap
         // of zero says a message fits, not that the queue is full, and
         // `push` agrees.
         let mut queue = Queue::new(PER_MESSAGE_OVERHEAD * 2);

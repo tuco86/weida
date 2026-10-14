@@ -6,14 +6,14 @@
 //! exchange per RPC, TLS-proved node identity and a streamed snapshot — so
 //! that building a replicated service is writing a state machine rather than
 //! writing a network layer
-//! ([0021](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)).
+//! ([0021](https://github.com/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)).
 //!
 //! # What this crate provides, and what is left to you
 //!
 //! | Provided here | Yours |
 //! | --- | --- |
 //! | the transport: one exchange per RPC on the ALPN `weida-raft/0`, on its own port | the **state machine**: `apply`, and what a committed entry means |
-//! | node identity: the fingerprint a peer proves in the handshake ([0020](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md) §4.4) | what the bytes of a [`Request`] and a [`Response`] mean |
+//! | node identity: the fingerprint a peer proves in the handshake ([0020](https://github.com/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md) §4.4) | what the bytes of a [`Request`] and a [`Response`] mean |
 //! | follower writes forwarded to the leader, membership changes, the two-voter configuration refused by name | the **log store**; [`MemoryStore`] is the reference it has to match |
 //! | the snapshot as one streamed exchange, not a chunked RPC | what a snapshot of your state machine *is* |
 //! | a public minicbor codec for openraft's persisted types ([`codec`]) | where those bytes are stored |
@@ -22,7 +22,7 @@
 //!
 //! Consensus traffic runs on a second QUIC binding, on
 //! [`ConsensusConfig::listen`], which offers only `weida-raft/0`
-//! ([0021](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)
+//! ([0021](https://github.com/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)
 //! §4.4). A heartbeat therefore never waits behind application payload in a
 //! shared receive window, and a client dialling `weida/0` fails the handshake
 //! there instead of reaching a consensus endpoint.
@@ -68,7 +68,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use weida_core::{EndpointAddr, Fingerprint};
+use weida::{EndpointAddr, Fingerprint};
 
 pub use codec::DecodeError;
 pub use consensus::Consensus;

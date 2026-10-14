@@ -20,9 +20,12 @@
 //!    them.
 //!
 //! What this crate does not do: check revocation (no CRL, no OCSP; the TTL
-//! is the answer, and the renewal is what makes a short one affordable),
-//! and mint the controller's wrapped token (a `bao` invocation in a unit
-//! file, see `examples/handoff`).
+//! is the answer, and the renewal is what makes a short one affordable).
+//!
+//! The controller half of the hand-off, minting the wrapped token and
+//! revoking the child by its accessor, is [`OpenBao::post_wrapped`] and
+//! [`OpenBao::revoke_accessor`], driven from the unit file in
+//! `examples/handoff`.
 
 #![forbid(unsafe_code)]
 

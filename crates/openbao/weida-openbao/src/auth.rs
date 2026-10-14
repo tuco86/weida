@@ -30,21 +30,24 @@ impl TokenInfo {
             .get("auth")
             .filter(|a| !a.is_null())
             .ok_or_else(|| Error::Shape("no `auth` object".into()))?;
+        TokenInfo::from_object(auth, "lease_duration")
+    }
+
+    /// Reads the token fields of one object: the `auth` object of a login or
+    /// renewal answer, whose lifetime is `lease_duration`, or the `data`
+    /// object of a lookup, whose lifetime is `ttl`.
+    pub(crate) fn from_object(object: &Value, ttl_key: &str) -> Result<TokenInfo> {
         Ok(TokenInfo {
-            accessor: auth
+            accessor: object
                 .get("accessor")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            ttl: Duration::from_secs(
-                auth.get("lease_duration")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            ),
-            renewable: auth
+            ttl: Duration::from_secs(object.get(ttl_key).and_then(Value::as_u64).unwrap_or(0)),
+            renewable: object
                 .get("renewable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            policies: auth
+            policies: object
                 .get("policies")
                 .and_then(Value::as_array)
                 .map(|a| {
@@ -151,31 +154,7 @@ impl Auth {
                 let data = answer
                     .get("data")
                     .ok_or_else(|| Error::Shape("no `data` in lookup-self".into()))?;
-                Ok((
-                    token,
-                    TokenInfo {
-                        accessor: data
-                            .get("accessor")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        ttl: Duration::from_secs(
-                            data.get("ttl").and_then(Value::as_u64).unwrap_or(0),
-                        ),
-                        renewable: data
-                            .get("renewable")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        policies: data
-                            .get("policies")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|p| p.as_str().map(str::to_owned))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    },
-                ))
+                Ok((token, TokenInfo::from_object(data, "ttl")?))
             }
             Auth::AppRole {
                 role_id,

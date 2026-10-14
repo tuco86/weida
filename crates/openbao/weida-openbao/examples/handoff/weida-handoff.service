@@ -3,16 +3,17 @@
 #
 # Before the service starts, the controller — this unit, running the
 # ExecStartPre= line with the controller's token — mints a child token of
-# the service's role and asks OpenBao to wrap it: what lands in the
-# credential is a wrapping token, good for one redemption within five
+# the service's role and asks OpenBao to wrap it: what lands in
+# RUNTIME_DIRECTORY is a wrapping token, good for one redemption within five
 # seconds and for nothing else. The service redeems it as its first act
 # (examples/handoff.rs). At every stop the controller revokes the service's
-# token by the accessor the service wrote, whether the stop was clean, a
+# token by the accessor ExecStartPre= wrote, whether the stop was clean, a
 # crash, or the alarm.
 #
 # Install as a user unit for the proof on a workstation, or as a system
 # unit with User= for a deployment. The controller token comes from
-# %d/bao-controller (LoadCredential=), never from the environment.
+# %d/bao-controller (LoadCredential=), never from the environment, and
+# ExecStartPre= and ExecStopPost= are the two lines that read it.
 
 [Unit]
 Description=weida hand-off example: redeem a wrapped OpenBao token, sign an identity, serve
@@ -20,19 +21,19 @@ After=network-online.target
 
 [Service]
 Type=exec
-# The controller's token: readable by this unit's ExecStartPre= only, from
-# the credentials directory. Provisioned once, out of band.
+# The controller's token, loaded as the credential `bao-controller`: read by
+# ExecStartPre= (to mint) and ExecStopPost= (to revoke) and by nothing else.
+# Provisioned once, out of band.
 LoadCredential=bao-controller:%h/.config/weida-handoff/controller.token
 # Mint and wrap. The child is minted from the controller token with the
 # service's role; the wrapping TTL is the window in which the service must
 # start and redeem. The answer names the wrapping token and, as
 # `wrapped_accessor`, the accessor of the child inside it — so the
 # controller can revoke the child at exit without ever holding it, and
-# whoever redeemed it. The credentials directory would be the place for the
-# wrapping token, but it is mounted read-only for ExecStartPre= as for the
-# service, so it goes into RUNTIME_DIRECTORY: created 0700 for this unit's
-# uid, private to it, removed with the unit. The service unlinks the file
-# once redeemed.
+# whoever redeemed it. The wrapping token goes into RUNTIME_DIRECTORY, which
+# ExecStartPre= can write (a credential is read-only): created 0700 for this
+# unit's uid, private to it, removed with the unit. The service unlinks the
+# file once redeemed.
 ExecStartPre=/bin/sh -c 'umask 077; out=$(BAO_TOKEN=$(cat "$CREDENTIALS_DIRECTORY/bao-controller") bao token create -role=weida-handoff -metadata=unit=%n -wrap-ttl=5s -format=json) && printf "%%s" "$out" | sed -n "s/.*\\"wrapped_accessor\\": *\\"\\([^\\"]*\\)\\".*/\\1/p" > "$RUNTIME_DIRECTORY/accessor" && printf "%%s" "$out" | sed -n "s/.*\\"token\\": *\\"\\([^\\"]*\\)\\".*/\\1/p" > "$RUNTIME_DIRECTORY/bao-handoff"'
 ExecStart=%h/.cargo/target/debug/examples/handoff
 # Revoke the child by its accessor at every exit — clean, crash or alarm —

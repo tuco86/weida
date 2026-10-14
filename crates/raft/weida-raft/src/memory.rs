@@ -18,9 +18,9 @@ use crate::{Node, NodeId, Request, Response, TypeConfig};
 ///
 /// An application supplies its own [`RaftLogStorage`] and [`RaftStateMachine`]
 /// to [`Consensus::start`](crate::Consensus::start); this is what such a pair
-/// has to match, and writing it is how the requirement list of 0021 §4.3 was
-/// checked against the actual traits. The v2 traits are `RaftLogStorage` —
-/// `get_log_state`, `get_log_reader`, `save_vote`/`read_vote`,
+/// has to match. The requirements of 0021 §4.3 are the v2 traits
+/// `RaftLogStorage` — `get_log_state`, `get_log_reader`,
+/// `save_vote`/`read_vote`,
 /// `save_committed`/`read_committed`, `append` **with a flush callback**,
 /// `truncate` backwards and `purge` forwards — plus `RaftStateMachine`:
 /// `applied_state`, `apply`, `get_snapshot_builder`,

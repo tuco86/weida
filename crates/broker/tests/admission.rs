@@ -2,63 +2,18 @@
 //!
 //! Every assertion here is from the producer's side of a real QUIC connection:
 //! the broker has no test hooks, and the confirm, the refusal and the silence
-//! are the whole observable surface of this slice.
+//! are the whole observable surface of admission.
 
 use std::time::Duration;
 
-use weida::{
-    Acknowledgement, Binding, ClientTls, Error, Identity, Listener, Pusher, Requester, Runtime,
-    RuntimeConfig, ServerTls, Trust,
-};
+use weida::{Acknowledgement, Error, Pusher, Requester, Runtime, RuntimeConfig};
 use weida_broker::{Broker, BrokerConfig, PER_MESSAGE_OVERHEAD};
 
-/// Generous ceiling: every assertion below settles in milliseconds.
-const DEADLINE: Duration = Duration::from_secs(10);
+mod common;
 
-/// A broker on a loopback port, and what a producer needs to reach it.
-struct Harness {
-    runtime: Runtime,
-    /// Held: dropping the listener stops serving.
-    _listener: Listener,
-    /// Held: dropping the binding closes the port.
-    _binding: Binding,
-    broker: Broker,
-    client: ClientTls,
-    port: u16,
-}
+use common::{DEADLINE, Harness};
 
 impl Harness {
-    /// Starts a broker serving `config`'s queues.
-    async fn start(config: BrokerConfig) -> Harness {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let listener = runtime.listener();
-        let identity = Identity::generate().expect("identity");
-        let fingerprint = identity.fingerprint().expect("fingerprint");
-        let binding = listener
-            .bind_quic(
-                "127.0.0.1:0".parse().expect("loopback address"),
-                ServerTls::new(identity),
-            )
-            .await
-            .expect("bind");
-        let port = binding.local_addr().port();
-        let broker = Broker::new(&listener, config).expect("broker");
-        let serving = broker.clone();
-        tokio::spawn(async move { serving.serve().await });
-        Harness {
-            runtime,
-            _listener: listener,
-            _binding: binding,
-            broker,
-            client: ClientTls::new(Trust::pin(fingerprint)),
-            port,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("weida://127.0.0.1:{}{}", self.port, path)
-    }
-
     /// A producer that waits for a certificate.
     async fn requester(&self, path: &str) -> Requester {
         let requester = self.runtime.requester(self.client.clone());
@@ -75,7 +30,7 @@ impl Harness {
 }
 
 /// The temporal decoupling a queue exists for: the confirm arrives although
-/// nothing is consuming, and nothing ever will in this slice.
+/// nothing is consuming, and nothing ever will.
 #[tokio::test]
 async fn a_confirm_arrives_with_no_consumer_registered() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
