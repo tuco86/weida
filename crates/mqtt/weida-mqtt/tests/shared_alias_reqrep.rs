@@ -1,5 +1,5 @@
-//! B-146 on the wire: shared subscriptions as a client, Topic Aliases in both
-//! directions, and request/response.
+//! Shared subscriptions as a client, Topic Aliases in both directions, and
+//! request/response, on the wire.
 //!
 //! The three have one thing in common that decides how they are tested: each
 //! is a mechanism whose *effect* lives on the server, and each gives the
@@ -7,33 +7,22 @@
 //! SUBSCRIBE carried, and which Subscription Identifier a delivery reports.
 //! Topic Aliases: the bytes on the wire and the topic the application is
 //! handed. Request/response: the two properties on the PUBLISH and the
-//! namespace CONNACK offered. Anything past that is B-149's, against a broker
-//! that actually implements it.
+//! namespace CONNACK offered. Anything past that belongs to the interop tests,
+//! against a broker that actually implements it.
 
 mod harness;
 
 use std::time::Duration;
 
-use harness::{Act, Server, bytes};
+use harness::{Act, Server, bytes, connack};
 use weida_mqtt::{
     Client, ConnectOptions, Context, DisconnectReasonCode, Event, Message, QoS, Session,
     Subscription, split_shared,
 };
 use weida_mqtt_codec::{Connack, ConnectReasonCode, Packet, Properties, Publish};
 
-fn connack(properties: Properties<'_>) -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present: false,
-        reason_code: ConnectReasonCode::Success,
-        properties,
-    }))
-}
-
 fn options() -> ConnectOptions {
-    let mut options = ConnectOptions::new("b146-client");
-    options.keep_alive = Duration::ZERO;
-    options.connect_timeout = Duration::from_secs(5);
-    options
+    harness::options("shared-alias-client")
 }
 
 /// A PUBLISH with an explicit alias and topic, which is how a server
@@ -471,7 +460,7 @@ async fn an_alias_does_not_survive_the_connection_that_established_it() {
     let mut resumable = options();
     resumable.clean_start = false;
     resumable.session_expiry = Some(Duration::from_secs(300));
-    let session = Session::new("b146-client", &resumable.limits);
+    let session = Session::new("shared-alias-client", &resumable.limits);
 
     let (client, mut events) =
         Client::connect_session(&context, &address, resumable.clone(), &session)
@@ -544,14 +533,14 @@ async fn an_alias_does_not_survive_the_connection_that_established_it() {
 async fn a_request_carries_its_response_topic_and_correlation_data() {
     let mut server = Server::start(vec![
         Act::Send(connack(Properties {
-            response_information: Some("clients/b146-client"),
+            response_information: Some("clients/shared-alias-client"),
             ..Properties::new()
         })),
         Act::Suback(vec![0x00]),
         Act::AckPublish, // the request
         // The responder's reply, carrying the correlation data back.
         Act::Send(bytes(&Packet::Publish(Publish {
-            topic: "clients/b146-client/reply",
+            topic: "clients/shared-alias-client/reply",
             payload: b"pong",
             qos: QoS::AtMostOnce,
             properties: Properties {
@@ -572,14 +561,14 @@ async fn a_request_carries_its_response_topic_and_correlation_data() {
     // The namespace the server granted, and a topic built under it.
     assert_eq!(
         client.response_information(),
-        Some("clients/b146-client"),
+        Some("clients/shared-alias-client"),
         "the server answered Request Response Information with a namespace"
     );
     let reply_to = client
         .response_topic("reply")
         .expect("a Topic Name")
         .expect("the server offered a namespace");
-    assert_eq!(reply_to, "clients/b146-client/reply");
+    assert_eq!(reply_to, "clients/shared-alias-client/reply");
 
     client
         .subscribe(vec![Subscription::new(&reply_to, QoS::AtMostOnce)])

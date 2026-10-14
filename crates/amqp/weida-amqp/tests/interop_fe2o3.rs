@@ -8,8 +8,9 @@
 //! here wrote accepts what this client emits, and that this client accepts
 //! what it emits back.
 //!
-//! RabbitMQ 4.x is the other half of the item and lives in
-//! `tests/interop_rabbitmq.rs`, `#[ignore]`d because the binary is absent.
+//! RabbitMQ 4.x is the second foreign peer and lives in
+//! `tests/interop_rabbitmq.rs`, `#[ignore]`d because the broker is a system
+//! package.
 
 use std::time::Duration;
 

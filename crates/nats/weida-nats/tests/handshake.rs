@@ -1,4 +1,4 @@
-//! B-165: the handshake against a scripted server, control line by control
+//! The handshake against a scripted server, control line by control
 //! line.
 //!
 //! The thing to assert first is the one that is the opposite of every
@@ -7,7 +7,7 @@
 //! connection, first proves the socket is silent and only then writes its
 //! `INFO`.
 //!
-//! The rest of the file walks the acceptance line: the `CONNECT` and its one
+//! The rest of the file walks the handshake: the `CONNECT` and its one
 //! credential form, TLS completed before ordinary traffic, `PING`/`PONG` in
 //! both directions with the unanswered ones bounded, asynchronous `INFO` with
 //! `connect_urls` and the `ldm` drain notice, and `max_payload` enforced

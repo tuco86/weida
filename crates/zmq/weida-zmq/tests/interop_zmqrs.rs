@@ -2,12 +2,12 @@
 //! ("zmq.rs") **0.6.0**, measured on 2026-09-11.
 //!
 //! Every other test in this crate drives our sockets against our own codec,
-//! which is byte-exact against `docs/adapters/zmtp.md` §10.1 and therefore
-//! faithful — and shares every assumption with the code under test. This
-//! file is the other kind: an implementation that shares no code and no
-//! assumptions with ours, where a disagreement is an interoperability bug
-//! rather than a tautology. No supervised process and no C library: zmq.rs
-//! is a dev-dependency, so `cargo test` is the whole apparatus.
+//! which is byte-exact against the golden vectors of `weida-zmtp` and
+//! therefore faithful — and shares every assumption with the code under
+//! test. This file is the other kind: an implementation that shares no code
+//! and no assumptions with ours, where a disagreement is an interoperability
+//! bug rather than a tautology. No supervised process and no C library:
+//! zmq.rs is a dev-dependency, so `cargo test` is the whole apparatus.
 //!
 //! **Both roles, every pairing both implement.** Ten tests: for REQ/REP,
 //! DEALER/ROUTER, PUSH/PULL, PUB/SUB and XPUB/XSUB, once with our socket
@@ -72,25 +72,18 @@
 //!   roles, in order where order is promised, with no adjustment on either
 //!   side beyond the subscription form and the XPUB `recv` above.
 
+mod common;
+
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::within;
 use weida_zmq::{
     Context, ContextConfig, DealerSocket, Message, Multipart, PairSocket, PubSocket, PullSocket,
     PushSocket, RepSocket, ReqSocket, RouterSocket, SocketOptions, SubSocket, SubscriptionForm,
     XPubSocket, XSubSocket,
 };
 use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
-
-/// Long enough that a slow machine is not a failure, short enough that a
-/// hang is not a hung suite.
-const DEADLINE: Duration = Duration::from_secs(10);
-
-async fn within<F: Future>(future: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, future)
-        .await
-        .expect("the operation timed out")
-}
 
 fn context() -> Context {
     Context::new(ContextConfig::default()).expect("context")
@@ -552,7 +545,8 @@ async fn the_command_subscription_form_is_not_understood_by_zmq_rs() {
 
 /// The gap in the peer rather than a disagreement: zmq.rs 0.6 has no PAIR
 /// socket, so the pairing cannot be tested against it at all. Ours exists
-/// and talks to itself, which is what B-089 checks against libzmq.
+/// and talks to itself, which is what `interop_libzmq.rs` checks against
+/// libzmq.
 #[tokio::test]
 async fn pair_is_absent_from_zmq_rs() {
     let context = context();

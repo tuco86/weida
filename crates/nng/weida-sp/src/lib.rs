@@ -1,14 +1,14 @@
 //! nanomsg/NNG Scalability Protocols (SP v1) codec: the TCP mapping's
 //! protocol header, its message framing, and the per-protocol headers.
 //!
-//! This crate is the first slice of the SP adapter described in
-//! `docs/adapters/nng.md`. It is **sans-I/O and weida-free**: no sockets, no
-//! executor, no dependency - not even on `weida-core`. What it exports is a
-//! byte-for-byte encoder and decoder for what an NNG or mangos peer puts on a
-//! TCP connection, so that it can be checked against a foreign specification
-//! rather than against weida's opinion of it (`docs/ARCHITECTURE.md` §4). The
-//! bridge slices that move messages between an SP socket and a weida endpoint
-//! are built on top and depend on both sides; this one depends on neither.
+//! This crate is the codec under `weida-nng`, the nanomsg/NNG library. It is
+//! **sans-I/O and weida-free**: no sockets, no executor, no dependency - not
+//! even on `weida-core`. What it exports is a byte-for-byte encoder and
+//! decoder for what an NNG or mangos peer puts on a TCP connection, so that
+//! it can be checked against a foreign specification rather than against
+//! weida's opinion of it (`docs/ARCHITECTURE.md` §4). `weida-nng` is built on
+//! top and depends on this crate and on `weida-runtime`; this one depends on
+//! neither.
 //!
 //! # Shape
 //!
@@ -61,9 +61,9 @@
 //!
 //! # Where this codec departs from the text
 //!
-//! Each of these is recorded in `docs/IMPLEMENTATION.md` as a decision, and in
-//! `docs/adapters/nng.md` §11 as an open question where a real peer settles
-//! it.
+//! Each of these is cited below to the research sheet
+//! (`docs/research/nanomsg-nng.md`), and where a real peer settles one,
+//! `docs/libraries/nng.md` §8 records what it measured.
 //!
 //! * **Endpoint type numbers come from the implementation.** The SP RFCs
 //!   assign the 12-bit protocol IDs and delegate the 4-bit endpoint roles to
@@ -84,9 +84,8 @@
 //!   [`error::MessageError::is_violation`].
 //! * **PAIR v0 and PUB/SUB have no per-protocol header**, so there is no
 //!   module for them: a PAIR v0 body is the payload, and a SUB topic is the
-//!   leading bytes of the body with no field of its own [nanomsg-nng §3]. The
-//!   adapter's topic split is configuration, not framing
-//!   (`docs/adapters/nng.md` §6).
+//!   leading bytes of the body with no field of its own [nanomsg-nng §3]. Any
+//!   topic split is the caller's configuration, not framing.
 
 #![warn(missing_docs)]
 

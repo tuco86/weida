@@ -37,15 +37,15 @@
 //! * **A zero-length Topic Name is legal only with an established Topic
 //!   Alias**, and an unestablished one earns DISCONNECT 0x82 [mqtt5 §8]. The
 //!   alias table is per direction and per connection ([MQTT-3.3.2-7]), so it
-//!   belongs to the client (B-146).
+//!   belongs to the client's alias table in `weida-mqtt`.
 //! * **`Subscription Identifier` MUST NOT appear in a client-to-server
 //!   PUBLISH** ([MQTT-3.3.4-6]) [mqtt5 §3]. The property is legal in the same
 //!   packet travelling the other way — that is how a client learns which
 //!   subscription caused a delivery — so the rule is about direction, which
 //!   this crate does not know. [`crate::PacketType::from_client`] is what a
-//!   client checks it against (B-144).
+//!   client checks it against.
 //! * **`Topic Alias` above the peer's `Topic Alias Maximum`** is a negotiated
-//!   bound, not a grammatical one (B-141).
+//!   bound, not a grammatical one: the client checks it against the CONNACK.
 
 use crate::data::{self, Reader};
 use crate::error::{DecodeError, EncodeError};

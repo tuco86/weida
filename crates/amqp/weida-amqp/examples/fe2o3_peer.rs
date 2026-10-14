@@ -1,11 +1,10 @@
 //! A foreign AMQP 1.0 peer, on `fe2o3-amqp`'s acceptor, for one connection.
 //!
-//! The Python binding's tests (B-170, B-171) have to run against the peer of
-//! B-162 rather than against a scripted server of their own: a client checked
-//! only against a script is checked against the opinion of whoever wrote the
-//! script. `fe2o3-amqp` is a pure-Rust implementation with an `acceptor`, so
-//! this needs no broker and no C toolchain - the same reason
-//! `tests/interop_fe2o3.rs` is not `#[ignore]`d.
+//! The Python binding's tests run against this peer rather than against a
+//! scripted server of their own: a client checked only against a script is
+//! checked against the opinion of whoever wrote the script. `fe2o3-amqp` is a
+//! pure-Rust implementation with an `acceptor`, so this needs no broker and no
+//! C toolchain - the same reason `tests/interop_fe2o3.rs` is not `#[ignore]`d.
 //!
 //! It lives here, as an example of the library, because the binding crate is
 //! a `cdylib`: a test binary there would be left with undefined Python

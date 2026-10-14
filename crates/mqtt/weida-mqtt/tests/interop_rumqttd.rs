@@ -13,17 +13,16 @@
 //! cargo test -p weida-mqtt --test interop_rumqttd -- --ignored
 //! ```
 //!
-//! `#[ignore]` because a broker is a runtime condition
-//! ([LOOP.md](../../../../docs/LOOP.md) §2): the file compiles everywhere and
-//! runs where port 21884 answers. In the session that wrote it the broker ran
-//! under the process supervisor with a TCP `ready` condition on that port and
-//! was stopped in the same item.
+//! `#[ignore]` because a broker is a runtime condition: the file compiles
+//! everywhere and runs where port 21884 answers. Start the broker under a
+//! process supervisor with a TCP `ready` condition on that port, and stop it
+//! when the run ends.
 //!
 //! # Measured, not inferred
 //!
-//! Every claim below was observed in this run against this version, and four
-//! of them contradict what the item's own note expected - which is the point
-//! of running it.
+//! Every claim below was observed against this version, and several of them
+//! contradict what was expected beforehand - which is the point of running
+//! it.
 //!
 //! * **`cargo install rumqttd --version 0.20.0 --locked` does not build on
 //!   rustc 1.98.** Its `Cargo.lock` pins a `metrics` version whose registry
@@ -37,9 +36,9 @@
 //!   MQTT 5 unchecked, and the checklist is out of date rather than the
 //!   build: the broker accepts a 5.0 CONNECT, answers a 5.0 CONNACK **with
 //!   properties**, honours Subscription Identifiers and enforces a Topic
-//!   Alias Maximum. The backlog item's premise that this broker is
-//!   "3.1.1-compatible" is therefore wrong in this client's favour, and what
-//!   remains for B-149 is smaller than expected.
+//!   Alias Maximum. So the premise that this broker is "3.1.1-compatible" is
+//!   wrong in this client's favour, and what remains for `interop_mqtt5.rs` is
+//!   smaller than expected.
 //! * **The CONNACK declares `Topic Alias Maximum` 4096** and nothing else, so
 //!   the other §11 defaults apply - `Receive Maximum` 65,535, `Maximum QoS`
 //!   2, `Retain Available` 1, `Maximum Packet Size` unlimited, all three
@@ -84,7 +83,8 @@
 //! # What this broker cannot exercise, named rather than worked around
 //!
 //! * **AUTH**: no enhanced-authentication mechanism is offered, so 4.12 is
-//!   unmeasured here and stays B-149's.
+//!   unmeasured here and is covered only by the scripted server of
+//!   `tls_auth.rs`.
 //! * **Shared subscriptions and the availability flags**: the broker declares
 //!   none of the three flags, so the flags' *refusal* paths cannot be reached;
 //!   `shared_subscriptions_strategy` exists in its configuration but a broker
@@ -99,6 +99,7 @@ mod harness;
 
 use std::time::Duration;
 
+use harness::{DEADLINE, unique};
 use weida_mqtt::{
     Client, Completion, ConnectOptions, Context, Delivery, DisconnectReasonCode, Event, Events,
     Message, QoS, RetainHandling, RetainedOrigin, Session, Subscription,
@@ -111,10 +112,6 @@ use weida_mqtt::{
 /// the worst possible outcome.
 const BROKER: &str = "127.0.0.1:21884";
 
-/// Every await in this file is bounded, so a broker that stops answering ends
-/// a test instead of hanging it ([LOOP.md](../../../../docs/LOOP.md) §2).
-const DEADLINE: Duration = Duration::from_secs(10);
-
 fn options(client_id: &str) -> ConnectOptions {
     let mut options = ConnectOptions::new(client_id);
     // A real broker enforces Keep Alive; 30 s is far longer than any test here
@@ -122,22 +119,6 @@ fn options(client_id: &str) -> ConnectOptions {
     options.keep_alive = Duration::from_secs(30);
     options.connect_timeout = Duration::from_secs(5);
     options
-}
-
-/// A Client Identifier no previous run of this file has used.
-///
-/// Sessions outlive a test run by design - that is what `Session Expiry
-/// Interval` is for - so a fixed identifier makes the *second* run of a
-/// session test start against state the first one left. Which is not a flaw
-/// in the tests: it is [MQTT-3.2.2-4] biting, and the run below measured it.
-/// A fresh identifier per run is what keeps each test measuring the thing it
-/// is about.
-fn unique(prefix: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_nanos();
-    format!("{prefix}-{nanos:x}")
 }
 
 /// A resumable session: Clean Start 0 and a Session Expiry the broker can
@@ -591,10 +572,10 @@ async fn disconnect_with_will_message_publishes_nothing_here() {
 /// The session survives a reconnect, and an unacknowledged QoS 2 exchange is
 /// completed after it.
 ///
-/// This is B-142 and B-143 measured against something that actually keeps
-/// session state: the connection dies with a PUBLISH in flight, the client
-/// reconnects with Clean Start 0, the broker answers `Session Present` 1, and
-/// the resent PUBLISH completes.
+/// This is `session.rs` and `qos.rs` measured against something that actually
+/// keeps session state: the connection dies with a PUBLISH in flight, the
+/// client reconnects with Clean Start 0, the broker answers `Session Present`
+/// 1, and the resent PUBLISH completes.
 #[tokio::test]
 #[ignore = "needs rumqttd on 127.0.0.1:21884; see the module doc for the command"]
 async fn a_session_survives_a_reconnect_and_completes_its_exchange() {
@@ -822,13 +803,13 @@ async fn the_connacks_declarations_are_the_specifications_defaults() {
 }
 
 /// The `Subscription Identifier` comes back "on every delivery it caused"
-/// ([MQTT-3.3.4-4]), which is the half of B-144 no scripted server can prove:
+/// ([MQTT-3.3.4-4]), which is the half no scripted server can prove:
 /// a harness that echoed it would only be echoing our own encoder.
 ///
 /// The same test also exercises `Subscriptions::matching`, which is what a
 /// client falls back on against a broker that declares `Subscription
 /// Identifiers Available` 0 - a case this broker does not present and
-/// B-149's does.
+/// `interop_mqtt5.rs`'s does.
 #[tokio::test]
 #[ignore = "needs rumqttd on 127.0.0.1:21884; see the module doc for the command"]
 async fn a_subscription_identifier_is_reported_back_on_the_delivery() {
@@ -858,7 +839,7 @@ async fn a_subscription_identifier_is_reported_back_on_the_delivery() {
         [42],
         "**measured**: rumqttd 0.20.0 does report the Subscription Identifier \
          back on every delivery it caused, which is [MQTT-3.3.4-4] honoured \
-         and the half of B-144 no scripted server can prove"
+         and the half no scripted server can prove"
     );
 
     // The client's own answer to exactly that, needing nothing from the

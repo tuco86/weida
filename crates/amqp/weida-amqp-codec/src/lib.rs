@@ -1,7 +1,8 @@
 //! AMQP 1.0 codec: the type system, the frames and the performatives,
 //! sans-I/O.
 //!
-//! This crate is the first slice of the AMQP 1.0 library described in
+//! This crate is the codec under `weida-amqp`, the AMQP 1.0 client library
+//! described in
 //! [0013](../../../docs/decisions/0013-competitor-libraries.md) §4.3 and
 //! [0014](../../../docs/decisions/0014-parallel-libraries.md) §2. It is
 //! **sans-I/O and weida-free**: no sockets, no executor, no dependency — not

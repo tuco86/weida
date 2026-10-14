@@ -108,8 +108,8 @@ impl SocketType {
     /// The specification's table, verbatim. "The peer SHOULD enforce that the
     /// other peer is using a valid socket type" and "SHOULD handle errors by
     /// returning an ERROR command, and then disconnecting the peer" - so this
-    /// is the predicate behind that ERROR, and the bridge decides when to
-    /// consult it.
+    /// is the predicate behind that ERROR, and the session driving this codec
+    /// decides when to consult it.
     pub const fn accepts(self, peer: SocketType) -> bool {
         use SocketType::{
             Channel, Client, Dealer, Dish, Gather, Pair, Peer, Pub, Pull, Push, Radio, Rep, Req,
@@ -375,7 +375,7 @@ mod tests {
             assert!(a.accepts(b), "{a:?} accepts {b:?}");
             assert!(b.accepts(a), "{b:?} accepts {a:?}");
         }
-        // The mismatches a bridge actually has to refuse.
+        // The mismatches a session actually has to refuse.
         assert!(!Push.accepts(Sub));
         assert!(!Req.accepts(Req));
         assert!(!Pub.accepts(Pull));

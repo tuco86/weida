@@ -2,8 +2,8 @@
 //!
 //! A `TcpListener` in the same process, with the server half written by hand,
 //! because that is the only way to assert what the *client* put on the wire
-//! and in what order. A real `nats-server` (B-168) proves interoperability;
-//! these tests prove the sequence.
+//! and in what order. A real `nats-server` (`tests/interop_nats_server.rs`)
+//! proves interoperability; these tests prove the sequence.
 //!
 //! Every await in every test that uses this is bounded by [`DEADLINE`], so a
 //! wrong turn fails the test rather than hanging the suite.

@@ -20,10 +20,10 @@
 //! is the one place the specification contradicts itself about this packet:
 //! 3.1.3 lists Client Identifier, Will Properties, Will Topic, Will Payload,
 //! User Name, Password, and Appendix B's non-normative example puts the Will
-//! fields elsewhere. The golden vectors of `docs/adapters/mqtt5.md` §10.1
-//! follow 3.1.3, which is what every implementation on the wire does, and
-//! §11 of that document keeps the contradiction on the record rather than
-//! resolving it silently.
+//! fields elsewhere. The golden vectors (`tests/golden_vectors.rs`) follow
+//! 3.1.3, which is what every implementation on the wire does, and this
+//! paragraph keeps the contradiction on the record rather than resolving it
+//! silently.
 //!
 //! **The protocol name is a fixed six bytes and is checked as such.** "The
 //! string, its offset and length will not be changed by future versions of the
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(wire[9], 0x34);
     }
 
-    /// Vector 2 of `docs/adapters/mqtt5.md` §10.1: the payload order of 3.1.3,
+    /// Golden vector 2 (`tests/golden_vectors.rs`): the payload order of 3.1.3,
     /// with all six fields present.
     #[test]
     fn the_payload_order_is_the_normative_bodys() {

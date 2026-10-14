@@ -261,9 +261,9 @@ impl Context {
     /// Reserves a socket slot against the ceiling and allocates its id.
     ///
     /// This is `zmq_socket()`'s accounting without a socket type: the ceiling
-    /// is checked here, so every socket type of the later slices gets it for
-    /// free by holding one of these. The slot is released when it is dropped,
-    /// which is `zmq_close()`.
+    /// is checked here, so every socket type gets it for free by holding one
+    /// of these. The slot is released when it is dropped, which is
+    /// `zmq_close()`.
     ///
     /// Fails with `EMFILE` at the ceiling — exactly where libzmq fails
     /// (`docs/research/zeromq.md` §11) — and with `ETERM` once the context is
@@ -351,7 +351,7 @@ impl std::fmt::Debug for Context {
 
 /// One socket's slot under its context's ceiling, plus its id.
 ///
-/// Every socket type of the later slices holds one, which is what makes
+/// Every socket type holds one, which is what makes
 /// `ZMQ_MAX_SOCKETS` a fact about the context rather than a number each
 /// socket type has to remember. Dropping it is `zmq_close()`: the slot is
 /// returned and a `shutdown` waiting for it is woken.

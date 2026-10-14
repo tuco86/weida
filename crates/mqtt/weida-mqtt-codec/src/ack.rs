@@ -20,9 +20,9 @@
 //! there are no Properties. In this case the PUBACK has a Remaining Length of
 //! 2" (3.4.1) [mqtt5 §6]. Both forms are legal and mean the same thing, so a
 //! decoder MUST accept either and an encoder has to pick: this one emits the
-//! short form whenever it applies, which is what makes the golden vectors of
-//! `docs/adapters/mqtt5.md` §10.1 rows 8 and 10 binding and row 9 — the long
-//! form of the same value — a decode-only vector.
+//! short form whenever it applies, which is what makes golden vectors 8 and 10
+//! (`tests/golden_vectors.rs`) binding and vector 9 — the long form of the
+//! same value — a decode-only vector.
 //!
 //! What each packet certifies is [mqtt5 §6], and it is worth having in the
 //! module that encodes them because it is the one thing about them that is not

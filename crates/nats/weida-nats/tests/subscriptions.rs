@@ -1,4 +1,4 @@
-//! B-166: `SUB`, `UNSUB`, queue groups, and `MSG`/`HMSG` dispatched to the
+//! `SUB`, `UNSUB`, queue groups, and `MSG`/`HMSG` dispatched to the
 //! subscription that asked for it.
 //!
 //! Subject matching itself is a pure function and is tested exhaustively in
@@ -213,7 +213,8 @@ async fn a_delivery_reaches_the_sid_it_names_and_no_other() {
 /// publication, the server selects one eligible member from each matching
 /// queue group") and no scripted server can establish it: a test that made
 /// its own fake server deliver one copy would be asserting the script, not
-/// the behaviour. It is proved against a real `nats-server` in B-168.
+/// the behaviour. It is proved against a real `nats-server` in
+/// `tests/interop_nats_server.rs`.
 #[tokio::test]
 async fn a_queue_group_is_one_argument_between_subject_and_sid() {
     let exec = Exec::current().unwrap();

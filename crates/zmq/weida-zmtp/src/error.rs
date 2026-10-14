@@ -163,8 +163,8 @@ pub enum CommandError {
     /// The command name is empty, or contains an octet other than a letter.
     BadName,
     /// A command name this codec does not implement. `JOIN` and `LEAVE` are
-    /// the known omission: they belong to RADIO/DISH, which the adapter's
-    /// socket-type table does not map.
+    /// the known omission: they belong to RADIO/DISH, which `weida-zmq` does
+    /// not carry.
     UnknownName,
     /// A metadata property name is empty or contains an octet the grammar does
     /// not allow.

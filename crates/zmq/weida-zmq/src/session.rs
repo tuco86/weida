@@ -128,7 +128,7 @@ pub struct Negotiated {
     pub version: Version,
     /// The peer's `Identity` property, if it announced one. Self-asserted —
     /// see [`RoutingId`] — and what a ROUTER keys its queue by, which is that
-    /// socket type's slice rather than this one.
+    /// socket type's concern rather than this one's.
     pub identity: Option<RoutingId>,
     /// The user id a ZAP handler returned with its 200, where this side
     /// authorized the connection.
@@ -1060,8 +1060,8 @@ pub enum Incoming {
 
 /// ZMTP over a byte stream: the I/O the codec deliberately does not do.
 ///
-/// Public because the socket types of the later slices drive it, and because
-/// it is what makes the session testable against a raw stream.
+/// Public because the socket types drive it, and because it is what makes the
+/// session testable against a raw stream.
 #[derive(Debug)]
 pub struct Wire<S> {
     io: S,

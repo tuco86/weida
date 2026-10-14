@@ -131,8 +131,8 @@
 //!   `orders.>.created` is [`Error::InvalidSubject`] at the `subscribe` call
 //!   rather than a pattern with a guessed meaning.
 //! * **There is no reconnect loop.** "Client reconnection policy is a
-//!   client-library policy, not a Core NATS wire guarantee" (§1), and B-165's
-//!   acceptance does not ask for one. When the connection ends,
+//!   client-library policy, not a Core NATS wire guarantee" (§1), so none is
+//!   built in. When the connection ends,
 //!   [`Connection::closed`] reports why, every subscription ends with it —
 //!   which is the protocol's behaviour, since core subscriptions have no
 //!   stored session — and the material a policy needs is exposed: the failure,

@@ -1,8 +1,8 @@
-//! Conformance: the golden test vectors of `docs/adapters/zmtp.md` §10.1.
+//! Conformance: the golden test vectors.
 //!
-//! §10.1 publishes these octets, so an implementation - this one, or a future
-//! reimplementation, or a reader checking libzmq against the document - MUST
-//! encode exactly them and MUST decode them back to exactly these values. The
+//! These octets are the contract, so an implementation - this one, or a future
+//! reimplementation, or a reader checking libzmq against them - MUST encode
+//! exactly them and MUST decode them back to exactly these values. The
 //! vectors are asserted here through the crate's public surface only, with no
 //! access to private helpers: the unit tests beside each codec cover the
 //! halves, and this file is what makes the published bytes binding.
@@ -17,9 +17,8 @@ use weida_zmtp::{
     Metadata, SocketType, VERSION, curve, frame, greeting, z85,
 };
 
-/// The cap every vector is decoded under: the adapter's own
-/// `max_message_bytes` neighbour on the weida side is `subscriber_buffer_bytes`
-/// (8 MiB), and no vector is anywhere near it.
+/// The cap every vector is decoded under, 8 MiB, and no vector is anywhere
+/// near it.
 const CAP: u64 = 8 * 1024 * 1024;
 
 /// Asserts one command vector: the whole frame encodes to `expected`, and
@@ -259,7 +258,7 @@ fn golden_ready_from_a_foreign_peer_is_read_field_by_field() {
 
 #[test]
 fn golden_unknown_command_names_are_refused_by_name() {
-    // JOIN is a real ZMTP 3.1 command this adapter does not carry, so the
+    // JOIN is a real ZMTP 3.1 command this crate does not carry, so the
     // vector is here to pin the refusal rather than the omission.
     let bytes: &[u8] = b"\x04\x0A\x04JOINgroup1";
     let (_, body, _) = frame::decode(bytes, CAP).expect("the frame is well formed");

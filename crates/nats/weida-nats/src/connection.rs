@@ -67,7 +67,7 @@
 //!
 //! Deliberately, and stated rather than left ambiguous: "client reconnection
 //! policy is a client-library policy, not a Core NATS wire guarantee" (§1),
-//! and B-165's acceptance does not ask for one. When the connection ends,
+//! so none is built in. When the connection ends,
 //! [`Connection::closed`] reports why and every subscription ends with it —
 //! which is the protocol's own behaviour, since "core subscriptions vanish
 //! with the connection and have no stored session". The material a policy

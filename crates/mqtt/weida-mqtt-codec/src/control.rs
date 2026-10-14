@@ -31,8 +31,8 @@
 //! client owns rather than the codec: a non-zero value when CONNECT carried
 //! zero is a Protocol Error, and the *server* MUST NOT send the property at
 //! all ([MQTT-3.14.2-2]) [mqtt5 §1]. Both need the CONNECT that came before
-//! and the direction of travel, so they are B-142's, and
-//! `docs/adapters/mqtt5.md` §9.10 is where the refusal is named.
+//! and the direction of travel, so they belong to the client's session in
+//! `weida-mqtt`, which refuses them before sending.
 //!
 //! **AUTH has no short form here, and that is a decision.** DISCONNECT's
 //! reason code and property length are omissible together (3.14.2.1), and this
@@ -42,8 +42,7 @@
 //! packet that cannot be conformant anyway, and spelling it in two bytes would
 //! be spelling something unusable. A peer that sends a zero-length AUTH is
 //! answered with [`crate::DecodeError::PacketLengthMismatch`] rather than
-//! guessed at; `docs/adapters/mqtt5.md` §11 records the asymmetry as
-//! deliberate.
+//! guessed at; the asymmetry with DISCONNECT is deliberate.
 
 use crate::data::Reader;
 use crate::error::{DecodeError, EncodeError};

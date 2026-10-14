@@ -1,23 +1,21 @@
-//! The MQTT-5-only half: everything B-148 could not reach because rumqttd
-//! 0.20.0 declares almost nothing.
+//! The MQTT-5-only half: everything `interop_rumqttd.rs` could not reach
+//! because rumqttd 0.20.0 declares almost nothing.
 //!
 //! Measured against **rmqtt 0.23.1** on 2026-09-12, rustc 1.98.
 //!
-//! # Why rmqtt and not Mosquitto
+//! # Why rmqtt, and where Mosquitto fits
 //!
-//! The item names Mosquitto, and Mosquitto is a **system package**: on this
-//! machine `which mosquitto` is empty and `pacman -Q mosquitto` reports it
-//! absent, and installing a system package is outside what this loop may do
-//! ([LOOP.md](../../../../docs/LOOP.md) §2). rmqtt is a Rust binary reachable
-//! with `cargo install`, it claims full 5.0 support, and - the part that
-//! decides it - **it declares its capabilities in CONNACK**, which is the
-//! exact gap B-148 left. A broker that declares nothing lets a client observe
-//! only success; a broker that declares `Maximum QoS` 1 or `Retain Available`
-//! 0 is the only way to reach a refusal path against something real.
+//! Mosquitto is a **system package**, so a test that needs it cannot count on
+//! being able to install it. rmqtt is a Rust binary reachable with
+//! `cargo install`, it claims full 5.0 support, and - the part that decides
+//! it - **it declares its capabilities in CONNACK**, which rumqttd does not.
+//! A broker that declares nothing lets a client observe only success; a broker
+//! that declares `Maximum QoS` 1 or `Retain Available` 0 is the only way to
+//! reach a refusal path against something real.
 //!
-//! The Mosquitto commands are kept below so the named broker can be measured
-//! where it exists, and any disagreement between the two is worth more than
-//! either alone.
+//! The Mosquitto commands are kept below so that broker can be measured where
+//! it exists, and any disagreement between the two is worth more than either
+//! alone.
 //!
 //! # Running them
 //!
@@ -27,7 +25,7 @@
 //! cargo install rmqttd --version 0.23.1 --locked
 //! rmqttd -f crates/mqtt/weida-mqtt/tests/interop/rmqtt.toml
 //!
-//! # The broker the item names, where the machine has it:
+//! # Mosquitto, where the machine has it:
 //! #   Debian/Ubuntu: apt install mosquitto
 //! #   Arch:          pacman -S mosquitto
 //! #   macOS:         brew install mosquitto
@@ -38,9 +36,9 @@
 //! ```
 //!
 //! `#[ignore]` because a broker is a runtime condition: the file compiles
-//! everywhere and runs where port 21885 answers. In the session that wrote it
-//! the broker ran under the process supervisor with a TCP `ready` condition
-//! on that port and was stopped in the same item.
+//! everywhere and runs where port 21885 answers. Start the broker under a
+//! process supervisor with a TCP `ready` condition on that port, and stop it
+//! when the run ends.
 //!
 //! # Measured, not inferred
 //!
@@ -53,8 +51,8 @@
 //! `Maximum Packet Size` 1,048,576, `Topic Alias Maximum` 16, all three
 //! subscription-availability flags 1, and `Server Keep Alive` 30 s. Every one
 //! of those is a property rumqttd 0.20.0 leaves absent, and absence is the
-//! default rather than a statement - so this is the first run in which a
-//! client's refusal paths are reachable at all.
+//! default rather than a statement - so this is where a client's refusal
+//! paths become reachable at all.
 //!
 //! **Two of them are plugins, not listener settings, and that is a trap.**
 //! `Retain Available` and `Shared Subscription Available` come from whether
@@ -74,7 +72,7 @@
 //!   the second and third publishes to one topic carry a zero-length Topic
 //!   Name and the alias, the broker resolves them, and the subscriber
 //!   receives the right topic every time.
-//! * **Retain Handling 1**, which B-148's broker could not separate from 0:
+//! * **Retain Handling 1**, which rumqttd could not separate from 0:
 //!   the first subscribe to a filter gets the stored value, the second
 //!   subscribe of the *same* filter does not, and Retain Handling 2 never
 //!   does.
@@ -86,9 +84,8 @@
 //!   Interval` rewritten downwards as 3.3.2.3.3 permits.
 //! * **The server's `Receive Maximum` becomes the send quota** and the
 //!   client's own declared ceiling is a *different* number the server does
-//!   not overwrite - the distinction one shared field got wrong in B-142,
-//!   now measured against a broker that declares 8 while the client declares
-//!   200.
+//!   not overwrite - two numbers that must not share a field, measured
+//!   against a broker that declares 8 while the client declares 200.
 //! * **One granted SUBACK code per filter in order**, three filters at three
 //!   QoS values, and UNSUBACK's 0x11 `No subscription existed` arriving as a
 //!   **success**.
@@ -143,8 +140,11 @@
 
 #![cfg(test)]
 
+mod harness;
+
 use std::time::Duration;
 
+use harness::{DEADLINE, unique};
 use weida_mqtt::{
     Client, ConnectOptions, Context, Delivery, DisconnectReasonCode, Error, Event, Events, Message,
     QoS, RetainHandling, Session, Subscription,
@@ -159,15 +159,6 @@ const BROKER: &str = "127.0.0.1:21885";
 /// only reachable against a declaration, so a broker that states nothing
 /// cannot exercise them at all.
 const RESTRICTED: &str = "127.0.0.1:21887";
-const DEADLINE: Duration = Duration::from_secs(10);
-
-fn unique(prefix: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_nanos();
-    format!("{prefix}-{nanos:x}")
-}
 
 fn options(client_id: &str) -> ConnectOptions {
     let mut options = ConnectOptions::new(client_id);
@@ -259,7 +250,7 @@ async fn the_connack_declares_the_five_dot_oh_capabilities() {
 /// The server's `Receive Maximum` becomes this client's send quota, and
 /// exhausting it **stalls** rather than exceeding it ([MQTT-4.9.0-2]).
 ///
-/// B-143 proved the stall against a scripted server. This proves the number
+/// `qos.rs` proves the stall against a scripted server. This proves the number
 /// came off a real CONNACK: the configuration says 8, the session says 8.
 #[tokio::test]
 #[ignore = "needs a 5.0 broker on 127.0.0.1:21885; see the module doc"]
@@ -285,8 +276,8 @@ async fn the_servers_receive_maximum_becomes_the_send_quota() {
         session.receive_maximum(),
         200,
         "and the client's own declared ceiling is a different number that the \
-         server's does not overwrite (3.1.2.11.3 against 3.2.2.3.3) - the \
-         distinction one shared field got wrong in B-142"
+         server's does not overwrite (3.1.2.11.3 against 3.2.2.3.3) - two \
+         numbers that must not share a field"
     );
 
     client
@@ -498,7 +489,7 @@ async fn topic_aliases_survive_a_round_trip_through_the_broker() {
 }
 
 /// All three Retain Handling values against a broker that implements them,
-/// including the **1** that B-148's broker could not separate from 0.
+/// including the **1** that rumqttd could not separate from 0.
 ///
 /// Retain Handling 1 is "send them only if the subscription did not already
 /// exist", so it takes two subscribes of the same filter on the same session
@@ -577,10 +568,9 @@ async fn retain_handling_one_sends_only_on_a_new_subscription() {
 /// one: a session with a 1-second expiry is gone a moment later, and the same
 /// client identifier with a long expiry is not.
 ///
-/// The wall-clock wait is the smallest that demonstrates it
-/// ([LOOP.md](../../../../docs/LOOP.md) §2), and the pairing is what makes it
-/// a measurement rather than a sleep: the long-expiry half runs the same
-/// sequence and finds the session still there.
+/// The wall-clock wait is the smallest that demonstrates it, and the pairing
+/// is what makes it a measurement rather than a sleep: the long-expiry half
+/// runs the same sequence and finds the session still there.
 #[tokio::test]
 #[ignore = "needs a 5.0 broker on 127.0.0.1:21885; see the module doc"]
 async fn a_session_expires_on_its_own_interval() {
@@ -861,7 +851,7 @@ async fn a_server_disconnect_arrives_as_a_reason_code() {
     drop(client);
 }
 
-/// **The availability flags as declarations, which is the gap B-148 left.**
+/// **The availability flags as declarations, which rumqttd cannot exercise.**
 ///
 /// The `restricted` listener of `tests/interop/rmqtt.toml` declares `Maximum
 /// QoS` 1 and `Topic Alias Maximum` 0. Against a broker that declares

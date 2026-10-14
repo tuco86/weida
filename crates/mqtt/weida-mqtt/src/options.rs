@@ -16,12 +16,11 @@
 //! * `ping_timeout` has **no** specification value at all: a client seeing no
 //!   PINGRESP "within a reasonable amount of time" SHOULD close, with no
 //!   number given, and HiveMQ's guide repeats the same non-quantified advice
-//!   [mqtt5 §1]. An unbounded wait there is a hang with a rationale
-//!   ([LOOP.md] §2), so it is a field with a real default rather than a
-//!   silent forever. The default is the Keep Alive interval itself: the
-//!   symmetric choice against the server's 1.5x would be more patient than
-//!   the server is, and a client that outlasts its own server's timeout
-//!   learns nothing by waiting.
+//!   [mqtt5 §1]. Every wait is bounded, so it is a field with a real default
+//!   rather than a silent forever. The default is the Keep Alive interval
+//!   itself: the symmetric choice against the server's 1.5x would be more
+//!   patient than the server is, and a client that outlasts its own server's
+//!   timeout learns nothing by waiting.
 //! * `connect_timeout` likewise: "missing CONNECT or CONNACK within a
 //!   reasonable amount of time SHOULD cause a close; neither timeout is
 //!   quantified" [mqtt5 §1].

@@ -69,7 +69,7 @@ pub const SESSION_QUEUE: usize = 64;
 /// **The protocol's own bound, set to a number rather than left at the
 /// default.** `handle-max` defaults to `4294967295`, which is 2^32 links per
 /// session; 255 is the number this client will actually accept, and it is
-/// what makes the link table of B-159 bounded rather than merely large.
+/// what makes the link table bounded rather than merely large.
 pub const DEFAULT_HANDLE_MAX: u32 = 255;
 
 /// How a session is begun.

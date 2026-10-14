@@ -1,10 +1,10 @@
-//! What a REQ/REP round trip costs in Rust, for B-117's comparison.
+//! What a REQ/REP round trip costs in Rust, for the comparison with Python.
 //!
 //! The Python binding's round trip is measured by
 //! `crates/zmq/weida-zmq-py/roundtrip_cost.py` with the same shape — one
 //! request out, one reply back, over `inproc://` and over loopback `tcp://`,
 //! at an empty payload and at 1 KiB — and the two numbers go into
-//! `docs/IMPLEMENTATION.md` §4. This is the Rust half: the same library
+//! `docs/IMPLEMENTATION.md §4.15`. This is the Rust half: the same library
 //! without a language boundary in the middle.
 //!
 //! Not a criterion bench on purpose: what is wanted is one median against

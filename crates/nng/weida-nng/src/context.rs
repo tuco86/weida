@@ -15,8 +15,8 @@
 //! **This is not `nng_ctx`.** NNG's context is per-transaction protocol
 //! state — one request ID and its resend timer, one survey and its deadline
 //! (`docs/research/nanomsg-nng.md` §2) — and it belongs to a socket, not to
-//! a process. Those are the per-protocol context types of the REQ/REP and
-//! SURVEYOR/RESPONDENT slices; this type is the container they all run in.
+//! a process. Those are the per-protocol context types of REQ/REP and
+//! SURVEYOR/RESPONDENT; this type is the container they all run in.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

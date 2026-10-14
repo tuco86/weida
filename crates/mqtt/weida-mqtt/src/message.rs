@@ -31,8 +31,7 @@
 //! **Durability is certified by none of them.** "No acknowledgement certifies
 //! durability": the specification puts the choice on the solution developer
 //! and 4.1.1 explicitly contemplates loss [mqtt5 §12/P7]. That is why nothing
-//! here is named `Stored`, and why `docs/adapters/mqtt5.md` §9.2 refuses to
-//! report a PUBACK as anything of the kind.
+//! here is named `Stored`.
 //!
 //! # Success codes that look like failures
 //!
@@ -154,7 +153,7 @@ impl Message {
     pub fn check(&self, limits: &ServerLimits) -> Result<()> {
         // A Topic Name and never a filter ([MQTT-3.3.2-2]). The zero-length
         // case is legal only with an established Topic Alias (3.3.2.1),
-        // which is B-146's, so it is refused here.
+        // which is the alias table's to decide, so it is refused here.
         crate::filter::check_topic_name(&self.topic, false)?;
         limits.require(crate::error::Feature::Qos(self.qos))?;
         if self.retain {

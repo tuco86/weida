@@ -19,18 +19,10 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::{Act, Server, bytes};
+use harness::{Act, Server, bytes, connack};
 use weida_mqtt::blocking::BlockingContext;
 use weida_mqtt::{ConnectOptions, DisconnectReasonCode, Error, Message, QoS, Subscription};
 use weida_mqtt_codec::{Connack, ConnectReasonCode, Packet, Properties, Publish};
-
-fn connack() -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present: false,
-        reason_code: ConnectReasonCode::Success,
-        properties: Properties::new(),
-    }))
-}
 
 fn delivery(topic: &str, payload: &[u8]) -> Vec<u8> {
     bytes(&Packet::Publish(Publish {
@@ -42,12 +34,7 @@ fn delivery(topic: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 fn options() -> ConnectOptions {
-    let mut options = ConnectOptions::new("blocking-client");
-    // Keep Alive off: a scripted server that has run out of answers sends no
-    // PINGRESP, and these tests are about the facade rather than the timer.
-    options.keep_alive = Duration::ZERO;
-    options.connect_timeout = Duration::from_secs(5);
-    options
+    harness::options("blocking-client")
 }
 
 /// The harness is async, so it needs a runtime of its own — started on a
@@ -101,7 +88,7 @@ fn the_facade_completes_a_round_trip_with_no_ambient_reactor() {
     );
 
     let server = ScriptedServer::start(vec![vec![
-        Act::Send(connack()),
+        Act::Send(connack(Properties::new())),
         Act::Suback(vec![0x02]),
         Act::AckPublish,     // the QoS 2 PUBLISH, answered PUBREC
         Act::CompletePubrel, // and PUBCOMP
@@ -147,7 +134,7 @@ fn the_facade_completes_a_round_trip_with_no_ambient_reactor() {
 #[test]
 fn a_deadline_expires_without_disturbing_the_connection() {
     let server = ScriptedServer::start(vec![vec![
-        Act::Send(connack()),
+        Act::Send(connack(Properties::new())),
         // Nothing for a while, so the first deadline expires.
         Act::Idle(Duration::from_millis(600)),
         Act::Send(delivery("room/12", b"late")),
@@ -240,8 +227,16 @@ fn a_refusal_is_the_asynchronous_surfaces_refusal() {
 #[test]
 fn two_threads_each_block_on_their_own_connection() {
     let server = ScriptedServer::start(vec![
-        vec![Act::Send(connack()), Act::AckPublish, Act::Expect],
-        vec![Act::Send(connack()), Act::AckPublish, Act::Expect],
+        vec![
+            Act::Send(connack(Properties::new())),
+            Act::AckPublish,
+            Act::Expect,
+        ],
+        vec![
+            Act::Send(connack(Properties::new())),
+            Act::AckPublish,
+            Act::Expect,
+        ],
     ]);
     let address = server.address.clone();
 

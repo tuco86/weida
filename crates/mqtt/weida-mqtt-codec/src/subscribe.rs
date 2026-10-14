@@ -47,8 +47,8 @@
 //!
 //! What is *not* here: matching. A filter's `+`/`#` grammar and the
 //! specification's worked examples belong to the client that subscribes with
-//! them (B-144), because a codec that rejected an unmatched filter would be
-//! refusing bytes a broker is free to accept.
+//! them (`weida-mqtt`'s `filter` module), because a codec that rejected an
+//! unmatched filter would be refusing bytes a broker is free to accept.
 
 use crate::data::{self, Reader};
 use crate::error::{DecodeError, EncodeError};
@@ -595,8 +595,7 @@ mod tests {
 
     /// Several filters in one packet, each with its own options and its own
     /// verdict — and one verdict being a failure leaves the others alone
-    /// (3.9.3), which is the thing weida cannot express at all
-    /// (`docs/adapters/mqtt5.md` §8 L18).
+    /// (3.9.3).
     #[test]
     fn many_filters_and_many_verdicts_keep_their_order() {
         let filters = [

@@ -1,4 +1,4 @@
-//! B-143 on the wire: both delivery state machines in both directions, the
+//! Delivery on the wire: both delivery state machines in both directions, the
 //! send quota, and the four points a QoS 2 handshake can be interrupted at.
 //!
 //! # The four lost-packet cases
@@ -20,39 +20,22 @@
 //! server's answer distinguishes them. 0x92 "is not an error during recovery"
 //! (3.6.2.1) [mqtt5 §6], so the client must complete the exchange on it rather
 //! than hang or fail — and the second and fourth rows together are the
-//! "neither loss nor duplication" the acceptance asks for.
+//! "neither loss nor duplication" of QoS 2.
 
 mod harness;
 
 use std::time::Duration;
 
-use harness::{Act, Server, bytes, decode};
+use harness::{Act, Server, bytes, connack_session, decode};
 use weida_mqtt::{
-    Client, Completion, ConnectOptions, ConnectReasonCode, Context, DisconnectReasonCode, Error,
-    Event, Message, Packet, QoS, Session,
+    Client, Completion, ConnectOptions, Context, DisconnectReasonCode, Error, Event, Message,
+    Packet, QoS, Session,
 };
-use weida_mqtt_codec::{
-    Connack, PacketType, Properties, PubackReasonCode, PubcompReasonCode, Publish,
-};
-
-fn connack(session_present: bool, properties: Properties<'_>) -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present,
-        reason_code: ConnectReasonCode::Success,
-        properties,
-    }))
-}
+use weida_mqtt_codec::{PacketType, Properties, PubackReasonCode, PubcompReasonCode, Publish};
 
 fn options(clean_start: bool) -> ConnectOptions {
-    let mut options = ConnectOptions::new("qos-client");
+    let mut options = harness::options("qos-client");
     options.clean_start = clean_start;
-    // Keep Alive off: these tests are about the delivery machines, and a
-    // scripted server that has run out of script answers no PINGREQ, so an
-    // enabled keep-alive would make every test wait out the PINGRESP
-    // deadline before its own assertions ran. The keep-alive behaviour has
-    // its own tests in `connection.rs`.
-    options.keep_alive = Duration::ZERO;
-    options.connect_timeout = Duration::from_secs(5);
     options.session_expiry = Some(Duration::from_secs(300));
     options
 }
@@ -63,7 +46,7 @@ fn options(clean_start: bool) -> ConnectOptions {
 #[tokio::test]
 async fn qos_0_completes_at_once_and_stores_nothing() {
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::AckPublish,
         Act::Expect,
     ])
@@ -105,7 +88,7 @@ async fn qos_0_completes_at_once_and_stores_nothing() {
 #[tokio::test]
 async fn qos_1_completes_on_the_puback_and_frees_its_identifier() {
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::AckPublish,
         Act::Expect,
     ])
@@ -148,7 +131,7 @@ async fn qos_1_completes_on_the_puback_and_frees_its_identifier() {
 #[tokio::test]
 async fn qos_2_completes_on_the_pubcomp() {
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::AckPublish,     // answers PUBREC
         Act::CompletePubrel, // answers PUBCOMP
         Act::Expect,
@@ -193,7 +176,7 @@ async fn qos_2_completes_on_the_pubcomp() {
 #[tokio::test]
 async fn a_failing_pubrec_ends_the_exchange_without_a_pubrel() {
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::RefusePublish(0x87), // Not authorized
         Act::Expect,              // the DISCONNECT, and no PUBREL before it
     ])
@@ -243,7 +226,7 @@ async fn a_failing_pubrec_ends_the_exchange_without_a_pubrel() {
 #[tokio::test]
 async fn no_matching_subscribers_is_a_success() {
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::RefusePublish(0x10),
         Act::Expect,
     ])
@@ -282,12 +265,12 @@ async fn a_lost_publish_is_replayed_on_reconnect() {
         // The PUBLISH is read and not answered, then the connection drops:
         // from the client's side this is a lost PUBLISH.
         vec![
-            Act::Send(connack(false, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
             Act::Expect,
             Act::Close,
         ],
         vec![
-            Act::Send(connack(true, Properties::new())),
+            Act::Send(connack_session(true, Properties::new())),
             Act::AckPublish,     // the resent PUBLISH, answered PUBREC
             Act::CompletePubrel, // PUBCOMP
             Act::Expect,         // the DISCONNECT
@@ -363,12 +346,12 @@ async fn a_lost_pubrec_is_replayed_without_a_second_delivery() {
         // because a race between the write and the close would decide which
         // packet was lost and a test must not be decided by a race.
         vec![
-            Act::Send(connack(false, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
             Act::AcceptPublish,
             Act::Close,
         ],
         vec![
-            Act::Send(connack(true, Properties::new())),
+            Act::Send(connack_session(true, Properties::new())),
             Act::AckPublish, // the resent PUBLISH: a repeat, so no new delivery
             Act::CompletePubrel,
             Act::Expect,
@@ -426,13 +409,13 @@ async fn a_lost_pubrec_is_replayed_without_a_second_delivery() {
 async fn a_lost_pubrel_replays_the_pubrel_and_not_the_publish() {
     let mut server = Server::start_all(vec![
         vec![
-            Act::Send(connack(false, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
             Act::AckPublish, // PUBREC
             Act::Expect,     // the PUBREL, read and not answered
             Act::Close,
         ],
         vec![
-            Act::Send(connack(true, Properties::new())),
+            Act::Send(connack_session(true, Properties::new())),
             Act::CompletePubrel, // the resent PUBREL, answered 0x00
             Act::Expect,
         ],
@@ -493,7 +476,7 @@ async fn a_lost_pubrel_replays_the_pubrel_and_not_the_publish() {
 async fn a_lost_pubcomp_completes_on_0x92() {
     let mut server = Server::start_all(vec![
         vec![
-            Act::Send(connack(false, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
             Act::AckPublish, // PUBREC
             // Released by the server, and the PUBCOMP lost on the way back —
             // again an accept rather than a send-then-close, so the test is
@@ -502,7 +485,7 @@ async fn a_lost_pubcomp_completes_on_0x92() {
             Act::Close,
         ],
         vec![
-            Act::Send(connack(true, Properties::new())),
+            Act::Send(connack_session(true, Properties::new())),
             Act::ForgetPubrel, // the resent PUBREL, answered 0x92
             Act::Expect,
         ],
@@ -566,7 +549,7 @@ async fn a_lost_pubcomp_completes_on_0x92() {
 #[tokio::test]
 async fn the_quota_stalls_the_sender_rather_than_being_exceeded() {
     let server = Server::start(vec![
-        Act::Send(connack(
+        Act::Send(connack_session(
             false,
             Properties {
                 receive_maximum: Some(2),
@@ -667,7 +650,7 @@ async fn an_inbound_qos_1_publish_is_delivered_and_acknowledged() {
         },
     }));
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::Send(delivery),
         Act::Expect, // the PUBACK
         Act::Expect, // the DISCONNECT
@@ -735,7 +718,7 @@ async fn an_inbound_qos_2_repeat_is_answered_again_and_not_delivered_twice() {
     let pubrel = bytes(&Packet::Pubrel(weida_mqtt_codec::Pubrel::new(9)));
 
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::Send(first),
         Act::Expect, // PUBREC
         Act::Send(repeat),
@@ -816,7 +799,7 @@ async fn an_inbound_qos_2_repeat_is_answered_again_and_not_delivered_twice() {
 async fn an_unknown_pubrel_is_answered_0x92_and_the_connection_survives() {
     let pubrel = bytes(&Packet::Pubrel(weida_mqtt_codec::Pubrel::new(4242)));
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::Send(pubrel),
         Act::Expect, // the PUBCOMP 0x92
         Act::Expect, // the DISCONNECT, so the connection did survive
@@ -853,7 +836,7 @@ async fn an_unknown_pubrel_is_answered_0x92_and_the_connection_survives() {
 /// DISCONNECT 0x93" [mqtt5 §5].
 #[tokio::test]
 async fn a_server_that_exceeds_the_declared_receive_maximum_is_reported() {
-    let mut script = vec![Act::Send(connack(false, Properties::new()))];
+    let mut script = vec![Act::Send(connack_session(false, Properties::new()))];
     for packet_id in 1..=3u16 {
         script.push(Act::Send(bytes(&Packet::Publish(Publish {
             topic: "in/flood",

@@ -1,5 +1,5 @@
-//! B-167: request-reply over an inbox, and the two ways a request ends
-//! without an answer.
+//! Request-reply over an inbox, and the two ways a request ends without an
+//! answer.
 //!
 //! The test that matters most here is the pair at the bottom. "With
 //! `no_responders` and headers negotiated, a request with no responder
@@ -396,8 +396,8 @@ async fn a_request_with_no_responder_fails_fast_with_the_503_status() {
 /// request that nobody answers at all ends in the caller's window elapsing,
 /// and it is reported as the timeout it is.
 ///
-/// Together with the test above this is the difference the acceptance asks
-/// for: same request API, two different facts, two different errors, and two
+/// Together with the test above this is the difference the pair exists to
+/// show: same request API, two different facts, two different errors, and two
 /// very different elapsed times.
 #[tokio::test]
 async fn a_request_nobody_answers_ends_in_the_callers_timeout() {

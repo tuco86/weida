@@ -2,7 +2,8 @@
 //!
 //! Every test here stands up a `TcpListener` in the same process and plays
 //! the server half by hand, because that is the only way to assert what the
-//! *client* put on the wire and in what order. A real broker (B-162) proves
+//! *client* put on the wire and in what order. A real peer
+//! (`tests/interop_fe2o3.rs`, `tests/interop_rabbitmq.rs`) proves
 //! interoperability; this proves the sequence.
 //!
 //! Part 2 §2.2's four negotiation outcomes each get a test, because they
@@ -15,91 +16,30 @@
 //! * nothing comes back — the handshake deadline, which is ours because the
 //!   protocol has none.
 
+mod support;
+
 #[cfg(feature = "tls")]
 use std::sync::Arc;
 use std::time::Duration;
 
+use support::{DEADLINE, Server, accept, options, scripted};
+#[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use weida_amqp::options::{ConnectionOptions, Sasl};
+#[cfg(feature = "tls")]
+use tokio::net::TcpStream;
+use weida_amqp::options::Sasl;
 use weida_amqp::{Connection, Error, SessionOptions, State};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::performative::{Close, Open, Performative};
-use weida_amqp_codec::protocol_header::{self, ProtocolHeader};
+#[cfg(feature = "tls")]
+use weida_amqp_codec::protocol_header;
+use weida_amqp_codec::protocol_header::ProtocolHeader;
 use weida_amqp_codec::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{Limits, Multiple};
 use weida_runtime::Exec;
 
-/// Every await in this file is bounded, so a wrong turn fails the test rather
-/// than hanging the suite.
-const DEADLINE: Duration = Duration::from_secs(5);
-
-/// The server half of a scripted exchange.
-struct Server {
-    stream: TcpStream,
-    buf: Vec<u8>,
-    from: usize,
-}
-
 impl Server {
-    async fn listen() -> (TcpListener, u16) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        (listener, port)
-    }
-
-    async fn accept(listener: &TcpListener) -> Self {
-        let (stream, _) = listener.accept().await.unwrap();
-        Self {
-            stream,
-            buf: Vec::new(),
-            from: 0,
-        }
-    }
-
-    async fn fill(&mut self, want: usize) {
-        while self.buf.len() - self.from < want {
-            let mut chunk = [0u8; 4096];
-            let read = self.stream.read(&mut chunk).await.unwrap();
-            assert_ne!(read, 0, "the client closed before sending {want} octets");
-            self.buf.extend_from_slice(&chunk[..read]);
-        }
-    }
-
-    async fn read_protocol_header(&mut self) -> ProtocolHeader {
-        self.fill(protocol_header::LEN).await;
-        let header = protocol_header::decode(&self.buf[self.from..]).unwrap();
-        self.from += protocol_header::LEN;
-        header
-    }
-
-    async fn read_frame_bytes(&mut self) -> Vec<u8> {
-        self.fill(8).await;
-        let header = frame::decode_header(&self.buf[self.from..], u32::MAX).unwrap();
-        let size = header.size as usize;
-        self.fill(size).await;
-        let bytes = self.buf[self.from..self.from + size].to_vec();
-        self.from += size;
-        bytes
-    }
-
-    /// The next frame's channel and performative, as owned facts.
-    async fn read_performative(&mut self) -> (u16, String) {
-        let bytes = self.read_frame_bytes().await;
-        let frame = frame::decode(&bytes, u32::MAX).unwrap();
-        if frame.is_empty() {
-            return (frame.header.channel, "empty".to_owned());
-        }
-        let (performative, _) = Performative::decode(frame.body, Limits::DEFAULT).unwrap();
-        (frame.header.channel, performative.name().to_owned())
-    }
-
-    async fn write(&mut self, bytes: &[u8]) {
-        self.stream.write_all(bytes).await.unwrap();
-        self.stream.flush().await.unwrap();
-    }
-
     async fn send_header(&mut self, header: ProtocolHeader) {
         self.write(&header.encode()).await;
     }
@@ -137,38 +77,30 @@ impl Server {
     }
 }
 
-fn options() -> ConnectionOptions {
-    let mut options = ConnectionOptions::new("client-1");
-    options.idle_time_out = None;
-    options.handshake_timeout = Duration::from_secs(2);
-    options.close_budget = Duration::from_secs(2);
-    options
-}
-
 #[tokio::test]
 async fn a_bare_connection_opens_and_closes() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
+        let mut server = accept(&listener).await;
         // The client MUST send its header immediately on connect, before it
         // has seen anything from us: that is what makes a multi-protocol
         // server able to dispatch on it.
         assert_eq!(
-            server.read_protocol_header().await,
+            server.read_header().await,
             ProtocolHeader::AMQP,
             "the first eight octets are AMQP %d0 1.0.0"
         );
         server.send_header(ProtocolHeader::AMQP).await;
 
         // `open` is the first frame and it is on channel 0.
-        let (channel, name) = server.read_performative().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "open"));
         server.send_open(None).await;
 
         // ...and `close` is the last thing the client ever writes.
-        let (channel, name) = server.read_performative().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "close"));
         server.send_close(None).await;
         server
@@ -216,11 +148,11 @@ async fn a_bare_connection_opens_and_closes() {
 #[tokio::test]
 async fn a_different_protocol_id_is_a_demand_and_not_a_retry() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        assert_eq!(server.read_protocol_header().await, ProtocolHeader::AMQP);
+        let mut server = accept(&listener).await;
+        assert_eq!(server.read_header().await, ProtocolHeader::AMQP);
         // Part 2 §2.2: a server requiring SASL answers a %d0 request with
         // %d3 and closes.
         server.send_header(ProtocolHeader::SASL).await;
@@ -251,11 +183,11 @@ async fn a_different_protocol_id_is_a_demand_and_not_a_retry() {
 #[tokio::test]
 async fn an_amqp_0_9_1_server_is_a_version_mismatch() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         // 0-9-1 shares this port and this four-octet prefix. Its header is
         // `AMQP` followed by 0 0 9 1, and the protocol-id octet is the same
         // %d0 we asked for - so only the version tells the two apart.
@@ -284,11 +216,11 @@ async fn an_amqp_0_9_1_server_is_a_version_mismatch() {
 #[tokio::test]
 async fn a_server_that_says_nothing_hits_our_own_deadline() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         // Say nothing at all. The protocol gives no deadline for the
         // answering header, so without one of ours this would hang for as
         // long as the OS allows.
@@ -317,12 +249,12 @@ async fn a_server_that_says_nothing_hits_our_own_deadline() {
 #[tokio::test]
 async fn the_sasl_plain_dialog_runs_inside_the_512_octet_frame() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
+        let mut server = accept(&listener).await;
         // %d3 both ways, then the dialog, then %d0 both ways.
-        assert_eq!(server.read_protocol_header().await, ProtocolHeader::SASL);
+        assert_eq!(server.read_header().await, ProtocolHeader::SASL);
         server.send_header(ProtocolHeader::SASL).await;
         server
             .send_sasl(SaslFrame::Mechanisms(SaslMechanisms {
@@ -330,7 +262,7 @@ async fn the_sasl_plain_dialog_runs_inside_the_512_octet_frame() {
             }))
             .await;
 
-        let bytes = server.read_frame_bytes().await;
+        let (_, bytes) = server.read_frame().await;
         let init = frame::decode(&bytes, u32::MAX).unwrap();
         assert_eq!(
             init.header.kind,
@@ -362,15 +294,15 @@ async fn the_sasl_plain_dialog_runs_inside_the_512_octet_frame() {
             .await;
 
         assert_eq!(
-            server.read_protocol_header().await,
+            server.read_header().await,
             ProtocolHeader::AMQP,
             "a successful outcome is followed by AMQP %d0 1.0.0"
         );
         server.send_header(ProtocolHeader::AMQP).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "open");
         server.send_open(None).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "close");
         server.send_close(None).await;
     });
@@ -400,18 +332,18 @@ async fn the_sasl_plain_dialog_runs_inside_the_512_octet_frame() {
 #[tokio::test]
 async fn a_failed_sasl_outcome_carries_its_code() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         server.send_header(ProtocolHeader::SASL).await;
         server
             .send_sasl(SaslFrame::Mechanisms(SaslMechanisms {
                 server_mechanisms: Multiple::One("PLAIN"),
             }))
             .await;
-        let _ = server.read_frame_bytes().await;
+        let _ = server.read_frame().await;
         server
             .send_sasl(SaslFrame::Outcome(SaslOutcome {
                 code: SaslCode::Auth,
@@ -449,11 +381,11 @@ async fn a_failed_sasl_outcome_carries_its_code() {
 #[tokio::test]
 async fn a_mechanism_the_server_does_not_offer_is_refused_rather_than_downgraded() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         server.send_header(ProtocolHeader::SASL).await;
         server
             .send_sasl(SaslFrame::Mechanisms(SaslMechanisms {
@@ -488,13 +420,13 @@ async fn a_mechanism_the_server_does_not_offer_is_refused_rather_than_downgraded
 #[tokio::test]
 async fn an_empty_frame_answers_the_peers_idle_timeout_at_half_the_interval() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         server.send_header(ProtocolHeader::AMQP).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "open");
         // We ask for a frame every 200 ms, so the client should emit one
         // every 100 ms: a keep-alive that arrives exactly at the deadline
@@ -503,7 +435,7 @@ async fn an_empty_frame_answers_the_peers_idle_timeout_at_half_the_interval() {
 
         let started = std::time::Instant::now();
         for _ in 0..2 {
-            let (channel, name) = server.read_performative().await;
+            let (channel, name, _) = server.read_named().await;
             assert_eq!(
                 (channel, name.as_str()),
                 (0, "empty"),
@@ -535,19 +467,19 @@ async fn an_empty_frame_answers_the_peers_idle_timeout_at_half_the_interval() {
 #[tokio::test]
 async fn a_zero_idle_timeout_means_unset_and_sends_no_keepalive() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         server.send_header(ProtocolHeader::AMQP).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "open");
         // Part 2 §2.4.5: zero equals unset, and unset means no timeout.
         server.send_open(Some(0)).await;
         // Nothing may arrive for a while. The next thing must be the close.
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(
             name, "close",
             "a zero idle-time-out asks for no keep-alive at all"
@@ -581,18 +513,18 @@ async fn a_zero_idle_timeout_means_unset_and_sends_no_keepalive() {
 #[tokio::test]
 async fn our_own_idle_threshold_closes_with_an_explanation() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         server.send_header(ProtocolHeader::AMQP).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "open");
         server.send_open(None).await;
         // Then go quiet. Part 2 §2.4.5: the client SHOULD close with an
         // error explaining why, and MAY then drop the socket.
-        let bytes = server.read_frame_bytes().await;
+        let (_, bytes) = server.read_frame().await;
         let frame = frame::decode(&bytes, u32::MAX).unwrap();
         let (performative, _) = Performative::decode(frame.body, Limits::DEFAULT).unwrap();
         match performative {
@@ -642,13 +574,13 @@ async fn our_own_idle_threshold_closes_with_an_explanation() {
 #[tokio::test]
 async fn our_idle_threshold_is_not_reset_by_our_own_traffic() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         server.send_header(ProtocolHeader::AMQP).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "open");
         // No idle-time-out of its own, so this side sends no keep-alive: every
         // frame on the wire is one the application asked for.
@@ -657,7 +589,7 @@ async fn our_idle_threshold_is_not_reset_by_our_own_traffic() {
         // stopped reading would stall the client's writes and the test would
         // be proving something else.
         loop {
-            let (_, name) = server.read_performative().await;
+            let (_, name, _) = server.read_named().await;
             if name == "begin" {
                 continue;
             }
@@ -681,7 +613,7 @@ async fn our_idle_threshold_is_not_reset_by_our_own_traffic() {
 
     // Keep the driver working: a session request every 20 ms, well inside the
     // 150 ms threshold, none of them answered. Each is a turn of the driver's
-    // loop, which is what used to postpone the threshold indefinitely.
+    // loop, and a threshold that restarted on every turn would never be reached.
     let busy = {
         let connection = connection.clone();
         tokio::spawn(async move {
@@ -712,13 +644,13 @@ async fn our_idle_threshold_is_not_reset_by_our_own_traffic() {
 #[tokio::test]
 async fn a_peer_initiated_close_is_reported_with_its_condition() {
     let exec = Exec::current().unwrap();
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
 
     let server = tokio::spawn(async move {
-        let mut server = Server::accept(&listener).await;
-        let _ = server.read_protocol_header().await;
+        let mut server = accept(&listener).await;
+        let _ = server.read_header().await;
         server.send_header(ProtocolHeader::AMQP).await;
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "open");
         server.send_open(None).await;
         server
@@ -729,7 +661,7 @@ async fn a_peer_initiated_close_is_reported_with_its_condition() {
             .await;
         // The client answers with its own close: simultaneous close is legal
         // and answering is what makes it orderly.
-        let (_, name) = server.read_performative().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "close");
     });
 
@@ -804,17 +736,12 @@ async fn tls_is_layered_by_protocol_id_two_and_the_second_header_is_inside_it() 
             .unwrap(),
     );
 
-    let (listener, port) = Server::listen().await;
+    let (listener, port) = scripted().await;
     let server = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut plain = Server {
-            stream: tcp,
-            buf: Vec::new(),
-            from: 0,
-        };
+        let mut plain = accept(&listener).await;
         // In the clear, before any TLS: AMQP %d2 1.0.0 both ways.
         assert_eq!(
-            plain.read_protocol_header().await,
+            plain.read_header().await,
             ProtocolHeader::TLS,
             "the layered form announces itself in the clear"
         );
@@ -828,7 +755,7 @@ async fn tls_is_layered_by_protocol_id_two_and_the_second_header_is_inside_it() 
             from: 0,
         };
         // And inside TLS: AMQP %d0 1.0.0, then open, then close.
-        assert_eq!(inside.read_protocol_header().await, ProtocolHeader::AMQP);
+        assert_eq!(inside.read_header().await, ProtocolHeader::AMQP);
         inside.send_header(ProtocolHeader::AMQP).await;
         assert_eq!(inside.read_performative().await, "open");
         inside.send_open().await;
@@ -878,7 +805,7 @@ impl TlsServer {
         }
     }
 
-    async fn read_protocol_header(&mut self) -> ProtocolHeader {
+    async fn read_header(&mut self) -> ProtocolHeader {
         self.fill(protocol_header::LEN).await;
         let header = protocol_header::decode(&self.buf[self.from..]).unwrap();
         self.from += protocol_header::LEN;

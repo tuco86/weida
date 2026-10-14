@@ -26,8 +26,8 @@
 //! pinged on a timer regardless would be spending the bandwidth MQTT exists to
 //! save. The other half, waiting for the PINGRESP, has **no** specification
 //! number at all [mqtt5 §1]; it is
-//! [`crate::ConnectOptions::effective_ping_timeout`] here, because an
-//! unbounded wait is a hang with a rationale ([LOOP.md] §2).
+//! [`crate::ConnectOptions::effective_ping_timeout`] here, because every wait
+//! is bounded.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -131,9 +131,8 @@ impl std::fmt::Debug for Context {
 #[non_exhaustive]
 pub enum Event {
     /// The connection ended, with the reason. A server DISCONNECT arrives
-    /// here as [`Error::ServerDisconnected`] carrying its code, which is the
-    /// whole of B-141's "surfaced as a named error rather than as a closed
-    /// socket".
+    /// here as [`Error::ServerDisconnected`] carrying its code: a named error
+    /// rather than a closed socket.
     Disconnected(Error),
     /// The server delivered a message.
     ///
@@ -142,9 +141,7 @@ pub enum Event {
     /// the receiver responds "having accepted ownership of the Application
     /// Message" and "does not need to complete delivery before sending the
     /// PUBACK" ([MQTT-4.3.2-4]) [mqtt5 §6]. So this event is a delivery, not
-    /// a request for one, and dropping it loses the message — which is
-    /// exactly what `Deduplication = None` means on the weida side of a
-    /// forwarder (`docs/adapters/mqtt5.md` §7).
+    /// a request for one, and dropping it loses the message.
     Delivered(Delivery),
     /// An exchange that outlived the connection it started on completed.
     ///
@@ -403,7 +400,8 @@ impl Client {
     ///
     /// What a client must *do* about it — close when it has no state and sees
     /// 1 ([MQTT-3.2.2-4]), discard when it has state and sees 0
-    /// ([MQTT-3.2.2-5]) — needs a session to compare against and is B-142's.
+    /// ([MQTT-3.2.2-5]) — needs a session to compare against and is
+    /// [`crate::Session::accept_connack`]'s.
     #[must_use]
     pub const fn session_present(&self) -> bool {
         self.session_present

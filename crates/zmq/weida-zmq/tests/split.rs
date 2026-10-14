@@ -1,6 +1,6 @@
 //! Claim: a socket whose two directions are independent can be split into
 //! halves that are usable at the same time, so a receive that has nothing to
-//! receive does not hold up a send on the same socket (B-177).
+//! receive does not hold up a send on the same socket.
 //!
 //! The shape of every test here: park a receive on one half in a task,
 //! prove it is parked (it has not returned after the send), send on the
@@ -8,23 +8,18 @@
 //! by giving it something. REQ and REP have no `split`, and that is asserted
 //! by the type system rather than here.
 
+mod common;
+
 use std::time::Duration;
 
+use common::within;
 use weida_zmq::{
     Context, ContextConfig, DealerSocket, Message, Multipart, PairSocket, RouterSocket, Sent,
     XPubSocket, XSubSocket,
 };
 
-const DEADLINE: Duration = Duration::from_secs(10);
-
 fn context() -> Context {
     Context::new(ContextConfig::default()).expect("context")
-}
-
-async fn within<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(DEADLINE, future)
-        .await
-        .expect("operation timed out")
 }
 
 fn body(message: &Multipart) -> &[u8] {

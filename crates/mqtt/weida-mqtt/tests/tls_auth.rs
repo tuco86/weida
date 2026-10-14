@@ -1,5 +1,5 @@
-//! B-147 on the wire: TLS on 8883, the CONNECT credentials, and the AUTH
-//! exchange of 4.12 including re-authentication over a live connection.
+//! TLS on 8883, the CONNECT credentials, and the AUTH exchange of 4.12,
+//! including re-authentication over a live connection, on the wire.
 //!
 //! The TLS test completes a **real** handshake against a certificate this test
 //! generates, rather than asserting a type: the claim being made is that the
@@ -10,25 +10,14 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{Act, Server, bytes};
+use harness::{Act, Server, bytes, connack};
 use weida_mqtt::{
     Authenticator, Client, ConnectOptions, Context, DisconnectReasonCode, Error, Event, Result,
 };
 use weida_mqtt_codec::{Connack, ConnectReasonCode, Packet, Properties};
 
-fn connack(properties: Properties<'_>) -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present: false,
-        reason_code: ConnectReasonCode::Success,
-        properties,
-    }))
-}
-
 fn options() -> ConnectOptions {
-    let mut options = ConnectOptions::new("b147-client");
-    options.keep_alive = Duration::ZERO;
-    options.connect_timeout = Duration::from_secs(5);
-    options
+    harness::options("tls-auth-client")
 }
 
 /// An AUTH the server sends: a reason code, the method it repeats, and its

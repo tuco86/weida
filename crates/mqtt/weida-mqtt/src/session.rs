@@ -11,11 +11,12 @@
 //! * QoS 2 messages **received** but not fully acknowledged.
 //!
 //! The server's half — the session's existence, the subscriptions, the queued
-//! messages, the Will and the session-end time — is a broker's and is Phase D
-//! ([0014](../../../docs/decisions/0014-parallel-libraries.md) §2). Holding
-//! the client half is explicitly not being a broker: "a client library may
-//! hold the *client half* of a server-side concept where the protocol defines
-//! it for a client — an MQTT session with its expiry" [0014 §2].
+//! messages, the Will and the session-end time — is a broker's, which this
+//! crate is not ([0014](../../../docs/decisions/0014-parallel-libraries.md)
+//! §2). Holding the client half is explicitly not being a broker: "a client
+//! library may hold the *client half* of a server-side concept where the
+//! protocol defines it for a client — an MQTT session with its expiry"
+//! [0014 §2].
 //!
 //! **weida has nothing like this, and that is the point of the type.** "There
 //! is no L0 session state. Nothing is retained across a connection… no expiry
@@ -25,7 +26,6 @@
 //! owner for" ([INVARIANTS.md]). So the state has an owner here — the
 //! application holds the [`Session`] and decides how long it lives — rather
 //! than being smuggled into a runtime that declined it.
-//! `docs/adapters/mqtt5.md` §8 L1 is where that division is written down.
 //!
 //! # Retransmission, and the one circumstance that permits it
 //!
@@ -381,8 +381,8 @@ impl Session {
     /// shortened or extended at close. A non-zero value when CONNECT carried
     /// zero is a Protocol Error" (3.14.2.2.2) [mqtt5 §1]. It needs the CONNECT
     /// that came before, which a sans-I/O codec does not have and a session
-    /// does — `docs/adapters/mqtt5.md` §9.10 names the refusal and
-    /// `weida-mqtt-codec`'s `control` module names this item as its owner.
+    /// does, which is why `weida-mqtt-codec`'s `control` module names this item
+    /// as its owner.
     ///
     /// Enforced **before sending**, so the client never earns the server's
     /// DISCONNECT 0x82 for it.
@@ -628,8 +628,8 @@ impl Session {
     /// [`Error::QuotaExhausted`] once as many QoS > 0 messages are
     /// unacknowledged as the peer's `Receive Maximum` permits. Exhausting the
     /// quota "stalls the sender rather than exceeding it" [mqtt5 §5], and
-    /// stalling is the caller's to do — this reports, and B-143's publish path
-    /// waits.
+    /// stalling is the caller's to do — this reports, and
+    /// [`crate::Client::publish`] waits.
     pub fn allocate(&self, message: StoredPublish) -> Result<u16> {
         debug_assert_ne!(message.qos, QoS::AtMostOnce, "QoS 0 is never stored");
         let mut state = self.lock();

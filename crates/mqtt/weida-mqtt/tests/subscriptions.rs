@@ -1,6 +1,6 @@
-//! B-144 on the wire: SUBSCRIBE and UNSUBSCRIBE, their per-filter verdicts,
-//! the Subscription Identifier a delivery reports back, and the identifier
-//! space the three packet types share.
+//! SUBSCRIBE and UNSUBSCRIBE on the wire: their per-filter verdicts, the
+//! Subscription Identifier a delivery reports back, and the identifier space
+//! the three packet types share.
 //!
 //! The matcher itself is unit-tested in `filter.rs`, against the
 //! specification's own worked examples. What needs a socket is everything the
@@ -13,29 +13,15 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{Act, Server, bytes};
+use harness::{Act, Server, bytes, connack};
 use weida_mqtt::{
     Client, ConnectOptions, Context, DisconnectReasonCode, Error, Event, Message, PacketType, QoS,
     RetainHandling, Session, SubackReasonCode, Subscription, UnsubackReasonCode, matches,
 };
-use weida_mqtt_codec::{Connack, Packet, Properties, Publish};
-/// A CONNACK carrying `properties`, which is how a script declares what the
-/// server does and does not offer.
-fn connack(properties: Properties<'_>) -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present: false,
-        reason_code: weida_mqtt::ConnectReasonCode::Success,
-        properties,
-    }))
-}
+use weida_mqtt_codec::{Packet, Properties, Publish};
 
-/// Keep Alive off: these tests are about the subscription packets, and a
-/// scripted server that has run out of answers sends no PINGRESP.
 fn options() -> ConnectOptions {
-    let mut options = ConnectOptions::new("sub-client");
-    options.keep_alive = Duration::ZERO;
-    options.connect_timeout = Duration::from_secs(5);
-    options
+    harness::options("sub-client")
 }
 
 /// One SUBSCRIBE, one SUBACK, and the granted codes come back in the order the

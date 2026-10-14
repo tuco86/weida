@@ -7,10 +7,10 @@
 //! a name a peer chose for itself; the other is what a peer demonstrated
 //! possession of. **No `From`, `Into`, `AsRef` or `Deref` between the two
 //! groups exists anywhere in this workspace, and none may be added** — that is
-//! loss L6 of `docs/adapters/zmtp.md` §8 and the adapter rule of
-//! [0008](../../../docs/decisions/0008-session-identity.md) §5 turned from
-//! prose into a compile error. Where the two must meet — a bridge — the
-//! meeting is a human's configuration decision, never a conversion.
+//! the rule of [0008](../../../docs/decisions/0008-session-identity.md) §5,
+//! that a foreign, self-asserted identifier is never presented as a weida peer
+//! identity, turned from prose into a compile error. Where the two must meet,
+//! the meeting is a human's configuration decision, never a conversion.
 //!
 //! `weida_core::LocalPrincipal` is shared, because `ipc://` peer credentials
 //! are the same kernel fact on both sides of the workspace. It is not a ZAP

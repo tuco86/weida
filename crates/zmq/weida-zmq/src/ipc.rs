@@ -80,8 +80,8 @@
 //! snapshot of the peer as it was when the socket was created
 //! (`docs/research/ipc.md` §1.5).
 //!
-//! Nothing in this crate authorizes anything with it yet. It is captured here
-//! because the authorization slice needs it: libzmq's own
+//! Nothing in this crate authorizes anything with it. It is captured here
+//! because an authorization handler needs it: libzmq's own
 //! `ZMQ_IPC_FILTER_UID`/`_GID`/`_PID` did precisely this filtering and are
 //! deprecated in favour of ZAP (`docs/research/zeromq.md` §10), so the
 //! kernel's answer belongs on the peer and the decision belongs to a handler.

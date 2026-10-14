@@ -98,7 +98,7 @@ async fn the_deadline_starts_at_the_send() {
     // receive that drains the pipes, so the receive comes first: it discards
     // the answer and then says the survey is over in the protocol's own
     // vocabulary rather than timing out again (§8). Polling the counter
-    // before that receive was a wait on nothing (B-182).
+    // before that receive would be a wait on nothing.
     let err = surveyor.recv().await.unwrap_err();
     assert!(matches!(err, Error::ESTATE(_)), "{err:?}");
     // `discarded_late` drains the pipes itself, so the only thing left to
@@ -106,8 +106,7 @@ async fn the_deadline_starts_at_the_send() {
     // when the message is queued, not when it is delivered, and on a
     // transport that coalesces writes it may still be in flight here. The
     // counter is monotone, so this poll is exact where a sleep would be a
-    // guess — and the Windows gate is what found the assumption (B-188's
-    // lesson, again).
+    // guess.
     let deadline = Instant::now() + Duration::from_secs(5);
     while surveyor.discarded_late() == 0 {
         assert!(

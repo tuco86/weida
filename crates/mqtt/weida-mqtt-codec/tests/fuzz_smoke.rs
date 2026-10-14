@@ -230,7 +230,7 @@ fn fuzz_smoke_packets_never_panic_and_respect_the_cap() {
 /// Uniformly random bytes almost never build a CONNECT: the four-byte protocol
 /// name alone is a 1-in-2^32 event. So the generator starts from packets that
 /// are valid in every field — one per packet type, the golden vectors of
-/// `docs/adapters/mqtt5.md` §10.1 among them — and flips bytes in the body,
+/// `golden_vectors.rs` among them — and flips bytes in the body,
 /// which lands the decoder in the property block, the Will Properties, the
 /// subscription options byte and the length-prefixed payload fields where the
 /// interesting faults live.

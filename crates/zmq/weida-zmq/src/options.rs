@@ -120,8 +120,8 @@ impl Security {
 
 /// What a socket's connection engine is configured with.
 ///
-/// The socket types of the later slices own the rest of the option surface —
-/// subscriptions, routing ids, the XPUB flags — and keep these.
+/// The socket types own the rest of the option surface — subscriptions,
+/// routing ids, the XPUB flags — and keep these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SocketOptions {
     /// `ZMQ_RECONNECT_IVL`: how long to wait before reconnecting a dropped

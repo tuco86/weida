@@ -307,8 +307,8 @@ mod tests {
     /// undo" — so a socket that both queued the subscription and replayed it
     /// from its table at the handshake would leave the publisher needing two
     /// cancellations for something the application asked for once, and the
-    /// application's `unsubscribe` would change nothing at all. Found by
-    /// B-092's Espresso trace, where the unsubscriptions never appeared.
+    /// application's `unsubscribe` would change nothing at all, so the
+    /// unsubscriptions would never appear in the Espresso trace.
     #[tokio::test]
     async fn a_subscription_made_before_the_handshake_needs_one_cancel() {
         let ctx = context();
@@ -454,7 +454,7 @@ mod tests {
 
     /// Claim: with `ZMQ_SNDHWM` set to libzmq's "no limit", a subscriber
     /// that never reads is **still** bounded, because the queue is bounded
-    /// in bytes as well (`pipe::DEFAULT_QUEUE_BYTES`, B-096). Nothing here
+    /// in bytes as well (`pipe::DEFAULT_QUEUE_BYTES`). Nothing here
     /// can refuse on a message count: `hwm: 0` means there is none.
     #[tokio::test]
     async fn a_byte_ceiling_bounds_a_subscriber_whose_high_water_mark_is_unlimited() {

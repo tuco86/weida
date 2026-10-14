@@ -1,8 +1,8 @@
 //! NATS client protocol codec: the twelve control-line verbs and the
 //! `NATS/1.0` header block, sans-I/O.
 //!
-//! This crate is the first slice of the NATS library described in
-//! [0013](../../../docs/decisions/0013-competitor-libraries.md) §4.3. It is
+//! This crate is the codec under `weida-nats`, the NATS client library
+//! ([0013](../../../docs/decisions/0013-competitor-libraries.md) §4.3). It is
 //! **sans-I/O and weida-free**: no sockets, no executor, no dependency — not
 //! even on `weida-core`, and not even a JSON one. What it exports is a
 //! byte-for-byte encoder and decoder for the published client protocol, so

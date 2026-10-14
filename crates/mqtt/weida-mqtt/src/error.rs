@@ -1,8 +1,8 @@
 //! The client's error vocabulary, in MQTT's own terms.
 //!
-//! The rule this enum exists to keep is B-141's acceptance in one sentence:
-//! **a server DISCONNECT's reason code is surfaced as a named error rather
-//! than as a closed socket.** In 3.1.1 a server reported every fault by
+//! The rule this enum exists to keep, in one sentence: **a server
+//! DISCONNECT's reason code is surfaced as a named error rather than as a
+//! closed socket.** In 3.1.1 a server reported every fault by
 //! closing the connection and the client had to guess [mqtt5 §1.9]; 5.0 puts
 //! a reason code on the refusal, and a client that threw it away would be
 //! back where 3.1.1 was. So [`Error::ServerDisconnected`] and
@@ -383,8 +383,9 @@ mod tests {
         }
     }
 
-    /// The distinction B-141 exists to make: a refusal carries its code, and
-    /// a bare close is its own variant rather than being conflated with one.
+    /// The distinction this vocabulary exists to make: a refusal carries its
+    /// code, and a bare close is its own variant rather than being conflated
+    /// with one.
     #[test]
     fn a_refusal_carries_its_code_and_a_bare_close_does_not() {
         let refused = Error::ConnectionRefused(ConnectReasonCode::BadUserNameOrPassword);

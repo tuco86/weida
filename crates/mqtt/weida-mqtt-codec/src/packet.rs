@@ -28,8 +28,8 @@
 //! PUBACK, PUBREC, PUBREL and PUBCOMP may omit an all-success tail and
 //! DISCONNECT may omit everything (3.4.1, 3.14.2.1) [mqtt5 §6], and properties
 //! may appear in any order [mqtt5 §3]. This codec decodes every spelling and
-//! emits one, which is what makes the golden vectors of
-//! `docs/adapters/mqtt5.md` §10.1 binding — and why the fuzz targets assert
+//! emits one, which is what makes the golden vectors
+//! (`tests/golden_vectors.rs`) binding — and why the fuzz targets assert
 //! that a re-encoded packet *decodes* to the same value rather than that it
 //! reproduces the same bytes.
 

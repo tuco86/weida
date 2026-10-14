@@ -6,9 +6,9 @@
 //! this asserts the absence the only way an absence can be asserted: by
 //! compiling code that must fail.
 //!
-//! **The plausible bug this fails on** is a later slice adding a `recv` to
-//! `PushSocket` or a `send` to `PullSocket` for convenience — at which
-//! point NNG's rule would have become a comment, and this test goes red.
+//! **The plausible bug this fails on** is someone adding a `recv` to
+//! `PushSocket` or a `send` to `PullSocket` for convenience — at which point
+//! NNG's rule would have become a comment, and this test goes red.
 //!
 //! Run with `TRYBUILD=overwrite` to refresh the expected errors after a
 //! deliberate change.

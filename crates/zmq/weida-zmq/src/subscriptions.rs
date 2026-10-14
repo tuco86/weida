@@ -37,14 +37,13 @@ pub const CANCEL_PREFIX: u8 = 0;
 /// **Not a libzmq option.** 37/ZMTP bounds a subscription neither in length
 /// nor in count, and subscriptions are non-idempotent, so "N repeated
 /// `SUBSCRIBE` commands cost N entries" is a memory cost a peer chooses
-/// (`docs/research/zeromq.md` §11). The ZMTP bridge needed the same ceilings
-/// for the same reason (B-051, B-054, `docs/INVARIANTS.md`). 1024 is far
-/// above any real topic set — the zguide's examples subscribe to one or a
-/// handful.
+/// (`docs/research/zeromq.md` §11), and `docs/INVARIANTS.md` allows no remote
+/// input that causes unbounded allocation. 1024 is far above any real topic
+/// set — the zguide's examples subscribe to one or a handful.
 ///
-/// **A count alone is not a bound**, which is the correction B-103 made:
-/// with the length unbounded, 1024 prefixes of a megabyte each are a
-/// megabyte times 1024 per peer. Both dimensions are capped, so the product
+/// **A count alone is not a bound**: with the length unbounded, 1024 prefixes
+/// of a megabyte each are a megabyte times 1024 per peer. Both dimensions
+/// are capped, so the product
 /// is `DEFAULT_MAX_SUBSCRIPTIONS × DEFAULT_MAX_SUBSCRIPTION_BYTES` per peer
 /// — 256 KiB — times `max_peers` peers.
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 1024;
@@ -53,11 +52,10 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 1024;
 ///
 /// **Also not a libzmq option**, and 37/ZMTP's grammar is explicitly
 /// unbounded here — "subscription = *OCTET" (`docs/research/zeromq.md` §11)
-/// — so the number is ours to choose and to state. 256 B is what the ZMTP
-/// bridge took for the same quantity (B-054), from `docs/PROTOCOL.md` §10's
-/// filter bound, and it is far above any real topic: the longest prefix in
-/// the zguide's examples is a handful of characters, and weida's own filters
-/// live under the same ceiling.
+/// — so the number is ours to choose and to state. 256 B is
+/// `docs/PROTOCOL.md` §10's filter bound, and it is far above any real topic:
+/// the longest prefix in the zguide's examples is a handful of characters,
+/// and weida's own filters live under the same ceiling.
 pub const DEFAULT_MAX_SUBSCRIPTION_BYTES: usize = 256;
 
 /// Which wire form a socket **sends** its subscriptions in.

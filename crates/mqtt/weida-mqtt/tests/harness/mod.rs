@@ -2,9 +2,9 @@
 //!
 //! It is faithful on the wire and is deliberately **not** an independent
 //! implementation: it shares this workspace's codec, so it proves the client's
-//! behaviour and not interoperability. Interoperability is B-148's `rumqttd`
-//! run and B-149's Mosquitto run, against implementations that share no code
-//! with ours.
+//! behaviour and not interoperability. Interoperability is what
+//! `interop_rumqttd.rs` and `interop_mqtt5.rs` measure, against brokers that
+//! share no code with ours.
 //!
 //! What it is for is the half of the client's behaviour a real broker cannot
 //! be made to exhibit on demand: a CONNACK with one particular availability
@@ -32,10 +32,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
+use weida_mqtt::ConnectOptions;
 use weida_mqtt_codec::{
-    Auth, AuthReasonCode, FixedHeader, Packet, PacketType, PayloadList, Properties, Puback,
-    PubackReasonCode, Pubcomp, PubcompReasonCode, Pubrec, QoS, Suback, SubackReasonCode, Unsuback,
-    UnsubackReasonCode, varint,
+    Auth, AuthReasonCode, Connack, ConnectReasonCode, FixedHeader, Packet, PacketType, PayloadList,
+    Properties, Puback, PubackReasonCode, Pubcomp, PubcompReasonCode, Pubrec, QoS, Suback,
+    SubackReasonCode, Unsuback, UnsubackReasonCode, varint,
 };
 
 /// The ceiling every harness decode is done under: the largest packet the
@@ -514,4 +515,52 @@ pub fn decode(bytes: &[u8]) -> Packet<'_> {
     Packet::decode(bytes, CAP)
         .map(|(packet, _)| packet)
         .expect("a recorded packet decodes")
+}
+
+/// A CONNACK with Success and `properties`, which is how a script declares
+/// what the server does and does not offer.
+pub fn connack(properties: Properties<'_>) -> Vec<u8> {
+    connack_session(false, properties)
+}
+
+/// The same with `Session Present` chosen, for the tests that resume a
+/// session.
+pub fn connack_session(session_present: bool, properties: Properties<'_>) -> Vec<u8> {
+    bytes(&Packet::Connack(Connack {
+        session_present,
+        reason_code: ConnectReasonCode::Success,
+        properties,
+    }))
+}
+
+/// Options for a client under test against the scripted server.
+///
+/// Keep Alive is off: a scripted server that has run out of script answers no
+/// PINGREQ, so an enabled keep-alive would make every test wait out the
+/// PINGRESP deadline before its own assertions ran. The keep-alive behaviour
+/// has its own tests in `connection.rs`, which switch it back on.
+pub fn options(client_id: &str) -> ConnectOptions {
+    let mut options = ConnectOptions::new(client_id);
+    options.keep_alive = Duration::ZERO;
+    options.connect_timeout = Duration::from_secs(5);
+    options
+}
+
+/// Every await in an interop test is bounded by this, so a broker that stops
+/// answering ends a test instead of hanging it.
+pub const DEADLINE: Duration = Duration::from_secs(10);
+
+/// A Client Identifier no previous run has used.
+///
+/// Sessions outlive a test run by design - that is what `Session Expiry
+/// Interval` is for - so a fixed identifier makes the *second* run of a
+/// session test start against state the first one left. Which is not a flaw
+/// in the tests: it is [MQTT-3.2.2-4] biting. A fresh identifier per run is
+/// what keeps each test measuring the thing it is about.
+pub fn unique(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_nanos();
+    format!("{prefix}-{nanos:x}")
 }

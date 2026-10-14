@@ -1,36 +1,28 @@
-//! B-142 on the wire: Clean Start, `Session Present`, the DISCONNECT expiry
-//! rule, and the one circumstance that permits retransmission.
+//! The session on the wire: Clean Start, `Session Present`, the DISCONNECT
+//! expiry rule, and the one circumstance that permits retransmission.
 //!
-//! The publish path itself is B-143's, so these tests put messages into the
+//! The publish path itself is `qos.rs`'s, so these tests put messages into the
 //! session through [`Session::allocate`] — which is the session's own public
 //! surface — and then assert what the *connection* does with them. That
-//! separation is deliberate: what B-142 owes is the rule about when a stored
-//! exchange goes back on the wire, and that is checkable without a publisher.
+//! separation is deliberate: what the session owes is the rule about when a
+//! stored exchange goes back on the wire, and that is checkable without a
+//! publisher.
 
 mod harness;
 
 use std::time::Duration;
 
-use harness::{Act, Server, bytes, decode};
+use harness::{Act, Server, bytes, connack_session, decode};
 use weida_mqtt::{
-    Client, ConnectOptions, ConnectReasonCode, Context, DisconnectReasonCode, Error, Packet, QoS,
-    Resumption, Session, StoredPublish,
+    Client, ConnectOptions, Context, DisconnectReasonCode, Error, Packet, QoS, Resumption, Session,
+    StoredPublish,
 };
-use weida_mqtt_codec::{Connack, PacketType, Properties};
-
-fn connack(session_present: bool, properties: Properties<'_>) -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present,
-        reason_code: ConnectReasonCode::Success,
-        properties,
-    }))
-}
+use weida_mqtt_codec::{PacketType, Properties};
 
 fn options(clean_start: bool) -> ConnectOptions {
-    let mut options = ConnectOptions::new("session-client");
+    let mut options = harness::options("session-client");
     options.clean_start = clean_start;
     options.keep_alive = Duration::from_secs(60);
-    options.connect_timeout = Duration::from_secs(5);
     options.session_expiry = Some(Duration::from_secs(300));
     options
 }
@@ -50,17 +42,20 @@ fn message(topic: &str, qos: QoS) -> StoredPublish {
     }
 }
 
-/// The reconnect that earns this item: a QoS 1 message left unacknowledged on
-/// one connection goes back out on the next, **with its original Packet
-/// Identifier and DUP 1** ([MQTT-4.4.0-1], [MQTT-3.3.1-1]).
+/// The reconnect: a QoS 1 message left unacknowledged on one connection goes
+/// back out on the next, **with its original Packet Identifier and DUP 1**
+/// ([MQTT-4.4.0-1], [MQTT-3.3.1-1]).
 #[tokio::test]
 async fn an_unacknowledged_publish_is_resent_on_reconnect_with_dup_and_its_identifier() {
     let mut server = Server::start_all(vec![
         // First connection: accept, then drop it with the message in flight.
-        vec![Act::Send(connack(false, Properties::new())), Act::Close],
+        vec![
+            Act::Send(connack_session(false, Properties::new())),
+            Act::Close,
+        ],
         // Second connection: Session Present 1, so the client resumes.
         vec![
-            Act::Send(connack(true, Properties::new())),
+            Act::Send(connack_session(true, Properties::new())),
             Act::Expect, // the resent PUBLISH
             Act::Expect, // the DISCONNECT
         ],
@@ -75,7 +70,7 @@ async fn an_unacknowledged_publish_is_resent_on_reconnect_with_dup_and_its_ident
         .expect("connects");
     assert_eq!(client.resumption(), Resumption::Fresh);
 
-    // Stand in for B-143's publish: the message is in the session, sent but
+    // Stand in for the publish path: the message is in the session, sent but
     // not acknowledged.
     let packet_id = session
         .allocate(message("a/b", QoS::AtLeastOnce))
@@ -139,7 +134,7 @@ async fn an_unacknowledged_publish_is_resent_on_reconnect_with_dup_and_its_ident
 async fn nothing_is_resent_inside_a_live_connection() {
     let pingresp = bytes(&Packet::Pingresp);
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::Expect,
         Act::Send(pingresp.clone()),
         Act::Expect,
@@ -197,7 +192,7 @@ async fn nothing_is_resent_inside_a_live_connection() {
 /// mean answering acknowledgements for exchanges this client has no record of.
 #[tokio::test]
 async fn session_present_without_local_state_closes_the_connection() {
-    let mut server = Server::start(vec![Act::Send(connack(true, Properties::new()))]).await;
+    let mut server = Server::start(vec![Act::Send(connack_session(true, Properties::new()))]).await;
     let context = Context::new().expect("ambient");
 
     let session = Session::new("session-client", &ConnectOptions::default().limits);
@@ -217,9 +212,12 @@ async fn session_present_without_local_state_closes_the_connection() {
 #[tokio::test]
 async fn session_present_zero_discards_local_state() {
     let mut server = Server::start_all(vec![
-        vec![Act::Send(connack(false, Properties::new())), Act::Close],
         vec![
-            Act::Send(connack(false, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
+            Act::Close,
+        ],
+        vec![
+            Act::Send(connack_session(false, Properties::new())),
             Act::Expect, // the DISCONNECT, and no PUBLISH before it
         ],
     ])
@@ -267,9 +265,12 @@ async fn session_present_zero_discards_local_state() {
 #[tokio::test]
 async fn clean_start_discards_before_connecting() {
     let mut server = Server::start_all(vec![
-        vec![Act::Send(connack(false, Properties::new())), Act::Close],
         vec![
-            Act::Send(connack(false, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
+            Act::Close,
+        ],
+        vec![
+            Act::Send(connack_session(false, Properties::new())),
             Act::Expect, // the DISCONNECT
         ],
     ])
@@ -301,7 +302,7 @@ async fn clean_start_discards_before_connecting() {
     server.finished().await;
 }
 
-/// The rule the codec deferred to this item: "a non-zero Session Expiry
+/// The rule the codec deferred to the session: "a non-zero Session Expiry
 /// Interval on DISCONNECT when CONNECT carried zero is a Protocol Error"
 /// (3.14.2.2.2). Refused **before sending**, so the client never earns the
 /// server's DISCONNECT 0x82 for it — and the wire shows the packet was not
@@ -309,7 +310,7 @@ async fn clean_start_discards_before_connecting() {
 #[tokio::test]
 async fn a_revised_expiry_is_refused_where_connect_declared_none() {
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::Expect, // exactly one DISCONNECT, the permitted one
     ])
     .await;
@@ -355,7 +356,7 @@ async fn a_revised_expiry_is_refused_where_connect_declared_none() {
 #[tokio::test]
 async fn a_revised_expiry_is_permitted_where_connect_declared_one() {
     let mut server = Server::start(vec![
-        Act::Send(connack(false, Properties::new())),
+        Act::Send(connack_session(false, Properties::new())),
         Act::Expect,
     ])
     .await;
@@ -392,9 +393,12 @@ async fn a_revised_expiry_is_permitted_where_connect_declared_one() {
 #[tokio::test]
 async fn a_qos2_exchange_past_pubrec_resends_only_the_pubrel() {
     let mut server = Server::start_all(vec![
-        vec![Act::Send(connack(false, Properties::new())), Act::Close],
         vec![
-            Act::Send(connack(true, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
+            Act::Close,
+        ],
+        vec![
+            Act::Send(connack_session(true, Properties::new())),
             Act::Expect, // the resent PUBREL, and no PUBLISH
             Act::Expect, // the DISCONNECT
         ],
@@ -443,9 +447,12 @@ async fn a_qos2_exchange_past_pubrec_resends_only_the_pubrel() {
 #[tokio::test]
 async fn resends_go_out_in_the_original_send_order() {
     let mut server = Server::start_all(vec![
-        vec![Act::Send(connack(false, Properties::new())), Act::Close],
         vec![
-            Act::Send(connack(true, Properties::new())),
+            Act::Send(connack_session(false, Properties::new())),
+            Act::Close,
+        ],
+        vec![
+            Act::Send(connack_session(true, Properties::new())),
             Act::Expect,
             Act::Expect,
             Act::Expect,
@@ -508,7 +515,7 @@ async fn resends_go_out_in_the_original_send_order() {
 #[tokio::test]
 async fn the_servers_receive_maximum_becomes_the_sessions_ceiling() {
     let mut server = Server::start(vec![
-        Act::Send(connack(
+        Act::Send(connack_session(
             false,
             Properties {
                 receive_maximum: Some(2),

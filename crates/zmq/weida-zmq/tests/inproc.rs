@@ -6,7 +6,7 @@
 //! way, and the ZMTP session above them is the same code. So this is not a
 //! second copy of the pattern suites — those live beside the patterns and
 //! run over `tcp://` — it is one exchange per socket type over `inproc://`,
-//! which is the claim the transport slice has to earn.
+//! which is the claim the transport has to earn.
 //!
 //! What is specific to `inproc` and tested here rather than there: the
 //! connect that arrives before the bind, and two contexts that never meet.

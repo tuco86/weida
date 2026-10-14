@@ -1,9 +1,9 @@
 //! MQTT 5.0 wire codec: the fixed header, the Variable Byte Integer, the data
 //! representations, the property framework and the control packets.
 //!
-//! This crate is the first slice of the MQTT client described in
-//! `docs/adapters/mqtt5.md`. It is **sans-I/O and weida-free**: no sockets, no
-//! executor, no dependency — not even on `weida-core`
+//! This crate is the codec under `weida-mqtt`, the MQTT 5.0 client library. It
+//! is **sans-I/O and weida-free**: no sockets, no executor, no dependency — not
+//! even on `weida-core`
 //! ([0013](../../../docs/decisions/0013-competitor-libraries.md) §4.3). What it
 //! exports is a byte-for-byte encoder and decoder for what an MQTT 5.0 client
 //! and server put on a connection, so that it can be checked against the OASIS
@@ -114,10 +114,10 @@
 //!
 //! # Where this codec makes a choice the specification leaves open
 //!
-//! Each of these is recorded in `docs/adapters/mqtt5.md` — §10.1 for the
-//! vectors, §10.3 for what an interop run measures, §11 for what stays open —
-//! so that a disagreement with a real broker is traceable to a decision rather
-//! than to a bug.
+//! Each of these is recorded here and in the module it names, with the vectors
+//! in `tests/golden_vectors.rs`; what an interop run measured against real
+//! brokers is in `docs/libraries/mqtt.md` §10. So a disagreement with a real
+//! broker is traceable to a decision rather than to a bug.
 //!
 //! * **CONNECT's payload order is the normative body's, not Appendix B's.**
 //!   3.1.3 lists Client Identifier, Will Properties, Will Topic, Will Payload,

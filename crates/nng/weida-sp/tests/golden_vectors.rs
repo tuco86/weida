@@ -1,8 +1,8 @@
-//! Conformance: the golden test vectors of `docs/adapters/nng.md` §10.1.
+//! Conformance: the golden test vectors.
 //!
-//! §10.1 publishes these octets, so an implementation - this one, or a future
-//! reimplementation, or a reader checking NNG against the document - MUST
-//! encode exactly them and MUST decode them back to exactly these values. The
+//! These octets are the contract, so an implementation - this one, or a future
+//! reimplementation, or a reader checking NNG against them - MUST encode
+//! exactly them and MUST decode them back to exactly these values. The
 //! vectors are asserted here through the crate's public surface only: the unit
 //! tests beside each module cover the halves, and this file is what makes the
 //! published bytes binding.
@@ -17,9 +17,7 @@
 use weida_sp::error::{HeaderError, MessageError, TagError};
 use weida_sp::{Backtrace, EndpointType, ProtocolHeader, backtrace, message, pair};
 
-/// The cap every message vector is decoded under. The adapter's own
-/// `max_message_bytes` neighbour on the weida side is
-/// `subscriber_buffer_bytes` (8 MiB, `docs/PROTOCOL.md` §10), and no vector is
+/// The cap every message vector is decoded under, 8 MiB, and no vector is
 /// anywhere near it.
 const CAP: u64 = 8 * 1024 * 1024;
 
@@ -219,7 +217,7 @@ fn golden_pair_v1_messages() {
 
 /// Vector 20: PUB/SUB has no topic field. The topic is the leading bytes of
 /// the body and nothing in the framing knows where it ends
-/// [nanomsg-nng §3], which is the point of `docs/adapters/nng.md` §6.
+/// [nanomsg-nng §3].
 #[test]
 fn golden_pub_message_carries_its_topic_inline() {
     #[rustfmt::skip]

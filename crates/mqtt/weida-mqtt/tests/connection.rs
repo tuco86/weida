@@ -1,5 +1,5 @@
-//! B-141 on the wire: the handshake, the negotiated limits, the keep-alive
-//! timer, and the reason code of a server DISCONNECT.
+//! The connection on the wire: the handshake, the negotiated limits, the
+//! keep-alive timer, and the reason code of a server DISCONNECT.
 //!
 //! Each test names the conformance statement it is about, because that is what
 //! makes it a conformance test rather than a regression net.
@@ -9,26 +9,16 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{Act, Server, bytes};
+use harness::{Act, Server, bytes, connack};
 use weida_mqtt::{
     Client, ConnectOptions, ConnectReasonCode, Context, DisconnectReasonCode, Error, Event,
     Feature, QoS,
 };
 use weida_mqtt_codec::{Connack, Packet, PacketType, Properties, Publish};
 
-/// A CONNACK with the properties a test wants and Success.
-fn connack(properties: Properties<'_>) -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present: false,
-        reason_code: ConnectReasonCode::Success,
-        properties,
-    }))
-}
-
 fn options() -> ConnectOptions {
-    let mut options = ConnectOptions::new("test-client");
+    let mut options = harness::options("test-client");
     options.keep_alive = Duration::from_secs(60);
-    options.connect_timeout = Duration::from_secs(5);
     options
 }
 
@@ -144,10 +134,10 @@ async fn an_assigned_client_identifier_replaces_the_empty_one() {
     server.finished().await;
 }
 
-/// The acceptance's own sentence: **using an unavailable feature is this
-/// client's own error and never reaches the wire.** The server clears every
-/// availability flag; the client refuses locally with the code the server
-/// would have sent, and the wire shows only CONNECT and DISCONNECT.
+/// **Using an unavailable feature is this client's own error and never
+/// reaches the wire.** The server clears every availability flag; the client
+/// refuses locally with the code the server would have sent, and the wire
+/// shows only CONNECT and DISCONNECT.
 #[tokio::test]
 async fn an_unavailable_feature_is_refused_locally_and_never_sent() {
     let mut server = Server::start(vec![
@@ -198,10 +188,9 @@ async fn an_unavailable_feature_is_refused_locally_and_never_sent() {
     );
 }
 
-/// The acceptance's other sentence: **a server DISCONNECT's reason code is
-/// surfaced as a named error rather than as a closed socket.** 3.1.1 had no
-/// server-to-client DISCONNECT at all and the client had to guess
-/// [mqtt5 §1.9].
+/// **A server DISCONNECT's reason code is surfaced as a named error rather
+/// than as a closed socket.** 3.1.1 had no server-to-client DISCONNECT at all
+/// and the client had to guess [mqtt5 §1.9].
 #[tokio::test]
 async fn a_server_disconnect_surfaces_its_reason_code() {
     let taken_over = bytes(&Packet::Disconnect(weida_mqtt_codec::Disconnect {

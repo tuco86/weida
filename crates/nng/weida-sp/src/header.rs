@@ -22,8 +22,7 @@
 //! per-protocol RFCs, which never published them, so the role halves here come
 //! from NNG's registry - `NNI_PROTO(major, minor) = major * 16 + minor`
 //! [nng-src `core/protocol.h`]. That gap is recorded in
-//! `docs/adapters/nng.md` §11 and in `docs/IMPLEMENTATION.md`, not hidden in a
-//! comment.
+//! `docs/research/nanomsg-nng.md` §3, not hidden in a comment.
 
 use crate::error::HeaderError;
 

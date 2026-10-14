@@ -317,9 +317,9 @@ impl ServerLimits {
 
     /// Refuses `feature` locally when the server declared it unavailable.
     ///
-    /// This is B-141's "using an unavailable feature is this client's own
-    /// error and never reaches the wire", and the error carries the code the
-    /// server would have sent.
+    /// Using an unavailable feature is this client's own error and never
+    /// reaches the wire, and the error carries the code the server would have
+    /// sent.
     ///
     /// # Errors
     ///

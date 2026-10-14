@@ -1,13 +1,12 @@
 //! ZMTP 3.1 codec: greeting, framing, commands and connection metadata.
 //!
-//! This crate is the first slice of the ZeroMQ adapter described in
-//! `docs/adapters/zmtp.md`. It is **sans-I/O and weida-free**: no sockets, no
-//! executor, no dependency - not even on `weida-core`. What it exports is a
-//! byte-for-byte encoder and decoder for [37/ZMTP], the protocol libzmq
-//! speaks, so that it can be checked against a foreign specification rather
-//! than against weida's opinion of it. The bridge slices that move messages
-//! between a ZeroMQ socket and a weida endpoint are built on top and depend on
-//! both sides; this one deliberately depends on neither.
+//! This crate is the codec under `weida-zmq`, the ZeroMQ library. It is
+//! **sans-I/O and weida-free**: no sockets, no executor, no dependency - not
+//! even on `weida-core`. What it exports is a byte-for-byte encoder and
+//! decoder for [37/ZMTP], the protocol libzmq speaks, so that it can be
+//! checked against a foreign specification rather than against weida's
+//! opinion of it. `weida-zmq` is built on top and depends on this crate and
+//! on `weida-runtime`; this one deliberately depends on neither.
 //!
 //! [37/ZMTP]: https://rfc.zeromq.org/spec/37/
 //!
@@ -93,7 +92,7 @@
 //!   declines: a peer below 3.1 is refused with
 //!   [`GreetingError::UnsupportedVersion`].
 //! * **`JOIN`/`LEAVE` are not implemented.** They belong to RADIO/DISH, which
-//!   the adapter's socket-type mapping does not carry; they decode to
+//!   `weida-zmq` does not carry (`docs/libraries/zmq.md` §2); they decode to
 //!   [`CommandError::UnknownName`].
 //! * **CURVE's HELLO padding is 72 octets, not 70.** 26/CURVEZMQ's ABNF says
 //!   `hello-padding = 72%x00` and its prose says 70; only 72 makes the

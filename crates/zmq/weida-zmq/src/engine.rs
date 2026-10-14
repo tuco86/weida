@@ -6,8 +6,8 @@
 //! is no `zmq_accept()`: a bound endpoint accepts automatically", and
 //! "application code cannot manipulate individual underlying connections"
 //! (`docs/research/zeromq.md` §2). So an [`Engine`] owns the listeners, the
-//! connecters and the [`Pipe`] of every peer, and the socket types of the
-//! later slices choose *which* pipe a message goes to and in what shape —
+//! connecters and the [`Pipe`] of every peer, and the socket types built on
+//! it choose *which* pipe a message goes to and in what shape —
 //! round-robin, fan-out, or by routing id.
 //!
 //! **A queue exists before a connection does.** Every pattern RFC: the double
@@ -31,10 +31,11 @@
 //!
 //! What this module does **not** do is speak ZMTP. A connection is
 //! established once its bytes flow, and it is handed to a [`Session`] — the
-//! greeting, the NULL handshake, `READY` and the framing are the next slice
-//! ([0013](../../../docs/decisions/0013-competitor-libraries.md) §5.3). There
-//! is no default `Session` in this crate: a socket that handed its peers to a
-//! no-op would be a ZeroMQ implementation that speaks nothing.
+//! greeting, the security handshake, `READY` and the framing belong to
+//! [`crate::session::ZmtpSession`]
+//! ([0013](../../../docs/decisions/0013-competitor-libraries.md) §5.3). The
+//! engine has no default `Session`: a socket that handed its peers to a no-op
+//! would be a ZeroMQ implementation that speaks nothing.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -217,7 +218,8 @@ pub struct Peer {
     /// Whether a connection is up right now.
     pub connected: bool,
     /// Connect attempts made for this peer, which is how a reconnect loop is
-    /// observable without a monitor socket (`ZMQ_EVENT_*` is a later slice).
+    /// observable without a monitor socket; with one, the same loop is
+    /// `ZMQ_EVENT_CONNECT_DELAYED` and `ZMQ_EVENT_CONNECT_RETRIED`.
     pub attempts: u64,
     /// This peer's double queue.
     pub pipe: Pipe,
@@ -456,8 +458,9 @@ impl Engine {
     /// `zmq_unbind()`" (`docs/research/zeromq.md` §2).
     ///
     /// `*` binds the IPv4 wildcard address. Whether the wildcard also takes
-    /// IPv6 is `ZMQ_IPV6`'s business and that option belongs to the slice
-    /// that implements it; nothing here pretends to have decided it.
+    /// IPv6 is `ZMQ_IPV6`'s business, which the option table refuses as
+    /// absent ([`crate::optiontable`]); nothing here pretends to have decided
+    /// it.
     ///
     /// `ZMQ_BACKLOG` is passed to `listen(2)`, and `SO_REUSEADDR` is set —
     /// what libzmq and Rust's own `TcpListener` both do, and what lets a
@@ -1586,9 +1589,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
 
-    /// A test double for the session the next slice implements. It records
-    /// what arrived, optionally completes the handshake, and then holds the
-    /// connection until the peer closes it — enough to observe the engine,
+    /// A test double for [`Session`], standing where `ZmtpSession` stands. It
+    /// records what arrived, optionally completes the handshake, and then holds
+    /// the connection until the peer closes it — enough to observe the engine,
     /// and deliberately not a protocol.
     struct Recorder {
         connections: Arc<Mutex<Vec<(PeerId, Role)>>>,

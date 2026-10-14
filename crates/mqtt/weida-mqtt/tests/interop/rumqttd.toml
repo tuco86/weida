@@ -1,4 +1,4 @@
-# rumqttd 0.20.0 for the B-148 interop run.
+# rumqttd 0.20.0 for `interop_rumqttd.rs`.
 #
 # Cut down from `rumqttd generate-config`: one MQTT 5 listener and nothing
 # else. The Prometheus exporter, the console, the websocket listener and the

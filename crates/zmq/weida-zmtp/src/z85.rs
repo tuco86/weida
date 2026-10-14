@@ -11,7 +11,7 @@
 //!
 //! This module is here rather than beside the key handling in `weida-zmq`
 //! because Z85 is octets, which is what this crate is for, and because both
-//! ends of the bridge need it: a key arrives from a configuration file as
+//! ends of a key's journey need it: a key arrives from a configuration file as
 //! text and goes onto the wire as 32 binary octets.
 //!
 //! ```

@@ -1,14 +1,7 @@
 //! Interop against `nats-server`, with an `async-nats` peer on the far side.
 //!
-//! **Every test in this file is `#[ignore]`d, and on this machine none of them
-//! has been run.** `which nats-server` is empty:
-//!
-//! ```text
-//! $ which nats-server
-//! $
-//! ```
-//!
-//! Install it and run them deliberately:
+//! **Every test in this file is `#[ignore]`d**, because `nats-server` is a
+//! separate binary and not a crate. Install it and run them deliberately:
 //!
 //! ```text
 //! # Arch:            pacman -S nats-server

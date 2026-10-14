@@ -49,8 +49,8 @@
 //! total is 200 octets, and 6 + 2 + 72 + 32 + 8 + 80 = 200 while 70 gives
 //! 198. **This module implements 72**, in both directions, and refuses a
 //! 198-octet `HELLO`. The reasoning and the arithmetic are recorded in
-//! `docs/research/zeromq.md` §10, and the vectors are published in
-//! `docs/adapters/zmtp.md` §10.1.
+//! `docs/research/zeromq.md` §10, and the vectors are asserted in
+//! `tests/golden_vectors.rs`.
 //!
 //! The practical consequence is worth naming: a peer written from the prose
 //! sends 198 octets, every field after the padding is displaced by two, and
@@ -454,10 +454,10 @@ impl<'a> CurveCommand<'a> {
     /// [`encode_body`](Self::encode_body) writes — but that body travels
     /// behind a **message** frame header, with the COMMAND bit clear, and a
     /// command-framed `MESSAGE` closes the connection. Measured against
-    /// libzmq 4.3.5 in `weida-zmq`'s `tests/interop_libzmq.rs` and published
-    /// as `00 21` in `docs/adapters/zmtp.md` §10.1. The handshake commands
-    /// stay command frames as specified, so the two forms are mixed inside
-    /// one connection.
+    /// libzmq 4.3.5 in `weida-zmq`'s `tests/interop_libzmq.rs` and asserted as
+    /// `00 21` in `tests/golden_vectors.rs`. The handshake commands stay
+    /// command frames as specified, so the two forms are mixed inside one
+    /// connection.
     ///
     /// The outer MORE flag is zero because the real one is the flags octet
     /// inside the box, which only the sealing side can write; a caller that

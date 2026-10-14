@@ -33,16 +33,14 @@
 //!
 //! # What this is not
 //!
-//! It is not weida's matcher, and the two genuinely disagree.
-//! [0007](../../../docs/decisions/0007-topic-namespace.md) §5's MQTT row group
-//! — reproduced in `docs/adapters/mqtt5.md` §6 — records four differences a
-//! forwarder owes, and the two that a reader would otherwise assume away are:
-//! weida's separator is `.` rather than `/`, so "an MQTT level containing `.`
-//! has no faithful translation and MUST be refused or escaped by the adapter,
-//! not silently flattened"; and weida "has no reserved topic prefix: `#`
-//! matches `$`-prefixed topics too", so an MQTT-facing adapter must exclude
-//! them itself. Nothing in this module translates anything; it implements
-//! MQTT's rules, and the translation is a forwarder's to refuse.
+//! It is not weida's matcher, and the two genuinely disagree: weida's
+//! separator is `.` rather than `/`, and weida reserves no topic prefix, so
+//! its `#` matches `$`-prefixed topics where MQTT's does not. Similar
+//! separators and wildcards do not make two grammars equal
+//! ([0007](../../../docs/decisions/0007-topic-namespace.md) §5). Nothing in
+//! this module translates anything; it implements MQTT's rules, and any
+//! conversion between the two namespaces is the application's to configure
+//! and to refuse.
 
 use weida_mqtt_codec::{QoS, RetainHandling, SubackReasonCode, SubscriptionOptions};
 

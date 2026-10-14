@@ -1,85 +1,24 @@
 //! Sessions against a scripted server: the two channel numberings, `end`,
 //! `DISCARDING`, and the two kinds of wrong channel.
 
-use std::time::Duration;
+mod support;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use support::{DEADLINE, Server, accept, options, scripted};
 use weida_amqp::session::{SessionEvent, SessionOptions, SessionState};
-use weida_amqp::{Condition, Connection, ConnectionOptions, State};
+use weida_amqp::{Condition, Connection, State};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::performative::{Begin, Close, End, Open, Performative};
-use weida_amqp_codec::protocol_header::{self, ProtocolHeader};
+use weida_amqp_codec::protocol_header::ProtocolHeader;
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{AmqpError, Limits};
 use weida_runtime::Exec;
 
-const DEADLINE: Duration = Duration::from_secs(5);
-
-/// The server half, scripted.
-struct Server {
-    stream: TcpStream,
-    buf: Vec<u8>,
-    from: usize,
-}
-
 impl Server {
-    async fn fill(&mut self, want: usize) {
-        while self.buf.len() - self.from < want {
-            let mut chunk = [0u8; 4096];
-            let read = self.stream.read(&mut chunk).await.unwrap();
-            assert_ne!(read, 0, "the client closed before sending {want} octets");
-            self.buf.extend_from_slice(&chunk[..read]);
-        }
-    }
-
-    async fn read_header(&mut self) -> ProtocolHeader {
-        self.fill(protocol_header::LEN).await;
-        let header = protocol_header::decode(&self.buf[self.from..]).unwrap();
-        self.from += protocol_header::LEN;
-        header
-    }
-
-    async fn read_frame(&mut self) -> (u16, Vec<u8>) {
-        self.fill(8).await;
-        let header = frame::decode_header(&self.buf[self.from..], u32::MAX).unwrap();
-        let size = header.size as usize;
-        self.fill(size).await;
-        let bytes = self.buf[self.from..self.from + size].to_vec();
-        self.from += size;
-        (header.channel, bytes)
-    }
-
-    /// The next frame's channel and the performative in it, named.
-    async fn read_named(&mut self) -> (u16, String) {
-        let (channel, bytes) = self.read_frame().await;
-        let frame = frame::decode(&bytes, u32::MAX).unwrap();
-        if frame.is_empty() {
-            return (channel, "empty".to_owned());
-        }
-        let (performative, _) = Performative::decode(frame.body, Limits::DEFAULT).unwrap();
-        (channel, performative.name().to_owned())
-    }
-
-    async fn write(&mut self, bytes: &[u8]) {
-        self.stream.write_all(bytes).await.unwrap();
-        self.stream.flush().await.unwrap();
-    }
-
-    async fn send(&mut self, channel: u16, performative: Performative<'_>) {
-        let mut out = Vec::new();
-        frame::write(&mut out, FrameKind::Amqp, channel, u32::MAX, |body| {
-            performative.encode(body)
-        })
-        .unwrap();
-        self.write(&out).await;
-    }
-
     /// The header exchange and `open`, with `channel-max` on our side.
     async fn handshake(&mut self, channel_max: u16) {
         assert_eq!(self.read_header().await, ProtocolHeader::AMQP);
         self.write(&ProtocolHeader::AMQP.encode()).await;
-        let (channel, name) = self.read_named().await;
+        let (channel, name, _) = self.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "open"));
         let mut open = Open::new("broker-1");
         open.channel_max = channel_max;
@@ -100,29 +39,6 @@ impl Server {
     }
 }
 
-async fn scripted() -> (TcpListener, u16) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    (listener, port)
-}
-
-async fn accept(listener: &TcpListener) -> Server {
-    let (stream, _) = listener.accept().await.unwrap();
-    Server {
-        stream,
-        buf: Vec::new(),
-        from: 0,
-    }
-}
-
-fn options() -> ConnectionOptions {
-    let mut options = ConnectionOptions::new("client-1");
-    options.idle_time_out = None;
-    options.handshake_timeout = Duration::from_secs(2);
-    options.close_budget = Duration::from_secs(2);
-    options
-}
-
 #[tokio::test]
 async fn a_session_is_begun_on_the_lowest_free_channel_and_answered_on_another() {
     let exec = Exec::current().unwrap();
@@ -134,21 +50,21 @@ async fn a_session_is_begun_on_the_lowest_free_channel_and_answered_on_another()
 
         // The first session takes channel 0, the second channel 1: lowest
         // free, as Part 2 §2.5.1 recommends.
-        let (channel, name) = server.read_named().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "begin"));
         // Answer on our own channel 4. The two directions are numbered
         // independently and usually differ, which is the whole point.
         server.answer_begin(4, 0).await;
 
-        let (channel, name) = server.read_named().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (1, "begin"));
         server.answer_begin(9, 1).await;
 
-        let (channel, name) = server.read_named().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "end"));
         server.send(4, Performative::End(End { error: None })).await;
 
-        let (channel, name) = server.read_named().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "close"));
         server
             .send(0, Performative::Close(Close { error: None }))
@@ -221,7 +137,7 @@ async fn an_end_carrying_an_error_discards_input_until_the_partners_end() {
     let server = tokio::spawn(async move {
         let mut server = accept(&listener).await;
         server.handshake(15).await;
-        let (_, name) = server.read_named().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "begin");
         server.answer_begin(4, 0).await;
 
@@ -245,7 +161,7 @@ async fn an_end_carrying_an_error_discards_input_until_the_partners_end() {
         server.send(4, Performative::Flow(flow)).await;
         server.send(4, Performative::End(End { error: None })).await;
 
-        let (channel, name) = server.read_named().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "close"));
         server
             .send(0, Performative::Close(Close { error: None }))
@@ -404,10 +320,10 @@ async fn the_peers_channel_max_bounds_how_many_sessions_we_may_begin() {
         let mut server = accept(&listener).await;
         // channel-max 0 admits exactly one session, on channel 0.
         server.handshake(0).await;
-        let (channel, name) = server.read_named().await;
+        let (channel, name, _) = server.read_named().await;
         assert_eq!((channel, name.as_str()), (0, "begin"));
         server.answer_begin(0, 0).await;
-        let (_, name) = server.read_named().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "close", "the second begin never reached the wire");
         server
             .send(0, Performative::Close(Close { error: None }))
@@ -454,7 +370,7 @@ async fn a_connection_close_ends_every_session_on_it() {
     let server = tokio::spawn(async move {
         let mut server = accept(&listener).await;
         server.handshake(15).await;
-        let (_, name) = server.read_named().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "begin");
         server.answer_begin(4, 0).await;
         // The connection goes, without ending the session first. Part 2
@@ -468,7 +384,7 @@ async fn a_connection_close_ends_every_session_on_it() {
                 }),
             )
             .await;
-        let (_, name) = server.read_named().await;
+        let (_, name, _) = server.read_named().await;
         assert_eq!(name, "close");
     });
 

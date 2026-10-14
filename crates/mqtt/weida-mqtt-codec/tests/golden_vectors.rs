@@ -1,10 +1,10 @@
-//! Conformance: the golden test vectors of `docs/adapters/mqtt5.md` §10.1.
+//! Conformance: the golden test vectors.
 //!
-//! §10.1 publishes these octets, so an implementation — this one, or a future
-//! reimplementation, or a reader checking a broker against the document — MUST
-//! encode exactly them and MUST decode them back to exactly these values. The
-//! vectors are asserted here through the crate's public surface only: the unit
-//! tests beside each module cover the halves, and this file is what makes the
+//! These octets are the contract, so an implementation — this one, or a future
+//! reimplementation, or a reader checking a broker against them — MUST encode
+//! exactly them and MUST decode them back to exactly these values. The vectors
+//! are asserted here through the crate's public surface only: the unit tests
+//! beside each module cover the halves, and this file is what makes the
 //! published bytes binding.
 //!
 //! Every accept vector is asserted **in both directions**. Encoding alone
@@ -14,10 +14,10 @@
 //! there is nothing to encode: they are bytes a peer may send and this codec
 //! must refuse.
 //!
-//! All twenty-three rows of §10.1 are here: the nineteen that carry bytes are
-//! asserted in both directions except row 9, which is the long spelling of
-//! row 8 and therefore decode-only, and the four malformed rows are asserted
-//! on the decoder alone.
+//! All twenty-three vectors are here: the nineteen that carry bytes are
+//! asserted in both directions except vector 9, which is the long spelling of
+//! vector 8 and therefore decode-only, and the four malformed vectors are
+//! asserted on the decoder alone.
 
 use weida_mqtt_codec::error::{MALFORMED_PACKET, PROTOCOL_ERROR};
 use weida_mqtt_codec::{
@@ -511,9 +511,8 @@ fn a_property_in_the_wrong_packet_is_refused_and_right_where_it_belongs() {
 }
 
 /// The whole of 3.1.2.11 and 3.2.2.3 through the public surface, in one packet
-/// each. B-139's acceptance names "every property of 3.1.2.11 and 3.2.2.3
-/// encoded and decoded", and this is that claim as a test rather than as a
-/// count of match arms.
+/// each: every property of both encoded and decoded, which is that claim as a
+/// test rather than as a count of match arms.
 #[test]
 fn every_connect_and_connack_property_survives_the_wire() {
     let pairs = [("trace", "1"), ("trace", "2")];

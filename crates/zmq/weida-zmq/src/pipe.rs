@@ -21,8 +21,8 @@
 //! **What happens at the bound is a property of the socket type**, from
 //! `zmq_socket(3)`'s "Action in mute state" column: block, drop, or return
 //! `EAGAIN` (§4.1). [`MuteAction::sending`] is that column, written once, so
-//! that the socket types of the later slices carry it rather than each
-//! re-deciding it at every send site.
+//! that the socket types carry it rather than each re-deciding it at every
+//! send site.
 //!
 //! # A queue is bounded twice: in messages, as libzmq is, and in bytes
 //!
@@ -1122,7 +1122,7 @@ mod tests {
 
     /// Claim: `DEFAULT_QUEUE_BYTES` is what a real peer meets, so the
     /// product the message limit's documentation states — `hwm ×
-    /// max_message_size` — is no longer the exposure. A peer sending 1 MiB
+    /// max_message_size` — is not the exposure. A peer sending 1 MiB
     /// messages gets eight of them queued, not a thousand.
     #[tokio::test]
     async fn the_default_queue_bounds_a_peer_in_bytes_not_in_messages() {
@@ -1273,8 +1273,8 @@ mod tests {
         assert_eq!(q.recv().await.expect("second"), Multipart::single("other"));
     }
 
-    // The four waits, against the window B-087 closed — and what the window
-    // measured, which is not quite what that fix claimed.
+    // The four waits, against the window between a wait's check and its
+    // await, and what exactly covers that window.
     //
     // The hazard is inside a *single poll*: nothing else on this thread runs
     // between a wait's check and its await, so it is not reachable through

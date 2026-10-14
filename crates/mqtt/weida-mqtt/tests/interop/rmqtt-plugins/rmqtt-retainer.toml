@@ -4,7 +4,8 @@
 # the `restricted` listener.
 #
 # RAM rather than sled or redis: a test must not leave a database behind, and
-# retained messages surviving a broker restart is not what B-149 measures.
+# retained messages surviving a broker restart is not what `interop_mqtt5.rs`
+# measures.
 [storage]
 type = "ram"
 

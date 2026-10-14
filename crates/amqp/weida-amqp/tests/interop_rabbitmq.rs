@@ -2,23 +2,20 @@
 //!
 //! RabbitMQ 4.x speaks AMQP 1.0 natively on 5672 — 3.x needed a plugin and
 //! translated 1.0 into 0-9-1 semantics, 4.x does not — so it is the broker
-//! worth measuring against. It is also a package rather than a crate, and this
-//! machine does not have it:
+//! worth measuring against. It is a system package rather than a crate, so
+//! every test here is `#[ignore]`d with the install command in the reason, and
+//! the harness starts and stops the broker itself rather than assuming a
+//! running one.
+//!
+//! Run them with `rabbitmq-server` on `PATH`:
 //!
 //! ```text
-//! $ which rabbitmq-server
-//! $
+//! cargo test -p weida-amqp --test interop_rabbitmq -- --ignored
 //! ```
 //!
-//! So every test here is `#[ignore]`d with the install command in the reason
-//! ([LOOP.md](../../../docs/LOOP.md) §2), and the harness starts and stops the
-//! broker itself rather than assuming a running one. Nothing in this file has
-//! been observed: `docs/libraries/amqp.md` records the `fe2o3-amqp` column as
-//! measured and this one as **not run**, which is the honest state and not a
-//! claim of compatibility.
-//!
-//! What each test would establish is written where the test is, so that
-//! running them later is reading rather than guessing.
+//! What each test establishes is written where the test is, so that a run is
+//! read rather than guessed at. Whether the RabbitMQ column has been run is
+//! recorded in `docs/libraries/amqp.md`.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -255,8 +252,8 @@ async fn rcv_settle_mode_second_is_probed_rather_than_assumed() {
     asked.snd_settle_mode = SenderSettleMode::Unsettled;
     asked.rcv_settle_mode = ReceiverSettleMode::Second;
 
-    // What this establishes, and it is the reason the item says *probed*: the
-    // sheet records RabbitMQ as listing exactly-once unsupported, which is a
+    // What this establishes: the research sheet (`docs/research/amqp10.md`
+    // §13) records RabbitMQ as listing exactly-once unsupported, which is a
     // documentation claim and not a measurement. Three outcomes are possible
     // and each goes in the parity table as what it is:
     //

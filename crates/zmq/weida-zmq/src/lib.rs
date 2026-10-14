@@ -14,7 +14,7 @@
 //! pattern layer to open a `tcp://` socket, and the dependency direction is
 //! what keeps a ZeroMQ socket from reaching weida's types at all [0013 §4.2].
 //!
-//! # What exists so far
+//! # What is here
 //!
 //! - [`Context`] — the reactor, the `inproc://` namespace and the socket
 //!   ceiling, created three ways ([`Context::new`], [`Context::with_handle`],
@@ -156,9 +156,9 @@
 //!   shared, because `ipc://` peer credentials are the same kernel fact, and
 //!   it is not a ZAP identity.
 //! - **No remote input causes unbounded allocation** (`docs/INVARIANTS.md`),
-//!   under libzmq's own names: `ZMQ_MAX_SOCKETS` here, `ZMQ_SNDHWM`,
-//!   `ZMQ_RCVHWM`, `ZMQ_MAXMSGSIZE` and `ZMQ_BACKLOG` in the slices that
-//!   introduce them.
+//!   under libzmq's own names: `ZMQ_MAX_SOCKETS` in `context`, `ZMQ_SNDHWM`
+//!   and `ZMQ_RCVHWM` in `pipe`, `ZMQ_MAXMSGSIZE` in `message` and
+//!   `ZMQ_BACKLOG` in `options`.
 //!
 //! # Sources
 //!

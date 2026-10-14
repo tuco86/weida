@@ -8,11 +8,10 @@
 //! once and runs over all of them.
 //!
 //! Three of the four this library implements are here — `tcp`, `ipc` and
-//! `inproc`; `tls+tcp` is refused at the endpoint until its own slice
-//! carries it. A transport whose variant is not yet carried is refused by
-//! name rather than accepted and dropped somewhere quieter, because a
-//! refusal SP can express is a close and a refusal it cannot is a hang
-//! (§6).
+//! `inproc`; `tls+tcp` is carried by `tls.rs`. A transport this library does
+//! not carry is refused by name rather than accepted and dropped somewhere
+//! quieter, because a refusal SP can express is a close and a refusal it
+//! cannot is a hang (§6).
 
 use std::io;
 use std::pin::Pin;

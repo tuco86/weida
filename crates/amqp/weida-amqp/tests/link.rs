@@ -2,24 +2,22 @@
 //! the steal, and the two conditions the specification names for a wrong
 //! handle.
 
+mod support;
+
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use support::{DEADLINE, Server, accept, options, scripted};
 use weida_amqp::link::{LinkEvent, LinkOptions, LinkState};
 use weida_amqp::session::{SessionOptions, SessionState};
 use weida_amqp::{
-    Condition, Connection, ConnectionOptions, Source, State, Target, TerminusDurability,
-    TerminusExpiryPolicy,
+    Condition, Connection, Source, State, Target, TerminusDurability, TerminusExpiryPolicy,
 };
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::performative::{Attach, Begin, Close, Detach, Open, Performative};
-use weida_amqp_codec::protocol_header::{self, ProtocolHeader};
+use weida_amqp_codec::protocol_header::ProtocolHeader;
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{Limits, ReceiverSettleMode, Role, SenderSettleMode};
 use weida_runtime::Exec;
-
-const DEADLINE: Duration = Duration::from_secs(5);
 
 /// What a test looks at in an `attach` it read, owned.
 #[allow(dead_code, reason = "each field is asserted by at least one test")]
@@ -33,64 +31,7 @@ struct AttachSeen {
     max_message_size: Option<u64>,
 }
 
-struct Server {
-    stream: TcpStream,
-    buf: Vec<u8>,
-    from: usize,
-}
-
 impl Server {
-    async fn fill(&mut self, want: usize) {
-        while self.buf.len() - self.from < want {
-            let mut chunk = [0u8; 4096];
-            let read = self.stream.read(&mut chunk).await.unwrap();
-            assert_ne!(read, 0, "the client closed before sending {want} octets");
-            self.buf.extend_from_slice(&chunk[..read]);
-        }
-    }
-
-    async fn read_header(&mut self) -> ProtocolHeader {
-        self.fill(protocol_header::LEN).await;
-        let header = protocol_header::decode(&self.buf[self.from..]).unwrap();
-        self.from += protocol_header::LEN;
-        header
-    }
-
-    async fn read_frame(&mut self) -> (u16, Vec<u8>) {
-        self.fill(8).await;
-        let header = frame::decode_header(&self.buf[self.from..], u32::MAX).unwrap();
-        let size = header.size as usize;
-        self.fill(size).await;
-        let bytes = self.buf[self.from..self.from + size].to_vec();
-        self.from += size;
-        (header.channel, bytes)
-    }
-
-    /// The next frame, decoded far enough to match on.
-    async fn read_named(&mut self) -> (u16, String, Vec<u8>) {
-        let (channel, bytes) = self.read_frame().await;
-        let frame = frame::decode(&bytes, u32::MAX).unwrap();
-        if frame.is_empty() {
-            return (channel, "empty".to_owned(), bytes);
-        }
-        let (performative, _) = Performative::decode(frame.body, Limits::DEFAULT).unwrap();
-        (channel, performative.name().to_owned(), bytes)
-    }
-
-    async fn write(&mut self, bytes: &[u8]) {
-        self.stream.write_all(bytes).await.unwrap();
-        self.stream.flush().await.unwrap();
-    }
-
-    async fn send(&mut self, channel: u16, performative: Performative<'_>) {
-        let mut out = Vec::new();
-        frame::write(&mut out, FrameKind::Amqp, channel, u32::MAX, |body| {
-            performative.encode(body)
-        })
-        .unwrap();
-        self.write(&out).await;
-    }
-
     async fn handshake(&mut self) {
         assert_eq!(self.read_header().await, ProtocolHeader::AMQP);
         self.write(&ProtocolHeader::AMQP.encode()).await;
@@ -192,29 +133,6 @@ impl<'a> Answer<'a> {
         self.rcv = rcv;
         self
     }
-}
-
-async fn scripted() -> (TcpListener, u16) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    (listener, port)
-}
-
-async fn accept(listener: &TcpListener) -> Server {
-    let (stream, _) = listener.accept().await.unwrap();
-    Server {
-        stream,
-        buf: Vec::new(),
-        from: 0,
-    }
-}
-
-fn options() -> ConnectionOptions {
-    let mut options = ConnectionOptions::new("client-1");
-    options.idle_time_out = None;
-    options.handshake_timeout = Duration::from_secs(2);
-    options.close_budget = Duration::from_secs(2);
-    options
 }
 
 #[tokio::test]

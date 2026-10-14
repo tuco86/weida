@@ -20,9 +20,9 @@
 //! Size`, `Topic Alias Maximum`, `Server Keep Alive` and the five availability
 //! flags — arrives here, in [`Connack::properties`], and their *absence* is
 //! meaningful: the defaults of [mqtt5 §11] are what an absent property means,
-//! not zero. Applying them is the client's job (B-141); this module's job is
-//! to make the difference between absent and present visible, which is why
-//! every one of them is an `Option` and none has a default substituted at
+//! not zero. Applying them is the client's job in `weida-mqtt`; this module's
+//! job is to make the difference between absent and present visible, which is
+//! why every one of them is an `Option` and none has a default substituted at
 //! decode time.
 //!
 //! Two rules are enforced here because both are facts about the bytes:
@@ -37,8 +37,8 @@
 //! Session Present 1 MUST close the connection" ([MQTT-3.2.2-4]) and one with
 //! state that receives 0 MUST discard it ([MQTT-3.2.2-5]) (3.2.2.1.1)
 //! [mqtt5 §1]. A sans-I/O codec has no session to compare against; that is
-//! B-142's work, and `docs/adapters/mqtt5.md` §8 L1 is where the division
-//! lives.
+//! the client's session in `weida-mqtt`, and `docs/libraries/mqtt.md` §9.5
+//! records how it reads the two rules.
 
 use crate::data::Reader;
 use crate::error::{DecodeError, EncodeError};

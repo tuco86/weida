@@ -509,8 +509,8 @@ mod tests {
         // An unbracketed IPv6 literal is split on its **last** colon, so
         // `::1:1883` parses as the host `::1` - which is what `rsplit_once`
         // does and what a caller writing the bracketless form gets. Asserted
-        // rather than left open, because the previous version of this line
-        // accepted either answer and therefore asserted nothing.
+        // rather than left open: a test that accepted either answer would
+        // assert nothing.
         assert_eq!(split_host_port("::1:1883").unwrap(), ("::1", 1883));
         assert!(split_host_port("broker").is_err());
         assert!(split_host_port("broker:0").is_err());

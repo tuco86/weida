@@ -1,5 +1,5 @@
-//! B-145 on the wire: RETAIN, the zero-byte delete, telling a retained
-//! delivery from a live one, and the Will.
+//! Retained messages and the Will on the wire: RETAIN, the zero-byte delete,
+//! telling a retained delivery from a live one, and the Will.
 //!
 //! # What a scripted server can and cannot prove about the Will
 //!
@@ -19,33 +19,23 @@
 //! the client's half of the contract. The broker half - that the message
 //! actually appears on the Will Topic, and that it does not appear when a new
 //! connection to the session arrives inside the Will Delay Interval - is
-//! measured against a real broker in B-148 and B-149, because asserting it
-//! here would only be asserting our own scripted server.
+//! measured against a real broker in the interop tests (`interop_rumqttd.rs`,
+//! `interop_mqtt5.rs`), because asserting it here would only be asserting our
+//! own scripted server.
 
 mod harness;
 
 use std::time::Duration;
 
-use harness::{Act, Server, bytes};
+use harness::{Act, Server, bytes, connack};
 use weida_mqtt::{
     Client, ConnectOptions, Context, DisconnectReasonCode, Event, Message, PacketType, QoS,
     RetainHandling, RetainedOrigin, ServerLimits, Session, Subscription, WillMessage,
 };
 use weida_mqtt_codec::{Connack, ConnectReasonCode, Packet, Properties, Publish};
 
-fn connack(properties: Properties<'_>) -> Vec<u8> {
-    bytes(&Packet::Connack(Connack {
-        session_present: false,
-        reason_code: ConnectReasonCode::Success,
-        properties,
-    }))
-}
-
 fn options() -> ConnectOptions {
-    let mut options = ConnectOptions::new("retain-client");
-    options.keep_alive = Duration::ZERO;
-    options.connect_timeout = Duration::from_secs(5);
-    options
+    harness::options("retain-client")
 }
 
 /// A delivery on `topic` with the RETAIN flag as given.
@@ -481,8 +471,8 @@ async fn the_three_ways_a_connection_ends_are_distinguishable_on_the_wire() {
 ///
 /// The server's answer is CONNACK 0x9A (Retain not supported)
 /// ([MQTT-3.2.2-14]), and what this client owes is to surface that code
-/// instead of a closed socket - which is the same contract B-141 established
-/// for every refusal.
+/// instead of a closed socket - which is the same contract every refusal
+/// carries (`connection.rs`).
 #[tokio::test]
 async fn will_retain_against_a_server_without_retain_is_the_connacks_code() {
     let refusal = bytes(&Packet::Connack(Connack {

@@ -1,16 +1,15 @@
 //! An MQTT 5.0 **client**, on `weida-runtime` and on the sans-I/O
 //! `weida-mqtt-codec`.
 //!
-//! This is the library `docs/adapters/mqtt5.md` is written for. It is a client
-//! and deliberately not a server: MQTT's topology is strictly asymmetric, "the
-//! server binds and accepts, the client connects", and a client "can never
-//! listen" [mqtt5 §12/P11]. An MQTT server is a broker — sessions that outlive
-//! connections, retained-message storage, shared-subscription dispatch — and
-//! the broker is Phase D
+//! It is a client and deliberately not a server: MQTT's topology is strictly
+//! asymmetric, "the server binds and accepts, the client connects", and a
+//! client "can never listen" [mqtt5 §12/P11]. An MQTT server is a broker —
+//! sessions that outlive connections, retained-message storage,
+//! shared-subscription dispatch — and a broker is not this crate
 //! ([0014](../../../docs/decisions/0014-parallel-libraries.md) §2). What a
 //! client library *may* hold is the client half of a server-side concept where
-//! the protocol defines it for a client, which is what the session of B-142
-//! and the joined shared subscription of B-146 are.
+//! the protocol defines it for a client, which is what the [`Session`] and the
+//! joined shared subscription are.
 //!
 //! **No weida in the picture.** This crate depends on `weida-core`,
 //! `weida-runtime` and `weida-mqtt-codec`, and on neither `weida` nor
@@ -99,8 +98,7 @@
 //! A missing CONNACK and a missing PINGRESP both get "a reasonable amount of
 //! time" and no number [mqtt5 §1]. Both are fields with finite defaults here
 //! ([`ConnectOptions::connect_timeout`],
-//! [`ConnectOptions::effective_ping_timeout`]), because an unbounded wait is a
-//! hang with a rationale ([LOOP.md] §2).
+//! [`ConnectOptions::effective_ping_timeout`]), because every wait is bounded.
 //!
 //! # The session, and the one place retransmission happens
 //!

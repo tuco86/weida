@@ -14,7 +14,7 @@
 //! crate compiles NNG from vendored sources with `cmake` and a C compiler,
 //! so with the feature on and no toolchain present nothing links. The
 //! dependency is therefore optional and the tests are `#[ignore]`d on top
-//! of it ([LOOP.md](../../../docs/LOOP.md) §2):
+//! of it:
 //!
 //! ```text
 //! # needs: cmake, a C compiler
@@ -30,8 +30,8 @@
 //!
 //! # The two things only an implementation can settle
 //!
-//! Both are settled here, and both were open questions in
-//! `docs/research/nanomsg-nng.md` §11 until they were measured.
+//! Both are settled here by measurement; the research sheet leaves them open
+//! (`docs/research/nanomsg-nng.md` §11).
 //!
 //! 1. **The endpoint-type role nibble.** The SP RFCs assign the 12-bit
 //!    protocol ids and delegate the 4-bit roles to the per-protocol RFCs,
@@ -51,15 +51,14 @@
 //!
 //! # Disagreements
 //!
-//! **One, found here, and fixed on our side.** Before this run
-//! `weida_sp::pair::INITIAL_HOPS` was `0`, on the strength of that source
-//! reading; a real NNG 1.4.0-rc.0 sends `1`, so the constant, the codec's
-//! golden vector 18, this crate's PAIR v1 vector and every doc comment
-//! that claimed otherwise now say one. Nothing about interoperability
-//! turned on it — a receiver compares the count to its own `MAXTTL` and
-//! nothing else, so both readings were always accepted in both
-//! directions — but the documentation was wrong and is the thing this file
-//! exists to correct.
+//! **One, and it is settled on our side.** `weida_sp::pair::INITIAL_HOPS` is
+//! `1`: a real NNG 1.4.0-rc.0 sends `1` where a reading of NNG's source
+//! suggested `0`, and the constant, the codec's golden vector 18 and this
+//! crate's PAIR v1 vector all say one. Nothing about interoperability turns
+//! on it — a receiver compares the count to its own `MAXTTL` and nothing
+//! else, so both readings are accepted in both directions — but the
+//! documentation must state the number NNG sends, which is the thing this
+//! file exists to check.
 //!
 //! Otherwise none, at this version: every pairing interoperates in both
 //! roles with no adjustment on either side. Two divergences this library
@@ -520,7 +519,7 @@ async fn survey_interoperates_in_both_roles() {
             // two equal, a first survey that missed the pipe left our
             // receive and NNG's next survey racing on the same clock, and
             // on Windows — where the dial takes longer — our side lost
-            // often enough to file B-189.
+            // often enough to make the test flaky.
             peer.set_opt::<survey::SurveyTime>(Some(Duration::from_millis(250)))
                 .expect("SurveyTime");
             peer.listen(&url).expect("listen");

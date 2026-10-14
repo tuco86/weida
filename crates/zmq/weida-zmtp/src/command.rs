@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn an_unknown_command_is_named_as_such() {
-        // JOIN belongs to RADIO/DISH, which this adapter does not map.
+        // JOIN belongs to RADIO/DISH, which this crate does not carry.
         assert_eq!(
             Command::decode(b"\x04JOINgroup"),
             Err(CommandError::UnknownName)

@@ -1,17 +1,18 @@
-# rmqtt 0.23.1 for the B-149 interop run: a broker that **declares** its
-# 5.0 capabilities, which is the thing rumqttd 0.20.0 does not do and the
-# whole reason for a second broker.
+# rmqtt 0.23.1 for `interop_mqtt5.rs`: a broker that **declares** its 5.0
+# capabilities, which is the thing rumqttd 0.20.0 does not do and the whole
+# reason for a second broker.
 #
-# One TCP listener and no plugins. The port is deliberately unusual, for the
-# same reason B-148's is: an interop test that silently measured against a
-# developer's own broker would be the worst possible outcome.
+# Two TCP listeners and two plugins, each explained below. The ports are
+# deliberately unusual, for the same reason rumqttd's are: an interop test that
+# silently measured against a developer's own broker would be the worst
+# possible outcome.
 
 ##--------------------------------------------------------------------
 ## Node
 ##--------------------------------------------------------------------
 [node]
 id = 1
-cookie = "weida-b149"
+cookie = "weida-interop"
 busy.check_enable = false
 
 ##--------------------------------------------------------------------

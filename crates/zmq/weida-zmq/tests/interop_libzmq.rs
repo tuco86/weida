@@ -46,8 +46,7 @@
 //!   CURVE server and our CURVE client reaches a libzmq server, which means
 //!   the `HELLO`/`WELCOME`/`INITIATE`/`READY` octets, the nonce prefixes,
 //!   the cookie and the vouch box all agree with 26/CURVEZMQ as libsodium
-//!   implements it. This is the B-084 acceptance line's "the boxes open in
-//!   libsodium", measured.
+//!   implements it. That is "the boxes open in libsodium", measured.
 //! * **ZAP: the CURVE credential libzmq presents is the client's long-term
 //!   public key**, 32 octets, and the PLAIN credential is the username and
 //!   password — the frames 27/ZAP specifies, in that order, from a foreign
@@ -61,40 +60,42 @@
 //!
 //! # Three disagreements, each one a fix on our side
 //!
-//! All three were found here and nowhere else, and each cost one test run
-//! before it cost a line of code. The monitor of B-086 named the first two
+//! All three show up here and nowhere else, and each costs one test run
+//! before it costs a line of code. The socket monitor names the first two
 //! without a packet capture.
 //!
 //! 1. **libzmq sends an `Identity` property with an empty value** on every
-//!    REQ, DEALER and ROUTER socket that has no `ZMQ_ROUTING_ID` set. We
-//!    refused it: a routing id is 1 to 255 octets, and zero was an error.
-//!    37/ZMTP's grammar is `identity = 0*255OCTET` and only a non-empty
-//!    identity must not begin with a zero octet, so an empty property is the
-//!    absence of one. `session.rs` now reads it that way, and half this
-//!    matrix depended on it.
+//!    REQ, DEALER and ROUTER socket that has no `ZMQ_ROUTING_ID` set. A
+//!    routing id is 1 to 255 octets, but 37/ZMTP's grammar is
+//!    `identity = 0*255OCTET` and only a non-empty identity must not begin
+//!    with a zero octet, so an empty property is the absence of one.
+//!    `session.rs` reads it that way, and half this matrix depends on it.
 //! 2. **libzmq's `as-server` octet is 0 even on a PLAIN or CURVE server.**
 //!    24/ZMTP-PLAIN and 25/ZMTP-CURVE both say it "SHALL be 1 for a
 //!    server"; the reference implementation disagrees with them and never
 //!    reads the peer's octet either, taking each side's role from its own
-//!    option. Our guard refused "both ends are the client" on the strength
-//!    of that octet, which refused every libzmq server. It now refuses only
-//!    two announced servers, and
+//!    option. So the guard cannot refuse "both ends are the client" on the
+//!    strength of that octet, which would refuse every libzmq server; it
+//!    refuses only two announced servers, and
 //!    [`libzmq_announces_as_server_zero_even_as_a_server`] pins the
 //!    measurement so that a future libzmq that fixes it is noticed.
 //! 3. **A CURVE `MESSAGE` travels in a *message* frame, not a command
 //!    frame.** 26/CURVEZMQ calls it a command and its body is a command
 //!    body — `\x07MESSAGE`, the nonce, the box — but libzmq puts a message
 //!    frame header in front of it and closes the connection on the
-//!    command-framed form. Our handshake with libzmq succeeded and the first
-//!    data frame ended it, which is how this was found. We now send what
-//!    libzmq sends and accept either kind, because the check that matters is
-//!    whether the box opens rather than which flag bit was set.
+//!    command-framed form. A handshake with libzmq succeeds and the first
+//!    data frame ends it, which is how this shows. So this library sends
+//!    what libzmq sends and accepts either kind, because the check that
+//!    matters is whether the box opens rather than which flag bit was set.
 //!
 //! Nothing else disagreed: no pairing and no mechanism needed an adjustment
 //! on either side beyond those three.
 
+mod common;
+
 use std::time::Duration;
 
+use common::within;
 use weida_zmq::curve::{CurvePublicKey, CurveSecretKey, keypair};
 use weida_zmq::{
     Context, ContextConfig, DealerSocket, Message, Multipart, PairSocket, PubSocket, PullSocket,
@@ -102,10 +103,8 @@ use weida_zmq::{
     XSubSocket, ZapReply, ZapRequest, ZapStatus,
 };
 
-/// Long enough for a loaded machine, short enough that a hang is a failure.
-const DEADLINE: Duration = Duration::from_secs(10);
-/// The same bound inside libzmq, so its blocking calls report rather than
-/// hang.
+/// The same bound as `common::DEADLINE`, inside libzmq, so its blocking calls
+/// report rather than hang.
 const LIBZMQ_TIMEOUT_MS: i32 = 10_000;
 
 /// What every `#[ignore]` says, so that the install command is one grep away
@@ -115,12 +114,6 @@ macro_rules! needs_libzmq {
         "needs libzmq installed (apt install libzmq3-dev / pacman -S zeromq / brew install \
          zeromq); run with --features libzmq-interop -- --ignored"
     };
-}
-
-async fn within<F: Future>(future: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, future)
-        .await
-        .expect("the operation timed out")
 }
 
 fn context() -> Context {

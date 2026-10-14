@@ -12,10 +12,9 @@
 //! What TLS proves is what the transport peer is. It says nothing about who
 //! composed a message: an application message that arrives on a TLS
 //! connection carries no claim about its publisher, because MQTT has no
-//! per-message identity at all ([mqtt5 §12/P14], and `docs/adapters/mqtt5.md`
-//! §5 records it as a named loss). So there is no conversion from the TLS peer
-//! to any identity type in this crate, and no accessor on a [`crate::Delivery`]
-//! that returns one. The same rule the SP adapter holds.
+//! per-message identity at all ([mqtt5 §12/P14]). So there is no conversion
+//! from the TLS peer to any identity type in this crate, and no accessor on a
+//! [`crate::Delivery`] that returns one.
 //!
 //! # Where the trust anchors are not
 //!

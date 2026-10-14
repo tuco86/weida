@@ -38,9 +38,8 @@
 //! lax, where at QoS 1 or 2 the message is redelivered and the subscriber
 //! disconnects again, and the remedies it offers are to fix the broker or to
 //! make the subscriber tolerant [mqtt5 §10]. A client library is the
-//! subscriber, so it is tolerant, and `docs/adapters/mqtt5.md` §5 records the
-//! choice. U+FEFF is likewise kept rather than stripped, which
-//! [MQTT-1.5.4-3] requires outright.
+//! subscriber, so it is tolerant. U+FEFF is likewise kept rather than
+//! stripped, which [MQTT-1.5.4-3] requires outright.
 
 use crate::error::{DecodeError, EncodeError};
 use crate::varint;

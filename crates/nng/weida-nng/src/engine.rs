@@ -1344,7 +1344,7 @@ mod tests {
     ///
     /// Enough to exercise every engine rule — the handshake gate, the
     /// ceiling, the pipe events, reconnect — and no more, because the SP
-    /// session proper is its own slice and this file must not anticipate it.
+    /// session proper is `session.rs`'s and these tests must not anticipate it.
     struct HeaderOnly {
         handshakes: Arc<AtomicUsize>,
         answer: bool,

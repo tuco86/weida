@@ -30,15 +30,15 @@
 //!    specification states the assignment without stating the verdict in one
 //!    place; this codec's reading is Malformed Packet, recorded here so that a
 //!    disagreement with a real broker is traceable to a decision rather than
-//!    to a bug (`docs/adapters/mqtt5.md` §10.3).
+//!    to a bug (`docs/libraries/mqtt.md` §3).
 //! 3. **Repetition is a Protocol Error for every property except `User
 //!    Property` and `Subscription Identifier`** (2.2.2, 3.1.2.11.8, 3.3.2.3.8)
 //!    [mqtt5 §3], answered with 0x82.
 //!
 //! Order between different identifiers is insignificant on the wire
 //! [mqtt5 §3], so decoding accepts any order. Encoding emits **ascending
-//! identifier order**, which makes the golden vectors of
-//! `docs/adapters/mqtt5.md` §10.1 binding and every round trip byte-exact;
+//! identifier order**, which makes the golden vectors
+//! (`tests/golden_vectors.rs`) binding and every round trip byte-exact;
 //! the repeatable properties keep the caller's order among themselves, which
 //! is required of User Property ([MQTT-3.3.2-17]) [mqtt5 §3].
 //!
