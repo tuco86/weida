@@ -1,9 +1,10 @@
 """`weida_mqtt.sync`: MQTT from a Python program with no event loop.
 
-The acceptance line of B-152: "the synchronous Python surface over the same
-client, no asyncio loop required in the process and no second implementation
-of any protocol behaviour, with a receive timeout where the async surface has
-cancellation; B-151's QoS 2 round trip runs unchanged in synchronous form."
+The claim: the synchronous Python surface over the same client, no asyncio
+loop required in the process and no second implementation of any protocol
+behaviour, with a receive timeout where the async surface has cancellation;
+the QoS 2 round trip of the asyncio surface runs unchanged in synchronous
+form.
 
 `test_the_qos_2_round_trip_runs_unchanged_in_synchronous_form` is the last
 clause, and it is deliberately the *same* assertions as
@@ -39,7 +40,7 @@ class TestRoundTrip:
     def test_the_qos_2_round_trip_runs_unchanged_in_synchronous_form(
         self, broker, client_id
     ):
-        """B-151's acceptance, with the `await`s removed and nothing else.
+        """The QoS 2 round trip, with the `await`s removed and nothing else.
 
         `Completion.kind == "complete"` is the PUBCOMP: the fourth packet of
         the four-packet handshake. A facade that resolved on the write would

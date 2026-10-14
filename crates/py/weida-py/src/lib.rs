@@ -1,11 +1,10 @@
 //! weida for Python, on the Rust implementation.
 //!
-//! `import weida` gets a runtime, a QUIC binding, the two patterns whose
-//! shape a Python caller reaches for first — Req/Rep and Push/Pull — and the
-//! library's failure vocabulary as exception classes. Underneath is `weida`
-//! itself, so this is the first binding in the workspace of the **product**
-//! rather than of a competitor implementation: the other five bind ZeroMQ,
-//! SP, MQTT, AMQP and NATS
+//! `import weida` gets a runtime, a QUIC binding, all six patterns, the
+//! cursor back channel and the library's failure vocabulary as exception
+//! classes. Underneath is `weida` itself, so this is the binding of the
+//! **product** rather than of a competitor implementation: the other five bind
+//! ZeroMQ, SP, MQTT, AMQP and NATS
 //! ([0014](../../../../docs/decisions/0014-parallel-libraries.md) §2).
 //!
 //! ```python
@@ -49,13 +48,13 @@
 //!
 //! **All six of weida's patterns**, on both surfaces. Asyncio:
 //! `Requester`/`Replier`,
-//! `Pusher`/`Puller`, `Publisher`/`Subscriber` (B-200, B-204) and
-//! `Paired`, `Surveyor`/`Respondent`, `BusMember` (B-244), each with
+//! `Pusher`/`Puller`, `Publisher`/`Subscriber` and
+//! `Paired`, `Surveyor`/`Respondent`, `BusMember`, each with
 //! the whole-payload calls a caller reaches for first — plus the streamed
 //! forms for a payload that does not fit memory where the pattern has one:
 //! `pusher.open()`, `requester.open()`, `publisher.open(topic)`,
 //! `puller.recv_stream()` and `subscriber.recv_stream()`. Synchronous:
-//! `weida.sync` (B-205), which is
+//! `weida.sync`, which is
 //! `weida::blocking` with argument conversion around it, for a process with
 //! no event loop; it shares every value class with the asyncio surface and
 //! deliberately has no streamed form, because the facade takes whole
@@ -70,7 +69,7 @@
 //! answers arrive one at a time. `weida.Cursors` reads the same way, and for
 //! the same reason: `while (set := await cursors.changed()) is not None:`.
 //!
-//! **The cursor surface** is here too (B-243): `pusher.send(payload,
+//! **The cursor surface** is here too: `pusher.send(payload,
 //! report=[weida.PROCESSED])` orders a report and hands back the
 //! `weida.Cursors` to read it on, `puller.recv_reporting(max_bytes)` hands a
 //! receiver the `weida.Reporter` to answer with, and `IncomingMeta` carries
@@ -82,8 +81,8 @@
 //! What is absent, with the reason: the raw L0 surface — `Peer` and
 //! `Acceptor`, weida's own stream-level API — because every pattern above is
 //! built on it and a Python caller that wants a bare stream wants the Rust
-//! API; and type stubs, which `docs/libraries/weida-py.md` §10 names as the
-//! follow-up they are.
+//! API; and type stubs, which are not shipped
+//! (`docs/libraries/weida-py.md` §10).
 //!
 //! # No protocol behaviour lives here
 //!
@@ -144,7 +143,7 @@ fn weida(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // application's own stages start at, and the two report modes. Integers
     // rather than an enum class, because the level space is **open** — an
     // application names its own numbers above the floor — and a class would
-    // close what the protocol leaves open (B-243).
+    // close what the protocol leaves open.
     for (name, value) in cursors::NAMED_LEVELS {
         module.add(name, value)?;
     }

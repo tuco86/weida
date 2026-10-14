@@ -1,9 +1,9 @@
-//! The throwaway consumer of B-111: a binding that binds nothing.
+//! The bridge-contract test: a binding that binds nothing.
 //!
 //! This is a `#[pyclass]` with four methods and no protocol behind it —
 //! deliberately, because what is under test is the foundation and not a
-//! library. It stands in for `weida-zmq-py` and proves the three things B-111
-//! asks for, from Python, through a real asyncio loop:
+//! library. It stands in for a real binding such as `weida-zmq-py` and proves
+//! the three things the bridge promises, from Python, through a real asyncio loop:
 //!
 //! 1. an awaitable completing with a value;
 //! 2. an exception arriving as its own class, carrying its errno name;

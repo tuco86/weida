@@ -1,6 +1,6 @@
 """The option table and the error vocabulary, from Python.
 
-B-113. The table is `weida_zmq.OPTIONS`, all 98 rows of the library's own, and
+The table is `weida_zmq.OPTIONS`, all 98 rows of the library's own, and
 the point of the tests below is that **no row is a silence**: an option this
 library implements can be set, and one it does not raises where it is set, with
 the reason the Rust table names.
@@ -97,7 +97,7 @@ def test_the_whole_table_is_reachable():
 
 
 def test_every_row_is_honoured_or_refused_and_never_ignored():
-    """The walk the item asks for: every one of the 98 rows, set."""
+    """The walk of every one of the 98 rows, set."""
     seen_reasons = set()
     for row in weida_zmq.OPTIONS:
         # ZMQ_LINGER's home here is the context, whatever libzmq's scope for

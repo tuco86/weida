@@ -1,6 +1,6 @@
 """Sending and receiving: the asyncio surface of all eleven socket types.
 
-B-112. What is asserted here beyond "a message crossed":
+What is asserted here beyond "a message crossed":
 
 * a `Multipart` is one value, sent and received atomically — all frames or
   none, which is 37/ZMTP's rule and not an accident of this binding;

@@ -1,6 +1,6 @@
 """The synchronous surface, and the zguide's Lazy Pirate written on it.
 
-B-116. `weida_zmq.sync` is `weida-zmq`'s own `blocking` facade with Python
+`weida_zmq.sync` is `weida-zmq`'s own `blocking` facade with Python
 argument conversion around it, so a Python program needs no event loop at all.
 Nothing about a pattern is implemented twice, which is why the assertions here
 are about the *guarantee* rather than about the plumbing:

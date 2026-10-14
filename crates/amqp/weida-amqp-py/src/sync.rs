@@ -235,7 +235,7 @@ impl SyncLink {
     /// Sends one message and blocks until the peer's `disposition` settles it.
     ///
     /// Returns the outcome, or `None` on a `settled`-mode link where no answer
-    /// is coming — B-170's `await send` in synchronous form: the same call
+    /// is coming — the synchronous form of `await send`: the same call
     /// with the same meaning.
     #[pyo3(signature = (body, *, text=false, durable=false))]
     fn send(
@@ -295,7 +295,7 @@ impl SyncLink {
 
     /// The next delivery, waiting at most `timeout` seconds.
     ///
-    /// The blocking drain B-173 asks for. `None` for `timeout` waits until the
+    /// The blocking drain. `None` for `timeout` waits until the
     /// link detaches, which is the honest synchronous equivalent of the
     /// asyncio surface's cancellation; a timeout that elapses returns `None`
     /// and leaves the link usable, because AMQP has no receive deadline and

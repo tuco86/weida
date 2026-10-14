@@ -1,6 +1,6 @@
 """The asyncio surface: what an await means, and who grants credit.
 
-B-170. Three claims, and each test asserts the claim rather than the plumbing:
+Three claims, and each test asserts the claim rather than the plumbing:
 
 1. `await send` completes when the **peer has said what happened**, and hands
    back the outcome. Not a boolean, not "the octets left".
@@ -10,7 +10,7 @@ B-170. Three claims, and each test asserts the claim rather than the plumbing:
    `except weida_amqp.LinkStolen` instead of matching on text.
 
 The peer is `broker.py`: a hand-written AMQP 1.0 other-end in this directory.
-`nats-server` and RabbitMQ are both absent on this machine
+RabbitMQ is absent on most machines
 (`docs/libraries/amqp.md` §9), so a scripted peer is what makes a Python round
 trip provable at all.
 """
@@ -67,7 +67,7 @@ async def test_await_send_returns_the_outcome_the_peer_committed_to():
         sender = await session.attach("orders", "sender", "/queues/orders")
 
         outcome = await asyncio.wait_for(sender.send(b"an order"), DEADLINE)
-        # The whole point of the item: an outcome, not a boolean.
+        # The whole point: an outcome, not a boolean.
         assert outcome is not None
         assert outcome.name == "accepted"
         assert outcome == "accepted"

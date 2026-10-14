@@ -18,11 +18,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: System :: Networking",
-    "Typing :: Typed",
 ]
 
 [project.urls]
-Repository = "https://git.doodleshnookie.net/tuco86/weida"
+Repository = "https://github.com/tuco86/weida"
 
 [tool.maturin]
 module-name = "weida_nng"

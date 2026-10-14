@@ -10,6 +10,7 @@ over QUIC works with both halves inside this one process.
 
 import asyncio
 import importlib.metadata
+import os
 import sys
 
 import weida
@@ -17,12 +18,22 @@ import weida
 CAP = 1 << 20
 
 
+def pep440(version: str) -> str:
+    """PEP 440 spelling of a Cargo version: `0.1.0-alpha.6` is `0.1.0a6`."""
+    base, _, pre = version.partition("-")
+    if not pre:
+        return base
+    kind, n = pre.split(".")
+    return base + {"alpha": "a", "beta": "b", "rc": "rc"}[kind] + n
+
+
 def metadata() -> None:
     """The wheel's own metadata, read from the installed distribution."""
     distribution = importlib.metadata.distribution("weida")
     assert distribution.metadata["Name"] == "weida", distribution.metadata["Name"]
-    # PEP 440 spelling of the crate's `0.1.0-alpha.6`, converted by maturin.
-    assert distribution.version == "0.1.0a6", distribution.version
+    # `package.sh` passes the workspace version; maturin converts it to PEP 440.
+    expected = pep440(os.environ["WEIDA_WORKSPACE_VERSION"])
+    assert distribution.version == expected, (distribution.version, expected)
     print(f"weida {distribution.version} installed as a wheel")
 
 
@@ -32,7 +43,7 @@ def surface() -> None:
         assert hasattr(weida, name), name
     assert issubclass(weida.Untrusted, weida.WeidaError)
     # `weida.Runtime` is the runtime and `weida.RuntimeFailure` is the
-    # failure: a wheel that lost the rename would shadow one with the other.
+    # failure: a wheel that mixed the two names up would shadow one with the other.
     assert not issubclass(weida.Runtime, BaseException)
     assert issubclass(weida.RuntimeFailure, weida.WeidaError)
     assert hasattr(weida.sync, "Runtime")

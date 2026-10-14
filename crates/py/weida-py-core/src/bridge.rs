@@ -35,8 +35,8 @@
 //! library in this workspace already owns a reactor — that is what
 //! [`weida_runtime::Exec`]'s three constructors are for, and the point of
 //! [0013](../../../docs/decisions/0013-competitor-libraries.md) §4.2 — and two
-//! runtimes in one process, one per binding, is the cost of not saying so. The
-//! equivalent named in B-111 is this module: it drives futures on the
+//! runtimes in one process, one per binding, is the cost of not saying so. This
+//! module is the replacement: it drives futures on the
 //! *library's* `Exec` and adds no runtime of its own.
 //!
 //! # Cancellation
@@ -175,7 +175,7 @@ impl Bridge {
 /// delivery future is completed here, on the loop's thread: `await` of an
 /// already-done future returns without yielding, so the common case of a
 /// busy program costs no reactor hop and no `call_soon_threadsafe` wakeup
-/// (B-117 measured the wakeup at ~78 µs). Only a future that is genuinely
+/// (measured at ~78 µs in IMPLEMENTATION.md §4.15). Only a future that is genuinely
 /// waiting is spawned. The poll runs inside the reactor's context, so a
 /// future that creates a timer on its first step finds one, and with a
 /// no-op waker: a future left pending is polled again the moment its task

@@ -1,4 +1,4 @@
-"""Cursors from Python: a verdict for a transfer that has no reply (B-243).
+"""Cursors from Python: a verdict for a transfer that has no reply.
 
 Both surfaces are here, because cursors are one subject: the asyncio cases
 first, the synchronous one after them. What each case is for:
@@ -207,7 +207,7 @@ def test_a_streamed_transfer_orders_a_report_too():
 
 
 def test_a_cursor_reaches_a_synchronous_sender():
-    """The same verdict with no event loop anywhere (B-243, `sync`)."""
+    """The same verdict with no event loop anywhere (`sync`)."""
     server = sync.Runtime()
     binding = server.bind("127.0.0.1:0", weida.Identity.generate())
     puller = binding.puller("/work")

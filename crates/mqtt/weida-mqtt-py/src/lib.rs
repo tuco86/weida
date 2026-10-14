@@ -37,7 +37,7 @@
 //!
 //! There is no `weida_mqtt.Broker`, and there will not be one here: retained
 //! storage, the session store, subscription routing and the Will's timer all
-//! live in the server, and the server is Phase D
+//! live in the server, and a server is a broker, outside the client libraries
 //! ([0014](../../../../docs/decisions/0014-parallel-libraries.md) §2). What
 //! this module has is everything a client says and reads;
 //! `docs/libraries/mqtt.md` §0 draws the line row by row.
@@ -76,10 +76,9 @@
 //!
 //! # Building it
 //!
-//! `crates/mqtt/weida-mqtt-py/develop.sh` is the whole of it, in the shape
-//! `weida-zmq-py`'s is: a `uv`-managed virtualenv under the worktree, `maturin`
-//! and `pytest` installed into that virtualenv and nothing into the system
-//! interpreter, then `maturin develop` and the Python tests.
+//! `crates/py/develop.sh` builds this binding into a `uv`-managed virtualenv
+//! and runs its Python tests (`crates/mqtt/weida-mqtt-py/develop.sh` is its
+//! wrapper).
 //!
 //! # What is not here
 //!

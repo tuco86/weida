@@ -1,5 +1,5 @@
 /target
-# The uv-managed virtualenv `crates/zmq/weida-zmq-py/develop.sh` builds the
+# The uv-managed virtualenv `crates/py/develop.sh` builds the
 # Python extension into. Nothing is ever installed into a system interpreter.
 /.venv
 __pycache__/

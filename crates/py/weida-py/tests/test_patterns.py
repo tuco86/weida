@@ -1,9 +1,9 @@
-"""Pub/Sub and the streamed surface, from Python (B-204).
+"""Pub/Sub and the streamed surface, from Python.
 
 The claim worth the file is the third test: a payload sixteen times the
 subscriber budget reaches two subscribers whole, which `publish` cannot do at
-all — the B-064 claim, asserted from the binding rather than taken from the
-Rust suite.
+all — the streamed-fan-out guarantee, asserted from the binding rather than
+taken from the Rust suite.
 """
 
 import asyncio
@@ -99,7 +99,7 @@ def test_a_slow_subscriber_loses_copies_and_the_publisher_says_which_topic():
 
 
 def test_a_streamed_publish_carries_what_publish_cannot():
-    """B-064 from Python: the budget bounds a chunk, not the payload."""
+    """The budget bounds a chunk, not the payload."""
 
     async def exchange():
         _server, binding, url = await served("/md")

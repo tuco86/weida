@@ -372,7 +372,7 @@ impl PyRequest {
     /// Built here and nowhere else, so that a replier and a **respondent**
     /// hand back the same object: a survey question is an exchange, byte for
     /// byte, and inventing a second request class for it would make a Python
-    /// caller learn two shapes for one thing (B-244).
+    /// caller learn two shapes for one thing.
     pub(crate) async fn accepted(
         mut request: weida::IncomingRequest,
         max_bytes: usize,

@@ -1,5 +1,5 @@
 //! The cursor surface on the asyncio side, and the level vocabulary both
-//! surfaces share (B-243).
+//! surfaces share.
 //!
 //! A cursor is how a **one-way** transfer gets a verdict: a Push has no reply
 //! to carry one, so `Accepted`, `Stored` and `Processed` arrive on a stream of

@@ -1,9 +1,7 @@
-//! PAIR, SURVEY and BUS on the asyncio surface (B-244), and RADIO/DISH
-//! (B-292).
+//! PAIR, SURVEY and BUS on the asyncio surface, and RADIO/DISH.
 //!
-//! The three patterns the library gained after this binding was written. They
-//! are here rather than in [`crate::endpoints`] because they are a slice of
-//! their own, not because they are different in kind: whole payloads, an
+//! They are here rather than in [`crate::endpoints`] because they are a group
+//! of their own, not because they are different in kind: whole payloads, an
 //! explicit ceiling on every receive, and no pattern behaviour of their own —
 //! the one-peer rule, the survey deadline and the never-yourself rule are
 //! `weida`'s ([PATTERNS.md](../../../../docs/PATTERNS.md) §4, §5, §6).

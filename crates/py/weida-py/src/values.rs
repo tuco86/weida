@@ -199,8 +199,8 @@ impl PyIncomingMeta {
     /// surface reads; and `peer_chain`, because its use is admitting a
     /// client's key and a Python binding cannot require a client
     /// ([0035](../../../../docs/decisions/0035-keys-proved-not-judged.md)
-    /// §4.7). The three report fields are here since B-243 added the cursor
-    /// surface: a caller can act on them.
+    /// §4.7). The three report fields are here because the cursor surface lets
+    /// a caller act on them.
     pub fn of(meta: &IncomingMeta) -> PyIncomingMeta {
         PyIncomingMeta {
             endpoint: meta.endpoint.clone(),

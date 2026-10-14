@@ -1,8 +1,8 @@
 """The module, the context and the eleven socket types, from Python.
 
-B-058's proof is the first test here: an asyncio REQ/REP round trip between two
+The first test here is an asyncio REQ/REP round trip between two
 sockets of this module, over each of the three transports the library
-implements. The rest assert what the item asks for beside it — the three
+implements. The rest assert what the module promises beside it — the three
 context constructors, the endpoint surface of all eleven socket types, and
 failures arriving as exception classes that carry libzmq's errno name rather
 than as one `RuntimeError`.
@@ -59,7 +59,7 @@ def endpoints(tmp_path):
 
 @pytest.mark.parametrize("transport", ["tcp", "ipc", "inproc"])
 def test_req_rep_round_trip(transport, tmp_path):
-    """The item's proof, over every transport."""
+    """The round trip, over every transport."""
 
     async def exchange():
         context = weida_zmq.Context()

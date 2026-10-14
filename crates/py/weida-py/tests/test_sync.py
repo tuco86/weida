@@ -1,4 +1,4 @@
-"""`weida.sync`: the same patterns with no event loop anywhere (B-205).
+"""`weida.sync`: the same patterns with no event loop anywhere.
 
 No `asyncio.run` in this file, which is the point. The endpoints run on
 threads, because that is how a synchronous messaging program is written — and

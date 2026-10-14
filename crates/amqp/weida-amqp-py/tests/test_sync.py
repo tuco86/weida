@@ -1,10 +1,10 @@
 """The synchronous surface: no event loop in the process at all.
 
-B-171. Two claims:
+Two claims:
 
-1. **B-170's send-to-`accepted` runs unchanged in synchronous form.** The same
-   call, the same outcome object, the same meaning — because it is the same
-   client with the waiting moved.
+1. **The send-to-`accepted` of the asyncio surface runs unchanged in
+   synchronous form.** The same call, the same outcome object, the same
+   meaning — because it is the same client with the waiting moved.
 2. **The GIL is released while a call blocks**, which the threaded test proves:
    a second thread runs while the first is parked in `next_delivery`.
 

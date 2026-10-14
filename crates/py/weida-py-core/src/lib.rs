@@ -1,12 +1,13 @@
 //! What every Python binding in this workspace shares, and no protocol in it.
 //!
-//! Four of the libraries of
-//! [0013](../../../docs/decisions/0013-competitor-libraries.md) get a Python
-//! binding, and the four bindings differ only in which protocol they speak.
+//! Each of the five libraries of
+//! [0013](../../../docs/decisions/0013-competitor-libraries.md) gets a Python
+//! binding, and `weida` has its own; the six bindings differ only in which
+//! protocol they speak.
 //! Everything else — how a Rust errno becomes a Python exception, how a Rust
 //! future becomes something a coroutine can `await`, what a cancelled
 //! `asyncio.Task` does to the Rust future underneath, and what a payload costs
-//! on the way across — is the same problem four times, so it is solved here
+//! on the way across — is the same problem six times, so it is solved here
 //! once ([0014](../../../docs/decisions/0014-parallel-libraries.md) §2).
 //!
 //! `[dependencies]` is `pyo3` and `weida-runtime`. **`weida`,

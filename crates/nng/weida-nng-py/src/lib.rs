@@ -67,11 +67,10 @@
 //!
 //! # Building it
 //!
-//! `crates/nng/weida-nng-py/develop.sh` is the whole of it: it creates a
-//! `uv`-managed virtualenv under the worktree, installs `maturin` and
-//! `pytest` into that virtualenv and nothing into the system interpreter,
-//! runs `maturin develop` and then the Python tests. The wheel is `abi3`
-//! from CPython 3.9, so one build serves every later interpreter.
+//! `crates/py/develop.sh` builds this binding into a `uv`-managed virtualenv
+//! and runs its Python tests (`crates/nng/weida-nng-py/develop.sh` is its
+//! wrapper). The wheel is `abi3` from CPython 3.9, so one build serves every
+//! later interpreter.
 //!
 //! # What differs from NNG
 //!

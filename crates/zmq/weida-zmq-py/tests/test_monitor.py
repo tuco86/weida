@@ -1,10 +1,10 @@
 """The monitor and the devices, from Python.
 
-B-115. Two renderings of one event stream — an async iterator of typed events
+Two renderings of one event stream — an async iterator of typed events
 and libzmq's two-frame `inproc://` PAIR form — and the devices over the same
 socket types the patterns use.
 
-The proxy test is the item's proof: an XSUB/XPUB proxy with a capture socket,
+The proxy test is the central one: an XSUB/XPUB proxy with a capture socket,
 a message crossing in each direction, and one captured copy.
 """
 
@@ -115,7 +115,7 @@ def test_the_same_events_arrive_over_the_inproc_pair_form():
 
 
 def test_an_xsub_xpub_proxy_with_a_capture_socket():
-    """B-115's proof: both directions cross, and the capture gets a copy."""
+    """Both directions cross, and the capture gets a copy."""
 
     async def pubsub_proxy():
         context = weida_zmq.Context(worker_threads=4)
@@ -239,7 +239,7 @@ def test_req_and_rep_are_not_device_ends():
 
 
 def test_a_streamer_device_forwards():
-    """The zguide's streamer: PULL in, PUSH out (B-178).
+    """The zguide's streamer: PULL in, PUSH out.
 
     A PUSH end cannot be read, and the device does not try: it is a side that
     never delivers rather than an ``ENOTSUP`` at the first poll. The capture

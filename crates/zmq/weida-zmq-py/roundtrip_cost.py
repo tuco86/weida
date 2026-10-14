@@ -1,10 +1,10 @@
-"""What a REQ/REP round trip costs from Python, for B-117's comparison.
+"""What a REQ/REP round trip costs from Python, against the Rust one.
 
 The same shape as `crates/zmq/weida-zmq/examples/roundtrip_cost.rs` — one
 request out, one reply back, over `inproc://` and over loopback `tcp://`, at an
 empty payload and at 1 KiB — so that the two medians are comparable and the
-difference is the language boundary rather than the measurement. Numbers go
-into `docs/IMPLEMENTATION.md` §4.
+difference is the language boundary rather than the measurement. The numbers
+are in `docs/IMPLEMENTATION.md` §4.15.
 
     .venv/bin/python crates/zmq/weida-zmq-py/roundtrip_cost.py
 

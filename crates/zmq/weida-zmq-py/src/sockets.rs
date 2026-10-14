@@ -285,7 +285,7 @@ macro_rules! python_socket {
             /// usable **at the same time** from two coroutines.
             ///
             /// This socket type's two directions are independent, so a task
-            /// parked in the receiving half's `recv` no longer holds up the
+            /// parked in the receiving half's `recv` does not hold up the
             /// sending half's `send` — the limitation
             /// [`crate::sockets`] describes for a whole socket. The
             /// connections stay while either half lives.

@@ -1,6 +1,6 @@
-"""Both surfaces against the peer of B-162: `fe2o3-amqp`, not a script.
+"""Both surfaces against `fe2o3-amqp`, a foreign peer and not a script.
 
-B-170 asks for a send awaited to `accepted` and a receive settled from Python
+A send awaited to `accepted` and a receive settled from Python are checked
 *against that peer*, because a client checked only against a server written by
 the same hand is checked against one opinion twice. `fe2o3-amqp` is a pure-Rust
 AMQP 1.0 implementation with an `acceptor`, so the peer needs no broker and no
@@ -127,7 +127,7 @@ async def test_a_delivery_from_a_fe2o3_sender_is_settled_from_python():
 
 @needs_peer
 def test_the_synchronous_surface_is_accepted_by_the_same_peer():
-    # B-171: the same exchange, no event loop in the process at all.
+    # The same exchange, no event loop in the process at all.
     with Peer("receiver") as peer:
         connection = sync.connect(
             "127.0.0.1", peer.port, container_id="weida-amqp-py", idle_time_out=None

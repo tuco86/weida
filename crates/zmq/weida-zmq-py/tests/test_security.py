@@ -1,13 +1,13 @@
 """PLAIN, CURVE, and a ZAP handler written in Python.
 
-B-114. The handler is the interesting part: 27/ZAP is an **in-process
+The handler is the interesting part: 27/ZAP is an **in-process
 request-reply dialog** over `inproc://zeromq.zap.01`, so a handler written in
 Python is a `RepSocket` of this module bound to that endpoint and nothing else
 — no callback registration, no Rust glue, and no GIL held while the Rust
 handshake waits for the answer, because the Rust side is talking to a socket
 rather than calling into Python.
 
-The refusal test asserts what the item asks for: a 400 stops the connection
+The refusal test asserts that a 400 stops the connection
 **before any message flows**, proved by the absence of the message rather than
 by the status code alone.
 """

@@ -1,6 +1,6 @@
 //! The link: credit granted from Python, and a send that returns an outcome.
 //!
-//! Two things here are the acceptance of B-170 and both are about *what an
+//! Two things here define the binding and both are about *what an
 //! await means*:
 //!
 //! * **`await send(...)` returns the delivery's terminal state**, not a

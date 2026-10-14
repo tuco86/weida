@@ -1,4 +1,4 @@
-"""The asyncio surface: B-172, against the scripted server of `scripted.py`.
+"""The asyncio surface, against the scripted server of `scripted.py`.
 
 What is asserted here beyond "a message crossed":
 

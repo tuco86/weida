@@ -2,9 +2,10 @@
 //!
 //! `sock.split()` on a DEALER, ROUTER, PAIR, XPUB or XSUB returns
 //! `(send_half, recv_half)`, and the two are usable **at the same time from
-//! two coroutines**: a task parked in `await recv_half.recv()` no longer
-//! makes `await send_half.send(...)` wait behind it, which is what pyzmq
-//! permits and the one-lease-per-socket rule of [`crate::sockets`] refused.
+//! two coroutines**: a task parked in `await recv_half.recv()` does not
+//! make `await send_half.send(...)` wait behind it, which is what pyzmq
+//! permits and the one-lease-per-socket rule of [`crate::sockets`] otherwise
+//! enforces on a whole socket.
 //! The halves are `weida-zmq`'s own (`weida_zmq::split`), so no pattern
 //! behaviour is decided here: each half is one of the library's half types
 //! in its own slot, and every method is the same [`crate::ops`] delegation

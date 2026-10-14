@@ -1,7 +1,7 @@
-"""B-058's round trip, run against an installed wheel.
+"""The asyncio round trip, run against an installed wheel.
 
 What `package.sh` runs inside a fresh virtualenv with no Rust toolchain on
-`PATH`: the item's own proof — an asyncio REQ/REP exchange between two sockets
+`PATH`: an asyncio REQ/REP exchange between two sockets
 of this module — plus the metadata a registry needs, read back from the
 installed distribution rather than from the source tree.
 """

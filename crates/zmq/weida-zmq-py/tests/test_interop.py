@@ -1,7 +1,8 @@
 """Interop: this binding against libzmq through `pyzmq`, in both roles.
 
-B-117, the Phase C bench of [LOOP.md](../../../docs/LOOP.md) §9 for this
-binding. Every pairing both implementations support, each pattern with
+The interop bench of this binding (results in
+[IMPLEMENTATION.md](../../../docs/IMPLEMENTATION.md) §4.15). Every pairing both
+implementations support, each pattern with
 
 * this module as the **bound** side and as the **connecting** side, and
 * this module in **either role** of the pattern (the REQ and the REP, the
@@ -24,7 +25,7 @@ from weida_zmq import sync
 
 zmq = pytest.importorskip(
     "zmq",
-    reason="pyzmq is absent; install it into the worktree venv with: "
+    reason="pyzmq is absent; install it into the repository venv with: "
     "uv pip install --python .venv pyzmq",
 )
 

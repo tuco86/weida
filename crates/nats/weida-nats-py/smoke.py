@@ -6,10 +6,10 @@ its reply, plus the metadata a registry needs, read back from the installed
 distribution rather than from the source tree.
 
 The peer is the tests' own scripted server and **not** `nats-server`: the
-binary is absent on most machines (B-168 says so and skips), and what this
-script has to prove is that the *extension in the wheel* works, not that a
-server accepts it. Routing, the 503 and the reply subject all come from
-`tests/scripted.py`, which is a server and nothing else.
+binary is absent on most machines (`tests/test_interop.py` skips without
+it), and what this script has to prove is that the *extension in the wheel*
+works, not that a server accepts it. Routing, the 503 and the reply subject
+all come from `tests/scripted.py`, which is a server and nothing else.
 """
 
 import asyncio

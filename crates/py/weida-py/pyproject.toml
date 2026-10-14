@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://git.doodleshnookie.net/tuco86/weida"
+Repository = "https://github.com/tuco86/weida"
 
 [tool.maturin]
 module-name = "weida"

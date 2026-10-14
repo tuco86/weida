@@ -57,6 +57,7 @@ use pyo3::types::PyModule;
 use weida_mqtt::DisconnectReasonCode;
 use weida_mqtt::blocking::{BlockingClient, BlockingContext, Deliveries};
 
+use crate::client;
 use crate::errors::raise;
 use crate::options::PyConnectOptions;
 use crate::values::{PyCompletion, PyDelivery, PyMessage, PySubscription};
@@ -89,9 +90,7 @@ impl SyncContext {
     #[new]
     #[pyo3(signature = (*, worker_threads = None))]
     fn new(py: Python<'_>, worker_threads: Option<usize>) -> PyResult<SyncContext> {
-        let threads = worker_threads.unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
-        });
+        let threads = worker_threads.unwrap_or_else(client::num_threads);
         let inner = raise(py, BlockingContext::owned(threads))?;
         Ok(SyncContext { inner })
     }

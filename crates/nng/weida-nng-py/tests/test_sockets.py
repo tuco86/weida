@@ -1,6 +1,6 @@
 """The eleven protocols, from Python, over real connections.
 
-B-137's proof is the first test here: an asyncio REQ/REP round trip between
+The first test here is an asyncio REQ/REP round trip between
 two sockets of this module, over each of the three transports the binding
 exposes. The rest assert the sentence each protocol's manual page claims —
 PUSH never discards, PUB is best effort and says how many copies it lost, SUB

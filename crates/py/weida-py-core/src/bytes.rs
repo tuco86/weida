@@ -33,7 +33,7 @@
 //!   and copies the frame into it in one step. A `memoryview` over
 //!   Rust-owned bytes would avoid the copy, and is deliberately **not** used
 //!   here: the buffer protocol is not part of the limited API before CPython
-//!   3.11, and B-058's wheel is `abi3` from 3.9 — a zero-copy path that only
+//!   3.11, and the wheel is `abi3` from 3.9 — a zero-copy path that only
 //!   exists on some interpreters is a performance cliff, not a feature.
 //!
 //! `benches/bytes_boundary.rs` measures both directions at 0 B, 64 B, 1 KiB

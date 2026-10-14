@@ -80,10 +80,10 @@
 //!
 //! # Building it
 //!
-//! `crates/amqp/weida-amqp-py/develop.sh` is the whole of it: a `uv`-managed
-//! virtualenv under the worktree, `maturin develop`, then `pytest`. The wheel
-//! is `abi3` from CPython 3.9, and `package.sh` proves it runs in a fresh
-//! virtualenv with no Rust toolchain on `PATH`.
+//! `crates/py/develop.sh` builds this binding into a `uv`-managed virtualenv
+//! and runs its Python tests (`crates/amqp/weida-amqp-py/develop.sh` is its
+//! wrapper). The wheel is `abi3` from CPython 3.9, and `package.sh` proves it
+//! runs in a fresh virtualenv with no Rust toolchain on `PATH`.
 
 use pyo3::prelude::*;
 

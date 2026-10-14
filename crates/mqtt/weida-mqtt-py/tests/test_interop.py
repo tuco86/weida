@@ -1,8 +1,8 @@
 """The round trip from Python, through a real broker, and back.
 
-The acceptance line of B-151 in one sentence: "a QoS 2 publish awaited to its
-PUBCOMP from Python, and the whole round trip run against the broker B-148
-supervises". `test_a_qos_2_publish_is_awaited_to_its_pubcomp` is that, and the
+The claim in one sentence: a QoS 2 publish awaited to its PUBCOMP from
+Python, with the whole round trip run against a real broker.
+`test_a_qos_2_publish_is_awaited_to_its_pubcomp` is that, and the
 rest of this file is what a caller needs around it to believe it.
 
 Skips with the command that starts a broker where none answers — see

@@ -17,7 +17,7 @@
 //! # It implements nothing, and the `block_on` is not here
 //!
 //! This module is `weida::blocking` — not a link, because a feature-gated
-//! item is a hard rustdoc error in the configuration that lacks it (B-184) —
+//! item is a hard rustdoc error in the configuration that lacks it —
 //! with argument conversion around it, and
 //! that is the whole of it. The facade is where the `block_on` lives, where
 //! the reactor is owned, and where the one refusal that matters is made: a
@@ -61,7 +61,7 @@
 //! sides keep alive never closes. A deadline that passes raises
 //! `TimeoutError`, the builtin, because it is **not** the end of the report:
 //! returning `None` for it would make a caller stop reading a verdict that is
-//! still coming (B-243).
+//! still coming.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

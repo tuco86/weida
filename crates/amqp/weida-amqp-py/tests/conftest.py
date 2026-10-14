@@ -9,8 +9,6 @@ this does it explicitly.
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent))
 
 
@@ -18,8 +16,3 @@ def pytest_configure(config):
     # Every coroutine test in this directory is asyncio; saying so once beats
     # a decorator on each.
     config.addinivalue_line("markers", "asyncio: an asyncio test")
-
-
-@pytest.fixture(scope="session")
-def anyio_backend():
-    return "asyncio"

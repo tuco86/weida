@@ -1,4 +1,4 @@
-"""The synchronous surface: B-173, against the same scripted server.
+"""The synchronous surface, against the same scripted server.
 
 `weida_nats.sync` drives the *same* futures `weida_nats` awaits, on the
 calling thread, with the GIL released. So the assertions here are about the
@@ -141,7 +141,7 @@ def test_a_bad_timeout_is_refused_where_it_was_given(server):
 
 
 # --------------------------------------------------------------------------
-# B-172's request-reply, unchanged, in synchronous form
+# The request-reply of the asyncio surface, unchanged, in synchronous form
 
 
 def test_request_is_answered(server):

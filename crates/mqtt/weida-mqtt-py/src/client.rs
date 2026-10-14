@@ -167,7 +167,7 @@ impl PyContext {
 
 /// One reactor thread per core, which is what a library that owns its reactor
 /// should default to and what `Context::owned` needs told.
-fn num_threads() -> usize {
+pub(crate) fn num_threads() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 

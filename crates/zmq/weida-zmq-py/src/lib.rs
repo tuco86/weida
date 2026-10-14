@@ -34,9 +34,9 @@
 //! blocks the event loop and nothing holds the GIL while waiting. A cancelled
 //! task cancels the Rust future underneath rather than leaving it running. The
 //! synchronous surface — the same eleven types over `weida-zmq`'s `blocking`
-//! facade, for a process with no loop at all — is B-116 and is deliberately
-//! second, because the facade exists in Rust and building it here first would
-//! build it twice (0014 §2).
+//! facade, for a process with no loop at all — is `weida_zmq.sync`, which
+//! implements nothing of its own: the facade exists in Rust and building it
+//! here would build it twice (0014 §2).
 //!
 //! # Errors
 //!
@@ -52,13 +52,11 @@
 //!
 //! # Building it
 //!
-//! `crates/zmq/weida-zmq-py/develop.sh` is the whole of it: it creates a
-//! `uv`-managed virtualenv under the worktree, installs `maturin` and `pytest`
-//! into that virtualenv and nothing into the system interpreter, runs
-//! `maturin develop` and then the Python tests. The wheel is `abi3` from
-//! CPython 3.9, so one build serves every later interpreter, and
-//! `package.sh` builds it and proves it runs in a fresh virtualenv with no
-//! Rust toolchain on `PATH`.
+//! `crates/py/develop.sh` builds this binding into a `uv`-managed virtualenv
+//! and runs its Python tests (`crates/zmq/weida-zmq-py/develop.sh` is its
+//! wrapper). The wheel is `abi3` from CPython 3.9, so one build serves every
+//! later interpreter, and `package.sh` builds it and proves it runs in a fresh
+//! virtualenv with no Rust toolchain on `PATH`.
 //!
 //! # What differs from `pyzmq`
 //!

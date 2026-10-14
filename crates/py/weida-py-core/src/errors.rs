@@ -158,7 +158,6 @@ impl ErrorFamily {
     /// After this, `from weida_zmq import EAGAIN` works, and so does
     /// `except weida_zmq.ZmqError`.
     pub fn register(&self, module: &Bound<'_, PyModule>) -> PyResult<()> {
-        let py = module.py();
         module.add(
             self.base_name.rsplit('.').next().unwrap_or("Error"),
             &self.base,
@@ -166,7 +165,6 @@ impl ErrorFamily {
         for (name, class) in &self.classes {
             module.add(*name, class)?;
         }
-        let _ = py;
         Ok(())
     }
 
@@ -179,13 +177,10 @@ impl ErrorFamily {
     /// release, and a caller must still see which errno arrived.
     pub fn error(&self, py: Python<'_>, errno: &Errno) -> PyErr {
         let class = self.classes.get(errno.name()).unwrap_or(&self.base);
-        match instantiate(py, class.bind(py), errno) {
-            Ok(err) => err,
-            // Instantiating an exception can only fail if the class or the
-            // interpreter is broken; reporting *that* as an error beats
-            // panicking inside a `raise`.
-            Err(err) => err,
-        }
+        // Instantiating an exception can only fail if the class or the
+        // interpreter is broken; reporting *that* as an error beats
+        // panicking inside a `raise`.
+        instantiate(py, class.bind(py), errno).unwrap_or_else(|err| err)
     }
 }
 

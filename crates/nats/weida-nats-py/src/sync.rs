@@ -15,7 +15,7 @@
 //!
 //! `weida-zmq` has a `blocking` module of its own, so `weida_zmq.sync` is
 //! that module with argument conversion around it. `weida-nats` has no such
-//! facade — B-165 built the asynchronous client and no second surface — so
+//! facade — it is an asynchronous client and nothing else — so
 //! the `block_on` lives here instead. That is the only difference. Every
 //! method below drives **the same future the coroutine surface awaits**:
 //! subject validation, `INFO.max_payload`, the inbox, the mandatory request
@@ -257,8 +257,9 @@ impl SyncConnection {
     /// Publishes a request and waits at most `timeout` seconds for one
     /// reply.
     ///
-    /// B-172's request-reply, unchanged, in synchronous form: the same three
-    /// outcomes and the same three classes, because it is the same call.
+    /// The request-reply of the asyncio surface, unchanged, in synchronous
+    /// form: the same three outcomes and the same three classes, because it
+    /// is the same call.
     fn request(
         &self,
         py: Python<'_>,

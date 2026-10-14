@@ -25,7 +25,7 @@ import weida_nng
 
 pynng = pytest.importorskip(
     "pynng",
-    reason="pynng is absent; install it into the worktree venv with: "
+    reason="pynng is absent; install it into the repository venv with: "
     "uv pip install --python .venv pynng",
 )
 

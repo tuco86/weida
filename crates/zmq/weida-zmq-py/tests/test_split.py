@@ -1,6 +1,6 @@
 """`sock.split()`: sending while another coroutine is parked in a receive.
 
-B-177's proof. Without a split, every operation on one socket object queues
+Without a split, every operation on one socket object queues
 behind the one in front, because the binding leases the socket to one call at
 a time (`weida_zmq.sockets`' module documentation). A DEALER waiting for a
 reply therefore could not send the next request until the reply arrived, and
@@ -37,7 +37,7 @@ def run(coroutine):
 
 
 def test_dealer_sends_while_recv_is_parked():
-    """The item: a parked receive does not hold up the other direction."""
+    """A parked receive does not hold up the other direction."""
 
     async def exchange():
         context = weida_zmq.Context()

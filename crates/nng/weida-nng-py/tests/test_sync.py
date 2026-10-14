@@ -1,6 +1,6 @@
 """`weida_nng.sync`: the same sockets, with no event loop in the process.
 
-The first test is B-137's round trip written synchronously — the same
+The first test is the asynchronous round trip written synchronously — the same
 exchange, the same assertions, no `asyncio` imported at all. The rest assert
 what a synchronous surface has to get right and an asynchronous one does not
 have to think about: a timeout turns a stalled exchange into an exception
@@ -47,7 +47,7 @@ def test_the_asyncio_round_trip_runs_unchanged_in_synchronous_form():
 
 
 def test_no_event_loop_is_running_while_this_suite_runs():
-    """The claim the item makes: no asyncio loop is required in the process."""
+    """No asyncio loop is required in the process."""
     import asyncio
 
     with pytest.raises(RuntimeError):
