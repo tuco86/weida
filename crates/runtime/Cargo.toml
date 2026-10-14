@@ -29,5 +29,5 @@ weida-winpipe.workspace = true
 # the capability `Exec::owned` exists for.
 futures.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

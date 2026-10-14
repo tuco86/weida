@@ -1,6 +1,7 @@
 [package]
 name = "weida-amqp-codec"
 description = "AMQP 1.0 codec: the Part 1 type system, frames, performatives and message sections, sans-I/O"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -17,5 +18,5 @@ categories.workspace = true
 # one depends on neither (`docs/decisions/0013-competitor-libraries.md` §4.3).
 [dependencies]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

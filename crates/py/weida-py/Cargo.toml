@@ -1,6 +1,7 @@
 [package]
 name = "weida-py"
 description = "The Python binding of weida: all six patterns over QUIC — Req/Rep, Push/Pull, Pub/Sub, Pair, Survey and Bus — asyncio and synchronous, with the library's error vocabulary as exception classes"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -30,8 +31,8 @@ doctest = false
 # (`docs/decisions/0014-parallel-libraries.md` §2).
 weida-py-core.workspace = true
 pyo3.workspace = true
-# The library being bound — weida itself, which is what makes this the first
-# binding of the *product* rather than of a competitor implementation.
+# The library being bound — weida itself, which is what makes this the binding
+# of the *product* rather than of a competitor implementation.
 # `generate` is on, because a Python caller that binds has no other way to
 # obtain an identity: there is no PEM file in a fresh process. `blocking` is
 # on because `weida.sync` **is** that facade with argument conversion around

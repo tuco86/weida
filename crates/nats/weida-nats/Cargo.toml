@@ -1,6 +1,7 @@
 [package]
 name = "weida-nats"
 description = "A NATS core client in Rust: connections, subscriptions, queue groups and request-reply, usable with no weida in the picture"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -59,5 +60,5 @@ default = ["tls"]
 # TLS completed before ordinary traffic where `INFO` requires it.
 tls = ["dep:tokio-rustls"]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

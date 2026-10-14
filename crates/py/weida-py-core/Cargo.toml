@@ -1,6 +1,7 @@
 [package]
 name = "weida-py-core"
-description = "The shared PyO3 foundation of every Python binding in this workspace: errno exception families, the asyncio bridge and the bytes boundary"
+description = "The shared PyO3 foundation of the six Python bindings in this workspace: errno exception families, the asyncio bridge and the bytes boundary"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -16,7 +17,7 @@ categories.workspace = true
 # appear here, which is the dependency-direction rule
 # `docs/decisions/0013-competitor-libraries.md` §4.2 gives `weida-runtime`, one
 # layer up (`docs/decisions/0014-parallel-libraries.md` §2). A crate that knew a
-# wire format could not be the foundation of four bindings.
+# wire format could not be the foundation of every binding.
 #
 # `tokio` is deliberately absent too, even though the reactor is one: the only
 # tokio value this crate handles is the join handle `Exec::spawn` returns, and it
@@ -35,7 +36,7 @@ name = "bytes_boundary"
 harness = false
 
 [lints.rust]
-# Every other crate in this workspace forbids `unsafe_code`; this one cannot.
+# Like every PyO3 crate here, this one cannot forbid `unsafe_code`.
 # PyO3's `#[pyclass]`, `#[pymethods]` and `#[pyfunction]` macros expand to
 # `unsafe impl`s of its type-object traits, and a `forbid` applies to macro
 # output as much as to hand-written code. `tests/no_handwritten_unsafe.rs`

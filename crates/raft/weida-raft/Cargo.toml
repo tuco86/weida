@@ -1,6 +1,6 @@
 [package]
 name = "weida-raft"
-description = "openraft plus the I/O it deliberately leaves out: QUIC transport, TLS-proved node identity and a streamed snapshot channel, so a Raft service needs only its state machine"
+description = "openraft plus the I/O it deliberately leaves out: QUIC transport, TLS-proved node identity and a streamed snapshot channel, so a Raft service supplies only its state machine and log store"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -20,7 +20,6 @@ categories.workspace = true
 openraft = { workspace = true, features = ["generic-snapshot-data"] }
 # The I/O half: connections, exchanges and streamed transfers.
 weida.workspace = true
-weida-core.workspace = true
 # The bounded CBOR skip of PROTOCOL.md §5, shared rather than copied.
 weida-protocol.workspace = true
 minicbor.workspace = true
@@ -30,5 +29,5 @@ tracing.workspace = true
 [dev-dependencies]
 weida = { workspace = true, features = ["generate"] }
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

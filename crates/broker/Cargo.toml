@@ -1,6 +1,6 @@
 [package]
 name = "weida-broker"
-description = "The minimal L2 broker: queues at endpoint paths, Accepted in, nothing durable"
+description = "The L2 broker: queues at endpoint paths, publisher confirms, credit and settlement; nothing durable"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -10,25 +10,12 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[features]
-# Raft-backed replication. Off by default: a broker that leads no cluster needs
-# no consensus engine, and this is where the dependency weight of one lives
-# ([decisions/0021](../../docs/decisions/0021-consensus-openraft.md) §4.1).
-cluster = ["dep:weida-raft"]
-
 [dependencies]
 # The whole dependency list, deliberately: a broker is an ordinary weida
 # process and the layer below it is the public API, not its internals
 # (`docs/ARCHITECTURE.md` §4). Nothing in `weida` may depend on this crate,
 # and a brokerless deployment does not link it.
 weida.workspace = true
-# Consensus, through the crate that adds the I/O openraft does not have
-# (0021 §4.1). **Optional**, behind the non-default `cluster` feature, because
-# a single-node broker must not link a consensus engine: 39 crates enter the
-# lockfile with it, among them a command-line parser, a JSON-schema generator
-# and five `windows-*` crates, none of which openraft 0.9 lets a feature flag
-# remove (B-222).
-weida-raft = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 
@@ -37,5 +24,5 @@ tracing.workspace = true
 weida = { workspace = true, features = ["generate"] }
 tracing-subscriber.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

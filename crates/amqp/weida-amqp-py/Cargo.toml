@@ -1,6 +1,7 @@
 [package]
 name = "weida-amqp-py"
 description = "The Python binding of weida-amqp: asyncio AMQP 1.0 connections, sessions and links on the Rust client, with the specification's error conditions as exception classes"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true

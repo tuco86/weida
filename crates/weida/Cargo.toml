@@ -16,7 +16,7 @@ default = ["generate"]
 # that only ever load certificates issued elsewhere.
 generate = ["dep:rcgen"]
 # `weida::blocking`: the synchronous facade over the same engine, for a caller
-# with no executor (B-194). Off by default, like every other library's in this
+# with no executor. Off by default, like every other library's in this
 # tree, because an application that has a reactor wants the async surface.
 blocking = ["dep:futures"]
 
@@ -56,7 +56,7 @@ futures.workspace = true
 # Tests build device chains signed by a user key (decisions/0035).
 rcgen.workspace = true
 
-# `weida send|request|sub|serve` (B-060). `serve` mints a self-signed identity
+# `weida send|request|sub|serve`. `serve` mints a self-signed identity
 # when no `--identity` file is given, so the binary needs the `generate`
 # feature; a downstream build with the feature off skips it rather than
 # failing to compile.
@@ -80,11 +80,11 @@ harness = false
 name = "transports"
 harness = false
 
-# What per-subscriber fan-out costs at width (B-247): the number the guide's
-# C8B arithmetic rests on.
+# What per-subscriber fan-out costs at width (IMPLEMENTATION.md §4.11): the
+# number the guide's C8B arithmetic rests on.
 [[bench]]
 name = "fanout"
 harness = false
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

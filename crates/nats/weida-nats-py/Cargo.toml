@@ -1,6 +1,7 @@
 [package]
 name = "weida-nats-py"
 description = "The Python binding of weida-nats: asyncio Core NATS on the Rust implementation, with the library's error vocabulary as exception classes"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true

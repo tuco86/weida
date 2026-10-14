@@ -16,7 +16,6 @@ categories.workspace = true
 # ([decisions/0032](../../../docs/decisions/0032-identity-sources-and-the-handoff.md)
 # §4.3).
 weida.workspace = true
-weida-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 # The two dependencies that make this its own crate: the OpenBao API is JSON
@@ -36,5 +35,5 @@ rcgen.workspace = true
 # The scripted HTTP server the tests answer from.
 tokio = { workspace = true, features = ["io-util", "net"] }
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

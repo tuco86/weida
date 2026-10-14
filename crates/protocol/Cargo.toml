@@ -21,5 +21,5 @@ criterion.workspace = true
 name = "codec"
 harness = false
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

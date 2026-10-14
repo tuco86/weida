@@ -123,7 +123,7 @@ Keep the failures block of the test output; a count without names is not a gate 
 
 **`--workspace` is not the whole workspace.** It builds every crate in its *default*
 configuration, so code behind a default-off feature is compiled by none of the four commands
-above — 850 tests and four synchronous facades, as of this writing. A commit that touches Rust
+above — 909 tests and four synchronous facades, as of this writing. A commit that touches Rust
 therefore also runs, for each crate whose sources it touched:
 
 | crate | feature | commands |
@@ -132,11 +132,10 @@ therefore also runs, for each crate whose sources it touched:
 | `weida-zmq` | `blocking` | the same two with `-p weida-zmq` |
 | `weida-mqtt` | `blocking` | the same two with `-p weida-mqtt` |
 | `weida-nng` | `blocking` | the same two with `-p weida-nng` |
-| `weida-broker` | `cluster` | the same two with `-p weida-broker --features cluster` |
 
-All five, run together, cost **89 s** warm and cover **850 tests** (284, 245, 152, 143, 26).
+All four, run together, cost **66 s** warm and cover **909 tests** (369, 245, 152, 143).
 A commit that touches the core (`weida`, `weida-protocol`, `weida-runtime`, `weida-core`) runs
-all five, because every facade sits on it.
+all four, because every facade sits on it.
 
 Two features are **excluded on purpose**, with the reason: `nng-interop` and `libzmq-interop`
 need a foreign C library present at run time, so they belong to the item that touches them and

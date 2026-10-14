@@ -1,6 +1,7 @@
 [package]
 name = "weida-amqp"
 description = "An AMQP 1.0 client in Rust: connections, sessions and links, usable with no weida in the picture"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -53,5 +54,5 @@ default = ["tls"]
 # the bare `amqps` listener on 5671, which needs no protocol header at all.
 tls = ["dep:tokio-rustls"]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

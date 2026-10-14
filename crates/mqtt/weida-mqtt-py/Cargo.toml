@@ -1,6 +1,7 @@
 [package]
 name = "weida-mqtt-py"
 description = "The Python binding of weida-mqtt: an asyncio MQTT 5.0 client on the Rust implementation, with MQTT's reason codes as exception classes"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -32,7 +33,7 @@ weida-py-core.workspace = true
 pyo3.workspace = true
 # The library being bound. Nothing of weida is reachable through it, which is
 # the dependency direction 0013 §4.2 fixed. Default features are off: the
-# `tls` feature links a TLS stack, and B-151's surface has no way to hand a
+# `tls` feature links a TLS stack, and the binding has no way to hand a
 # `rustls::ClientConfig` in from Python — a binding that linked one it could
 # not configure would be linking it for nothing. `default-features = false`
 # cannot override an inherited default, so the path is named here rather than

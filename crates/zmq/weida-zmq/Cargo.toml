@@ -1,6 +1,7 @@
 [package]
 name = "weida-zmq"
 description = "A ZeroMQ implementation in Rust: contexts, sockets and endpoints, usable with no weida in the picture"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -29,8 +30,8 @@ tracing.workspace = true
 # CURVE's cryptography, and the only cryptographic dependency this crate has:
 # `crypto_box` **is** NaCl's `crypto_box`, which is the construction
 # 26/CURVEZMQ is written in terms of. The layouts stay in `weida-zmtp`, whose
-# own manifest is still empty, and `unsafe_code = "forbid"` below survives
-# this because the crate is pure Rust.
+# own manifest is empty, and `unsafe_code = "forbid"` survives this because
+# the crate is pure Rust.
 crypto_box.workspace = true
 # The executor the blocking facade drives its futures on, and only that: the
 # reactor's own threads are busy driving the connections, so a blocking caller
@@ -40,7 +41,7 @@ crypto_box.workspace = true
 # that promise taken up. Optional, so a caller that does not want the facade
 # does not link it.
 futures = { workspace = true, optional = true }
-# libzmq itself, for B-089's interop tests — the reference implementation this
+# libzmq itself, for the interop tests — the reference implementation this
 # library is measured against, reached through the `zmq` crate's bindings.
 #
 # **Optional and off**, because cargo forbids an optional dev-dependency and
@@ -53,8 +54,8 @@ futures = { workspace = true, optional = true }
 # always builds libzmq from source, and that build reports
 # `zmq_has("curve") == false`, so CURVE could not be measured against it at
 # all. 0.9's `zmq-sys` 0.11 links the system library through `pkg-config`,
-# which is the library a deployment actually meets — here libzmq 4.3.5 with
-# libsodium, where CURVE exists and the boxes are libsodium's.
+# which is the library a deployment actually meets: with libsodium behind it
+# CURVE exists and the boxes are libsodium's.
 zmq = { version = "0.9", optional = true }
 
 [dev-dependencies]
@@ -125,5 +126,5 @@ name = "last_value_cache"
 name = "hello_world"
 required-features = ["blocking"]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

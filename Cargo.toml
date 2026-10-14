@@ -10,7 +10,7 @@ members = [
     # depends on it (0018 §4.1).
     "crates/broker",
     # openraft plus the I/O it deliberately does not have: weida's transport
-    # under it, so a Raft service needs only a state machine
+    # under it, so a Raft service supplies only its state machine and log store
     # ([decisions/0021](docs/decisions/0021-consensus-openraft.md)).
     "crates/raft/weida-raft",
     # The one crate that calls Win32; empty everywhere else.
@@ -60,6 +60,11 @@ homepage = "https://weida.doodleshnookie.net"
 keywords = ["messaging", "quic", "broker", "async", "protocol"]
 categories = ["network-programming", "asynchronous"]
 
+[workspace.lints.rust]
+# Inherited with `[lints] workspace = true`. `weida-winpipe` and the PyO3 crates
+# cannot forbid it and carry their own table.
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 weida-core = { path = "crates/core", version = "0.1.0-alpha.6" }
 weida-protocol = { path = "crates/protocol", version = "0.1.0-alpha.6" }
@@ -101,13 +106,13 @@ webpki-roots = "1"
 # 0.11.12 is the first release that requires `quinn-proto` 0.11.18, whose
 # `PathStats` carries `min_rtt` ([decisions/0036](docs/decisions/0036-connection-statistics.md) §2.1).
 quinn = "0.11.12"
-# The consensus engine of the L2 broker, and a dependency rather than a
+# The consensus engine behind `weida-raft`, and a dependency rather than a
 # subsystem ([decisions/0021](docs/decisions/0021-consensus-openraft.md)): the
 # part of writing one that matters is the invariant harness this crate already
 # runs tick by tick against the paper and the TLA+ spec. Pinned to the stable
-# 0.9 line, because its own README promises incompatible changes before 1.0 —
-# which is also why no `openraft::` type may appear in a public signature of
-# `weida-broker`, the only crate allowed to name it.
+# 0.9 line, because its own README promises incompatible changes before 1.0.
+# `weida-raft` is the only crate that names openraft; it re-exports it, so a
+# `weida-raft` release names one openraft minor line.
 # `storage-v2` unseals `RaftLogStorage`/`RaftStateMachine` for third-party
 # crates — without it the only implementable storage trait is the v1
 # `RaftStorage` behind an `Adaptor`, and v2 is what 0.10 makes the sole API.
@@ -156,19 +161,22 @@ ring = "0.17"
 crypto_box = "0.9"
 # The Python bindings' one foreign dependency: CPython through PyO3.
 # `abi3-py39` is the limited API, so one wheel covers every CPython from 3.9
-# on, which is what B-118's registry metadata promises. The bindings hold this
-# version in common because two PyO3 versions in one interpreter cannot share a
-# type object.
+# on, which is what the bindings' registry metadata promises. The bindings
+# hold this version in common because two PyO3 versions in one interpreter
+# cannot share a type object.
 pyo3 = { version = "0.29", features = ["abi3-py39"] }
-
+# Tests, benches and examples only.
+# Also an optional dependency of `weida` (the `generate` feature) and a normal
+# dependency of `weida-openbao`; the entry lives here because every use shares
+# one version.
 rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 # The foreign peer for the ZMTP interop bench and tests: a pure-Rust ZeroMQ that
 # shares no code and no assumptions with our codec, which is the only thing that
-# turns "we agree with ourselves" into interoperability
-# (`docs/adapters/zmtp.md` §10 item 3). Tests and benches only.
+# turns "we agree with ourselves" into interoperability. Tests and benches
+# only.
 zeromq = "0.6"
 # Proves a negative the type system holds and no runtime test can see: a
-# socket shared between threads must not compile (B-102). Tests only.
+# socket shared between threads must not compile. Tests only.
 trybuild = "1"

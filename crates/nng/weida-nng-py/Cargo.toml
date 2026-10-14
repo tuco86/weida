@@ -1,6 +1,7 @@
 [package]
 name = "weida-nng-py"
 description = "The Python binding of weida-nng: asyncio SP sockets on the Rust implementation, with NNG's errno vocabulary as exception classes"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -51,6 +52,6 @@ tokio.workspace = true
 extension-module = ["pyo3/extension-module"]
 
 [lints.rust]
-# As in `weida-py-core`: PyO3's macros expand to `unsafe impl`s, so `forbid`
-# is not available. No `unsafe` is written by hand in this crate.
+# As in `weida-py-core`: PyO3's macros expand to `unsafe impl`s, so `forbid` is
+# not available. No `unsafe` is written by hand in this crate.
 unsafe_code = "allow"

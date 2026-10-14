@@ -1,6 +1,7 @@
 [package]
 name = "weida-nats-codec"
 description = "NATS client protocol codec: the twelve control-line verbs and the NATS/1.0 header block, sans-I/O"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -18,5 +19,5 @@ categories.workspace = true
 # (`docs/decisions/0013-competitor-libraries.md` §4.3).
 [dependencies]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

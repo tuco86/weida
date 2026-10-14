@@ -12,5 +12,5 @@ categories.workspace = true
 
 [dependencies]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

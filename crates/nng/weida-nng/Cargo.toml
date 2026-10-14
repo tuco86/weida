@@ -1,6 +1,7 @@
 [package]
 name = "weida-nng"
 description = "An implementation of the nanomsg Scalability Protocols in Rust: sockets, endpoints and pipes, usable with no weida in the picture"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -37,7 +38,7 @@ tracing.workspace = true
 # rather than a new cryptographic stack.
 tokio-rustls.workspace = true
 rustls-webpki.workspace = true
-# NNG itself, for B-133's interop tests — the reference implementation this
+# NNG itself, for the interop tests — the reference implementation this
 # library is measured against, reached through the `nng` crate's bindings
 # over `nng-sys`, which builds the C library from vendored sources.
 #
@@ -94,5 +95,5 @@ nng-interop = ["dep:nng"]
 # context).
 blocking = ["dep:futures"]
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

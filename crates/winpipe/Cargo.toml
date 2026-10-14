@@ -12,8 +12,8 @@ categories.workspace = true
 
 # Empty on every platform but Windows: the crate exists so that the one
 # place this workspace has to call Win32 is a crate that does nothing else
-# (`docs/ARCHITECTURE.md` §4). Every other crate keeps
-# `unsafe_code = "forbid"`.
+# (`docs/ARCHITECTURE.md` §4). Apart from the PyO3 crates, every other crate
+# forbids `unsafe_code`.
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]
@@ -32,7 +32,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [lints.rust]
-# The exception, and the only one: every `unsafe` block here wraps one Win32
-# call and states what it relies on. `unsafe_op_in_unsafe_fn` keeps a block
-# from hiding inside an `unsafe fn`.
+# Win32 FFI: every `unsafe` block wraps one call and states what it relies on;
+# the PyO3 crates are the other crates that cannot forbid `unsafe_code`.
+# `unsafe_op_in_unsafe_fn` keeps a block from hiding inside an `unsafe fn`.
 unsafe_op_in_unsafe_fn = "forbid"

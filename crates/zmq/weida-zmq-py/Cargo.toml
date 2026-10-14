@@ -1,6 +1,7 @@
 [package]
 name = "weida-zmq-py"
 description = "The Python binding of weida-zmq: asyncio ZeroMQ sockets on the Rust implementation, with libzmq's errno vocabulary as exception classes"
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
