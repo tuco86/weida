@@ -18,8 +18,8 @@ Three verdicts and no others:
 pyzmq's the row says so and §9 states why.
 
 Measured against: pyzmq 27.2.0 over libzmq 4.3.5 with libsodium (`zmq.has("curve")` true),
-CPython 3.13.14, PyO3 0.29.2, `abi3` from CPython 3.9, Linux x86-64. Every number in §8 was
-measured on this machine by a program in the repository.
+CPython 3.13.14, PyO3 0.29.2, `abi3` from CPython 3.9, Linux x86-64. Every number in §8 is
+measured by a program in the repository against that configuration.
 
 ## 2. Socket types
 
@@ -101,10 +101,10 @@ Differences from pyzmq's option surface:
 | `zmq.proxy_steerable(...)` | `await weida_zmq.proxy_steerable(frontend, backend, control, capture=None)` | present, with `CONTROL_PAUSE`/`RESUME`/`TERMINATE`/`STATISTICS` and a `ProxyStatistics` of libzmq's eight counters |
 | `zmq.devices.ThreadProxy`, `ProcessDevice`, `ThreadDevice` | — | absent: they are `threading`/`multiprocessing` wrappers around the proxy. `asyncio.create_task(weida_zmq.proxy(...))` is the same thing in this surface, and a cancelled task ends it |
 | a proxy between REQ and REP | — | refused: `TypeError` at the call. 28/REQREP's alternation is the application's to drive, `weida_zmq::Device` is not implemented for those two, and libzmq's devices do not accept them either |
-| a PULL→PUSH streamer device | `weida_zmq.proxy(pull, push)` | present since B-178: `weida_zmq::proxy` reads only the sides that receive (`Device::RECEIVES`), so an end that cannot receive is a side that never delivers rather than an `ENOTSUP` at the first poll; a device whose two ends both never deliver is refused. Proved in the library by `a_streamer_forwards_through_a_side_that_never_receives` and from Python by `test_monitor.py::test_a_streamer_device_forwards` |
+| a PULL→PUSH streamer device | `weida_zmq.proxy(pull, push)` | present: `weida_zmq::proxy` reads only the sides that receive (`Device::RECEIVES`), so an end that cannot receive is a side that never delivers rather than an `ENOTSUP` at the first poll; a device whose two ends both never deliver is refused. Proved in the library by `a_streamer_forwards_through_a_side_that_never_receives` and from Python by `test_monitor.py::test_a_streamer_device_forwards` |
 | `zmq.asyncio.Context`/`Socket` | — | absent as an API shape: this binding is asyncio-first, so there is no second "asyncio flavour" of it to import. The synchronous surface is `weida_zmq.sync` |
 | `send_string`, `recv_string`, `send_json`, `send_pyobj` | — | absent: a payload is `bytes`, and a `str` is refused with a message saying to encode it. Guessing an encoding or a serialization for somebody else's wire format is not this library's to guess |
-| `zmq.Frame`, `copy_threshold`, `sock.send(..., copy=False)` | — | absent: a message is a `Multipart` value of `bytes` frames. What the copy costs is measured, in [IMPLEMENTATION.md](../IMPLEMENTATION.md) §4 (B-112), rather than made configurable |
+| `zmq.Frame`, `copy_threshold`, `sock.send(..., copy=False)` | — | absent: a message is a `Multipart` value of `bytes` frames. What the copy costs is measured, in [IMPLEMENTATION.md](../IMPLEMENTATION.md) §4.14, rather than made configurable |
 
 ## 8. Interop evidence
 
@@ -122,7 +122,7 @@ Skipped with its install command where pyzmq is absent.
 
 Cost, measured by `crates/zmq/weida-zmq/examples/roundtrip_cost.rs` and
 `crates/zmq/weida-zmq-py/roundtrip_cost.py` and recorded in
-[IMPLEMENTATION.md](../IMPLEMENTATION.md) §4 (B-117): a REQ/REP round trip is **16.5 µs**
+[IMPLEMENTATION.md](../IMPLEMENTATION.md) §4.15: a REQ/REP round trip is **16.5 µs**
 in Rust, **67.7 µs** through `weida_zmq.sync`, **330 µs** through the asyncio surface and
 **5.7 µs** through pyzmq, over `inproc://`; over loopback `tcp://` the four are 32.4, 111,
 343 and 45.8 µs. The asyncio figure is one event-loop wakeup per `await`, and the fast path
@@ -135,7 +135,7 @@ that would remove it for an operation that does not wait is filed rather than hi
    `await sock.send(...)` on that *same object* queues behind it: a `weida-zmq` socket's
    operations take `&self` on a handle that is not `Sync`, which is libzmq's thread rule as a
    type. pyzmq allows the overlap, so the five socket types whose two directions are
-   independent have `await sock.split()` (B-177): it returns `(send_half, recv_half)` onto the
+   independent have `await sock.split()`: it returns `(send_half, recv_half)` onto the
    same connections, usable from two coroutines at once, and retires the object it was called
    on (`ENOTSOCK` naming the split). DEALER, ROUTER, PAIR, XPUB and XSUB have it; REQ and REP
    do not, because 28/REQREP's alternation is a single sequence and two halves would promise
@@ -146,9 +146,8 @@ that would remove it for an operation that does not wait is filed rather than hi
    held by a parked receive, and a synchronous Python method that waited for it would block
    the event-loop thread. The two `_nowait` methods are synchronous, because they never wait.
 3. **The work starts at the first `await`, not at the call.** `sock.recv()` builds a coroutine
-   and starts nothing; a coroutine never awaited does nothing at all. This was a change made
-   after the eager version was caught losing a message to a task cancelled before it ran
-   (B-112).
+   and starts nothing; a coroutine never awaited does nothing at all. Starting at the call
+   would lose a message to a task cancelled before it ran.
 4. **Seconds, not milliseconds**, for every duration, with `None` for libzmq's sentinels (§5).
 5. **Two defaults differ from libzmq**, inherited from the library and readable from Python:
    `ZMQ_LINGER` is finite (`weida_zmq.DEFAULT_CLOSE_BUDGET`, 1.0 s) where libzmq's is
@@ -171,7 +170,7 @@ that would remove it for an operation that does not wait is filed rather than hi
 | Asyncio first, synchronous second and over the same code | yes, `weida_zmq.sync` over the library's `blocking` facade | §7, §9.2 |
 | Security in both directions, ZAP handler in the binding's language | yes | §4, §8 |
 | Interop in both roles against the reference implementation | yes, 32 pairings plus security both ways | §8 |
-| Payload boundary measured rather than assumed | yes | §8, IMPLEMENTATION.md §4 |
+| Payload boundary measured rather than assumed | yes | §8, IMPLEMENTATION.md §4.14 and §4.15 |
 | No row says "partial" | yes: §7 and §9.1 name what a caller does not get | §7, §9 |
 
 ## 11. Sources
@@ -180,7 +179,7 @@ that would remove it for an operation that does not wait is filed rather than hi
   `monitor.rs`, `devices.rs`, `sync.rs`, `errors.rs`), `crates/py/weida-py-core/src/`.
 - Tests: `crates/zmq/weida-zmq-py/tests/` — `test_sockets.py`, `test_messages.py`,
   `test_options.py`, `test_security.py`, `test_monitor.py`, `test_sync.py`, `test_interop.py`.
-- Measurements: [IMPLEMENTATION.md](../IMPLEMENTATION.md) §4, B-112 and B-117.
+- Measurements: [IMPLEMENTATION.md](../IMPLEMENTATION.md) §4.14 and §4.15.
 - Decisions: [0014](../decisions/0014-parallel-libraries.md) §2 (one shared PyO3 foundation,
   asyncio first, the bytes boundary), [0013](../decisions/0013-competitor-libraries.md) §4.4
   (the three constructors, options honoured or refused, the two deliberate defaults, identity

@@ -1,7 +1,7 @@
 # The store interface
 
-*Specification ahead of code.* Nothing in this repository implements it yet: Phase 5 does
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §1). This document exists because the interface is **not**
+*Specification ahead of code.* Nothing in this repository implements it; the persistence
+subsystem is Phase 5 of the tracker ([IMPLEMENTATION.md](IMPLEMENTATION.md) §1). This document exists because the interface is **not**
 the store's to choose — [0021](decisions/0021-consensus-openraft.md) made the consensus engine a
 dependency, and a consensus engine prescribes what a log must be able to do. Writing the contract
 down before the store means the store is built once.
@@ -84,8 +84,8 @@ store can make *N* true ([decisions/0023](decisions/0023-completion-is-a-cursor.
 A store that flushes in 4 MiB segments reports in 4 MiB steps, and that is honest rather than
 coarse.
 
-A consequence for testing, found while implementing the reference in-memory store: openraft's
-`LogFlushed::new` is `pub(crate)`, so **a store cannot construct the callback in a unit test**.
+A consequence for testing: openraft's `LogFlushed::new` is `pub(crate)`, so **a store cannot
+construct the callback in a unit test**.
 `append` conformance is exercised through a live consensus group; everything else in this document
 is unit-testable directly.
 
@@ -144,10 +144,10 @@ Not prescribed by the consensus engine, and therefore decided here:
 | Bound | Applies to | Why it is not optional |
 | --- | --- | --- |
 | entries per read | `limited_get_log_entries` | a peer names the range ([INVARIANTS.md](INVARIANTS.md)) |
-| bytes per read | the same call | entry count alone is not a memory bound, which is the lesson B-096 and B-201 both recorded |
+| bytes per read | the same call | entry count alone is not a memory bound, as the zmq queue and the broker queue already apply ([INVARIANTS.md](INVARIANTS.md)) |
 | snapshot chunk | `install_snapshot`'s stream | a peer chooses the size of what it sends |
 | log segment | the log's own files | a segment that grows without limit cannot be purged incrementally |
-| payload store bytes | the payload half | a disk that fills is a Phase 5 failure row ([FAILURE_MODEL.md](FAILURE_MODEL.md) §3) |
+| payload store bytes | the payload half | a disk that fills is a failure row of [FAILURE_MODEL.md](FAILURE_MODEL.md) §3 |
 
 ## 5. The one ordering rule across the two halves
 
@@ -157,7 +157,8 @@ Not prescribed by the consensus engine, and therefore decided here:
 
 Everything else about the two halves is independent. This rule is what makes
 `Replicated(n, flushed)` ([0004](decisions/0004-durability-levels.md) §4.2) true rather than
-optimistic, and it is the property B-221's test exists to break on purpose.
+optimistic, and it is the property a conformance test must break on purpose: drop a follower's
+payload stream mid-write and assert that no commit record naming it is ever committed.
 
 ## 6. What recovery must establish, in order
 

@@ -6,7 +6,7 @@ nowhere to send, followed by what happens at every failure. Where ZeroMQ's table
 what its threads and queues do, these describe what the **transport** does, because a weida
 pattern is a thin wrapper over transport streams and inherits its behaviour from them.
 
-Four transports carry those streams today ([decisions/0010](decisions/0010-local-transport.md),
+Four transports carry those streams ([decisions/0010](decisions/0010-local-transport.md),
 [0012](decisions/0012-local-connection-grouping.md)): QUIC, an in-process channel pair,
 `AF_UNIX` and, on Windows, a named pipe, where the OS connection **is** the stream. Every statement below is written for
 QUIC unless it says otherwise, because QUIC is the transport whose flow control the patterns
@@ -85,10 +85,10 @@ Flow control is per stream and per connection, and the two behave differently:
 
 - **Per stream, transfers are isolated.** A stream nobody reads does not delay its siblings.
 - **Per connection, one slow reader stalls every other writer on that connection** — and
-  "that connection" is now one **endpoint path**. The connection window is shared by every
+  "that connection" is one **endpoint path**. The connection window is shared by every
   stream on the connection. Unread streams consume it; when it is spent, every writer on the
-  connection blocks until the slow reader consumes at least an eighth of the window. Since
-  one connection per dialled path
+  connection blocks until the slow reader consumes at least an eighth of the window. Because
+  there is one connection per dialled path
   ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2), "everyone" means
   the writers on that path and nothing else: another path is another connection and another
   window. What is *not* isolated is a path's own control traffic: a SUBSCRIBE rides the
@@ -128,8 +128,9 @@ the message credit, both receiver-granted through transport parameters and both 
 idempotent ([decisions/0003](decisions/0003-credit-unit.md) §4.1). A consumer that wants a
 prefetch of *n* messages grants `max_concurrent_uni_streams = n` on the connection it reads
 from — one per dialled path, per §1.3 — and that is the whole mechanism
-[0003 §5]. A per-subscription message credit arrives with the L2 broker and travels on the
-connection of the path its subscription names, never at L0 [0003 §4.2, as amended by
+[0003 §5]. A per-subscription message credit is the L2 broker's credit frame
+([PROTOCOL.md](PROTOCOL.md) §6.6): it travels on the connection of the path its subscription
+names, never at L0 [0003 §4.2, as amended by
 [0011](decisions/0011-answered-where-it-arrived.md) §4.3].
 
 ### 1.5 Cancel: not a retraction, and never EOF
@@ -141,17 +142,16 @@ connection of the path its subscription names, never at L0 [0003 §4.2, as amend
 may still be read before the reset is processed: cancellation guarantees the peer cannot
 mistake the transfer for a whole one, not that the peer saw fewer bytes.
 
-**Every transport, and one of them had to be given the ability.** QUIC has `RESET_STREAM`; the
-in-process transport checks the writer's reset flag before reporting EOF; a named pipe frames
-every write and carries a `CHUNK_RESET` with its code. An `AF_UNIX` socket had none of the
-three: a stream socket has no abort — `SO_LINGER` with a zero timeout followed by `close` is
-byte-for-byte indistinguishable from a plain close at the reader, which was measured rather
-than assumed — so `finish` and `reset` were the same call, and a cancelled transfer, a transfer
-dropped without `finish()` and a producer that died mid-payload all read as a **complete**
-transfer. The distinction now lives in the payload, in the framing the named-pipe transport
-already had and both socket transports now share: five bytes per write, a FIN chunk, and a
-RESET chunk carrying the code
-([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e), B-245).
+**Every transport carries the distinction, and the socket transports carry it in the payload.**
+QUIC has `RESET_STREAM`; the in-process transport checks the writer's reset flag before
+reporting EOF; both socket transports frame every write and carry a `CHUNK_RESET` with its
+code. A stream socket has no abort — `SO_LINGER` with a zero timeout followed by `close` is
+byte-for-byte indistinguishable from a plain close at the reader — so without the framing
+`finish` and `reset` would be the same call, and a cancelled transfer, a transfer dropped
+without `finish()` and a producer that died mid-payload would all read as a **complete**
+transfer. The framing costs five bytes per write, plus a FIN chunk and a RESET chunk
+carrying the code
+([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e)).
 
 *`cancel_discards_unread_bytes_and_keeps_read_ones`, `push_cancel_mid_transfer`,
 `cancel_mid_transfer`, `an_abandoned_transfer_over_a_socket_is_a_named_cancellation`,
@@ -167,7 +167,7 @@ before its application refuses it, and `delivered()` then resolves `Ok` — trut
 receipt says nothing about the application, including that it said no. **This is a decided
 position, not an open question** ([decisions/0005](decisions/0005-refusal-race.md)): no
 application-level signal is added to the L0 wire to order a refusal ahead of the receipt, and
-the deterministic counterpart is the reserved `Accepted` of an L2 broker hop. A refusal is
+the deterministic counterpart is the `Accepted` of an L2 broker hop. A refusal is
 guaranteed to be observed in exactly two constructions [0005 §4.3]: a payload beyond the peer's
 stream receive window, where flow control forces the application to act before the write can
 finish, and an exchange, whose ERROR frame is written by the application on the reply half and
@@ -186,10 +186,10 @@ other: a peer that opens A then B may see B dispatched first. Every pattern's or
 therefore `None` across messages ([GUARANTEES.md](GUARANTEES.md) §6), and the within-stream
 order is the only order there is. An application that needs message order must carry it in
 the payload or keep one long-lived stream (§5). The sequence key of
-[PROTOCOL.md](PROTOCOL.md) §6.2 will let a receiver *detect* a gap or reassemble in order, and
+[PROTOCOL.md](PROTOCOL.md) §6.2 lets a receiver *detect* a gap or reassemble in order, and
 the cost of reassembling is measured: reverse-order completion forces a reorder buffer of
 N − 1 of the transfers in flight, and 84 of 256 were held with no adversarial pattern at all
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-010). Ordering is not free at the receiver, which
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.7). Ordering is not free at the receiver, which
 is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3).
 
 ### 1.8 Liveness: idle timeout, keep-alive, redial
@@ -210,7 +210,7 @@ is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3)
   peer.
 - **The address reconnects; the connection does not.** `connect` records a slot the runtime
   redials under `ReconnectPolicy` (100 ms doubling to 30 s with jitter by default;
-  `ReconnectPolicy::never()` for the old behaviour) until the endpoint is dropped or the address
+  `ReconnectPolicy::never()` for none) until the endpoint is dropped or the address
   is disconnected. A redial that reaches a peer with a different key does not go live. A
   `Subscriber` re-registers its route and re-sends its filters on the new connection; nothing
   else is restored — the peer kept nothing ([decisions/0008](decisions/0008-session-identity.md)
@@ -267,7 +267,7 @@ companion Req/Rep path the client posts the token to, and `ServerTls::require_cl
 fingerprint. Without client identity a verdict lives no longer than the connection it was
 given on, and a *subscription* cannot present a token at all, because SUBSCRIBE has no reply
 half ([PROTOCOL.md](PROTOCOL.md) §6.4) — the one cost that answer has, named here rather than
-discovered. A verdict that changes is enforced with the two runtime operations 0035 added:
+discovered. A verdict that changes is enforced with the two runtime operations of 0035:
 `Radio::evict(peer, filter)` withdraws a join (§6.4), and `Binding::disconnect(fingerprint)`
 closes every connection of a key with `REJECTED`. The dialler redials under its
 `ReconnectPolicy`, so a disconnect is not a ban; a ban is refusing that peer's arrivals and
@@ -319,7 +319,7 @@ one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
 - **§1.4's stream budget becomes that descriptor count.** `open` waits for a descriptor at
   the local ceiling exactly as it waits for a QUIC stream at the peer's budget: the
   backpressure is a wait on every transport, bounded by the caller's own deadline and
-  cancelled by dropping the future (B-059). A descriptor comes free when a transfer ends,
+  cancelled by dropping the future ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.13). A descriptor comes free when a transfer ends,
   which locally means when both ends are done with it — so a consumer that stops reading
   slows its producer down instead of failing it. What `LimitExceeded` still means locally is
   a refusal somebody decided on, the reverse pool of §4 below, and never a busy transport.
@@ -349,10 +349,8 @@ one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
   payload the same way (`crates/weida/src/chunked.rs`): five bytes per write, a FIN chunk, and
   a RESET chunk carrying the code, which is what makes a cancelled transfer `Canceled` at the
   reader instead of a short payload that looks whole. In process the reader checks the writer's
-  reset flag instead, which needs no framing at all. The cost is stated where it was chosen
-  (0012 §4.7(e)): five bytes per write and the zero-copy read. **Until B-245 `AF_UNIX` was the
-  exception**, and every statement of the form "a reset is never mistaken for a FIN" carried an
-  `AF_UNIX` caveat; none does now.
+  reset flag instead, which needs no framing at all. The cost is priced in 0012 §4.7(e): five
+  bytes per write and the zero-copy read.
 
 *`crates/weida/tests/transports.rs`: the three pattern bodies over all three transports,
 `a_unix_peer_presents_the_principal_the_kernel_proved`,
@@ -372,12 +370,12 @@ decision over:
 > **Within a connection, QUIC retransmits; when the connection ends, an unfinished stream is
 > gone, and weida does not resend it.**
 
-What the two sides observe is already exact, on every transport. The sender gets
+What the two sides observe is exact, on every transport. The sender gets
 `ConnectionLost` before FIN and `Ok` after it (§1.1, the pattern tables below); the receiver
 never sees an unfinished stream as complete — `AsyncRead` fails with `ConnectionReset`,
 `collect` with `Error::Canceled`, **never** `Ok(0)` (§1.5). "Half a frame is not a frame"
-(§4.1) is the rule and not a special case, and since B-245 it is a rule every transport can
-enforce: the one that could not was given the framing to do it.
+(§4.1) is the rule and not a special case, and every transport enforces it: the socket
+transports with the framing of §1.5.
 
 What happens next is the **application's** choice, and there are exactly three, one of which is
 usually wrong:
@@ -392,7 +390,7 @@ The third is the one that needs the cursors of
 [decisions/0023](decisions/0023-completion-is-a-cursor.md): a receiver that reports "durable up to
 *N*" is telling the sender what it may skip, and the sender decides. weida does **not** decide
 and does not re-open a stream on anyone's behalf — a library that did would be rebuilding
-retries, which are Phase 4 and, in every system this repository surveyed, application-level
+retries, which in every system this repository surveyed are application-level
 (ZeroMQ's Lazy Pirate and Titanic are recipes, not features). The one payload it does remember
 is not a stream: a body handed to `send` is a **message**, owned by the runtime from the call,
 held in a bounded outbox until it is written to a live connection and never resent after that
@@ -419,15 +417,14 @@ than a layer ([decisions/0024](decisions/0024-three-families-one-back-channel.md
 admission needs no vocabulary of its own — there is nothing to talk about yet — and why a
 redelivery is an ordinary new stream rather than a continuation.
 
-**Every row of both tables above is a test** (B-242,
-`crates/weida/tests/interrupted.rs`), and so is the rule they follow from: a transfer
+**Every row of both tables above is a test**
+(`crates/weida/tests/interrupted.rs`), and so is the rule they follow from: a transfer
 interrupted before FIN is a definite `ConnectionLost` for the sender
 (*`a_transfer_interrupted_before_fin_is_connection_lost_for_the_sender`*); a reader never sees
 an interrupted stream as complete, with `collect` failing `Canceled`, `AsyncRead` failing
 `ConnectionReset` and **never** `Ok(0)`
-(*`a_reader_never_sees_an_interrupted_stream_as_complete`*, which is a statement about QUIC,
-inproc and named pipes — over `AF_UNIX` the same interruption is read as a complete transfer,
-§1.10); a requester learns
+(*`a_reader_never_sees_an_interrupted_stream_as_complete`* over QUIC, and over a socket
+transport *`a_dropped_transfer_over_a_socket_is_a_cancellation_and_not_a_short_payload`*, §1.5); a requester learns
 `Indeterminate` and can re-issue (*`a_reqrep_requester_can_reissue_after_an_indeterminate_outcome`*);
 a Push producer is the only side that can (*`a_push_producer_is_the_only_side_that_can_reschedule`*);
 a lost fan-out copy is counted and never re-sent
@@ -491,7 +488,7 @@ Failure modes, from the requester's side:
 | Path unknown at the peer | `Error::UnknownEndpoint` (ERROR frame) |
 | Path serves another pattern | `Error::Unsupported` (ERROR frame) |
 | Replier dropped the request | `Error::NoReply`; the request may have had an effect |
-| Replier refused on purpose | the code it chose: `Error::Rejected`, or `Error::NoReply` where the request was taken and nobody will answer it — an adapter whose far side dropped it silently |
+| Replier refused on purpose | the code it chose: `Error::Rejected`, or `Error::NoReply` where the request was taken and nobody will answer it — a handler whose far side dropped it silently |
 | Connection lost before the request FIN | `Error::ConnectionLost` from the write: definitely not delivered |
 | Connection lost after the FIN, no reply seen | `Error::Indeterminate`: the replier may have acted |
 | Replier reset the reply mid-stream | `Error::Canceled` from the read |
@@ -521,7 +518,7 @@ One unidirectional stream per message. Fire-and-forget with an optional transpor
 | Ordering | `None` | |
 | Delivery signal | none (`send`) or the transport receipt (§1.2) | none; EOF is EOF |
 | Backpressure | `max_concurrent_uni_streams` on `open` (§1.4), then the windows (§1.3) | a puller that stops reading stalls its pushers after the budget; nothing is dropped |
-| Cancellation | `cancel` or drop: the puller's read fails, never EOF (§1.5) — over `AF_UNIX` it *is* EOF, and the puller takes the truncated payload for a whole one (§1.10) | drop an unread transfer: `STOP_SENDING(REJECTED)` |
+| Cancellation | `cancel` or drop: the puller's read fails, never EOF (§1.5), on every transport | drop an unread transfer: `STOP_SENDING(REJECTED)` |
 
 Failure modes, from the pusher's side:
 
@@ -574,17 +571,17 @@ Failure modes:
 | Publisher's connection lost | — | `recv` keeps waiting; filters are remembered and re-sent on the next `connect` |
 | Too many filters on one connection | closes it with `LIMIT_EXCEEDED` | `connect`/`subscribe` fails |
 | Message beyond the budget | `LimitExceeded`, nothing sent | — |
-| Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one, on every transport (§1.5, B-245) |
+| Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one, on every transport (§1.5) |
 
 This is the one place weida answers overload by discarding, and it is confined to fan-out
-([GUARANTEES.md](GUARANTEES.md) §6). Today a subscriber cannot detect a drop; **subscriber-side
+([GUARANTEES.md](GUARANTEES.md) §6). Under `core` a subscriber cannot detect a drop; **subscriber-side
 drop detection is what the sequence key of [PROTOCOL.md](PROTOCOL.md) §6.2 exists for**
 ([decisions/0001](decisions/0001-sequence-field.md) §7.2). A subscriber that has negotiated
 the detect level of `PerProducer` sees the gap — how many messages were missed, expected
 against seen — without anything being held back, which is the honest answer to a policy that
 drops on purpose. The reassemble level holds messages instead, bounded by
 `Limits::max_reorder_hold` and releasing the oldest held transfer with its gap reported at
-the cap, at the buffer cost measured in [IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-010).
+the cap, at the buffer cost measured in [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.7.
 Both are **on the wire and implemented**: DATA keys 6 and 7 carry the sequence and the
 producer ([PROTOCOL.md](PROTOCOL.md) §6.2), and a fan-out drop reaches a detecting
 subscriber as a `Gap`.
@@ -592,9 +589,9 @@ subscriber as a `Gap`.
 `a_dropped_fan_out_copy_shows_up_as_a_gap`,
 `a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for`.*
 
-**What the width costs, measured** (B-247, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4). The
-per-subscriber stream above is what buys the isolation one shared queue per socket cannot, and
-until B-247 nothing here priced it beyond eight subscribers. At 1 KiB on loopback with both
+**What the width costs, measured** ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11). The
+per-subscriber stream above is what buys the isolation one shared queue per socket cannot.
+At 1 KiB on loopback with both
 ends in one process: **396-436 KiB** of transport state per subscriber, **88.8 ns** of
 publisher CPU per subscriber per message (22.94 µs for a publish at width 256, against 287 ns
 at width 1), **276-279 Kcopies/s** delivered, and a median idle latency of **507-539 µs** at
@@ -617,10 +614,10 @@ accounting bound and the resident cost is one payload per distinct message.
 
 `Publisher::open(topic)` returns a `FanOut`: one stream per matched subscriber, written
 chunk by chunk. It exists because `publish` takes a whole `Bytes` and refuses anything above
-`subscriber_buffer_bytes` — so a 33 MB video frame could not be published at all, and
-raising the limit would have bought a per-subscriber copy of it inside the publisher, which
-is exactly the materialization [INVARIANTS.md](INVARIANTS.md) forbids (B-064,
-[requirements/zeughaus-video.md](requirements/zeughaus-video.md) request 1). With `open` the
+`subscriber_buffer_bytes` — so a 33 MB video frame could not be published through it at all,
+and raising the limit would buy a per-subscriber copy of it inside the publisher, which
+is exactly the materialization [INVARIANTS.md](INVARIANTS.md) forbids
+([requirements/zeughaus-video.md](requirements/zeughaus-video.md) request 1). With `open` the
 budget bounds a **chunk**, one `Bytes` allocation is shared by every copy, and the payload
 has no ceiling.
 
@@ -629,7 +626,7 @@ has no ceiling.
 | `write_within(chunk, limit)` | waits up to `limit` for a subscriber with no room, then drops **that** subscriber's copy. The bound is mandatory and finite for the reason `drain(Duration)`'s is ([decisions/0009](decisions/0009-drain.md) §4.4): an unbounded wait is how a publisher hangs on a peer, and never waiting would make a payload larger than the budget undeliverable to anybody — the publisher would outrun its own budget and abort every copy |
 | `write_now(chunk)` | never waits: a subscriber without room right now loses the transfer. Fan-out's `Drop` in its purest form, and the right call where a later chunk supersedes an earlier one |
 | `finish()` | FIN on every remaining copy; returns how many subscribers got all of it as far as this side can tell. A fan-out copy carries no receipt, so the acknowledgement is the drain's business and nobody else's |
-| dropping the handle | resets every copy, so no subscriber mistakes a partial payload for a whole one — over `AF_UNIX` every subscriber does (§1.10) |
+| dropping the handle | resets every copy, so no subscriber mistakes a partial payload for a whole one, on every transport (§1.5) |
 
 **This is also v0's conflation**, and that is decided rather than a workaround
 ([decisions/0016](decisions/0016-conflation.md) §4.3): a producer that wants "keep the newest,
@@ -718,12 +715,12 @@ the datagrams itself, at most 1200 bytes each.
 
 ## 6. PAIR, SURVEY, BUS and RADIO/DISH
 
-The three patterns [ARCHITECTURE.md](ARCHITECTURE.md) §6b mapped and nobody had built, and the
-one ZeroMQ named for lossy fan-out. The first three are built and added **no wire
-vocabulary**: a `Paired` talks to a bare `Peer` and `Acceptor` on the same path, a
+PAIR, SURVEY and BUS complete the nanomsg set ([ARCHITECTURE.md](ARCHITECTURE.md) §6b maps
+them), and RADIO/DISH is the pattern ZeroMQ names for lossy fan-out. The first three add **no
+wire vocabulary**: a `Paired` talks to a bare `Peer` and `Acceptor` on the same path, a
 `Respondent`'s route is byte-for-byte a replier's, a `BusMember`'s is a puller's. RADIO/DISH
-adds two keys, DATA `13` and SUBSCRIBE `2` (§6.4). Router/Dealer stay emergent (§2); connecting
-publishers and binding pushers stay recorded deferrals.
+adds two keys, DATA `13` and SUBSCRIBE `2` (§6.4). Router/Dealer are emergent (§2); connecting
+publishers and binding pushers are deferred.
 
 ### 6.1 PAIR
 
@@ -930,7 +927,7 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 | work distributed over workers, nothing lost under load | Push/Pull | backpressure is `Block`; the only losses are explicit refusals and `Indeterminate` after a loss (§3) |
 | the newest of a feed, many readers, laggards may lose | Pub/Sub | drops are per subscriber and counted (§4) |
 | ordered messages to one peer | a raw stream | QUIC orders bytes within a stream and nowhere else (§1.7, §5) |
-| a signal larger than `subscriber_buffer_bytes` to many readers | `Publisher::open`, which streams one per subscriber (§4.1) | `publish` takes a whole `Bytes` and refuses it; `open` bounds a chunk instead (B-064) |
+| a signal larger than `subscriber_buffer_bytes` to many readers | `Publisher::open`, which streams one per subscriber (§4.1) | `publish` takes a whole `Bytes` and refuses it; `open` bounds a chunk instead |
 | proof the peer's application acted | Req/Rep, or an L2 broker (`weida-broker`) | a transport receipt never says that (§1.2); `Accepted`/`Stored`/`Processed` belong to a hop that owns the message, and a broker reports `Accepted` as a cursor (§1.11) |
 | to know whether the receiver accepted it | Req/Rep | a one-way refusal can lose the race with the receipt and then reaches no observer (§1.6, [decisions/0005](decisions/0005-refusal-race.md) §4.3) |
 | exactly one peer, both directions, no selection policy | PAIR | a second peer is refused rather than silently preferred (§6.1) |

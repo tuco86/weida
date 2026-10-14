@@ -32,9 +32,9 @@ Three verdicts and no fourth:
 missing (0013 §4.7 clause 6).
 
 **Versions every measured claim was measured against.** `fe2o3-amqp` **0.17.0**, the pure-Rust
-peer, through its `acceptor` module over loopback TCP, run on 2026-09-12 by
+peer, through its `acceptor` module over loopback TCP, by
 `crates/amqp/weida-amqp/tests/interop_fe2o3.rs` — eight tests, nothing `#[ignore]`d. **RabbitMQ
-4.x was not run**: `which rabbitmq-server` is empty on this machine and so are `docker` and
+4.x is not run**: no `rabbitmq-server` is available to the tests, and neither is `docker` or
 `podman`, so `tests/interop_rabbitmq.rs` is four `#[ignore]`d tests carrying the install
 command, and every RabbitMQ column below says *not run* rather than a verdict. Claims about
 what the specification *says* cite [`../research/amqp10.md`](../research/amqp10.md), which
@@ -229,34 +229,33 @@ at the peer. Four probes rather than assumptions, each recorded above: `rcv-sett
 stolen — §7.2), and transactions (§7.1). `cargo tree -p weida-amqp --no-dev-dependencies`
 reaches neither `weida` nor `weida-protocol`, and the peer brings no second TLS stack.
 
-`crates/amqp/weida-amqp/tests/interop_rabbitmq.rs` — **4 tests, all `#[ignore]`d**, because
-`which rabbitmq-server` is empty. The harness starts and stops the broker on a port of its own
+`crates/amqp/weida-amqp/tests/interop_rabbitmq.rs` — **4 tests, all `#[ignore]`d**, because no
+`rabbitmq-server` is available. The harness starts and stops the broker on a port of its own
 and waits for the socket rather than assuming readiness; every test says what it *would*
-establish. **Nothing in it has been observed**, and the sheet's RabbitMQ claims stay
+establish. **Nothing in it is observed**, and the sheet's RabbitMQ claims stay
 documentation until it runs.
 
-## 10. Three bugs interop found, and what they were
+## 10. Three rules a reader is likely to misread
 
-Recorded because each was a rule misread, and the misreadings are the kind a reader of this
-library would repeat.
+Each is a rule of the specification that a reader of this library would be likely to misread.
 
-1. **`close` was overtaking a completed transfer.** "`close` MUST be the last frame ever
+1. **`close` does not overtake a completed transfer.** "`close` MUST be the last frame ever
    written" (Part 2 §2.4.3) makes it *last*; it is not a licence to drop what was already
-   queued. The driver's biased `select` preferred the command channel over the outbound queue,
-   so a frame a sender had already handed over was dropped as "raced the close". Fixed by
-   flushing the queue before writing `close`.
-2. **A `flow` for a just-detached handle ended the session.** That frame is a race with the
-   `detach`, not a fault, and `fe2o3-amqp` really sends one. Frames for the peer's handles of
-   **cleanly** detached links are now discarded; a handle detached **with an error** now gets
-   `amqp:session:errant-link`, which Part 2 §2.6.5 names and which was not being distinguished
-   from `amqp:session:unattached-handle` at all.
-3. **A client that re-attached a name stole its own just-detached link**, sending
-   `amqp:link:stolen` for a link the application had closed itself and poisoning the handle for
-   the rest of the session. Links already detaching are no longer candidates for the steal.
+   queued. The driver flushes the queue before writing `close`: preferring the command channel
+   over the outbound queue would drop a frame a sender had already handed over as "raced the
+   close".
+2. **A `flow` for a just-detached handle does not end the session.** That frame is a race with
+   the `detach`, not a fault, and `fe2o3-amqp` really sends one. Frames for the peer's handles
+   of **cleanly** detached links are discarded; a handle detached **with an error** gets
+   `amqp:session:errant-link`, which Part 2 §2.6.5 names and which is distinct from
+   `amqp:session:unattached-handle`.
+3. **A client that re-attaches a name does not steal its own just-detached link.** Sending
+   `amqp:link:stolen` for a link the application had closed itself would poison the handle for
+   the rest of the session, so links already detaching are not candidates for the steal.
 
-A fourth, found by the same run: the peer's `detach` was **not being answered**. A link
-endpoint is destroyed only when both ends have detached, so a peer whose application held the
-link waited forever.
+A fourth rule completes them: the peer's `detach` is **answered**. A link endpoint is destroyed
+only when both ends have detached, so a peer whose application held the link would wait
+forever.
 
 ## 11. The definition of done
 

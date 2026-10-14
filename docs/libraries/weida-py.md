@@ -1,7 +1,7 @@
 # weida for Python (the Rust API of `crates/weida`) — API parity
 
 The parity document of `weida-py`, the Python binding of **weida itself**, built on
-`weida-py-core` (B-200, B-204, B-205). It answers one question per row: *what does a Python
+`weida-py-core`. It answers one question per row: *what does a Python
 caller get of the API this binding binds, and what does that caller not get.*
 
 ## 1. What a row means, and what the other column is
@@ -33,11 +33,11 @@ about (§2, last paragraph).
 `runtime.rs`, `endpoints.rs`, `pubsub.rs`, `patterns.rs`, `streams.rs`, `sync.rs`, `values.rs`,
 `errors.rs` —
 and the tests under `crates/py/weida-py/tests/`. The Rust column is `crates/weida/src/`:
-`lib.rs`'s re-exports (`lib.rs:67-99`), `config.rs`, `runtime.rs`, `listener.rs`,
+`lib.rs`'s re-exports, `config.rs`, `runtime.rs`, `listener.rs`,
 `endpoint.rs`, `transfer.rs`, `stream.rs` and `blocking.rs`. CPython 3.9 and up through PyO3
-0.29 with `abi3-py39` (`Cargo.toml:110-114` at the workspace root,
-`crates/py/weida-py/pyproject.toml:8`), the library entered with the `generate` and `blocking`
-features (`crates/py/weida-py/Cargo.toml:34`), Linux x86-64.
+0.29 with `abi3-py39` (the `pyo3` entry of the workspace `Cargo.toml` and `requires-python` in
+`crates/py/weida-py/pyproject.toml`), the library entered with the `generate` and `blocking`
+features (the `weida` dependency of `crates/py/weida-py/Cargo.toml`), Linux x86-64.
 
 **How the numbers were counted.** Every count in this document was counted out of the tree,
 not estimated:
@@ -55,14 +55,14 @@ not estimated:
 
 | Rust-side fact | This binding | Verdict |
 | --- | --- | --- |
-| the crate is `weida_py`, the module is `weida` | one `#[pymodule] fn weida` (`lib.rs:101-130`); the crate cannot share the name because rustdoc writes one directory per lib name | present, and the reason is in `Cargo.toml:9-15` |
-| `cargo test` links libpython, a wheel must not | `extension-module` is off by default in the crate and turned on by maturin (`Cargo.toml:41-46`, `pyproject.toml:27-32`) | present |
-| — | `develop.sh` | present: a `uv` virtualenv at the repository root, `maturin` and `pytest` into **that** virtualenv and nothing into a system interpreter, `maturin develop`, then pytest with the caller's arguments (`develop.sh:23-37`) |
-| — | `package.sh` | present: `maturin build --release`, a wheel whose name is **checked to contain `abi3`** or the script exits 1 (`package.sh:40-43`), a fresh temporary virtualenv holding only that wheel, and `smoke.py` run with `PATH=/usr/bin:/bin` (`package.sh:45-52`) — so "the wheel needs no Rust toolchain" is established rather than expected |
-| `abi3-py39`, one wheel for CPython 3.9 and up | `requires-python = ">=3.9"` (`pyproject.toml:8`), one `abi3` wheel | present, and the two agree — **for GIL-enabled CPython**, which is the exception this row used to omit. Read out of PyO3 0.29.2's own selector (`pyo3-build-config-0.29.2/src/impl_.rs:96-132`): a **free-threaded** interpreter below 3.15 gets `None` from `applicable_stable_abi` and therefore a version-specific build, because the free-threaded stable ABI (`abi3t`) starts at 3.15 — so `cp39-abi3` does not serve 3.13t or 3.14t and a second, version-specific wheel would be needed for them. PyPy and GraalPy take the same branch from the other side: a stable ABI is selected but pinned to the interpreter's own version, so their artifact is their own too (§10) |
-| — | what `smoke.py` claims | present, and it is four claims: the installed distribution's name and version (`smoke.py:20-25`), every name of `weida.__all__` resolving plus `RuntimeFailure` under `WeidaError` and `weida.Runtime` **not** a `BaseException` (`smoke.py:28-38`), a Req/Rep round trip, a Push/Pull transfer and a Pub/Sub message over real QUIC in one process (`smoke.py:43-81`), a **10 MiB streamed fan-out against an 8 MiB subscriber budget** (`smoke.py:83-92`), and a wrong fingerprint refused with the key that answered in the message (`smoke.py:94-103`) |
-| the whole thing under one wall-clock bound | `asyncio.run(asyncio.wait_for(round_trip(), 30.0))` (`smoke.py:109`), and each test file's `run()` helper wraps its coroutine in `asyncio.wait_for(..., 15.0)` (`test_asyncio.py:25-31`, `test_patterns.py:19-23`) | present: a binding that deadlocks fails the suite instead of hanging it |
-| a broker, a server or a C library to test against | none needed | present: both halves of every test are this library (`develop.sh:16-18`, `test_asyncio.py:3-5`) |
+| the crate is `weida_py`, the module is `weida` | one `#[pymodule] fn weida` in `lib.rs`; the crate cannot share the name because rustdoc writes one directory per lib name | present, and the reason is in the `[lib]` comment of `Cargo.toml` |
+| `cargo test` links libpython, a wheel must not | `extension-module` is off by default in the crate and turned on by maturin (the `extension-module` feature in `Cargo.toml`, `[tool.maturin] features` in `pyproject.toml`) | present |
+| — | `develop.sh` | present: a wrapper that calls `crates/py/develop.sh` with this directory, the one script every binding shares — a `uv` virtualenv at the repository root, `maturin` and `pytest` into **that** virtualenv and nothing into a system interpreter, `maturin develop`, then pytest with the caller's arguments |
+| — | `package.sh` | present: a wrapper that calls `crates/py/package.sh` with this directory and the wheel prefix `weida` — `maturin build --release`, a wheel whose name is **checked to contain `abi3`** or the script exits 1, a fresh temporary virtualenv holding only that wheel, and `smoke.py` run with `PATH=/usr/bin:/bin` — so "the wheel needs no Rust toolchain" is established rather than expected |
+| `abi3-py39`, one wheel for CPython 3.9 and up | `requires-python = ">=3.9"` (in `pyproject.toml`), one `abi3` wheel | present, and the two agree **for GIL-enabled CPython** only. Read out of PyO3 0.29.2's own selector (`pyo3-build-config-0.29.2/src/impl_.rs:96-132`): a **free-threaded** interpreter below 3.15 gets `None` from `applicable_stable_abi` and therefore a version-specific build, because the free-threaded stable ABI (`abi3t`) starts at 3.15 — so `cp39-abi3` does not serve 3.13t or 3.14t and a second, version-specific wheel would be needed for them. PyPy and GraalPy take the same branch from the other side: a stable ABI is selected but pinned to the interpreter's own version, so their artifact is their own too (§10) |
+| — | what `smoke.py` claims | present, and it is five claims: the installed distribution's name and version (the version is the workspace version that `crates/py/package.sh` passes in `WEIDA_WORKSPACE_VERSION`, in PEP 440 spelling), every name of `weida.__all__` resolving plus `RuntimeFailure` under `WeidaError` and `weida.Runtime` **not** a `BaseException`, a Req/Rep round trip, a Push/Pull transfer and a Pub/Sub message over real QUIC in one process, a **10 MiB streamed fan-out against an 8 MiB subscriber budget**, and a wrong fingerprint refused with the key that answered in the message |
+| the whole thing under one wall-clock bound | `asyncio.run(asyncio.wait_for(round_trip(), 30.0))` in `smoke.py`, and each test file's `run()` helper wraps its coroutine in `asyncio.wait_for(..., 15.0)` | present: a binding that deadlocks fails the suite instead of hanging it |
+| a broker, a server or a C library to test against | none needed | present: both halves of every test are this library (the module docstring of `test_asyncio.py` says so) |
 
 **There is no interop section in this document, and that is not an omission.** The other five
 Python parity documents have one because a foreign implementation of their protocol exists to
@@ -71,7 +71,7 @@ is a thin wrapper over it, so a "pairing" here would be this library against its
 what every test in `crates/py/weida-py/tests/` and `smoke.py` already is. The claim a real
 interop section would carry is therefore unavailable, and no number in this document is an
 interop number. The counts above were counted out of the tree with the sources named in §1
-**and re-measured by a run** when B-244 and B-243 completed the surface: 32 tests passed and
+**and re-measured by a run**: 32 tests passed and
 `smoke.py` resolved all 56 names through a freshly built wheel.
 
 ## 3. The runtime, the binding and the reactor
@@ -80,10 +80,10 @@ interop number. The counts above were counted out of the tree with the sources n
 | --- | --- | --- |
 | `Runtime::owned(config)` (`runtime.rs:220`) | `weida.Runtime(worker_threads=1)` | present — `runtime.rs:53-66`, used by every test |
 | `Runtime::new(config)` (needs an ambient Tokio reactor), `Runtime::with_handle(handle, config)` | — | absent, and the reason is that they mean nothing here: a plain Python process has no ambient Tokio runtime and no Python caller can hold a `tokio::runtime::Handle` (`runtime.rs:3-11`). `owned` is the only constructor that can serve this surface, so it is the only one offered |
-| `RuntimeConfig`'s thirteen fields (`config.rs`) | `worker_threads`, and nothing else | present for one field — absent for `limits`, `max_connections`, `max_connections_per_peer`, `endpoint_queue`, `max_resolved_addresses`, `shutdown_timeout`, `guarantees`, `connect_attempt_timeout` and, since [0031](../decisions/0031-transparent-redial-and-the-sender-outbox.md), `reconnect`, `send_timeout`, `outbox_messages`, `outbox_bytes` and `outbox_full`: a Python caller gets `RuntimeConfig::default()` for all of them (`runtime.rs:56-59`) and cannot change them. The redial therefore runs with its defaults from Python, and the `PeerEvent` stream of 0031 §4.8 has no Python surface yet. §10 |
+| `RuntimeConfig`'s thirteen fields (`config.rs`) | `worker_threads`, and nothing else | present for one field — absent for `limits`, `max_connections`, `max_connections_per_peer`, `endpoint_queue`, `max_resolved_addresses`, `shutdown_timeout`, `guarantees`, `connect_attempt_timeout` and the five of [0031](../decisions/0031-transparent-redial-and-the-sender-outbox.md), `reconnect`, `send_timeout`, `outbox_messages`, `outbox_bytes` and `outbox_full`: a Python caller gets `RuntimeConfig::default()` for all of them (`runtime.rs:56-59`) and cannot change them. The redial therefore runs with its defaults from Python, and the `PeerEvent` stream of 0031 §4.8 has no Python surface. §10 |
 | `Runtime::exec()` (`runtime.rs:431`) | not a method; the bridge is built on it | present as the *reason that accessor exists*: `Bridge::new(runtime.exec().clone(), ...)` at `runtime.rs:61` puts this crate's futures on the runtime's own executor, so one process holds **one** Tokio runtime rather than two (`runtime.rs:13-18`) |
 | `Runtime::listener()` then `Listener::bind_quic(addr, identity)` | `await runtime.bind("host:port", identity)` → `Binding` | present as one call — `runtime.rs:78-109`. `bind` is a coroutine because it creates a socket and a QUIC endpoint, and a `__new__` that did that would block the event loop (`runtime.rs:20-25`) |
-| `Listener::bind_inproc(bus)` | `runtime.bind_inproc(bus)` → `Binding`, on both surfaces | present since **B-303**, synchronous because nothing is created that could block; the binding's `url(path)` is `weida+inproc://<bus><path>`, `fingerprint()` is `None` and `local_addr()` the bus name. A client in the same process dials it |
+| `Listener::bind_inproc(bus)` | `runtime.bind_inproc(bus)` → `Binding`, on both surfaces | present, synchronous because nothing is created that could block; the binding's `url(path)` is `weida+inproc://<bus><path>`, `fingerprint()` is `None` and `local_addr()` the bus name. A client in the same process dials it |
 | `Listener::bind_unix`, `bind_pipe` | — | absent: a Python **server** on a socket transport is what is missing; the dialling side's address grammar accepts `weida+unix://` and `weida+pipe://` (`endpoints.rs:59-62`). §10 |
 | `Listener::replier/puller/publisher(path)` | `binding.replier(path)`, `.puller(path)`, `.publisher(path)` | present, synchronous, raising `weida.AlreadyRegistered` or `weida.InvalidEndpointPath` — `runtime.rs:225-261`. `pair`, `respondent` and `bus` join them at `runtime.rs:263-311` (§4.4) |
 | `Listener::acceptor(path)` (`listener.rs:350`) | — | absent: the raw L0 surface. §9.2 |
@@ -112,7 +112,7 @@ the call, so a coroutine that is never awaited does nothing at all
 | `Requester::request(body)` / `request_with(meta, body)` | `await requester.request(payload, max_reply_bytes)` → `bytes` | present — `endpoints.rs:101-119`. Two differences: the ceiling is mandatory (§8) and the binding sets `content_len` for the caller (`endpoints.rs:112`, asserted as `meta.content_len == 4` at `test_asyncio.py:48`). Proved end to end by `test_asyncio.py::test_a_request_is_answered_over_quic` |
 | `Requester::open(meta)` → `(OutgoingTransfer, ReplyStream)` | `await requester.open()` → `(OutgoingStream, Reply)` | present — `endpoints.rs:127-141`, `test_patterns.py::test_a_streamed_exchange_reads_the_reply_while_writing`, which reads the reply's `meta.endpoint is None` and collects `b"streamed request"` |
 | `Requester::peer_count()` | — | absent on `Requester` and `Pusher`; `Subscriber.peer_count()` has it (`pubsub.rs:336-338`). The Rust method exists on all three (`endpoint.rs:131`, `225`, `490`) |
-| `Requester::connection_stats()` and the same method on every dialling endpoint, `ConnectionStats`, `TransportStats`, `PathStats`, `UdpCounts`, `RemoteStats` ([0036](../decisions/0036-connection-statistics.md)) | `connection_stats()` → list of `weida.ConnectionStats` on `Requester`, `Pusher`, `Subscriber`, `Paired`, `Surveyor`, `BusMember` and `Dish` of both surfaces; `url`, `age` (seconds), `redials`, `transport` (`path`, `tx`, `rx`) or `None`, `remote` or `None` | present since **B-303**, synchronous on both surfaces; times are `float` seconds. `Runtime(path_report=True)` turns the peer's view on; both ends must set it. Asserted by `test_asyncio.py::test_connection_stats_over_quic_and_in_process` and its `test_sync.py` twin: an RTT over QUIC, the remote view when both report, `transport is None` over `weida+inproc` |
+| `Requester::connection_stats()` and the same method on every dialling endpoint, `ConnectionStats`, `TransportStats`, `PathStats`, `UdpCounts`, `RemoteStats` ([0036](../decisions/0036-connection-statistics.md)) | `connection_stats()` → list of `weida.ConnectionStats` on `Requester`, `Pusher`, `Subscriber`, `Paired`, `Surveyor`, `BusMember` and `Dish` of both surfaces; `url`, `age` (seconds), `redials`, `transport` (`path`, `tx`, `rx`) or `None`, `remote` or `None` | present, synchronous on both surfaces; times are `float` seconds. `Runtime(path_report=True)` turns the peer's view on; both ends must set it. Asserted by `test_asyncio.py::test_connection_stats_over_quic_and_in_process` and its `test_sync.py` twin: an RTT over QUIC, the remote view when both report, `transport is None` over `weida+inproc` |
 | `Listener::replier(path)`, `Replier::path()` | `Replier.path()` | present — `endpoints.rs:232-235` |
 | `Replier::accept()` → `IncomingRequest` (payload still a stream) | `await replier.accept(max_bytes)` → `Request` (payload already `bytes`) | present, and the shape differs on purpose: the accept and the `take_body().collect(max_bytes)` are one call (`endpoints.rs:247-267`), because a Python object is materialized anyway |
 | `IncomingRequest::meta()`, its body | `Request.payload` → `bytes`, `Request.meta` → `IncomingMeta` | present as getters — `endpoints.rs:295-304` |
@@ -153,8 +153,7 @@ the call, so a coroutine that is never awaited does nothing at all
 
 ### 4.4 PAIR, SURVEY and BUS
 
-The three patterns the library gained after this binding was written, added on both surfaces
-by **B-244**. `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `values.rs`.
+Present on both surfaces: `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `values.rs`.
 
 | `crates/weida` | This binding | Verdict |
 | --- | --- | --- |
@@ -175,7 +174,7 @@ by **B-244**. `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `val
 
 ### 4.4a RADIO/DISH
 
-Added on both surfaces by **B-292** ([0034](../decisions/0034-late-is-lost.md) §4.6):
+Present on both surfaces ([0034](../decisions/0034-late-is-lost.md) §4.6):
 `crates/py/weida-py/src/patterns.rs` for asyncio, `sync.rs` for `weida.sync`. A runtime that
 carries datagram segments is built with `weida.Runtime(datagrams=True)`, which sets
 `Limits::datagram_receive_bytes` to its documented 64 KiB; both ends need it.
@@ -183,7 +182,7 @@ carries datagram segments is built with `weida.Runtime(datagrams=True)`, which s
 | `crates/weida` | This binding | Verdict |
 | --- | --- | --- |
 | `Listener::radio(path)` | `binding.radio(path)` → `Radio` | present |
-| `Radio::segment(topic, SegmentTerms)` → `Segment`, `write`, `write_layer`, `finish_layer`, `finish` | `radio.segment(topic, max_age=None, priority=0, follows_upstream=False)` → `Segment`; `segment.write(chunk)` and `segment.write_layer(layer, chunk)` → `int`; `segment.finish_layer(layer)`; `segment.finish()` → `int` | present since **B-311**, and **none of them is a coroutine**: a radio never waits for a dish, so the calls are plain on both surfaces. `SegmentTerms` is keywords, not a class |
+| `Radio::segment(topic, SegmentTerms)` → `Segment`, `write`, `write_layer`, `finish_layer`, `finish` | `radio.segment(topic, max_age=None, priority=0, follows_upstream=False)` → `Segment`; `segment.write(chunk)` and `segment.write_layer(layer, chunk)` → `int`; `segment.finish_layer(layer)`; `segment.finish()` → `int` | present, and **none of them is a coroutine**: a radio never waits for a dish, so the calls are plain on both surfaces. `SegmentTerms` is keywords, not a class |
 | `Radio::datagram(topic, bytes)` | `radio.datagram(topic, payload)` → `int` | present, plain |
 | `Radio::dish_count()`, `dropped()`, `dish_drops()` | all three; `dish_drops()` → list of `weida.DishDrops` (`peer` as `IncomingMeta.peer` formats it, and the seven counters) | present; `dropped_on` and `drops` stay Rust-only, as `publisher.dropped_on` does in `sync` |
 | `Radio::with_admission`, `Radio::evict`, `Join` | — | absent: admission and eviction decide on the dish's proved key ([0035](../decisions/0035-keys-proved-not-judged.md) §4.3), and a Python binding accepts anonymous clients only (`bind_quic(addr, identity)`, `runtime.rs:98`, `sync.rs:133`), so every dish it serves has `peer: None` and cannot be evicted by name ([0035](../decisions/0035-keys-proved-not-judged.md) §4.7) |
@@ -210,7 +209,7 @@ carries datagram segments is built with `weida.Runtime(datagrams=True)`, which s
 
 How a **one-way** transfer gets a verdict: a Push has no reply to carry one, so `Accepted`,
 `Stored` and `Processed` arrive on a stream of their own, after the payload's FIN
-([0023](../decisions/0023-completion-is-a-cursor.md)). Added on both surfaces by **B-243**;
+([0023](../decisions/0023-completion-is-a-cursor.md)). Present on both surfaces;
 `crates/py/weida-py/src/cursors.rs` is the asyncio half.
 
 | `crates/weida` | This binding | Verdict |
@@ -240,7 +239,7 @@ How a **one-way** transfer gets a verdict: a Push has no reply to carry one, so 
 | `IncomingMeta`'s 16 fields | 13 attributes: `endpoint`, `content_len`, `content_type`, `topic`, `peer`, `sequence`, `missed`, `report`, `report_mode`, `report_id`, `traceparent`, `segment`, `layer` | present — `values.rs:147-216`, and the shape is flattened: `gap` becomes `missed` as a number, `trace` becomes the W3C `traceparent` string, and `report` becomes a list of wire values (§4.6). `tracestate`, `achieved` and `peer_chain` are absent |
 | `IncomingMeta::tracestate` | — | absent: forwarded unmodified by the library and not surfaced here. A caller that propagates a full trace context gets the `traceparent` and loses the vendor state |
 | `IncomingMeta::peer_chain`, `FlowInfo::peer_chain`, `PeerChain` | — | absent: the chain's use is admitting and deriving rights from a client's key ([0035](../decisions/0035-keys-proved-not-judged.md) §4.2), and a Python binding accepts anonymous clients only, so it never receives one; on the dialling side the server's key is already named by the address ([0035](../decisions/0035-keys-proved-not-judged.md) §4.7) |
-| `IncomingMeta::{report, report_mode, report_id}` | `meta.report`, `meta.report_mode`, `meta.report_id` | present since **B-243** — `values.rs:168-179`, `200-207`. They were absent while the cursor surface was, because the metadata of a report a caller could not act on would have been worse than nothing; now a receiver acts on them (§4.6) |
+| `IncomingMeta::{report, report_mode, report_id}` | `meta.report`, `meta.report_mode`, `meta.report_id` | present — `values.rs:168-179`, `200-207`. The metadata of a report a caller could not act on would be worse than nothing; a receiver acts on it through the cursor surface (§4.6) |
 | `PeerIdentity` as a type | `meta.peer` as `str` or `None` | present as text — `values.rs:157-161`: `sha256:…` over QUIC, `uid=…` over a local socket, `None` for an anonymous or in-process peer. Never from a header, so it can be authorized on rather than claimed ([0015](../decisions/0015-peer-authorization.md)); `test_asyncio.py:47` asserts the `None` for a client that presented no identity |
 | a survey's outcome: `SurveyRun`'s answers, `respondents()` and `late()` | `weida.Survey` — `replies`, `asked`, `failed`, `late`, `silent()` | present as a shared value class, on both surfaces (§4.4) — `values.rs:206-250` |
 | `TransferMeta::with_content_len` | set by the binding on `request`, `send`, `reply` | present implicitly — `endpoints.rs:112`, `188`, `323` |
@@ -264,7 +263,7 @@ is what makes one thread per endpoint the shape it is supposed to be
 Eighteen classes: `Runtime`, `Binding`, `Requester`, `Pusher`, `Subscriber`, `Replier`,
 `Request`, `Puller`, `Publisher`, `Paired`, `Surveyor`, `Respondent`, `BusMember`, `Radio`,
 `Segment`, `Dish`, `Cursors`, `Reporter` — every pattern of §4 and the cursor surface of §4.6,
-because B-244, B-243 and B-292 added each to both surfaces at once. The value classes are
+each present on both surfaces. The value classes are
 **shared, not copied** —
 `weida.Trust`, `weida.Identity`, `weida.IncomingMeta`, `weida.DishDrops` and the five statistics classes (`ConnectionStats`, `TransportStats`, `PathStats`, `UdpCounts`, `RemoteStats`) are the same objects on both surfaces
 (`sync.rs:50-52`, `sync.rs:62`) — and so is the whole exception family
@@ -299,8 +298,8 @@ library is a class under `weida.WeidaError`, each instance carrying `errno` and 
 
 | Rust | Python | Verdict |
 | --- | --- | --- |
-| `Error::Runtime` | `weida.RuntimeFailure` | present, and **the one rename**: `weida.Runtime` is the runtime, a module cannot have one name for two things, and the module with the collision silently keeps whichever was added last. So the class is `RuntimeFailure`, its `errno` says the same, and the variant it comes from is written beside it (`errors.rs:45-53`, `72-73`). Both `smoke.py:33-36` and `test_sync.py:119-122` assert that `weida.Runtime` is not a `BaseException` |
-| the other 23 variants of `weida_core::Error` | the same names: `InvalidAddress`, `InvalidEndpointPath`, `InvalidFingerprint`, `AlreadyRegistered`, `NotConnected`, `ConnectionLost`, `Negotiation`, `Protocol`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `NoParkedConnection`, `NoReply`, `Canceled`, `Expired`, `Indeterminate`, `LimitExceeded`, `DatagramsUnavailable`, `TooLarge`, `Tls`, `Untrusted`, `Io`, `Transport` | present — `errors.rs:74-97`; the three 0034 added (`Expired`, `DatagramsUnavailable`, `TooLarge`) arrived with it, because the exhaustive match below does not compile without them |
+| `Error::Runtime` | `weida.RuntimeFailure` | present, and **the one rename**: `weida.Runtime` is the runtime, a module cannot have one name for two things, and the module with the collision silently keeps whichever was added last. So the class is `RuntimeFailure`, its `errno` says the same, and the variant it comes from is written beside it (`errors.rs:45-53`, `72-73`). Both `smoke.py` and `test_sync.py` assert that `weida.Runtime` is not a `BaseException` |
+| the other 23 variants of `weida_core::Error` | the same names: `InvalidAddress`, `InvalidEndpointPath`, `InvalidFingerprint`, `AlreadyRegistered`, `NotConnected`, `ConnectionLost`, `Negotiation`, `Protocol`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `NoParkedConnection`, `NoReply`, `Canceled`, `Expired`, `Indeterminate`, `LimitExceeded`, `DatagramsUnavailable`, `TooLarge`, `Tls`, `Untrusted`, `Io`, `Transport` | present — `errors.rs:74-97`; the three of 0034 (`Expired`, `DatagramsUnavailable`, `TooLarge`) are included, because the exhaustive match below does not compile without them |
 | a variant added to the library | a **compile error in this file** | present: `name_of` is an exhaustive `match` written by the same macro that writes the name list (`errors.rs:54-70`), so a new variant cannot silently arrive as the base class |
 | `Error::Display` | `cause` | present, and no second vocabulary: the library's own `Display` is the wording, because a binding that rephrased it would be a second one to keep in step (`errors.rs:101-109`) |
 | `Error::is_definite_failure()` keeping `Indeterminate` out of the definite set | `weida.Indeterminate` as a **sibling** of `ConnectionLost`, not a kind of it | present — `errors.rs:18-23`, and it is the one class worth reading twice: the transfer may or may not have arrived, and a caller that treats it as a definite failure is wrong ([FAILURE_MODEL.md](../FAILURE_MODEL.md)) |
@@ -371,7 +370,7 @@ two coroutines may hold, so "answered at most once" and "a transfer ends once" a
 an `Option` behind a mutex and a named failure, not by a panic: `weida.NoReply` with the
 sentence that says why (`endpoints.rs:351-369`, `pubsub.rs:154-160`, `streams.rs:42-48`).
 `FanOut` and the stream classes use a `tokio::sync::Mutex` because the guard is held across an
-await, which `std`'s may not be (`Cargo.toml:36-39`, `pubsub.rs:146-149`).
+await, which `std`'s may not be (the `tokio` dependency comment in `Cargo.toml`, `pubsub.rs:146-149`).
 
 ### 9.6 Each object holds its runtime alive
 
@@ -381,30 +380,14 @@ Every endpoint, stream and request holds an `Arc<Runtime>` (`endpoints.rs:37-38`
 handle, not with the first (`endpoints.rs:10-12`). The Rust API needs no such rule, because a
 Rust caller holds the `Runtime` for as long as its endpoints borrow from it.
 
-### 9.7 Two text claims this document found, and closed
-
-Both were prose that had fallen behind the code, and both were fixed when this document
-caught them rather than recorded as living defects:
-
-- `lib.rs`'s module documentation said the synchronous facade "is B-205" — the shape of a
-  sentence written before it landed — while `lib.rs:105` registered `weida.sync`. It now
-  states what the module has on both surfaces and what is absent with the reason.
-- `pyproject.toml`'s and `Cargo.toml`'s descriptions said "Req/Rep and Push/Pull", which was
-  B-200's scope; Pub/Sub and the streamed surface landed in B-204 and PAIR, SURVEY and BUS in
-  B-244, so the wheel's own summary understated the module it ships twice over. Both now name
-  all six patterns and both surfaces.
-
-The `Typing :: Typed` classifier was the third of the same kind and is handled in §10: it was
-**removed**, because a classifier is a claim and no stub file ships.
-
 ## 10. What is absent, with a reason and where a follow-up adds it
 
 | Absent | What a caller does not get | Where it would be added |
 | --- | --- | --- |
 | the raw L0 surface, `Peer` and `Acceptor` (§9.2) | taking a stream without a pattern interpreting it; `Incoming::Transfer` vs `Incoming::Exchange` as the application's choice | a slice binding `Runtime.peer(trust)` and `Binding.acceptor(path)` with an `Incoming` the two arms of which are distinguishable in Python |
-| a **streamed** form for PAIR (§4.4) | writing or reading a pair's payload in pieces; `Paired::open(meta)` is the Rust call | the same shape Push/Pull has here — one `paired.open()` returning an `OutgoingStream` — if a caller ever needs it. PAIR, SURVEY and BUS themselves landed on both surfaces in **B-244** |
-| `Reporter::with_granularity(bytes, interval)` (§4.6) | choosing how often a reporter's records reach the wire; the library's default stands | one method on `weida.Reporter` taking bytes and seconds, if a Python reporter ever needs coarser records. The cursor surface itself landed on both surfaces in **B-243**, and nothing is lost by the default: a cursor is absolute, so coarser records end at the same numbers |
-| a Python **server** on a socket transport | `bind_unix`, `bind_pipe` (`listener.rs`); the client side already dials both (`endpoints.rs:59-62`), and `bind_inproc` landed in **B-303** | two calls on `Runtime` beside `bind`, plus the `LocalPrincipal`/`WindowsPrincipal` reading that makes `uid=…` useful |
+| a **streamed** form for PAIR (§4.4) | writing or reading a pair's payload in pieces; `Paired::open(meta)` is the Rust call | the same shape Push/Pull has here — one `paired.open()` returning an `OutgoingStream` — if a caller ever needs it |
+| `Reporter::with_granularity(bytes, interval)` (§4.6) | choosing how often a reporter's records reach the wire; the library's default stands | one method on `weida.Reporter` taking bytes and seconds, if a Python reporter ever needs coarser records. Nothing is lost by the default: a cursor is absolute, so coarser records end at the same numbers |
+| a Python **server** on a socket transport | `bind_unix`, `bind_pipe` (`listener.rs`); the client side already dials both (`endpoints.rs`), and `bind_inproc` is present (§3) | two calls on `Runtime` beside `bind`, plus the `LocalPrincipal`/`WindowsPrincipal` reading that makes `uid=…` useful |
 | eight of `RuntimeConfig`'s nine fields, and all of `Limits` (§3) | every resource ceiling weida bounds — queue depths, connection counts, the subscriber budget, the guarantee set — is the library's default and cannot be moved from Python | a `weida.Limits` and keyword arguments on `Runtime`, in the shape [`mqtt-py.md`](mqtt-py.md) §5 uses for the two limits that surface there |
 | streaming in `weida.sync` (§9.3) | a synchronous caller cannot write or read a payload in pieces | `weida::blocking` gaining a streamed form first; building it in the binding is what 0013 §4.4 forbids |
 | `await runtime.shutdown()` on the asyncio surface (§3) | a close that does not wait for anything in flight; `drain` is the only end | one coroutine wrapping `weida::Runtime::shutdown`, beside `drain` |
@@ -416,8 +399,8 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 | `TransferMeta::with_content_type`, `with_trace`; `publish_with_trace`, `open_with_trace` (§4.3, §5) | declaring a content type on an outbound payload, and propagating an inbound trace outward — the read side of both already works | keyword arguments on `request`, `send`, `reply` and `publish` |
 | `IncomingMeta.tracestate` (§5) | the vendor half of a W3C trace context | one more field in `PyIncomingMeta::of` |
 | `Publisher.drops()`, `Subscriber.filter_count()`, `Requester/Pusher.peer_count()` (§4.3, §4.1) | three read-only accessors the Rust API has | one method each |
-| type stubs | a `.pyi` or a `py.typed` marker: there is none anywhere under `crates/py/`, so a type checker sees an untyped extension module. The `Typing :: Typed` classifier was **removed** from `pyproject.toml` when this document found it, because a classifier is a claim | a stub file per module, generated or written, and the classifier back with it |
-| **a client for PyPy** (B-266) | `import weida` on PyPy, GraalPy, or a free-threaded CPython below 3.15 | **nothing, and the answer is "no" rather than "later"** — decided on the number that already exists. The cost of this binding is **~78 µs per operation dominated by one event-loop wakeup per `await`** ([IMPLEMENTATION.md](../IMPLEMENTATION.md) §4), not by interpreting bytecode, so the part PyPy replaces is not the part that costs. Against that stands a second artifact per interpreter (§2: PyPy and GraalPy pin the stable ABI to their own version, and a free-threaded build below 3.15 gets no stable ABI at all), plus a second Python surface to keep in step with this one — which is what [0013](../decisions/0013-competitor-libraries.md) §4.4 exists to prevent. If it is ever wanted, the route is a `cffi` shim over the **C ABI** of [0030](../decisions/0030-which-runtimes-and-in-which-order.md) §3.4, which makes it a consumer of that row rather than a binding of its own: a few hundred lines of Python over a stable header, with the surface list taken from this document. Free-threaded CPython is the case worth revisiting first, and it revisits itself: when `abi3t` (3.15) is the floor, one wheel serves both builds again |
+| type stubs | a `.pyi` or a `py.typed` marker: there is none anywhere under `crates/py/`, so a type checker sees an untyped extension module, and `pyproject.toml` carries no `Typing :: Typed` classifier, because a classifier is a claim | a stub file per module, generated or written, and the classifier with it |
+| **a client for PyPy** | `import weida` on PyPy, GraalPy, or a free-threaded CPython below 3.15 | **nothing, and the answer is "no" rather than "later"** — decided on the number that already exists. The cost of this binding is **~78 µs per operation dominated by one event-loop wakeup per `await`** ([IMPLEMENTATION.md](../IMPLEMENTATION.md) §4.15), not by interpreting bytecode, so the part PyPy replaces is not the part that costs. Against that stands a second artifact per interpreter (§2: PyPy and GraalPy pin the stable ABI to their own version, and a free-threaded build below 3.15 gets no stable ABI at all), plus a second Python surface to keep in step with this one — which is what [0013](../decisions/0013-competitor-libraries.md) §4.4 exists to prevent. If it is ever wanted, the route is a `cffi` shim over the **C ABI** of [0030](../decisions/0030-which-runtimes-and-in-which-order.md) §3.4, which makes it a consumer of that row rather than a binding of its own: a few hundred lines of Python over a stable header, with the surface list taken from this document. Free-threaded CPython is the case worth revisiting first, and it revisits itself: when `abi3t` (3.15) is the floor, one wheel serves both builds again |
 | an interop section (§2) | nothing measurable is missing: weida has one implementation, so there is no second peer to pair against | a second implementation of the protocol, which is not a binding slice |
 
 ## 11. Sources
@@ -425,17 +408,17 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 - This binding: `crates/py/weida-py/src/` (`lib.rs`, `runtime.rs`, `endpoints.rs`,
   `pubsub.rs`, `patterns.rs`, `cursors.rs`, `streams.rs`, `sync.rs`, `values.rs`,
   `errors.rs`),
-  `crates/py/weida-py/Cargo.toml`, `pyproject.toml`, `develop.sh`, `package.sh`, `smoke.py`,
-  `README.md`.
+  `crates/py/weida-py/Cargo.toml`, `pyproject.toml`, `smoke.py`, `README.md`, and the wrappers
+  `develop.sh` and `package.sh`, which delegate to `crates/py/develop.sh` and `crates/py/package.sh`.
 - The shared foundation: `crates/py/weida-py-core/src/` — `bridge.rs` (the coroutine and its
   lazy start), `bytes.rs` (the payload boundary), the exception-family machinery `errors.rs`
   builds on.
-- The API this document is the parity table of: `crates/weida/src/` — `lib.rs:67-99`,
+- The API this document is the parity table of: `crates/weida/src/` — `lib.rs`'s re-exports,
   `config.rs`, `runtime.rs`, `listener.rs`, `endpoint.rs`, `transfer.rs`, `stream.rs`,
   `cursor.rs`, `blocking.rs`.
 - Tests: `crates/py/weida-py/tests/` — `test_asyncio.py` (8), `test_patterns.py` (9),
-  `test_sync.py` (8), `test_cursors.py` (7). **Run** for B-243: 32 passed, and `smoke.py`
-  resolving all 56 names through a freshly built wheel.
+  `test_sync.py` (8), `test_cursors.py` (7). A run of them passed 32, and `smoke.py`
+  resolved all 56 names through a freshly built wheel.
 - Normative documents the rows cite: [PROTOCOL.md](../PROTOCOL.md) §6.4 and §9.4,
   [PATTERNS.md](../PATTERNS.md) §4.1, [GUARANTEES.md](../GUARANTEES.md) §1,
   [INVARIANTS.md](../INVARIANTS.md), [FAILURE_MODEL.md](../FAILURE_MODEL.md).
@@ -445,5 +428,3 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
   [0009](../decisions/0009-drain.md) §4.4 (the mandatory finite deadline),
   [0010](../decisions/0010-local-transport.md) §4.8 (the local address forms),
   [0015](../decisions/0015-peer-authorization.md) (the proved peer).
-- Backlog: B-200, B-204, B-205, B-244 and B-243 in [BACKLOG.md](../BACKLOG.md), whose merge
-  notes are the recorded executions of the suite this document counts.

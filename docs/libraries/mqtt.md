@@ -18,7 +18,7 @@ protocol's central mechanisms — retained messages, the session store, subscrip
 shared-subscription selection, the Will's delay timer — lives in the server. A client cannot
 implement half of them and does not try.
 
-[0014](../decisions/0014-parallel-libraries.md) §2 draws the line and Phase D owns the other
+[0014](../decisions/0014-parallel-libraries.md) §2 draws the line, and a broker owns the other
 side. So every row below answers **"does the client have it"**, and a mechanism whose whole
 implementation is the server's is marked `server-side` rather than absent: it is not missing
 from this library, it is not this library's to have. Where a client must *say* something for

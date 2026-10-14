@@ -12,33 +12,31 @@ transport delivery receipt, and cancellation by reset. **L1** is the ZeroMQ/nano
 family as thin wrappers over L0: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS — the whole
 nanomsg set — and RADIO/DISH for lossy fan-out of segments; only RADIO/DISH adds wire
 vocabulary (DATA key 13, SUBSCRIBE key 2). **L2** is a RabbitMQ-analog broker,
-`weida-broker`: queues at endpoint paths, publisher confirms, and an absolute per-subscription
-credit. Consumer acknowledgement and redelivery are the slice still to come.
+`weida-broker`: queues at endpoint paths, publisher confirms, an absolute per-subscription
+credit, and consumer settlement with requeue when a consumer is lost. The redelivery count on
+the wire, relaying a consumer's report to the producer and retiring a queue are still to come.
 
 A completion is a **cursor**, not a verdict: a level plus an **absolute byte offset**, reported
 on a unidirectional stream of its own that never shares a stream with payload. So a Push
 producer gets a reliable `Accepted` without an exchange, a reader learns how far the far end
 got rather than only whether it finished, and no pattern changes shape to gain any of it.
 
-**Status:** alpha. Published on crates.io: `weida`, `weida-core`, `weida-protocol`,
-`weida-runtime` and `weida-winpipe` at `0.1.0-alpha.1` to `0.1.0-alpha.6`, and
-`weida-broker`, `weida-raft` and `weida-openbao` at `0.1.0-alpha.2` to `0.1.0-alpha.6`. The other seventeen
-members are not published: `weida-py-core`, every Python binding and all five protocol
-libraries with their codecs. Nothing is on PyPI and there are no prebuilt binaries.
-Wire protocol version `0` is experimental and breaking changes are permitted within `0.x`.
-Phases 0-3 are implemented — the docs, the core model, the native QUIC
-transport, the in-process, `AF_UNIX` and named-pipe transports, all six patterns, the raw L0
-stream API, datagram flows and RADIO/DISH, peer identity by public-key fingerprint, opt-in
-per-producer ordering and bounded deduplication, a bounded `drain`, the cursor back channel, a
-synchronous facade (`weida::blocking`), a `weida` binary and a Python binding (`weida-py`) —
-and the first two broker slices with them. Beside weida the repository ships **five protocol
-libraries**, none of which has weida in its picture: ZeroMQ (`weida-zmtp` + `weida-zmq` +
-`weida-zmq-py`), the
-nanomsg SP protocols (`weida-sp` + `weida-nng` + `weida-nng-py`), MQTT 5 (`weida-mqtt-codec` +
-`weida-mqtt` + `weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` +
-`weida-amqp-py`) and Core NATS (`weida-nats-codec` + `weida-nats` + `weida-nats-py`), each
-with a parity document under [docs/libraries/](docs/libraries/) and each measured against a
-real peer where one exists. `weida-zmq` is complete against
+**Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
+`weida-broker`, `weida-raft` and `weida-openbao` are published on crates.io, all at
+`0.1.0-alpha.6`. The other seventeen members are not published: `weida-py-core`, every Python
+binding and all five protocol libraries with their codecs. The one exception on crates.io,
+`weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI
+and there are no prebuilt binaries. Wire protocol version `0` is experimental and breaking
+changes are permitted within `0.x`. Phase status lives in
+[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §1.
+
+Beside weida the repository ships **five protocol libraries**, none of which has weida in its
+picture: ZeroMQ (`weida-zmtp` + `weida-zmq` + `weida-zmq-py`), the nanomsg SP protocols
+(`weida-sp` + `weida-nng` + `weida-nng-py`), MQTT 5 (`weida-mqtt-codec` + `weida-mqtt` +
+`weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` + `weida-amqp-py`) and Core NATS
+(`weida-nats-codec` + `weida-nats` + `weida-nats-py`), each with a parity document under
+[docs/libraries/](docs/libraries/) and each measured against a real peer where one exists.
+`weida-zmq` is complete against
 [decisions/0013](docs/decisions/0013-competitor-libraries.md) §4.7's definition of
 first-class — every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`,
 NULL/PLAIN/CURVE with ZAP, the option table honoured or refused row by row, the monitor and
@@ -66,7 +64,9 @@ anything is built ([decisions/0026](docs/decisions/0026-the-guide-and-the-c8b-qu
 | [docs/GUARANTEES.md](docs/GUARANTEES.md) | guarantee vocabulary and what is actually implemented in v0 |
 | [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) | failure scope, required scenarios, sender outcome rules, `Indeterminate` |
 | [docs/INVARIANTS.md](docs/INVARIANTS.md) | the short invariant list every change is checked against |
-| [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | phase tracker, development loop, agent rules, acceptance, known debt |
+| [docs/STORE.md](docs/STORE.md) | the store interface, specified ahead of the store |
+| [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | phase tracker, development loop, agent rules, verified results, decisions, known debt |
+| [docs/STATUS.md](docs/STATUS.md) | where the project stands, layer by layer |
 | [docs/libraries/zmq.md](docs/libraries/zmq.md) | the ZeroMQ feature-parity table against libzmq 4.3.5, row by row, with [docs/libraries/README.md](docs/libraries/README.md) as the parity-document index |
 | [Master Architecture and Implementation Plan — QUIC-native Messaging Framework.md](Master%20Architecture%20and%20Implementation%20Plan%20%E2%80%94%20QUIC-native%20Messaging%20Framework.md) | the normative architectural source of truth for the whole project |
 
@@ -88,8 +88,8 @@ hand.
 | `crates/runtime` | `weida-runtime` | weida | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry, `AF_UNIX` bind hygiene with peer credentials and, on Windows, named-pipe hygiene with the client's SID |
 | `crates/winpipe` | `weida-winpipe` | weida | the Win32 calls a named pipe needs and nothing else — an owner-only DACL, the client's token SID, the pipe's owner SID, both process ids — behind a safe surface; the one crate that may use `unsafe`, and empty off Windows |
 | `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, all six patterns — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS — and the cursor back channel |
-| `crates/broker` | `weida-broker` | weida | L2, and a layer rather than a fork: queues at endpoint paths, the publisher confirm and the absolute per-subscription credit; depends on `weida` and nothing depends on it ([0018](docs/decisions/0018-minimal-broker.md) §4.1) |
-| `crates/raft/weida-raft` | `weida-raft` | weida | openraft plus the I/O it deliberately does not have — weida's transport under it — so a Raft service needs only a state machine ([0021](docs/decisions/0021-consensus-openraft.md)) |
+| `crates/broker` | `weida-broker` | weida | L2, and a layer rather than a fork: queues at endpoint paths, the publisher confirm, the absolute per-subscription credit and consumer settlement with requeue; depends only on `weida`, and nothing depends on it ([0018](docs/decisions/0018-minimal-broker.md) §4.1) |
+| `crates/raft/weida-raft` | `weida-raft` | weida | openraft plus the I/O it deliberately does not have — weida's transport under it — so a Raft service supplies only its state machine and log store ([0021](docs/decisions/0021-consensus-openraft.md)) |
 | `crates/openbao/weida-openbao` | `weida-openbao` | weida | OpenBao/Vault for weida: token, AppRole and wrapped hand-off authentication, and identity sources signed by a PKI mount, anchored on its CA, or read from KV; its own crate because it carries the HTTP client and JSON the core does not ([0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3, [docs/libraries/weida-openbao.md](docs/libraries/weida-openbao.md)) |
 | `crates/py/weida-py-core` | `weida-py-core` | foundation | the shared PyO3 foundation under every binding, with nothing protocol-specific in it: errno exception families, the asyncio bridge that drives a Rust future on the caller's loop, and the bytes boundary ([0014](docs/decisions/0014-parallel-libraries.md) §2) |
 | `crates/py/weida-py` | `weida-py` | binding | the Python surface of weida itself: every pattern including the streamed fan-out, asyncio and synchronous ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
@@ -106,7 +106,7 @@ hand.
 | `crates/amqp/weida-amqp` | `weida-amqp` | library | the AMQP 1.0 client: connection, session and link with both credit schemes, the settle modes, dispositions and SASL, interop-tested against `fe2o3-amqp` 0.17.0 in both roles ([docs/libraries/amqp.md](docs/libraries/amqp.md)) |
 | `crates/amqp/weida-amqp-py` | `weida-amqp-py` | binding | the Python AMQP surface: connection, session and link as objects, `send` returning the delivery's terminal state, asyncio and synchronous |
 | `crates/nats/weida-nats-codec` | `weida-nats-codec` | codec | the NATS client protocol — twelve control-line verbs and the `NATS/1.0` header block — sans-I/O |
-| `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; interop is written and **not run**, because no `nats-server` was available ([docs/libraries/nats.md](docs/libraries/nats.md)) |
+| `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; its interop tests are written and **not run**, because they need a `nats-server` ([docs/libraries/nats.md](docs/libraries/nats.md)) |
 | `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
 
 ## Quick start, without writing a program

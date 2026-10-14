@@ -183,9 +183,9 @@ Raw sockets and the device are the reason the tag stack is a public type
 `tests/interop_nng.rs`, eleven tests, against the versions §1 names. The `nng` crate is an
 optional dependency behind the `nng-interop` feature and the tests are `#[ignore]`d on top of
 that, because the C library is a build condition rather than a runtime one
-([LOOP.md](../LOOP.md) §2); the run that produced this document was
+([LOOP.md](../LOOP.md) §2); the command is
 `cargo test -p weida-nng --features nng-interop --test interop_nng -- --ignored`, and all
-eleven passed.
+eleven pass.
 
 Every pairing runs in **both roles** — this library bound with NNG dialling, and this library
 dialling an NNG listener: REQ/REP, PUSH/PULL, PUB/SUB, PAIR v0, PAIR v1, SURVEYOR/RESPONDENT
@@ -195,15 +195,14 @@ encodes, and `the_tag_stack_survives_a_round_trip_through_nng` sends a stack thr
 NNG REP socket and back. One is about the device: `the_device_forwards_between_two_nng_sockets`
 puts this library's `device()` between two NNG sockets.
 
-**What the run measured that reading had not settled:**
+**What interop settled that reading had not:**
 
 1. **PAIR v1's initial hop count.** The RFC says the counter is "initialized to one and
    incremented at each node"; a reading of NNG's source suggested zero. A running NNG
-   1.4.0-rc.0 originates **one** — the RFC's value. `weida_sp::pair::INITIAL_HOPS` held `0`
-   before this run and now holds `1`, the golden vectors were corrected with it, and both
-   readings are still accepted on receipt, because the difference is a count and not a
+   1.4.0-rc.0 originates **one** — the RFC's value, so `weida_sp::pair::INITIAL_HOPS` is `1`,
+   and both readings are accepted on receipt, because the difference is a count and not a
    format.
-2. **Every other pairing agreed with no adjustment on either side**, in both roles, including
+2. **Every other pairing agrees on both sides**, in both roles, including
    the tag stack's byte order and the terminal-bit rule.
 
 **Two deliberate divergences, visible on the wire and kept:**

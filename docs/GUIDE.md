@@ -23,8 +23,8 @@ are in the same chapter as the success case rather than in an appendix.
    `crates/weida/tests/guide.rs`, which asserts the claims its chapter makes. A claim added
    without a program and an assertion fails
    `every_claim_the_chapters_make_has_a_program_and_a_test`.
-2. **No number here is an estimate.** Measured figures name the item that measured them
-   ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4); arithmetic derived from them says so in the
+2. **No number here is an estimate.** Measured figures cite the subsection of
+   [IMPLEMENTATION.md](IMPLEMENTATION.md) §4 that holds them; arithmetic derived from them says so in the
    sentence. Where nothing has been measured, the guide says *that* instead of guessing — and
    §0.4 names the gaps.
 
@@ -60,17 +60,17 @@ Take the simplest possible C8B workload: **one 64-byte message to every person, 
 The measured pieces, all from this repository's own runs on one desktop machine
 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4):
 
-| Measured | Value | Item |
+| Measured | Value | Source |
 | --- | --- | --- |
-| Message rate, 64-byte payload, one producer | **192.6-195.9 Kmsg/s** | B-246 |
-| Bytes on the wire for that message | **76 B** frame for 64 B of payload | B-246 |
-| Resident memory per live connection, both ends together | **750-850 KiB** | B-011 |
-| Cold handshake | **1.04-1.10 ms**; a pooled dial 3.8 µs | B-011 |
-| Publish cost at 256 subscribers | **22.94 µs** per message → **88.8 ns per subscriber** | B-247 |
-| Fan-out delivery rate at 256 subscribers | **276-279 Kcopies/s** | B-247 |
-| Transport state per subscriber, both ends | **396-436 KiB** | B-247 |
-| Latency to a subscriber at width 256, idle | **507-539 µs** median, **816-989 µs** p99 | B-247 |
-| Topic filter match | **14 ns**, shape-independent | B-021 |
+| Message rate, 64-byte payload, one producer | **192.6-195.9 Kmsg/s** | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.5 |
+| Bytes on the wire for that message | **76 B** frame for 64 B of payload | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.5 |
+| Resident memory per live connection, both ends together | **750-850 KiB** | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.8 |
+| Cold handshake | **1.04-1.10 ms**; a pooled dial 3.8 µs | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.8 |
+| Publish cost at 256 subscribers | **22.94 µs** per message → **88.8 ns per subscriber** | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11 |
+| Fan-out delivery rate at 256 subscribers | **276-279 Kcopies/s** | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11 |
+| Transport state per subscriber, both ends | **396-436 KiB** | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11 |
+| Latency to a subscriber at width 256, idle | **507-539 µs** median, **816-989 µs** p99 | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11 |
+| Topic filter match | **14 ns**, shape-independent | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.10 |
 
 Everything below is **arithmetic on those numbers**, and says so where it is.
 
@@ -90,9 +90,7 @@ corrected. At **396-436 KiB** of transport state per subscriber, 64 GiB holds on
 | 10⁵ | ~360 ms | ~2.8 |
 
 So the width is a **choice against a message rate** rather than a ceiling: a node serves 10³
-subscribers at a few hundred messages a second, or 10⁴ at tens. Call the width *d* ∈ [10³, 10⁴]
-— the same interval the first version of this section derived from memory, for an entirely
-different reason.
+subscribers at a few hundred messages a second, or 10⁴ at tens. Call the width *d* ∈ [10³, 10⁴].
 
 **Then the depth is tiny.** log(8·10⁹) ÷ log(10³) ≈ 3.3, and ÷ log(10⁴) ≈ 2.5. So
 
@@ -130,7 +128,7 @@ in twenty lines.
 every intermediary into a memory ceiling: three hops × 8·10⁹ recipients is a lot of copies of
 anything. weida's transfers are streams end to end, and the measured consequence is the one
 that matters — a 4 GiB payload crosses with **14.4 MiB of peak resident memory**
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4). Chapter 1 §1.2 is that property at 64 MiB.
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.2). Chapter 1 §1.2 is that property at 64 MiB.
 
 **Fan-out drops and counts; it never blocks.** One slow subscriber out of 10⁴ must not stall the
 other 9,999, so a publisher's answer to overload is a counted drop rather than backpressure
@@ -139,49 +137,48 @@ was dropped" is not an operational answer. What a stalled subscriber costs the p
 measured on both sides of the crossover the defaults put at a **32 KiB** message: below it the
 queue refuses first (0.34-1.19 MiB held per stalled subscriber at 1 KiB), above it the byte
 budget does (9.3-10.7 MiB at 64 KiB), and the counter says which
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-247). Chapter 2 §2.3 is that experiment as a
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11). Chapter 2 §2.3 is that experiment as a
 program.
 
 ### 0.3 What the arithmetic says about the bytes
 
-One more line of the same arithmetic, and it is the one that changed the code.
+One more line of the same arithmetic, and it is the one that shaped the frame.
 
-A 64-byte message to everybody is 8·10⁹ frames at the leaf edge. When this section was first
-written each of those frames was **135 B**, of which 64 were payload and **60** were a W3C
-`traceparent` the runtime wrote whether anything traced or not — ≈**480 GB per
-message-to-everyone**, 44 % of the total, spent on a trace context nobody asked for. Against
-ZMTP's one to nine bytes of framing per message and SP's eight, that was not a rounding error;
-it was the third-largest line in the budget.
+A 64-byte message to everybody is 8·10⁹ frames at the leaf edge. A frame that carried a W3C
+`traceparent` whether anything traced or not would be **135 B**, of which 64 are payload and
+**60** the trace context — ≈**480 GB per message-to-everyone**, 44 % of the total, spent on a
+trace context nobody asked for. Against ZMTP's one to nine bytes of framing per message and
+SP's eight, that is not a rounding error; it would be the third-largest line in the budget.
 
-It is gone. A context is now **propagated and never minted**
+So weida does not write one. A context is **propagated and never minted**
 ([decisions/0028](decisions/0028-trace-propagation-is-the-callers.md)), so:
 
 | | Frame | 8·10⁹ of them | Message rate |
 | --- | --- | --- | --- |
-| Before | 135 B | ≈1.08 TB | — |
-| Now, untraced | **76 B** | **≈608 GB** | **192.6-195.9 Kmsg/s** |
-| Now, with a caller's context | 136 B | ≈1.09 TB | 168.9-171.2 Kmsg/s |
+| A minted context on every frame (refused) | 135 B | ≈1.08 TB | — |
+| Untraced | **76 B** | **≈608 GB** | **192.6-195.9 Kmsg/s** |
+| With a caller's context | 136 B | ≈1.09 TB | 168.9-171.2 Kmsg/s |
 
 **Twelve bytes of framing around 64 bytes of payload**, half of it the endpoint path, and 84 %
-of the wire is now the message. The rate figure is the pair measured in one run, not a
-comparison against B-009's 179.4 Kmsg/s from another day, and both numbers are the bench's
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-246).
+of the wire is the message. The rate figure is the pair measured in one run, not a
+comparison against the 179.4 Kmsg/s of another day ([IMPLEMENTATION.md](IMPLEMENTATION.md)
+§4.4), and both numbers are the bench's ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.5).
 
-Two things worth taking from how that went, because they are the method rather than the result.
-**The arithmetic found it.** Nobody profiled anything: writing down 8·10⁹ × 135 B and asking
-what the bytes were made a fixed 60-byte field indefensible in a way that a 9 % benchmark
-difference never had. And **the decision was about honesty, not bytes**: a minted root is not a
-safe default but a fabricated fact, because a hop that received a context and forgot to pass it
-on used to emit a *new trace* rather than nothing — two unrelated traces in a collector instead
-of one visible gap. The bytes made it urgent; that made it right.
+Two things are worth taking from this, because they are the method rather than the result.
+**The arithmetic finds it.** Writing down 8·10⁹ × 135 B and asking what the bytes are makes a
+fixed 60-byte field indefensible in a way that a 9 % benchmark difference never does. And
+**the decision is about honesty, not bytes**: a minted root is not a safe default but a
+fabricated fact, because a hop that received a context and forgot to pass it on would emit a
+*new trace* rather than nothing — two unrelated traces in a collector instead of one visible
+gap. The bytes make it urgent; that makes it right.
 
 ### 0.4 What is not answered
 
 Honesty is part of the method, so the gaps are named where the arithmetic needs them:
 
-- **The width is measured to 256 subscribers, and *d* is 10³ to 10⁴.** B-247 replaced the
-  derivation this section used to carry, but it replaced it with a measurement one order of
-  magnitude below the number the depth argument uses: 256 subscribers on one desktop, both ends
+- **The width is measured to 256 subscribers, and *d* is 10³ to 10⁴.** The measurement
+  ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11) is one order of magnitude below the number
+  the depth argument uses: 256 subscribers on one desktop, both ends
   in one process, over loopback. The per-subscriber cost is flat from 16 to 256 — 396-436 KiB
   and a falling CPU cost per subscriber — which is the shape that extrapolates, and an
   extrapolation is what it remains. What a real 10⁴-subscriber node does with **one** network
@@ -197,8 +194,8 @@ Honesty is part of the method, so the gaps are named where the arithmetic needs 
   nothing yet answers in a deployment.
 - **The cluster and the store are specified and not finished.** [STORE.md](STORE.md) and
   [0020](decisions/0020-cluster-and-discovery.md)-[0022](decisions/0022-consensus-topology.md)
-  are the plan; `weida-broker` today has queues, a publisher confirm and credit, and no
-  durability. A chapter about a hop that survives a restart cannot be written yet, and this
+  are the plan; `weida-broker` has queues, a publisher confirm, credit and settlement with
+  requeue, and no durability. A chapter about a hop that survives a restart cannot be written yet, and this
   guide will not pretend otherwise.
 
 ---
@@ -278,7 +275,7 @@ not a silent truncation.
 For the gigabyte itself, this repository has the measurement rather than a claim:
 `examples/large_stream.rs` moves 4 GiB between two processes at 908.7 MiB/s with **14.4 MiB of
 peak resident memory**, and `tests/large.rs` asserts a 512 MiB ceiling on a 1 GiB echo
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4). §0.2 is why that number is load-bearing rather
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.2). §0.2 is why that number is load-bearing rather
 than impressive.
 
 ### 1.3 The outcome is a value
@@ -397,12 +394,12 @@ is *enough* at scale:
 - no hop in the middle, so responsibility never transfers;
 - nothing durable, so no restart survives anything.
 
-The rest are filed rather than written: this document grows one chapter per slice, each with
-its programs and its assertions, because a guide whose examples do not run is worse than no
-guide ([decisions/0025](decisions/0025-the-website.md) §2 is the same argument about a landing
+The rest are filed rather than written: a chapter is added only with its programs and its
+assertions, because a guide whose examples do not run is worse than no guide
+([decisions/0025](decisions/0025-the-website.md) §2 is the same argument about a landing
 page). The arc is in
 [decisions/0026](decisions/0026-the-guide-and-the-c8b-question.md) §4.4, and the backlog holds
-the slices.
+the remaining chapters.
 
 ---
 
@@ -464,23 +461,22 @@ flat out: 1537 more absorbed by a subscriber that has never read, then 1 dropped
 subscriber.** The reading subscriber received every message while its neighbour read nothing at
 all. In a design with one queue per socket, the silent subscriber's backlog is the reader's
 problem; here it is not, because each subscriber has its own stream, its own queue and its own
-byte budget ([PATTERNS.md](PATTERNS.md) §1.3). What that isolation costs is measured in B-247
-and quoted in §2.4.
+byte budget ([PATTERNS.md](PATTERNS.md) §1.3). What that isolation costs is measured
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11) and quoted in §2.4.
 
 **The second line is the part that surprises people, including the author of this program.**
 A subscriber that has read nothing for two megabytes loses nothing at all while the publisher
 is paced — and the reason is that a publisher's byte budget is released when the bytes reach
 the **wire**, not when somebody reads them. QUIC absorbs the difference. The loss starts only
-when the publisher outruns the silent subscriber's *transport*, which on this machine took
-another ~1500 messages.
+when the publisher outruns the silent subscriber's *transport*, which took another ~1500
+messages in the run above.
 
 > **Overload is a rate, not a backlog.**
 
 That sentence is why the drop counters are per cause rather than per subscriber, and why the
-first two versions of this program measured the wrong thing: a paced publisher reported zero
-drops for a subscriber that had read nothing, and a tiny budget starved the reader as well as
-the silent one. Both attempts are in the program's doc comment, because the mistakes are more
-instructive than the result.
+program runs the publisher in two phases: a paced publisher reports zero drops for a
+subscriber that has read nothing, and a tiny budget starves the reader as well as the silent
+one. Either alone would measure the wrong thing.
 
 ### 2.3 Which ceiling binds, and how you know
 
@@ -497,11 +493,11 @@ budget 8192 KiB:  1665 messages (1665 KiB) accepted, then the queue
 
 One variable, two outcomes, and the mechanism is QUIC. A copy's budget permit is released when
 its bytes reach the wire, and a connection absorbs a window's worth before it stops — 0.6 to
-1.5 MiB on this machine. So a budget **below** that band is spent while QUIC is still
+1.5 MiB in the measured runs. So a budget **below** that band is spent while QUIC is still
 accepting, and the budget refuses; a budget **above** it never fills, because the wire stops
 the writer first and then the queue backs up. `benches/fanout.rs` sees the same thing at the
-defaults (B-247): the 8 MiB default means the **queue** is what refuses, at 1153-1537 messages
-of 1 KiB.
+defaults ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11): the 8 MiB default means the
+**queue** is what refuses, at 1153-1537 messages of 1 KiB.
 
 **The operational point is the counter, not the rule.** `dropped_on(topic)` separates
 `subscriber_budget` from `subscriber_queue` from `no_parked_connection`, so a starving
@@ -510,7 +506,7 @@ remedies: a budget refusal wants a bigger budget or a smaller payload, a queue r
 faster consumer or a deeper queue. "Messages are being dropped" is not an operational answer,
 which is why this API does not offer it.
 
-What a stalled subscriber costs in **memory** is the second half, measured in B-247: 0.34-1.19
+What a stalled subscriber costs in **memory** is the second half, measured ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11): 0.34-1.19
 MiB resident per stalled subscriber at a 1 KiB payload, 9.3-10.7 MiB at 64 KiB. And one
 correction that a reader sizing a node will want: `subscribers × subscriber_buffer_bytes`
 **overstates** the cost, because one `publish` is one `Bytes` that every copy shares. The
@@ -522,8 +518,8 @@ budget is an accounting bound; the resident cost is one payload per distinct mes
 subscriber falls.**
 
 The program prints its own numbers — in a debug build unless you pass `--release`, and it says
-so. The figures worth quoting are the benchmark's, from B-247
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4), because they are release builds over three runs:
+so. The figures worth quoting are the benchmark's, from
+[IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11, because they are release builds over three runs:
 
 | Width | One publish | Per subscriber | Idle latency, median | Transport state per subscriber |
 | --- | --- | --- | --- | --- |
@@ -633,7 +629,7 @@ case — is bytes to it. What weida contributes is that every loss on the way is
 cause: `Radio::dropped_on` splits by budget, supersession, expiry, a datagram too large for a
 dish's connection, and a dish that carries no datagrams, and a datagram segment is never turned
 into a stream segment, which would deliver it late. Where both kinds share a bottleneck with a
-bulk upload, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-289) measured what the path and the
+bulk upload, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.17 measures what the path and the
 congestion controller cost the voice.
 
 ### 2.7 Quality without re-encoding

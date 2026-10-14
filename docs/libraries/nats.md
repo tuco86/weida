@@ -31,15 +31,14 @@ Three verdicts and no fourth:
 "Partial" is not a verdict. Where something is present in part, the row says which part is
 missing (0013 §4.7 clause 6).
 
-**What was measured, and what was not.** **Nothing here was measured against a running
-server.** `which nats-server` is empty on this machine, and so are `docker` and `podman`, so
+**What is measured, and what is not.** **Nothing here is measured against a running
+server.** No `nats-server` is available to the tests, and neither is `docker` or `podman`, so
 `crates/nats/weida-nats/tests/interop_nats_server.rs` is eight `#[ignore]`d tests carrying the
-install command. **And there is no substitute**: unlike the AMQP half of this workstream, where
+install command. **And there is no substitute**: unlike AMQP, where
 `fe2o3-amqp` ships an `acceptor` and therefore a foreign *server* that runs anywhere, NATS has
 none — `async-nats` is a **client**, and two clients cannot talk to each other, because
 routing, queue-group selection and request-reply all live in the server. So absence means *no
-interop*, not weaker interop, and §9 says what the eight tests would establish rather than what
-they did.
+interop*, not weaker interop, and §9 says what the eight tests would establish when run.
 
 Every claim below is therefore one of two kinds, and the rows say which: **read from the
 protocol reference** (`docs/research/nats.md`, which cites the client protocol reference and

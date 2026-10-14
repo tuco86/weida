@@ -18,7 +18,7 @@ Three verdicts and no others:
 "Partial" is not a verdict ([0013](../decisions/0013-competitor-libraries.md) §4.7 clause 6).
 Where this binding's shape differs from pynng's the row says so and §9 states why.
 
-**Two C releases, and every row says which one it was measured against.** This library is now
+**Two C releases, and every row says which one it was measured against.** This library is
 measured against two different builds of the NNG C implementation, which is worth more than
 either alone:
 
@@ -28,9 +28,10 @@ either alone:
 | `crates/nng/weida-nng-py/tests/test_interop.py` (this binding) | **NNG 1.11.0** | bundled and built by **pynng 0.9.0**, which is the peer in §8 |
 
 The 1.11.0 figure is not assumed: `pynng.ffi.string(pynng.lib.nng_version())` answers
-`1.11.0` in this worktree's virtualenv today, and pynng reports `0.9.0` (§11 names the
-command). **The pynng version is not pinned anywhere**: `develop.sh` installs it as
-`uv pip install --python .venv pynng`, `pyproject.toml` declares no dependency on it, and
+`1.11.0` in the repository virtualenv, and pynng reports `0.9.0` (§11 names the
+command). **The pynng version is not pinned anywhere**: `develop.sh` (a wrapper over
+`crates/py/develop.sh`) installs `pynng` unpinned into the repository virtualenv,
+`pyproject.toml` declares no dependency on it, and
 `tests/test_interop.py::test_the_c_library_is_the_one_this_test_claims` asserts only that the
 C library is an NNG 1.x. A later `develop.sh` run may therefore measure a different 1.x, and
 the test will still pass — which is the honest bound on every claim in §8.
@@ -75,7 +76,7 @@ invocation each, and eleven more in `src/sync.rs` for the synchronous surface (�
 
 The binding exposes what the library parses; a URL is bounded by `NNG_MAXADDRLEN` = 128 before
 anything else happens (`tests/test_options.py::test_a_url_past_nng_maxaddrlen_is_refused_before_it_is_parsed`).
-The pynng column was measured on this machine against its bundled NNG 1.11.0 by attempting a
+The pynng column is measured against its bundled NNG 1.11.0 by attempting a
 listen on each scheme (§11).
 
 | pynng / NNG 1.11.0 | This binding | Verdict |
@@ -176,14 +177,15 @@ Differences from pynng's option surface:
 | `pynng`'s Trio backend (`async_backend=`) | — | absent: this binding drives asyncio futures from the context's reactor (`weida-py-core`'s `Bridge`). What is missing: any second event-loop flavour |
 
 A note on the manifest rather than on the API: `weida-sp` is a declared dependency of
-`crates/nng/weida-nng-py` "for the raw socket's constructor" (`Cargo.toml:33-36`), and
+`crates/nng/weida-nng-py`, commented as the endpoint-type enum that "travels no further than
+the raw socket's constructor" (its `Cargo.toml`), and
 `grep -rn 'weida_sp' crates/nng/weida-nng-py/src` finds no use of it — consistent with the two
 absences above.
 
 ## 8. Interop evidence
 
 `crates/nng/weida-nng-py/tests/test_interop.py` — **six tests**, against **pynng** over the NNG
-C library it bundles, which is **1.11.0** in this worktree (§1). Where pynng is absent every
+C library it bundles, which is **1.11.0** in the repository virtualenv (§1). Where pynng is absent every
 test skips with its install command in the skip message. Every pynng call is blocking and runs
 in a worker thread through `asyncio.to_thread`, because a blocking C call on the event-loop
 thread would deadlock against the coroutine it waits for.
@@ -197,12 +199,10 @@ thread would deadlock against the coroutine it waits for.
 | `test_work_pushed_by_this_binding_is_pulled_by_the_c_library` | PUSH/PULL | PUSH, dialling | loopback `tcp` |
 | `test_a_survey_from_the_c_library_is_answered_by_this_respondent` | SURVEYOR/RESPONDENT | RESPONDENT, dialling | loopback `tcp` |
 
-**REQ/REP is exercised in both roles and on both sides of the bind**, which is B-137's
-acceptance clause; PUB/SUB, PUSH/PULL and SURVEYOR/RESPONDENT are exercised in one role each.
-**Nothing disagreed** in the recorded run: B-137 merged with all of them passing and
-[NIGHTLOG.md](../NIGHTLOG.md) 2026-09-12T07:35Z records the run; B-138 added the synchronous
-surface and its entry records **51 Python tests**. This document counted the suite from the
-source rather than re-running it (§11).
+**REQ/REP is exercised in both roles and on both sides of the bind**; PUB/SUB, PUSH/PULL and
+SURVEYOR/RESPONDENT are exercised in one role each. **Nothing disagreed** in the recorded
+run: all six pass. The suite's 51 Python test cases are counted from the source rather than
+re-run (§11).
 
 What the interop does **not** cover, named rather than implied:
 
@@ -235,7 +235,7 @@ What the interop does **not** cover, named rather than implied:
 5. **The synchronous surface is a facade over a facade and implements nothing.**
    `weida_nng.sync` is the same eleven protocols and the same three context classes over
    `weida-nng`'s own `blocking` module, which the binding enables as a Cargo feature
-   (`Cargo.toml:32`, B-138). No protocol behaviour exists twice, which is why the two surfaces
+   (the `blocking` feature of `Cargo.toml`). No protocol behaviour exists twice, which is why the two surfaces
    cannot disagree and why a `sync` socket and an asyncio socket exchange a message in the
    suite (`test_the_two_surfaces_talk_to_each_other`). **The GIL is released** — `py.detach`
    around every blocking `send`, `recv`, `dial`, `listen` and `shutdown` (`sync.rs:146`, `190`,
@@ -270,7 +270,7 @@ What the interop does **not** cover, named rather than implied:
 
 ## 10. The definition of done
 
-B-137's and B-138's acceptance clauses, plus B-183's, each with its verdict.
+The acceptance clauses of the asyncio surface, the synchronous surface and this document, each with its verdict.
 
 | Clause | Verdict | Where |
 | --- | --- | --- |
@@ -284,7 +284,7 @@ B-137's and B-138's acceptance clauses, plus B-183's, each with its verdict.
 | Send and receive timeouts turning a stalled exchange into an exception | yes, both asserted within two seconds | §9.5 |
 | The two absences stated as rows rather than as prose | yes — `tls+tcp` in §3 and §4, raw sockets with `nng_device` in §7 | §3, §7 |
 | Which C release each claim was measured against | yes, and the pynng version is recorded as **unpinned** | §1 |
-| The wheel needs no Rust toolchain | yes, since B-190: `package.sh` builds the `abi3` release wheel (`weida_nng-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl` here), installs it into a fresh virtualenv and runs `smoke.py` — one REQ/REP round trip on each surface, both ends this module, no `pynng` installed — with `PATH` scrubbed to `/usr/bin:/bin`. The document's first draft recorded this clause as not met, which is what filed B-190 | `package.sh`, `smoke.py` |
+| The wheel needs no Rust toolchain | yes: `package.sh` (a wrapper over `crates/py/package.sh`) builds the `abi3` release wheel (`weida_nng-0.1.0a6-cp39-abi3-manylinux_2_34_x86_64.whl` here), installs it into a fresh virtualenv and runs `smoke.py` — one REQ/REP round trip on each surface, both ends this module, no `pynng` installed — with `PATH` scrubbed to `/usr/bin:/bin` | `package.sh`, `smoke.py` |
 | No row says "partial" | yes: §3, §6 and §7 name what a caller does not get | §3, §6, §7 |
 
 ## 11. Sources, and the commands behind every count
@@ -294,9 +294,10 @@ B-137's and B-138's acceptance clauses, plus B-183's, each with its verdict.
   `crates/py/weida-py-core/src/`. The library: `crates/nng/weida-nng/src/`
   (`optiontable.rs`, `options.rs`, `engine.rs`, `raw.rs`).
 - Tests: `crates/nng/weida-nng-py/tests/` — `test_sockets.py`, `test_options.py`,
-  `test_contexts.py`, `test_sync.py`, `test_interop.py`. Build and run: `./develop.sh`
-  (`uv` virtualenv, `maturin develop`, `pytest`), which also installs `pynng`.
-- pynng's surface was read from the copy in this worktree's virtualenv:
+  `test_contexts.py`, `test_sync.py`, `test_interop.py`. Build and run: `./develop.sh` in
+  `crates/nng/weida-nng-py`, a wrapper over `crates/py/develop.sh` (`uv` virtualenv,
+  `maturin develop`, `pytest`), which also installs `pynng`.
+- pynng's surface is read from the copy in the repository virtualenv:
   `.venv/lib/python3.13/site-packages/pynng/` — `nng.py`, `exceptions.py`, `tls.py`,
   `__init__.py`.
 
@@ -306,14 +307,14 @@ Every count in this document, with the command that produces it:
 | --- | --- | --- |
 | The peer's versions (§1, §8) | `.venv/bin/python -c "import pynng; print(pynng.__version__, pynng.ffi.string(pynng.lib.nng_version()).decode())"` | `0.9.0 1.11.0` |
 | The suite's size (§8) | `grep -c 'def test_' crates/nng/weida-nng-py/tests/*.py` | `test_contexts.py:4`, `test_interop.py:6`, `test_options.py:12`, `test_sockets.py:12`, `test_sync.py:9` — **43 test functions** |
-| Collected test cases | the two `@pytest.mark.parametrize` rows (`grep -n 'parametrize' crates/nng/weida-nng-py/tests/*.py`) expand one function to 7 and one to 3, so 41 + 7 + 3 = **51** — the number B-138's merge recorded | 51 |
+| Collected test cases | the two `@pytest.mark.parametrize` rows (`grep -n 'parametrize' crates/nng/weida-nng-py/tests/*.py`) expand one function to 7 and one to 3, so 41 + 7 + 3 = **51** | 51 |
 | Eleven socket classes (§2) | `grep -c '^python_socket!($' crates/nng/weida-nng-py/src/sockets.rs` and `grep -c '^sync_socket!($' crates/nng/weida-nng-py/src/sync.rs` | 11 and 11 |
 | Three context classes (§2) | `grep -c '^python_context!($' crates/nng/weida-nng-py/src/contexts.rs` and `grep -c '^sync_context!($' crates/nng/weida-nng-py/src/sync.rs` | 3 and 3 |
 | 23 exception classes (§9.7) | `grep -cE '^    E[A-Z]*,$' crates/nng/weida-nng-py/src/errors.rs` | 23 |
 | 31 pynng exception classes (§9.7) | `grep -c '^class [A-Za-z]*(NNGException):' .venv/lib/python3.13/site-packages/pynng/exceptions.py` | 31 |
 | Fifteen option keywords (§5) | `grep -cE '^        [a-z_]*=None,$' crates/nng/weida-nng-py/src/options.rs` | 15 |
 | 50 option rows, 33 honoured, 17 refused (§5) | `grep -c 'name: "NNG_OPT_' crates/nng/weida-nng/src/optiontable.rs`, then the same file with `'        disposition: Disposition::Honoured'` and `'        disposition: Disposition::Refused'` | 50, 33, 17 |
-| `package.sh` and `smoke.py` present (§10) | `glob 'crates/**/package.sh; crates/**/smoke.py'` | all five bindings have both, `weida-nng-py` since B-190 |
+| `package.sh` and `smoke.py` present (§10) | `glob 'crates/**/package.sh; crates/**/smoke.py'` | every binding has both, each `package.sh` a wrapper over `crates/py/package.sh` |
 | pynng's transports (§3) | a listen attempt per scheme through `.venv/bin/python` against `pynng.Pull0` | `ws`, `wss`, `tls+tcp`, `inproc`, `ipc`, `abstract` accepted; `udp` raised `NotSupported` |
 | NNG's protocol names (§2) | `protocol_name` read from each of pynng's eleven classes | `pair` for `Pair0`, where this binding answers `pair0`; the other ten agree |
 
@@ -325,19 +326,17 @@ Every count in this document, with the command that produces it:
   mechanisms, §5 the 50 option rows, §6 pipes and events, §7 raw mode and `nng_device`, §9
   bounds. The protocol sheet it cites:
   [`../research/nanomsg-nng.md`](../research/nanomsg-nng.md).
-- Backlog: B-137 (the asyncio surface), B-138 (the synchronous surface), B-183 (this
-  document), in [BACKLOG.md](../BACKLOG.md).
 
-**What this document could not check, stated rather than guessed:**
+**What this document does not check, stated rather than guessed:**
 
-1. **The pynng version is unpinned.** `0.9.0` over NNG `1.11.0` is what this worktree's
-   virtualenv holds today; nothing in the repository fixes it, and the suite asserts only
+1. **The pynng version is unpinned.** `0.9.0` over NNG `1.11.0` is what the repository
+   virtualenv holds; nothing in the repository fixes it, and the suite asserts only
    `1.x`. Any §8 claim is a claim about that build.
-2. **The suite was not re-run for this document.** The 43 test functions and 51 cases are
-   counted from the source; the last recorded green run is B-138's, which reports 51.
-3. **Whether `weida-sp` in the binding's manifest is intended for a future raw-socket surface
-   or is a leftover** is not stated in the crate; §7 records only that nothing under `src/`
-   refers to it.
+2. **The suite's size is counted, not run.** The 43 test functions and 51 cases are
+   counted from the source; the last recorded green run reports 51.
+3. **Whether `weida-sp` in the binding's manifest is reserved for a raw-socket surface or is a
+   leftover** is not decided by the manifest's own comment, which names the raw socket's
+   constructor; §7 records that nothing under `src/` refers to it.
 4. **The `ws://`, `wss://` and `tls+tcp://` probes in §3 record that pynng's bundled build
    accepted a `listen` call**, not that a handshake completes on them. Only `udp://`'s refusal
    is a completed negative.

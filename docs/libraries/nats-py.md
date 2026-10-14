@@ -19,7 +19,7 @@ Where this binding's shape differs from nats-py's the row says so and §8 states
 
 Measured against: nats-py 2.15.0 (the `nats.aio.client`, `nats.aio.subscription`,
 `nats.aio.msg` and `nats.errors` modules of nats-io/nats.py), CPython 3.13.14, PyO3 0.29.2,
-`abi3` from CPython 3.9, Linux x86-64. **No `nats-server` was reachable on this machine**, so
+`abi3` from CPython 3.9, Linux x86-64. **Interop against a real `nats-server` is written and not run**, so
 every row below is checked against the scripted server of
 `crates/nats/weida-nats-py/tests/scripted.py` and against the protocol reference - not against
 a running server. The two interop tests that need one are skipped with their install command,
@@ -107,10 +107,11 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
   "a wildcard subscription received it" an assertion about matching rather than about a
   hand-written `MSG`.
 - **2 against a real `nats-server`** (`tests/test_interop.py`), **skipped**: the binary is
-  absent on this machine and the skip carries its four install routes. Until one runs, nothing
+  absent where the suite runs and the skip carries its four install routes. Until one runs, nothing
   here is evidence that a server accepts what this client writes - only that the bytes are
   what the reference describes.
-- The wheel is proved separately: `crates/nats/weida-nats-py/package.sh` builds the `abi3`
+- The wheel is proved separately: `crates/nats/weida-nats-py/package.sh` (a wrapper over
+  `crates/py/package.sh`) builds the `abi3`
   release wheel, installs it into a fresh virtualenv, and runs a publish/subscribe round trip,
   a request-reply over an inbox and the 503 with `PATH` scrubbed of `cargo`, `rustc` and
   `maturin`.
@@ -163,7 +164,7 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 | `request` with a mandatory timeout that raises rather than hangs | yes, and the 503 is its own class | §4 |
 | The no-responder status among the exception classes | yes, `NoResponders` beside `RequestTimeout` | §4, §5 |
 | The synchronous surface over the same client, no second implementation | yes, `next_msg(timeout)` where the other has cancellation | §8.4 |
-| The round trip against the server B-168 supervises | **not met**: `nats-server` is absent, the two interop tests are skipped with their install command, and nothing here claims a server accepted it | §7 |
+| The round trip against a supervised `nats-server` | **not met**: `nats-server` is not run, the two interop tests skip with their install command, and nothing here claims a server accepted it | §7 |
 | No row says "partial" | yes: §6 and §8.5 name what a caller does not get | §6, §8 |
 
 ## 10. Sources

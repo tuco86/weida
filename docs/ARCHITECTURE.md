@@ -13,9 +13,10 @@ Related: [PROTOCOL.md](PROTOCOL.md), [GUARANTEES.md](GUARANTEES.md),
 
 ## 1. What a user chooses from
 
-weida is **three carriers and three vocabularies over them**, plus adapters. A user picks the
-vocabulary their problem has; there is no stack to climb, and no vocabulary is further from the
-metal than another ([decisions/0024](decisions/0024-three-families-one-back-channel.md)).
+weida is **three carriers and three vocabularies over them**, plus standalone foreign-protocol
+libraries. A user picks the vocabulary their problem has; there is no stack to climb, and no
+vocabulary is further from the metal than another
+([decisions/0024](decisions/0024-three-families-one-back-channel.md)).
 
 | Vocabulary | What it gives you | What it is made of |
 | --- | --- | --- |
@@ -58,12 +59,11 @@ rather than to a private one.
                               │
               ┌───────────────┴────────────────────────┐
               │                                        │
-          native QUIC                              adapters
-                                                  Web
-                                                  ZeroMQ
-                                                  MQTT
-                                                  AMQP 0-9-1
-                                                  ...
+          native QUIC                              other bindings
+                                                  in-process
+                                                  AF_UNIX
+                                                  named pipe
+                                                  Web (planned)
 ```
 
 **Streaming is the headline, and messaging is first-class.** The difference shows in a video
@@ -126,10 +126,14 @@ layer beneath L0 from which it could get one.
 ### L2 — broker semantics
 
 The RabbitMQ-analog layer: managed queues, publisher confirms, consumer reports with
-redelivery, storage and replication. The current `weida-broker` slice registers the queues
-named by its process-local configuration, admits a producer's message into memory, reports
-`Accepted`, and delivers under absolute per-subscription credit
-([decisions/0018](decisions/0018-minimal-broker.md)).
+redelivery, storage and replication. `weida-broker` registers the queues named by its
+process-local configuration, admits a producer's message into memory, reports `Accepted`,
+delivers under absolute per-subscription credit, and settles: a delivery orders `Processed`,
+keeps its charge against the queue until its consumer reports, and is requeued when that
+consumer is lost ([decisions/0018](decisions/0018-minimal-broker.md),
+[decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md)). The redelivery
+count on the wire, relaying a consumer's report to the producer and retiring a queue are still
+to come.
 
 The cluster design replaces that process-local inventory with a **declarative control
 plane**. An administrative API commits long-lived resources to the control Raft; controllers
@@ -159,22 +163,22 @@ under broker resource lifecycle and is not a free-standing bridge product or a d
 
 ### Why the split exists
 
-Earlier drafts had no L0/L2 line. They mixed RabbitMQ semantics into the socket layer — an
-application acknowledgement frame, an acknowledgement mode on every transfer — and got less
-than either system alone. Two removals fixed it, and both teach the same lesson.
+Mixing RabbitMQ semantics into the socket layer — an application acknowledgement frame, an
+acknowledgement mode on every transfer — gets less than either system alone. Two things
+therefore stay out of L0, and both teach the same lesson.
 
 1. **A brokerless application acknowledgement means "arrived in RAM".** QUIC already
    retransmits, and already reports that the peer's transport holds every byte. An
-   acknowledgement frame layered on that borrowed RabbitMQ's vocabulary without RabbitMQ's
-   substance: nobody had taken responsibility for the message, because there was nobody but
+   acknowledgement frame layered on that would borrow RabbitMQ's vocabulary without RabbitMQ's
+   substance: nobody would have taken responsibility for the message, because there is nobody but
    the peer to take it. An acknowledgement earns a wire frame only when it transfers
    responsibility to a hop that outlives the sender — which is what L2 is for.
-2. **The correlation machinery existed only because replies rode separate streams.** A reply
-   on its own unidirectional stream must be matched back to its request, so the design
-   carried per-transfer identifiers, a per-connection pending-reply table, a cancellation
-   frame and a reply-arrival notification — machinery whose entire job was to undo a choice
-   made one layer down. Req/Rep on one bidirectional stream deletes all of it: the stream
-   *is* the correlation, and nothing on the wire names an exchange.
+2. **Correlation machinery would exist only because replies rode separate streams.** A reply
+   on its own unidirectional stream must be matched back to its request, which takes
+   per-transfer identifiers, a per-connection pending-reply table, a cancellation frame and a
+   reply-arrival notification — machinery whose entire job would be to undo a choice made one
+   layer down. Req/Rep on one bidirectional stream needs none of it: the stream *is* the
+   correlation, and nothing on the wire names an exchange.
 
 Guarantees belong to the layer that can underwrite them. QUIC underwrites bytes; a broker
 underwrites responsibility; the socket layer between them should invent neither.
@@ -187,8 +191,8 @@ The master doc's rule survives the restructure:
 > programming model.
 
 L2 is a layer, not a fork: it adds guarantees to the same patterns rather than a second way
-of writing programs. The v0 implementation is L0 + L1 over native QUIC, and it MUST NOT
-acquire a second messaging model when L2 is built.
+of writing programs. `weida-broker` builds it from L0 + L1 over native QUIC and MUST NOT
+acquire a second messaging model.
 
 ---
 
@@ -200,7 +204,7 @@ The term `Node` is deliberately not used; it is too overloaded.
 
 A process-level execution/resource container. The asynchronous Rust implementation is
 primary. The Runtime owns or coordinates asynchronous execution, timers, DNS, QUIC runtime
-integration, connection pooling, buffer pools, transport/adapter registrations, shutdown,
+integration, connection pooling, buffer pools, transport registrations, shutdown,
 common resource limits and observability infrastructure.
 
 A process MAY create multiple Runtimes, especially in tests or deliberately isolated
@@ -246,8 +250,8 @@ A Binding represents one concrete reachable transport of **this** protocol. Nati
 reference transport and the only externally reachable one; the local transports of
 [decisions/0010](decisions/0010-local-transport.md) — in-process, `AF_UNIX`, Windows named
 pipes — are bindings too, reachable only on the machine and carrying the same frames without
-TLS (§3, [PROTOCOL.md](PROTOCOL.md) §2.1). The Web adapter (master doc §38, §39) is the
-framework's way into browsers and exposes the same namespace over WebSocket or WebTransport.
+TLS (§3, [PROTOCOL.md](PROTOCOL.md) §2.1). The planned Web binding (master doc §38, §39) is the
+framework's way into browsers and will expose the same namespace over WebSocket or WebTransport.
 This semantic division between Listener and Binding is mandatory, and it is what lets one
 Listener answer on a QUIC port and a UNIX socket at once.
 
@@ -325,7 +329,7 @@ the dialling side — with the pid the pipe reports. An in-process peer is `None
 anonymous client, because there is nobody else to prove. Three rules travel with it: the
 credential is the one captured when the connection was made, not when a transfer was sent; a
 PID is an observation and MUST NOT be the thing authorized on; and the rule this amends is
-only the *count* — 0008 §4.1 said the fingerprint was the only identity, and what survives
+only the *count* — 0008 §4.1 names the fingerprint as the only identity, and what holds
 unchanged is that an identity is proved and never claimed.
 
 ### Endpoint
@@ -491,12 +495,15 @@ Its `proxy` and `proxy_steerable` helpers run the protocol's own queue, forwarde
 topologies on the reactor. They do not name `weida`, and no second crate assigns global weida
 counterparts to ZeroMQ socket types. The same boundary applies to every foreign library.
 
-`weida-broker` is the L2 layer of §1. Its current slice is an in-memory queue at each
-configured endpoint path; the cluster design moves queue existence and configuration into
-control-Raft resources without adding a declare operation to the messaging data plane
+`weida-broker` is the L2 layer of §1: an in-memory queue at each configured endpoint path,
+with bounded admission, `Accepted` on the producer hop, absolute per-subscription credit, and
+settlement with requeue when a consumer is lost. The redelivery count on the wire (DATA key
+`12`), relaying a consumer's report to the producer and retiring a queue are still to come.
+The cluster design moves queue existence and configuration into control-Raft resources without
+adding a declare operation to the messaging data plane
 ([decisions/0018](decisions/0018-minimal-broker.md),
 [decisions/0022](decisions/0022-consensus-topology.md)). It is a separate crate because it is
-a separate layer: it depends on `weida`, nothing in the core may depend on it, and a
+a separate layer: it depends only on `weida`, nothing in the core may depend on it, and a
 brokerless deployment does not link it.
 
 Planned, not yet present: `weida-web` (the Web binding) and protocol-specific Connector
@@ -508,18 +515,17 @@ separately useful and never depend on `weida` or `weida-protocol`.
 ### `weida-core`
 
 The I/O-free model. No tokio, no sockets, no quinn. Contains `Error` with the `ErrorCode`
-and `StopReason` vocabularies, `EndpointAddr` and the `SCHEME` constant, `Limits`, and
-`TraceContext` with its W3C traceparent codec. It is deliberately smaller than it was: the
-send, receive and correlation state machines it used to hold described the acknowledgement
-model that no longer exists, and the correlation table was replaced by nothing at all when
-Req/Rep moved onto a bidirectional stream. Because the crate is I/O-free, the error
-vocabulary and its stop-code mapping ([FAILURE_MODEL.md](FAILURE_MODEL.md) §4) are
-unit-testable without a network.
+and `StopReason` vocabularies, `EndpointAddr` and the `SCHEME` constant, `Fingerprint`,
+`Limits`, and `TraceContext` with its W3C traceparent codec. It holds no send, receive or
+correlation state machine: a completion is a cursor over bytes rather than an acknowledgement
+exchange, and Req/Rep is one bidirectional stream, so there is no correlation table to keep.
+Because the crate is I/O-free, the error vocabulary and its stop-code mapping
+([FAILURE_MODEL.md](FAILURE_MODEL.md) §4) are unit-testable without a network.
 
 ### `weida-protocol`
 
 The wire codec, also with no I/O: RFC 9000 varints, the stream preamble with its
-cap-before-allocation check, the seven frame headers behind the eight frame kinds — SUBSCRIBE
+cap-before-allocation check, the eight frame headers behind the nine frame kinds — SUBSCRIBE
 and UNSUBSCRIBE share one — with hand-written CBOR encoders and decoders, the cursor record's
 varint pair, the datagram flow prefix, the negotiation
 function, and the QUIC application error code constants. Being I/O-free makes it directly
@@ -571,10 +577,11 @@ already holds and `weida` has no second way to reach the reactor.
 
 ### `weida-broker`
 
-L2, currently implemented as the smallest useful local slice: an in-memory queue per
-configured endpoint path, bounded admission, `Accepted` on the producer hop, absolute consumer
-credit, settlement and requeue. Its whole dependency list is `weida`; the layer below is the
-public API, not its internals, and a brokerless deployment does not link it.
+L2 as built: an in-memory queue per configured endpoint path, bounded admission, `Accepted`
+on the producer hop, absolute consumer credit, and settlement with requeue when a consumer is
+lost. The redelivery count on the wire (DATA key `12`), relaying a consumer's report to the
+producer and retiring a queue are still to come. Its whole dependency list is `weida`; the
+layer below is the public API, not its internals, and a brokerless deployment does not link it.
 
 The cluster target is a managed resource system. A control Raft stores queue and Connector
 specifications, generations, placement and ownership; one Raft group per replicated queue
@@ -608,8 +615,8 @@ openraft is re-exported, because a user implements openraft's own traits and two
 in one binary do not compose. The cost — openraft is pre-1.0 — is paid by naming one openraft
 minor line per `weida-raft` release, the contract `tokio-rustls` has with `rustls`.
 
-`weida-broker` depends on it behind the non-default `cluster` feature; nothing in the core depends
-on it at all.
+No other crate names openraft: `weida-broker` depends only on `weida`, and nothing in the core
+depends on `weida-raft`.
 
 ### Dependency direction
 
@@ -620,7 +627,7 @@ protocol   runtime
  ↑          ↑    ↖
 weida ──────┘     weida-zmq ──→ weida-zmtp   (the codec, which depends on nothing)
 
-weida-broker        →  weida + weida-raft     L2; cluster support is optional
+weida-broker        →  weida                  L2
 weida-raft          →  weida + weida-protocol + openraft   consensus with I/O
 ```
 
@@ -633,39 +640,31 @@ dependencies are prohibited (master doc §74).
 
 ### Why runtime and transport are one crate
 
-Master doc §73 lists `runtime/` and `transport-quic/` as separate crates. They are merged
-into `crates/weida` for this increment, on the authority of §73's own rule:
+Master doc §73 lists `runtime/` and `transport-quic/` as separate crates. The QUIC transport
+stays in `crates/weida` with the stream core, on the authority of §73's own rule:
 
 > Do not create dozens of tiny crates prematurely.
 > Start with strong module boundaries and split crates where the dependency/ownership
 > boundary is real.
 
-The boundary was not real when that was written. Exactly one transport existed, so a
-`runtime` crate would have had exactly one consumer and a `transport-quic` crate exactly one
-dependent; the split would have bought no isolation and no independent versioning while
-adding a public API surface between two halves of one design. The QUIC code is confined to
-module `transport` inside `crates/weida`, so extracting it later is a mechanical move: the
-module boundary that a crate split needs already exists and is already enforced by the
-module system. The split becomes worthwhile when a second consumer of the runtime appears.
+A `transport-quic` crate would have exactly one dependent: a ZeroMQ implementation has no use
+for QUIC, and the other transports are variants of the same closed enum (§5, The transport
+boundary). The split would buy no isolation and no independent versioning while adding a
+public API surface between two halves of one design. The QUIC code is confined to module
+`transport` inside `crates/weida`, so the module boundary a crate split needs already exists
+and is enforced by the module system.
 
-**The trigger has fired, and the cut is not the one §73 named.** The second consumer arrived
-as the standalone competitor libraries of
-[0013](decisions/0013-competitor-libraries.md), so `weida-runtime` **is** extracted: B-070,
-`crates/runtime`, with `weida` as its first consumer. What it takes is the **reactor and
-the OS**: `Exec` with `spawn`, `sleep`, `within`, `enter` and the capped resolver, the three
-reactor-ownership constructors with their background-shutdown discipline, the `AF_UNIX` bind
-hygiene and peer credentials of [0010](decisions/0010-local-transport.md) §4.5, a generic
-named-endpoint registry and the bounded close budget. What it deliberately leaves behind is
-QUIC: §73's `transport-quic` still has exactly one dependent, because a ZeroMQ
-implementation has no use for it, so `Link`, the connection pool, the actor and every line
-of [0012](decisions/0012-local-connection-grouping.md) stay here with the protocol they
-serve. No public item of `weida` changes [0013 §4.2].
-
-That last sentence is checked rather than asserted: the item list `cargo doc` generates for
-`weida` — every page and every rendered signature — is identical before and after the
-extraction, because `Exec` was `pub(crate)`, so publishing it in a new crate added surface
-there and removed none here. The only observable difference for a user of `Runtime` is one
-more node in `cargo tree`.
+**The runtime is the cut that has a second consumer.** The standalone foreign-protocol
+libraries of [0013](decisions/0013-competitor-libraries.md) need a reactor and the OS but no
+QUIC, so `weida-runtime` (`crates/runtime`) holds the **reactor and the OS**: `Exec` with
+`spawn`, `sleep`, `within`, `enter` and the capped resolver, the three reactor-ownership
+constructors with their background-shutdown discipline, the `AF_UNIX` bind hygiene and peer
+credentials of [0010](decisions/0010-local-transport.md) §4.5, a generic named-endpoint
+registry and the bounded close budget. `Link`, the connection pool, the actor and every line
+of [0012](decisions/0012-local-connection-grouping.md) stay in `weida` with the protocol they
+serve. No public item of `weida` is affected [0013 §4.2]: `Exec` is `pub(crate)` in `weida`,
+so its public home in `weida-runtime` adds surface there and removes none here, and a user of
+`Runtime` sees `weida-runtime` as one more node in `cargo tree`.
 
 ---
 
@@ -691,10 +690,10 @@ All three constructors are `weida-runtime`'s — `Exec::current`, `Exec::from_ha
 holds for as long as the runtime that created it.
 
 `Exec` is the **whole** surface onto the async runtime: `spawn`, `sleep`, `within`,
-`resolve` (DNS) and `enter`. It lives in `crates/runtime/src/exec.rs` since B-070 and is
-re-exported `pub(crate)` from `weida`'s `runtime.rs`. Nothing else calls `tokio::spawn`,
-`tokio::time` or `lookup_host`, and the check is two greps — one per crate, because the
-surface moved but the rule did not:
+`resolve` (DNS) and `enter`. It lives in `crates/runtime/src/exec.rs` and is re-exported
+`pub(crate)` from `weida`'s `runtime.rs`. Nothing else calls `tokio::spawn`, `tokio::time`
+or `lookup_host`, and the check is two greps, one per crate, because the surface lives in
+`weida-runtime` while the rule binds both:
 
 ```text
 grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src   # no call outside #[cfg(test)]
@@ -713,7 +712,7 @@ stating:
   place hands work to the runtime instead of entering it — the client handshake, because
   completing it spawns `quinn`'s connection driver from inside the poll.
 - **The payload path is untouched.** `Exec` appears in connection setup, never between
-  `write_all` and the socket: no task hop and no allocation was added to the hot path
+  `write_all` and the socket: it adds no task hop and no allocation to the hot path
   ([INVARIANTS.md](INVARIANTS.md)).
 
 ### The transport boundary
@@ -731,7 +730,7 @@ through a vtable would put an indirection on exactly the path that is otherwise 
 task hops and locks. `AF_UNIX` and named pipes are one variant each
 ([decisions/0010](decisions/0010-local-transport.md) §4.1) and no new concept.
 
-The first non-QUIC variant is the in-process transport, `crates/weida/src/inproc.rs`: a
+The in-process variant is `crates/weida/src/inproc.rs`: a
 process-global registry of bus names — `weida-runtime`'s `NameRegistry<LocalConn>` under
 `weida-core`'s 256-byte budget — and a connection that mints a channel pair per
 stream. That pair *is* the stream, which is §4.2's "the OS connection is the stream" with
@@ -763,10 +762,9 @@ sides. Both carry an `Arc<Namespace>`: on a server it is the Listener's, on a cl
 starts empty and a `Subscriber` registers its path there, so fanned-out copies arriving on a
 dialled connection have somewhere to land.
 
-It owns no tables. The correlation and acknowledgement maps it used to hold went away with
-the model that needed them: an exchange is one stream, so there is nothing per connection to
-index, and there are no acknowledgements to await. What is left is a serialization point for
-the only two frames a **destructor** may still need to emit:
+It owns no tables: an exchange is one stream, so there is nothing per connection to index,
+and there are no acknowledgements to await. It is a serialization point for the only two
+frames a **destructor** may need to emit:
 
 ```text
 Ctl::SendUnsubscribe { path, filter }   // a dropped Subscriber withdraws its filters
@@ -775,24 +773,23 @@ Ctl::ReplyError      { send, code }     // a dropped IncomingRequest reports NO_
 
 Both exist for one narrow reason: `Drop` may run on a thread with no Tokio reactor, so it
 can neither await nor safely spawn. Handles hand the work over a bounded `mpsc` (depth 1024)
-with a non-blocking `notify` and never wait for an answer — no oneshot reply channel remains
-anywhere in the actor protocol, so no API call is ever serialized behind the actor.
+with a non-blocking `notify` and never wait for an answer — the actor protocol has no oneshot
+reply channel, so no API call is ever serialized behind the actor.
 
 ### Payload bytes never traverse the actor
 
 This is a hard rule. Handles own their quinn `SendStream` and `RecvStream` directly, so the
 hot path from `write_all` to the wire has **no task hop and no lock**. Routing payload
-through the actor would reintroduce exactly the per-transfer heavyweight actor that
-master doc §49 forbids. With the tables gone the rule is nearly free: on a healthy
+through the actor would be exactly the per-transfer heavyweight actor that
+master doc §49 forbids. The actor owns no tables, so the rule is nearly free: on a healthy
 connection the actor sees no messages at all.
 
 ### Nothing to register
 
-`open()` picks a peer, writes the DATA header and returns. An earlier design reserved an
-identifier and awaited the actor's confirmation *before* touching the network, to close the
-race where an acknowledgement could arrive before its bookkeeping entry existed. No entry,
-no race, and no round trip on the critical path: `push_1kib_best_effort` is 72 % faster than
-the registering version it replaced ([IMPLEMENTATION.md](IMPLEMENTATION.md)).
+`open()` picks a peer, writes the DATA header and returns. It reserves no identifier and
+awaits nothing from the actor before touching the network, so there is no bookkeeping entry
+for an acknowledgement to race with and no round trip on the critical path:
+`push_1kib_best_effort` measures 7.9 µs ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.2).
 
 ### Accept dispatch
 
@@ -875,7 +872,7 @@ Server side, `max_connections_per_peer` (default 64) bounds what one peer may ho
 binding, counted by the fingerprint it proved and released when a connection closes. It exists
 because one connection per path lets the dialling side choose the number: 64 connections to one
 peer measured ~50 MiB of transport state across both ends, against a ~1.1 ms handshake each
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011). Anonymous connections are not counted
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.8). Anonymous connections are not counted
 together, because two of them cannot be shown to be one peer; a binding that wants the bound
 requires a client identity.
 
@@ -893,9 +890,8 @@ Server: the binding's `Identity` supplies the certificate chain and key — from
 PEM already in memory, because a key held in a secret store must not have to be written to
 disk first — `alpn_protocols` is set to exactly `[b"weida/0"]`, and the transport
 configuration applies the stream and connection windows, both stream-count limits and the
-idle timeout from `Limits`. The bidirectional limit was hardcoded to `0` while Req/Rep rode
-unidirectional streams — the transport refused bidirectional streams outright — and is now
-`max_concurrent_bidi_streams`, which is what bounds the exchanges a peer may hold open on us.
+idle timeout from `Limits`. The bidirectional limit is `max_concurrent_bidi_streams`, which
+bounds the exchanges a peer may hold open on us.
 A binding whose `client_trust` is set requires client authentication: an anonymous client
 fails the handshake and sees `Error::Tls`, and so does a client whose identity a
 `ClientTrust::Trusted` trust does not accept. `ClientTrust::AnyKey` refuses no key: it checks
@@ -914,8 +910,8 @@ a peer is only ever accepted for a key it proved it holds. The provider is named
 rather than taken from the rustls process default: a library must not install global state in
 its host application.
 
-**Authentication is not authorization**, and since
-[decisions/0015](decisions/0015-peer-authorization.md) that is a decision rather than a
+**Authentication is not authorization**, and
+[decisions/0015](decisions/0015-peer-authorization.md) makes that a decision rather than a
 description of what happens to be missing. A completed handshake says which key answered and
 nothing about what that peer may do. Deciding that is the acceptor's job, on
 `IncomingMeta::peer`: the identity is on every inbound transfer and request, so a handler can
@@ -983,8 +979,8 @@ responder will not answer at all, the reply half carries `ERROR{NO_REPLY}` + FIN
 DATA header, and `recv()` returns `Error::NoReply`.
 
 The two halves are independent for flow control, so the interleaving in the diagram is real
-rather than illustrative. The stream count went from five to three, and `echo_1kib_rtt` fell
-about 30 % with it ([IMPLEMENTATION.md](IMPLEMENTATION.md)).
+rather than illustrative. On a warm connection an exchange is one stream, and `echo_1kib_rtt`
+measures its round trip ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.2).
 
 `Delivery` is orthogonal to the reply and usually much slower than it: it reports that the
 responder's *transport* took the request, and on an idle connection the peer's delayed
@@ -997,8 +993,8 @@ for is the one it exists for.
 ## 6a. Pattern taxonomy
 
 Master doc §82 leaves open "whether a smaller internal primitive set can implement the
-patterns cleanly". Answered from the built system: yes — and the set got simpler, not richer,
-when Req/Rep moved onto a bidirectional stream.
+patterns cleanly". Answered from the built system: yes, and the set is small because
+Req/Rep is one bidirectional stream.
 
 | # | Primitive | Where it lives | Used by |
 | --- | --- | --- | --- |
@@ -1010,9 +1006,8 @@ when Req/Rep moved onto a bidirectional stream.
 So: **Req = P2 + P3**, **Push = P1 + P3**, **Rep = P4**, **Pull = P4**, **Sub = P3 + P4**,
 and **Pub = P1 per matching subscriber under a fan-out selection**.
 
-P2 used to be something else entirely: a correlation table, a pending-reply map keyed by an
-identifier the DATA header carried, owned by the connection actor and reachable only by
-message. It is deleted, and nothing implements it now — **the bidirectional stream is the
+P2 is not a correlation table. There is no pending-reply map keyed by an identifier in the
+DATA header and owned by the connection actor — **the bidirectional stream is the
 correlation**. That is the difference between a primitive and machinery: P1 and P2 are the
 two stream kinds QUIC already gives us, and the patterns add only selection (P3) and
 queueing (P4) on top.
@@ -1041,8 +1036,8 @@ Neither constraint exists here.
   in an envelope. That is what Router provides for the direct-peer case.
 
 What Router adds *beyond* that — forwarding to third parties, explicit identity envelopes,
-routing tables — is broker work (master doc §47, §85), belongs to L2 in Phase 6, and would be
-a new component rather than a new socket type. Introducing `Endpoint<Router>` in v0 would
+routing tables — is broker work (master doc §47, §85), belongs to L2, and would be a new
+component rather than a new socket type. Introducing `Endpoint<Router>` in v0 would
 name a distinction the transport does not have.
 
 ### Why fan-out is unordered
@@ -1050,15 +1045,15 @@ name a distinction the transport does not have.
 P1 is one transfer per stream, and QUIC does not order streams relative to one another. A
 publisher's per-subscriber writer is serialized, so copies are handed to the transport in
 publication order — but that is a property of one hop's implementation, not a guarantee.
-Making per-producer ordering real requires a sequence number in the DATA header and
-reassembly on the receiving side; that is a deliberate later protocol addition rather than
-something to imply from the current behaviour ([GUARANTEES.md](GUARANTEES.md) §6).
+Per-producer ordering needs a sequence number in the DATA header and, to reassemble, a hold
+on the receiving side; both exist, and both are opt-in by negotiation (`PerProducer`) rather
+than something to imply from the default behaviour ([GUARANTEES.md](GUARANTEES.md) §3, §6).
 
 ---
 
 ## 6b. The ZeroMQ pattern family, mapped
 
-Every pattern in the family has a place in this model, and **every one of them is now built**.
+Every pattern in the family has a place in this model, and all of them are built.
 
 | zmq/nanomsg | weida | Status |
 | --- | --- | --- |
@@ -1070,30 +1065,27 @@ Every pattern in the family has a place in this model, and **every one of them i
 | BUS | n members, each bound on its own path and dialling the others | implemented |
 | SURVEYOR/RESPONDENT | fan-out of exchanges with a deadline | implemented |
 
-"Mapped, unimplemented" **was** a status rather than a backlog entry, and the question it left
-open — is this vocabulary worth a type? — has been answered twice: by the owner (**yes, the
-full family**) and then by building all three (B-236, B-237, B-238), which completes the
-nanomsg set, whose patterns are PAIR, REQREP, PUBSUB, PIPELINE, SURVEY and BUS. Each maps onto
-stream kinds the wire already carries and primitives §6a already lists, so each is API surface
-rather than protocol — and building them proved it: **not one byte of wire vocabulary was
-added for any of the three.** A test has a `Paired` talking to a bare `Peer` and `Acceptor` on
-the same path; a respondent's route is byte-for-byte a replier's; a bus member's is a
-puller's.
+PAIR, SURVEY and BUS complete the nanomsg set, whose patterns are PAIR, REQREP, PUBSUB,
+PIPELINE, SURVEY and BUS. Each maps onto stream kinds the wire already carries and
+primitives §6a already lists, so each is API surface rather than protocol: **no wire
+vocabulary is specific to any of the three.** A test has a `Paired` talking to a bare `Peer`
+and `Acceptor` on the same path; a respondent's route is byte-for-byte a replier's; a bus
+member's is a puller's.
 
-Four things the table cannot say, each one found by building rather than by mapping.
+Four things the table cannot say.
 
 - **PAIR is one-way transfers in both directions**, not "one exchange or one one-way transfer
-  each way" as this row once read: an exchange's reply half would make one side a replier, and
+  each way": an exchange's reply half would make one side a replier, and
   PAIR is symmetric. The one-peer rule is a claim taken at dispatch, and the **first** peer is
   kept — ZeroMQ drops the newcomer silently, weida refuses it with `LIMIT_EXCEEDED` and says so
   ([0005](decisions/0005-refusal-race.md)).
 - **A bound side learns its peer only when that peer speaks.** A bound pair's first send
   therefore waits for the peer rather than buffering; the accepting side of this library has no
-  other way to address a peer it has not heard from, and inventing a queue there would have been
-  a guarantee nobody asked for.
-- **SURVEY needed one primitive, not a pattern's worth.** `Peer::open_bi` picks *one* peer,
+  other way to address a peer it has not heard from, and inventing a queue there would be a
+  guarantee nobody asked for.
+- **SURVEY needs one primitive, not a pattern's worth.** `Peer::open_bi` picks *one* peer,
   which is Req/Rep's selection policy; a survey needs the same write against every peer, so the
-  body moved into `stream::open_exchange_on` and the pattern is a fan-out of it plus a deadline.
+  write lives in `stream::open_exchange_on` and the pattern is a fan-out of it plus a deadline.
   The deadline is the caller's, nothing on the wire carries it, and a late reply is dropped and
   **counted** where the reply arrives rather than where the caller reads — so the number means
   "after the deadline" whatever the caller does with its handle.
@@ -1102,8 +1094,8 @@ Four things the table cannot say, each one found by building rather than by mapp
   `max_concurrent_uni_streams`, and `open_uni` blocks. With one, a slow member costs its own
   copies — counted in `BusMember::dropped`, at the queue when it is full and at the wire when a
   write fails — and never the sender's time. That is the same rule Pub/Sub states in
-  [GUARANTEES.md](GUARANTEES.md) §6, and BUS is the second pattern to need it, which is what
-  makes it a rule rather than a Pub/Sub detail.
+  [GUARANTEES.md](GUARANTEES.md) §6, and BUS needs it as well, which is what makes it a rule
+  rather than a Pub/Sub detail.
 
 ---
 
@@ -1144,7 +1136,7 @@ The surface of crate `weida`, grouped by layer.
 ```rust
 // re-exports from weida-core: Error, ErrorCode, StopReason, Limits, TraceContext,
 //     EndpointAddr (with .peer: Option<Fingerprint>), Fingerprint
-// new error variants: Error::InvalidFingerprint(String), Error::Untrusted(Fingerprint)
+// error variants: Error::InvalidFingerprint(String), Error::Untrusted(Fingerprint)
 pub struct RuntimeConfig { pub limits: Limits,
     pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/,
     pub worker_threads: usize /*1; Runtime::owned only*/ }                   // Default impl
@@ -1306,12 +1298,12 @@ impl Subscriber {
 
 // ---- transfer handles, shared by both layers ------------------------------------------
 #[derive(Default, Clone)] pub struct TransferMeta { pub content_type: Option<String>,
-    pub content_len: Option<u64>, pub trace: Option<TraceContext> }  // None trace → generate ids
+    pub content_len: Option<u64>, pub trace: Option<TraceContext> }  // None trace → none written
                                        // builders: with_content_type / with_content_len / with_trace
 
 pub struct OutgoingTransfer;                                 // impl tokio::io::AsyncWrite + futures_io::AsyncWrite
 impl OutgoingTransfer {
-    pub fn trace(&self) -> TraceContext;
+    pub fn trace(&self) -> Option<TraceContext>;             // what the caller supplied, if anything
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error>;
     pub fn finish(self) -> Result<Delivery, Error>;          // sync: marks FIN, hands back the receipt
     pub fn cancel(self);                                     // RESET_STREAM(CANCELED)
@@ -1399,7 +1391,8 @@ Type by type:
 - **`Replier`** — `Endpoint<Rep>`. `accept()` yields inbound exchanges from the endpoint
   queue.
 - **`TransferMeta`** — per-transfer outbound metadata: content type, advisory length, trace
-  context. A `None` trace means the runtime generates fresh trace and span ids.
+  context. A `None` trace writes no `traceparent`: a context is propagated and never minted
+  ([decisions/0028](decisions/0028-trace-propagation-is-the-callers.md)).
 - **`OutgoingTransfer`** — the write half of a transfer, an `AsyncWrite` in both the
   `tokio::io` and the `futures-io` sense. `finish()` is
   synchronous: it marks the FIN and hands back the receipt without waiting for it. `cancel()`

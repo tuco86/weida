@@ -13,10 +13,10 @@ get, and what does that caller not get.*
 
 The same reason [`mqtt.md`](mqtt.md) §0 gives, one layer up: **MQTT's topology is strictly
 asymmetric and this is a client**. Retained storage, the session store, subscription routing,
-shared-subscription selection and the Will's delay timer are all the server's, the server is
-Phase D ([0014](../decisions/0014-parallel-libraries.md) §2), and there is no
-`weida_mqtt.Broker` — `crates/mqtt/weida-mqtt-py/src/lib.rs:36-43` says so in the module's own
-documentation. paho-mqtt is a client too, so the two columns below line up: neither has a
+shared-subscription selection and the Will's delay timer are all the server's, a server is a
+broker and so outside this library ([0014](../decisions/0014-parallel-libraries.md) §2), and
+there is no `weida_mqtt.Broker`, as the module documentation of
+`crates/mqtt/weida-mqtt-py/src/lib.rs` says. paho-mqtt is a client too, so the two columns below line up: neither has a
 server half, and a row about server behaviour belongs in [`mqtt.md`](mqtt.md) §6 and §10.
 
 ## 1. What a row means
@@ -33,12 +33,13 @@ Where this binding's shape differs from paho's the row says so and §9 states wh
 **What this side was read from.** Every verdict below names a module under
 `crates/mqtt/weida-mqtt-py/src/` or a test function under `crates/mqtt/weida-mqtt-py/tests/`,
 and was read there. CPython 3.9 and up through PyO3 0.29 with `abi3-py39`
-(`Cargo.toml:113` at the workspace root, `crates/mqtt/weida-mqtt-py/pyproject.toml:8`), the
+(the `pyo3` entry of the workspace `Cargo.toml`, `requires-python` in
+`crates/mqtt/weida-mqtt-py/pyproject.toml`), the
 library entered with `default-features = false` plus `blocking`
-(`crates/mqtt/weida-mqtt-py/Cargo.toml:35-40`), Linux x86-64.
+(the `weida-mqtt` dependency of `crates/mqtt/weida-mqtt-py/Cargo.toml`), Linux x86-64.
 
 **Which broker the tests run against.** One: **`rumqttd` 0.20.0** on `127.0.0.1:21884`, the
-listener of `crates/mqtt/weida-mqtt/tests/interop/rumqttd.toml`. `tests/conftest.py:15-41`
+listener of `crates/mqtt/weida-mqtt/tests/interop/rumqttd.toml`. `tests/conftest.py`
 probes that port once per session and skips with the `cargo install rumqttd --version 0.20.0`
 command where nothing answers — the Python half of what `#[ignore]` does for the Rust suites.
 The port is deliberately not 1883, so a developer's own broker cannot be measured by accident.
@@ -46,11 +47,12 @@ The second broker of [`mqtt.md`](mqtt.md) §1, `rmqtt` 0.23.1, is **not** used b
 suite: no test in `crates/mqtt/weida-mqtt-py/tests/` names it.
 
 **Which paho version.** None. `paho` does not occur anywhere under `crates/`, nothing in
-`pyproject.toml`, `develop.sh` (which installs `maturin`, `pytest` and `pytest-asyncio` and
-nothing else), `tests/conftest.py` or `tests/test_interop.py` pins or imports it, and no test
-in this repository has ever run against it. The paho column below is therefore **the
-documented public API of paho-mqtt 2.x, not a measurement**, and it is the one column of this
-document that cannot be checked out of the repository — see §8 and the open question in §9.7.
+`pyproject.toml`, `develop.sh` (a wrapper over `crates/py/develop.sh` that installs `maturin`,
+`pytest` and `pytest-asyncio` and nothing else), `tests/conftest.py` or `tests/test_interop.py`
+pins or imports it, and no test in this repository runs against it. The paho column below is
+therefore **the documented public API of paho-mqtt 2.x, not a measurement**, and it is the one
+column of this document that cannot be checked out of the repository — see §8 and the open
+question in §9.7.
 Where a claim about paho's *behaviour* rather than its API names appears, it is one the
 research sheet already carries with a citation:
 [`../research/mqtt5.md`](../research/mqtt5.md) §13 and its references [37] and [38].
@@ -91,7 +93,7 @@ client and a delivery stream — the three handles §9.2 measures the two surfac
 | paho-mqtt 2.x | This binding | Verdict |
 | --- | --- | --- |
 | `transport="tcp"`, port 1883 | `context.connect("127.0.0.1:1883", options)` | present — `client.rs:97-123`, and every interop test runs over it |
-| `client.tls_set(ca_certs=..., certfile=..., keyfile=...)`, `tls_set_context(ssl.SSLContext)`, `tls_insecure_set` | — | **absent by construction.** The library has TLS behind a default-on `tls` feature and this binding turns it off (`Cargo.toml:29-40`), because `weida_mqtt::ConnectOptions::tls` takes the caller's `rustls::ClientConfig` (`crates/mqtt/weida-mqtt/src/options.rs:113-122`) and this surface has no way to accept one from Python. A binding that linked a TLS stack it could not configure would be linking it for nothing. §9.1 |
+| `client.tls_set(ca_certs=..., certfile=..., keyfile=...)`, `tls_set_context(ssl.SSLContext)`, `tls_insecure_set` | — | **absent by construction.** The library has TLS behind a default-on `tls` feature and this binding turns it off (the `weida-mqtt` dependency in `Cargo.toml`), because `weida_mqtt::ConnectOptions::tls` takes the caller's `rustls::ClientConfig` (`crates/mqtt/weida-mqtt/src/options.rs:113-122`) and this surface has no way to accept one from Python. A binding that linked a TLS stack it could not configure would be linking it for nothing. §9.1 |
 | `client.socket()` after a TLS connect, to ask what protected the credentials | `client.is_encrypted` → **always `False`**, and says so | present as an honest answer rather than an absent attribute — `client.rs:457-469`, `sync.rs:259-264`, asserted at `tests/test_interop.py::test_the_connack_reaches_python` (`assert client.is_encrypted is False`). The User Name, the Password and every byte of Authentication Data travel in the CONNECT, so this is the only question a client can ask about what protected them, and the answer here is "nothing" |
 | `transport="websockets"`, `ws_set_options(path, headers)`, `wss` | — | absent, in the library too: an HTTP upgrade and a framing layer `weida-mqtt` has no dependency for ([`mqtt.md`](mqtt.md) §8). A caller who needs it wants a WebSocket client plus `weida-mqtt-codec`, which is sans-I/O so that the composition is possible |
 | `transport="unix"` | — | absent: not in the specification, and brokers that offer one differ on the address syntax ([`mqtt.md`](mqtt.md) §8) |
@@ -136,7 +138,7 @@ byte" (`options.rs:1-8`, `234-240`).
 | `client.message_retry_set(seconds)` | — | absent, and the absence is the library's rule: retransmission happens once, just after a CONNACK with `Session Present` 1, and there is no retry timer anywhere ([`mqtt.md`](mqtt.md) §4) |
 | — | `max_subscription_ids=`, `incoming_queue=` | present, and paho has no counterpart: the two resources MQTT bounds nowhere ([`mqtt.md`](mqtt.md) §9.1) are caller arguments — `options.rs:223-228` |
 | — | `connect_timeout=`, `ping_timeout=` | present, and paho has neither as a number the caller sets: the specification puts no deadline on the CONNACK and none on a missing PINGRESP, and an unbounded wait is a hang — `options.rs:229-232` |
-| `Limits::max_addresses` (the library's cap on a resolver's answer), `Limits::max_user_properties` (its cap on `User Property` pairs per delivery) | — | absent from the Python surface: these are the two `Limits` fields with no keyword argument (`crates/mqtt/weida-mqtt/src/limits.rs` against `options.rs:214-228`), so a Python caller gets the library's defaults of 8 and 64 and cannot change either. The second followed the first deliberately when it was added rather than widening the pyo3 signature |
+| `Limits::max_addresses` (the library's cap on a resolver's answer), `Limits::max_user_properties` (its cap on `User Property` pairs per delivery) | — | absent from the Python surface: these are the two `Limits` fields with no keyword argument (`crates/mqtt/weida-mqtt/src/limits.rs` against `options.rs:214-228`), so a Python caller gets the library's defaults of 8 and 64 and cannot change either. Both stay out of the pyo3 signature deliberately |
 | `client.enable_logger()`, `on_log` | — | absent — §6 |
 | `client.manual_ack=True`, `client.ack(mid, qos)` | — | absent: acknowledgements are the connection task's, and a delivery reaching the iterator has already been acknowledged at its QoS. What paho's manual ack buys — backpressure — is `incoming_queue`, which stops the reader rather than delaying an ack |
 
@@ -174,7 +176,7 @@ byte" (`options.rs:1-8`, `234-240`).
 
 **45 pytest functions** in `crates/mqtt/weida-mqtt-py/tests/`: 12 in `test_interop.py`, 12 in
 `test_sync.py` and 21 in `test_values.py`. **23** of them ask for the `broker` fixture and
-skip with its install command where the port does not answer (`conftest.py:36-41`); the other
+skip with its install command where the port does not answer (`conftest.py`); the other
 **22** — the 21 in `test_values.py` and `test_sync.py::test_no_event_loop_exists_in_this_process`,
 which asserts the condition every other test in that file runs under — need nothing.
 
@@ -203,13 +205,13 @@ which asserts the condition every other test in that file runs under — need no
 - `NotConnected` after a DISCONNECT, and a **cancelled publish leaving the client usable**
   (`test_a_cancelled_publish_leaves_the_client_usable`).
 
-**The synchronous surface against the same broker** (`test_sync.py`): B-151's QoS 2 round trip
+**The synchronous surface against the same broker** (`test_sync.py`): the QoS 2 round trip
 with the `await`s removed and nothing else, the blocking iterator, the receive deadline where
 cancellation goes, the GIL released while blocked (asserted by a *count* a second thread
 raises), one thread publishing while another consumes, and the same refusal class arriving
 from both surfaces (`test_a_refusal_is_the_asynchronous_surfaces_refusal`).
 
-**One measured disagreement, and it was found from Python.** rumqttd 0.20.0 answers a
+**One measured disagreement.** rumqttd 0.20.0 answers a
 two-filter UNSUBSCRIBE with **one** reason code where [MQTT-3.11.3-1] requires one per filter
 in order. Position is the only thing binding a code to a filter, so a count that disagrees is
 unreadable rather than merely odd, and this client raises `AcknowledgementLengthMismatch`
@@ -219,32 +221,32 @@ filter's code. One filter per UNSUBSCRIBE interoperates, and the second half of
 entry of [`mqtt.md`](mqtt.md) §10's disagreement list and the only one raised by the Python
 suite.
 
-**The wheel, with no Rust toolchain.** `package.sh` builds the `abi3` release wheel, refuses
+**The wheel, with no Rust toolchain.** `package.sh` (a wrapper over `crates/py/package.sh`)
+builds the `abi3` release wheel, refuses
 one whose name is not `abi3`, installs it into a fresh temporary virtualenv and runs
 `smoke.py` with `PATH` scrubbed to `/usr/bin:/bin` — so "the wheel needs no Rust toolchain" is
-established rather than expected (`package.sh:1-48`). `smoke.py` checks the eleven names of
+established rather than expected. `smoke.py` checks the eleven names of
 the module surface, both import spellings of `weida_mqtt.sync`, eleven exception classes under
 one base, the matcher and the grammar, the two refusals of Retain Handling 3 and QoS 3, and a
-connect to a closed port raising a *named* failure rather than hanging (`smoke.py:26-160`).
+connect to a closed port raising a *named* failure rather than hanging.
 
-**What has never been run: paho.** No test in this repository imports paho-mqtt, and no
-pairing between this binding and paho has been measured — in either role. Everything in the
+**Paho is not run.** No test in this repository imports paho-mqtt, and no
+pairing between this binding and paho is measured — in either role. Everything in the
 paho column of this document is that library's documented API, and nothing here is evidence
 that paho and this client agree on the wire. What would close it is the shape
 [`zmq-py.md`](zmq-py.md) §8 has: a `test_interop_paho.py` publishing from one and subscribing
 with the other, both ways, skipped with `pip install paho-mqtt` where the package is absent.
 
-**Neither was this document's numbers re-measured by a run.** The counts above were counted
-out of the tree with the commands in §11; the last recorded execution is B-152's merge note
-(`docs/BACKLOG.md`, "45 passed" with rumqttd under the supervisor), which matches the 45
-functions the tree holds today.
+**The numbers are counted, not run.** The counts above were counted out of the tree with the
+commands in §11; the last recorded execution passed 45 tests with rumqttd under the
+supervisor, which matches the 45 functions the tree holds.
 
 ## 9. Deliberate deviations and bounds
 
 ### 9.1 TLS is absent by construction, not unfinished
 
 The library implements TLS behind a default-on `tls` feature, and this binding enters it with
-`default-features = false` (`Cargo.toml:29-40`). The reason is one line of the library's API:
+`default-features = false` (the `weida-mqtt` dependency in `Cargo.toml`). The reason is one line of the library's API:
 `ConnectOptions::tls` takes the caller's `rustls::ClientConfig`
 (`crates/mqtt/weida-mqtt/src/options.rs:113-122`), because which certificates an application
 trusts is the application's decision and a messaging library that picked for it is one that
@@ -271,7 +273,7 @@ built for one surface is passed to the other unchanged
 
 **The three handles are the only difference**: `Context`, `Client` and the delivery stream,
 which is `Events` on the asyncio surface and `sync.Deliveries` on the blocking one
-(`sync.rs:33-38`, `sync.rs:344-360`, and `smoke.py:40` asserts the three names). They differ
+(`sync.rs`, and `smoke.py` asserts the three names). They differ
 because only they can: an awaitable and a blocked thread are not the same object.
 
 `weida_mqtt.sync` implements **no protocol behaviour**. It is Python argument conversion over
@@ -284,13 +286,11 @@ released while blocked, through `Python::detach` on every call, so the usual sha
 synchronous MQTT program — one thread publishing, one consuming — is two threads and not one
 (`tests/test_sync.py::test_the_gil_is_released_while_blocked`).
 
-Two honest riders. The blocking `Client` carries **fewer accessors** than the asyncio one:
+One honest rider. The blocking `Client` carries **fewer accessors** than the asyncio one:
 `server`, `keep_alive`, `response_information`, `response_topic` and `session` have no
 synchronous counterpart (`sync.rs:247-264` against `client.rs:444-567`), and `Deliveries` has
 no `next_event`, so a resumed exchange's completion is not reachable from the blocking
-surface. And `sync.rs:36` says "the **four** handles differ" while naming three — the count in
-the prose is wrong, the code registers three classes (`sync.rs:344-348`), and this document
-records three.
+surface.
 
 ### 9.3 51 exception classes, where paho has one errno
 
@@ -309,13 +309,13 @@ improvement over 3.1.1. paho hands that back as a value: an `MQTTErrorCode` retu
 
 36 + 14 + 1 = **51 classes**, each carrying `errno` (the name), `cause` (why) and
 `reason_code` (the byte, or `None`) — `tests/test_values.py::test_every_reason_code_is_its_own_class_under_one_base`
-and `test_the_failures_with_no_reason_code_are_classes_too`. B-185 and B-151's merge note say
-"36 coded plus 15 uncoded"; the code has 14 uncoded, so 51 is the right total only when the
-base class is counted, and that is how this document counts it (§11 gives the commands).
+and `test_the_failures_with_no_reason_code_are_classes_too`. A count of "36 coded plus 15
+uncoded" gives the same total by counting the base among the uncoded; the code has 14
+uncoded, so 51 is the right total only when the base class is counted, and that is how this
+document counts it (§11 gives the commands).
 
 Two properties of the table are structural rather than tested. A duplicated name is refused at
-**import** by the foundation, which is what caught `ProtocolError` being listed twice in the
-first draft (`errors.rs:27-31`). And `connect_name` and `disconnect_name` are **exhaustive
+**import** by the foundation (`errors.rs:27-31`). And `connect_name` and `disconnect_name` are **exhaustive
 matches** over the codec's own enums (`errors.rs:138-202`), so a reason code added to the
 library that is not added here is a compile error in this file rather than a code that
 silently arrives as the base class.
@@ -367,18 +367,16 @@ arguments here rather than constants: `max_subscription_ids` (32), `incoming_que
 float**, and a negative or non-finite one is a `ValueError` at the call that wrote it
 (`options.rs:18-29`, `values.rs:55-66`, `sync.rs:64-75`).
 
-### 9.7 Open questions this document could not close from the repository
+### 9.7 Open questions
 
 1. **The paho column is unmeasured.** No paho version is pinned anywhere under `crates/`, and
    no test imports it (§1, §8). The API names in the left-hand column are paho-mqtt 2.x's
    documented surface; a reader who needs them load-bearing should run the interop suite §8
    describes rather than trust this column.
-2. `sync.rs`'s module doc said "four handles" and named three; fixed with this document
-   (§9.2 names the three).
 
 ## 10. The definition of done
 
-The clauses of B-151, B-152 and B-185, each with its verdict and the section that proves it.
+The clauses the asyncio surface, the synchronous surface and this document were built against, each with its verdict and the section that proves it.
 
 | Clause | Verdict | Where |
 | --- | --- | --- |
@@ -392,7 +390,7 @@ The clauses of B-151, B-152 and B-185, each with its verdict and the section tha
 | A receive deadline where the asynchronous surface has cancellation | yes, and `publish` deliberately has none | §9.4 |
 | Options honoured under a name or refused at configuration time | yes, 19 CONNECT keywords, `validate()` at construction; two library fields (`max_addresses`, `max_user_properties`) have no keyword and the row says so | §5 |
 | TLS absent by construction, with `is_encrypted` saying so | yes | §3, §9.1 |
-| The wheel builds and runs with no Rust toolchain | yes: `package.sh` builds the `abi3` wheel, installs it into a fresh virtualenv and runs `smoke.py` with `PATH` scrubbed to `/usr/bin:/bin`; both files exist and B-151's and B-152's merge notes record the runs. **Not re-run for this document** | §8, `package.sh`, `smoke.py` |
+| The wheel builds and runs with no Rust toolchain | yes: `package.sh` (a wrapper over `crates/py/package.sh`) builds the `abi3` wheel, installs it into a fresh virtualenv and runs `smoke.py` with `PATH` scrubbed to `/usr/bin:/bin`; both files exist and the last recorded runs passed. This document does not re-run them | §8, `package.sh`, `smoke.py` |
 | Interop against the Python reference implementation | **not met**: paho-mqtt is not pinned, not installed and never run against this binding, and §8 says what would close it | §8, §9.7 |
 | No row says "partial" | yes: §3, §4 and §9.5 name what a caller does not get | §3, §4, §9 |
 
@@ -428,7 +426,7 @@ Where the verdicts were read:
   `crates/mqtt/weida-mqtt/src/`.
 - Tests: `crates/mqtt/weida-mqtt-py/tests/` — `test_interop.py`, `test_sync.py`,
   `test_values.py`, with `conftest.py` for the broker fixture; `smoke.py` for the wheel;
-  `develop.sh` and `package.sh` for how both are run.
+  `develop.sh` and `package.sh` (wrappers over `crates/py/develop.sh` and `crates/py/package.sh`) for how both are run.
 - The library's own parity table: [`mqtt.md`](mqtt.md) — §0 (why there is no server column),
   §2, §3, §4, §5, §6, §7, §8 (transports and the TLS trust anchors), §9 (the bounds), §10 (the
   broker disagreements). The protocol sheet it cites:
@@ -438,8 +436,6 @@ Where the verdicts were read:
   asyncio first, the bytes boundary, the client/broker line),
   [0013](../decisions/0013-competitor-libraries.md) §4.4 (the three constructors, options
   honoured or refused, no second implementation in the binding) and §4.7 (the six clauses).
-- Backlog: B-151 (the asyncio surface), B-152 (the synchronous surface, and the merge note
-  this document's test count is compared against), B-185 (this document).
 - paho-mqtt's surface: `paho.mqtt.client`, `paho.mqtt.properties`, `paho.mqtt.reasoncodes`,
   `paho.mqtt.subscribeoptions`, `paho.mqtt.enums`, `paho.mqtt.publish` and
   `paho.mqtt.subscribe` of eclipse-paho/paho.mqtt.python 2.x — **read from that project's

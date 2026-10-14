@@ -289,16 +289,16 @@ that crate's behaviour rather than ours: its XPUB applies a subscription only wh
 application receives it, and its DEALER announces no `Identity`.
 
 **Four measured facts about libzmq 4.3.5**, each observed in one exchange over loopback TCP and
-none of them stated by its documentation (sheet §13, source [41]) — three of them forced a fix
-on our side:
+none of them stated by its documentation (sheet §13, source [41]) — three of them determine
+what our side sends or accepts:
 
 1. The greeting's `as-server` octet is **0 even on a socket configured as the PLAIN or CURVE
    server**, against 24/ZMTP-PLAIN and 25/ZMTP-CURVE, and libzmq never reads the peer's octet
-   either. Our guard was narrowed accordingly: two peers that both claim the server role are
-   still refused, but the octet alone no longer decides.
+   either. Our guard is narrower accordingly: two peers that both claim the server role are
+   refused, and the octet alone does not decide.
 2. Every REQ, DEALER and ROUTER socket with no `ZMQ_ROUTING_ID` announces an `Identity`
    property with an **empty value**. 37/ZMTP's `identity = 0*255OCTET` permits it, so an empty
-   property is the *absence* of an identity; we refused it before, which failed half the
+   property is the *absence* of an identity and is accepted; refusing it would fail half the
    matrix at the handshake.
 3. A CURVE `MESSAGE` travels behind a **message frame header, not a command frame header**,
    although 26/CURVEZMQ calls it a command and its body is a command body — and a
@@ -339,7 +339,7 @@ announcing a mechanism or socket type this side cannot pair with, or a malformed
 ROUTER, PAIR, XPUB and XSUB, returning a sending and a receiving half onto the same
 connections. libzmq's socket is a pointer any thread may use one at a time; a Rust socket is
 a `Send`, non-`Sync` handle, and one task parked in `recv()` would otherwise hold the whole
-socket — so the concurrency libzmq permits needed a type to say it (B-177). REQ and REP have
+socket — so the concurrency libzmq permits needs a type to say it. REQ and REP have
 no `split`: 28/REQREP alternates, so two independent halves would promise what the protocol
 forbids. Each half is still one operation at a time, and a ROUTER's two halves share one
 routing table behind a lock that is never held across an `await`.
@@ -351,7 +351,7 @@ nothing else; every number below exists because no remote input may cause unboun
 | Bound | Default | What it bounds, and why libzmq has no option for it |
 | --- | --- | --- |
 | `SocketOptions::max_peers` | 1024 | how many peers one socket admits. libzmq bounds sockets per context (`ZMQ_MAX_SOCKETS`) but not connections per socket, so a stranger decides the multiplier on every per-peer queue |
-| `QueueConfig::max_bytes` | 8 MiB | the payload one direction of one peer's queue holds. `ZMQ_SNDHWM`/`ZMQ_RCVHWM` count **messages**, so at the defaults one peer could hold 1000 × 1 MiB per direction — a product, not a bound (B-096). The message count keeps libzmq's meaning exactly; this refuses the peer that actually occupies the memory. A queue that is *empty* accepts one message of any size, so the real exposure is `max_bytes - 1 + max_message_size`, just under 9 MiB, and never a wait for room that cannot appear |
+| `QueueConfig::max_bytes` | 8 MiB | the payload one direction of one peer's queue holds. `ZMQ_SNDHWM`/`ZMQ_RCVHWM` count **messages**, so at the defaults one peer could hold 1000 × 1 MiB per direction — a product, not a bound. The message count keeps libzmq's meaning exactly; this refuses the peer that actually occupies the memory. A queue that is *empty* accepts one message of any size, so the real exposure is `max_bytes - 1 + max_message_size`, just under 9 MiB, and never a wait for room that cannot appear |
 | `Subscriptions::max_subscriptions` | 1024 | distinct prefixes one peer may hold. 37/ZMTP makes subscriptions additive and non-idempotent, so N `SUBSCRIBE` commands cost N entries and the count is a peer's choice |
 | `Subscriptions::max_subscription_bytes` | 256 | one prefix's length. 37/ZMTP's grammar is `subscription = *OCTET`, unbounded; a count alone is not a bound, because 1024 prefixes of a megabyte each is a megabyte times 1024 |
 | `MessageLimits::max_message_frames` | 1024 | frames in one message. ZMTP bounds a frame's size through `ZMQ_MAXMSGSIZE` and the frame *count* not at all, so a peer could send a million empty frames |
@@ -366,7 +366,7 @@ command to the subscriber whose subscription arrived last, and
 `Pipe::refuse` is the channel underneath it. The protocol has always had the command — "the
 peer SHALL treat an incoming ERROR command as fatal" — and libzmq's API exposes no way to send
 one: an XPUB application can decline to *apply* a subscription (`ZMQ_XPUB_MANUAL`) and cannot
-say why. That silence is unusable for an adapter, because a subscription silently ignored is a
+say why. That silence is unusable for a program that relays subscriptions, because a subscription silently ignored is a
 subscriber waiting forever for messages nobody will send, so this library has the command and
 the row is here rather than hidden. It is additive: nothing sends an `ERROR` unless an
 application asks, and the connection is left to the peer's own rule.

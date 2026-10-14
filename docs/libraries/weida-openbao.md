@@ -34,12 +34,12 @@ calls `sys/wrapping/unwrap` before anything else, and turns the one failure that
 the service exits. The controller keeps the child's `wrapped_accessor` from the minting
 answer and revokes by it at every exit, which also kills whatever a thief redeemed.
 
-`examples/handoff/` is the whole thing as a systemd user unit plus a service binary, proved
-on the project workstation against `bao server -dev`: a clean start redeems, signs an
+`examples/handoff/` is the whole thing as a systemd user unit plus a service binary, exercised
+against `bao server -dev`: a clean start redeems, signs an
 identity with the role and answers a `weida request` pinned by that identity's fingerprint;
 a start whose wrapping token was redeemed first by hand exits with status 3 and
-`ExecStopPost=` leaves the thief with a revoked token. One finding from that proof, recorded
-in the unit: the credentials directory is mounted read-only for `ExecStartPre=` as for the
+`ExecStopPost=` leaves the thief with a revoked token. One constraint is recorded in the
+unit: the credentials directory is mounted read-only for `ExecStartPre=` as for the
 service, so the wrapping token travels through `RuntimeDirectory=` (0700, the unit's uid,
 gone with the unit) and the service unlinks it once redeemed.
 

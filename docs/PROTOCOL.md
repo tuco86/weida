@@ -8,38 +8,16 @@ experimental and breaking changes are permitted. Implementations MUST NOT assume
 compatibility guarantee across `0.x` releases. The library version (`0.1.0` and its
 pre-releases) and the wire protocol version (`0`) are independent.
 
-This version is a deliberate break from earlier `0.x` drafts: ACK and CANCEL frames are
-gone, the DATA header lost `transfer_id`, `role`, `correlation_id` and `ack_mode`, and
-Req/Rep moved onto bidirectional streams. Old and new binaries do not interoperate. The
-ALPN token stays `weida/0` because `0.x` carries no compatibility promise to preserve.
-
 This document is the single normative source for the weida wire format. Anything not stated
 here is unspecified in v0. Implementations MUST NOT infer wire behaviour from
 implementation source; where this document and an implementation disagree, this document is
 authoritative and the implementation is a defect.
 
-**Wire version 0 is unchanged by the decided-but-unbuilt parts of this document.** Sections
-marked *spec ahead of code* — §2.5, HELLO keys `5` and `6` (§6.1), the guarantee set of §6.5,
-the profiles of §10.1 — specify behaviour that the accepted decision notes in
-[decisions/](decisions/) have settled and that no v0 implementation yet produces. They are
-written here rather than left to the implementation for two reasons: a key number and an
-encoding must be fixed once, by the specification, before two implementations can disagree
-about them; and every one of them is already load-bearing for an adapter mapping document.
-They change nothing for a v0 peer, because every one of them is either an optional key that an
-encoder omits and a decoder skips (§5), or a statement about how many connections a pair
-holds. The version stays `0`.
-
-DATA keys `6` and `7` (§6.2) are a narrower case and no longer only on paper: the codec
-encodes and decodes both and §8 pins their vectors, while no v0 *sender* sets either, so they
-are implemented and unused rather than unimplemented.
-
-One change was not merely additive: the topic filter grammar of §6.4 replaced the byte-prefix
-match of earlier drafts, so the same SUBSCRIBE bytes can select a different set of topics than
-they used to ([decisions/0007](decisions/0007-topic-namespace.md) §4.2). The implementation
-follows it as of B-020 — the matcher is a segment walk and an invalid filter is rejected at
-the codec boundary — so this is history rather than a pending defect. `0.x` carries no
-compatibility promise, which is what made fixing the grammar before the adapters exist
-cheaper than fixing it after.
+A passage marked *spec ahead of code* specifies behaviour that an accepted decision note has
+settled and that nothing in this repository produces yet. It is written here rather than left
+to the implementation so that a key number and an encoding are fixed once, by the
+specification, before two implementations can disagree about them. Such a passage adds no
+frame and no required key, so wire version `0` does not change with it.
 
 Related documents: [ARCHITECTURE.md](ARCHITECTURE.md),
 [GUARANTEES.md](GUARANTEES.md), [FAILURE_MODEL.md](FAILURE_MODEL.md),
@@ -99,7 +77,7 @@ differences, and only three:
 
   One consequence is worth stating rather than deriving. A local connection is bidirectional
   by nature, so it carries no equivalent of QUIC's stream kind, and the dispatch of §9.4 —
-  today a function of the stream kind *and* the addressed path — is locally a function of the
+  on QUIC a function of the stream kind *and* the addressed path — is locally a function of the
   **path alone**: the pattern registered there says whether a reply is expected. A replier path
   answers on the same connection; a puller or publisher path never writes back, and the
   initiator MUST NOT wait for a reply on it. The mismatch case is unchanged and already
@@ -237,7 +215,7 @@ The algorithm is:
 Agreed {
     version: u64,                 // the effective version from step 3
     send_max_header_bytes: u64,   // = theirs.max_header_bytes
-    guarantees: GuaranteeSet,     // the effective set from step 5; spec ahead of code
+    guarantees: GuaranteeSet,     // the effective set from step 5
     datagrams: bool,              // both HELLOs listed capability code 1 (§6.1)
     path_report: bool,            // both HELLOs listed capability code 2 (§6.1)
 }
@@ -247,7 +225,7 @@ Agreed {
 headers this side may send. The local receive limit remains the local
 `limits.max_header_bytes` and is not affected by the peer's advertisement.
 
-Negotiation is still a pure function of the two HELLO frames: the effective set is computed,
+Negotiation is a pure function of the two HELLO frames: the effective set is computed,
 not agreed in a second round trip, and both sides compute the same one from the same two
 frames.
 
@@ -343,9 +321,7 @@ a defect because it lets a remote peer choose the allocation size.
 ### 3.2 Conditions that MUST close the connection with PROTOCOL_VIOLATION
 
 - Magic byte not equal to `0x57`.
-- Unknown `kind` value, i.e. anything in `9..=255`. Kinds `5` and `6` were reserved for the
-  L2 credit frame and the cursor stream and are now defined (§6.6, §6.7): the reservation was
-  a promise not to reuse the number, and the promise was kept when the number was spent.
+- Unknown `kind` value, i.e. anything in `9..=255`.
 - `header_len` greater than the local `limits.max_header_bytes` (§3.1).
 - CBOR parse failure of the header.
 - A required key missing from the header.
@@ -391,14 +367,14 @@ Kinds `9..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLAT
 is not a forward-compatibility hook: a receiver cannot know whether an unknown stream kind
 carries payload it would have to drain.
 
-**Kind `5` is known as of B-202**, and it is the L2 credit of
+**Kind `5` is the L2 credit** of
 [decisions/0003](decisions/0003-credit-unit.md) §4.2: a consumer's absolute delivery limit
 for one subscription (§6.6). A peer that does not run a queue **ignores** it rather than
 closing the connection — credit is idempotent state, not a transfer, and the frame has no
 reply half to refuse on — which is the same position SUBSCRIBE takes for a path no publisher
 has claimed.
 
-**Kind `6` is known as of B-233**, and it is the cursor stream of
+**Kind `6` is the cursor stream** of
 [decisions/0023](decisions/0023-completion-is-a-cursor.md) and
 [decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.4: a report about one
 payload stream, on a unidirectional stream of its own. It is the one kind that is neither
@@ -408,18 +384,18 @@ makes a report add nothing to a pattern's topology. A peer that ordered no repor
 state for the id a CURSOR stream names and resets that stream with `CANCELED` rather than
 closing the connection: nothing was allocated for an id it never handed out.
 
-**Kind `7` is known as of B-281**, and it is the datagram flow of
+**Kind `7` is the datagram flow** of
 [decisions/0034](decisions/0034-late-is-lost.md) §4.2: a registration whose stream is the
 flow's lifetime and whose units travel as QUIC DATAGRAM frames (§6.8, §6.9). It is sent only
 to a peer that listed capability code `1` (§6.1), so a peer that never listed the code never
 sees one. On QUIC a FLOW stream carries its header and then nothing until FIN; a byte after
 the header is a `PROTOCOL_VIOLATION`.
 
-**Kind `8` is known as of B-301**, and it is the path report of
+**Kind `8` is the path report** of
 [decisions/0036](decisions/0036-connection-statistics.md) §4.5: one stream per side and
 connection that carries this side's view of the QUIC path — round trip, window, its own losses,
 its UDP counts — to the peer, which can see its own download loss no other way. It is sent only
-on QUIC and only when both HELLOs listed capability code `2` (§6.1). Kind `9` is now the first
+on QUIC and only when both HELLOs listed capability code `2` (§6.1). Kind `9` is the first
 free number.
 
 HELLO, ERROR, SUBSCRIBE, UNSUBSCRIBE and CREDIT are header-only frames: the sender MUST FIN
@@ -503,8 +479,8 @@ and above.
 | `2` | `uint` | `max_transfers` | yes | — | maximum concurrent inbound transfers; **advisory in v0**, not enforced |
 | `3` | `[uint]` | `capabilities` | yes | — | optional capability codes supported (table below); a side that enables nothing sends `[]` |
 | `4` | `[uint]` | `required_capabilities` | yes | — | capability codes the sender requires the peer to support; `[]` unless a profile requires one |
-| `5` | `map` | `guarantees_offered` | no | §6.5 | guarantee set the sender can honour; **optional, absent in v0** |
-| `6` | `map` | `guarantees_required` | no | §6.5 | guarantee set the sender requires of the peer; **optional, absent in v0** |
+| `5` | `map` | `guarantees_offered` | no | §6.5 | guarantee set the sender can honour; **optional**, absent means `core` |
+| `6` | `map` | `guarantees_required` | no | §6.5 | guarantee set the sender requires of the peer; **optional**, absent means `core` |
 
 Keys `0` to `4` are required. A missing one of them is a framing violation per §3.2.
 
@@ -528,11 +504,12 @@ QUIC — a local transport has no path to report — so a server opts in per bin
 client per runtime, and neither is made to send by the other
 ([decisions/0036](decisions/0036-connection-statistics.md) §4.5).
 
-**Keys `5` and `6` are specified ahead of code** (§11) and are the only optional HELLO keys.
+**Keys `5` and `6` are the only optional HELLO keys.**
 They declare guarantee sets per [decisions/0006](decisions/0006-guarantee-sets.md) §4.4,
-encoded as §6.5. An absent key means the default set `core` — which is exactly what every v0
-peer offers and requires — so a v0 HELLO is unchanged on the wire and a v0 decoder skips both
-keys by the rule of §5. `guarantees_required` MUST be a subset-or-equal of the sender's own
+encoded as §6.5. An absent key means the default set `core` — which is exactly what a peer
+with no configured set offers and requires — so such a HELLO is unchanged on the wire and a
+decoder that does not know the keys skips both by the rule of §5. `guarantees_required` MUST
+be a subset-or-equal of the sender's own
 `guarantees_offered` on every dimension: requiring what you cannot yourself honour is a
 configuration error, not a negotiation position.
 
@@ -552,7 +529,7 @@ configuration error, not a negotiation position.
 | `9` | `uint` | `report_id` | no | — | identifier of the CURSOR stream that will report on this transfer (§6.7) |
 | `10` | `array` of `uint` | `report` | no | 16 items, strictly ascending | levels the sender **orders** a report for; an order, not a guarantee |
 | `11` | `uint` | `report_mode` | no | one of §6.2's `report_mode` values | `0` `progress` (default, never written), `1` `final-only` |
-| `12` | `uint` | `delivery_attempt` | no | — | how often an L2 queue has handed this message out, first attempt included; **absent means `1`**. A count rather than a flag: a repeat is visible, and a poison message is countable. **Reserved and written by nobody today** — the number is spent so it cannot be spent twice, and B-203 is the slice that writes it |
+| `12` | `uint` | `delivery_attempt` | no | — | **Reserved** for `delivery_attempt`: how often an L2 queue has handed this message out, first attempt included; **absent means `1`**. A count rather than a flag: a repeat is visible, and a poison message is countable. **No implementation writes it yet**; the number is spent so that it cannot be spent twice |
 | `13` | `uint` | `segment` | no | — | segment number per (sender, path, topic), from 0; **written by a radio, or by `Peer::segment` toward a bound path** ([decisions/0034](decisions/0034-late-is-lost.md) §4.6, [decisions/0037](decisions/0037-layered-segments.md) §4.2) |
 | `14` | `uint` | `layer` | no | 15 | the layer of a stream segment, `0..=15`; **absent means `0`**, and layer 0 is never written; written only together with key `13` ([decisions/0037](decisions/0037-layered-segments.md) §4.3). A value above 15, or key `14` without key `13`, is a `PROTOCOL_VIOLATION` |
 
@@ -610,14 +587,14 @@ written exactly when the sending application supplied a context — from an inbo
 metadata, or minted deliberately — and nothing in the library mints one on an application's
 behalf. The reason is stated where it belongs, in
 [decisions/0028](decisions/0028-trace-propagation-is-the-callers.md): a minted root is not a
-safe default but a fabricated fact, and it cost a fixed 60 bytes of every frame of every
+safe default but a fabricated fact, and it would cost a fixed 60 bytes of every frame of every
 pattern (measured: a 64-byte push is 76 B without it and 136 B with it,
-[IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-246). A peer that writes the key on every frame
+[IMPLEMENTATION.md](IMPLEMENTATION.md) §4.5). A peer that writes the key on every frame
 is **conformant**; a peer that treats an absent key as an error is **not**, and a receiver
 reads an absent value exactly as it reads a malformed one — no trace context for this transfer.
 
-**Key `6` is written, and key `7` is not** — a distinction worth stating, because both were
-"coded but unused" in earlier versions of this section and only one still is.
+**Key `6` is written, and key `7` is not** — a distinction worth stating, because the codec
+carries both and only one has a sender.
 
 `sequence` is set by a **publisher whose connection negotiated `PerProducer` ordering**: the
 number is assigned once per published message, before fan-out, so every subscriber's copy carries
@@ -649,8 +626,8 @@ proved fingerprint from the handshake and a claimed name could not be trusted an
 appear on the wire. The length is exact rather than merely capped — a `bstr` of any other
 length is a framing violation (§3.2), because a truncated digest names nobody — and the
 absent default is also what keeps a connection that negotiated no ordering from paying for
-one: the measured cost of writing the text form was +80 B and −9 % of the message rate at a
-64-byte payload ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-009).
+one: the measured cost of writing the text form is +80 B and −9 % of the message rate at a
+64-byte payload ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.4).
 
 `sequence` and `producer` are independent: either may appear without the other. Ordering and
 deduplication are separate guarantee dimensions and neither implies the other [0001 §7.1].
@@ -709,7 +686,7 @@ without an exchange ([0024](decisions/0024-three-families-one-back-channel.md) �
 
 An ERROR frame is legal **only on the reply half of a bidi stream**, where it is the
 alternative to a reply (§4.1). It therefore needs no reference to what it answers: the
-stream is the reference. The `re` key of earlier drafts is gone.
+stream is the reference.
 
 Error codes:
 
@@ -779,7 +756,7 @@ Receiver behaviour:
 - A peer that registers no publishers MAY ignore these frames. Subscribing to a side that
   publishes nothing is useless, not hostile.
 
-### 6.5 Guarantee set encoding (spec ahead of code)
+### 6.5 Guarantee set encoding
 
 A **guarantee set** is the unit of configuration and of negotiation: one level per guarantee
 dimension of [GUARANTEES.md](GUARANTEES.md) §3, carried as one CBOR map
@@ -815,16 +792,17 @@ Rules:
   of `1`, a missing `dedup_window_ms` under `Bounded`) is a framing violation (§3.2). The
   levels reserved for the L2 broker — `acknowledgement` `2` to `5` — are legal to *declare*
   and impossible to honour **in the v0 core**, so a peer that requires one gets a failed
-  negotiation (§2.3), never a quieter success. `2` (`Accepted`) is the first to become
-  honourable: a process running `weida-broker` reaches it for a message it has taken into a
-  queue, and reports it in DATA key `8` (§6.2, B-201). `3` and `4` stay declare-only, with
+  negotiation (§2.3), never a quieter success. `2` (`Accepted`) is honourable by a process
+  running `weida-broker`, which reaches it for a message it has taken into a queue and
+  reports it in DATA key `8` (§6.2). `3` and `4` are declare-only, with
   their `durability` and `replicas` axes unchanged, until a store and a replica set exist to
   make them true.
 - **`backpressure` `4` (Coalesce) with `ordering` `2` (PerProducer reassemble) is forbidden**,
   because it asks for two incompatible things at once: reassembly holds an arrival until its
   predecessors arrive, and a conflating hop is the reason some of them never will
   ([decisions/0016](decisions/0016-conflation.md) §4.5). Either declaration alone is legal;
-  the combination is a framing violation like the others above. A conflating hop under
+  the combination is a framing violation like the others above (*spec ahead of code*: the
+  decoder does not refuse it yet). A conflating hop under
   `ordering` `1` (detect) is coherent and is the intended pairing: the copy is numbered before
   it is discarded, so what a subscriber sees is a gap rather than a renumbering.
 - **If `backpressure` `4` is ever honoured, the coalescing key is the DATA `topic` of §6.2**
@@ -887,9 +865,9 @@ A large limit is not a hostile number: what a broker holds is bounded by its own
 (§10), not by what a consumer promises to take, and a consumer that states `u64::MAX` has said
 "send me everything" rather than "allocate something". What a broker *does* cap is the number
 of deliveries it lets go **unsettled** at once — `weida-broker`'s `max_unsettled` — and that
-cap became binding with the consumer settlement of
+cap binds through the consumer settlement of
 [decisions/0018](decisions/0018-minimal-broker.md) §4.3 and
-[decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.7 (B-203):
+[decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.7:
 a delivery is outstanding until its consumer reports `Processed` on the cursor stream the
 delivery ordered, and its bytes stay charged to the queue until then. A receiver MUST NOT
 deliver beyond the limit it has accepted, and a limit it declines to honour in full is not an
@@ -1061,9 +1039,8 @@ distinct from the ERROR frame codes of §6.3.
 | `9` | `UNSUPPORTED` | endpoint exists but does not serve this stream kind |
 | `10` | `RESTARTING` | binding closed because its server is being replaced; redial at once |
 
-`UNSUPPORTED` is new in this revision. A misrouted uni stream has no reply half to carry an
-ERROR frame, so the refusal has to be a stop code; without a distinct code, "wrong pattern"
-would be indistinguishable from "declined".
+A misrouted uni stream has no reply half to carry an ERROR frame, so `UNSUPPORTED` is a stop
+code; without a distinct code, "wrong pattern" would be indistinguishable from "declined".
 
 `RESTARTING` is used only in `CONNECTION_CLOSE`. A peer that does not know code `10` treats it
 as any other close code it does not map, a deliberate close, so no capability negotiates it.
@@ -1217,8 +1194,8 @@ length is a framing violation (§6.2).
 
 These two vectors fix an *encoding*, not a match: under the filter grammar of §6.4 the byte
 string `px.` is a two-segment filter `["px", ""]`, so it does **not** select the topic
-`px.eur` of the fan-out vector above — `px.*` or `px.#` does. The vector predates the grammar
-and its bytes are still exactly what an encoder must produce for that filter string.
+`px.eur` of the fan-out vector above — `px.*` or `px.#` does. The bytes are exactly what an
+encoder must produce for that filter string.
 
 **Filter grammar vectors** — four SUBSCRIBE frames, one per construct of §6.4, all on
 `endpoint = "/md"` and differing only in key `1`: the literal `px.eur`
@@ -1270,8 +1247,7 @@ without interpreting it, while `15` in the same position would be a protocol vio
 the reserved range belongs to a later version of this specification, not to an application
 (§6.2).
 
-Every vector §8 once deferred has now landed with its codec. The DATA key `6` and `7`
-vectors and the extended HELLO below pin encodings rather than describe traffic:
+The DATA key `6` and `7` vectors and the extended HELLO below pin encodings:
 `weida-protocol` reads and writes all three; key `6` is written by a publisher under negotiated
 `PerProducer` ordering, key `7` by nothing here, and a peer that declares nothing offers and
 requires `core`.
@@ -1279,8 +1255,8 @@ requires `core`.
 **HELLO vector** — magic `0x57`, kind `0x00` (HELLO), `header_len = 0x10` (16 bytes),
 CBOR map of 5 entries: key `0` `versions = [0]`, key `1` `max_header_bytes = 16384`,
 key `2` `max_transfers = 1024`, key `3` `capabilities = []`, key `4`
-`required_capabilities = []`. Keys `5` and `6` are absent, which is the declaration every v0
-peer makes: offering and requiring the default guarantee set `core` (§6.1, §6.5).
+`required_capabilities = []`. Keys `5` and `6` are absent, which is the declaration of a peer
+that configures no set: offering and requiring the default guarantee set `core` (§6.1, §6.5).
 
 **HELLO-with-guarantees vector** — the same five keys plus key `5`
 `guarantees_offered = {4: 1}` and key `6` `guarantees_required = {4: 1}`, each a nested
@@ -1356,8 +1332,8 @@ are intended:
 - Unlimited concurrent exchanges on one connection, bounded only by
   `max_concurrent_bidi_streams`. This is what DEALER/ROUTER exists for in socket-oriented
   systems; here it is emergent rather than a separate pattern.
-- Exactly one reply per exchange, structurally. A second reply is not representable, so the
-  "reset a duplicate correlation" rule of earlier drafts has nothing left to guard.
+- Exactly one reply per exchange, structurally. A second reply is not representable, so there
+  is no duplicate correlation to guard against.
 
 The responder MAY write the reply header at any time, including **before** the request half
 has reached FIN. The two halves of a QUIC bidi stream are independent, so simultaneous
@@ -1395,8 +1371,9 @@ ERROR frame on the reply half is written by the receiving application and takes 
 over the request half's receipt (§9.1). An application that must observe a refusal uses
 Req/Rep.
 
-The acknowledgement vocabulary of Accepted / Stored / Replicated / Processed is reserved for
-a broker layer (§11) and has no v0 wire representation. See
+The acknowledgement vocabulary of Accepted / Stored / Replicated / Processed belongs to a
+broker layer (§11), and the brokerless core writes none of it: its wire carriers are DATA key
+`8` for a publisher confirm (§6.2) and CURSOR records for reports (§6.7). See
 [GUARANTEES.md](GUARANTEES.md) for why a brokerless application ACK would restate what QUIC
 already guarantees.
 
@@ -1415,10 +1392,9 @@ Cancellation uses QUIC's own stream teardown throughout. No frame carries it.
 
 A receiver observing a reset before FIN MUST discard all partial state for that transfer.
 
-The requester's stop on the reply half is the direct replacement for the CANCEL frame of
-earlier drafts. In the reference implementation it is what dropping a `ReplyStream` before
-`recv()` does; the responder observes it as its reply half's `stopped()` future resolving,
-and as a failure on its next write.
+A requester abandons a reply with a stop on the reply half. In the reference implementation it
+is what dropping a `ReplyStream` before `recv()` does; the responder observes it as its reply
+half's `stopped()` future resolving, and as a failure on its next write.
 
 ### 9.4 Endpoint dispatch and refusal
 
@@ -1544,14 +1520,14 @@ Per connection (`Limits`):
 | `flow_queue_bytes` | 16 KiB | unread datagram bytes held per inbound flow; a slow consumer loses its oldest datagrams, counted per flow |
 | `flow_early_bytes` | 4 KiB | per-connection ring for datagrams naming an id with no live flow yet (§6.9) |
 | `flow_early_hold` | 1 s | how long a datagram waits in that ring for its FLOW header before it is dropped |
-| `congestion` | `Cubic` | the QUIC congestion controller of this profile's connections: `Cubic`, `NewReno` or `Bbr`. Not a bound and not on the wire; it is here because it is chosen per profile ([decisions/0034](decisions/0034-late-is-lost.md) §6, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-289) |
+| `congestion` | `Cubic` | the QUIC congestion controller of this profile's connections: `Cubic`, `NewReno` or `Bbr`. Not a bound and not on the wire; it is here because it is chosen per profile ([decisions/0034](decisions/0034-late-is-lost.md) §6, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.17) |
 
 Per runtime (`RuntimeConfig`):
 
 | Field | Default | Bound enforced |
 | --- | --- | --- |
 | `max_connections` | `1024` | connections accepted per server binding; excess connections are closed immediately with `LIMIT_EXCEEDED` |
-| `max_connections_per_peer` | `64` | connections one **peer** may hold on one binding, counted by the fingerprint it proved; the excess connection is closed with `LIMIT_EXCEEDED`. It exists because one connection per dialled path (§2.5) lets the dialling side choose the count, and 64 connections to one peer measured about 50 MiB of transport state on the pair ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011). Connections that proved no identity are each their own peer and are bounded only by `max_connections` (§2.5) |
+| `max_connections_per_peer` | `64` | connections one **peer** may hold on one binding, counted by the fingerprint it proved; the excess connection is closed with `LIMIT_EXCEEDED`. It exists because one connection per dialled path (§2.5) lets the dialling side choose the count, and 64 connections to one peer measured about 50 MiB of transport state on the pair ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.8). Connections that proved no identity are each their own peer and are bounded only by `max_connections` (§2.5) |
 | `endpoint_queue` | `256` | depth of the accept channel per registered endpoint |
 | `max_resolved_addresses` | `8` | addresses a dialling endpoint will try for one hostname, in the resolver's order; a resolver answer is remote input, so its length needs a ceiling |
 | `connect_attempt_timeout` | 250 ms | how long a dial waits on one resolved address before trying the next. Every address but the last is bounded by it; an IP literal and a single-address name keep the full handshake budget. The value is RFC 8305's Connection Attempt Delay, and it exists because an address that answers nothing gives QUIC no refusal to observe |
@@ -1568,10 +1544,8 @@ Both stream budgets count: a peer may open its full unidirectional *and* bidirec
 allowance, and every accepted stream starts with one header. This is the governing number
 for hostile-peer memory sizing in v0.
 
-`max_concurrent_bidi_streams` replaces the previous hardcoded `0`, which refused bidi
-streams outright. It is also the concurrency ceiling for inbound requests: a peer cannot
-hold more live exchanges than this, which is what the deleted `max_pending` used to bound
-locally — except that it is now enforced by the transport, on the side that pays for it.
+`max_concurrent_bidi_streams` is the concurrency ceiling for inbound requests: a peer cannot
+hold more live exchanges than this, and the transport enforces it, on the side that pays for it.
 
 `endpoint_queue` produces natural backpressure: when the queue is full, the inbound stream
 task awaits queue capacity, which stops reading the payload, which closes the QUIC
@@ -1591,7 +1565,7 @@ Per broker (`weida_broker::BrokerConfig`), for a process that runs the L2 layer:
 | --- | --- | --- |
 | `queue_bytes` | 8 MiB | bytes one queue holds, charged as the payload plus the retained labels plus a fixed `PER_MESSAGE_OVERHEAD` (256 B) per message. A queue at the bound refuses admission — ERROR `{REJECTED}` on an exchange's reply half, `STOP_SENDING(REJECTED)` on a one-way stream — and never discards a message it has already confirmed ([decisions/0018](decisions/0018-minimal-broker.md) §4.8) |
 | `max_queues` | `64` | queues one broker registers; a configuration naming more is refused before any path is claimed |
-| `max_unsettled` | `256` | deliveries **one subscription** may have unsettled at once, live since B-203. A consumer's credit limit is cumulative and is honoured in full (§6.6); this bounds what may be in flight without an outcome, and an unsettled delivery keeps its bytes charged against `queue_bytes`. Named `max_unacked` until [decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.7: a consumer reports, it does not acknowledge |
+| `max_unsettled` | `256` | deliveries **one subscription** may have unsettled at once. A consumer's credit limit is cumulative and is honoured in full (§6.6); this bounds what may be in flight without an outcome, and an unsettled delivery keeps its bytes charged against `queue_bytes`. The name follows [decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.7: a consumer reports, it does not acknowledge |
 
 These are a **third** profile rather than fields on `Limits`, because a queue is not a
 per-connection object: it outlives every connection that touches it, which is the whole point
@@ -1617,8 +1591,8 @@ per-connection profile so that a second one can be added without moving anything
 The control numbers are not chosen here, and deliberately not in the code either: a profile
 nothing reads would be a number nobody has to justify. They are chosen with the tier, from the
 measured cost of a connection — a cold handshake of ~1.1 ms and 750-850 KiB of resident state
-per live connection counting both ends ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011) — and
-from the per-path fan measurement that follows it. What is normative now is that a peer MUST
+per live connection counting both ends ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.8) — and
+from the per-path fan measurement ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.9). What is normative is that a peer MUST
 NOT be charged twice for the same limit: profiles are separate budgets, not one budget shared,
 and `max_connections_per_peer` bounds the connections of a peer whatever tier they belong to.
 
@@ -1634,38 +1608,38 @@ The following are deliberately absent from wire protocol version 0. Implementati
 NOT invent wire representations for them; they will be specified in later protocol
 versions.
 
-- **A frame kind for an application-level acknowledgement.** The levels themselves are no
-  longer all unreachable: `Accepted` and `Processed` are what an L2 broker issues, with the
+- **A frame kind for an application-level acknowledgement.** The levels are not all
+  unreachable: `Accepted` and `Processed` are what an L2 broker issues and orders, with the
   exact conditions each certifies fixed
   ([decisions/0004](decisions/0004-durability-levels.md) §4.1-§4.4,
-  [GUARANTEES.md](GUARANTEES.md) §1), and `Accepted` is reachable today through
-  `weida-broker` — but **no frame carries one**, and none is needed: a confirm rides the
-  reply half of the producer's exchange as DATA key `8` (§6.2), and a consumer's outcome
-  rides the reply half of the delivery exchange
-  ([decisions/0018](decisions/0018-minimal-broker.md) §4.6). `Stored(Written|Flushed)` and
-  `Replicated(n, flushed)` remain undeclarable-and-unhonourable, so a peer that requires one
-  fails negotiation (§2.3): without a store there is nothing to survive a restart, and
-  reporting them for an in-memory buffer is prohibited rather than optimistic
-  ([GUARANTEES.md](GUARANTEES.md) §1). The v0 core itself still certifies nothing above the
+  [GUARANTEES.md](GUARANTEES.md) §1), and `weida-broker` reaches `Accepted` — but **no
+  frame carries one**, and none is needed: a confirm rides the reply half of the producer's
+  exchange as DATA key `8` (§6.2), and a consumer's outcome rides a CURSOR stream (§6.7) that
+  the delivery ordered ([decisions/0018](decisions/0018-minimal-broker.md) §4.3,
+  [decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.8).
+  `Stored(Written|Flushed)` and `Replicated(n, flushed)` are unhonourable, so a peer that
+  requires one fails negotiation (§2.3): without a store there is nothing to survive a
+  restart, and reporting them for an in-memory buffer is prohibited rather than optimistic
+  ([GUARANTEES.md](GUARANTEES.md) §1). The v0 core itself certifies nothing above the
   transport receipt (§9.2), and that a receipt cannot be ordered against an application
   refusal is a decided position, not an omission
   ([decisions/0005](decisions/0005-refusal-race.md), §9.2).
 - **Router/Dealer equivalents.** Not needed as wire constructs: an exchange is a stream, so
   unlimited concurrent unsynchronized requests and correctly matched replies both fall out
   of §9.1. What Router adds beyond that — forwarding to third parties, identity envelopes —
-  is broker work and has no v0 representation. Pair patterns are likewise unspecified.
+  is broker work and has no v0 representation. PAIR, SURVEY and BUS are likewise not wire
+  constructs: each is a selection policy over the frames above ([PATTERNS.md](PATTERNS.md) §6).
 - **Connecting publishers and binding pushers.** In v0 Rep, Pull and Pub bind while Req,
   Push and Sub connect. The reverse directions have no v0 representation.
-- **Nothing for streaming fan-out**, because it needed nothing. A publisher can write one
-  stream per subscriber chunk by chunk (`Publisher::open`, B-064,
+- **Nothing for streaming fan-out**, because it needs nothing. A publisher can write one
+  stream per subscriber chunk by chunk (`Publisher::open`,
   [PATTERNS.md](PATTERNS.md) §4.1), and that is the same DATA frame on the same
   unidirectional stream as §9.5's whole message with the `content_len` key absent — a
   subscriber reads to FIN, as it does for every streamed transfer. What the drop looks like
   is `RESET_STREAM(CANCELED)` on that subscriber's stream and nothing on anybody else's,
-  which is §7's existing vocabulary. The design the deferral expected — a wire construct for
-  tee-ing — did not exist to be added.
+  which is §7's existing vocabulary.
 - **Ordering and deduplication beyond what is negotiated.** The sequence and producer keys
-  of §6.2 are coded, pinned (§8) and now acted on: a peer that negotiated `PerProducer`
+  of §6.2 are coded, pinned (§8) and acted on: a peer that negotiated `PerProducer`
   numbers its one-way transfers and, in `detect`, reports gaps, or, in `reassemble`, holds
   arrivals back up to `max_reorder_hold` ([decisions/0001](decisions/0001-sequence-field.md)
   §7.5, [GUARANTEES.md](GUARANTEES.md) §3). What stays unspecified: `PerKey` ordering has no
@@ -1685,25 +1659,13 @@ versions.
   resumption. The peer's proved fingerprint identifies it across connections and carries no
   retained state; resumption is L2 work
   ([decisions/0008](decisions/0008-session-identity.md) §4.5, §4.6).
-- ~~**The L2 credit frame.**~~ **Specified and implemented** as of B-202: kind `5`, the fields
-  of [decisions/0003](decisions/0003-credit-unit.md) §4.2-§4.3, encoded in §6.6. It names a
-  subscription, so it is path-scoped and rides that path's connection rather than a control
-  connection, which amends 0003 §4.2
-  ([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3). It is listed here so
-  the change is visible from the section that used to forbid it: a v0 receiver treated kind `5`
-  as unknown, and now every receiver knows it — a peer with no queue ignores it rather than
-  closing (§4).
 - **Multiple replies per exchange.** Exactly one reply or one ERROR per reply half; a second
   is not representable.
 - **Persistence.** No wire concept of durability, storage acknowledgement or recovery.
-- **Deduplication as a behaviour.** The producer-identity key of §6.2 is coded and pinned in
-  §8; `Bounded(window)` and the receiver-side window that would use it are decided
-  [0001 §7.6], [0008 §4.4] and unbuilt, so no v0 peer suppresses a duplicate. `Durable`
-  deduplication is L2 work.
 - **Resumable or checkpointed streams.** No offsets, content addressing or resume semantics
   (master doc §82 leaves this for after the basic protocol is proven).
-- **Retries.** The protocol carries no retry or attempt metadata; retry is entirely an
-  application concern in v0.
+- **Retries.** The protocol carries no retry metadata, and the one attempt counter it reserves
+  (DATA key `12`, §6.2) is written by nothing; retry is entirely an application concern in v0.
 - **Authentication beyond TLS.** No application-level authentication fields in HELLO, and
   [decisions/0015](decisions/0015-peer-authorization.md) makes that a decision with a reason
   rather than an omission: the handshake proves a key, and *authorization* is the acceptor's

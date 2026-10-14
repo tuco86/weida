@@ -62,31 +62,34 @@ implemented.
 
 ## 3. Required failure scenarios
 
-Verbatim from master doc §63, each annotated with its status in the current increment.
-Scenarios are covered now only where they are reachable without persistence and without a
-broker; the rest are deferred to the phase that introduces the subsystem they exercise
-(see [IMPLEMENTATION.md](IMPLEMENTATION.md)).
+Verbatim from master doc §63, each annotated with its status. A scenario is covered where it
+is reachable without persistence and without a broker; the rest belong to the phase that
+builds the subsystem they exercise ([IMPLEMENTATION.md](IMPLEMENTATION.md) §1).
 
 ```text
-producer crashes before local acceptance                                [out of scope until Phase 4]
-producer crashes after local persistence before sending                 [out of scope until Phase 5]
+producer crashes before local acceptance                                [not covered: Phase 4]
+producer crashes after local persistence before sending                 [not covered: Phase 5]
 network disappears during stream                                        [covered in v0]
 receiver crashes during stream                                          [covered in v0]
 receiver gets entire transfer but crashes before ACK                    [covered in v0]
-receiver persists transfer but ACK is lost                              [out of scope until Phase 5]
-broker persists but crashes before replication                          [out of scope until Phase 7]
-replicated quorum completes but broker dies before upstream ACK         [out of scope until Phase 7]
-consumer receives but crashes before processing                         [out of scope until Phase 4]
-consumer processes successfully then crashes before processed ACK        [out of scope until Phase 4]
-processed ACK reaches broker but broker crashes before storing state    [out of scope until Phase 6]
+receiver persists transfer but ACK is lost                              [not covered: Phase 5]
+broker persists but crashes before replication                          [not covered: Phase 7]
+replicated quorum completes but broker dies before upstream ACK         [not covered: Phase 7]
+consumer receives but crashes before processing                         [partially covered: broker requeue]
+consumer processes successfully then crashes before processed ACK       [partially covered: broker requeue]
+processed ACK reaches broker but broker crashes before storing state    [not covered: Phase 6]
 network partition splits broker cluster                                 [decided: 0022 §4.7, unbuilt]
-old shard owner returns after epoch changed                             [out of scope until Phase 7]
-disk becomes full during stream persistence                             [out of scope until Phase 5]
-persisted state becomes corrupt                                         [out of scope until Phase 5]
-client reconnects through another broker                                [out of scope until Phase 6]
-retry reaches another replica                                           [out of scope until Phase 7]
+old shard owner returns after epoch changed                             [not covered: Phase 7]
+disk becomes full during stream persistence                             [not covered: Phase 5]
+persisted state becomes corrupt                                         [not covered: Phase 5]
+client reconnects through another broker                                [not covered: Phase 6]
+retry reaches another replica                                           [not covered: Phase 7]
 request side effect succeeds but reply disappears                       [partially covered in v0]
 ```
+
+`weida-broker` requeues an unsettled delivery whose consumer is lost, so a queue answers the two
+consumer-crash rows with a redelivery; what it cannot yet say is that the delivery is a repeat
+(DATA key `12`, [PROTOCOL.md](PROTOCOL.md) §6.2).
 
 **The partition row is decided even though it is unbuilt**, and the decision is what makes the
 topology worth its overhead: consensus is one group for the cluster plus one per replicated queue
@@ -115,8 +118,8 @@ Notes on the covered ones:
   stays lost exactly as above
   ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) §4.3, §4.4;
   `crates/weida/tests/reconnect.rs`).
-- **receiver crashes during stream** — indistinguishable at the wire from the previous case;
-  same rule, same outcome, and the same two `streams.rs` tests apply unchanged.
+- **receiver crashes during stream** — indistinguishable at the wire from *network disappears
+  during stream*; same rule, same outcome, and the same two `streams.rs` tests apply.
 - **receiver gets the entire transfer but crashes before answering** — exercised by
   `hostile::a_server_that_never_answers_yields_indeterminate`, where a raw server reads the
   request to FIN, sends nothing, then closes with `NO_ERROR`. The transport receipt resolves
@@ -225,7 +228,7 @@ No frame cancels anything; cancellation is entirely QUIC stream state.
 
 | Situation | Mechanism | What the peer observes |
 | --- | --- | --- |
-| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the transfer is never observable as complete: the read in progress fails — `Error::Canceled` through `read_capped`, `io::ErrorKind::ConnectionReset` on the `AsyncRead` — and never returns EOF. On **every** transport: QUIC resets the stream, the in-process reader checks the writer's reset flag, and both socket transports carry a RESET chunk with the code, which is what a stream socket cannot express by closing (B-245, [decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e)) |
+| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the transfer is never observable as complete: the read in progress fails — `Error::Canceled` through `read_capped`, `io::ErrorKind::ConnectionReset` on the `AsyncRead` — and never returns EOF. On **every** transport: QUIC resets the stream, the in-process reader checks the writer's reset flag, and both socket transports carry a RESET chunk with the code, which is what a stream socket cannot express by closing ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e)) |
 | Receiver refuses an inbound payload | `STOP_SENDING(REJECTED)` — `IncomingTransfer` dropped mid-payload, or a payload past `read_capped`'s cap | `Error::Rejected` from `write_all` or from `delivered()` |
 | Requester abandons the reply | drop `ReplyStream` before `recv()`, which stops the reply half with `CANCELED` | `IncomingRequest::canceled()` resolves; subsequent reply writes fail with `Error::Canceled` |
 | Replier will not answer | ERROR `{NO_REPLY}` + FIN on the reply half — `IncomingRequest` dropped without `reply()` | `ReplyStream::recv()` yields `Error::NoReply` |
@@ -238,15 +241,14 @@ this is how the handler learns to stop.
 
 `cancel()` guarantees an outcome, not a retraction — **on every transport**. What holds is
 that the receiver can never mistake the transfer for a complete one: it observes a reset error
-and never EOF. Two of the four transports get that from the kernel and two had to be given it:
-QUIC has `RESET_STREAM`, the in-process reader checks the writer's reset flag, and both socket
-transports frame their payload and carry a RESET chunk with the code
-(`crates/weida/src/chunked.rs`). That framing was the named pipe's — a pipe has no half-close
-at all — and `AF_UNIX` needed it for the opposite reason: a stream socket has a half-close and
+and never EOF. QUIC has `RESET_STREAM`, the in-process reader checks the writer's reset flag,
+and both socket transports frame their payload and carry a RESET chunk with the code
+(`crates/weida/src/chunked.rs`). A named pipe needs that framing because it has no half-close
+at all, and `AF_UNIX` needs it for the opposite reason: a stream socket has a half-close and
 **no abort**, so `SO_LINGER` with a zero timeout plus `close` is byte-for-byte a plain close at
-the reader and the transport's `finish` and `reset` were the same call. Until B-245 a cancelled
-transfer, a transfer dropped without `finish()` and a producer that died mid-payload therefore
-all arrived over `weida+unix://` as a clean end of payload, and an application took half a
+the reader and `finish` and `reset` would be the same call. Without the RESET chunk a cancelled
+transfer, a transfer dropped without `finish()` and a producer that died mid-payload would all
+arrive over `weida+unix://` as a clean end of payload, and an application would take half a
 message for a whole one with nothing on the wire to warn it
 ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e)). What does
 **not** hold is that the peer saw fewer bytes. The receiver's assembler is cleared when the
@@ -316,9 +318,9 @@ fans a message out, a subscriber whose byte budget is exhausted does not receive
 message, and **no** stream is ever opened for it — so there is nothing to reset, no receipt
 to await and no outcome to resolve. The loss is therefore:
 
-- invisible to the subscriber, which cannot distinguish "nothing was published" from
-  "a message was dropped for me" (making it visible needs a sequence field, which v0 does
-  not have);
+- invisible to the subscriber under the default `core` set, which cannot distinguish "nothing
+  was published" from "a message was dropped for me" (a negotiated `PerProducer` ordering
+  numbers the copies and makes the gap visible, [GUARANTEES.md](GUARANTEES.md) §6);
 - visible to the publisher only in aggregate, as `Publisher::publish` returning a smaller
   count than `Publisher::subscriber_count` and as the `Publisher::dropped` counter.
 
@@ -339,13 +341,14 @@ observation available to the local side distinguishes these.
 
 Consequences for the application:
 
-- Retry only if the operation is **idempotent**. v0 provides no deduplication
-  ([GUARANTEES.md](GUARANTEES.md) §6), so a retry of a non-idempotent operation can produce
-  a second effect.
+- Retry only if the operation is **idempotent**. Under the default `core` set weida
+  deduplicates nothing ([GUARANTEES.md](GUARANTEES.md) §6), so a retry of a non-idempotent
+  operation can produce a second effect; the opt-in `Bounded` window suppresses a repeat only
+  within its window and its entry cap.
 - Do not report success to a user. Do not report definite failure either.
 - If the operation is not idempotent and the outcome matters, reconcile out of band — query
   the peer for the effect, or defer to an application-level idempotency key. The framework
-  will grow durable idempotency helpers in Phase 4/5; until then reconciliation is the
-  application's responsibility.
+  has no durable idempotency helper; that belongs to the reliability and persistence phases
+  ([IMPLEMENTATION.md](IMPLEMENTATION.md) §1), so reconciliation is the application's responsibility.
 - Distinguish it in logs and metrics from both success and failure. Folding indeterminate
   outcomes into an error counter destroys exactly the information §22 exists to preserve.
