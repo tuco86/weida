@@ -49,10 +49,10 @@ is enforced at the handshake by `SocketType::accepts` in the codec, called from
 | `ZMQ_REQ` | present | `ReqSocket` (`reqrep.rs`) | block both ways; strict send/receive alternation with `EFSM` on any other order; round-robin out, last peer in; the empty delimiter prepended and stripped; `ZMQ_REQ_CORRELATE` and `ZMQ_REQ_RELAXED` |
 | `ZMQ_REP` | present | `RepSocket` (`reqrep.rs`) | outgoing **drop**, incoming block — the manual omits REP's mute row and 28/REQREP says the reply to a vanished originator is discarded and sending never blocks; receive/send alternation, envelope stored and restored, fair-queued in |
 | `ZMQ_DEALER` | present | `DealerSocket` (`dealerrouter.rs`) | block both ways; unrestricted; round-robin out, fair-queued in; never discards |
-| `ZMQ_ROUTER` | present | `RouterSocket` (`dealerrouter.rs`) | outgoing **drop**, incoming block; routing-id frame prepended and stripped, peer-chosen `Identity` honoured; `ZMQ_ROUTER_MANDATORY` turns the drop into `EHOSTUNREACH`, `ZMQ_ROUTER_HANDOVER` evicts an incumbent, `ZMQ_PROBE_ROUTER` sends the empty message |
+| `ZMQ_ROUTER` | present | `RouterSocket` (`dealerrouter.rs`) | outgoing **drop**, incoming block; routing-id frame prepended and stripped, peer-chosen `Identity` honoured; `ZMQ_ROUTER_MANDATORY` turns the drop into `EHOSTUNREACH`, `ZMQ_ROUTER_HANDOVER` evicts an incumbent, `ZMQ_PROBE_ROUTER` sends the empty message; `router_bind_identity_to_user` (not a libzmq option, off by default) accepts only the ZAP user's own id as a routing id |
 | `ZMQ_PUB` | present | `PubSocket` (`pubsub.rs`) | outgoing **drop**; send only; publisher-side binary prefix match on the first frame; fan out |
 | `ZMQ_SUB` | present | `SubSocket` (`pubsub.rs`) | incoming **drop** — 29/PUBSUB's receiving-side rule, which the manual's table omits for SUB; receive only, fair-queued; subscriptions additive and non-idempotent; both wire forms accepted, the sent one configurable |
-| `ZMQ_XPUB` | present | `XPubSocket` (`xpubxsub.rs`) | outgoing **drop**; subscriptions delivered to the application in the `%x01`/`%x00` form, a departure synthesized as an unsubscribe; `ZMQ_XPUB_VERBOSE`, `_VERBOSER`, `_MANUAL`, `_WELCOME_MSG` |
+| `ZMQ_XPUB` | present | `XPubSocket` (`xpubxsub.rs`) | outgoing **drop**; subscriptions delivered to the application in the `%x01`/`%x00` form, a departure synthesized as one unsubscribe for each subscription the application was handed and has seen no unsubscribe for; `ZMQ_XPUB_VERBOSE`, `_VERBOSER`, `_MANUAL`, `_WELCOME_MSG` |
 | `ZMQ_XSUB` | present | `XSubSocket` (`xpubxsub.rs`) | drop both ways; subscriptions forwarded upstream and re-sent at every handshake, with their counts |
 | `ZMQ_PUSH` | present | `PushSocket` (`pipeline.rs`) | outgoing block; send only; round-robin over peers whose queue has room; never discards |
 | `ZMQ_PULL` | present | `PullSocket` (`pipeline.rs`) | incoming block; receive only, fair-queued |
@@ -266,8 +266,8 @@ have (§9).
 
 | libzmq | Verdict |
 | --- | --- |
-| `zmq_proxy(frontend, backend, capture)` | present — `proxy()`, over the typed socket surfaces behind the `Device` trait (PAIR, DEALER, ROUTER, XSUB, XPUB, PUB, SUB, PUSH, PULL). Both directions, one message held at a time, and a copy of every message to the capture socket including the subscription control frames. Returns the counters it reached rather than only an error code |
-| `zmq_proxy_steerable(frontend, backend, capture, control)` | present — `proxy_steerable()`, with `PAUSE`, `RESUME`, `TERMINATE` and `STATISTICS`; `STATISTICS` replies with libzmq's eight `u64` counters, and `PAUSE` stops reading both data sockets so their queues fill and their peers feel it |
+| `zmq_proxy(frontend, backend, capture)` | present — `proxy()`, over the typed socket surfaces behind the `Device` trait (PAIR, DEALER, ROUTER, XSUB, XPUB, PUB, SUB, PUSH, PULL). Both directions, one message held at a time, and a copy of every message to the capture socket including the subscription control frames. Returns the counters it reached rather than only an error code. A message a socket refuses with `EINVAL`, `EHOSTUNREACH` or `EAGAIN` is counted in `refused` and dropped, and the device goes on; any other socket error ends it |
+| `zmq_proxy_steerable(frontend, backend, capture, control)` | present — `proxy_steerable()`, with `PAUSE`, `RESUME`, `TERMINATE` and `STATISTICS`; `STATISTICS` replies with libzmq's eight `u64` counters, and `PAUSE` stops reading both data sockets so their queues fill and their peers feel it. `refused` is not one of the eight; an unknown control command is counted in it and skipped |
 | The three canonical configurations — shared queue (ROUTER/DEALER), forwarder (XSUB/XPUB), streamer (PULL/PUSH) | present — as socket-type pairings of `proxy()`, not as separate functions; libzmq ships them the same way |
 | `zmq_device(3)` | **absent** — removed from libzmq itself in favour of `zmq_proxy`. What is missing: nothing a 4.x caller can reach |
 | `zmq_poll`, `zmq_poller` | **absent by construction** — what is missing: a descriptor-set poller. Readiness here is a future, and `tokio::select!` over socket futures is what a `zmq_poll` loop becomes; every zguide recipe in `examples/` is such a loop, which is the evidence that the shape survives the translation |
@@ -352,7 +352,7 @@ than a magic value:
 | Bound | Default | What it bounds, and why libzmq has no option for it |
 | --- | --- | --- |
 | `SocketOptions::max_peers` | 1024 | how many peers one socket admits. libzmq bounds sockets per context (`ZMQ_MAX_SOCKETS`) but not connections per socket, so a stranger decides the multiplier on every per-peer queue |
-| `QueueConfig::max_bytes` | 8 MiB | the payload one direction of one peer's queue holds. `ZMQ_SNDHWM`/`ZMQ_RCVHWM` count **messages**, so at the defaults one peer could hold 1000 × 1 MiB per direction — a product, not a bound. The message count keeps libzmq's meaning exactly; this refuses the peer that actually occupies the memory. A queue that is *empty* accepts one message of any size, so the real exposure is `max_bytes - 1 + max_message_size`, just under 9 MiB, and never a wait for room that cannot appear |
+| `QueueConfig::max_bytes` | 8 MiB | what one direction of one peer's queue holds, **charged** as payload plus `QUEUE_FRAME_OVERHEAD` (64 B) per frame and `QUEUE_MESSAGE_OVERHEAD` (64 B) per message (`Queue::charge`). `ZMQ_SNDHWM`/`ZMQ_RCVHWM` count **messages**, so at the defaults one peer could hold 1000 × 1 MiB per direction — a product, not a bound — and a message of a thousand empty frames is no payload at all; the message count keeps libzmq's meaning exactly, and this refuses the peer that actually occupies the memory. A queue that is *empty* accepts one message of any size, so the real exposure is `max_bytes - 1` plus one message's charge, about 9.1 MiB at the defaults, and never a wait for room that cannot appear |
 | `Subscriptions::max_subscriptions` | 1024 | distinct prefixes one peer may hold. 37/ZMTP makes subscriptions additive and non-idempotent, so N `SUBSCRIBE` commands cost N entries and the count is a peer's choice |
 | `Subscriptions::max_subscription_bytes` | 256 | one prefix's length. 37/ZMTP's grammar is `subscription = *OCTET`, unbounded; a count alone is not a bound, because 1024 prefixes of a megabyte each is a megabyte times 1024 |
 | `MessageLimits::max_message_frames` | 1024 | frames in one message. ZMTP bounds a frame's size through `ZMQ_MAXMSGSIZE` and the frame *count* not at all, so a peer could send a million empty frames |
@@ -368,6 +368,13 @@ than a magic value:
 
 `INPROC_BUFFER_BYTES` (64 KiB) and `DEFAULT_MAX_RESOLVED_ADDRESSES` (8) are the same kind of
 number for the `inproc` transport and the resolver.
+
+**One option libzmq does not have, off by default.** `SocketOptions::router_bind_identity_to_user`
+binds a ROUTER's routing ids to the user the ZAP handler authenticated: an announced id is
+accepted only if it is byte for byte the user id the handler returned for that connection, so
+nobody authorized as one user can squat the id of another or take it over with
+`ZMQ_ROUTER_HANDOVER`. libzmq's routing id is whatever the peer announces, and so it stays
+here until the option is set; the option needs ZAP and is refused on any other socket type.
 
 **One capability libzmq's API does not have.** `XPubSocket::refuse` sends 37/ZMTP's `ERROR`
 command to the subscriber whose subscription arrived last, and

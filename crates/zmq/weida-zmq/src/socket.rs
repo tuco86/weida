@@ -24,12 +24,11 @@
 
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
+use tokio::sync::futures::Notified;
 use weida_runtime::Exec;
 use weida_zmtp::SocketType;
 
@@ -39,7 +38,7 @@ use crate::engine::{Discarded, Engine, Peer, PeerId, Session};
 use crate::error::{Error, Result};
 use crate::message::Multipart;
 use crate::options::SocketOptions;
-use crate::pipe::{MuteAction, Pipe, Queue, Sent};
+use crate::pipe::{MuteAction, Pipe, Sent, Weighed};
 use crate::session::ZmtpSession;
 
 /// What a round-robin send did, and to whom.
@@ -179,8 +178,10 @@ macro_rules! socket_endpoints {
             /// library knows about one, which for a local peer includes the
             /// credentials the kernel attributed to it
             /// ([`Peer::credentials`][$crate::engine::Peer::credentials]).
+            /// A copy the caller owns, taken from the engine's shared
+            /// snapshot; it is made on request and never on the message path.
             pub fn connections(&self) -> Vec<$crate::engine::Peer> {
-                self.core.engine().peers()
+                self.core.engine().peers().to_vec()
             }
 
             /// The socket type this socket announces in its `READY`.
@@ -375,8 +376,10 @@ impl Shared {
         self.engine.last_endpoint()
     }
 
-    /// Peers this socket may send to right now, honouring `ZMQ_IMMEDIATE`.
-    pub fn peers(&self) -> Vec<Peer> {
+    /// Peers this socket may send to right now, honouring `ZMQ_IMMEDIATE`, as
+    /// the engine's shared snapshot: taking it is a lock and a
+    /// reference-count bump, however many peers there are.
+    pub fn peers(&self) -> Arc<[Peer]> {
         self.engine.outgoing_peers()
     }
 
@@ -394,18 +397,41 @@ impl Shared {
     /// for room on *whichever* peer frees first, and for a peer at all when
     /// there is none — "SHALL block on sending… when it has no connected
     /// peers".
+    ///
+    /// "Not full" is judged for **this message**: a queue with room for a
+    /// small one and not for this one is full for it. A socket that promises
+    /// never to discard cannot afford a check that says yes to a message the
+    /// queue then refuses, so the queue decides once, under its own lock, and
+    /// hands the message back when it does not fit.
     pub async fn send_round_robin(&self, message: Multipart) -> Result<Delivered> {
         let mute = self.options().pipe.outgoing.mute;
-        loop {
-            let peers = self.peers();
-            if let Some((index, queue)) = self.next_with_room(&peers) {
-                self.send_cursor
-                    .store(index.wrapping_add(1), Ordering::Relaxed);
-                queue.try_send(message)?;
+        let mut message = Weighed::new(message);
+        // A send that finds room never creates a bell: the look below it
+        // repeats, under a bell, only for a send that is about to wait.
+        let peers = self.peers();
+        match self.offer_round_robin(&peers, message) {
+            Ok(peer) => {
                 return Ok(Delivered {
-                    peer: Some(peers[index].id),
+                    peer: Some(peer),
                     sent: Sent::Queued,
                 });
+            }
+            Err(refused) => message = refused,
+        }
+        loop {
+            // Created before the look, so that room which appears between the
+            // look and the sleep ends the sleep ([`Engine::writable`]).
+            let mut room = std::pin::pin!(self.engine.writable());
+            room.as_mut().enable();
+            let peers = self.peers();
+            match self.offer_round_robin(&peers, message) {
+                Ok(peer) => {
+                    return Ok(Delivered {
+                        peer: Some(peer),
+                        sent: Sent::Queued,
+                    });
+                }
+                Err(refused) => message = refused,
             }
             match mute {
                 MuteAction::Drop => {
@@ -415,7 +441,11 @@ impl Shared {
                     });
                 }
                 MuteAction::Fail => return Err(mute_error(peers.is_empty())),
-                MuteAction::Block => wait_for_room(&self.engine, &peers).await,
+                MuteAction::Block => {
+                    #[cfg(test)]
+                    in_window();
+                    room.await;
+                }
             }
         }
     }
@@ -425,13 +455,27 @@ impl Shared {
     /// not to block asked for the refusal.
     pub fn try_send_round_robin(&self, message: Multipart) -> Result<PeerId> {
         let peers = self.peers();
-        let Some((index, queue)) = self.next_with_room(&peers) else {
-            return Err(mute_error(peers.is_empty()));
-        };
-        self.send_cursor
-            .store(index.wrapping_add(1), Ordering::Relaxed);
-        queue.try_send(message)?;
-        Ok(peers[index].id)
+        self.offer_round_robin(&peers, Weighed::new(message))
+            .map_err(|_| mute_error(peers.is_empty()))
+    }
+
+    /// Offers `message` to each peer in turn, starting at the cursor, and
+    /// moves the cursor past the one that took it. A refusal hands the
+    /// message back untouched.
+    fn offer_round_robin(&self, peers: &[Peer], mut message: Weighed) -> Result<PeerId, Weighed> {
+        let start = self.send_cursor.load(Ordering::Relaxed);
+        for offset in 0..peers.len() {
+            let index = start.wrapping_add(offset) % peers.len();
+            match peers[index].pipe.outgoing_ref().offer(message) {
+                Ok(()) => {
+                    self.send_cursor
+                        .store(index.wrapping_add(1), Ordering::Relaxed);
+                    return Ok(peers[index].id);
+                }
+                Err(refused) => message = refused,
+            }
+        }
+        Err(message)
     }
 
     /// Sends to one named peer: REP's originator, ROUTER's routing id.
@@ -445,12 +489,12 @@ impl Shared {
                 format!("{peer} is gone; its queue was destroyed with it").into(),
             ));
         };
-        pipe.outgoing().send(message).await
+        pipe.outgoing_ref().send(message).await
     }
 
     /// This peer's pipe, if it still exists.
     pub fn pipe_of(&self, peer: PeerId) -> Option<Pipe> {
-        self.engine.peer(peer).map(|peer| peer.pipe)
+        self.engine.pipe_of(peer)
     }
 
     /// Takes the next message from any peer, fair-queued.
@@ -459,12 +503,23 @@ impl Shared {
     /// socket type: the cursor advances past whoever was served, so one busy
     /// peer cannot starve the others (§4.1).
     pub async fn recv_fair(&self) -> Result<(PeerId, Multipart)> {
+        // A receive that finds a message never creates a bell: the look below
+        // repeats, under a bell, only for a receive that is about to wait.
+        if let Some(taken) = self.take_fair() {
+            return Ok(taken);
+        }
         loop {
+            // Created before the look, so that a message — or a peer — that
+            // arrives between the look and the sleep ends the sleep
+            // ([`Engine::readable`]).
+            let mut arrived = std::pin::pin!(self.engine.readable());
+            arrived.as_mut().enable();
             if let Some(taken) = self.take_fair() {
                 return Ok(taken);
             }
-            let peers = self.engine.peers();
-            wait_for_message(&self.engine, &peers).await;
+            #[cfg(test)]
+            in_window();
+            arrived.await;
         }
     }
 
@@ -484,12 +539,11 @@ impl Shared {
     /// discard silently any messages received from other peers" (§4.2).
     pub async fn recv_from(&self, peer: PeerId) -> Result<Multipart> {
         loop {
+            let mut arrived = std::pin::pin!(self.engine.readable());
+            arrived.as_mut().enable();
             let peers = self.engine.peers();
-            for other in &peers {
-                if other.id == peer {
-                    continue;
-                }
-                while let Ok(stray) = other.pipe.incoming().try_recv() {
+            for other in peers.iter().filter(|other| other.id != peer) {
+                while let Ok(stray) = other.pipe.incoming_ref().try_recv() {
                     tracing::debug!(
                         peer = %other.id,
                         frames = stray.len(),
@@ -497,42 +551,29 @@ impl Shared {
                     );
                 }
             }
-            let Some(pipe) = self.pipe_of(peer) else {
+            let Ok(index) = peers.binary_search_by_key(&peer, |candidate| candidate.id) else {
                 return Err(Error::EHOSTUNREACH(
                     format!("{peer} is gone before it answered").into(),
                 ));
             };
-            if let Ok(message) = pipe.incoming().try_recv() {
+            if let Ok(message) = peers[index].pipe.incoming_ref().try_recv() {
                 return Ok(message);
             }
-            wait_for_message(&self.engine, &peers).await;
+            #[cfg(test)]
+            in_window();
+            arrived.await;
         }
     }
 
-    /// Waits until a message could be waiting, or the peer set changed.
+    /// A wait for the next thing a receive could act on, for a socket type
+    /// whose receive has more to report than messages — an XPUB turns a
+    /// departure into an unsubscribe — and so must wake on a peer going away
+    /// as well as on a message, and decide for itself.
     ///
-    /// For a socket type whose `recv` has more to report than messages — an
-    /// XPUB turns a departure into an unsubscribe — so it must wake on both
-    /// and decide for itself.
-    pub async fn wait_for_activity(&self) {
-        let peers = self.engine.peers();
-        wait_for_message(&self.engine, &peers).await;
-    }
-
-    /// The next peer with room, starting at the cursor, and its index.
-    fn next_with_room(&self, peers: &[Peer]) -> Option<(usize, Arc<Queue>)> {
-        if peers.is_empty() {
-            return None;
-        }
-        (0..peers.len()).find_map(|offset| {
-            let index = (self
-                .send_cursor
-                .load(Ordering::Relaxed)
-                .wrapping_add(offset))
-                % peers.len();
-            let queue = peers[index].pipe.outgoing();
-            queue.has_room().then_some((index, queue))
-        })
+    /// Create it before looking, and look after creating it: see
+    /// [`Engine::readable`].
+    pub(crate) fn readable(&self) -> Notified<'_> {
+        self.engine.readable()
     }
 
     /// One fair-queued take, advancing the cursor past whoever was served.
@@ -541,13 +582,10 @@ impl Shared {
         if peers.is_empty() {
             return None;
         }
+        let start = self.recv_cursor.load(Ordering::Relaxed);
         for offset in 0..peers.len() {
-            let index = (self
-                .recv_cursor
-                .load(Ordering::Relaxed)
-                .wrapping_add(offset))
-                % peers.len();
-            if let Ok(message) = peers[index].pipe.incoming().try_recv() {
+            let index = start.wrapping_add(offset) % peers.len();
+            if let Ok(message) = peers[index].pipe.incoming_ref().try_recv() {
                 self.recv_cursor
                     .store(index.wrapping_add(1), Ordering::Relaxed);
                 return Some((peers[index].id, message));
@@ -555,30 +593,6 @@ impl Shared {
         }
         None
     }
-}
-
-/// Waits for room on any of `peers`, or for the peer set to change.
-///
-/// A free function taking `&Engine` rather than a method taking `&self`, and
-/// that is load-bearing: a socket is `!Sync`, so a future holding
-/// `&SocketCore` is not `Send` and could not be moved into a task. Holding
-/// `&Engine` — which *is* `Sync` — keeps every socket future `Send`, so
-/// libzmq's rule comes out exactly right: a socket may be moved to another
-/// thread and used there, and may not be shared between two.
-async fn wait_for_room(engine: &Engine, peers: &[Peer]) {
-    let queues: Vec<Arc<Queue>> = peers.iter().map(|peer| peer.pipe.outgoing()).collect();
-    let waits: Vec<_> = queues.iter().map(|queue| queue.wait_for_room()).collect();
-    first_of(waits, engine.wait_for_peer_change()).await;
-}
-
-/// Waits for a message from any of `peers`, or for the peer set to change.
-async fn wait_for_message(engine: &Engine, peers: &[Peer]) {
-    let queues: Vec<Arc<Queue>> = peers.iter().map(|peer| peer.pipe.incoming()).collect();
-    let waits: Vec<_> = queues
-        .iter()
-        .map(|queue| queue.wait_for_message())
-        .collect();
-    first_of(waits, engine.wait_for_peer_change()).await;
 }
 
 /// Runs `future` under a wall-clock bound — `ZMQ_SNDTIMEO` and
@@ -614,45 +628,37 @@ fn mute_error(no_peers: bool) -> Error {
     if no_peers {
         Error::EAGAIN("this socket has no peer to send to".into())
     } else {
-        Error::EAGAIN("every peer's queue is at its high-water mark".into())
+        Error::EAGAIN("every peer's queue is full".into())
     }
 }
 
-/// Resolves as soon as the first of `many` — or `one` — does.
+#[cfg(test)]
+thread_local! {
+    /// What a test makes happen in the instant between a wait's look and its
+    /// sleep — see [`in_window`].
+    static WINDOW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms `action` to run once, in the next wait on this thread that reaches
+/// the window between its look and its sleep.
 ///
-/// `tokio::select!` cannot take a set whose size is a peer count, and pulling
-/// in a combinator crate for twenty lines is worse than the twenty lines.
-/// Every future here is one `Notify` wait, so polling them all on every wake
-/// costs a peer-count pass and no allocation beyond the vector.
-async fn first_of<A: Future<Output = ()>, B: Future<Output = ()>>(many: Vec<A>, one: B) {
-    FirstOf {
-        many: many.into_iter().map(Box::pin).collect(),
-        one: Box::pin(one),
-    }
-    .await
+/// That instant is **inside a single poll**: nothing else on this thread runs
+/// there, so a peer arriving or a queue freeing at exactly that point is not
+/// reachable through the public surface, and only a second thread landing on
+/// it ever hits the hazard the waits are written against. This is how the
+/// tests below reach it deterministically instead of racing for it, as
+/// `pipe.rs` does for a queue's own waits.
+#[cfg(test)]
+fn arm_window(action: impl FnOnce() + 'static) {
+    WINDOW.with(|window| *window.borrow_mut() = Some(Box::new(action)));
 }
 
-struct FirstOf<A, B> {
-    many: Vec<Pin<Box<A>>>,
-    one: Pin<Box<B>>,
-}
-
-impl<A: Future<Output = ()>, B: Future<Output = ()>> Future for FirstOf<A, B> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
-        // `Self` is `Unpin` — every field is a `Pin<Box<_>>` — so the
-        // projection needs no `unsafe`, which this crate forbids anyway.
-        let this = self.get_mut();
-        if this.one.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
-        }
-        for future in &mut this.many {
-            if future.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-        }
-        Poll::Pending
+/// Runs the armed action, if there is one.
+#[cfg(test)]
+fn in_window() {
+    if let Some(action) = WINDOW.with(|window| window.borrow_mut().take()) {
+        action();
     }
 }
 
@@ -660,6 +666,42 @@ impl<A: Future<Output = ()>, B: Future<Output = ()>> Future for FirstOf<A, B> {
 mod tests {
     use super::*;
     use crate::context::ContextConfig;
+    use crate::pipe::{PipeConfig, Queue, QueueConfig};
+    use std::task::{Context as TaskContext, Poll, Waker};
+
+    fn context() -> Context {
+        Context::new(ContextConfig::default()).expect("context")
+    }
+
+    /// Options that dial once and give up: a peer that never connects stays
+    /// as it is, with a queue nobody drains — the stalled reader the
+    /// size-aware tests need, with no network behind it.
+    fn dials_once() -> SocketOptions {
+        SocketOptions {
+            reconnect_ivl: None,
+            ..SocketOptions::default()
+        }
+    }
+
+    fn nowhere() -> Endpoint {
+        Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint")
+    }
+
+    /// Polls `future` by hand with a waker that does nothing, exactly as often
+    /// as one wake is worth: once to let it register and look — the armed
+    /// window fires inside that poll — and once more for the wake it is owed.
+    /// `None` is the lost wake-up: the event happened and the waiter is still
+    /// asleep, which no amount of further polling would change.
+    fn poll_through_the_window<F: Future>(future: F) -> Option<F::Output> {
+        let mut future = std::pin::pin!(future);
+        let mut cx = TaskContext::from_waker(Waker::noop());
+        for _ in 0..2 {
+            if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+                return Some(out);
+            }
+        }
+        None
+    }
 
     /// Claim: a socket may be **moved** between threads, which is what
     /// `Send` means and what a caller handing a socket to a task needs.
@@ -704,5 +746,158 @@ mod tests {
         within(core.exec(), Some(Duration::from_secs(30)), async { Ok(()) })
             .await
             .expect("inside the bound");
+    }
+
+    // The waits of a socket, against the window between a wait's look and its
+    // sleep. A peer arrives, or room appears, at exactly that instant — which
+    // is inside one poll, so only a second thread landing there ever hits it
+    // and `arm_window` is how a test lands there on purpose.
+    //
+    // What these tests catch is the shape that creates the bell **after** the
+    // look: a snapshot taken, then a wait created, loses a ring that lands
+    // between the two, and a PULL or a ROUTER with no peer yet sleeps through
+    // the first message of a brand-new one. All three tests below report that
+    // sleeper when the order is reversed.
+
+    /// Claim: a peer that arrives, with a message already queued, in the
+    /// instant between a receive's look and its sleep still wakes that
+    /// receive. The peer was not in the snapshot the look took, so the
+    /// per-queue waits of the snapshot could not have covered it.
+    #[tokio::test]
+    async fn a_peer_arriving_in_the_window_wakes_a_receive() {
+        let core = SocketCore::new(&context(), SocketType::Pull, dials_once()).expect("core");
+        let engine = core.engine().clone();
+        arm_window(move || {
+            let peer = engine.connect(&nowhere()).expect("connect");
+            engine
+                .pipe_of(peer)
+                .expect("a pipe")
+                .incoming()
+                .try_send(Multipart::single("hello"))
+                .expect("queued");
+        });
+        let (_, message) = poll_through_the_window(core.recv_fair())
+            .expect("a peer arriving in the window must wake the receive")
+            .expect("the receive");
+        assert_eq!(message, Multipart::single("hello"));
+    }
+
+    /// Claim: the same window for a blocked send with no peer to send to: a
+    /// peer that arrives between the look and the sleep ends the wait and
+    /// takes the message — "SHALL block on sending… when it has no connected
+    /// peers" is a wait that must end when one appears.
+    #[tokio::test]
+    async fn a_peer_arriving_in_the_window_wakes_a_blocked_send() {
+        let core = SocketCore::new(&context(), SocketType::Push, dials_once()).expect("core");
+        let engine = core.engine().clone();
+        arm_window(move || {
+            engine.connect(&nowhere()).expect("connect");
+        });
+        let delivered = poll_through_the_window(core.send_round_robin(Multipart::single("work")))
+            .expect("a peer arriving in the window must wake the send")
+            .expect("the send");
+        assert_eq!(delivered.sent, Sent::Queued);
+        assert!(delivered.peer.is_some());
+    }
+
+    /// Claim: the same window for a send whose only peer has a full queue:
+    /// room freed in the instant between the look and the sleep ends the
+    /// wait. The queue rings the socket's bell when its session takes a
+    /// message, which is what has to reach a sender that has not yet slept.
+    #[tokio::test]
+    async fn room_freed_in_the_window_wakes_a_blocked_send() {
+        let options = SocketOptions {
+            pipe: PipeConfig {
+                outgoing: QueueConfig {
+                    hwm: 1,
+                    ..PipeConfig::default().outgoing
+                },
+                ..PipeConfig::default()
+            },
+            ..dials_once()
+        };
+        let core = SocketCore::new(&context(), SocketType::Push, options).expect("core");
+        let peer = core.engine().connect(&nowhere()).expect("connect");
+        let pipe = core.pipe_of(peer).expect("a pipe");
+        core.try_send_round_robin(Multipart::single("fills the queue"))
+            .expect("room for one");
+
+        arm_window(move || {
+            pipe.outgoing()
+                .try_recv()
+                .expect("the session takes the message");
+        });
+        let delivered = poll_through_the_window(core.send_round_robin(Multipart::single("waits")))
+            .expect("room freed in the window must wake the send")
+            .expect("the send");
+        assert_eq!(delivered.peer, Some(peer));
+    }
+
+    /// Claim: **a blocking send waits for room for its own size.** A message
+    /// the queue cannot take yet is waited for, not refused with `EAGAIN` and
+    /// lost — on a socket whose documentation says it blocks and never
+    /// discards. Judging "room" by one byte and then sending the message's
+    /// real size is the shape that gets this wrong. Here the queue holds three
+    /// one-kilobyte messages under a ceiling that fits exactly three; the send
+    /// of a large message stays blocked while the room freed is too small for
+    /// it, ends when there is room for it, and the message arrives.
+    #[tokio::test]
+    async fn a_blocking_send_waits_for_room_for_its_own_size() {
+        let small = Multipart::single(vec![b'x'; 1000]);
+        let large = Multipart::single(vec![b'y'; 2500]);
+        let each = Queue::charge(&small);
+        let options = SocketOptions {
+            pipe: PipeConfig {
+                outgoing: QueueConfig {
+                    hwm: 0,
+                    max_bytes: 3 * each,
+                    mute: MuteAction::Block,
+                },
+                ..PipeConfig::default()
+            },
+            ..dials_once()
+        };
+        let core = SocketCore::new(&context(), SocketType::Push, options).expect("core");
+        let peer = core.engine().connect(&nowhere()).expect("connect");
+        for _ in 0..3 {
+            core.try_send_round_robin(small.clone()).expect("it fits");
+        }
+
+        let shared = core.shared.clone();
+        let message = large.clone();
+        let sending = tokio::spawn(async move { shared.send_round_robin(message).await });
+        // Margin: 100 ms for a send that must *not* complete. The phenomenon
+        // is the absence of an event, so the interval only has to exceed the
+        // time a send takes to refuse outright, which is microseconds.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !sending.is_finished(),
+            "the send must wait for room, not fail with EAGAIN"
+        );
+
+        // The session takes two messages: room for a small one, not yet for
+        // this one, so the send stays where it is.
+        let pipe = core.pipe_of(peer).expect("a pipe");
+        for _ in 0..2 {
+            pipe.outgoing().try_recv().expect("queued");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !sending.is_finished(),
+            "room for a small message is not room for a large one"
+        );
+
+        pipe.outgoing().try_recv().expect("queued");
+        let delivered = tokio::time::timeout(Duration::from_secs(10), sending)
+            .await
+            .expect("the send ended once there was room for it")
+            .expect("the task")
+            .expect("the send");
+        assert_eq!(delivered.peer, Some(peer));
+        assert_eq!(
+            pipe.outgoing().try_recv().expect("the large one arrived"),
+            large,
+            "and it was not lost on the way"
+        );
     }
 }

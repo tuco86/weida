@@ -42,17 +42,40 @@
 //! `zmq_setsockopt(3)` says it does and refuses only the peer that occupies
 //! the memory.
 //!
+//! **The bytes are accounted, not only counted.** A queued message is charged
+//! its payload *plus* [`QUEUE_FRAME_OVERHEAD`] for every frame and
+//! [`QUEUE_MESSAGE_OVERHEAD`] for the message ([`Queue::charge`]), because
+//! what a peer makes the receiver hold is not what it sent: an empty frame is
+//! two octets on the wire and a frame handle plus an allocation in memory. A
+//! payload-only count sees a message of a thousand empty frames as zero
+//! bytes, so only `ZMQ_SNDHWM` would bound the queue — at the product
+//! `hwm × max_message_frames × frame size`, a number nobody states. With the
+//! charge the same message is about 64 KiB and the ceiling admits 127 of them
+//! instead of a thousand.
+//!
 //! **A queue always accepts one message**, however large, which is why the
 //! byte ceiling applies only to a queue that is not already empty. Without
 //! that rule a message above the ceiling could never be queued at all, and a
 //! blocking socket type would wait for room that cannot appear — a deadlock
 //! in place of a bound. The exposure per direction per peer is therefore
-//! `min(hwm, ...) × message size` capped at
-//! `max_bytes - 1 + max_message_size`, i.e. **just under 9 MiB** at the
-//! defaults, and `max_message_size` is what bounds the single-message case.
+//! `max_bytes - 1` plus the charge of one message, which `max_message_size`
+//! and `max_message_frames` bound: **about 9.1 MiB** at the defaults
+//! (`8 MiB + 1 MiB + 1024 × 64 B + 64 B`).
+//!
+//! # Who is told when a queue changes
+//!
+//! A socket that receives from many peers must not park on one wait per peer:
+//! that is a vector of futures built on every park and every one of them
+//! polled on every wake, at a count a stranger chooses. Instead the engine
+//! gives all of a socket's pipes the same two bells (`Pipe::attach`): one
+//! rung after a message arrives from any peer, one rung after a message
+//! leaves for any peer, and the socket parks on one of them. A bell carries no
+//! message — it says "look again" — so the wait that uses it is allocation-free,
+//! and it registers *before* it looks, so a message that lands between the
+//! look and the sleep ends the wait instead of being slept through.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::Notify;
 use weida_zmtp::SocketType;
@@ -85,6 +108,25 @@ pub const DEFAULT_RCVHWM: usize = 1000;
 /// implementation bound. `0` means no ceiling, which is libzmq's behaviour
 /// and is available for a caller who wants exactly it.
 pub const DEFAULT_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// What one frame costs a queue besides its bytes, in bytes.
+///
+/// A queue charges every message for the memory it **makes the receiver
+/// hold**, and a frame is more than its payload: a handle in the message's
+/// frame list (32 B at most) and, for a non-empty payload, an allocation with
+/// the allocator's own header and rounding. 64 B covers both with room to
+/// spare, so a million one-byte frames cost the queue 64 MB and not the 2 MB
+/// they cost their sender on the wire — and a frame of no bytes costs
+/// something at all, which is the case a payload-only count cannot see. See
+/// [`Queue::charge`].
+pub const QUEUE_FRAME_OVERHEAD: u64 = 64;
+
+/// What one queued message costs besides its frames, in bytes: the message's
+/// frame list, its slot in the queue and the bookkeeping that goes with them.
+/// Charged once per message, so a flood of one-frame empty messages is bounded
+/// by `max_bytes / (QUEUE_MESSAGE_OVERHEAD + QUEUE_FRAME_OVERHEAD)` even when
+/// the high-water mark is off.
+pub const QUEUE_MESSAGE_OVERHEAD: u64 = 64;
 
 /// What a socket does when a peer's queue is full, or when it has no peer to
 /// send to at all: `zmq_socket(3)`'s "Action in mute state".
@@ -155,10 +197,13 @@ pub struct QueueConfig {
     /// `ZMQ_SNDHWM`/`ZMQ_RCVHWM` for this direction, in messages. `0` means
     /// no limit, as in libzmq.
     pub hwm: usize,
-    /// The same direction's ceiling in bytes, which libzmq has no option for.
-    /// `0` means no ceiling. A queue that is empty accepts one message of any
-    /// size regardless of this number, so the memory one peer occupies is
-    /// bounded by `max_bytes - 1 + max_message_size` and never by this alone.
+    /// The same direction's ceiling in bytes, which libzmq has no option for,
+    /// counted as [`Queue::charge`] counts: payload plus
+    /// [`QUEUE_FRAME_OVERHEAD`] per frame and [`QUEUE_MESSAGE_OVERHEAD`] per
+    /// message. `0` means no ceiling. A queue that is empty accepts one
+    /// message of any size regardless of this number, so the memory one peer
+    /// occupies is bounded by `max_bytes - 1` plus one message's charge and
+    /// never by this alone.
     pub max_bytes: u64,
     /// What to do at either bound.
     pub mute: MuteAction,
@@ -212,17 +257,53 @@ pub struct Queue {
     room: Notify,
     /// Woken when a message goes in, for a waiting receiver.
     ready: Notify,
+    /// Rung after a message goes in, when the socket receives from this
+    /// queue: the socket-wide bell its fair-queued receive parks on instead
+    /// of on one wait per peer. Set once, by [`Pipe::attach`].
+    on_push: OnceLock<Arc<Notify>>,
+    /// Rung after a message is taken out, when the socket sends into this
+    /// queue: the bell its blocked senders park on.
+    on_pop: OnceLock<Arc<Notify>>,
 }
 
 struct QueueState {
-    messages: VecDeque<Multipart>,
-    /// The payload the queued messages hold, maintained on every push and
-    /// pop rather than summed on demand: a send at the bound is on the hot
-    /// path and walking the queue there would make the ceiling cost more
-    /// than the memory it saves.
+    messages: VecDeque<Weighed>,
+    /// What the queued messages are charged in total — see [`Queue::charge`]
+    /// — maintained on every push and pop rather than summed on demand: a
+    /// send at the bound is on the hot path and walking the queue there would
+    /// make the ceiling cost more than the memory it saves.
     bytes: u64,
     dropped: u64,
     closed: bool,
+}
+
+/// A message together with what a queue charges for holding it.
+///
+/// The charge is computed once, when the message is first offered, and then
+/// travels with it: a send that tries several peers does not walk the frames
+/// again for each, and a pop subtracts exactly what the push added.
+#[derive(Clone, Debug)]
+pub(crate) struct Weighed {
+    message: Multipart,
+    charge: u64,
+}
+
+impl Weighed {
+    /// Weighs `message` once.
+    pub(crate) fn new(message: Multipart) -> Weighed {
+        let charge = Queue::charge(&message);
+        Weighed { message, charge }
+    }
+
+    /// The message, for a sender that was refused and keeps what it has.
+    pub(crate) fn into_message(self) -> Multipart {
+        self.message
+    }
+
+    /// The message, to look at without giving it up.
+    pub(crate) fn message(&self) -> &Multipart {
+        &self.message
+    }
 }
 
 /// Which bound a queue reached, so the refusal can name it.
@@ -275,7 +356,29 @@ impl Queue {
             }),
             room: Notify::new(),
             ready: Notify::new(),
+            on_push: OnceLock::new(),
+            on_pop: OnceLock::new(),
         }
+    }
+
+    /// What a queue charges for holding `message`: its payload, plus
+    /// [`QUEUE_FRAME_OVERHEAD`] for every frame and [`QUEUE_MESSAGE_OVERHEAD`]
+    /// for the message.
+    ///
+    /// The number [`QueueConfig::max_bytes`] is measured in, and the reason it
+    /// is not [`Multipart::total_bytes`]: that counts what the sender paid on
+    /// the wire, while the receiver holds the frames themselves — one handle
+    /// each and, for a payload, one allocation. A message of a thousand empty
+    /// frames has no payload at all and still costs a thousand handles.
+    pub fn charge(message: &Multipart) -> u64 {
+        message
+            .frames()
+            .iter()
+            .fold(QUEUE_MESSAGE_OVERHEAD, |total, frame| {
+                total
+                    .saturating_add(QUEUE_FRAME_OVERHEAD)
+                    .saturating_add(frame.len() as u64)
+            })
     }
 
     /// This queue's bound and its action at the bound.
@@ -293,8 +396,8 @@ impl Queue {
         self.lock().messages.is_empty()
     }
 
-    /// The payload the queued messages hold, in bytes — what
-    /// [`QueueConfig::max_bytes`] bounds.
+    /// What the queued messages are charged, in bytes — the number
+    /// [`QueueConfig::max_bytes`] bounds, as [`Queue::charge`] counts it.
     pub fn queued_bytes(&self) -> u64 {
         self.lock().bytes
     }
@@ -310,67 +413,6 @@ impl Queue {
         self.lock().closed
     }
 
-    /// Whether one more message fits right now.
-    ///
-    /// For a socket type that round-robins, this is how "a peer is available
-    /// only when it has an outgoing queue that is not full" is checked
-    /// (28/REQREP's DEALER rule, `docs/research/zeromq.md` §4.2). A socket
-    /// owns the producing end of its outgoing queues and is `!Sync`, so a
-    /// `true` here cannot become false under it before it sends.
-    pub fn has_room(&self) -> bool {
-        let state = self.lock();
-        // One byte, not one message: without the message in hand this is the
-        // strongest thing that can be said, and the send itself re-checks
-        // against the real size.
-        !state.closed && self.full(&state, 1).is_none()
-    }
-
-    /// Waits until [`Queue::has_room`] would be true, or the pipe is
-    /// destroyed.
-    ///
-    /// For a sender choosing between peers: it waits on *this* queue, and a
-    /// socket races one of these per peer so that whichever frees first wins.
-    pub async fn wait_for_room(&self) {
-        loop {
-            let mut room = std::pin::pin!(self.room.notified());
-            // Created *and* enabled above the check, so that room freed
-            // between the check and the await still ends this wait:
-            // `notified()` registers its waiter when it is **polled**, and
-            // `enable()` is that registration without awaiting. Creating it
-            // below the check is the shape that loses the wakeup, and the
-            // reason a reply could sit in a queue while its session slept.
-            // The same at every wait in this file; `tests` pins all four
-            // against that shape and records what it could not measure.
-            room.as_mut().enable();
-            if self.has_room() || self.is_closed() {
-                return;
-            }
-            #[cfg(test)]
-            self.in_window(Window::Frees);
-            room.await;
-        }
-    }
-
-    /// Waits until a message is queued, or the pipe is destroyed.
-    ///
-    /// The fair-queueing counterpart of [`Queue::wait_for_room`]: a receiver
-    /// races one per peer and then takes from whichever answered.
-    pub async fn wait_for_message(&self) {
-        loop {
-            let mut ready = std::pin::pin!(self.ready.notified());
-            ready.as_mut().enable();
-            {
-                let state = self.lock();
-                if !state.messages.is_empty() || state.closed {
-                    return;
-                }
-            }
-            #[cfg(test)]
-            self.in_window(Window::Arrives);
-            ready.await;
-        }
-    }
-
     /// Queues `message`, applying this queue's mute action at the bound.
     ///
     /// - [`MuteAction::Block`] waits for room — the backpressure a PUSH or a
@@ -382,7 +424,13 @@ impl Queue {
     /// Fails with `EHOSTUNREACH` once the pipe is destroyed: the peer is
     /// gone, and the RFCs destroy its queue with it.
     pub async fn send(&self, message: Multipart) -> Result<Sent> {
-        let size = message.total_bytes();
+        self.send_with(message, self.config.mute).await
+    }
+
+    /// [`Queue::send`] under a mute action the caller chooses: a ROUTER's
+    /// queues drop, and `ZMQ_ROUTER_MANDATORY` asks one of them to wait.
+    pub(crate) async fn send_with(&self, message: Multipart, mute: MuteAction) -> Result<Sent> {
+        let weighed = Weighed::new(message);
         loop {
             // Register before looking, so that room freed between the two
             // wakes this wait instead of being missed by it.
@@ -393,13 +441,13 @@ impl Queue {
                 if state.closed {
                     return Err(gone());
                 }
-                let Some(bound) = self.full(&state, size) else {
-                    self.push(&mut state, message, size);
+                let Some(bound) = self.full(&state, weighed.charge) else {
+                    self.push(&mut state, weighed);
                     drop(state);
-                    self.ready.notify_waiters();
+                    self.pushed();
                     return Ok(Sent::Queued);
                 };
-                match self.config.mute {
+                match mute {
                     MuteAction::Drop => {
                         state.dropped += 1;
                         return Ok(Sent::Dropped);
@@ -422,19 +470,38 @@ impl Queue {
     /// caller that asked not to block is asking for the refusal, not for a
     /// silent drop. A socket type that drops still drops on the blocking
     /// path, where the drop is its documented behaviour rather than the
-    /// caller's choice.
+    /// caller's choice. The message is consumed either way.
     pub fn try_send(&self, message: Multipart) -> Result<()> {
-        let size = message.total_bytes();
+        let weighed = Weighed::new(message);
         let mut state = self.lock();
         if state.closed {
             return Err(gone());
         }
-        if let Some(bound) = self.full(&state, size) {
+        if let Some(bound) = self.full(&state, weighed.charge) {
             return Err(Error::EAGAIN(self.at(bound, state.bytes).into()));
         }
-        self.push(&mut state, message, size);
+        self.push(&mut state, weighed);
         drop(state);
-        self.ready.notify_waiters();
+        self.pushed();
+        Ok(())
+    }
+
+    /// Queues the message if it fits right now, and hands it back if it does
+    /// not — because the queue is full at either bound, or destroyed.
+    ///
+    /// The decision is made once, under the queue's lock, against the
+    /// message's real charge. A check made first ("is there room?") and a
+    /// send made after it can disagree when the message is larger than the
+    /// room the check imagined, and the send then loses a message its caller
+    /// believed it could place.
+    pub(crate) fn offer(&self, weighed: Weighed) -> Result<(), Weighed> {
+        let mut state = self.lock();
+        if state.closed || self.full(&state, weighed.charge).is_some() {
+            return Err(weighed);
+        }
+        self.push(&mut state, weighed);
+        drop(state);
+        self.pushed();
         Ok(())
     }
 
@@ -450,7 +517,7 @@ impl Queue {
                 let mut state = self.lock();
                 if let Some(message) = Self::pop(&mut state) {
                     drop(state);
-                    self.room.notify_waiters();
+                    self.popped();
                     return Ok(message);
                 }
                 if state.closed {
@@ -469,7 +536,7 @@ impl Queue {
         match Self::pop(&mut state) {
             Some(message) => {
                 drop(state);
-                self.room.notify_waiters();
+                self.popped();
                 Ok(message)
             }
             None if state.closed => Err(gone()),
@@ -497,21 +564,29 @@ impl Queue {
         };
         self.room.notify_waiters();
         self.ready.notify_waiters();
+        // Whoever parked on a socket-wide bell must look again: this queue is
+        // not one they can wait for any more.
+        if let Some(bell) = self.on_push.get() {
+            bell.notify_waiters();
+        }
+        if let Some(bell) = self.on_pop.get() {
+            bell.notify_waiters();
+        }
         discarded
     }
 
-    /// Which bound `size` further bytes would cross, if any.
+    /// Which bound a message of `charge` bytes would cross, if any.
     ///
     /// The byte ceiling is skipped for an empty queue, so a message larger
     /// than the ceiling is queued rather than waited for forever (module
     /// documentation).
-    fn full(&self, state: &QueueState, size: u64) -> Option<Full> {
+    fn full(&self, state: &QueueState, charge: u64) -> Option<Full> {
         if self.config.hwm != 0 && state.messages.len() >= self.config.hwm {
             return Some(Full::Messages);
         }
         if self.config.max_bytes != 0
             && !state.messages.is_empty()
-            && state.bytes.saturating_add(size) > self.config.max_bytes
+            && state.bytes.saturating_add(charge) > self.config.max_bytes
         {
             return Some(Full::Bytes);
         }
@@ -535,15 +610,34 @@ impl Queue {
         }
     }
 
-    fn push(&self, state: &mut QueueState, message: Multipart, size: u64) {
-        state.bytes = state.bytes.saturating_add(size);
+    fn push(&self, state: &mut QueueState, message: Weighed) {
+        state.bytes = state.bytes.saturating_add(message.charge);
         state.messages.push_back(message);
     }
 
     fn pop(state: &mut QueueState) -> Option<Multipart> {
-        let message = state.messages.pop_front()?;
-        state.bytes = state.bytes.saturating_sub(message.total_bytes());
-        Some(message)
+        let weighed = state.messages.pop_front()?;
+        state.bytes = state.bytes.saturating_sub(weighed.charge);
+        Some(weighed.message)
+    }
+
+    /// Tells whoever waits for a message here — and the socket's bell, if
+    /// this is a queue the socket receives from — that one arrived. Called
+    /// after the push and after the lock is released, so a waiter that
+    /// registered first and then looked cannot miss it.
+    fn pushed(&self) {
+        self.ready.notify_waiters();
+        if let Some(bell) = self.on_push.get() {
+            bell.notify_waiters();
+        }
+    }
+
+    /// The counterpart of [`Queue::pushed`] for room: a message left.
+    fn popped(&self) {
+        self.room.notify_waiters();
+        if let Some(bell) = self.on_pop.get() {
+            bell.notify_waiters();
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -707,6 +801,33 @@ impl Pipe {
     /// The queue of messages received from this peer.
     pub fn incoming(&self) -> Arc<Queue> {
         Arc::clone(&self.incoming)
+    }
+
+    /// The queue of messages headed for this peer, borrowed.
+    ///
+    /// For the paths that look at every peer's queue once per message and must
+    /// not pay a reference-count round trip on each: [`Pipe::outgoing`] is the
+    /// owned form, for whoever keeps the queue.
+    pub(crate) fn outgoing_ref(&self) -> &Queue {
+        &self.outgoing
+    }
+
+    /// The queue of messages received from this peer, borrowed; see
+    /// [`Pipe::outgoing_ref`].
+    pub(crate) fn incoming_ref(&self) -> &Queue {
+        &self.incoming
+    }
+
+    /// Makes this pipe ring a socket's two bells: `readable` after a message
+    /// arrives from the peer and `writable` after one leaves for it.
+    ///
+    /// Idempotent, and the first attachment stays. The engine calls it for
+    /// every pipe it publishes to a socket, which is what lets the socket's
+    /// waits park on two shared bells instead of on one future per peer
+    /// (module documentation).
+    pub(crate) fn attach(&self, readable: &Arc<Notify>, writable: &Arc<Notify>) {
+        self.incoming.on_push.get_or_init(|| Arc::clone(readable));
+        self.outgoing.on_pop.get_or_init(|| Arc::clone(writable));
     }
 
     /// Asks this connection to carry one ZMTP `ERROR` naming `reason`.
@@ -1030,14 +1151,17 @@ mod tests {
     /// count — and with `hwm: 0` there is no message count to blame.
     #[tokio::test]
     async fn at_the_byte_ceiling_a_failing_queue_names_the_bytes() {
-        let q = byte_queue(1024, MuteAction::Fail);
         let chunk = message(&"x".repeat(400));
+        let small = message(&"y".repeat(100));
+        let (big, little) = (Queue::charge(&chunk), Queue::charge(&small));
+        // Room for two chunks and one small message, to the byte.
+        let q = byte_queue(2 * big + little, MuteAction::Fail);
         assert_eq!(q.send(chunk.clone()).await.expect("first"), Sent::Queued);
         assert_eq!(q.send(chunk.clone()).await.expect("second"), Sent::Queued);
-        assert_eq!(q.queued_bytes(), 800);
+        assert_eq!(q.queued_bytes(), 2 * big);
 
-        // 800 + 400 > 1024, and nothing about the message count is at its
-        // bound: two messages of an unlimited number.
+        // A third chunk is over the ceiling, and nothing about the message
+        // count is at its bound: two messages of an unlimited number.
         let err = q.send(chunk.clone()).await.unwrap_err();
         assert!(
             matches!(err, Error::EAGAIN(_)),
@@ -1052,11 +1176,8 @@ mod tests {
 
         // A smaller message still fits under the ceiling: what is bounded is
         // the memory, not the number of sends.
-        assert_eq!(
-            q.send(message(&"y".repeat(224))).await.expect("the rest"),
-            Sent::Queued
-        );
-        assert_eq!(q.queued_bytes(), 1024);
+        assert_eq!(q.send(small).await.expect("the rest"), Sent::Queued);
+        assert_eq!(q.queued_bytes(), 2 * big + little);
     }
 
     /// Claim: at the byte ceiling every mute action means what it means at
@@ -1099,7 +1220,10 @@ mod tests {
             waiting.await.expect("join").expect("room at last"),
             Sent::Queued
         );
-        assert_eq!(blocking.queued_bytes(), 60);
+        assert_eq!(
+            blocking.queued_bytes(),
+            Queue::charge(&message(&"b".repeat(60)))
+        );
     }
 
     /// Claim: a queue always accepts one message, however large, so a
@@ -1110,12 +1234,16 @@ mod tests {
     async fn one_message_above_the_ceiling_is_queued_rather_than_deadlocked() {
         let q = byte_queue(1024, MuteAction::Block);
         let huge = message(&"x".repeat(4096));
+        let charged = Queue::charge(&huge);
         assert_eq!(q.send(huge).await.expect("the one message"), Sent::Queued);
-        assert_eq!(q.queued_bytes(), 4096);
+        assert_eq!(q.queued_bytes(), charged);
 
         // And the next one waits, because the queue is no longer empty: the
         // exemption is for an empty queue, not for every large message.
-        assert!(!q.has_room());
+        let refused = q
+            .offer(Weighed::new(message("after")))
+            .expect_err("the queue is not empty any more");
+        assert_eq!(refused.into_message(), message("after"));
         let err = q.try_send(message("after")).unwrap_err();
         assert!(matches!(err, Error::EAGAIN(_)), "{err:?}");
     }
@@ -1123,21 +1251,159 @@ mod tests {
     /// Claim: `DEFAULT_QUEUE_BYTES` is what a real peer meets, so the
     /// product the message limit's documentation states — `hwm ×
     /// max_message_size` — is not the exposure. A peer sending 1 MiB
-    /// messages gets eight of them queued, not a thousand.
+    /// messages gets seven of them queued, because the eighth and its
+    /// overhead would pass 8 MiB, and not a thousand.
     #[tokio::test]
     async fn the_default_queue_bounds_a_peer_in_bytes_not_in_messages() {
         let q = queue(DEFAULT_SNDHWM, MuteAction::Drop);
         let one_mib = message(&"x".repeat(1024 * 1024));
+        let each = Queue::charge(&one_mib);
         for _ in 0..64 {
             q.send(one_mib.clone()).await.expect("send");
         }
-        assert_eq!(q.len(), 8, "8 MiB of 1 MiB messages, not 1000");
-        assert_eq!(q.queued_bytes(), DEFAULT_QUEUE_BYTES);
-        assert_eq!(q.dropped(), 56);
+        let held = DEFAULT_QUEUE_BYTES / each;
+        assert_eq!(held, 7, "8 MiB of 1 MiB messages and their overhead");
+        assert_eq!(q.len() as u64, held, "not 1000");
+        assert_eq!(q.queued_bytes(), held * each);
+        assert!(q.queued_bytes() <= DEFAULT_QUEUE_BYTES);
+        assert_eq!(q.dropped(), 64 - held);
         assert!(
             q.len() < DEFAULT_SNDHWM,
             "the message bound was never the thing that refused"
         );
+    }
+
+    /// Claim: **a message of empty frames is charged for its frames.** A
+    /// payload-only count sees nothing in it, so a queue with no message
+    /// bound took such messages without end while each cost the receiver a
+    /// thousand frame handles. With the overhead charged the byte ceiling
+    /// refuses, and what it admits is the arithmetic the module states.
+    #[test]
+    fn a_message_of_empty_frames_is_charged_for_its_frames() {
+        // `hwm: 0`: only the byte ceiling can refuse.
+        let q = byte_queue(DEFAULT_QUEUE_BYTES, MuteAction::Fail);
+        let hollow = Multipart::new(vec![crate::message::Message::empty(); 1024]).expect("frames");
+        assert_eq!(hollow.total_bytes(), 0, "there is nothing in it to count");
+        let each = Queue::charge(&hollow);
+        assert_eq!(each, 1024 * QUEUE_FRAME_OVERHEAD + QUEUE_MESSAGE_OVERHEAD);
+
+        let mut accepted = 0u64;
+        while q.try_send(hollow.clone()).is_ok() {
+            accepted += 1;
+            assert!(
+                accepted < 10_000,
+                "a queue with no message bound must still refuse hollow messages"
+            );
+        }
+        assert_eq!(accepted, DEFAULT_QUEUE_BYTES / each);
+        assert_eq!(q.queued_bytes(), accepted * each);
+        assert!(q.queued_bytes() <= DEFAULT_QUEUE_BYTES);
+    }
+
+    /// Claim: the message itself costs something even with one empty frame,
+    /// so a flood of the smallest message there is cannot fill a queue
+    /// without a message bound past the byte ceiling either.
+    #[test]
+    fn the_smallest_message_is_charged_too() {
+        let q = byte_queue(1024 * 1024, MuteAction::Fail);
+        let smallest = Multipart::single(crate::message::Message::empty());
+        let each = Queue::charge(&smallest);
+        assert_eq!(each, QUEUE_FRAME_OVERHEAD + QUEUE_MESSAGE_OVERHEAD);
+
+        let mut accepted = 0u64;
+        while q.try_send(smallest.clone()).is_ok() {
+            accepted += 1;
+            assert!(accepted < 100_000, "the ceiling must refuse");
+        }
+        assert_eq!(accepted, 1024 * 1024 / each);
+    }
+
+    /// Claim: whether a message fits is decided once, against its real size,
+    /// and a refusal hands the message back. A check that asks "is there a
+    /// byte of room?" and a send that asks "is there room for these two
+    /// mebibytes?" disagree, and the send then loses a message its caller
+    /// believed it could place — which a socket that promises never to
+    /// discard cannot afford.
+    #[test]
+    fn an_offer_decides_against_the_real_size_and_keeps_what_it_refuses() {
+        let small = message(&"s".repeat(100));
+        let large = message(&"l".repeat(2000));
+        let little = Queue::charge(&small);
+        // Room for three small messages and nothing like a large one.
+        let q = byte_queue(3 * little, MuteAction::Block);
+        assert!(q.offer(Weighed::new(small.clone())).is_ok());
+        assert!(q.offer(Weighed::new(small.clone())).is_ok());
+
+        let back = q
+            .offer(Weighed::new(large.clone()))
+            .expect_err("two kilobytes do not fit");
+        assert_eq!(back.into_message(), large, "the refused message comes back");
+        assert_eq!(q.len(), 2, "and nothing was queued for it");
+        assert!(
+            q.offer(Weighed::new(small)).is_ok(),
+            "the room that was there is still there"
+        );
+        assert_eq!(q.queued_bytes(), 3 * little);
+
+        // A destroyed queue refuses too, and the message still comes back.
+        q.close();
+        let late = q
+            .offer(Weighed::new(message("late")))
+            .expect_err("the pipe is gone");
+        assert_eq!(late.into_message(), message("late"));
+    }
+
+    /// Claim: an attached pipe rings the socket's bells, each for its own
+    /// direction: `readable` after a message arrives from the peer and
+    /// `writable` after one leaves for it — and queuing for the peer is not
+    /// room, so it rings neither.
+    #[test]
+    fn an_attached_pipe_rings_the_socket_bells() {
+        let readable = Arc::new(Notify::new());
+        let writable = Arc::new(Notify::new());
+        let pipe = Pipe::new(PipeConfig::default());
+        pipe.attach(&readable, &writable);
+
+        let mut arrived = std::pin::pin!(readable.notified());
+        let mut freed = std::pin::pin!(writable.notified());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(arrived.as_mut().poll(&mut cx).is_pending());
+        assert!(freed.as_mut().poll(&mut cx).is_pending());
+
+        pipe.incoming().try_send(message("in")).expect("queued");
+        assert!(arrived.as_mut().poll(&mut cx).is_ready());
+        assert!(
+            freed.as_mut().poll(&mut cx).is_pending(),
+            "a message arriving is not room"
+        );
+
+        pipe.outgoing().try_send(message("out")).expect("queued");
+        assert!(
+            freed.as_mut().poll(&mut cx).is_pending(),
+            "a message queued for the peer is not room"
+        );
+        pipe.outgoing().try_recv().expect("the session takes it");
+        assert!(freed.as_mut().poll(&mut cx).is_ready());
+    }
+
+    /// Claim: destroying a pipe rings both bells, so a socket parked on them
+    /// looks again and finds the peer gone rather than sleeping on it.
+    #[test]
+    fn closing_an_attached_pipe_rings_both_bells() {
+        let readable = Arc::new(Notify::new());
+        let writable = Arc::new(Notify::new());
+        let pipe = Pipe::new(PipeConfig::default());
+        pipe.attach(&readable, &writable);
+
+        let mut incoming = std::pin::pin!(readable.notified());
+        let mut outgoing = std::pin::pin!(writable.notified());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(incoming.as_mut().poll(&mut cx).is_pending());
+        assert!(outgoing.as_mut().poll(&mut cx).is_pending());
+
+        pipe.close();
+        assert!(incoming.as_mut().poll(&mut cx).is_ready());
+        assert!(outgoing.as_mut().poll(&mut cx).is_ready());
     }
 
     /// Claim: destroying a peer's pipe discards what it held and unblocks
@@ -1273,8 +1539,10 @@ mod tests {
         assert_eq!(q.recv().await.expect("second"), Multipart::single("other"));
     }
 
-    // The four waits, against the window between a wait's check and its
-    // await, and what exactly covers that window.
+    // The two waits a queue keeps, against the window between a wait's check
+    // and its await, and what exactly covers that window. The socket-wide
+    // waits that replaced the other two have the same window and the same
+    // tests, beside them in `socket.rs`.
     //
     // The hazard is inside a *single poll*: nothing else on this thread runs
     // between a wait's check and its await, so it is not reachable through
@@ -1283,18 +1551,17 @@ mod tests {
     //
     // What fails without the fix is the shape that creates the `Notified`
     // **below** the check — `self.ready.notified().await` after an empty
-    // read, the obvious simplification of all four of these loops: all four
-    // tests then report the message or the room that never woke anybody.
-    // What does **not** fail is dropping `enable()` alone while the
-    // `notified()` stays above the check, and that is worth writing down
-    // rather than assuming: `Notified` snapshots the count of
-    // `notify_waiters()` calls when it is *constructed* and its first poll
-    // completes if the count moved (tokio 1.53.1, `sync/notify.rs:569` and
-    // `:1121`), so construction — not `enable()` — is what covers the window
-    // for a `notify_waiters()`. `enable()` is still what makes that
-    // registration explicit rather than a detail of tokio's, and it is what
-    // a `notify_one()` would require, so it stays and these tests hold the
-    // creation point above the check.
+    // read, the obvious simplification of these loops: both tests then
+    // report the message or the room that never woke anybody. What does
+    // **not** fail is dropping `enable()` alone while the `notified()` stays
+    // above the check, and that is worth writing down rather than assuming:
+    // `Notified` snapshots the count of `notify_waiters()` calls when it is
+    // *constructed* and its first poll completes if the count moved (tokio
+    // 1.53.1, `sync/notify.rs:569` and `:1121`), so construction — not
+    // `enable()` — is what covers the window for a `notify_waiters()`.
+    // `enable()` is still what makes that registration explicit rather than
+    // a detail of tokio's, and it is what a `notify_one()` would require, so
+    // it stays and these tests hold the creation point above the check.
 
     /// Claim: a message queued in the instant between a receiver's check and
     /// its await still wakes that receiver — the message must not sit in the
@@ -1308,17 +1575,6 @@ mod tests {
             .expect("the receive");
         assert_eq!(received, message(WINDOW_BODY));
         assert!(q.is_empty(), "the woken receiver took the message");
-    }
-
-    /// Claim: the same window, for the wait a fair-queueing receiver races
-    /// one of per peer.
-    #[test]
-    fn a_message_arriving_in_the_window_ends_a_wait_for_a_message() {
-        let q = queue(4, MuteAction::Block);
-        Queue::arm_window();
-        poll_through_the_window(q.wait_for_message())
-            .expect("a message queued in the window must end the wait");
-        assert_eq!(q.len(), 1, "the wait ended on a message that is there");
     }
 
     /// Claim: room freed in the instant between a blocked sender's check and
@@ -1339,17 +1595,5 @@ mod tests {
             1,
             "the window took one out and the send put one in"
         );
-    }
-
-    /// Claim: the same window, for the wait a sender choosing between peers
-    /// races one of per peer.
-    #[test]
-    fn room_freed_in_the_window_ends_a_wait_for_room() {
-        let q = queue(1, MuteAction::Block);
-        q.try_send(message("filling the bound")).expect("filling");
-        Queue::arm_window();
-        poll_through_the_window(q.wait_for_room())
-            .expect("room freed in the window must end the wait");
-        assert!(q.has_room(), "the wait ended on room that is there");
     }
 }

@@ -27,7 +27,8 @@
 //!   `ZMQ_MAXMSGSIZE` judged from the declared length before a body is
 //!   allocated.
 //! - [`Pipe`] and [`Queue`] — the per-peer double queue every pattern RFC
-//!   specifies, bounded by `ZMQ_SNDHWM`/`ZMQ_RCVHWM` in messages, with
+//!   specifies, bounded by `ZMQ_SNDHWM`/`ZMQ_RCVHWM` in messages and by a byte
+//!   ceiling that charges every frame and message its overhead, with
 //!   [`MuteAction`] carrying `zmq_socket(3)`'s "Action in mute state" column
 //!   so that no socket type re-decides it.
 //! - [`Engine`] and [`SocketOptions`] — one socket's binds, connects and

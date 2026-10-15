@@ -29,6 +29,14 @@
 //! * **There is no polling loop.** libzmq's proxy is a `zmq_poll` over two
 //!   sockets; this is a `select!` over two futures, which is the same
 //!   decision made by the reactor instead of by a timeout.
+//! * **A refused message does not end the device.** A socket refuses one
+//!   message with `EINVAL`, `EHOSTUNREACH` or `EAGAIN`: a ROUTER given a
+//!   message with no routing id, a routing id nobody holds under
+//!   `ZMQ_ROUTER_MANDATORY`, a send that ran out of `ZMQ_SNDTIMEO`. The proxy
+//!   drops that message, counts it in [`ProxyStatistics::refused`] and goes
+//!   on, because the message came from a peer and one peer's message must not
+//!   end the device for every other peer. Any other failure is the socket's,
+//!   not the message's, and ends the device with its error.
 //!
 //! # No unbounded buffering
 //!
@@ -44,7 +52,9 @@
 //! subscriber is full" (29/PUBSUB), so a pub-sub proxy loses a message for a
 //! slow subscriber instead of stalling every other one. That is the
 //! mechanism's rule and not this module's choice, and it is why the
-//! statistics count what was handed over rather than what arrived.
+//! statistics count what was handed over rather than what arrived. A message
+//! a socket refused counts in [`ProxyStatistics::refused`] and in neither
+//! `_out` counter.
 
 use std::fmt;
 
@@ -238,9 +248,10 @@ pub struct Counter {
 }
 
 impl Counter {
-    fn record(&mut self, message: &Multipart) {
+    /// Counts one message of `bytes` octets.
+    fn record(&mut self, bytes: u64) {
         self.messages += 1;
-        self.bytes += message.total_bytes();
+        self.bytes += bytes;
     }
 }
 
@@ -248,18 +259,25 @@ impl Counter {
 ///
 /// libzmq replies with eight 64-bit numbers in this order, one frame each:
 /// the frontend's messages in, bytes in, messages out, bytes out, then the
-/// backend's four. "In" is what the socket received and "out" is what it was
-/// given to send.
+/// backend's four. "In" is what the socket received and "out" is what it
+/// accepted for sending. A message a socket refused is in neither: it is
+/// counted in [`ProxyStatistics::refused`] instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProxyStatistics {
     /// What the frontend received.
     pub frontend_in: Counter,
-    /// What the frontend was given to send.
+    /// What the frontend accepted for sending.
     pub frontend_out: Counter,
     /// What the backend received.
     pub backend_in: Counter,
-    /// What the backend was given to send.
+    /// What the backend accepted for sending.
     pub backend_out: Counter,
+    /// Messages a socket refused with `EINVAL`, `EHOSTUNREACH` or `EAGAIN`:
+    /// forwarded messages, capture copies and steering replies that were
+    /// dropped rather than handed over. Not one of libzmq's eight counters, so
+    /// [`ProxyStatistics::encode`] does not send it and
+    /// [`ProxyStatistics::decode`] sets it to zero.
+    pub refused: u64,
 }
 
 impl ProxyStatistics {
@@ -325,6 +343,7 @@ impl ProxyStatistics {
                 messages: values[6],
                 bytes: values[7],
             },
+            refused: 0,
         })
     }
 
@@ -355,7 +374,11 @@ impl fmt::Display for ProxyStatistics {
             self.backend_in.bytes,
             self.backend_out.messages,
             self.backend_out.bytes,
-        )
+        )?;
+        if self.refused > 0 {
+            write!(f, ", refused {}", self.refused)?;
+        }
+        Ok(())
     }
 }
 
@@ -408,14 +431,15 @@ impl Steer {
 /// device would forward nothing. The steerable form has no such refusal:
 /// its control socket is always read, so a `TERMINATE` still ends it.
 ///
-/// Runs until one of the sockets reports an error — which is what closing a
-/// socket or terminating the context looks like from in here — and returns
-/// the counters it reached.
+/// Runs until one of the sockets reports an error that is not a refusal —
+/// which is what closing a socket or terminating the context looks like from
+/// in here — and returns the counters it reached.
 ///
 /// # Errors
 ///
-/// Whatever a socket reports. `ENOTSOCK` and `ETERM` are the ordinary
-/// endings: the sockets went away.
+/// Whatever a socket reports other than a refusal, which is counted and does
+/// not end the device. `ENOTSOCK` and `ETERM` are the ordinary endings: the
+/// sockets went away.
 pub async fn proxy<F: Device, B: Device, C: Device>(
     frontend: &mut F,
     backend: &mut B,
@@ -428,17 +452,17 @@ pub async fn proxy<F: Device, B: Device, C: Device>(
         tokio::select! {
             arrived = frontend.recv(), if front_receives => {
                 let message = arrived?;
-                statistics.frontend_in.record(&message);
-                capture_copy(&mut capture, &message).await?;
-                statistics.backend_out.record(&message);
-                backend.send(message).await?;
+                statistics.frontend_in.record(message.total_bytes());
+                capture_copy(&mut capture, &message, &mut statistics.refused).await?;
+                forward(backend, message, &mut statistics.backend_out, &mut statistics.refused)
+                    .await?;
             }
             arrived = backend.recv(), if back_receives => {
                 let message = arrived?;
-                statistics.backend_in.record(&message);
-                capture_copy(&mut capture, &message).await?;
-                statistics.frontend_out.record(&message);
-                frontend.send(message).await?;
+                statistics.backend_in.record(message.total_bytes());
+                capture_copy(&mut capture, &message, &mut statistics.refused).await?;
+                forward(frontend, message, &mut statistics.frontend_out, &mut statistics.refused)
+                    .await?;
             }
             else => return Err(nothing_to_read()),
         }
@@ -455,7 +479,9 @@ pub async fn proxy<F: Device, B: Device, C: Device>(
 ///
 /// # Errors
 ///
-/// As [`proxy`], plus `EINVAL` for a control command libzmq does not define.
+/// As [`proxy`]. A control command libzmq does not define is refused the way a
+/// message is: counted in [`ProxyStatistics::refused`] and skipped, so one
+/// malformed control message does not end the device.
 pub async fn proxy_steerable<F: Device, B: Device, C: Device, S: Device>(
     frontend: &mut F,
     backend: &mut B,
@@ -469,28 +495,105 @@ pub async fn proxy_steerable<F: Device, B: Device, C: Device, S: Device>(
     loop {
         tokio::select! {
             steering = control.recv() => {
-                match Steer::parse(&steering?)? {
-                    Steer::Pause => paused = true,
-                    Steer::Resume => paused = false,
-                    Steer::Statistics => control.send(statistics.encode()).await?,
-                    Steer::Terminate => return Ok(statistics),
+                if let Some(steer) = parse_or_refuse(&steering?, &mut statistics.refused)? {
+                    match steer {
+                        Steer::Pause => paused = true,
+                        Steer::Resume => paused = false,
+                        Steer::Statistics => {
+                            let reply = statistics.encode();
+                            hand_over(control, reply, &mut statistics.refused).await?;
+                        }
+                        Steer::Terminate => return Ok(statistics),
+                    }
                 }
             }
             arrived = frontend.recv(), if front_receives && !paused => {
                 let message = arrived?;
-                statistics.frontend_in.record(&message);
-                capture_copy(&mut capture, &message).await?;
-                statistics.backend_out.record(&message);
-                backend.send(message).await?;
+                statistics.frontend_in.record(message.total_bytes());
+                capture_copy(&mut capture, &message, &mut statistics.refused).await?;
+                forward(backend, message, &mut statistics.backend_out, &mut statistics.refused)
+                    .await?;
             }
             arrived = backend.recv(), if back_receives && !paused => {
                 let message = arrived?;
-                statistics.backend_in.record(&message);
-                capture_copy(&mut capture, &message).await?;
-                statistics.frontend_out.record(&message);
-                frontend.send(message).await?;
+                statistics.backend_in.record(message.total_bytes());
+                capture_copy(&mut capture, &message, &mut statistics.refused).await?;
+                forward(frontend, message, &mut statistics.frontend_out, &mut statistics.refused)
+                    .await?;
             }
         }
+    }
+}
+
+/// Whether a send's failure is about the message and not the socket.
+///
+/// `EINVAL` is a message the socket cannot frame for its type, such as a
+/// ROUTER given a message with no routing id. `EHOSTUNREACH` is a routing id
+/// nobody holds under `ZMQ_ROUTER_MANDATORY`, the everyday race in which the
+/// client has already gone away. `EAGAIN` is a send that ran out of
+/// `ZMQ_SNDTIMEO`. The socket is usable after each of them, so the device
+/// keeps it. Any other failure is the socket's own, and ends the device.
+fn is_refusal(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::EINVAL(_) | Error::EHOSTUNREACH(_) | Error::EAGAIN(_)
+    )
+}
+
+/// Counts one refused message and says so at debug level. A peer chooses what
+/// it sends, so a refusal is never a warning: at a peer's rate, a line per
+/// message would flood the log.
+fn refuse(refused: &mut u64, error: &Error) {
+    *refused += 1;
+    tracing::debug!(
+        errno = error.errno(),
+        cause = error.cause(),
+        "a socket refused a message; the proxy dropped it and went on"
+    );
+}
+
+/// Hands `message` to `socket`. Returns whether it was handed over: a refusal
+/// is counted in `refused` and the message dropped, and any other failure is
+/// returned, because it ends the device.
+async fn hand_over<D: Device>(
+    socket: &mut D,
+    message: Multipart,
+    refused: &mut u64,
+) -> Result<bool> {
+    match socket.send(message).await {
+        Ok(()) => Ok(true),
+        Err(error) if is_refusal(&error) => {
+            refuse(refused, &error);
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Forwards `message` to `socket` and counts it in `out` once it was handed
+/// over, so the counters say what the socket accepted, not what was tried.
+async fn forward<D: Device>(
+    socket: &mut D,
+    message: Multipart,
+    out: &mut Counter,
+    refused: &mut u64,
+) -> Result<()> {
+    let bytes = message.total_bytes();
+    if hand_over(socket, message, refused).await? {
+        out.record(bytes);
+    }
+    Ok(())
+}
+
+/// Parses a control message, or counts it as refused when it names no command.
+fn parse_or_refuse(message: &Multipart, refused: &mut u64) -> Result<Option<Steer>> {
+    match Steer::parse(message) {
+        Ok(steer) => Ok(Some(steer)),
+        Err(error) if is_refusal(&error) => {
+            refuse(refused, &error);
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -498,12 +601,18 @@ pub async fn proxy_steerable<F: Device, B: Device, C: Device, S: Device>(
 ///
 /// A copy and not the message: the capture socket is an observer, so what it
 /// gets must not be what the backend gets. This is the one clone a proxy
-/// makes, and it is made only when somebody is watching.
-async fn capture_copy<C: Device>(capture: &mut Option<&mut C>, message: &Multipart) -> Result<()> {
-    match capture {
-        Some(capture) => capture.send(message.clone()).await,
-        None => Ok(()),
+/// makes, and it is made only when somebody is watching. A refused copy is
+/// counted and the message still goes on: an observer that refuses must not
+/// stop the traffic it watches.
+async fn capture_copy<C: Device>(
+    capture: &mut Option<&mut C>,
+    message: &Multipart,
+    refused: &mut u64,
+) -> Result<()> {
+    if let Some(capture) = capture {
+        hand_over(&mut **capture, message.clone(), refused).await?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -511,6 +620,9 @@ mod tests {
     use super::*;
     use crate::context::{Context, ContextConfig};
     use crate::message::Message;
+    use crate::options::SocketOptions;
+    use std::time::Duration;
+    use tokio::task::JoinHandle;
 
     fn context() -> Context {
         Context::new(ContextConfig::default()).expect("context")
@@ -537,6 +649,7 @@ mod tests {
                 messages: 7,
                 bytes: 8,
             },
+            refused: 0,
         };
         let message = statistics.encode();
         assert_eq!(message.len(), 8);
@@ -889,5 +1002,301 @@ mod tests {
             statistics.backend_in.messages, 0,
             "nothing came back the other way"
         );
+    }
+
+    /// Bounds one await in a test: a hang becomes a failure that names the
+    /// step, not a test run that never ends.
+    async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not finish within 10 s"))
+    }
+
+    /// Asks a running steerable proxy for its counters until its backend has
+    /// received `backend_in` messages. The loop that reads the data sockets
+    /// also answers STATISTICS, one event at a time, and a message's forward
+    /// is awaited inside its own branch, so a reply that counts a message
+    /// comes after that forward finished, refused or not.
+    async fn statistics_once_received(
+        device: &JoinHandle<Result<ProxyStatistics>>,
+        steer: &mut PairSocket,
+        backend_in: u64,
+    ) -> ProxyStatistics {
+        bounded("the proxy answers STATISTICS", async {
+            loop {
+                assert!(
+                    !device.is_finished(),
+                    "the proxy ended on a message it had to survive"
+                );
+                steer
+                    .send(Multipart::single(CONTROL_STATISTICS.to_vec()))
+                    .await
+                    .expect("ask");
+                let reply = steer.recv().await.expect("a reply");
+                let statistics = ProxyStatistics::decode(&reply).expect("decode");
+                if statistics.backend_in.messages >= backend_in {
+                    return statistics;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+    }
+
+    /// The queue device the refusal tests share: a REQ client on the
+    /// frontend, a raw DEALER worker on the backend, and the proxy steered
+    /// over `control_endpoint`. The worker first sends `unprompted`, which the
+    /// frontend refuses; then one request must still cross and its reply come
+    /// back. Returns the counters the device reports at `TERMINATE`.
+    async fn a_queue_device_outlives_a_refused_message(
+        context: &Context,
+        mut frontend: RouterSocket,
+        unprompted: Multipart,
+        control_endpoint: &str,
+    ) -> ProxyStatistics {
+        use crate::reqrep::ReqSocket;
+
+        let front = bounded("bind the frontend", frontend.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let mut backend = DealerSocket::new(context).expect("dealer");
+        let back = bounded("bind the backend", backend.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let mut worker = DealerSocket::new(context).expect("dealer");
+        worker.connect(&back.to_string()).expect("connect");
+        let mut client = ReqSocket::new(context).expect("req");
+        client.connect(&front.to_string()).expect("connect");
+
+        let mut control = PairSocket::new(context).expect("pair");
+        bounded("bind the control", control.bind(control_endpoint))
+            .await
+            .expect("bind");
+        let mut steer = PairSocket::new(context).expect("pair");
+        steer.connect(control_endpoint).expect("connect");
+
+        let device = tokio::spawn(async move {
+            proxy_steerable::<_, _, PairSocket, _>(&mut frontend, &mut backend, None, &mut control)
+                .await
+        });
+
+        bounded("the worker sends", worker.send(unprompted))
+            .await
+            .expect("send");
+        let seen = statistics_once_received(&device, &mut steer, 1).await;
+        assert_eq!(
+            seen.backend_in.messages, 1,
+            "the unprompted message was taken"
+        );
+
+        bounded("the client sends", client.send(Multipart::single("work")))
+            .await
+            .expect("send");
+        let request = bounded("the request arrives", worker.recv())
+            .await
+            .expect("a request");
+        assert_eq!(request.len(), 3, "routing id, empty delimiter, body");
+        assert_eq!(request.frames()[2].as_slice(), b"work");
+        let mut answer = Multipart::single(request.frames()[0].as_slice().to_vec());
+        answer.push(Vec::new());
+        answer.push(b"done".to_vec());
+        bounded("the worker answers", worker.send(answer))
+            .await
+            .expect("reply");
+        let reply = bounded("the reply arrives", client.recv())
+            .await
+            .expect("a reply");
+        assert_eq!(reply.frames()[0].as_slice(), b"done");
+
+        bounded(
+            "TERMINATE",
+            steer.send(Multipart::single(CONTROL_TERMINATE.to_vec())),
+        )
+        .await
+        .expect("terminate");
+        bounded("the proxy ends", device)
+            .await
+            .expect("the task")
+            .expect("the counters")
+    }
+
+    /// Claim: a ROUTER frontend refuses a message that carries only a routing
+    /// id with EINVAL, and that refusal does not end the queue device. One
+    /// worker's malformed message must not take the broker down for every
+    /// client: the message is counted and dropped, and the next request still
+    /// crosses.
+    #[tokio::test]
+    async fn a_refused_message_does_not_end_a_queue_device() {
+        let context = context();
+        let frontend = RouterSocket::new(&context).expect("router");
+        let statistics = a_queue_device_outlives_a_refused_message(
+            &context,
+            frontend,
+            Multipart::single(b"x".to_vec()),
+            "inproc://proxy.queue.refused",
+        )
+        .await;
+        assert_eq!(statistics.refused, 1, "{statistics}");
+    }
+
+    /// Claim: with ZMQ_ROUTER_MANDATORY a reply to a routing id nobody holds
+    /// is refused with EHOSTUNREACH, which is the everyday race in which the
+    /// client has already gone away. It must not end the device that serves
+    /// everybody else.
+    #[tokio::test]
+    async fn a_reply_to_a_departed_client_does_not_end_a_queue_device() {
+        let context = context();
+        let options = SocketOptions {
+            router_mandatory: true,
+            ..SocketOptions::default()
+        };
+        let frontend = RouterSocket::with_options(&context, options).expect("router");
+        // A reply addressed to a routing id that no connected client holds.
+        let mut departed = Multipart::single(b"gone".to_vec());
+        departed.push(Vec::new());
+        departed.push(b"late reply".to_vec());
+        let statistics = a_queue_device_outlives_a_refused_message(
+            &context,
+            frontend,
+            departed,
+            "inproc://proxy.queue.departed",
+        )
+        .await;
+        assert_eq!(statistics.refused, 1, "{statistics}");
+    }
+
+    /// Claim: a capture socket that refuses its copy does not stop the message
+    /// reaching its destination, and the refusal is counted. The capture is a
+    /// ROUTER, which refuses a message that has no routing id.
+    #[tokio::test]
+    async fn a_refused_capture_copy_still_reaches_its_destination() {
+        let context = context();
+        let mut frontend = PairSocket::new(&context).expect("pair");
+        let front = bounded("bind the frontend", frontend.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let mut backend = PairSocket::new(&context).expect("pair");
+        let back = bounded("bind the backend", backend.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let mut capture = RouterSocket::new(&context).expect("router");
+
+        let mut sender = PairSocket::new(&context).expect("pair");
+        sender.connect(&front.to_string()).expect("connect");
+        let mut receiver = PairSocket::new(&context).expect("pair");
+        receiver.connect(&back.to_string()).expect("connect");
+
+        let mut control = PairSocket::new(&context).expect("pair");
+        bounded(
+            "bind the control",
+            control.bind("inproc://proxy.capture.refused"),
+        )
+        .await
+        .expect("bind");
+        let mut steer = PairSocket::new(&context).expect("pair");
+        steer
+            .connect("inproc://proxy.capture.refused")
+            .expect("connect");
+
+        let device = tokio::spawn(async move {
+            proxy_steerable::<_, _, RouterSocket, _>(
+                &mut frontend,
+                &mut backend,
+                Some(&mut capture),
+                &mut control,
+            )
+            .await
+        });
+
+        bounded("the sender sends", sender.send(Multipart::single("first")))
+            .await
+            .expect("send");
+        let arrived = bounded("the message is forwarded", receiver.recv())
+            .await
+            .expect("a message");
+        assert_eq!(arrived.frames()[0].as_slice(), b"first");
+
+        bounded(
+            "TERMINATE",
+            steer.send(Multipart::single(CONTROL_TERMINATE.to_vec())),
+        )
+        .await
+        .expect("terminate");
+        let statistics = bounded("the proxy ends", device)
+            .await
+            .expect("the task")
+            .expect("the counters");
+        assert_eq!(statistics.refused, 1, "the capture copy was refused");
+        assert_eq!(statistics.frontend_in.messages, 1);
+        assert_eq!(
+            statistics.backend_out.messages, 1,
+            "the message still went on"
+        );
+    }
+
+    /// Claim: a failure that is about the socket, not the message, still ends
+    /// the device with its error. A PULL cannot send, so forwarding to it is
+    /// ENOTSUP: a wrong device, which no later message can fix.
+    #[tokio::test]
+    async fn a_socket_that_cannot_send_still_ends_the_device() {
+        let context = context();
+        let mut frontend = PairSocket::new(&context).expect("pair");
+        let front = bounded("bind the frontend", frontend.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let mut backend = PullSocket::new(&context).expect("pull");
+        let mut sender = PairSocket::new(&context).expect("pair");
+        sender.connect(&front.to_string()).expect("connect");
+
+        let device = tokio::spawn(async move {
+            proxy::<_, _, PairSocket>(&mut frontend, &mut backend, None).await
+        });
+        bounded("the sender sends", sender.send(Multipart::single("job")))
+            .await
+            .expect("send");
+        let err = bounded("the device ends", device)
+            .await
+            .expect("the task")
+            .expect_err("a send the socket cannot make ends the device");
+        assert_eq!(err.errno(), "ENOTSUP", "{err}");
+    }
+
+    /// Claim: a control message that names no command is counted and skipped;
+    /// the proxy keeps running, and a TERMINATE sent after it still ends it.
+    #[tokio::test]
+    async fn an_unknown_control_command_is_counted_and_skipped() {
+        let context = context();
+        let mut frontend = PairSocket::new(&context).expect("pair");
+        let mut backend = PairSocket::new(&context).expect("pair");
+        let mut control = PairSocket::new(&context).expect("pair");
+        bounded(
+            "bind the control",
+            control.bind("inproc://proxy.unknown.command"),
+        )
+        .await
+        .expect("bind");
+        let mut steer = PairSocket::new(&context).expect("pair");
+        steer
+            .connect("inproc://proxy.unknown.command")
+            .expect("connect");
+
+        let device = tokio::spawn(async move {
+            proxy_steerable::<_, _, PairSocket, _>(&mut frontend, &mut backend, None, &mut control)
+                .await
+        });
+        bounded("send STOP", steer.send(Multipart::single(b"STOP".to_vec())))
+            .await
+            .expect("send");
+        bounded(
+            "TERMINATE",
+            steer.send(Multipart::single(CONTROL_TERMINATE.to_vec())),
+        )
+        .await
+        .expect("terminate");
+        let statistics = bounded("the proxy ends", device)
+            .await
+            .expect("the task")
+            .expect("the counters");
+        assert_eq!(statistics.refused, 1, "STOP was counted");
     }
 }
