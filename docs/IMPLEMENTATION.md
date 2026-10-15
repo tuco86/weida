@@ -343,7 +343,12 @@ on `weida` ([0018](decisions/0018-minimal-broker.md)).
   with ERROR `REJECTED` and the connection survives (`tests/admission.rs`). Producers are
   read concurrently, each under a reservation against the same budget, `max_inflight_admissions`
   at a time and `io_timeout` per wait, and deliveries are written one per subscription by
-  tasks of their own, so no peer's silence is another peer's wait (`tests/stalls.rs`).
+  tasks of their own, so no peer's silence is another peer's wait (`tests/stalls.rs`). A
+  consumer whose delivery write fails or stalls past `io_timeout` has its connection closed
+  with `LIMIT_EXCEEDED` through `weida::Consumer::close`, because dropping its subscription
+  alone would leave a client that still believes it is subscribed; its unsettled deliveries
+  return to the queue and its redial subscribes again
+  (`a_consumer_that_stops_reading_has_its_connection_closed`).
 - **Publisher confirm.** A producer's exchange is answered on the reply half with `Accepted`
   (DATA key `8`); a one-way producer that orders `Accepted` gets it as a cursor on a stream of
   its own, and one that orders nothing gets the transport receipt. `Stored` is never reported:
