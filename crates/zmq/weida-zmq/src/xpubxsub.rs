@@ -20,12 +20,18 @@
 //! into an XSUB, which puts it on the wire in whichever form that socket is
 //! configured for.
 //!
-//! **The synthesized unsubscribe is the socket's memory, not the peer's.** A
-//! subscriber's table dies with its connection, so an XPUB remembers what
-//! each peer held and, when the peer goes, hands its application one `%x00`
-//! per prefix — otherwise a proxy would keep forwarding a subscription
-//! nobody holds any more. What that remembers is bounded by the same product
-//! as everything else: `max_peers` peers times `max_subscriptions` prefixes.
+//! **The synthesized unsubscribe is the application's record, not the
+//! peer's table.** A subscriber's table dies with its connection, so an XPUB
+//! remembers what its application was *handed* for each peer and, when the
+//! peer goes, hands the application one `%x00` per prefix still held —
+//! otherwise a proxy would keep forwarding a subscription nobody holds any
+//! more. It is the application's record and not the table because the two can
+//! differ: a subscription notification is dropped when the application is not
+//! reading, and an unsubscribe for a subscription the application never saw
+//! would cancel, upstream, one that another subscriber's holds. What that
+//! remembers is bounded by the same product as everything else: `max_peers`
+//! peers times `max_subscriptions` prefixes, and the departed are turned into
+//! unsubscribes one at a time ([`crate::split`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,9 +53,9 @@ use crate::subscriptions::Subscriptions;
 #[derive(Debug)]
 pub struct XPubSocket {
     core: SocketCore,
-    /// The receive-side memory: what each peer held, the synthesized
-    /// unsubscribes, and who spoke last. Lives with the receiving half once
-    /// split ([`crate::split`]).
+    /// The receive-side memory: what the application was told each peer
+    /// holds, the unsubscribes still owed for peers that left, and who spoke
+    /// last. Lives with the receiving half once split ([`crate::split`]).
     events: XPubEvents,
 }
 
@@ -138,15 +144,12 @@ impl XPubSocket {
 
     /// Subscribers this socket has.
     pub fn subscriber_count(&self) -> usize {
-        self.core.peers().len()
+        split::subscriber_count(&self.core)
     }
 
     /// Whether any subscriber's table would take `topic`.
     pub fn anybody_wants(&self, topic: &[u8]) -> bool {
-        self.core
-            .peers()
-            .iter()
-            .any(|peer| peer.subscriptions.matches(topic))
+        split::anybody_wants(&self.core, topic)
     }
 
     /// Splits the socket into a publishing half and a receiving half,
@@ -495,6 +498,79 @@ mod tests {
             "the departure must be reported as an unsubscribe"
         );
         assert_eq!(broker.subscriber_count(), 0);
+    }
+
+    /// Claim: **an XPUB owes its application an unsubscribe for exactly the
+    /// subscriptions the application was handed**, and for no others. A
+    /// subscriber's own table can hold prefixes whose notification was
+    /// dropped because the application was not reading, and an unsubscribe
+    /// for one of those, forwarded upstream by a proxy, cancels a
+    /// subscription the application never made — one that another
+    /// subscriber's may be holding. Here the notification queue holds eight
+    /// and the subscriber subscribes fifty prefixes in a burst the
+    /// application does not read: the table holds all fifty, the application
+    /// is handed eight, and when the subscriber goes it is owed those eight
+    /// back and nothing else.
+    #[tokio::test]
+    async fn a_departure_is_unsubscribed_only_for_what_the_application_was_handed() {
+        use crate::pipe::{PipeConfig, QueueConfig};
+        use std::collections::BTreeSet;
+
+        let ctx = context();
+        let mut broker = XPubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                pipe: PipeConfig {
+                    incoming: QueueConfig {
+                        hwm: 8,
+                        ..PipeConfig::default().incoming
+                    },
+                    ..PipeConfig::default()
+                },
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xpub");
+        let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| broker.subscriber_count() == 1).await;
+
+        for n in 0..50 {
+            subscriber
+                .subscribe(format!("topic.{n:02}"))
+                .expect("subscribe");
+        }
+        wait_for(|| broker.anybody_wants(b"topic.49")).await;
+
+        let mut handed = BTreeSet::new();
+        while let Ok(event) = broker.try_recv() {
+            let frame = event.frames()[0].as_slice();
+            assert_eq!(frame[0], 1, "only subscribes so far");
+            handed.insert(frame[1..].to_vec());
+        }
+        assert_eq!(
+            handed.len(),
+            8,
+            "the queue held eight; the other forty-two notifications were dropped"
+        );
+
+        subscriber.close();
+        drop(subscriber);
+        wait_for(|| broker.subscriber_count() == 0).await;
+        let mut released = BTreeSet::new();
+        // Margin: 300 ms of silence ends the drain. The unsubscribes are
+        // generated in memory, so the interval only has to exceed the time
+        // that takes, which is microseconds.
+        while let Ok(event) = broker.recv_timeout(Duration::from_millis(300)).await {
+            let frame = event.frames()[0].as_slice();
+            assert_eq!(frame[0], 0, "only unsubscribes now");
+            released.insert(frame[1..].to_vec());
+        }
+        assert_eq!(
+            released, handed,
+            "an unsubscribe for every subscribe the application saw, and for no other"
+        );
     }
 
     /// Claim: an XSUB forwards its subscriptions upstream — to a plain PUB,

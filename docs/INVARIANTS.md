@@ -157,15 +157,28 @@ protocol's own names, because users of those protocols must recognize them —
 table: `ZMQ_MAXMSGSIZE` is finite because a ZMTP frame may declare 2^63-1 octets, and
 `ZMQ_LINGER` is finite rather than infinite [0013 §4.4].
 
+**An XPUB's memory of its subscribers is bounded by the tables' own product.** What its
+application was handed for each peer — the record a departure is turned into unsubscribes
+from — holds at most `max_subscriptions` prefixes of `max_subscription_bytes` for each peer,
+and a departed peer is expanded into unsubscribes one prefix at a time, ahead of any new
+event, so the records of the departed and of the live together never outnumber the peers
+that were live (`weida-zmq`'s `split::XPubEvents`).
+
 **A message count is not a memory bound**, and that is the one place a standalone library
 adds a name of its own rather than the foreign protocol's. `ZMQ_SNDHWM` and `ZMQ_RCVHWM`
 count messages, so at libzmq's own defaults one peer could hold `1000 × ZMQ_MAXMSGSIZE` per
 direction; `weida-zmq`'s `QueueConfig::max_bytes` (`DEFAULT_QUEUE_BYTES`, 8 MiB per
 direction per peer) bounds the bytes instead, with the message count left at exactly what
-`zmq_setsockopt(3)` documents. A queue that is empty still accepts one message of any size,
+`zmq_setsockopt(3)` documents. The bytes are **accounted, not only counted**: a queued
+message is charged its payload plus `QUEUE_FRAME_OVERHEAD` (64 B) for every frame and
+`QUEUE_MESSAGE_OVERHEAD` (64 B) for the message (`Queue::charge`), because a frame of no
+bytes still costs the receiver a handle and an allocation — a message of a thousand empty
+frames is two kilobytes to its sender and 64 KiB to the queue, so the ceiling admits 127 of
+them instead of a thousand. A queue that is empty still accepts one message of any size,
 because a bound that can refuse the only message in a queue is a deadlock and not a bound,
-so the exposure is `max_bytes - 1 + max_message_size` and `ZMQ_MAXMSGSIZE` is what bounds
-the single-message case (`docs/libraries/zmq.md` §9).
+so the exposure is `max_bytes - 1` plus one message's charge, `max_message_size +
+max_message_frames × 64 B + 64 B`: about 9.1 MiB at the defaults, with `ZMQ_MAXMSGSIZE` and
+`max_message_frames` bounding the single-message case (`docs/libraries/zmq.md` §9).
 
 **And a payload-byte budget is not a bound either, if a message may be empty.** The L2
 broker's queue is the case: `weida_broker::BrokerConfig::queue_bytes` (8 MiB per queue)

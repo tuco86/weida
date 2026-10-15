@@ -40,10 +40,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use weida_runtime::Exec;
@@ -305,15 +307,30 @@ pub struct AnnouncedIdentity(Arc<Mutex<Announcement>>);
 struct Announcement {
     announced: bool,
     identity: Option<RoutingId>,
+    /// Where the engine learns that this slot changed, set by the engine when
+    /// it first publishes the peer; see [`AnnouncedIdentity::watch`].
+    changes: Option<Arc<PeerChanges>>,
 }
 
 impl AnnouncedIdentity {
     /// Records the handshake's outcome: the identity the peer chose, or
     /// `None` where it chose none. Called once, after the handshake.
+    ///
+    /// **The last thing a session records about a connection**, after the
+    /// user id a ZAP handler returned: the engine rebuilds the snapshot it
+    /// publishes after this call, so a socket that reads [`Peer::user_id`]
+    /// beside [`Peer::identity`] sees both, and a ROUTER parked on the
+    /// engine's bells is woken to learn the peer.
     pub fn announce(&self, identity: Option<RoutingId>) {
-        let mut slot = self.0.lock().expect("identity slot poisoned");
-        slot.announced = true;
-        slot.identity = identity;
+        let changes = {
+            let mut slot = self.0.lock().expect("identity slot poisoned");
+            slot.announced = true;
+            slot.identity = identity;
+            slot.changes.clone()
+        };
+        if let Some(changes) = changes {
+            changes.notify_waiters();
+        }
     }
 
     /// What the peer announced, if anything. A peer that announced nothing
@@ -330,6 +347,89 @@ impl AnnouncedIdentity {
     /// above becomes meaningful.
     pub fn is_announced(&self) -> bool {
         self.0.lock().expect("identity slot poisoned").announced
+    }
+
+    /// Both answers, taken under one lock so that they agree.
+    fn read(&self) -> (Option<RoutingId>, bool) {
+        let slot = self.0.lock().expect("identity slot poisoned");
+        (slot.identity.clone(), slot.announced)
+    }
+
+    /// Tells this slot where to report a change. Idempotent; called when the
+    /// engine publishes the peer, which is before any session could have
+    /// announced anything a published snapshot would miss: an announcement
+    /// that landed earlier is read by the snapshot being built, and one that
+    /// lands later reports itself.
+    fn watch(&self, changes: &Arc<PeerChanges>) {
+        self.0
+            .lock()
+            .expect("identity slot poisoned")
+            .changes
+            .get_or_insert_with(|| Arc::clone(changes));
+    }
+}
+
+/// What a change to the peer set — or to anything a [`Peer`] reports — has
+/// to do besides changing it: drop the snapshot the engine publishes, and
+/// ring the two bells a socket's waits are parked on.
+///
+/// Shared by the engine and by every peer's [`AnnouncedIdentity`], which is
+/// how an announcement — made by a session on its own task, with no access
+/// to the engine's state — reaches the socket that is waiting for it.
+#[derive(Debug, Default)]
+struct PeerChanges {
+    /// The published snapshot, built on demand and dropped on every change,
+    /// so it is never stale and a departed peer's queues and subscription
+    /// table are released at once rather than at the next rebuild.
+    view: Mutex<Option<View>>,
+    /// How many times the peer set has changed in a way a reader reconciles
+    /// against — a peer arrived, connected, went or announced itself. A
+    /// reader that remembers the number it last looked at knows, with one
+    /// load and no lock, that nothing has changed since, and holds nothing
+    /// of the peers it looked at while it waits to find out.
+    generation: AtomicU64,
+    /// Rung when a receive may now find something: a message arrived on any
+    /// peer's incoming queue, or the peer set changed. Every pipe the engine
+    /// publishes is attached to it ([`Pipe::attach`]).
+    readable: Arc<Notify>,
+    /// Rung when a send may now find room: a message left any peer's outgoing
+    /// queue, or the peer set changed.
+    writable: Arc<Notify>,
+}
+
+/// What the engine publishes about its peers: the same list twice when every
+/// peer is usable, and the connected ones alone as the second when
+/// `ZMQ_IMMEDIATE` hides the others from a sender.
+#[derive(Debug)]
+struct View {
+    all: Arc<[Peer]>,
+    outgoing: Arc<[Peer]>,
+}
+
+impl PeerChanges {
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Drops the published snapshot without waking anybody: for a change no
+    /// wait can be parked on and no reader reconciles against, such as a
+    /// connect attempt being counted.
+    fn touch(&self) {
+        *self.view.lock().expect("peer view poisoned") = None;
+    }
+
+    /// Drops the published snapshot, moves the generation on and rings both
+    /// bells, so that every wait looks again at a peer set that has changed
+    /// under it.
+    ///
+    /// In that order: a reader that sees the new generation must find the old
+    /// snapshot already gone, or it would reconcile against the old peers and
+    /// remember the new number.
+    fn notify_waiters(&self) {
+        self.touch();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.readable.notify_waiters();
+        self.writable.notify_waiters();
     }
 }
 
@@ -356,11 +456,11 @@ struct EngineInner {
     /// `zmq_close()`'s accounting.
     slot: SocketSlot,
     state: Mutex<EngineState>,
-    /// Signalled whenever the peer set changes: one arrived, one connected,
-    /// one went away. A socket type that must wait for *a* peer — every
-    /// blocking mute action with nothing to send to — waits on this instead
-    /// of polling.
-    peers_changed: Notify,
+    /// The peer set's change notification, and the snapshot it invalidates.
+    /// Rung whenever the set changes — one arrived, one connected, one went
+    /// away — and whenever a published pipe moves a message; see
+    /// [`PeerChanges`].
+    peers_changed: Arc<PeerChanges>,
     /// Where connection-lifecycle events are published, and the mask the
     /// one installed monitor asked for. `zmq_socket_monitor`'s events are
     /// one source rendered two ways, and this is the source
@@ -434,7 +534,7 @@ impl Engine {
                     next_peer: 1,
                     closed: false,
                 }),
-                peers_changed: Notify::new(),
+                peers_changed: Arc::default(),
                 monitor: MonitorSink::default(),
             }),
         })
@@ -632,14 +732,36 @@ impl Engine {
         Ok(peer)
     }
 
-    /// Waits until the peer set changes: one arrived, one connected, one went
-    /// away.
+    /// A wait for the next thing a receive could act on: a message arriving
+    /// from any peer, or the peer set changing.
     ///
-    /// What a socket type blocking with nowhere to send waits on. "SHALL
-    /// block on sending… when it has no connected peers" is a wait for a
-    /// peer, and this is that wait rather than a poll.
-    pub async fn wait_for_peer_change(&self) {
-        self.inner.peers_changed.notified().await;
+    /// **Create it before looking, and look after creating it.** The returned
+    /// future counts every ring from the moment it exists, so a message that
+    /// lands between the look and the sleep ends the wait; one created after
+    /// the look would sleep through it. [`Engine::peers`] is the look, and
+    /// publishing a peer is what attaches its pipe to this bell, so a wait
+    /// that creates this first and reads the peers second cannot miss a pipe.
+    pub(crate) fn readable(&self) -> Notified<'_> {
+        self.inner.peers_changed.readable.notified()
+    }
+
+    /// A wait for the next thing a send could act on: room appearing on any
+    /// peer's outgoing queue, or the peer set changing — "SHALL block on
+    /// sending… when it has no connected peers" is a wait for a peer, and
+    /// this is that wait rather than a poll. Create it before looking; see
+    /// [`Engine::readable`].
+    pub(crate) fn writable(&self) -> Notified<'_> {
+        self.inner.peers_changed.writable.notified()
+    }
+
+    /// How many times the peer set has changed in a way a reader reconciles
+    /// against: a peer arrived, connected, went or announced itself.
+    ///
+    /// Read it **before** [`Engine::peers`] and remember it with what was
+    /// read: a change between the two costs one pass more, never a missed
+    /// one.
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.peers_changed.generation()
     }
 
     /// Stops accepting on `endpoint`, which may be the endpoint as requested
@@ -723,16 +845,17 @@ impl Engine {
             .collect()
     }
 
-    /// Every peer this socket has, connected or not.
-    pub fn peers(&self) -> Vec<Peer> {
-        let state = self.lock();
-        let mut peers: Vec<Peer> = state
-            .peers
-            .iter()
-            .map(|(id, entry)| snapshot(*id, entry))
-            .collect();
-        peers.sort_by_key(|peer| peer.id);
-        peers
+    /// Every peer this socket has, connected or not, sorted by id.
+    ///
+    /// One shared, immutable snapshot: the engine rebuilds it only after the
+    /// peer set — or anything a [`Peer`] reports — has changed, so calling
+    /// this once per message costs a lock and a reference-count bump. A fresh
+    /// list per call costs a lock per peer and an allocation or three, at a
+    /// peer count a stranger chooses. The caller keeps the snapshot it took
+    /// however the set moves on, and two calls that return the same `Arc`
+    /// saw the same peers.
+    pub fn peers(&self) -> Arc<[Peer]> {
+        self.view(|view| Arc::clone(&view.all))
     }
 
     /// The peers a sender may put a message in right now.
@@ -740,19 +863,65 @@ impl Engine {
     /// Every peer, unless `ZMQ_IMMEDIATE` is set — in which case only the
     /// connected ones, so that "messages shall be queued only to completed
     /// connections" and a round-robin socket does not fill the queue of an
-    /// endpoint that never answers (`docs/research/zeromq.md` §5).
-    pub fn outgoing_peers(&self) -> Vec<Peer> {
-        let immediate = self.inner.options.immediate;
-        self.peers()
-            .into_iter()
-            .filter(|peer| !immediate || peer.connected)
-            .collect()
+    /// endpoint that never answers (`docs/research/zeromq.md` §5). A shared
+    /// snapshot like [`Engine::peers`].
+    pub fn outgoing_peers(&self) -> Arc<[Peer]> {
+        self.view(|view| Arc::clone(&view.outgoing))
     }
 
     /// One peer, by id.
     pub fn peer(&self, id: PeerId) -> Option<Peer> {
         let state = self.lock();
-        state.peers.get(&id).map(|entry| snapshot(id, entry))
+        state
+            .peers
+            .get(&id)
+            .map(|entry| snapshot(id, entry, &self.inner.peers_changed))
+    }
+
+    /// One peer's pipe, by id: all a send to a named peer needs, without
+    /// building the whole [`Peer`] it belongs to.
+    pub fn pipe_of(&self, id: PeerId) -> Option<Pipe> {
+        self.lock().peers.get(&id).map(|entry| entry.pipe.clone())
+    }
+
+    /// Records on a peer what a session records after its handshake — the user
+    /// id a ZAP handler named, then the routing id the peer announced — for a
+    /// test that needs a peer a ROUTER can learn with no connection behind it.
+    #[cfg(test)]
+    pub(crate) fn assume(
+        &self,
+        peer: PeerId,
+        user: Option<ZapUserId>,
+        identity: Option<RoutingId>,
+    ) {
+        let (user_slot, identity_slot) = {
+            let state = self.lock();
+            let entry = state.peers.get(&peer).expect("a peer this engine has");
+            (entry.user.clone(), entry.identity.clone())
+        };
+        user_slot.set(user);
+        identity_slot.announce(identity);
+    }
+
+    /// Reads the published snapshot, building it first if a change has
+    /// dropped it.
+    ///
+    /// The state lock is taken before the snapshot's, here and nowhere in
+    /// the other order, so a change that clears the snapshot while holding
+    /// the state cannot deadlock against a rebuild. A change whose table
+    /// update lands before a rebuild and whose notification lands after the
+    /// rebuild's install clears a snapshot that was already current, which
+    /// costs one more rebuild and never leaves a stale one behind.
+    fn view<R>(&self, read: impl FnOnce(&View) -> R) -> R {
+        let changes = &self.inner.peers_changed;
+        if let Some(view) = changes.view.lock().expect("peer view poisoned").as_ref() {
+            return read(view);
+        }
+        let state = self.lock();
+        let mut published = changes.view.lock().expect("peer view poisoned");
+        let view = published
+            .get_or_insert_with(|| build_view(&state, changes, self.inner.options.immediate));
+        read(view)
     }
 
     /// Destroys one peer's pipe and forgets it, which ends its connection.
@@ -864,7 +1033,15 @@ impl std::fmt::Debug for Engine {
     }
 }
 
-fn snapshot(id: PeerId, entry: &PeerEntry) -> Peer {
+fn snapshot(id: PeerId, entry: &PeerEntry, changes: &Arc<PeerChanges>) -> Peer {
+    // Publishing a peer is what wires it to the socket: its pipe starts
+    // ringing the bells, and its identity slot starts reporting to the
+    // engine. Every wait creates its bell before it reads a snapshot, so a
+    // pipe that was not yet attached cannot have been one the wait failed to
+    // look at.
+    entry.pipe.attach(&changes.readable, &changes.writable);
+    entry.identity.watch(changes);
+    let (identity, announced) = entry.identity.read();
     Peer {
         id,
         user_id: entry.user.get(),
@@ -873,10 +1050,28 @@ fn snapshot(id: PeerId, entry: &PeerEntry) -> Peer {
         connected: entry.connected,
         attempts: entry.attempts,
         pipe: entry.pipe.clone(),
-        identity: entry.identity.get(),
-        announced: entry.identity.is_announced(),
+        identity,
+        announced,
         subscriptions: Arc::clone(&entry.subscriptions),
     }
+}
+
+/// The snapshot of every peer in `state`, sorted by id, and the part of it a
+/// sender may use.
+fn build_view(state: &EngineState, changes: &Arc<PeerChanges>, immediate: bool) -> View {
+    let mut peers: Vec<Peer> = state
+        .peers
+        .iter()
+        .map(|(id, entry)| snapshot(*id, entry, changes))
+        .collect();
+    peers.sort_unstable_by_key(|peer| peer.id);
+    let all: Arc<[Peer]> = Arc::from(peers);
+    let outgoing = if immediate {
+        all.iter().filter(|peer| peer.connected).cloned().collect()
+    } else {
+        Arc::clone(&all)
+    };
+    View { all, outgoing }
 }
 
 /// The engine carries ZeroMQ's whole working set — `tcp`, `ipc` and
@@ -986,6 +1181,7 @@ impl EngineInner {
         {
             entry.credentials = credentials;
         }
+        self.peers_changed.touch();
     }
 
     fn count_attempt(&self, peer: PeerId) {
@@ -998,6 +1194,7 @@ impl EngineInner {
         {
             entry.attempts += 1;
         }
+        self.peers_changed.touch();
     }
 
     fn subscriptions_of(&self, peer: PeerId) -> Option<Arc<Subscriptions>> {
@@ -2200,5 +2397,137 @@ mod tests {
             .await
             .expect("after the slot freed");
         wait_for(|| engine.peers().len() == 1).await;
+    }
+
+    /// An engine that dials once and gives up, so that a peer which never
+    /// connects stays exactly as it is: no retry counts an attempt and
+    /// publishes a new snapshot under a test that is comparing two.
+    fn dials_once() -> SocketOptions {
+        SocketOptions {
+            reconnect_ivl: None,
+            ..options()
+        }
+    }
+
+    /// Claim: **the peers are one shared snapshot until something about them
+    /// changes** — the same `Arc`, not an equal copy — so a send or a receive
+    /// per message costs a lock and a reference-count bump instead of a lock
+    /// per peer and an allocation or three, at a peer count a stranger
+    /// chooses. A peer arriving, an announcement and a peer going each publish
+    /// a new one, and a snapshot already taken is never altered under its
+    /// holder.
+    #[tokio::test]
+    async fn the_peers_are_one_shared_snapshot_until_something_changes() {
+        let ctx = context();
+        let engine = Engine::new(&ctx, dials_once(), Recorder::new()).expect("engine");
+        let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+        let elsewhere = Endpoint::parse("tcp://127.0.0.1:10").expect("endpoint");
+        let first = engine.connect(&nowhere).expect("connect");
+        // The one attempt is counted, and that is the last change there is
+        // until the test makes one.
+        wait_for(|| engine.peers().first().map(|peer| peer.attempts) == Some(1)).await;
+
+        let before = engine.peers();
+        assert!(
+            Arc::ptr_eq(&before, &engine.peers()),
+            "nothing changed, so nothing was rebuilt"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &engine.outgoing_peers()),
+            "without ZMQ_IMMEDIATE every peer is one a sender may use"
+        );
+
+        let before_connect = engine.generation();
+        assert_eq!(before_connect, engine.generation(), "nothing changed");
+        engine.connect(&elsewhere).expect("connect");
+        let grown = engine.peers();
+        assert!(!Arc::ptr_eq(&before, &grown), "a peer arrived");
+        let grown_at = engine.generation();
+        assert!(grown_at > before_connect, "a peer arrived");
+        assert_eq!(grown.len(), 2);
+        assert!(
+            grown.windows(2).all(|pair| pair[0].id < pair[1].id),
+            "sorted by id, which is what lets a reader search it"
+        );
+        assert_eq!(before.len(), 1, "the snapshot already taken is unchanged");
+
+        engine.assume(
+            first,
+            Some(ZapUserId::new("alice")),
+            Some(RoutingId::new(b"alpha".to_vec()).expect("id")),
+        );
+        let announced = engine.peers();
+        assert!(!Arc::ptr_eq(&grown, &announced), "an announcement");
+        let announced_at = engine.generation();
+        assert!(
+            announced_at > grown_at,
+            "an announcement is a change of its own"
+        );
+        let peer = announced
+            .iter()
+            .find(|peer| peer.id == first)
+            .expect("peer");
+        assert!(peer.announced);
+        assert_eq!(
+            peer.identity.as_ref().map(RoutingId::as_bytes),
+            Some(&b"alpha"[..])
+        );
+        assert_eq!(peer.user_id.as_ref().map(ZapUserId::as_str), Some("alice"));
+        assert!(!grown[0].announced, "an older snapshot does not learn it");
+
+        engine.disconnect(&nowhere).expect("disconnect");
+        let shrunk = engine.peers();
+        assert!(!Arc::ptr_eq(&announced, &shrunk), "a peer went");
+        assert!(engine.generation() > announced_at, "a peer went");
+        assert_eq!(shrunk.len(), 1);
+    }
+
+    /// Claim: **every change to the peer set rings both bells a socket's waits
+    /// are parked on**, whichever way the set changes — a peer arriving, an
+    /// announcement, a peer going — because a socket waiting for "a message or
+    /// a peer" has nothing else to be woken by.
+    #[tokio::test]
+    async fn a_change_to_the_peer_set_rings_both_bells() {
+        use std::task::{Context as TaskContext, Poll, Waker};
+
+        let ctx = context();
+        let engine = Engine::new(&ctx, dials_once(), Recorder::new()).expect("engine");
+        let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+        let mut cx = TaskContext::from_waker(Waker::noop());
+
+        let mut rung = |change: &dyn Fn()| {
+            let mut readable = std::pin::pin!(engine.readable());
+            let mut writable = std::pin::pin!(engine.writable());
+            assert!(readable.as_mut().poll(&mut cx).is_pending());
+            assert!(writable.as_mut().poll(&mut cx).is_pending());
+            change();
+            (
+                readable.as_mut().poll(&mut cx) == Poll::Ready(()),
+                writable.as_mut().poll(&mut cx) == Poll::Ready(()),
+            )
+        };
+
+        let first = std::cell::Cell::new(None);
+        assert_eq!(
+            rung(&|| first.set(Some(engine.connect(&nowhere).expect("connect")))),
+            (true, true),
+            "a peer arrived"
+        );
+        let first = first.get().expect("the peer");
+        // A wait reads the peers after it creates its bell, which is what
+        // publishes the peer and makes its announcement report to the engine.
+        let _published = engine.peers();
+        assert_eq!(
+            rung(&|| engine.assume(first, None, None)),
+            (true, true),
+            "a peer announced"
+        );
+        assert_eq!(
+            rung(&|| {
+                engine.disconnect(&nowhere).expect("disconnect");
+            }),
+            (true, true),
+            "a peer went"
+        );
     }
 }

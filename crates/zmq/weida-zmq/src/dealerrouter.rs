@@ -258,9 +258,12 @@ socket_endpoints!(RouterSocket);
 mod tests {
     use super::*;
     use crate::context::ContextConfig;
+    use crate::endpoint::Endpoint;
+    use crate::engine::PeerId;
     use crate::identity::RoutingId;
     use crate::message::Message;
-    use crate::pipe::{PipeConfig, QueueConfig};
+    use crate::pipe::{PipeConfig, Queue, QueueConfig};
+    use crate::zap::ZapUserId;
 
     fn context() -> Context {
         Context::new(ContextConfig::default()).expect("context")
@@ -669,6 +672,174 @@ mod tests {
             .send(Multipart::single("just-an-id"))
             .await
             .unwrap_err();
+        assert_eq!(err.errno(), "EINVAL", "{err}");
+    }
+
+    /// Dials an endpoint nothing listens on, which leaves a peer entry whose
+    /// outgoing queue nobody drains, and records on it what a handshake would.
+    fn stranded(router: &RouterSocket, port: u16, user: Option<&str>, id: Option<&[u8]>) -> PeerId {
+        let engine = router.core.engine();
+        let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
+        let peer = engine.connect(&endpoint).expect("connect");
+        engine.assume(
+            peer,
+            user.map(ZapUserId::new),
+            id.map(|id| RoutingId::new(id.to_vec()).expect("a routing id")),
+        );
+        peer
+    }
+
+    /// Claim: **a message the peer's queue cannot take is a drop, not an
+    /// error** — "0 discards silently when it cannot be routed or the peer's
+    /// SNDHWM is reached", and a ceiling in bytes is the same refusal as a
+    /// ceiling in messages. A check made for one byte of room before a send of
+    /// the real size says yes and then fails with `EAGAIN`, which a ROUTER
+    /// without `ZMQ_ROUTER_MANDATORY` never reports. With the option, the
+    /// refusal under `ZMQ_DONTWAIT` is `EAGAIN`, as before.
+    #[tokio::test]
+    async fn a_message_the_peers_queue_cannot_take_is_a_drop() {
+        let ctx = context();
+        let body = vec![b'x'; 100_000];
+        let each = Queue::charge(&Multipart::single(body.clone()));
+        let options = |mandatory: bool| SocketOptions {
+            router_mandatory: mandatory,
+            pipe: PipeConfig {
+                outgoing: QueueConfig {
+                    hwm: 0,
+                    // Two of these messages fit, and a third does not.
+                    max_bytes: 2 * each + 1000,
+                    mute: MuteAction::Drop,
+                },
+                ..PipeConfig::default()
+            },
+            ..SocketOptions::default()
+        };
+        let framed = || {
+            Multipart::new(vec![Message::from("worker"), Message::from(body.clone())])
+                .expect("frames")
+        };
+
+        let mut lenient = RouterSocket::with_options(&ctx, options(false)).expect("router");
+        stranded(&lenient, 9, None, Some(b"worker"));
+        assert_eq!(lenient.peers(), vec![RoutingKey::from_wire(b"worker")]);
+        assert_eq!(lenient.send(framed()).await.expect("first"), Sent::Queued);
+        assert_eq!(lenient.send(framed()).await.expect("second"), Sent::Queued);
+        assert_eq!(
+            lenient.send(framed()).await.expect("a drop, not an error"),
+            Sent::Dropped
+        );
+        assert_eq!(
+            lenient.try_send(framed()).expect("a drop, not an error"),
+            Sent::Dropped
+        );
+
+        let mut strict = RouterSocket::with_options(&ctx, options(true)).expect("router");
+        stranded(&strict, 10, None, Some(b"worker"));
+        assert_eq!(strict.peers().len(), 1);
+        strict.try_send(framed()).expect("first");
+        strict.try_send(framed()).expect("second");
+        let err = strict.try_send(framed()).unwrap_err();
+        assert_eq!(err.errno(), "EAGAIN", "{err}");
+    }
+
+    /// Claim: **with `router_bind_identity_to_user` a routing id is the
+    /// authenticated user's and nobody else's.** An announced id is accepted
+    /// only if it is byte for byte the user id the ZAP handler named for the
+    /// connection: a peer authorized as "bravo" cannot take the id of the peer
+    /// authorized as "alpha" — not by claiming it first, and not by claiming
+    /// it with `ZMQ_ROUTER_HANDOVER` on — and a peer no handler named a user
+    /// for cannot announce one at all. A peer that announces nothing still
+    /// gets a generated id.
+    #[tokio::test]
+    async fn a_bound_routing_id_is_the_authenticated_users() {
+        let ctx = context();
+        let mut router = RouterSocket::with_options(
+            &ctx,
+            SocketOptions {
+                router_handover: true,
+                router_bind_identity_to_user: true,
+                zap_domain: "test".to_string(),
+                reconnect_ivl: None,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("router");
+
+        let alpha = stranded(&router, 9, Some("alpha"), Some(b"alpha"));
+        let hijacker = stranded(&router, 10, Some("bravo"), Some(b"alpha"));
+        let nameless = stranded(&router, 11, None, Some(b"charlie"));
+        let quiet = stranded(&router, 12, Some("delta"), None);
+
+        let keys = router.peers();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(keys.contains(&RoutingKey::from_wire(b"alpha")));
+        assert!(keys.iter().any(RoutingKey::is_generated), "{keys:?}");
+
+        let engine = router.core.engine();
+        assert!(engine.peer(alpha).is_some(), "the owner of the id stays");
+        assert!(
+            engine.peer(hijacker).is_none(),
+            "another user's claim is refused even with handover on"
+        );
+        assert!(
+            engine.peer(nameless).is_none(),
+            "an id no user vouches for is refused"
+        );
+        assert!(
+            engine.peer(quiet).is_some(),
+            "a peer that claims nothing is untouched"
+        );
+    }
+
+    /// Claim: without the option the ROUTER is libzmq's: a routing id is
+    /// whatever the peer announces, and with `ZMQ_ROUTER_HANDOVER` a newcomer
+    /// takes it from the incumbent whoever either of them was authorized as.
+    /// That is the hijack the option exists to close, and the default stays
+    /// as libzmq has it.
+    #[tokio::test]
+    async fn without_binding_a_routing_id_is_whatever_the_peer_announces() {
+        let ctx = context();
+        let mut router = RouterSocket::with_options(
+            &ctx,
+            SocketOptions {
+                router_handover: true,
+                reconnect_ivl: None,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("router");
+        let alpha = stranded(&router, 9, Some("alpha"), Some(b"alpha"));
+        let newcomer = stranded(&router, 10, Some("bravo"), Some(b"alpha"));
+
+        assert_eq!(router.peers(), vec![RoutingKey::from_wire(b"alpha")]);
+        let engine = router.core.engine();
+        assert!(
+            engine.peer(alpha).is_none(),
+            "the incumbent was handed over"
+        );
+        assert!(engine.peer(newcomer).is_some(), "and the newcomer holds it");
+    }
+
+    /// Claim: the binding is refused where it cannot work — without ZAP, where
+    /// no peer would ever have a user to compare with, and on any socket type
+    /// but ROUTER.
+    #[tokio::test]
+    async fn identity_binding_needs_zap_and_a_router() {
+        let ctx = context();
+        let binding = SocketOptions {
+            router_bind_identity_to_user: true,
+            ..SocketOptions::default()
+        };
+        let err = RouterSocket::with_options(&ctx, binding.clone()).unwrap_err();
+        assert_eq!(err.errno(), "EINVAL", "{err}");
+        assert!(err.cause().contains("ZAP"), "{err}");
+
+        let with_zap = SocketOptions {
+            zap_domain: "test".to_string(),
+            ..binding
+        };
+        RouterSocket::with_options(&ctx, with_zap.clone()).expect("a ROUTER with ZAP may bind");
+        let err = DealerSocket::with_options(&ctx, with_zap).unwrap_err();
         assert_eq!(err.errno(), "EINVAL", "{err}");
     }
 }

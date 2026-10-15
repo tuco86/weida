@@ -40,6 +40,7 @@ use crate::options::SocketOptions;
 use crate::pipe::MuteAction;
 use crate::session::ZmtpSession;
 use crate::socket::{SocketCore, socket_endpoints};
+use crate::split;
 use crate::subscriptions::{self, Subscriptions};
 
 /// What one [`PubSocket::publish`] achieved.
@@ -91,30 +92,7 @@ impl PubSocket {
     /// copy and a message nobody subscribed to goes nowhere, both counted in
     /// [`Published`]. That is the pattern, not a degradation.
     pub fn publish(&mut self, message: impl Into<Multipart>) -> Published {
-        let message = message.into();
-        let topic = message.frames()[0].as_slice().to_vec();
-        let mut report = Published {
-            delivered: 0,
-            dropped: 0,
-            unmatched: 0,
-        };
-        for peer in self.core.peers() {
-            if !peer.subscriptions.matches(&topic) {
-                report.unmatched += 1;
-                continue;
-            }
-            let queue = peer.pipe.outgoing();
-            if queue.has_room() && queue.try_send(message.clone()).is_ok() {
-                report.delivered += 1;
-            } else {
-                report.dropped += 1;
-                tracing::trace!(
-                    peer = %peer.id,
-                    "dropped a copy: the subscriber's queue is at its high-water mark"
-                );
-            }
-        }
-        report
+        split::fan_out(&self.core, message.into(), true)
     }
 
     /// How many subscribers this socket has right now, and what each holds.
@@ -123,15 +101,12 @@ impl PubSocket {
     /// application uses to know whether anybody is listening yet — the
     /// zguide's "slow joiner" needs exactly this or a second channel.
     pub fn subscriber_count(&self) -> usize {
-        self.core.peers().len()
+        split::subscriber_count(&self.core)
     }
 
     /// Whether any subscriber's table would take `topic`.
     pub fn anybody_wants(&self, topic: &[u8]) -> bool {
-        self.core
-            .peers()
-            .iter()
-            .any(|peer| peer.subscriptions.matches(topic))
+        split::anybody_wants(&self.core, topic)
     }
 }
 
@@ -262,14 +237,9 @@ impl SubSocket {
     /// itself.
     fn announce(&self, subscribe: bool, prefix: &[u8]) {
         let frame = Message::from(subscriptions::write_message_form(subscribe, prefix));
-        for peer in self.core.peers() {
-            // A publisher that is not reachable right now will be told at
-            // the handshake instead, from the set.
-            let _ = peer
-                .pipe
-                .outgoing()
-                .try_send(Multipart::single(frame.clone()));
-        }
+        // A publisher that is not reachable right now will be told at the
+        // handshake instead, from the set.
+        split::tell_every_peer(&self.core, Multipart::single(frame));
     }
 }
 
@@ -628,7 +598,7 @@ mod tests {
         // the payload rather than choking on it — and the payload reached no
         // application, because a PUB has nowhere to put one.
         wait_for(|| publisher.anybody_wants(b"ok.then")).await;
-        for peer in publisher.core.peers() {
+        for peer in publisher.core.peers().iter() {
             assert!(
                 peer.pipe.incoming().is_empty(),
                 "a publisher must hand its application nothing a subscriber sent"

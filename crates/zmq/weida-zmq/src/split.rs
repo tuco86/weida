@@ -24,15 +24,15 @@
 //! plus the routing table of a ROUTER, which is behind a lock that is never
 //! held across an await.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::engine::{Engine, PeerId};
+use crate::engine::{Peer, PeerId};
 use crate::error::{Error, Result};
 use crate::identity::RoutingKey;
 use crate::message::{Message, Multipart};
-use crate::pipe::Sent;
+use crate::pipe::{MuteAction, Sent, Weighed};
 use crate::pubsub::Published;
 use crate::socket::{Shared, SocketCore};
 use crate::subscriptions::{self, Subscriptions};
@@ -99,29 +99,60 @@ pub(crate) async fn recv_fair_within(core: &Shared, limit: Duration) -> Result<M
     }
 }
 
-/// A fan-out to every peer with room, dropping for the rest: XPUB's
-/// publish and XSUB's upstream send, with an optional match on the first
-/// frame.
+/// A fan-out to every peer with room, dropping for the rest: PUB's and
+/// XPUB's publish and XSUB's upstream send, with an optional match on the
+/// first frame.
+///
+/// The message is weighed once and its topic borrowed for the whole loop, so
+/// what each peer costs is the copy it is offered and nothing else.
 pub(crate) fn fan_out(core: &Shared, message: Multipart, matching: bool) -> Published {
-    let topic = message.frames()[0].as_slice().to_vec();
+    let weighed = Weighed::new(message);
+    let topic = weighed.message().frames()[0].as_slice();
     let mut report = Published {
         delivered: 0,
         dropped: 0,
         unmatched: 0,
     };
-    for peer in core.peers() {
-        if matching && !peer.subscriptions.matches(&topic) {
+    for peer in core.peers().iter() {
+        if matching && !peer.subscriptions.matches(topic) {
             report.unmatched += 1;
             continue;
         }
-        let queue = peer.pipe.outgoing();
-        if queue.has_room() && queue.try_send(message.clone()).is_ok() {
+        if peer.pipe.outgoing_ref().offer(weighed.clone()).is_ok() {
             report.delivered += 1;
         } else {
             report.dropped += 1;
+            tracing::trace!(
+                peer = %peer.id,
+                "dropped a copy: the subscriber's queue is full"
+            );
         }
     }
     report
+}
+
+/// How many subscribers a publisher has: every peer a sender may use right
+/// now.
+pub(crate) fn subscriber_count(core: &Shared) -> usize {
+    core.peers().len()
+}
+
+/// Whether any peer's subscriptions would take `topic`.
+pub(crate) fn anybody_wants(core: &Shared, topic: &[u8]) -> bool {
+    core.peers()
+        .iter()
+        .any(|peer| peer.subscriptions.matches(topic))
+}
+
+/// Puts `message` in the queue of every peer that has room for it, and
+/// nothing more: what a SUB or an XSUB says to its publishers about a change
+/// to its subscriptions. A publisher that cannot take it now is told at its
+/// handshake instead, from the table that travels with the session.
+pub(crate) fn tell_every_peer(core: &Shared, message: Multipart) {
+    let weighed = Weighed::new(message);
+    for peer in core.peers().iter() {
+        let _ = peer.pipe.outgoing_ref().offer(weighed.clone());
+    }
 }
 
 // --- DEALER -------------------------------------------------------------------
@@ -310,10 +341,7 @@ pub(crate) fn xsub_unsubscribe(core: &Shared, mine: &Subscriptions, prefix: &[u8
 }
 
 fn xsub_forward(core: &Shared, frame: Vec<u8>) {
-    let message = Multipart::single(Message::from(frame));
-    for peer in core.peers() {
-        let _ = peer.pipe.outgoing().try_send(message.clone());
-    }
+    tell_every_peer(core, Multipart::single(Message::from(frame)));
 }
 
 // --- XPUB ---------------------------------------------------------------------
@@ -342,15 +370,12 @@ impl XPubPublish {
 
     /// As [`XPubSocket::subscriber_count`][crate::XPubSocket::subscriber_count].
     pub fn subscriber_count(&self) -> usize {
-        self.core.peers().len()
+        subscriber_count(&self.core)
     }
 
     /// As [`XPubSocket::anybody_wants`][crate::XPubSocket::anybody_wants].
     pub fn anybody_wants(&self, topic: &[u8]) -> bool {
-        self.core
-            .peers()
-            .iter()
-            .any(|peer| peer.subscriptions.matches(topic))
+        anybody_wants(&self.core, topic)
     }
 }
 
@@ -386,16 +411,45 @@ impl XPubRecv {
     }
 }
 
-/// The receive-side memory of an XPUB: what each peer held, the
-/// unsubscribes synthesized for peers that left, and who spoke last.
+/// The receive-side memory of an XPUB: what its application has been told
+/// each peer holds, the peers that left and the unsubscribes still owed for
+/// them, and who spoke last.
+///
+/// **The unit of accounting is what the application was handed.** An XPUB's
+/// application — a proxy, typically — turns the subscriptions it reads into
+/// subscriptions of its own, upstream, so what it is owed when a subscriber
+/// vanishes is one unsubscribe for every subscribe it *saw* and has seen no
+/// unsubscribe for. A peer's own table is a different record: it can hold
+/// prefixes whose notification was dropped because the application was not
+/// reading, and an unsubscribe synthesized from the table would cancel,
+/// upstream, a subscription the application never made — one that another
+/// subscriber's (counted) subscription may be holding. So this keeps a record
+/// of its own, updated by the events it hands over, and never reads a table.
+///
+/// **Everything here is bounded by the tables' own product.** A peer's record
+/// holds at most `max_subscriptions` prefixes of at most
+/// `max_subscription_bytes` each, and the peers that left are turned into
+/// unsubscribes one at a time, ahead of any new event: no subscription is
+/// handed over while a departed peer is still owed, so the records of the
+/// departed and of the live together never outnumber the peers that were
+/// live.
 #[derive(Debug, Default)]
 pub(crate) struct XPubEvents {
-    /// What each peer was last seen holding, so that a departure can be
-    /// turned into unsubscribes for the application.
-    remembered: HashMap<PeerId, Vec<Vec<u8>>>,
-    /// Unsubscribes synthesized for peers that have gone, waiting to be
-    /// handed over.
-    synthesized: VecDeque<Multipart>,
+    /// What the application believes each peer holds: the prefixes it was
+    /// handed a subscribe for and no unsubscribe since — or, under
+    /// `ZMQ_XPUB_MANUAL`, the ones it applied itself. A peer that holds
+    /// nothing has no entry.
+    held: HashMap<PeerId, HashSet<Vec<u8>>>,
+    /// The peers that left holding something, oldest first, each waiting to be
+    /// turned into unsubscribes: one prefix per receive, "SHALL, if the
+    /// subscriber peer disconnects prematurely, generate a suitable
+    /// unsubscribe request for the calling application."
+    departed: VecDeque<Vec<Vec<u8>>>,
+    /// The peer-set generation the departures were last looked for at.
+    /// Looking again is worth a pass over `held` only when the engine has
+    /// moved on, and a number keeps none of the peers it was taken from
+    /// alive while it waits.
+    seen: Option<u64>,
     /// The peer whose subscription was delivered most recently, which is what
     /// `ZMQ_XPUB_MANUAL`'s `subscribe` applies to — libzmq applies it to the
     /// last pipe too.
@@ -418,13 +472,8 @@ impl XPubEvents {
     }
 
     pub(crate) fn try_recv(&mut self, core: &Shared) -> Result<Multipart> {
-        self.reconcile(core);
-        if let Some(synthesized) = self.synthesized.pop_front() {
-            return Ok(synthesized);
-        }
-        let (peer, message) = core.try_recv_fair()?;
-        self.note(core, peer, &message);
-        Ok(message)
+        self.poll_event(core)
+            .ok_or_else(|| Error::EAGAIN("nothing is queued from any peer".into()))
     }
 
     pub(crate) async fn recv_within(
@@ -441,20 +490,32 @@ impl XPubEvents {
         }
     }
 
-    pub(crate) fn subscribe(&self, core: &Shared, prefix: &[u8]) -> Result<()> {
+    pub(crate) fn subscribe(&mut self, core: &Shared, prefix: &[u8]) -> Result<()> {
         let peer = self.subscriber(core)?;
         if peer.subscriptions.subscribe(prefix).is_none() {
             return Err(Error::EINVAL(
                 "that subscriber is at its subscription ceiling".into(),
             ));
         }
+        // Applied by the application, so owed an unsubscribe when the
+        // subscriber goes: under `ZMQ_XPUB_MANUAL` this is the only thing
+        // that makes a peer hold anything.
+        self.held
+            .entry(peer.id)
+            .or_default()
+            .insert(prefix.to_vec());
         Ok(())
     }
 
-    pub(crate) fn unsubscribe(&self, core: &Shared, prefix: &[u8]) -> Result<()> {
+    pub(crate) fn unsubscribe(&mut self, core: &Shared, prefix: &[u8]) -> Result<()> {
         let peer = self.subscriber(core)?;
         match peer.subscriptions.cancel(prefix) {
-            Some(_) => Ok(()),
+            Some(last) => {
+                if last {
+                    self.release(peer.id, prefix);
+                }
+                Ok(())
+            }
             None => Err(Error::EINVAL(
                 "that subscriber does not hold that subscription".into(),
             )),
@@ -467,29 +528,44 @@ impl XPubEvents {
     }
 
     async fn next_event(&mut self, core: &Shared) -> Result<Multipart> {
+        // An event that is already there never creates a bell.
+        if let Some(event) = self.poll_event(core) {
+            return Ok(event);
+        }
         loop {
-            self.reconcile(core);
-            if let Some(synthesized) = self.synthesized.pop_front() {
-                return Ok(synthesized);
+            // An XPUB must wake on a peer **going away** as well as on a
+            // message, because a departure is an event it owes its
+            // application — so it parks on the bell that rings for both, and
+            // creates it before the look, so that neither can happen between
+            // the look and the sleep unnoticed.
+            let mut woken = std::pin::pin!(core.readable());
+            woken.as_mut().enable();
+            if let Some(event) = self.poll_event(core) {
+                return Ok(event);
             }
-            if let Ok((peer, message)) = core.try_recv_fair() {
-                self.note(core, peer, &message);
-                return Ok(message);
-            }
-            // Nothing queued and nothing synthesized. An XPUB must wake on a
-            // peer **going away** as well as on a message, because a
-            // departure is an event it owes its application — so this waits
-            // for either and loops rather than parking on a receive.
-            core.wait_for_activity().await;
+            woken.await;
         }
     }
 
-    fn subscriber(&self, core: &Shared) -> Result<crate::engine::Peer> {
-        let peers = core.peers();
-        let wanted = self.last_subscriber;
-        peers
-            .into_iter()
-            .find(|peer| Some(peer.id) == wanted)
+    /// The next event the application is owed, if there is one: the
+    /// unsubscribe for a peer that left, ahead of everything else, and then
+    /// what the peers sent.
+    fn poll_event(&mut self, core: &Shared) -> Option<Multipart> {
+        self.reconcile(core);
+        if let Some(unsubscribe) = self.next_departure() {
+            return Some(unsubscribe);
+        }
+        while let Ok((peer, message)) = core.try_recv_fair() {
+            if self.admit(core, peer, &message) {
+                return Some(message);
+            }
+        }
+        None
+    }
+
+    fn subscriber(&self, core: &Shared) -> Result<Peer> {
+        self.last_subscriber
+            .and_then(|id| core.engine().peer(id))
             .ok_or_else(|| {
                 Error::EINVAL(
                     "no subscription has been delivered yet, so there is no subscriber to apply \
@@ -499,55 +575,109 @@ impl XPubEvents {
             })
     }
 
-    /// Remembers what a peer holds, and which peer spoke last.
-    fn note(&mut self, core: &Shared, peer: PeerId, message: &Multipart) {
-        if message.len() == 1
-            && subscriptions::read_message_form(message.frames()[0].as_slice()).is_some()
-        {
-            self.last_subscriber = Some(peer);
+    /// Notes what handing `message` to the application tells it, and says
+    /// whether to hand it over at all.
+    ///
+    /// Only a one-frame message in the subscription form is an event; any
+    /// other is something a subscriber sent, and passes. Under
+    /// `ZMQ_XPUB_MANUAL` a subscription is a request and not a holding, so
+    /// nothing is recorded until the application applies it.
+    ///
+    /// A subscriber that would hold more than `max_subscriptions` distinct
+    /// prefixes in the application's view is disconnected, and its subscribe
+    /// is not handed over. The table refuses such a peer itself, so this is
+    /// reachable only by cancelling and subscribing again while the
+    /// notifications of the cancellations are being dropped, and the record
+    /// must not grow with a peer that does that.
+    fn admit(&mut self, core: &Shared, peer: PeerId, message: &Multipart) -> bool {
+        let Some((subscribe, prefix)) = subscription_of(message) else {
+            return true;
+        };
+        self.last_subscriber = Some(peer);
+        if core.options().xpub_manual {
+            return true;
         }
-        if let Some(current) = core.peers().into_iter().find(|current| current.id == peer) {
-            self.remembered
-                .insert(peer, current.subscriptions.prefixes());
+        if !subscribe {
+            self.release(peer, prefix);
+            return true;
+        }
+        let held = self.held.entry(peer).or_default();
+        if !held.contains(prefix) {
+            if held.len() >= core.options().max_subscriptions {
+                core.engine().evict(peer);
+                return false;
+            }
+            held.insert(prefix.to_vec());
+        }
+        true
+    }
+
+    /// Forgets that the application holds `prefix` for `peer`.
+    fn release(&mut self, peer: PeerId, prefix: &[u8]) {
+        if let Some(held) = self.held.get_mut(&peer) {
+            held.remove(prefix);
+            if held.is_empty() {
+                self.held.remove(&peer);
+            }
         }
     }
 
-    /// Turns departures into unsubscribes, and keeps the memory in step with
-    /// the live peers so that it cannot grow past `max_peers` entries.
+    /// Moves every peer that has left from `held` to `departed`, when the
+    /// peer set has changed since the last look — and does nothing otherwise,
+    /// so a receive costs one atomic load and not a pass over every peer's
+    /// record.
     fn reconcile(&mut self, core: &Shared) {
-        let live = core.engine().peers();
-        for peer in &live {
-            if let Some(known) = self.remembered.get_mut(&peer.id) {
-                let current = peer.subscriptions.prefixes();
-                if !current.is_empty() {
-                    *known = current;
-                }
-            } else {
-                self.remembered
-                    .insert(peer.id, peer.subscriptions.prefixes());
-            }
+        let engine = core.engine();
+        // Read before the snapshot: a change between the two costs one more
+        // pass, and never a missed one.
+        let generation = engine.generation();
+        if self.seen == Some(generation) {
+            return;
         }
+        let live = engine.peers();
+        // The snapshot is sorted by id, so "is it still here" is a binary
+        // search and the pass is N log N, not N².
+        let is_live = |id: &PeerId| live.binary_search_by_key(id, |peer| peer.id).is_ok();
         let gone: Vec<PeerId> = self
-            .remembered
+            .held
             .keys()
             .copied()
-            .filter(|id| !live.iter().any(|peer| peer.id == *id))
+            .filter(|id| !is_live(id))
             .collect();
         for id in gone {
-            let prefixes = self.remembered.remove(&id).unwrap_or_default();
-            for prefix in prefixes {
-                // "SHALL, if the subscriber peer disconnects prematurely,
-                // generate a suitable unsubscribe request for the calling
-                // application."
-                self.synthesized.push_back(Multipart::single(Message::from(
-                    subscriptions::write_message_form(false, &prefix),
-                )));
-            }
-            if self.last_subscriber == Some(id) {
-                self.last_subscriber = None;
+            if let Some(prefixes) = self.held.remove(&id) {
+                self.departed.push_back(prefixes.into_iter().collect());
             }
         }
+        if self.last_subscriber.is_some_and(|id| !is_live(&id)) {
+            self.last_subscriber = None;
+        }
+        self.seen = Some(generation);
     }
+
+    /// The next unsubscribe owed for a peer that left, one prefix at a time:
+    /// generated when it is handed over, not queued whole, so that a peer
+    /// which held a thousand prefixes does not become a thousand messages in
+    /// memory at once.
+    fn next_departure(&mut self) -> Option<Multipart> {
+        let owed = self.departed.front_mut()?;
+        let prefix = owed.pop()?;
+        if owed.is_empty() {
+            self.departed.pop_front();
+        }
+        Some(Multipart::single(Message::from(
+            subscriptions::write_message_form(false, &prefix),
+        )))
+    }
+}
+
+/// A one-frame message in the subscription form, read: `true` for a
+/// subscribe, and the prefix.
+fn subscription_of(message: &Multipart) -> Option<(bool, &[u8])> {
+    if message.len() != 1 {
+        return None;
+    }
+    subscriptions::read_message_form(message.frames()[0].as_slice())
 }
 
 // --- ROUTER -------------------------------------------------------------------
@@ -610,15 +740,34 @@ impl RouterRecv {
 /// Behind a `Mutex` only so that the two halves of a split ROUTER may hold
 /// it together; the lock is taken for a reconciliation or a lookup and
 /// never across an await. Bounded as the socket's doc says: one entry per
-/// live peer, reconciled against the engine before every use.
+/// live peer, reconciled against the engine's peer snapshot — and **only
+/// when that snapshot has changed**. A table that re-read every peer on every
+/// message would cost the whole peer count per message, and a stranger
+/// chooses the count.
 #[derive(Debug)]
 pub(crate) struct Routing {
     /// Two maps because both directions are hot: inbound needs the id of a
     /// peer, outbound the peer of an id.
     by_key: HashMap<RoutingKey, PeerId>,
-    by_peer: HashMap<PeerId, RoutingKey>,
+    /// The id as the frame an inbound message carries in front of its own,
+    /// built once when the peer is learned: a receive hands out a copy of it
+    /// instead of rebuilding the frame from a key every time.
+    by_peer: HashMap<PeerId, Message>,
     /// The counter behind a generated routing id; see [`RoutingKey`].
     next_generated: u32,
+    /// The peer-set generation this table was last reconciled at. The same
+    /// number again means no peer arrived, left or announced since.
+    reconciled: Option<u64>,
+}
+
+/// Lets the table be searched by the bytes a message carries, without
+/// building a key — an allocation per outbound message — for the lookup. A
+/// `RoutingKey` hashes and compares as its bytes do, which is what `Borrow`
+/// requires.
+impl std::borrow::Borrow<[u8]> for RoutingKey {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
 
 impl Routing {
@@ -627,6 +776,7 @@ impl Routing {
             by_key: HashMap::new(),
             by_peer: HashMap::new(),
             next_generated: 1,
+            reconciled: None,
         }
     }
 
@@ -645,7 +795,7 @@ impl Routing {
         keys
     }
 
-    pub(crate) fn peer_of(&self, key: &RoutingKey) -> Option<PeerId> {
+    pub(crate) fn peer_of(&self, key: &[u8]) -> Option<PeerId> {
         self.by_key.get(key).copied()
     }
 
@@ -654,18 +804,36 @@ impl Routing {
     /// This is also where a duplicate identity is resolved:
     /// `ZMQ_ROUTER_HANDOVER` decides whether the newcomer takes the name and
     /// the incumbent is disconnected, or the newcomer is rejected — libzmq's
-    /// default being to reject it.
+    /// default being to reject it. With `router_bind_identity_to_user` an
+    /// identity is also refused outright unless it is the user id the ZAP
+    /// handler named for the connection, so that nobody authorized as one
+    /// user can squat or take over the name of another.
+    ///
+    /// Does nothing when the peer set has not changed since the table was last
+    /// reconciled.
     pub(crate) fn learn_peers(&mut self, core: &Shared) {
-        let engine: &Engine = core.engine();
+        let engine = core.engine();
+        // Read before the snapshot: a change between the two costs one more
+        // pass, and never a missed one.
+        let generation = engine.generation();
+        if self.reconciled == Some(generation) {
+            return;
+        }
         let live = engine.peers();
-        self.by_peer.retain(|peer, key| {
-            let alive = live.iter().any(|current| current.id == *peer);
-            if !alive {
-                self.by_key.remove(key);
+        // The snapshot is sorted by id, so "is it still here" is a binary
+        // search and the pass is N log N, not N².
+        let gone: Vec<PeerId> = self
+            .by_peer
+            .keys()
+            .copied()
+            .filter(|id| live.binary_search_by_key(id, |peer| peer.id).is_err())
+            .collect();
+        for id in gone {
+            if let Some(frame) = self.by_peer.remove(&id) {
+                self.by_key.remove(frame.as_slice());
             }
-            alive
-        });
-        for peer in live {
+        }
+        for peer in live.iter() {
             if self.by_peer.contains_key(&peer.id) {
                 continue;
             }
@@ -673,6 +841,19 @@ impl Routing {
                 // Its READY has not been read yet, so its own identity is
                 // not known: keying it now would key it by a generated id
                 // for the rest of its life.
+                continue;
+            }
+            if core.options().router_bind_identity_to_user
+                && let Some(identity) = &peer.identity
+                && peer.user_id.as_ref().map(|user| user.as_str().as_bytes())
+                    != Some(identity.as_bytes())
+            {
+                tracing::debug!(
+                    peer = %peer.id,
+                    "refused a routing id that is not the authenticated user's \
+                     (router_bind_identity_to_user)"
+                );
+                engine.evict(peer.id);
                 continue;
             }
             let key = match &peer.identity {
@@ -689,7 +870,9 @@ impl Routing {
                     engine.evict(incumbent);
                     self.by_peer.remove(&incumbent);
                 } else {
-                    tracing::warn!(
+                    // Peer-chosen and repeatable at the peer's reconnect
+                    // rate, so never louder than a debug line.
+                    tracing::debug!(
                         key = ?key,
                         %incumbent,
                         "rejected a peer claiming a routing id already in use"
@@ -698,26 +881,29 @@ impl Routing {
                     continue;
                 }
             }
-            self.by_key.insert(key.clone(), peer.id);
-            self.by_peer.insert(peer.id, key);
+            let frame = Message::from(key.as_bytes());
+            self.by_key.insert(key, peer.id);
+            self.by_peer.insert(peer.id, frame);
         }
+        self.reconciled = Some(generation);
     }
 
-    /// This peer's routing id, learning it if the handshake has completed
-    /// since the last reconciliation — which it usually has, because a
-    /// message from a peer is proof that its `READY` was read.
-    pub(crate) fn key_for(&mut self, core: &Shared, peer: PeerId) -> RoutingKey {
-        if let Some(key) = self.by_peer.get(&peer) {
-            return key.clone();
+    /// This peer's routing id as a frame, learning it if the handshake has
+    /// completed since the last reconciliation — which it usually has,
+    /// because a message from a peer is proof that its `READY` was read.
+    pub(crate) fn frame_for(&mut self, core: &Shared, peer: PeerId) -> Message {
+        if let Some(frame) = self.by_peer.get(&peer) {
+            return frame.clone();
         }
         self.learn_peers(core);
-        if let Some(key) = self.by_peer.get(&peer) {
-            return key.clone();
+        if let Some(frame) = self.by_peer.get(&peer) {
+            return frame.clone();
         }
         let key = self.next_key();
-        self.by_key.insert(key.clone(), peer);
-        self.by_peer.insert(peer, key.clone());
-        key
+        let frame = Message::from(key.as_bytes());
+        self.by_key.insert(key, peer);
+        self.by_peer.insert(peer, frame.clone());
+        frame
     }
 
     fn next_key(&mut self) -> RoutingKey {
@@ -779,10 +965,9 @@ fn with_routing_id(
     peer: PeerId,
     message: Multipart,
 ) -> Multipart {
-    let key = lock(routing).key_for(core, peer);
-    let mut frames = Vec::with_capacity(message.len() + 1);
-    frames.push(Message::from(key.as_bytes()));
-    frames.extend(message.into_frames());
+    let id = lock(routing).frame_for(core, peer);
+    let mut frames = message.into_frames();
+    frames.insert(0, id);
     Multipart::new(frames).expect("a routing id plus at least one frame")
 }
 
@@ -791,57 +976,40 @@ pub(crate) async fn router_send(
     routing: &Mutex<Routing>,
     message: Multipart,
 ) -> Result<Sent> {
-    let (key, body) = split_routing_id(message)?;
+    let (id, body) = split_routing_id(message)?;
     let mandatory = core.options().router_mandatory;
     let peer = {
         let mut table = lock(routing);
         table.learn_peers(core);
-        table.peer_of(&key)
+        table.peer_of(id.as_slice())
     };
     let Some(peer) = peer else {
-        return unroutable(&key, mandatory);
+        return unroutable(id.as_slice(), mandatory);
     };
     let Some(pipe) = core.pipe_of(peer) else {
-        return unroutable(&key, mandatory);
+        return unroutable(id.as_slice(), mandatory);
     };
-    let queue = pipe.outgoing();
-    if queue.has_room() {
-        queue.try_send(body)?;
-        return Ok(Sent::Queued);
-    }
+    let queue = pipe.outgoing_ref();
+    // The queue decides once, against this message's real size: a message too
+    // large for the room left is refused here exactly as a full queue is,
+    // not as an error the caller was never promised.
+    let body = match queue.offer(Weighed::new(body)) {
+        Ok(()) => return Ok(Sent::Queued),
+        Err(refused) => refused.into_message(),
+    };
     if !mandatory {
         // "0 discards silently when it cannot be routed **or the peer's
         // SNDHWM is reached**."
         tracing::debug!(
-            key = ?key,
-            "dropped a message: the peer's queue is at its high-water mark"
+            key = ?RoutingKey::from_wire(id.as_slice()),
+            "dropped a message: the peer's queue is full"
         );
         return Ok(Sent::Dropped);
     }
-    // ZMQ_ROUTER_MANDATORY without ZMQ_DONTWAIT: wait for room, bounded
-    // by ZMQ_SNDTIMEO.
+    // ZMQ_ROUTER_MANDATORY without ZMQ_DONTWAIT: wait for room for this
+    // message, bounded by ZMQ_SNDTIMEO, and report the peer going away.
     let limit = core.options().send_timeout;
-    let queued = crate::socket::within(core.exec(), limit, async {
-        loop {
-            queue.wait_for_room().await;
-            if queue.is_closed() {
-                return Err(Error::EHOSTUNREACH(
-                    "the peer went away while its queue was full".into(),
-                ));
-            }
-            if queue.has_room() {
-                return Ok(());
-            }
-        }
-    })
-    .await;
-    match queued {
-        Ok(()) => {
-            queue.try_send(body)?;
-            Ok(Sent::Queued)
-        }
-        Err(e) => Err(e),
-    }
+    crate::socket::within(core.exec(), limit, queue.send_with(body, MuteAction::Block)).await
 }
 
 pub(crate) fn router_try_send(
@@ -849,34 +1017,33 @@ pub(crate) fn router_try_send(
     routing: &Mutex<Routing>,
     message: Multipart,
 ) -> Result<Sent> {
-    let (key, body) = split_routing_id(message)?;
+    let (id, body) = split_routing_id(message)?;
     let mandatory = core.options().router_mandatory;
     let peer = {
         let mut table = lock(routing);
         table.learn_peers(core);
-        table.peer_of(&key)
+        table.peer_of(id.as_slice())
     };
     let Some(peer) = peer else {
-        return unroutable(&key, mandatory);
+        return unroutable(id.as_slice(), mandatory);
     };
     let Some(pipe) = core.pipe_of(peer) else {
-        return unroutable(&key, mandatory);
+        return unroutable(id.as_slice(), mandatory);
     };
-    let queue = pipe.outgoing();
-    if queue.has_room() {
-        queue.try_send(body)?;
+    if pipe.outgoing_ref().offer(Weighed::new(body)).is_ok() {
         return Ok(Sent::Queued);
     }
     if mandatory {
         Err(Error::EAGAIN(
-            "the peer's queue is at its high-water mark (ZMQ_ROUTER_MANDATORY)".into(),
+            "the peer's queue is full (ZMQ_ROUTER_MANDATORY)".into(),
         ))
     } else {
         Ok(Sent::Dropped)
     }
 }
 
-fn unroutable(key: &RoutingKey, mandatory: bool) -> Result<Sent> {
+fn unroutable(id: &[u8], mandatory: bool) -> Result<Sent> {
+    let key = RoutingKey::from_wire(id);
     if mandatory {
         Err(Error::EHOSTUNREACH(
             format!("no peer holds the routing id {key:?} (ZMQ_ROUTER_MANDATORY)").into(),
@@ -893,7 +1060,7 @@ fn unroutable(key: &RoutingKey, mandatory: bool) -> Result<Sent> {
 ///
 /// `EINVAL` when nothing would be left: a ROUTER strips that frame, and a
 /// message that is only its address is no message.
-pub(crate) fn split_routing_id(message: Multipart) -> Result<(RoutingKey, Multipart)> {
+pub(crate) fn split_routing_id(message: Multipart) -> Result<(Message, Multipart)> {
     let mut frames = message.into_frames();
     if frames.len() < 2 {
         return Err(Error::EINVAL(
@@ -902,7 +1069,184 @@ pub(crate) fn split_routing_id(message: Multipart) -> Result<(RoutingKey, Multip
                 .into(),
         ));
     }
-    let key = RoutingKey::from_wire(frames.remove(0).as_slice());
+    let id = frames.remove(0);
     let body = Multipart::new(frames).expect("at least one frame remains");
-    Ok((key, body))
+    Ok((id, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{Context, ContextConfig};
+    use crate::options::SocketOptions;
+    use weida_zmtp::SocketType;
+
+    fn xpub(options: SocketOptions) -> SocketCore {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        SocketCore::new(&ctx, SocketType::XPub, options).expect("core")
+    }
+
+    fn subscribe(prefix: &[u8]) -> Multipart {
+        Multipart::single(subscriptions::write_message_form(true, prefix))
+    }
+
+    fn cancel(prefix: &[u8]) -> Multipart {
+        Multipart::single(subscriptions::write_message_form(false, prefix))
+    }
+
+    /// Claim: **what the application is owed for one peer is bounded by the
+    /// table's own ceiling.** The record follows the events the application is
+    /// handed, so a subscriber that cancels and subscribes anew while the
+    /// notifications of its cancellations are being dropped could otherwise
+    /// grow it without end; past `max_subscriptions` distinct prefixes the
+    /// peer is disconnected and the subscribe that would have crossed the
+    /// line is not handed over, so the application never holds one the
+    /// record does not.
+    #[tokio::test]
+    async fn the_record_of_one_peer_stops_at_the_table_ceiling() {
+        let core = xpub(SocketOptions {
+            max_subscriptions: 2,
+            ..SocketOptions::default()
+        });
+        let peer = PeerId::detached();
+        let mut events = XPubEvents::default();
+
+        assert!(events.admit(&core, peer, &subscribe(b"a")));
+        assert!(events.admit(&core, peer, &subscribe(b"b")));
+        assert!(
+            events.admit(&core, peer, &subscribe(b"a")),
+            "a repeat holds nothing new"
+        );
+        assert!(
+            !events.admit(&core, peer, &subscribe(b"c")),
+            "a third distinct prefix is not handed over"
+        );
+        assert!(events.admit(&core, peer, &cancel(b"a")));
+        assert!(
+            events.admit(&core, peer, &subscribe(b"c")),
+            "there is room again once one was cancelled"
+        );
+        assert!(
+            events.admit(&core, peer, &Multipart::single("hello")),
+            "a message that is no subscription passes untouched"
+        );
+        assert_eq!(events.held[&peer].len(), 2);
+    }
+
+    /// Claim: **a peer that left is turned into unsubscribes one prefix at a
+    /// time**, from a single record, and never as a queue of messages built
+    /// all at once: a subscriber that held a thousand prefixes and went must
+    /// not become a thousand messages in memory because its application is
+    /// slow to read. Each is `%x00` and the prefix, and the record is gone
+    /// when the last one is handed over.
+    #[tokio::test]
+    async fn a_departed_peer_is_one_record_until_it_is_handed_over() {
+        let core = xpub(SocketOptions::default());
+        let mut events = XPubEvents::default();
+        // The engine has no such peer, which is what having left looks like.
+        let gone = PeerId::detached();
+        for prefix in [b"a".as_slice(), b"b", b"c"] {
+            assert!(events.admit(&core, gone, &subscribe(prefix)));
+        }
+
+        events.reconcile(&core);
+        assert!(events.held.is_empty());
+        assert_eq!(
+            events.departed.len(),
+            1,
+            "one record for the peer, not a message per prefix"
+        );
+
+        let mut owed = Vec::new();
+        while let Some(message) = events.next_departure() {
+            owed.push(message.frames()[0].as_slice().to_vec());
+        }
+        owed.sort();
+        assert_eq!(
+            owed,
+            [b"\x00a".to_vec(), b"\x00b".to_vec(), b"\x00c".to_vec()]
+        );
+        assert!(events.departed.is_empty());
+    }
+
+    /// A change to the peer set: a dialled peer that never connects arrives.
+    fn a_peer_arrives(core: &SocketCore) {
+        let nowhere = crate::endpoint::Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+        core.engine().connect(&nowhere).expect("connect");
+    }
+
+    /// Claim: **an XPUB looks for departed peers only when the peer set has
+    /// changed.** A receive that finds the set as it was costs one atomic
+    /// load; a pass over every peer's record on every receive is a cost per
+    /// message that a stranger multiplies by connecting. Shown with a record
+    /// for a peer the engine does not have: it is left alone until the set
+    /// changes, and then noticed.
+    #[tokio::test]
+    async fn a_receive_looks_for_departures_only_when_the_peer_set_changed() {
+        let core = xpub(SocketOptions {
+            reconnect_ivl: None,
+            ..SocketOptions::default()
+        });
+        let mut events = XPubEvents::default();
+        events.reconcile(&core);
+        events
+            .held
+            .entry(PeerId::detached())
+            .or_default()
+            .insert(b"a".to_vec());
+
+        events.reconcile(&core);
+        assert!(
+            events.departed.is_empty(),
+            "the peer set has not changed, so nobody was looked for"
+        );
+
+        a_peer_arrives(&core);
+        events.reconcile(&core);
+        assert_eq!(
+            events.departed.len(),
+            1,
+            "the set changed, and the peer is gone"
+        );
+    }
+
+    /// Claim: **a ROUTER reconciles its routing table only when the peer set
+    /// has changed**, for the same reason: re-reading every peer on every
+    /// message is a cost a stranger multiplies by connecting. Shown with an
+    /// entry for a peer the engine does not have.
+    #[tokio::test]
+    async fn a_router_reconciles_only_when_the_peer_set_changed() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let core = SocketCore::new(
+            &ctx,
+            SocketType::Router,
+            SocketOptions {
+                reconnect_ivl: None,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("core");
+        let mut routing = Routing::new();
+        routing.learn_peers(&core);
+
+        let ghost = PeerId::detached();
+        routing.by_peer.insert(ghost, Message::from("ghost"));
+        routing
+            .by_key
+            .insert(RoutingKey::from_wire(b"ghost"), ghost);
+        routing.learn_peers(&core);
+        assert_eq!(
+            routing.len(),
+            1,
+            "nothing changed, so nothing was reconciled"
+        );
+
+        a_peer_arrives(&core);
+        routing.learn_peers(&core);
+        assert_eq!(
+            routing.len(),
+            0,
+            "the set changed, and the ghost is dropped"
+        );
+    }
 }

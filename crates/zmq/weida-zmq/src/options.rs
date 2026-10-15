@@ -122,7 +122,7 @@ impl Security {
 ///
 /// The socket types own the rest of the option surface — subscriptions,
 /// routing ids, the XPUB flags — and keep these.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SocketOptions {
     /// `ZMQ_RECONNECT_IVL`: how long to wait before reconnecting a dropped
     /// or refused outgoing connection. `None` is libzmq's `-1`: do not
@@ -209,6 +209,26 @@ pub struct SocketOptions {
     /// the safe answer when an identity is a name two peers may both believe
     /// they own.
     pub router_handover: bool,
+    /// Bind a ROUTER's routing ids to the user the ZAP handler authenticated.
+    ///
+    /// **Not a libzmq option**, and off by default so that a ROUTER behaves as
+    /// libzmq's does, where a routing id is whatever the peer announces. A
+    /// routing id is self-asserted and ZAP's user id is a different fact, one
+    /// this socket learned from a handler, and nothing links the two: a peer
+    /// that passed authentication may announce any id, so without
+    /// `router_handover` the first claimant squats a name the legitimate peer
+    /// then cannot take, and with it any authenticated peer takes over the
+    /// traffic addressed to an incumbent.
+    ///
+    /// With this on, an announced id is accepted only if it is byte for byte
+    /// the user id the handler returned for that connection; a peer that
+    /// announces another, or one no handler named a user for, is disconnected
+    /// where it would have been given a routing id. A peer that announces
+    /// nothing still gets a generated one. It needs ZAP — a PLAIN server or a
+    /// `ZMQ_ZAP_DOMAIN` — because without a user to compare with every
+    /// announced id would be refused, and that is refused as a configuration
+    /// instead. Legal on ROUTER only, like `ZMQ_ROUTER_HANDOVER`.
+    pub router_bind_identity_to_user: bool,
     /// `ZMQ_PROBE_ROUTER`: send an empty message on every new connection, so
     /// that a ROUTER peer learns of this socket before it has anything to
     /// say.
@@ -339,10 +359,11 @@ pub struct SocketOptions {
     ///
     /// libzmq: "A ZAP domain must be specified to enable authentication. When
     /// the ZAP domain is empty, which is the default, ZAP authentication is
-    /// disabled" — and that is exactly the behaviour here, for NULL and for
-    /// CURVE, where an empty domain is 26/CURVEZMQ's first security model,
-    /// "where the server does not check client keys at all". PLAIN always
-    /// authenticates, because a username nobody checks is theatre.
+    /// disabled" — and that is the behaviour here for NULL. PLAIN always
+    /// authenticates, because a username nobody checks is theatre, and CURVE
+    /// asks when a domain is set **or a handler is bound**, which is what
+    /// libzmq 4.3.5 does when measured; [`SocketOptions::authorizes`] states
+    /// the whole rule.
     ///
     /// The domain's meaning is the application's: 27/ZAP calls it "the only
     /// scoping string" and leaves it at that.
@@ -356,6 +377,101 @@ pub struct SocketOptions {
     /// dialog without a domain is refused at construction rather than at the
     /// handshake.
     pub zap_enforce_domain: bool,
+}
+
+impl std::fmt::Debug for SocketOptions {
+    /// Prints every field but the PLAIN password, which is a secret: a
+    /// `{:?}` of the options — in a log line, an assertion, a `Peer` — must
+    /// not carry it. The CURVE secret key redacts itself.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field is named, so that adding one stops compiling until
+        // somebody has decided here whether it may be printed.
+        let SocketOptions {
+            reconnect_ivl,
+            reconnect_ivl_max,
+            handshake_ivl,
+            connect_timeout,
+            immediate,
+            backlog,
+            max_message_size,
+            heartbeat_ivl,
+            heartbeat_timeout,
+            heartbeat_ttl,
+            send_timeout,
+            recv_timeout,
+            req_correlate,
+            req_relaxed,
+            router_mandatory,
+            router_handover,
+            router_bind_identity_to_user,
+            probe_router,
+            routing_id,
+            max_message_frames,
+            max_subscriptions,
+            max_subscription_bytes,
+            subscription_form,
+            xpub_verbose,
+            xpub_verboser,
+            xpub_manual,
+            xpub_welcome_msg,
+            max_peers,
+            pipe,
+            max_resolved_addresses,
+            plain_server,
+            plain_username,
+            plain_password,
+            curve_server,
+            curve_publickey,
+            curve_secretkey,
+            curve_serverkey,
+            zap_domain,
+            zap_enforce_domain,
+        } = self;
+        f.debug_struct("SocketOptions")
+            .field("reconnect_ivl", reconnect_ivl)
+            .field("reconnect_ivl_max", reconnect_ivl_max)
+            .field("handshake_ivl", handshake_ivl)
+            .field("connect_timeout", connect_timeout)
+            .field("immediate", immediate)
+            .field("backlog", backlog)
+            .field("max_message_size", max_message_size)
+            .field("heartbeat_ivl", heartbeat_ivl)
+            .field("heartbeat_timeout", heartbeat_timeout)
+            .field("heartbeat_ttl", heartbeat_ttl)
+            .field("send_timeout", send_timeout)
+            .field("recv_timeout", recv_timeout)
+            .field("req_correlate", req_correlate)
+            .field("req_relaxed", req_relaxed)
+            .field("router_mandatory", router_mandatory)
+            .field("router_handover", router_handover)
+            .field("router_bind_identity_to_user", router_bind_identity_to_user)
+            .field("probe_router", probe_router)
+            .field("routing_id", routing_id)
+            .field("max_message_frames", max_message_frames)
+            .field("max_subscriptions", max_subscriptions)
+            .field("max_subscription_bytes", max_subscription_bytes)
+            .field("subscription_form", subscription_form)
+            .field("xpub_verbose", xpub_verbose)
+            .field("xpub_verboser", xpub_verboser)
+            .field("xpub_manual", xpub_manual)
+            .field("xpub_welcome_msg", xpub_welcome_msg)
+            .field("max_peers", max_peers)
+            .field("pipe", pipe)
+            .field("max_resolved_addresses", max_resolved_addresses)
+            .field("plain_server", plain_server)
+            .field("plain_username", plain_username)
+            .field(
+                "plain_password",
+                &plain_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("curve_server", curve_server)
+            .field("curve_publickey", curve_publickey)
+            .field("curve_secretkey", curve_secretkey)
+            .field("curve_serverkey", curve_serverkey)
+            .field("zap_domain", zap_domain)
+            .field("zap_enforce_domain", zap_enforce_domain)
+            .finish()
+    }
 }
 
 impl Default for SocketOptions {
@@ -386,6 +502,7 @@ impl Default for SocketOptions {
             req_relaxed: false,
             router_mandatory: false,
             router_handover: false,
+            router_bind_identity_to_user: false,
             probe_router: false,
             routing_id: None,
             pipe: PipeConfig::default(),
@@ -554,6 +671,14 @@ impl SocketOptions {
                 .into(),
             ));
         }
+        if self.router_bind_identity_to_user && !self.authorizes() {
+            return Err(Error::EINVAL(
+                "router_bind_identity_to_user compares a routing id with the user id a ZAP \
+                 handler returned, and this socket asks no handler (no PLAIN server, no \
+                 ZMQ_ZAP_DOMAIN), so every announced id would be refused"
+                    .into(),
+            ));
+        }
         if self.max_resolved_addresses == 0 {
             return Err(Error::EINVAL(
                 "max_resolved_addresses is zero, so no hostname could be dialled".into(),
@@ -621,11 +746,13 @@ impl SocketOptions {
                 .into(),
             ));
         }
-        if (self.router_mandatory || self.router_handover) && socket_type != SocketType::Router {
+        if (self.router_mandatory || self.router_handover || self.router_bind_identity_to_user)
+            && socket_type != SocketType::Router
+        {
             return Err(Error::EINVAL(
                 format!(
-                    "ZMQ_ROUTER_MANDATORY and ZMQ_ROUTER_HANDOVER are ROUTER options; a {} \
-                     socket cannot honour them",
+                    "ZMQ_ROUTER_MANDATORY, ZMQ_ROUTER_HANDOVER and router_bind_identity_to_user \
+                     are ROUTER options; a {} socket cannot honour them",
                     socket_type.as_str()
                 )
                 .into(),
@@ -685,16 +812,30 @@ impl SocketOptions {
         }
     }
 
-    /// Whether a connection this socket **accepted or bound** must be
-    /// authorized by a ZAP handler.
+    /// Whether these options alone send a connection this socket **accepted or
+    /// bound** to a ZAP handler.
     ///
-    /// PLAIN always is: the credentials are only worth sending if somebody
-    /// checks them. NULL and CURVE are when a domain is configured, which is
-    /// libzmq's switch — "when the ZAP domain is empty… ZAP authentication
-    /// is disabled". For CURVE that switch is also the choice between
-    /// 26/CURVEZMQ's security models: no domain is "the server does not
-    /// check client keys at all", and a domain hands every client's
-    /// long-term key to the handler ([`crate::curve::SecurityModel`]).
+    /// The rule is libzmq 4.3.5's, as measured against it, and it differs by
+    /// mechanism:
+    ///
+    /// - **PLAIN** always asks: the credentials are only worth sending if
+    ///   somebody checks them.
+    /// - **NULL** asks only when a ZAP domain is set — "when the ZAP domain is
+    ///   empty… ZAP authentication is disabled".
+    /// - **CURVE** asks when a domain is set **or a handler is bound**. With
+    ///   neither it is 26/CURVEZMQ's first security model, "the server does
+    ///   not check client keys at all"; with either, every client's long-term
+    ///   key is handed to the handler ([`crate::curve::SecurityModel`]).
+    ///
+    /// Wherever the rule says to ask, a missing handler refuses the
+    /// connection: admitting a peer nobody checked would make the question
+    /// theatre.
+    ///
+    /// This answers from the options, which hold the first half of that rule
+    /// and not the second: `true` for a PLAIN server, and for NULL and CURVE
+    /// exactly when a domain is set. Whether a handler is bound is a fact about
+    /// the context the socket lives in, so a CURVE server this reports `false`
+    /// for still asks a handler that is there. A client authorizes nobody.
     pub fn authorizes(&self) -> bool {
         match self.security() {
             Security::PlainServer => true,
@@ -836,7 +977,10 @@ mod tests {
         assert_eq!(server.security(), Security::CurveServer);
         assert!(server.security().as_server());
         assert!(server.security().encrypts());
-        assert!(!server.authorizes(), "no domain is model 1");
+        assert!(
+            !server.authorizes(),
+            "no domain: the options alone ask no handler, though a bound one is asked anyway"
+        );
 
         let client = SocketOptions {
             curve_publickey: Some(client_public),
@@ -892,5 +1036,25 @@ mod tests {
             assert_eq!(err.errno(), "EINVAL", "{err}");
             assert!(!err.cause().is_empty());
         }
+    }
+
+    /// Claim: **the PLAIN password is not in the options' `Debug`**, in either
+    /// form. `SocketOptions` is a public type that ends up in assertions, log
+    /// lines and every [`Connection`](crate::Connection), so a derived
+    /// `Debug` would print a secret wherever any of them is printed. The field
+    /// is still named, so that "a password is set" can be read off.
+    #[test]
+    fn the_plain_password_is_not_printed() {
+        let options = SocketOptions {
+            plain_username: Some("operator".to_string()),
+            plain_password: Some("hunter2".to_string()),
+            ..SocketOptions::default()
+        };
+        for printed in [format!("{options:?}"), format!("{options:#?}")] {
+            assert!(!printed.contains("hunter2"), "{printed}");
+            assert!(printed.contains("plain_password"), "{printed}");
+        }
+        let unset = format!("{:?}", SocketOptions::default());
+        assert!(unset.contains("plain_password: None"), "{unset}");
     }
 }
