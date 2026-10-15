@@ -11,13 +11,20 @@
 //! one mistake that deadlocks instead of failing, and the facade refuses it.
 #![cfg(all(feature = "blocking", feature = "generate"))]
 
-use std::time::Duration;
+mod common;
 
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
+
+use common::Certs;
+use quinn::rustls::pki_types::CertificateDer;
+use quinn::rustls::pki_types::pem::PemObject;
 use weida::blocking::Runtime;
 use weida::{
     Acknowledgement, CursorLevel, Error, Identity, ReportMode, Reported, RuntimeConfig,
     TransferMeta, Trust,
 };
+use weida_protocol::{DataHeader, FrameKind, encode_frame};
 
 /// A payload ceiling for every receive: the facade has no default, on purpose.
 const CAP: usize = 1024 * 1024;
@@ -482,5 +489,150 @@ fn a_transfer_that_orders_no_report_hands_out_no_handles() {
 
     receiving.join().expect("the receiving thread");
     client.shutdown().expect("client shutdown");
+    server.shutdown().expect("server shutdown");
+}
+
+/// A raw client that trusts `cert_pem` and keeps its connection alive with
+/// QUIC PINGs, so that only the receive deadline can end a stall: the idle
+/// timeout never fires for a peer that is never silent.
+fn pinging_client(cert_pem: &std::path::Path) -> quinn::Endpoint {
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(cert_pem).expect("read the certificate") {
+        roots
+            .add(cert.expect("parse the certificate"))
+            .expect("add the root");
+    }
+    let provider = Arc::new(quinn::rustls::crypto::ring::default_provider());
+    let mut crypto = quinn::rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .expect("tls 1.3")
+        .with_root_certificates(Arc::new(roots))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![weida_protocol::ALPN.to_vec()];
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_millis(100)));
+    let mut config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic crypto"),
+    ));
+    config.transport_config(Arc::new(transport));
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
+    endpoint.set_default_client_config(config);
+    endpoint
+}
+
+/// The receive deadline, end to end. A peer sends a DATA header and one byte
+/// of its payload, then stalls with its connection kept alive. The receive
+/// must give up within `receive_timeout`, and the transfer after it, from a
+/// second client, must still arrive.
+#[test]
+fn a_stalled_body_expires_and_the_next_message_still_arrives() {
+    let certs = Certs::generate();
+    let server = Runtime::new(RuntimeConfig {
+        receive_timeout: Some(Duration::from_millis(300)),
+        ..RuntimeConfig::default()
+    })
+    .expect("server runtime");
+    let binding = server
+        .bind_quic("127.0.0.1:0".parse().expect("addr"), certs.identity())
+        .expect("bind");
+    let addr = binding.local_addr().expect("a QUIC binding");
+    let puller = binding.puller("/in").expect("puller");
+
+    // The stalling peer runs on a reactor of its own, on its own thread.
+    let (stalled_tx, stalled_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let peer_cert = certs.cert_pem.clone();
+    let peer = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the peer's reactor")
+            .block_on(async move {
+                let endpoint = pinging_client(&peer_cert);
+                // Bounded, so that a handshake that never completes fails the
+                // test instead of hanging it.
+                let (conn, stream) = tokio::time::timeout(Duration::from_secs(10), async {
+                    let conn = endpoint
+                        .connect(addr, "127.0.0.1")
+                        .expect("connect")
+                        .await
+                        .expect("handshake");
+                    common::raw::send_hello(&conn).await;
+                    let mut stream = conn.open_uni().await.expect("open uni");
+                    let header = DataHeader::addressed("/in").encode();
+                    stream
+                        .write_all(&encode_frame(FrameKind::Data, &header))
+                        .await
+                        .expect("write the header");
+                    stream.write_all(&[7]).await.expect("write one byte");
+                    (conn, stream)
+                })
+                .await
+                .expect("the stalling peer set up in time");
+                stalled_tx.send(()).expect("the test is waiting");
+                // Stalled until the test releases it. A test that panics drops
+                // the sender, which releases the peer just the same.
+                let _ = release_rx.await;
+                drop(stream);
+                conn.close(0u32.into(), b"done");
+            });
+    });
+    stalled_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the stalling peer sent its header");
+    let started = Instant::now();
+
+    // The receiver is a synchronous consumer on its own thread: a first
+    // receive that must give up, then one that must return the next message.
+    let (results_tx, results_rx) = mpsc::channel();
+    let receiving = std::thread::spawn(move || {
+        let first = puller.recv(CAP).map(|message| message.payload);
+        results_tx.send(first).expect("the test is waiting");
+        let second = puller.recv(CAP).map(|message| message.payload);
+        results_tx.send(second).expect("the test is waiting");
+    });
+
+    // The second client sends its message while the first receive is still
+    // waiting on the stalled body.
+    let url = format!("weida://127.0.0.1:{}/in", addr.port());
+    let anchor = certs.cert_pem.clone();
+    let sender = std::thread::spawn(move || {
+        // The header of the stalled transfer was read before this client
+        // connects, so its transfer is the one the puller takes first.
+        std::thread::sleep(Duration::from_millis(200));
+        let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+        let pusher = client.pusher(Trust::anchor_file(&anchor));
+        pusher.connect(&url).expect("connect");
+        pusher.send(b"after the stall").expect("send");
+        drop(pusher);
+        client.shutdown().expect("client shutdown");
+    });
+
+    let first = results_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the first receive returned");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(first, Err(Error::Expired)),
+        "a stalled body must expire, got {first:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the expiry took {elapsed:?}"
+    );
+
+    let second = results_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the next receive returned");
+    assert_eq!(
+        second.expect("the next message arrives"),
+        b"after the stall"
+    );
+
+    let _ = release_tx.send(());
+    peer.join().expect("the stalling peer");
+    sender.join().expect("the second client");
+    receiving.join().expect("the receiving thread");
     server.shutdown().expect("server shutdown");
 }

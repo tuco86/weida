@@ -42,6 +42,16 @@
 //! asynchronous API, and every wrapper here hands it out
 //! ([`Requester::endpoint`], [`Replier::endpoint`], and so on).
 //!
+//! # A receive is bounded
+//!
+//! A transfer is handed over as soon as its header is read; its body is
+//! collected after that. Every receive here that collects a body does so under
+//! [`RuntimeConfig::receive_timeout`], measured on the runtime's clock from the
+//! header to the end of the body, so one peer that stalls cannot hold a
+//! single-threaded caller past that bound. Past it the transfer is dropped,
+//! which stops its stream, and the call returns [`Error::Expired`]; the next
+//! receive is unaffected. A `None` limit collects without a timer.
+//!
 //! # The reactor is the library's, and blocking a worker is refused
 //!
 //! [`Runtime::new`] builds a [`crate::Runtime::owned`] reactor: its threads
@@ -117,6 +127,7 @@ impl Runtime {
     pub fn requester(&self, trust: impl Into<ClientTls>) -> Requester {
         Requester {
             endpoint: self.inner.requester(trust),
+            deadline: BodyDeadline::of(&self.inner),
         }
     }
 
@@ -131,6 +142,7 @@ impl Runtime {
     pub fn subscriber(&self, trust: impl Into<ClientTls>) -> Subscriber {
         Subscriber {
             endpoint: self.inner.subscriber(trust),
+            deadline: BodyDeadline::of(&self.inner),
         }
     }
 
@@ -141,6 +153,7 @@ impl Runtime {
     pub fn pair(&self, trust: impl Into<ClientTls>) -> Paired {
         Paired {
             endpoint: self.inner.pair(trust),
+            deadline: BodyDeadline::of(&self.inner),
         }
     }
 
@@ -155,6 +168,7 @@ impl Runtime {
     pub fn dish(&self, trust: impl Into<ClientTls>) -> Dish {
         Dish {
             endpoint: self.inner.dish(trust),
+            deadline: BodyDeadline::of(&self.inner),
         }
     }
 
@@ -178,6 +192,7 @@ impl Runtime {
         Ok(Binding {
             listener,
             kind: BindingKind::Quic(binding),
+            deadline: BodyDeadline::of(&self.inner),
         })
     }
 
@@ -195,6 +210,7 @@ impl Runtime {
         Ok(Binding {
             listener,
             kind: BindingKind::Inproc(binding),
+            deadline: BodyDeadline::of(&self.inner),
         })
     }
 
@@ -233,6 +249,7 @@ impl Runtime {
 pub struct Binding {
     listener: crate::Listener,
     kind: BindingKind,
+    deadline: BodyDeadline,
 }
 
 /// What a [`Binding`] holds bound.
@@ -278,6 +295,7 @@ impl Binding {
     pub fn replier(&self, path: &str) -> Result<Replier, Error> {
         Ok(Replier {
             endpoint: self.listener.replier(path)?,
+            deadline: self.deadline.clone(),
         })
     }
 
@@ -289,6 +307,7 @@ impl Binding {
     pub fn puller(&self, path: &str) -> Result<Puller, Error> {
         Ok(Puller {
             endpoint: self.listener.puller(path)?,
+            deadline: self.deadline.clone(),
         })
     }
 
@@ -315,6 +334,7 @@ impl Binding {
     pub fn pair(&self, path: &str) -> Result<Paired, Error> {
         Ok(Paired {
             endpoint: self.listener.pair(path)?,
+            deadline: self.deadline.clone(),
         })
     }
 
@@ -329,6 +349,7 @@ impl Binding {
     pub fn respondent(&self, path: &str) -> Result<Respondent, Error> {
         Ok(Respondent {
             endpoint: self.listener.respondent(path)?,
+            deadline: self.deadline.clone(),
         })
     }
 
@@ -345,6 +366,7 @@ impl Binding {
     pub fn bus(&self, path: &str, trust: impl Into<ClientTls>) -> Result<BusMember, Error> {
         Ok(BusMember {
             endpoint: self.listener.bus(path, trust)?,
+            deadline: self.deadline.clone(),
         })
     }
 
@@ -503,6 +525,38 @@ fn outside_a_reactor() -> Result<(), Error> {
     }
 }
 
+/// The receive deadline of one blocking wrapper: the runtime's clock and the
+/// `RuntimeConfig::receive_timeout` it was built with. Captured when the
+/// wrapper is made, so every receive on it is timed by the runtime that owns
+/// the connection, whichever thread drives it.
+#[derive(Clone)]
+struct BodyDeadline {
+    exec: crate::runtime::Exec,
+    limit: Option<Duration>,
+}
+
+impl BodyDeadline {
+    fn of(runtime: &crate::Runtime) -> BodyDeadline {
+        BodyDeadline {
+            exec: runtime.exec().clone(),
+            limit: runtime.config().receive_timeout,
+        }
+    }
+
+    /// Awaits one body under the limit. Past it `body` is dropped, which is
+    /// what stops a transfer's stream, and the result is [`Error::Expired`].
+    async fn bounded<T>(&self, body: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+        match self.limit {
+            None => body.await,
+            Some(limit) => self
+                .exec
+                .within(limit, body)
+                .await
+                .unwrap_or(Err(Error::Expired)),
+        }
+    }
+}
+
 /// Writes the endpoint accessor, the connect call and the connection
 /// statistics every dialling wrapper has.
 macro_rules! dialling {
@@ -538,6 +592,7 @@ macro_rules! dialling {
 /// A requester: one exchange at a time, whole payloads in and out.
 pub struct Requester {
     endpoint: crate::Requester,
+    deadline: BodyDeadline,
 }
 
 dialling!(Requester, crate::Requester);
@@ -551,6 +606,9 @@ impl Requester {
     /// [`Error::Indeterminate`] as the asynchronous `request`;
     /// [`Error::LimitExceeded`] when the reply exceeds the ceiling;
     /// [`Error::Runtime`] from inside a reactor.
+    ///
+    /// [`Error::Expired`] when the reply is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn request(&self, body: &[u8], max_reply_bytes: usize) -> Result<Vec<u8>, Error> {
         self.request_with(TransferMeta::default(), body, max_reply_bytes)
     }
@@ -560,6 +618,9 @@ impl Requester {
     /// # Errors
     ///
     /// As [`Requester::request`].
+    ///
+    /// [`Error::Expired`] when the reply is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn request_with(
         &self,
         meta: TransferMeta,
@@ -569,7 +630,7 @@ impl Requester {
         outside_a_reactor()?;
         drive(async {
             let reply = self.endpoint.request_with(meta, body).await?;
-            reply.collect(max_reply_bytes).await
+            self.deadline.bounded(reply.collect(max_reply_bytes)).await
         })
     }
 }
@@ -657,6 +718,7 @@ impl Pusher {
 /// A subscriber: whole published messages, one call each.
 pub struct Subscriber {
     endpoint: crate::Subscriber,
+    deadline: BodyDeadline,
 }
 
 dialling!(Subscriber, crate::Subscriber);
@@ -695,12 +757,15 @@ impl Subscriber {
     /// [`Error::NotConnected`] when the subscription is gone,
     /// [`Error::LimitExceeded`] past the ceiling, [`Error::Runtime`] from
     /// inside a reactor.
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn recv(&self, max_bytes: usize) -> Result<Message, Error> {
         outside_a_reactor()?;
         drive(async {
             let transfer = self.endpoint.recv().await?;
             let meta = transfer.meta().clone();
-            let payload = transfer.collect(max_bytes).await?;
+            let payload = self.deadline.bounded(transfer.collect(max_bytes)).await?;
             Ok(Message { payload, meta })
         })
     }
@@ -709,6 +774,7 @@ impl Subscriber {
 /// A replier: accept a request, answer it, whole payloads both ways.
 pub struct Replier {
     endpoint: crate::Replier,
+    deadline: BodyDeadline,
 }
 
 impl Replier {
@@ -724,12 +790,18 @@ impl Replier {
     /// [`Error::NotConnected`] when the listener is gone,
     /// [`Error::LimitExceeded`] past the ceiling, [`Error::Runtime`] from
     /// inside a reactor.
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn accept(&self, max_bytes: usize) -> Result<Request, Error> {
         outside_a_reactor()?;
         drive(async {
             let mut request = self.endpoint.accept().await?;
             let meta = request.meta().clone();
-            let payload = request.take_body().collect(max_bytes).await?;
+            let payload = self
+                .deadline
+                .bounded(request.take_body().collect(max_bytes))
+                .await?;
             Ok(Request {
                 request,
                 message: Message { payload, meta },
@@ -813,6 +885,7 @@ impl Request {
 /// A puller: whole transfers, one call each.
 pub struct Puller {
     endpoint: crate::Puller,
+    deadline: BodyDeadline,
 }
 
 impl Puller {
@@ -826,12 +899,15 @@ impl Puller {
     /// # Errors
     ///
     /// As [`Subscriber::recv`].
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn recv(&self, max_bytes: usize) -> Result<Message, Error> {
         outside_a_reactor()?;
         drive(async {
             let transfer = self.endpoint.recv().await?;
             let meta = transfer.meta().clone();
-            let payload = transfer.collect(max_bytes).await?;
+            let payload = self.deadline.bounded(transfer.collect(max_bytes)).await?;
             Ok(Message { payload, meta })
         })
     }
@@ -850,6 +926,9 @@ impl Puller {
     /// # Errors
     ///
     /// As [`Puller::recv`].
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn recv_reporting(&self, max_bytes: usize) -> Result<(Message, Option<Reporter>), Error> {
         outside_a_reactor()?;
         drive(async {
@@ -857,7 +936,7 @@ impl Puller {
             let meta = transfer.meta().clone();
             // Taken before the payload: `collect` consumes the transfer.
             let reporter = transfer.reporter().map(|inner| Reporter { inner });
-            let payload = transfer.collect(max_bytes).await?;
+            let payload = self.deadline.bounded(transfer.collect(max_bytes)).await?;
             Ok((Message { payload, meta }, reporter))
         })
     }
@@ -919,6 +998,7 @@ impl Publisher {
 /// distinguishes them is which of them calls [`Paired::connect`].
 pub struct Paired {
     endpoint: crate::Paired,
+    deadline: BodyDeadline,
 }
 
 dialling!(Paired, crate::Paired);
@@ -993,12 +1073,15 @@ impl Paired {
     /// # Errors
     ///
     /// As [`Puller::recv`].
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn recv(&self, max_bytes: usize) -> Result<Message, Error> {
         outside_a_reactor()?;
         drive(async {
             let transfer = self.endpoint.recv().await?;
             let meta = transfer.meta().clone();
-            let payload = transfer.collect(max_bytes).await?;
+            let payload = self.deadline.bounded(transfer.collect(max_bytes)).await?;
             Ok(Message { payload, meta })
         })
     }
@@ -1008,13 +1091,16 @@ impl Paired {
     /// # Errors
     ///
     /// As [`Paired::recv`].
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn recv_reporting(&self, max_bytes: usize) -> Result<(Message, Option<Reporter>), Error> {
         outside_a_reactor()?;
         drive(async {
             let transfer = self.endpoint.recv().await?;
             let meta = transfer.meta().clone();
             let reporter = transfer.reporter().map(|inner| Reporter { inner });
-            let payload = transfer.collect(max_bytes).await?;
+            let payload = self.deadline.bounded(transfer.collect(max_bytes)).await?;
             Ok((Message { payload, meta }, reporter))
         })
     }
@@ -1126,6 +1212,7 @@ impl Surveyor {
 /// hands out the same [`Request`].
 pub struct Respondent {
     endpoint: crate::Respondent,
+    deadline: BodyDeadline,
 }
 
 impl Respondent {
@@ -1139,12 +1226,18 @@ impl Respondent {
     /// # Errors
     ///
     /// As [`Replier::accept`].
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn accept(&self, max_bytes: usize) -> Result<Request, Error> {
         outside_a_reactor()?;
         drive(async {
             let mut request = self.endpoint.accept().await?;
             let meta = request.meta().clone();
-            let payload = request.take_body().collect(max_bytes).await?;
+            let payload = self
+                .deadline
+                .bounded(request.take_body().collect(max_bytes))
+                .await?;
             Ok(Request {
                 request,
                 message: Message { payload, meta },
@@ -1162,6 +1255,7 @@ impl Respondent {
 /// member.
 pub struct BusMember {
     endpoint: crate::BusMember,
+    deadline: BodyDeadline,
 }
 
 dialling!(BusMember, crate::BusMember);
@@ -1205,12 +1299,15 @@ impl BusMember {
     /// # Errors
     ///
     /// As [`Puller::recv`].
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn recv(&self, max_bytes: usize) -> Result<Message, Error> {
         outside_a_reactor()?;
         drive(async {
             let transfer = self.endpoint.recv().await?;
             let meta = transfer.meta().clone();
-            let payload = transfer.collect(max_bytes).await?;
+            let payload = self.deadline.bounded(transfer.collect(max_bytes)).await?;
             Ok(Message { payload, meta })
         })
     }
@@ -1255,8 +1352,7 @@ impl Radio {
     ///
     /// As [`crate::Radio::datagram`].
     pub fn datagram(&self, topic: &str, payload: &[u8]) -> Result<usize, Error> {
-        self.endpoint
-            .datagram(topic, bytes::Bytes::copy_from_slice(payload))
+        self.endpoint.datagram(topic, payload)
     }
 
     /// Dishes currently joined.
@@ -1364,6 +1460,7 @@ pub enum Delivered {
 /// A dish: joins topics on a radio and receives the newest segment of each.
 pub struct Dish {
     endpoint: crate::Dish,
+    deadline: BodyDeadline,
 }
 
 dialling!(Dish, crate::Dish);
@@ -1400,13 +1497,16 @@ impl Dish {
     /// [`Error::LimitExceeded`] past the ceiling, [`Error::Canceled`] for a
     /// segment the radio reset while it was being read, [`Error::Runtime`]
     /// from inside a reactor.
+    ///
+    /// [`Error::Expired`] when the body is not complete within
+    /// `RuntimeConfig::receive_timeout`.
     pub fn recv(&self, max_bytes: usize) -> Result<Delivered, Error> {
         outside_a_reactor()?;
         drive(async {
             match self.endpoint.recv().await? {
                 crate::Received::Segment(transfer) => {
                     let meta = transfer.meta().clone();
-                    let payload = transfer.collect(max_bytes).await?;
+                    let payload = self.deadline.bounded(transfer.collect(max_bytes)).await?;
                     Ok(Delivered::Segment(Box::new(Message { payload, meta })))
                 }
                 crate::Received::Datagram {
@@ -1414,7 +1514,7 @@ impl Dish {
                     segment,
                     payload,
                 } => Ok(Delivered::Datagram {
-                    topic,
+                    topic: topic.to_string(),
                     segment,
                     payload: payload.to_vec(),
                 }),

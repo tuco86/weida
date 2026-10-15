@@ -1084,21 +1084,6 @@ fn data_frame(header: &DataHeader) -> (Vec<u8>, usize) {
     (buf, start)
 }
 
-/// Writes the preamble and DATA header of an outgoing transfer.
-///
-/// Refuses a header the decoder would refuse ([`DataHeader::check`]) with
-/// [`Error::LimitExceeded`] before anything is written. A caller that holds
-/// the connection uses [`write_data_head`], which also holds the header to
-/// what the peer said it reads.
-pub(crate) async fn write_data_preamble(
-    stream: &mut SendHalf,
-    header: &DataHeader,
-) -> Result<(), Error> {
-    header.check().map_err(|_| Error::LimitExceeded)?;
-    let (buf, start) = data_frame(header);
-    stream.write_all(&buf[start..]).await
-}
-
 /// A DATA frame head that has been checked and framed and not yet written.
 ///
 /// Built **before** a stream is opened, so a header the peer would not read
@@ -1126,7 +1111,7 @@ impl DataHead {
     }
 }
 
-/// Like [`write_data_preamble`], for a stream that already exists (a reply
+/// Writes a checked DATA frame head on a stream that already exists (a reply
 /// half): the head is checked against the peer's `max_header_bytes` first.
 pub(crate) async fn write_data_head(
     conn: &ConnHandle,

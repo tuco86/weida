@@ -684,7 +684,7 @@ fn refuse_cursor(mut stream: RecvHalf) -> Result<(), Error> {
 ///   no state exists for an id we never handed out, which is the hostile
 ///   case;
 /// * a record that repeats an offset or moves one backwards changes nothing,
-///   and neither does a level the sender never ordered: [`CursorSet::advance`]
+///   and neither does a level the sender never ordered: [`crate::cursor::CursorSet::advance`]
 ///   keeps the maximum, so the peer is told nothing and no notification is
 ///   sent;
 /// * a record truncated at FIN **is** a violation. A record is at most
@@ -973,7 +973,7 @@ async fn handle_subscription(
                 header.filter,
                 header.max_age_ms,
                 header.max_layer,
-                || subs.reserve(conn_id),
+                || subs.reserve(ctx),
             );
             if joined.is_err() {
                 return too_many_subscriptions(ctx);
@@ -993,7 +993,7 @@ async fn handle_subscription(
                 .namespace
                 .note_consumer(conn_id, &header.endpoint, &header.filter)
             {
-                if subs.reserve(conn_id).is_err() {
+                if subs.reserve(ctx).is_err() {
                     return too_many_subscriptions(ctx);
                 }
                 let consumer = Consumer::new(

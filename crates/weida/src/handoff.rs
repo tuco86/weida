@@ -35,6 +35,17 @@ const MAGIC: &[u8; 4] = b"WDHO";
 /// The one version of the byte format.
 const VERSION: u8 = 1;
 
+/// The most datagrams a handoff holds and a successor accepts. A handover
+/// holds a close packet per connection, and `Limits::max_connections`
+/// defaults to 1024 per binding, so this leaves room for the packets of
+/// handshakes still in flight; a handoff past it is not one this process
+/// made.
+pub(crate) const MAX_HELD_DATAGRAMS: usize = 4096;
+/// The largest datagram a handoff holds and a successor accepts: `quinn`'s
+/// largest UDP payload under its default MTU discovery (1452 bytes), with
+/// headroom.
+pub(crate) const MAX_HELD_DATAGRAM_BYTES: usize = 1500;
+
 const TAG_NONE: u8 = 0;
 const TAG_V4: u8 = 4;
 const TAG_V6: u8 = 6;
@@ -126,11 +137,19 @@ impl AsyncUdpSocket for HandoverSocket {
                 // the last one possibly shorter; each is kept on its own.
                 let size = transmit.segment_size.unwrap_or(transmit.contents.len());
                 for contents in transmit.contents.chunks(size.max(1)) {
-                    held.push(HeldDatagram {
-                        destination: transmit.destination,
-                        src_ip: transmit.src_ip,
-                        contents: contents.to_vec(),
-                    });
+                    // Only what `decode` would accept: a datagram it refuses
+                    // would make the successor refuse the whole handoff, and
+                    // every client with it. The count is bounded for the same
+                    // reason and so that a handover cannot pin memory.
+                    if held.len() < MAX_HELD_DATAGRAMS
+                        && plausible(transmit.destination, transmit.src_ip, contents)
+                    {
+                        held.push(HeldDatagram {
+                            destination: transmit.destination,
+                            src_ip: transmit.src_ip,
+                            contents: contents.to_vec(),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -189,10 +208,26 @@ impl fmt::Debug for HandoverSocket {
 /// [`Handoff::into_parts`] splits it in two. The socket goes to the successor
 /// as a descriptor, over `SCM_RIGHTS` or inherited across `exec`, and is
 /// served there with [`Listener::bind_quic_socket`](crate::Listener::bind_quic_socket).
-/// The bytes go alongside it, in any channel, to
+/// The bytes go alongside it to
 /// [`Binding::take_over`](crate::Binding::take_over). They are QUIC packets,
 /// readable in the clear only as far as their headers go, and need no
 /// secrecy.
+///
+/// **They do need the integrity of their channel.** Whoever can write them
+/// decides what the successor sends from the binding's UDP port, and to whom:
+/// `take_over` sends each datagram it is given, once. That is bounded and not
+/// harmless: it refuses more than 4096 datagrams, one larger than 1500
+/// bytes, and a destination that is multicast, broadcast, unspecified or
+/// port 0, none of which a client has — but within those bounds it sends
+/// what it is told. The successor cannot check the destinations against
+/// connections, because it has none: they were the predecessor's. So carry
+/// the bytes over the channel that carries the socket descriptor, which only
+/// the two processes' own user can reach, and not through a file or socket
+/// other users can write.
+///
+/// A binding that holds more than 4096 datagrams keeps the first ones: the
+/// clients whose close did not fit notice through `Limits::idle_timeout` and
+/// redial on their normal schedule.
 pub struct Handoff {
     pub(crate) socket: std::net::UdpSocket,
     pub(crate) local_addr: SocketAddr,
@@ -260,6 +295,11 @@ pub(crate) fn encode(local_addr: SocketAddr, held: &[HeldDatagram]) -> Vec<u8> {
 
 /// Decodes what [`encode`] wrote, refusing anything else with
 /// `Error::Io` of kind `InvalidData`.
+///
+/// "Anything else" includes what no handover can have produced: more than
+/// [`MAX_HELD_DATAGRAMS`] datagrams, and a datagram [`plausible`] refuses.
+/// The bytes are trusted by the caller that passes them, and still bounded
+/// here, because the bound is cheap and what it protects is not.
 pub(crate) fn decode(bytes: &[u8]) -> Result<(SocketAddr, Vec<HeldDatagram>), Error> {
     let Some(rest) = bytes.strip_prefix(MAGIC.as_slice()) else {
         return Err(invalid("handoff: not a weida handoff".into()));
@@ -271,6 +311,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(SocketAddr, Vec<HeldDatagram>), Er
     }
     let local_addr = reader.addr()?;
     let count = reader.u32()?;
+    if !usize::try_from(count).is_ok_and(|count| count <= MAX_HELD_DATAGRAMS) {
+        return Err(invalid(format!(
+            "handoff: {count} datagrams, a handover holds at most {MAX_HELD_DATAGRAMS}"
+        )));
+    }
     // The count is not trusted for an allocation: entries are pushed as they
     // parse, so a lying count fails on truncation instead.
     let mut held = Vec::new();
@@ -281,10 +326,14 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(SocketAddr, Vec<HeldDatagram>), Er
             tag => Some(reader.ip(tag)?),
         };
         let len = usize::from(reader.u16()?);
-        if len == 0 {
+        // Before the copy: a length no datagram has is refused unread.
+        if len > MAX_HELD_DATAGRAM_BYTES {
             return Err(malformed());
         }
         let contents = reader.take(len)?.to_vec();
+        if !plausible(destination, src_ip, &contents) {
+            return Err(malformed());
+        }
         held.push(HeldDatagram {
             destination,
             src_ip,
@@ -295,6 +344,29 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(SocketAddr, Vec<HeldDatagram>), Er
         return Err(malformed());
     }
     Ok((local_addr, held))
+}
+
+/// Whether a handover could have held this datagram.
+///
+/// A QUIC client has a unicast address with a port, so a destination that is
+/// multicast, broadcast, unspecified or port 0 is no client's; the source is
+/// a local unicast address when there is one; and the contents are one
+/// packet of at most [`MAX_HELD_DATAGRAM_BYTES`]. The first byte is not
+/// looked at: a connection whose peer offers the `grease_quic_bit` transport
+/// parameter (RFC 9287, which `quinn` sends by default) carries packets whose
+/// fixed bit is zero at random, so no first byte is a safe test for a QUIC
+/// packet, and one that refused such a close would lose a client's
+/// restart notice at random. This is a bound on what a successor may be told
+/// to send, not a validation of the packet.
+fn plausible(destination: SocketAddr, src_ip: Option<IpAddr>, contents: &[u8]) -> bool {
+    (1..=MAX_HELD_DATAGRAM_BYTES).contains(&contents.len())
+        && unicast(destination.ip())
+        && destination.port() != 0
+        && src_ip.is_none_or(unicast)
+}
+
+fn unicast(ip: IpAddr) -> bool {
+    !(ip.is_multicast() || ip.is_unspecified() || ip == IpAddr::V4(Ipv4Addr::BROADCAST))
 }
 
 fn put_addr(out: &mut Vec<u8>, addr: SocketAddr) {
@@ -437,5 +509,138 @@ mod tests {
             contents: Vec::new(),
         };
         assert_invalid_data(&encode(local, &[empty]));
+    }
+
+    fn held_datagram(destination: &str, contents: Vec<u8>) -> HeldDatagram {
+        HeldDatagram {
+            destination: destination.parse().unwrap(),
+            src_ip: None,
+            contents,
+        }
+    }
+
+    #[test]
+    fn decode_refuses_more_datagrams_than_a_handover_holds() {
+        let (local, _) = sample();
+        let one = held_datagram("10.0.0.7:50000", vec![0x40]);
+
+        let at_the_cap = vec![one.clone(); MAX_HELD_DATAGRAMS];
+        let (_, decoded) = decode(&encode(local, &at_the_cap)).unwrap();
+        assert_eq!(decoded.len(), MAX_HELD_DATAGRAMS);
+
+        let past_the_cap = vec![one; MAX_HELD_DATAGRAMS + 1];
+        assert_invalid_data(&encode(local, &past_the_cap));
+    }
+
+    #[test]
+    fn decode_refuses_a_destination_no_client_has() {
+        let (local, _) = sample();
+        for destination in [
+            "224.0.0.1:5000",
+            "239.255.255.250:1900",
+            "255.255.255.255:5000",
+            "0.0.0.0:5000",
+            "10.0.0.7:0",
+            "[ff02::1]:5000",
+            "[::]:5000",
+        ] {
+            let held = held_datagram(destination, vec![0x40, 1, 2, 3]);
+            assert_invalid_data(&encode(local, &[held]));
+        }
+        for source in ["224.0.0.1", "0.0.0.0", "ff02::1"] {
+            let mut held = held_datagram("10.0.0.7:5000", vec![0x40, 1, 2, 3]);
+            held.src_ip = Some(source.parse().unwrap());
+            assert_invalid_data(&encode(local, &[held]));
+        }
+    }
+
+    #[test]
+    fn decode_refuses_a_datagram_larger_than_one_packet() {
+        let (local, _) = sample();
+        let accepted = |contents: Vec<u8>| {
+            let held = held_datagram("10.0.0.7:5000", contents);
+            decode(&encode(local, &[held])).is_ok()
+        };
+        // The first byte is not a test: a connection that negotiated the
+        // grease bit sends packets whose fixed bit is zero at random.
+        assert!(accepted(vec![0x00, 1]));
+        assert!(accepted(vec![0x1f, 1]));
+        assert!(accepted(vec![0xc0, 1]));
+        // One packet is at most one MTU.
+        let mut at_the_cap = vec![0x40; MAX_HELD_DATAGRAM_BYTES];
+        assert!(accepted(at_the_cap.clone()));
+        at_the_cap.push(0x40);
+        assert!(!accepted(at_the_cap));
+    }
+
+    /// A socket that sends nothing and receives nothing, for the decorator
+    /// to sit on.
+    #[derive(Debug)]
+    struct Nowhere;
+
+    impl UdpPoller for Nowhere {
+        fn poll_writable(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncUdpSocket for Nowhere {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Box::pin(Nowhere)
+        }
+
+        fn try_send(&self, _: &Transmit) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_recv(
+            &self,
+            _: &mut Context,
+            _: &mut [IoSliceMut<'_>],
+            _: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:4433".parse().unwrap())
+        }
+    }
+
+    #[test]
+    fn a_held_socket_keeps_only_what_a_successor_would_accept() {
+        let socket = HandoverSocket::new(Arc::new(Nowhere));
+        socket.hold();
+        let send = |destination: &str, contents: &[u8], segment_size: Option<usize>| {
+            socket
+                .try_send(&Transmit {
+                    destination: destination.parse().unwrap(),
+                    ecn: None,
+                    contents,
+                    segment_size,
+                    src_ip: None,
+                })
+                .unwrap();
+        };
+        // Neither of these could be a client's close.
+        send("224.0.0.1:9", &[0x40], None);
+        send("10.0.0.7:9", &[0x40; MAX_HELD_DATAGRAM_BYTES + 1], None);
+        // A packet whose fixed bit is zero is a client's close all the same:
+        // `quinn` greases the bit by default (RFC 9287).
+        send("10.0.0.7:9", &[0x1f, 9], None);
+        // A GSO batch is kept as the datagrams it is made of.
+        send("10.0.0.7:9", &[0x40, 1, 2, 3, 0x40, 5], Some(4));
+        for _ in 0..MAX_HELD_DATAGRAMS + 10 {
+            send("10.0.0.7:9", &[0x40], None);
+        }
+
+        let held = socket.release();
+        assert_eq!(held.len(), MAX_HELD_DATAGRAMS, "bounded, first ones kept");
+        assert_eq!(held[0].contents, [0x1f, 9]);
+        assert_eq!(held[1].contents, [0x40, 1, 2, 3]);
+        assert_eq!(held[2].contents, [0x40, 5]);
+        // What was kept is what a successor accepts.
+        let (local, _) = sample();
+        assert!(decode(&encode(local, &held)).is_ok());
     }
 }

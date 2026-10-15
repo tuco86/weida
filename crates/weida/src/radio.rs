@@ -13,11 +13,12 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use weida_core::{Error, Limits, PeerIdentity};
 use weida_protocol::header::limits::MAX_TOPIC_BYTES;
 use weida_protocol::{FrameKind, codes, encode_varint, filter, split_flow_datagram};
@@ -28,7 +29,7 @@ use crate::endpoint::{Dish, Radio, send_subscription};
 use crate::flow::{Flow, FlowMeta, IncomingFlow, open_flow_on};
 use crate::identity::PeerChain;
 use crate::listener::{Namespace, Route};
-use crate::pubsub::{Causes, DishDrops, DropCause, DropTable, TopicDrops};
+use crate::pubsub::{Causes, DishDrops, DropCause, DropTable, FilterIndex, TopicDrops};
 use crate::reconnect::PeerEvents;
 use crate::runtime::RuntimeInner;
 use crate::segment::{CopyTarget, Segment, SegmentTerms, SegmentTopics, open_segment};
@@ -101,25 +102,131 @@ impl JoinTerms {
         self.max_layer = Some(max_layer);
         self
     }
+
+    /// Combines the terms of two filters of one dish that both match a topic:
+    /// the smallest `max_age` among those that carry one, and the largest
+    /// `max_layer`, none if either has none.
+    fn merge(&self, other: &JoinTerms) -> JoinTerms {
+        JoinTerms {
+            max_age: match (self.max_age, other.max_age) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            max_layer: self.max_layer.zip(other.max_layer).map(|(a, b)| a.max(b)),
+        }
+    }
 }
 
 // --- radio side ---------------------------------------------------------------
 
-/// One joined dish: a connection and the filters it joined with.
-struct DishEntry {
+/// What the copies and datagrams to one dish go through. Shared with every
+/// send, so no send holds the dish table's lock.
+struct DishPort {
     conn: ConnHandle,
-    conn_id: usize,
-    /// Filter to what the dish asked for with it.
-    filters: HashMap<String, JoinTerms>,
     /// Chunk bytes this dish's copies may hold unwritten, over all topics.
     budget: Arc<Semaphore>,
     /// One datagram flow per topic, opened lazily on the connection the join
     /// arrived on; bounded by the topics the dish's filters match.
-    flows: Arc<Mutex<HashMap<Arc<str>, FlowSlot>>>,
+    flows: Mutex<HashMap<Arc<str>, FlowSlot>>,
     /// What this dish connection lost, over topics
     /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
     /// §4.6); goes with the entry when the connection closes.
     drops: Arc<Causes>,
+}
+
+/// One joined dish: the filters it joined with, and what its copies go
+/// through.
+struct DishEntry {
+    port: Arc<DishPort>,
+    /// Filter to what the dish asked for with it.
+    filters: HashMap<String, JoinTerms>,
+    /// Forgets this entry when its connection closes. Aborted with the entry,
+    /// so a radio that goes away releases the connections it held.
+    watch: JoinHandle<()>,
+}
+
+impl Drop for DishEntry {
+    fn drop(&mut self) {
+        self.watch.abort();
+    }
+}
+
+/// The joined dishes of a radio path, by connection id, and the (dish,
+/// filter) pairs that select a topic. Both change under one lock, so the
+/// index and the dishes always agree.
+struct DishTable {
+    dishes: HashMap<usize, DishEntry>,
+    index: FilterIndex<JoinTerms>,
+}
+
+impl DishTable {
+    /// The dishes whose connection is still open. A closed connection's entry
+    /// goes when its task runs, and a read must not count it in between.
+    fn live(&self) -> impl Iterator<Item = (usize, &DishEntry)> {
+        self.dishes
+            .iter()
+            .filter(|(_, dish)| dish.port.conn.conn.close_reason().is_none())
+            .map(|(conn_id, dish)| (*conn_id, dish))
+    }
+
+    /// The dishes with a filter that selects `topic`, each with the terms its
+    /// matching filters combine to. A snapshot: a send runs after the table
+    /// is released.
+    fn matching(&self, topic: &str) -> Vec<(Arc<DishPort>, JoinTerms)> {
+        let mut combined: HashMap<usize, JoinTerms> = HashMap::new();
+        self.index.matching(topic, |conn_id, terms| {
+            combined
+                .entry(conn_id)
+                .and_modify(|seen| *seen = seen.merge(terms))
+                .or_insert_with(|| terms.clone());
+        });
+        combined
+            .into_iter()
+            .filter_map(|(conn_id, terms)| {
+                let dish = self.dishes.get(&conn_id)?;
+                Some((Arc::clone(&dish.port), terms))
+            })
+            .collect()
+    }
+
+    /// Withdraws `withdrawn` from the dish on `conn_id`: its index entry, its
+    /// `max_subscriptions` slot and the flows no remaining filter matches. A
+    /// dish goes with its last filter. `false` when it did not hold it.
+    fn withdraw(&mut self, conn_id: usize, withdrawn: &str) -> bool {
+        let Some(dish) = self.dishes.get_mut(&conn_id) else {
+            return false;
+        };
+        if dish.filters.remove(withdrawn).is_none() {
+            return false;
+        }
+        self.index.remove(conn_id, withdrawn);
+        if let Some(subs) = dish.port.conn.subs.as_ref() {
+            subs.release(conn_id);
+        }
+        let filters = &dish.filters;
+        lock(&dish.port.flows).retain(|topic, _| filters.keys().any(|f| filter::matches(topic, f)));
+        if dish.filters.is_empty() {
+            self.dishes.remove(&conn_id);
+        }
+        true
+    }
+
+    /// Forgets the dish on `conn_id`, but only if it still belongs to `conn`:
+    /// the entry may be gone already, or hold a newer connection.
+    fn forget(&mut self, conn_id: usize, conn: &ConnHandle) {
+        let same = self
+            .dishes
+            .get(&conn_id)
+            .is_some_and(|dish| Arc::ptr_eq(&dish.port.conn, conn));
+        if !same {
+            return;
+        }
+        if let Some(dish) = self.dishes.remove(&conn_id) {
+            for filter in dish.filters.keys() {
+                self.index.remove(conn_id, filter);
+            }
+        }
+    }
 }
 
 /// A dish's datagram flow for one topic.
@@ -127,54 +234,44 @@ enum FlowSlot {
     /// The FLOW header is on its way; holds the newest datagram meanwhile,
     /// never more than one.
     Opening(Option<Bytes>),
-    Open(Flow),
+    /// The flow is open. `since` is when it opened, and `backoff` is the wait
+    /// its next refusal imposes.
+    Open {
+        flow: Flow,
+        since: Instant,
+        backoff: Duration,
+    },
+    /// The dish refused or ended the flow. Datagrams on the topic are counted
+    /// drops until `until`; the first one after that opens a flow, and
+    /// `backoff` is the wait that flow's refusal imposes.
+    Refused { until: Instant, backoff: Duration },
 }
 
-impl DishEntry {
-    /// What the dish asked for on `topic`, combined over the matching
-    /// filters: the smallest `max_age` among those that carry one, and the
-    /// largest `max_layer`, none if any matching filter has none. `None` for
-    /// no match at all.
-    fn matching(&self, topic: &str) -> Option<JoinTerms> {
-        let mut combined: Option<JoinTerms> = None;
-        for (f, terms) in &self.filters {
-            if !filter::matches(topic, f) {
-                continue;
-            }
-            combined = Some(match combined {
-                None => terms.clone(),
-                Some(seen) => JoinTerms {
-                    max_age: match (seen.max_age, terms.max_age) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (a, b) => a.or(b),
-                    },
-                    max_layer: seen.max_layer.zip(terms.max_layer).map(|(a, b)| a.max(b)),
-                },
-            });
-        }
-        combined
-    }
+/// The first wait after a dish refuses a datagram flow. A dish that answers
+/// every FLOW with STOP_SENDING would otherwise cost the radio one stream
+/// open per datagram.
+const FLOW_BACKOFF_START: Duration = Duration::from_millis(100);
 
-    /// Withdraws `filter` and releases its `max_subscriptions` slot; `false`
-    /// when the dish did not hold it. A topic no remaining filter matches
-    /// loses its flow: dropping it closes the FLOW stream with FIN.
-    fn drop_filter(&mut self, withdrawn: &str) -> bool {
-        if self.filters.remove(withdrawn).is_none() {
-            return false;
-        }
-        if let Some(subs) = self.conn.subs.as_ref() {
-            subs.release(self.conn_id);
-        }
-        let filters = &self.filters;
-        lock(&self.flows).retain(|topic, _| filters.keys().any(|f| filter::matches(topic, f)));
-        true
-    }
+/// The longest wait between two attempts at a flow the dish refuses.
+const FLOW_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How long a flow must stay open before its refusals start over at
+/// [`FLOW_BACKOFF_START`]. A refusal arrives after the open has returned, so
+/// resetting at the open would hold a dish that refuses every flow at the
+/// first wait.
+const FLOW_SETTLE: Duration = FLOW_BACKOFF_MAX;
+
+/// The wait a refusal imposes after `backoff`: twice as long, up to the cap.
+fn doubled(backoff: Duration) -> Duration {
+    (backoff * 2).min(FLOW_BACKOFF_MAX)
 }
 
 /// Everything a radio path holds: its dishes, its topics and its drops.
 pub(crate) struct RadioHub {
     path: Arc<str>,
-    dishes: Mutex<Vec<DishEntry>>,
+    /// The joined dishes. The tasks that forget a dish when its connection
+    /// closes hold this weakly, so they do not keep a radio alive.
+    dishes: Arc<Mutex<DishTable>>,
     /// Per-topic numbering and the copies the next segment supersedes.
     topics: SegmentTopics,
     drops: Arc<DropTable>,
@@ -189,7 +286,10 @@ impl RadioHub {
     pub(crate) fn new(path: &str, limits: Limits) -> RadioHub {
         RadioHub {
             path: Arc::from(path),
-            dishes: Mutex::new(Vec::new()),
+            dishes: Arc::new(Mutex::new(DishTable {
+                dishes: HashMap::new(),
+                index: FilterIndex::new(),
+            })),
             topics: SegmentTopics::new(limits.max_sequence_scopes),
             drops: Arc::new(DropTable::new(limits.max_sequence_scopes)),
             limits,
@@ -197,11 +297,34 @@ impl RadioHub {
         }
     }
 
-    /// The dish table, with every entry whose connection closed removed.
-    fn dishes(&self) -> MutexGuard<'_, Vec<DishEntry>> {
-        let mut dishes = lock(&self.dishes);
-        dishes.retain(|d| d.conn.conn.close_reason().is_none());
-        dishes
+    /// The dish table.
+    fn dishes(&self) -> MutexGuard<'_, DishTable> {
+        lock(&self.dishes)
+    }
+
+    /// A new dish on `ctx`, and the task that forgets it when `ctx` closes.
+    fn new_dish(&self, ctx: &ConnHandle, conn_id: usize) -> DishEntry {
+        let port = Arc::new(DishPort {
+            conn: ConnHandle::clone(ctx),
+            // tokio panics above `Semaphore::MAX_PERMITS`.
+            budget: Arc::new(Semaphore::new(
+                self.limits
+                    .subscriber_buffer_bytes
+                    .min(Semaphore::MAX_PERMITS),
+            )),
+            flows: Mutex::new(HashMap::new()),
+            drops: Arc::new(Causes::default()),
+        });
+        let watch = ctx.exec.spawn(forget_when_closed(
+            Arc::downgrade(&self.dishes),
+            ConnHandle::clone(ctx),
+            conn_id,
+        ));
+        DishEntry {
+            port,
+            filters: HashMap::new(),
+            watch,
+        }
     }
 
     /// Records a join. `reserve` counts a new filter against the
@@ -226,7 +349,7 @@ impl RadioHub {
             max_age: max_age_ms.map(Duration::from_millis),
             max_layer,
         };
-        let mut dishes = loop {
+        let mut guard = loop {
             let (generation, admit) = {
                 let admission = lock(&self.admission);
                 (admission.0, admission.1.clone())
@@ -244,58 +367,46 @@ impl RadioHub {
                 break dishes;
             }
         };
-        let index = match dishes.iter().position(|d| d.conn_id == conn_id) {
-            Some(index) => index,
-            None => {
-                dishes.push(DishEntry {
-                    conn: ConnHandle::clone(ctx),
-                    conn_id,
-                    filters: HashMap::new(),
-                    budget: Arc::new(Semaphore::new(self.limits.subscriber_buffer_bytes)),
-                    flows: Arc::new(Mutex::new(HashMap::new())),
-                    drops: Arc::new(Causes::default()),
-                });
-                dishes.len() - 1
-            }
-        };
-        let entry = &mut dishes[index];
-        if let Some(held) = entry.filters.get_mut(&filter) {
-            *held = terms;
+        let table = &mut *guard;
+        if let Some(dish) = table.dishes.get_mut(&conn_id)
+            && let Some(held) = dish.filters.get_mut(&filter)
+        {
+            *held = terms.clone();
+            table.index.insert(conn_id, &filter, terms);
             return Ok(());
         }
-        if let Err(e) = reserve() {
-            if entry.filters.is_empty() {
-                dishes.swap_remove(index);
-            }
-            return Err(e);
-        }
-        entry.filters.insert(filter, terms);
+        reserve()?;
+        let dish = table
+            .dishes
+            .entry(conn_id)
+            .or_insert_with(|| self.new_dish(ctx, conn_id));
+        dish.filters.insert(filter.clone(), terms.clone());
+        table.index.insert(conn_id, &filter, terms);
         Ok(())
     }
 
     /// Withdraws a join the dish asked to leave, and releases its slot.
     pub(crate) fn leave(&self, conn_id: usize, filter: &str) {
-        let mut dishes = self.dishes();
-        let Some(index) = dishes.iter().position(|d| d.conn_id == conn_id) else {
-            return;
-        };
-        dishes[index].drop_filter(filter);
-        if dishes[index].filters.is_empty() {
-            dishes.swap_remove(index);
-        }
+        self.dishes().withdraw(conn_id, filter);
     }
 
-    /// Withdraws `filter` from every connection `peer` joined it on; the
+    /// Withdraws `filter` from every live connection `peer` joined it on; the
     /// number of joins withdrawn.
     pub(crate) fn evict(&self, peer: &PeerIdentity, filter: &str) -> usize {
-        let mut dishes = self.dishes();
+        let mut table = self.dishes();
+        let holders: Vec<usize> = table
+            .live()
+            .filter(|(_, dish)| {
+                dish.port.conn.peer.as_ref() == Some(peer) && dish.filters.contains_key(filter)
+            })
+            .map(|(conn_id, _)| conn_id)
+            .collect();
         let mut evicted = 0;
-        for entry in dishes.iter_mut() {
-            if entry.conn.peer.as_ref() == Some(peer) && entry.drop_filter(filter) {
+        for conn_id in holders {
+            if table.withdraw(conn_id, filter) {
                 evicted += 1;
             }
         }
-        dishes.retain(|d| !d.filters.is_empty());
         evicted
     }
 
@@ -311,12 +422,12 @@ impl RadioHub {
         }
         let recorded: Vec<(usize, ConnHandle, Vec<String>)> = self
             .dishes()
-            .iter()
-            .map(|d| {
+            .live()
+            .map(|(conn_id, dish)| {
                 (
-                    d.conn_id,
-                    ConnHandle::clone(&d.conn),
-                    d.filters.keys().cloned().collect(),
+                    conn_id,
+                    ConnHandle::clone(&dish.port.conn),
+                    dish.filters.keys().cloned().collect(),
                 )
             })
             .collect();
@@ -332,13 +443,19 @@ impl RadioHub {
         if refused.is_empty() {
             return;
         }
-        let mut dishes = self.dishes();
+        let mut table = self.dishes();
         for (conn_id, filter) in &refused {
-            if let Some(entry) = dishes.iter_mut().find(|d| d.conn_id == *conn_id) {
-                entry.drop_filter(filter);
-            }
+            table.withdraw(*conn_id, filter);
         }
-        dishes.retain(|d| !d.filters.is_empty());
+    }
+}
+
+/// Forgets a dish once its connection closes, so the table holds only what is
+/// still connected and no send has to ask each dish whether it is.
+async fn forget_when_closed(dishes: Weak<Mutex<DishTable>>, conn: ConnHandle, conn_id: usize) {
+    let _ = conn.conn.closed().await;
+    if let Some(dishes) = dishes.upgrade() {
+        lock(&dishes).forget(conn_id, &conn);
     }
 }
 
@@ -410,18 +527,17 @@ impl Radio {
         let hub = self.hub();
         let topic: Arc<str> = Arc::from(topic);
         let number = hub.topics.next(&topic)?;
-        let targets = hub
+        let targets: Vec<CopyTarget> = hub
             .dishes()
-            .iter()
-            .filter_map(|entry| {
-                entry.matching(&topic).map(|joined| CopyTarget {
-                    conn: ConnHandle::clone(&entry.conn),
-                    path: Arc::clone(&hub.path),
-                    budget: Arc::clone(&entry.budget),
-                    max_age: joined.max_age,
-                    max_layer: joined.max_layer,
-                    dish: Some(Arc::clone(&entry.drops)),
-                })
+            .matching(&topic)
+            .into_iter()
+            .map(|(port, joined)| CopyTarget {
+                conn: ConnHandle::clone(&port.conn),
+                path: Arc::clone(&hub.path),
+                budget: Arc::clone(&port.budget),
+                max_age: joined.max_age,
+                max_layer: joined.max_layer,
+                dish: Some(Arc::clone(&port.drops)),
             })
             .collect();
         Ok(open_segment(
@@ -446,63 +562,93 @@ impl Radio {
     /// dish's connection carries, are counted drops with their causes —
     /// never turned into a stream segment, which would arrive late
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
-    /// §4.6 rule 4).
-    pub fn datagram(&self, topic: &str, payload: impl Into<Bytes>) -> Result<usize, Error> {
+    /// §4.6 rule 4). A dish that refuses its flow costs a drop per datagram
+    /// until the flow's backoff is over, which starts at 100 ms and doubles up
+    /// to 30 s; no stream is opened meanwhile.
+    ///
+    /// The payload is copied once, into the frame that is sent, so the caller
+    /// keeps its buffer.
+    pub fn datagram(&self, topic: &str, payload: impl AsRef<[u8]>) -> Result<usize, Error> {
         if topic.len() > MAX_TOPIC_BYTES {
             return Err(Error::LimitExceeded);
         }
         let hub = self.hub();
         let topic: Arc<str> = Arc::from(topic);
         let number = hub.topics.next(&topic)?;
-        let payload = payload.into();
-        let mut body = Vec::with_capacity(8 + payload.len());
-        encode_varint(number, &mut body).expect("segment numbers stay below 2^62");
-        body.extend_from_slice(&payload);
-        let body = Bytes::from(body);
+        let payload = payload.as_ref();
+        let mut frame = Vec::with_capacity(8 + payload.len());
+        encode_varint(number, &mut frame).expect("segment numbers stay below 2^62");
+        frame.extend_from_slice(payload);
+        let body = Bytes::from(frame);
 
+        let dishes = hub.dishes().matching(&topic);
         let mut handed = 0;
-        for entry in hub.dishes().iter() {
-            if entry.matching(&topic).is_none() {
+        for (port, _) in dishes {
+            if !port.conn.agreed_now().is_some_and(|a| a.datagrams) {
+                record(&hub.drops, &port.drops, &topic, DropCause::NoDatagrams);
                 continue;
             }
-            if !entry.conn.agreed_now().is_some_and(|a| a.datagrams) {
-                record(&hub.drops, &entry.drops, &topic, DropCause::NoDatagrams);
-                continue;
-            }
-            let mut flows = lock(&entry.flows);
+            let mut flows = lock(&port.flows);
             match flows.get_mut(&topic) {
-                Some(FlowSlot::Open(flow)) => match flow.send(body.clone()) {
-                    Ok(()) => handed += 1,
-                    Err(Error::TooLarge { .. }) => {
-                        record(&hub.drops, &entry.drops, &topic, DropCause::TooLarge);
-                    }
-                    Err(Error::DatagramsUnavailable) => {
-                        record(&hub.drops, &entry.drops, &topic, DropCause::NoDatagrams);
-                    }
-                    // The flow ended — refused, released or its connection
-                    // gone. This datagram is lost; the next one reopens.
-                    Err(_) => {
-                        flows.remove(&topic);
-                        record(&hub.drops, &entry.drops, &topic, DropCause::SubscriberQueue);
-                    }
-                },
-                Some(FlowSlot::Opening(pending)) => {
-                    if pending.replace(body.clone()).is_some() {
-                        record(&hub.drops, &entry.drops, &topic, DropCause::SubscriberQueue);
-                    }
-                    handed += 1;
-                }
                 None => {
                     flows.insert(Arc::clone(&topic), FlowSlot::Opening(Some(body.clone())));
-                    entry.conn.exec.spawn(open_datagram_flow(
-                        ConnHandle::clone(&entry.conn),
-                        Arc::clone(&hub.path),
-                        Arc::clone(&topic),
-                        Arc::clone(&entry.flows),
-                        Arc::clone(&hub.drops),
-                        Arc::clone(&entry.drops),
-                    ));
+                    spawn_flow_open(&port, hub, &topic, FLOW_BACKOFF_START);
                     handed += 1;
+                }
+                Some(slot) => {
+                    let next = match &mut *slot {
+                        FlowSlot::Opening(pending) => {
+                            if pending.replace(body.clone()).is_some() {
+                                record(&hub.drops, &port.drops, &topic, DropCause::SubscriberQueue);
+                            }
+                            handed += 1;
+                            None
+                        }
+                        FlowSlot::Open {
+                            flow,
+                            since,
+                            backoff,
+                        } => match flow.send(body.clone()) {
+                            Ok(()) => {
+                                handed += 1;
+                                if since.elapsed() >= FLOW_SETTLE {
+                                    *backoff = FLOW_BACKOFF_START;
+                                }
+                                None
+                            }
+                            Err(Error::TooLarge { .. }) => {
+                                record(&hub.drops, &port.drops, &topic, DropCause::TooLarge);
+                                None
+                            }
+                            Err(Error::DatagramsUnavailable) => {
+                                record(&hub.drops, &port.drops, &topic, DropCause::NoDatagrams);
+                                None
+                            }
+                            // The flow ended: the dish refused or released it, or its
+                            // connection is gone. The datagram is lost, and the flow
+                            // waits out its backoff before the next one opens.
+                            Err(_) => {
+                                record(&hub.drops, &port.drops, &topic, DropCause::SubscriberQueue);
+                                Some(FlowSlot::Refused {
+                                    until: Instant::now() + *backoff,
+                                    backoff: doubled(*backoff),
+                                })
+                            }
+                        },
+                        FlowSlot::Refused { until, backoff } => {
+                            if Instant::now() < *until {
+                                record(&hub.drops, &port.drops, &topic, DropCause::SubscriberQueue);
+                                None
+                            } else {
+                                spawn_flow_open(&port, hub, &topic, *backoff);
+                                handed += 1;
+                                Some(FlowSlot::Opening(Some(body.clone())))
+                            }
+                        }
+                    };
+                    if let Some(next) = next {
+                        *slot = next;
+                    }
                 }
             }
         }
@@ -516,7 +662,7 @@ impl Radio {
 
     /// Dishes currently joined.
     pub fn dish_count(&self) -> usize {
-        self.hub().dishes().len()
+        self.hub().dishes().live().count()
     }
 
     /// Copies dropped, over topics and causes.
@@ -577,8 +723,8 @@ impl Radio {
     pub fn dish_drops(&self) -> Vec<DishDrops> {
         self.hub()
             .dishes()
-            .iter()
-            .map(|d| d.drops.dish_snapshot(d.conn.peer.clone()))
+            .live()
+            .map(|(_, dish)| dish.port.drops.dish_snapshot(dish.port.conn.peer.clone()))
             .collect()
     }
 }
@@ -590,55 +736,78 @@ fn record(drops: &DropTable, dish: &Causes, topic: &Arc<str>, cause: DropCause) 
 }
 
 /// Opens a dish's datagram flow for one topic and sends the datagram that
-/// waited for it; on failure the slot goes, so the next datagram tries again.
+/// waited for it. A failed open leaves the topic `Refused` for `backoff`; a
+/// flow that opens keeps `backoff` as the wait its next refusal imposes.
 async fn open_datagram_flow(
-    conn: ConnHandle,
+    port: Arc<DishPort>,
     path: Arc<str>,
     topic: Arc<str>,
-    flows: Arc<Mutex<HashMap<Arc<str>, FlowSlot>>>,
     drops: Arc<DropTable>,
-    dish: Arc<Causes>,
+    backoff: Duration,
 ) {
     let meta = FlowMeta::default().with_topic(topic.as_ref());
-    let opened = open_flow_on(&conn, &path, &meta).await;
-    let mut flows = lock(&flows);
+    let opened = open_flow_on(&port.conn, &path, &meta).await;
+    let mut flows = lock(&port.flows);
+    let Some(slot) = flows.get_mut(&topic) else {
+        // The dish left the topic meanwhile, which removed the slot; a flow
+        // opened now is dropped, and closes with FIN.
+        return;
+    };
+    let pending = match &mut *slot {
+        FlowSlot::Opening(pending) => pending.take(),
+        // A newer open owns the slot; this flow is dropped, and closes with FIN.
+        _ => return,
+    };
     match opened {
         Ok(flow) => {
-            // The dish may have left the topic meanwhile, which removed the
-            // slot; the new flow then just closes.
-            let Some(slot) = flows.get_mut(&topic) else {
-                return;
-            };
-            if let FlowSlot::Opening(pending) = slot
-                && let Some(body) = pending.take()
-            {
+            if let Some(body) = pending {
                 match flow.send(body) {
                     Ok(()) => {}
                     Err(Error::TooLarge { .. }) => {
-                        record(&drops, &dish, &topic, DropCause::TooLarge);
+                        record(&drops, &port.drops, &topic, DropCause::TooLarge);
                     }
-                    Err(_) => record(&drops, &dish, &topic, DropCause::SubscriberQueue),
+                    Err(_) => record(&drops, &port.drops, &topic, DropCause::SubscriberQueue),
                 }
             }
-            *slot = FlowSlot::Open(flow);
+            *slot = FlowSlot::Open {
+                flow,
+                since: Instant::now(),
+                backoff,
+            };
         }
         Err(e) => {
-            if let Some(FlowSlot::Opening(Some(_))) = flows.remove(&topic) {
+            if pending.is_some() {
                 let cause = match e {
                     Error::DatagramsUnavailable => DropCause::NoDatagrams,
                     _ => DropCause::SubscriberQueue,
                 };
-                record(&drops, &dish, &topic, cause);
+                record(&drops, &port.drops, &topic, cause);
             }
+            *slot = FlowSlot::Refused {
+                until: Instant::now() + backoff,
+                backoff: doubled(backoff),
+            };
         }
     }
+}
+
+/// Starts opening the flow for `topic` on `port`; `backoff` is the wait its
+/// next refusal imposes.
+fn spawn_flow_open(port: &Arc<DishPort>, hub: &RadioHub, topic: &Arc<str>, backoff: Duration) {
+    port.conn.exec.spawn(open_datagram_flow(
+        Arc::clone(port),
+        Arc::clone(&hub.path),
+        Arc::clone(topic),
+        Arc::clone(&hub.drops),
+        backoff,
+    ));
 }
 
 /// Moves a radio's datagram segments from one flow into its dish's queue:
 /// stale ones against the newest delivered on the connection, path and topic
 /// are discarded, and a full queue discards rather than waits.
 pub(crate) async fn pump_flow(ctx: ConnHandle, route: DishRoute, flow: IncomingFlow) {
-    let Some(topic) = flow.info().topic.clone() else {
+    let Some(topic) = flow.info().topic.as_deref().map(Arc::<str>::from) else {
         // A radio names its topic; a flow without one is not a segment.
         return;
     };
@@ -654,10 +823,12 @@ pub(crate) async fn pump_flow(ctx: ConnHandle, route: DishRoute, flow: IncomingF
             route.shared.stale.fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        // Copied: a slice would keep the whole receive batch alive, and the
+        // queue charges nothing for that.
         let received = Received::Datagram {
-            topic: topic.clone(),
+            topic: Arc::clone(&topic),
             segment,
-            payload: datagram.slice(offset..),
+            payload: Bytes::copy_from_slice(&datagram[offset..]),
         };
         if route.queue.try_send(received).is_err() {
             route.shared.overflow.fetch_add(1, Ordering::Relaxed);
@@ -676,7 +847,7 @@ pub enum Received {
     /// A datagram segment: one packet, whole.
     Datagram {
         /// The topic it was sent on.
-        topic: String,
+        topic: Arc<str>,
         /// Its segment number on that topic.
         segment: u64,
         /// The payload.

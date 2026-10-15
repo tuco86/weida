@@ -659,3 +659,85 @@ async fn a_level_the_reporter_cannot_honour_is_absent_rather_than_fatal() {
     assert_eq!(cursors.snapshot().offset(STORED), None);
     assert!(cursors.snapshot().is_empty());
 }
+
+/// A report is one shared value however many CURSOR streams name it: a peer
+/// that opens a second stream for the same `report_id` cannot move it
+/// backwards by starting that stream lower. Keeping the maximum per level is
+/// the property the whole carrier rests on
+/// ([PROTOCOL.md](../../../docs/PROTOCOL.md) §6.7 rule 1).
+#[tokio::test]
+async fn a_second_cursor_stream_for_one_report_cannot_move_it_backwards() {
+    let certs = common::Certs::generate();
+    let (endpoint, addr) = raw::server_endpoint(&certs);
+
+    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
+    let pusher = client.pusher(weida::ClientTls::new(weida::Trust::anchor_file(
+        &certs.cert_pem,
+    )));
+    let url = format!("weida://127.0.0.1:{}/jobs", addr.port());
+
+    let (first_seen, wait_for_first) = tokio::sync::oneshot::channel::<()>();
+    let (done, wait_for_done) = tokio::sync::oneshot::channel::<()>();
+    let peer = tokio::spawn(async move {
+        let incoming = endpoint.accept().await.expect("inbound");
+        let conn = incoming.await.expect("handshake");
+        raw::send_hello(&conn).await;
+        let (mut recv, header) = raw::accept_data(&conn).await;
+        let report_id = header.report_id.expect("a report was ordered");
+        let mut chunk = vec![0u8; 1024];
+        while recv.read(&mut chunk).await.expect("read").is_some() {}
+
+        // The first stream reports 1000 and stays open, so the report is
+        // live while the second stream arrives.
+        let head = CursorHeader { report_id }.encode();
+        let mut bytes = Vec::new();
+        encode_preamble(FrameKind::Cursor, head.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&head);
+        encode_cursor_record(STORED, 1000, &mut bytes).expect("encode record");
+        let mut first = conn.open_uni().await.expect("open uni");
+        first
+            .write_all(&bytes)
+            .await
+            .expect("write the first stream");
+        wait_for_first.await.expect("the client saw 1000");
+
+        // The second stream starts lower. Its second record, a level the
+        // first never reported, is what tells the client that its first one
+        // has been applied: records of a stream are applied in order.
+        report_raw(&conn, report_id, &[(STORED, 5), (PROCESSED, 1)]).await;
+        wait_for_done.await.ok();
+        first.finish().expect("finish the first stream");
+    });
+
+    within(pusher.connect(&url)).await.expect("connect");
+    let mut transfer =
+        within(pusher.open(TransferMeta::default().with_report([STORED, PROCESSED])))
+            .await
+            .expect("open");
+    let mut cursors = transfer.cursors().expect("cursors");
+    within(transfer.write_all(b"payload")).await.expect("write");
+    transfer.finish().expect("finish");
+
+    within(async {
+        while cursors.offset(STORED) != Some(1000) {
+            cursors.changed().await.expect("the first stream is live");
+        }
+    })
+    .await;
+    first_seen.send(()).expect("the peer is waiting");
+    within(async {
+        while cursors.offset(PROCESSED) != Some(1) {
+            cursors.changed().await.expect("the report is live");
+        }
+    })
+    .await;
+    assert_eq!(
+        cursors.offset(STORED),
+        Some(1000),
+        "the second stream's lower record must change nothing"
+    );
+
+    done.send(()).ok();
+    peer.await.expect("peer");
+    client.shutdown().await;
+}
