@@ -3612,6 +3612,7 @@ dependencies = [
  "weida-core",
  "weida-protocol",
  "weida-runtime",
+ "zeroize",
 ]
 
 [[package]]
