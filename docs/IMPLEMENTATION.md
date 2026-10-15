@@ -154,7 +154,7 @@ which is empty off Windows.
   profile and `RuntimeConfig` holds the per-runtime numbers (`max_connections`,
   `max_connections_per_peer`, `endpoint_queue`, `max_resolved_addresses`); the tables are in
   [PROTOCOL.md](PROTOCOL.md) §10 and [INVARIANTS.md](INVARIANTS.md), and worst-case header
-  memory is 48 MiB.
+  memory is 1 MiB: `max_header_bytes` times `max_header_streams`, the streams that may read a frame head at once.
 
 ### Phase 3 — Brokerless messaging patterns
 
@@ -315,7 +315,7 @@ Responsibility is explicit and opt-in; a `core` connection writes nothing it doe
 - **Transparent redial and the sender outbox** (`src/reconnect.rs`,
   [0031](decisions/0031-transparent-redial-and-the-sender-outbox.md)). A dialled address
   outlives its connection: `connect` records a slot that the runtime redials under a
-  `ReconnectPolicy` (exponential backoff with jitter; `ReconnectPolicy::never()` switches it
+  `ReconnectPolicy` (exponential backoff with jitter, which restarts only after a connection that lived at least `max`; `ReconnectPolicy::never()` switches it
   off), re-registers a subscriber's own route and filters on the new connection, refuses a peer
   that answers with a different key (`GiveUp::PeerChanged`) and reports every transition on a
   bounded `PeerEvent` stream. `open` waits for a live peer, bounded by
@@ -338,9 +338,12 @@ on `weida` ([0018](decisions/0018-minimal-broker.md)).
 - **Queues.** `Broker::new(&listener, BrokerConfig::with_queues([...]))` registers one
   in-memory queue per configured endpoint path; there is no declare frame, and a path another
   pattern holds is refused (`broker.rs`, `queue.rs`). `queue_bytes` bounds what a queue holds,
-  with a fixed per-message overhead (`PER_MESSAGE_OVERHEAD`) so that it bounds the message
-  count too; a full queue refuses with ERROR `REJECTED` and the connection survives
-  (`tests/admission.rs`).
+  with a fixed per-message overhead (`PER_MESSAGE_OVERHEAD`, 1 KiB: what a message costs
+  while it is out for delivery) so that it bounds the message count too; a full queue refuses
+  with ERROR `REJECTED` and the connection survives (`tests/admission.rs`). Producers are
+  read concurrently, each under a reservation against the same budget, `max_inflight_admissions`
+  at a time and `io_timeout` per wait, and deliveries are written one per subscription by
+  tasks of their own, so no peer's silence is another peer's wait (`tests/stalls.rs`).
 - **Publisher confirm.** A producer's exchange is answered on the reply half with `Accepted`
   (DATA key `8`); a one-way producer that orders `Accepted` gets it as a cursor on a stream of
   its own, and one that orders nothing gets the transport receipt. `Stored` is never reported:
@@ -791,7 +794,7 @@ path.
 | 256 paths, pooled per authority | same | **1.47 ms** for all 256 dials, 256 peer entries over **one** connection. Dialling more paths costs microseconds, not connections |
 | 16 paths, one connection each (0002) | same | **22.6-23.6 ms** total, **1.41-1.47 ms** per path |
 | 256 paths, one connection each (0002) | same | **277.7 ms** total, **1.08 ms** per path — no degradation with the count, and 995 KiB of RSS per connection for both ends together, consistent with §4.8's 750-850 KiB at 64 |
-| The refusal point | same | with `max_connections = 8`, connections 0 through 7 are accepted and the ninth dial fails with `Error::LimitExceeded` — "resource limit exceeded". The server completes the handshake first and then closes with `LIMIT_EXCEEDED` on purpose, so a peer can tell overload from a routing mistake (`crates/weida/src/listener.rs`) |
+| The refusal point | same | with `max_connections = 8`, connections 0 through 7 are accepted and the ninth dial fails at once: the server refuses its Initial with `CONNECTION_REFUSED` before the handshake is accepted and builds nothing for it (`crates/weida/src/listener.rs`) |
 
 The consequence, as the pool implements it: **a per-path connection is affordable in time and
 linear in memory, but it converts a path count into a connection count against
@@ -1217,7 +1220,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Delivery signal | `OutgoingTransfer::finish() -> Delivery`, `Delivery::delivered().await` | The honest signal QUIC can actually give: quinn's `stopped()` resolving `Ok(None)` means the peer acknowledged every byte "although not necessarily the processing of it". `finish()` is synchronous and dropping the `Delivery` costs one uncontended lock and a push (§4.6), so fire-and-forget senders pay almost nothing ([FAILURE_MODEL.md](FAILURE_MODEL.md)). |
 | Misroute refusal code | QUIC application error code `UNSUPPORTED = 9` | With ERROR frames confined to the reply half of an exchange, a unidirectional stream sent to a path that does not serve it has no frame to be refused with. A dedicated stop code keeps the refusal typed instead of collapsing it into `REJECTED` ([PROTOCOL.md](PROTOCOL.md) §7). |
 | Raw stream API | `Peer` and `Acceptor` are public (`crates/weida/src/stream.rs`) | L0 is the product, not an implementation detail: if the patterns are the only way in, every unanticipated topology needs a new pattern. `Peer::open`/`open_bi` and `Acceptor::accept` expose the two QUIC stream kinds directly; the patterns are thin wrappers over them. |
-| Stream limits | `max_concurrent_bidi_streams = 1024`; no `max_pending` | There is no pending-reply table to bound. Concurrent exchanges are bounded by QUIC itself, through the bidirectional stream budget. Worst-case header memory is `max_header_bytes * (uni + bidi)` = **48 MiB** ([INVARIANTS.md](INVARIANTS.md)). |
+| Stream limits | `max_concurrent_bidi_streams = 1024`; no `max_pending` | There is no pending-reply table to bound. Concurrent exchanges are bounded by QUIC itself, through the bidirectional stream budget. Worst-case header memory is `max_header_bytes * min(max_header_streams, uni + bidi)` = **1 MiB** ([INVARIANTS.md](INVARIANTS.md)); only `max_header_streams` streams hold a frame head at once. |
 
 ### Identity and trust decisions
 

@@ -59,24 +59,34 @@ one feature, and the reasoning the table cannot carry.
 | --- | --- | --- |
 | a stream header | `max_header_bytes` (16 KiB) | the preamble reader compares `header_len` **before** allocating ([PROTOCOL.md](PROTOCOL.md) §3.1) |
 | CBOR nesting | `max_depth = 8` | the iterative skip of `weida-protocol` ([PROTOCOL.md](PROTOCOL.md) §5) |
+| AMQP array of zero-width elements (a decode, codec `Limits`) | `max_zero_width_elements` (16 per decode, 256 for message bodies) | the count is charged from the array header, before anything is reserved, against one allowance per decode that every array of it shares ([libraries/amqp.md](libraries/amqp.md) §8) |
+| AMQP octets queued for a peer that stopped reading | `transport::OUTBOX_HIGH_WATER` (256 KiB) and `ConnectionOptions::write_timeout` (10 s) | frames are queued, never awaited: past the mark the driver stops reading the peer and stops taking local frames, and a stall clock that restarts whenever the socket takes anything fails the connection with `Error::WriteTimeout`; ending a connection gives what is queued `close_budget` to leave ([libraries/amqp.md](libraries/amqp.md) §8) |
+| what an AMQP link tells an application that never reads | `link::MAX_QUEUED_REPORTS` (1024); deliveries by the credit the application granted | the connection driver waits for no application: a delivery is queued only against credit the receiver granted itself (a delivery past every limit it announced is refused with `amqp:link:transfer-limit-exceeded`), consecutive credit updates are merged and the oldest unread report is let go |
+| an AMQP receiver's unsettled deliveries | `settlement::DEFAULT_MAX_UNSETTLED` (2048) | an unsettled delivery that finds the map full is refused with `amqp:resource-limit-exceeded` instead of being delivered unrecorded, and `grant_credit` refuses a grant the map could not hold |
+| the AMQP peer's link handles mapped onto our links | `handle-max` advertised in `begin` (255) | an `attach` above it closes the connection with `amqp:connection:framing-error`; a second `attach` for a link already answered detaches it with `amqp:link:stolen` instead of mapping another handle |
 | buffered payload and concurrent stream state | `stream_receive_window`, `connection_receive_window`, `max_concurrent_uni_streams`, `max_concurrent_bidi_streams` | QUIC transport configuration |
-| header memory per connection, worst case | `max_header_bytes * (max_concurrent_uni_streams + max_concurrent_bidi_streams)` = **48 MiB** | the product of the caps above ([PROTOCOL.md](PROTOCOL.md) §10) |
-| accepted connections | `max_connections` per binding | excess connections are closed immediately with `LIMIT_EXCEEDED` |
+| header memory per connection, worst case | `max_header_bytes * min(max_header_streams, max_concurrent_uni_streams + max_concurrent_bidi_streams)` = **1 MiB** (16 KiB × 64) | `max_header_streams` (64) inbound streams may hold a frame-head buffer at once: a stream takes a slot for its preamble and another for its header, and a stream waiting for negotiation holds none. Each read runs under `header_timeout_ms` (10 s), counted from the moment its slot is taken; a stream that misses it is stopped with `STOP_SENDING(CANCELED)` and the connection survives. A header buffer grows with the bytes that arrive, in 2 KiB steps past 192 bytes ([PROTOCOL.md](PROTOCOL.md) §10) |
+| accepted connections | `max_connections` per binding (1024), `max_handshakes` (256) in progress, `retry_above_handshakes` (64) | a QUIC Initial that arrives at `max_connections` live connections, or at `max_handshakes` handshakes in progress, is refused with `CONNECTION_REFUSED` before its handshake is accepted, so nothing is built for it. Above `retry_above_handshakes` in progress, an Initial from an address the peer has not validated gets a stateless Retry instead. Refusals are logged at most once a second. A local socket takes one of the `max_connections` places before it is accepted and keeps it for its life, so the surplus waits in the kernel's backlog; its preamble must arrive within `hello_timeout_ms` or it is closed ([PROTOCOL.md](PROTOCOL.md) §2.1, §10) |
 | connections one peer may hold | `max_connections_per_peer` (64), counted by the fingerprint the peer proved and released when a connection closes | the accept loop. One connection per dialled path lets the dialling side choose the count, which is why the bound exists. Connections that proved no identity are each their own peer, because two anonymous connections cannot be shown to be one, and are bounded only by `max_connections` |
-| subscriptions | `max_subscriptions` filters per connection, each at most 256 B | the connection is closed with `LIMIT_EXCEEDED` past the cap, and its subscriptions are dropped wholesale when it closes ([PROTOCOL.md](PROTOCOL.md) §6.4) |
+| subscriptions | `max_subscriptions` filters per connection, summed over paths, each at most 256 B | counted per held filter: a repeated SUBSCRIBE of a filter the connection holds is ignored, and an UNSUBSCRIBE of a filter it does not hold releases nothing. The connection is closed with `LIMIT_EXCEEDED` past the cap, and its subscriptions are dropped wholesale when it closes ([PROTOCOL.md](PROTOCOL.md) §6.4) |
 | payload queued for one subscriber | `subscriber_buffer_bytes` | the publisher drops and counts a copy that does not fit |
-| gap-detector and reassembler scopes | `max_sequence_scopes` (1024) per connection | a new scope at the cap is left untracked rather than inserted |
-| reassembly hold | `max_reorder_hold` (256) transfers over all scopes | at the cap the oldest held transfer is released out of order with its gap reported, never by growing; a held transfer is an unread stream, so the bytes it pins are quinn's and are bounded again by `connection_receive_window` |
-| deduplication identities | `max_dedup_entries` (4096) per connection, and the negotiated window in time | the oldest entry is evicted at the cap, so a peer that sends fast buys itself missed suppression rather than memory |
+| gap-detector and reassembler scopes | `max_sequence_scopes` (1024) `(path, topic)` pairs per connection | on the receiver, at the cap the least recently used scope that holds no transfer is forgotten to make room for a new one. A scope holding a transfer is never forgotten, and a new scope is passed through untracked only when every tracked scope holds one. On the sender, the `Sequencer` never evicts: a new scope past the cap is sent unnumbered (`Sequencer::next` returns `None`, logged once), so the receiver passes it through with no gap tracking and no deduplication, while the scopes already tracked keep counting (`crates/weida/src/ordering.rs`) |
+| reassembly hold | `max_reorder_hold` (256) transfers over all scopes | at the cap the oldest held transfer of the scope holding the most is released out of order with its gap reported, never by growing; a held transfer is an unread stream, so the bytes it pins are quinn's and are bounded again by `connection_receive_window` |
+| deduplication identities | `max_dedup_entries` (4096) per connection, each keyed by its `(path, topic)` scope, and the negotiated window in time | the oldest entry is evicted at the cap, so a peer that sends fast buys itself missed suppression rather than memory |
 | a resolver answer | `max_resolved_addresses` (8) | a dial tries the addresses in order, and every attempt but the last is bounded by `connect_attempt_timeout` |
-| live transfers on one local connection | `max_local_streams` (255) | an `open` at the cap waits for a live transfer to end rather than allocating past it, the same wait a QUIC `open` makes on the peer's stream budget ([decisions/0010](decisions/0010-local-transport.md) §4.2, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.13), because on a local transport the stream *is* the OS object. The named-pipe instance count needs nothing beyond it: the "1-255" of `CreateNamedPipe` is the range of its `nMaxInstances` argument and 255 is `PIPE_UNLIMITED_INSTANCES`, so the pipe is created unlimited and the per-peer stream slots are the only ceiling, as on `AF_UNIX` |
+| live transfers on one local connection | `max_local_streams` (255) | an `open` at the cap waits for a live transfer to end rather than allocating past it, the same wait a QUIC `open` makes on the peer's stream budget ([decisions/0010](decisions/0010-local-transport.md) §4.2, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.13), because on a local transport the stream *is* the OS object. A transfer or parked connection also holds one of the binding's `max_connections` places until its last half is gone (see accepted connections above). The named-pipe instance count needs nothing beyond it: the "1-255" of `CreateNamedPipe` is the range of its `nMaxInstances` argument and 255 is `PIPE_UNLIMITED_INSTANCES`, so the pipe is created unlimited and the per-peer stream slots are the only ceiling, as on `AF_UNIX` |
 | parked reverse connections | `max_parked_reverse` (8) | the pool's own ceiling and `max_local_streams`, which counts a parked connection like any other live local connection: it is a descriptor held open for a copy that may never come ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.4) |
-| a pipe chunk | the caller's buffer per read | the chunk framing ([PROTOCOL.md](PROTOCOL.md) §2.1) allocates nothing for a chunk length; the one buffer the transport owns, the 8 KiB scratch of a draining reader, is a constant |
-| the publisher's per-topic drop table | `max_sequence_scopes` (1024), the same ceiling as the sequencer's per-topic table | at the cap a topic's drops count in the aggregate only; the topics are the local application's, not a peer's, but a table nobody bounds grows for the life of the process |
+| a pipe chunk | the caller's buffer per read | the chunk framing ([PROTOCOL.md](PROTOCOL.md) §2.1) allocates nothing for a chunk length. The buffers the transport owns are constants: a 4 KiB read-ahead per chunked reader (`READ_AHEAD`) and the 8 KiB scratch of a draining reader (`DRAIN_BUF`), which gives up on a peer that is silent for 30 s (`DRAIN_IDLE`) and so releases its descriptor; a payload that keeps flowing drains to its FIN |
+| the publisher's per-topic drop table, per publisher path | `max_sequence_scopes` (1024), the same ceiling as the sequencer's per-topic table, which never evicts (see the row above) | at the cap a new topic's drops count in the path's total only; the topics are the local application's, not a peer's, but a table nobody bounds grows for the life of the process |
 | QUIC datagrams | `datagram_receive_bytes` (0 by default) | a connection advertises no `max_datagram_frame_size` and buffers no datagram unless its profile enables flows |
 | a report order | `MAX_REPORT_LEVELS` (16) | the decoder, before the level vector is reserved; a non-ascending or repeated level is refused rather than stored, so the order costs at most sixteen `u64` pairs however many a peer writes |
 | a CURSOR stream's reader | `MAX_CURSOR_RECORD_LEN` (16 B) | one 64-byte read buffer plus at most one partial record, because a record is self-delimiting and applied as soon as it is whole; the set it fills is a **fixed** `[(u64, u64); 16]` that allocates nothing |
 | a CURSOR stream naming a `report_id` this side never handed out | no state at all | the stream is reset with `CANCELED` before the first record is read ([PROTOCOL.md](PROTOCOL.md) §6.7), which keeps the report table bounded by the `Cursors` handles this side holds rather than by what a peer sends |
+| the MQTT client's queue of deliveries for the application | `Limits::incoming_queue` (1024) **and** `Limits::incoming_queue_bytes` (8 MiB) | `weida-mqtt`'s event queue: a delivery is charged its packet's length plus a fixed overhead, the reader stops reading while either number is spent, and an empty queue still admits one delivery of any size. Only the *socket* waits: keep-alive, commands and `disconnect` run throughout, and the final `Disconnected` event is not subject to the queue (`docs/libraries/mqtt.md` §9.1) |
+| the MQTT client's QoS 1 and 2 messages awaiting acknowledgement | `Limits::max_inflight` (1024) and `Limits::max_inflight_bytes` (8 MiB) | `Session::allocate`: the send quota is the smaller of the server's `Receive Maximum` — the peer's number, 65,535 when it declares none — and `max_inflight`; a publish past either stalls in the connection task, in order, until an acknowledgement frees room |
+| the MQTT client's Topic Alias tables | `Limits::max_alias_bytes` (256 KiB) per table, with a fixed per-entry overhead | `InboundAliases::resolve` refuses an alias that would pass it with 0x94; `OutboundAliases::publish` sends a topic that would pass it without an alias |
+| the MQTT client's acknowledgements owed to a peer that is not reading | `MAX_UNSENT_ACKS` (4096) in `weida-mqtt`'s task | the reader stops reading until the socket has taken some, and a socket that takes nothing for `ConnectOptions::write_timeout` ends the connection with `Timeout("write")` |
+| one MQTT enhanced-authentication exchange | `MAX_AUTH_ROUNDS` (8) and, for a re-authentication, `ConnectOptions::connect_timeout` | the handshake counts the AUTH packets before it answers one; the live connection counts them beside its `Reauthentication` and arms a deadline with it |
 
 **Datagram flows and RADIO/DISH are inside this invariant with a cap each**
 ([decisions/0034](decisions/0034-late-is-lost.md)). `datagram_receive_bytes` (0 by default,
@@ -128,13 +138,26 @@ identity and a 64-event stream, and reads nothing on a timer.** A `files` source
 modification times at most once per `FilesOptions::poll` (10 s), and only when the identity
 is used — no task, no reactor, no inotify; the parse of a changed file happens then, once,
 and a file that does not parse leaves the previous identity in service with `RenewalFailed`
-on the stream. A rustls resolver caches one certified key per source generation, so an
-unchanged source costs a handshake one atomic load. What `weida-openbao` adds runs as tasks
-that hold the source and the client and end with them: one renewal per `PkiSign`, one
-refresh per `PkiAnchor` and `Kv`, one token renewal per client; each sleeps between
-rounds and none queues. A response from OpenBao is bounded by `reqwest`'s body read into a
-`serde_json::Value`, which is the one place this crate trusts a server it authenticated to
-with a token — the same trust the `bao` CLI extends.
+on the stream. A rustls resolver caches one certified key per source generation: an unchanged
+source costs a handshake a generation check, and a file source also its due check under a mutex.
+A rebuild that fails leaves the previous key in service and is retried only when the generation
+moves, so its failure is reported once per generation. The client verifier is cached the same way.
+No TLS session ticket is issued and no server session is stored, so every handshake is a full one
+that the verifier judges: a withdrawn trust applies to the next handshake, not to a resumed one.
+What `weida-openbao` adds runs as tasks
+that hold the client and a *weak* handle on the source, and end with it: one renewal per
+`PkiSign`, one refresh per `PkiAnchor` and `Kv`, one token renewal per client; each sleeps
+between rounds, none queues, and a renewal task returns the first time it wakes to find the
+application has dropped the source. The client reads an answer under a named cap
+(`MAX_RESPONSE_BYTES`, 16 MiB, refused by its declared length and again as it streams), keeps at
+most 16 entries of 1 KiB of a server's error text, follows no redirect, speaks `http://` only
+when `Config::allow_insecure` says so, and holds every token, secret id and wrapping token as
+a `Secret` that is wiped on drop and redacted in `Debug`. A renewal that fails is retried
+inside what is left of the token (a backoff of 5 s doubling to a minute, never past a quarter
+of the remaining life), and a token with no TTL or one the server stopped honouring is not
+renewed at all. The JSON itself is parsed into a `serde_json::Value`, which is the one place
+this crate trusts a server it authenticated to with a token — the same trust the `bao` CLI
+extends.
 
 **The cursor stream is inside this invariant, and the shape that keeps it there is worth
 naming.** A report is the first thing a peer sends that is *about* a transfer rather than part
@@ -157,6 +180,21 @@ protocol's own names, because users of those protocols must recognize them —
 table: `ZMQ_MAXMSGSIZE` is finite because a ZMTP frame may declare 2^63-1 octets, and
 `ZMQ_LINGER` is finite rather than infinite [0013 §4.4].
 
+**`weida-nng` bounds what a connection can make it hold, and what a connection can make it
+wait for, with named numbers** ([`docs/libraries/nng.md`](libraries/nng.md) §9 has the table).
+What a peer can make it allocate: `NNG_OPT_RECVMAXSZ` (1 MiB, judged from the declared length
+before a body is read; for the tag-stack protocols the stack rides on top, at most `4 ×
+(MAXTTL + 1)` octets), a body buffer that grows only with the octets that arrived, per-pipe
+queues of 128 messages and 8 MiB per direction (PUB and PUSH hold nothing a peer writes to them),
+the socket's buffer for messages from pipes that have gone (one pipe's depth **and** octets),
+and one survey's answers (the receive depth and 8 MiB). What it can make it hold: `max_pipes`
+(1024), `max_pipes_per_peer` (256, counted by IPv4 address or IPv6 `/64`, by uid on `ipc`,
+handshaking connections included) and `max_tls_handshakes` (64 per listener). What it can make
+it wait for: `handshake_timeout` (10 s, for each TCP connect attempt and then for the TLS
+handshake and the protocol header together, with the pipe slot reserved first), TCP keepalive
+on every connection, and the opt-in `message_timeout` and `idle_timeout`. A reply to a pipe
+that cannot take it is discarded, never waited for, so no peer can park a replier.
+
 **A message count is not a memory bound**, and that is the one place a standalone library
 adds a name of its own rather than the foreign protocol's. `ZMQ_SNDHWM` and `ZMQ_RCVHWM`
 count messages, so at libzmq's own defaults one peer could hold `1000 × ZMQ_MAXMSGSIZE` per
@@ -165,32 +203,70 @@ direction per peer) bounds the bytes instead, with the message count left at exa
 `zmq_setsockopt(3)` documents. A queue that is empty still accepts one message of any size,
 because a bound that can refuse the only message in a queue is a deadlock and not a bound,
 so the exposure is `max_bytes - 1 + max_message_size` and `ZMQ_MAXMSGSIZE` is what bounds
-the single-message case (`docs/libraries/zmq.md` §9).
+the single-message case (`docs/libraries/zmq.md` §9). `weida-nats` states the same rule for
+Core NATS, where the protocol bounds neither side of it: `subscription_queue` counts messages
+per subscription, so `ConnectionOptions::max_queued_bytes` (64 MiB per connection, the server's
+own `max_pending`) charges every message a reader has not yet taken — a subscription's or a
+pending request's — its octets plus a 4 KiB floor for the read-buffer chunk its slices keep
+alive, and drops and counts what does not fit. The largest message accepted at all is
+`max_inbound_payload` (8 MiB), the smaller of it and the server's `INFO.max_payload` being the
+decode bound, because that number is announced by the peer and may lower the bound but must
+not raise it (`docs/libraries/nats.md` §7).
+`weida-mqtt` applies it to the application's delivery queue, where QoS 0 has no flow
+control at all: `Limits::incoming_queue` (1024) is joined by
+`Limits::incoming_queue_bytes` (8 MiB), each delivery being charged its packet's length plus
+a fixed overhead and an empty queue still admitting one of any size. The deliveries are
+copied out of the receive buffer, once, rather than sliced from it, so that a small queued
+message cannot keep a large packet's buffer alive behind the budget's back
+(`docs/libraries/mqtt.md` §9.1).
+
+**`weida-zmq` bounds what a connection can make it hold and what it can make it wait for, too**
+(`docs/libraries/zmq.md` §9 has the table). Before the handshake ends a frame is at most 64 KiB
+(`HANDSHAKE_MAX_FRAME`) and a metadata dictionary at most 64 properties (`MAX_PROPERTIES`); a
+message that has started must keep arriving (`MESSAGE_IVL` 30 s, extended by the octets that
+arrive at `MIN_MESSAGE_RATE`); a connection stops taking messages from its pipe at
+`OUT_HIGH_WATER` of unwritten output; one remote address holds at most `max_peers / 8` peers
+(at least 8, loopback, `ipc` and `inproc` exempt) and a handshake that stalls for
+`HANDSHAKE_EVICT_AFTER` gives its slot to a newcomer; and an accept that fails backs off from
+10 ms to 1 s instead of ending the listener. A received frame is a slice of its read buffer
+only when it is large; small ones are copied out, so a few octets never pin a read buffer.
 
 **And a payload-byte budget is not a bound either, if a message may be empty.** The L2
 broker's queue is the case: `weida_broker::BrokerConfig::queue_bytes` (8 MiB per queue)
 bounds what a queue holds, but a producer of zero-byte messages costs zero payload bytes and
 one live `QueuedMessage` each, so the byte budget alone would bound nothing at all. Each
-message is therefore charged `PER_MESSAGE_OVERHEAD` (256 B) plus its body's **allocation**
+message is therefore charged `PER_MESSAGE_OVERHEAD` (1 KiB) plus its body's **allocation**
 plus the labels the queue retains, which makes `queue_bytes / PER_MESSAGE_OVERHEAD` the
-ceiling on the message count as well. The allocation rather than the payload length, because
-a body arrives through `IncomingTransfer::collect`, which grows a `Vec` from empty in 64 KiB
-reads: a 2 MiB + 64 KiB message comes to rest in a 4 MiB allocation, so charging its length
-would let a queue hold close to twice `queue_bytes` of resident payload, with the factor
-chosen by the producer's message size. One further bound belongs to that config rather than
-to `Limits`, because a queue outlives every connection that touches it: `max_queues`,
-checked before any path is claimed. `max_unsettled` bounds, **per subscription**, the
-deliveries a queue has handed out and not seen reported, and is enforced in
-the delivery scan, which is the one place it can be: a subscription at its bound is not
-eligible. It could not be enforced against a *cumulative* credit limit without capping a
-subscription's lifetime delivery count rather than its outstanding one, which is why it is a
-separate number rather than a clamp on credit. An unsettled delivery **keeps its charge**
-against `queue_bytes`, so the two bounds compose: a consumer that stops reporting costs its
-own slots and the queue's budget, and nothing else. The payload is read under the queue's
-*remaining* budget,
-never under the producer's advisory `content_len`, so an over-budget message is refused
-rather than buffered and then rejected
-([decisions/0018](decisions/0018-minimal-broker.md) §4.8).
+ceiling on the message count as well. The overhead is that large because the charge of a
+message is one number for its whole life and a message out for delivery is about a kilobyte
+— its table entry, the task watching its report and the connection's cursor state — so a
+queue of unreported deliveries stays near `queue_bytes` of resident memory. The allocation
+rather than the payload length: the broker reads a payload into a buffer that grows by
+doubling and trims it to the payload, so for a message that came through admission the two
+differ by an allocator's rounding. **Producers are read concurrently, so what they are about to
+buffer is promised first**: a reader reserves its message's overhead and labels, then its
+payload in steps (a first step of at most 1 KiB, whatever `content_len` says), and a
+reservation counts against `queue_bytes` exactly as a held message does, so `charged +
+reserved` never passes the budget however many producers are mid-message. At most
+`max_inflight_admissions` (1024) admissions run per queue, and the loop stops reading streams
+while they all do; every wait on a peer — a payload, a delivery write, a confirm, a refusal, a
+cursor — is under `io_timeout` (10 s) with a minimum rate (`MIN_PEER_RATE`, 16 KiB/s), so a
+peer that stops or trickles holds one admission and its few bytes for one window, and no other
+peer waits for it. One further bound belongs to that config rather than to `Limits`, because
+a queue outlives every connection that touches it: `max_queues`, checked before any path is
+claimed. `max_unsettled` bounds, **per subscription**, the deliveries a queue has handed out
+and not seen reported, and `max_unsettled_per_consumer` (1024) bounds them per **connection**,
+over every filter it holds, because the filters are the peer's to multiply. Both are enforced
+by who is *ready* — a subscription at either bound is not in the set the delivery scan walks —
+which is the one place they can be; they could not be enforced against a *cumulative* credit
+limit without capping a subscription's lifetime delivery count rather than its outstanding
+one, which is why they are separate numbers rather than a clamp on credit. An unsettled
+delivery **keeps its charge** against `queue_bytes`, so the bounds compose: a consumer that
+stops reporting costs its own slots and the queue's budget, and nothing else; one that stops
+*reading* holds one write for `io_timeout` and is then dropped, with everything it held back
+in the queue. The payload is read under the queue's *remaining* budget, never under the
+producer's advisory `content_len`, so an over-budget message is refused rather than buffered
+and then rejected ([decisions/0018](decisions/0018-minimal-broker.md) §4.8).
 
 **A grant that arrives before its subscription is state a peer can create, so it is capped
 too.** A CREDIT frame and the SUBSCRIBE it belongs to ride two separate unidirectional
