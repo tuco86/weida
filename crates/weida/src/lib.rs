@@ -96,6 +96,7 @@ pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow};
 pub use handoff::Handoff;
 pub use identity::{
     FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, PeerChain, TrustSource,
+    WeakIdentitySource, WeakTrustSource,
 };
 #[cfg(windows)]
 pub use listener::PipeBinding;

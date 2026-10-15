@@ -23,7 +23,7 @@ use weida_core::{Error, TraceContext};
 use weida_protocol::{CreditHeader, FrameKind, SubscriptionHeader};
 
 use crate::config::ClientTls;
-use crate::conn::{ConnHandle, Ctl, write_control};
+use crate::conn::{ConnHandle, Ctl, check_header_len, write_control};
 use crate::listener::{PairOwner, Route};
 use crate::pubsub::{FanOut, SubRegistry};
 use crate::reconnect::PeerEvents;
@@ -753,7 +753,13 @@ impl Subscriber {
     pub async fn grant(&self, filter: &str, limit: u64) -> Result<(), Error> {
         weida_protocol::filter::validate(filter)?;
         for (conn, path) in self.state.peer.live_peers() {
-            let header = CreditHeader::new(path.as_ref(), filter, limit).encode();
+            let header = CreditHeader::new(path.as_ref(), filter, limit);
+            // Refused before anything is written: a header no peer would read,
+            // or one longer than the peer said it reads, makes it close the
+            // connection.
+            header.check().map_err(|_| Error::LimitExceeded)?;
+            let header = header.encode();
+            check_header_len(&conn, header.len())?;
             write_control(&conn.conn, FrameKind::Credit, &header).await?;
         }
         Ok(())
@@ -779,8 +785,13 @@ pub(crate) async fn send_subscription(
         max_age_ms,
         max_layer,
         ..SubscriptionHeader::new(path, filter)
-    }
-    .encode();
+    };
+    // Refused before anything is written: a filter or path no peer would
+    // read, or a header longer than the peer said it reads, makes it close
+    // the connection, and a subscriber re-sends its filters on every redial.
+    header.check().map_err(|_| Error::LimitExceeded)?;
+    let header = header.encode();
+    check_header_len(conn, header.len())?;
     write_control(&conn.conn, kind, &header).await
 }
 

@@ -162,7 +162,7 @@ impl DrainState {
 /// full, and then settled receipts are reaped to make room before anything
 /// is thrown away.
 pub(crate) struct ConnDrain {
-    parked: Mutex<VecDeque<Receipt>>,
+    parked: Mutex<Parked>,
     /// Cap on this connection's parked set, taken from the stream budgets:
     /// what can plausibly be unacknowledged at once is what can be in flight
     /// at once, so this adds no new knob (0009 §5 asks for none).
@@ -204,6 +204,11 @@ pub(crate) struct ConnDrain {
     /// is open. Because that `open` waits for a slot instead of failing,
     /// this half is also what keeps the wait finite.
     max_parked: usize,
+    /// Fewest parks between two sweeps of a full set. A sweep polls every
+    /// parked receipt, so one sweep per this many parks costs at most eight
+    /// polls per park whatever the set holds. A sweep that frees `f` receipts
+    /// waits for `max(f, sweep_interval)` parks before the next.
+    sweep_interval: usize,
 }
 
 impl ConnDrain {
@@ -215,9 +220,14 @@ impl ConnDrain {
         } else {
             by_stream_budget
         };
+        Self::with_capacity(max_parked)
+    }
+
+    fn with_capacity(max_parked: usize) -> ConnDrain {
         ConnDrain {
-            parked: Mutex::new(VecDeque::new()),
+            parked: Mutex::new(Parked::default()),
             max_parked,
+            sweep_interval: (max_parked / 8).max(1),
         }
     }
 
@@ -231,18 +241,35 @@ impl ConnDrain {
         // during an unwind aborts the process. A deque of receipts has no
         // invariant a panic could have broken, so a poisoned lock is taken
         // rather than propagated.
-        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        let parked = &mut *guard;
+        // Every park counts toward the next sweep, so a sweep of a full set
+        // is due no sooner than `sweep_interval` parks after the last one.
+        parked.parks_until_sweep = parked.parks_until_sweep.saturating_sub(1);
         let mut lost = false;
-        if parked.len() >= self.max_parked {
-            // Only now is it worth looking: everything settled goes, and the
-            // oldest unsettled one goes too if that was not enough.
-            parked.retain_mut(|receipt| settled(receipt).is_none());
-            if parked.len() >= self.max_parked {
-                parked.pop_front();
-                lost = true;
+        if parked.receipts.len() >= self.max_parked {
+            if parked.parks_until_sweep == 0 {
+                // Only now is it worth looking: everything settled goes.
+                let before = parked.receipts.len();
+                parked
+                    .receipts
+                    .retain_mut(|receipt| settled(receipt).is_none());
+                // The room this sweep made is the wait before the next one,
+                // so a set that stays full of unsettled receipts is swept once
+                // per `sweep_interval` parks, not on every park.
+                let freed = before - parked.receipts.len();
+                parked.parks_until_sweep = freed.max(self.sweep_interval);
+            }
+            if parked.receipts.len() >= self.max_parked {
+                // The oldest goes. It counts as lost only if it had not
+                // settled: a settled receipt loses nothing, and a sweep would
+                // have dropped it silently too.
+                if let Some(mut oldest) = parked.receipts.pop_front() {
+                    lost = settled(&mut oldest).is_none();
+                }
             }
         }
-        parked.push_back(receipt);
+        parked.receipts.push_back(receipt);
         lost
     }
 
@@ -255,17 +282,32 @@ impl ConnDrain {
     /// too coarse to notice. Nothing is thrown away that has not settled, so a
     /// drain still sees every receipt whose outcome is still open.
     pub(crate) fn reap(&self) -> usize {
-        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        let before = parked.len();
-        parked.retain_mut(|receipt| settled(receipt).is_none());
-        before - parked.len()
+        let mut guard = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        let parked = &mut *guard;
+        let before = parked.receipts.len();
+        parked
+            .receipts
+            .retain_mut(|receipt| settled(receipt).is_none());
+        // A full sweep leaves nothing waiting on the cadence of parks.
+        parked.parks_until_sweep = 0;
+        before - parked.receipts.len()
     }
 
     /// Takes this connection's receipts, for a drain.
     pub(crate) fn take(&self) -> Vec<Receipt> {
-        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *parked).into()
+        let mut guard = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        let parked = &mut *guard;
+        parked.parks_until_sweep = 0;
+        std::mem::take(&mut parked.receipts).into()
     }
+}
+
+/// The parked receipts of one connection, and how many parks must pass before
+/// a full set is swept again.
+#[derive(Default)]
+struct Parked {
+    receipts: VecDeque<Receipt>,
+    parks_until_sweep: usize,
 }
 
 /// Polls one parked receipt without a real waker: `Some` when it has settled.
@@ -328,5 +370,68 @@ pub(crate) async fn wait_for(
     Drained {
         delivered,
         outstanding: unfinished + refused + evicted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// A receipt that never settles and counts how often it is polled.
+    struct Stuck {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Future for Stuck {
+        type Output = Result<Option<u64>, weida_core::Error>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+    }
+
+    /// Parking past the cap drops exactly one unsettled receipt per park, as
+    /// it always has, without polling the whole set on each of them.
+    #[test]
+    fn parking_past_the_cap_costs_a_bounded_number_of_polls() {
+        const CAP: usize = 256;
+        const PARKS: usize = 2_000;
+        let drain = ConnDrain::with_capacity(CAP);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut lost = 0;
+        for _ in 0..CAP + PARKS {
+            let receipt: Receipt = Box::pin(Stuck {
+                polls: Arc::clone(&polls),
+            });
+            if drain.park(receipt) {
+                lost += 1;
+            }
+        }
+        assert_eq!(lost, PARKS, "each park past the cap loses one receipt");
+        let polls = polls.load(Ordering::Relaxed);
+        assert!(
+            polls <= 16 * (CAP + PARKS),
+            "{polls} polls for {} parks",
+            CAP + PARKS
+        );
+    }
+
+    /// Settled receipts make room silently: only an unsettled receipt counts
+    /// as lost.
+    #[test]
+    fn settled_receipts_make_room_without_counting_as_lost() {
+        const CAP: usize = 8;
+        let drain = ConnDrain::with_capacity(CAP);
+        for _ in 0..CAP {
+            let receipt: Receipt = Box::pin(std::future::ready(Ok(None)));
+            assert!(!drain.park(receipt));
+        }
+        for _ in 0..4 * CAP {
+            let receipt: Receipt = Box::pin(std::future::ready(Ok(None)));
+            assert!(!drain.park(receipt), "a settled receipt is not a loss");
+        }
     }
 }

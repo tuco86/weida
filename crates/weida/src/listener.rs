@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use quinn::VarInt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use weida_core::{Error, Fingerprint, Limits, validate_endpoint_path};
 use weida_protocol::codes;
 use weida_protocol::header::GuaranteeSet;
@@ -30,7 +30,7 @@ use crate::runtime::{Exec, RuntimeInner, Shared};
 use crate::stream::{Acceptor, Incoming};
 use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
-use crate::transport::Link;
+use crate::transport::{Link, QuicLink};
 
 /// What a registered endpoint path does with an inbound transfer.
 pub(crate) enum Route {
@@ -161,21 +161,30 @@ impl PairOwner {
     }
 }
 
+/// Connection, then path, then the filters held: [`Namespace`]'s record of
+/// raw consumers.
+type ConsumerFilters = HashMap<usize, HashMap<Arc<str>, HashSet<String>>>;
+
 /// Endpoint path to accept-queue map.
 ///
 /// A plain `RwLock<HashMap>`, not an async lock: lookup is a hash and a channel
 /// clone, and the guard is never held across an `await`.
 pub(crate) struct Namespace {
     routes: RwLock<HashMap<Arc<str>, Route>>,
-    /// Which raw paths each connection holds a subscription on.
+    /// Which filters each connection holds on which raw paths: connection,
+    /// then path, then the set of filters.
     ///
     /// Only L2 consumers appear here: a Pub/Sub subscription is the
     /// [`SubRegistry`]'s business, and a queue's is this table's, because the
     /// thing that must happen when the connection closes is different — a
     /// publisher forgets a subscriber, a queue is *told*, so it can requeue
-    /// what that consumer owed (0018 §4.7). Bounded by the same
-    /// `max_subscriptions` count the registry enforces.
-    consumers: RwLock<HashMap<usize, HashSet<Arc<str>>>>,
+    /// what that consumer owed (0018 §4.7). The set holds **filters**, not
+    /// paths, because a connection may hold several on one path and the path
+    /// is only forgotten with the last of them; it is also what makes a
+    /// reservation against `max_subscriptions` exist exactly once per filter
+    /// held. Bounded by the same `max_subscriptions` count the registry
+    /// enforces.
+    consumers: RwLock<ConsumerFilters>,
 }
 
 impl Namespace {
@@ -223,31 +232,51 @@ impl Namespace {
             .remove(path);
     }
 
-    /// Records that `conn_id` consumes on `path`.
-    pub(crate) fn note_consumer(&self, conn_id: usize, path: &str) {
-        self.consumers
-            .write()
-            .expect("namespace lock poisoned")
-            .entry(conn_id)
-            .or_default()
-            .insert(Arc::from(path));
-    }
-
-    /// Forgets one (connection, path) pair; the last one removes the entry.
-    pub(crate) fn forget_consumer(&self, conn_id: usize, path: &str) {
+    /// Records that `conn_id` consumes on `path` with `filter`.
+    ///
+    /// `false` when it already did: the caller then has nothing to count and
+    /// nothing to announce.
+    pub(crate) fn note_consumer(&self, conn_id: usize, path: &str, filter: &str) -> bool {
         let mut consumers = self.consumers.write().expect("namespace lock poisoned");
-        if let Some(paths) = consumers.get_mut(&conn_id) {
-            paths.remove(path);
-            if paths.is_empty() {
-                consumers.remove(&conn_id);
+        let paths = consumers.entry(conn_id).or_default();
+        match paths.get_mut(path) {
+            Some(filters) if filters.contains(filter) => false,
+            Some(filters) => filters.insert(filter.to_owned()),
+            None => {
+                paths.insert(Arc::from(path), HashSet::from([filter.to_owned()]));
+                true
             }
         }
     }
 
-    /// Takes every path `conn_id` consumed on, with the route serving it.
+    /// Forgets one filter `conn_id` held on `path`; `false` when it held no
+    /// such filter. The last filter of a path takes the path with it and the
+    /// last path takes the connection, so nothing is left behind.
+    pub(crate) fn forget_consumer(&self, conn_id: usize, path: &str, filter: &str) -> bool {
+        let mut consumers = self.consumers.write().expect("namespace lock poisoned");
+        let Some(paths) = consumers.get_mut(&conn_id) else {
+            return false;
+        };
+        let Some(filters) = paths.get_mut(path) else {
+            return false;
+        };
+        let held = filters.remove(filter);
+        if filters.is_empty() {
+            paths.remove(path);
+        }
+        if paths.is_empty() {
+            consumers.remove(&conn_id);
+        }
+        held
+    }
+
+    /// Takes every path `conn_id` still consumes on, with the route serving
+    /// it.
     ///
     /// Called once, when the connection closes: the entry is removed, so a
-    /// queue is told exactly once that a consumer is gone.
+    /// queue is told exactly once that a consumer is gone, and told so for
+    /// **every** path with a filter still held, however many filters the
+    /// connection withdrew along the way.
     pub(crate) fn take_consumer_routes(&self, conn_id: usize) -> Vec<(Arc<str>, Route)> {
         let taken = self
             .consumers
@@ -259,7 +288,7 @@ impl Namespace {
         };
         let routes = self.routes.read().expect("namespace lock poisoned");
         paths
-            .into_iter()
+            .into_keys()
             .filter_map(|path| {
                 let route = routes.get(&path)?.clone_sender();
                 Some((path, route))
@@ -525,6 +554,7 @@ impl Listener {
         &self,
         link: fn(crate::grouped::Grouped<S>) -> Link,
     ) -> LocalAccept<S> {
+        let max_connections = self.inner.runtime.config.max_connections;
         LocalAccept {
             groups: Arc::new(crate::grouped::Groups::default()),
             namespace: Arc::clone(&self.inner.namespace),
@@ -534,6 +564,9 @@ impl Listener {
             guarantees: self.inner.runtime.config.guarantees,
             shared: self.inner.runtime.shared(),
             link,
+            admitted: Arc::new(Semaphore::new(max_connections)),
+
+            refusals: Arc::new(LogThrottle::new(REFUSAL_LOG_INTERVAL)),
         }
     }
 
@@ -805,6 +838,11 @@ impl Binding {
     /// redials within one round trip, and a path not yet registered refuses
     /// it. Each datagram is sent once; the return value is how many were.
     ///
+    /// **The bytes must reach this process over a channel as trusted as the
+    /// one that carries the socket descriptor.** Whoever can write them makes
+    /// this binding send up to the decoder's cap of datagrams from its port,
+    /// to destinations of their choosing within what the decoder accepts.
+    ///
     /// # Errors
     ///
     /// [`Error::Io`] of kind `InvalidData` for bytes that are not a handoff,
@@ -909,6 +947,12 @@ impl PipeBinding {
     }
 }
 
+/// How long a local accept loop waits after a failed `accept` before it asks
+/// again. Descriptor or memory exhaustion passes, and a loop that spun on it
+/// would only make it worse.
+#[cfg(any(unix, windows))]
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
 /// What one accepted local connection is served with.
 #[cfg(any(unix, windows))]
 struct LocalAccept<S: crate::grouped::Stream> {
@@ -921,6 +965,16 @@ struct LocalAccept<S: crate::grouped::Stream> {
     shared: Arc<Shared>,
     /// Which `Link` variant a peer over this stream is.
     link: fn(crate::grouped::Grouped<S>) -> Link,
+    /// The places `RuntimeConfig::max_connections` hands out: one per live
+    /// local connection, taken before it is accepted and kept for as long as
+    /// it lives (a control connection for the life of its peer, a transfer or
+    /// parked connection until its last half is gone). What a hostile or buggy
+    /// local process can make a binding hold is this count, not the
+    /// descriptor limit of the whole process.
+    admitted: Arc<Semaphore>,
+    /// One record a second for everything an accept loop turns away or trips
+    /// over, so a flood is not a flood of log lines.
+    refusals: Arc<LogThrottle>,
 }
 
 #[cfg(any(unix, windows))]
@@ -935,6 +989,9 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
             guarantees: self.guarantees,
             shared: Arc::clone(&self.shared),
             link: self.link,
+            admitted: Arc::clone(&self.admitted),
+
+            refusals: Arc::clone(&self.refusals),
         }
     }
 
@@ -942,25 +999,35 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
     /// peer, a transfer or reverse connection joins the peer its token
     /// names ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
     /// §4.1, §4.2, §4.4).
-    async fn serve(self, stream: S) {
+    async fn serve(self, stream: S, place: OwnedSemaphorePermit) {
         use crate::grouped::{
             Accepted, accept_control, admit_reverse, admit_transfer, read_accepted,
         };
-        let accepted = match read_accepted(stream).await {
-            Ok(accepted) => accepted,
-            Err(e) => {
+        // The preamble is the peer's to send, and a socket that never sends
+        // one would hold a place and a descriptor for ever.
+        let deadline = Duration::from_millis(self.limits.hello_timeout_ms);
+        let accepted = match self.exec.within(deadline, read_accepted(stream)).await {
+            Some(Ok(accepted)) => accepted,
+            Some(Err(e)) => {
                 tracing::debug!(error = %e, "local connection preamble rejected");
+                return;
+            }
+            None => {
+                tracing::debug!("local connection sent no preamble in time");
                 return;
             }
         };
         match accepted {
             Accepted::Control(stream, principal) => {
+                // A control connection is a peer, and keeps its place until
+                // it closes.
                 let link = match accept_control(
                     stream,
                     principal,
                     Arc::clone(&self.groups),
                     self.limits.max_local_streams,
                     self.limits.max_parked_reverse,
+                    self.exec.clone(),
                 )
                 .await
                 {
@@ -984,21 +1051,27 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
                 self.subs.remove_connection(conn_id);
                 crate::conn::drop_consumers(&ctx).await;
                 tracing::debug!(%reason, "local connection closed");
+                drop(place);
             }
             Accepted::Transfer(token, stream, principal) => {
-                // The token names the group and the kernel says who is
+                // The connection keeps its place until both of its halves are
+                // gone. The token names the group and the kernel says who is
                 // asking; an unbound connection is dispatched nowhere
                 // [0012 §4.2].
-                if !admit_transfer(&self.groups, &token, &principal, stream) {
+                if !admit_transfer(&self.groups, &token, &principal, stream, place)
+                    && let Some(held_back) = self.refusals.pass()
+                {
                     tracing::warn!(
+                        held_back,
                         "local transfer connection refused: unknown or mismatched group"
                     );
                 }
             }
             Accepted::Reverse(token, stream, principal) => {
                 // A connection parked for fan-out, under the same admission
-                // rule and the two bounds of [0012 §4.4].
-                if !admit_reverse(&self.groups, &token, &principal, stream) {
+                // rule and the two bounds of [0012 §4.4]; it keeps its place
+                // while it is parked.
+                if !admit_reverse(&self.groups, &token, &principal, stream, place) {
                     tracing::debug!(
                         "local reverse connection not parked: unknown group or pool full"
                     );
@@ -1009,15 +1082,35 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
 }
 
 /// Accepts `AF_UNIX` connections and serves each one.
+///
+/// A place is taken before the next connection is accepted. Past
+/// `max_connections` live connections the surplus waits in the kernel's queue,
+/// and a dialler's `connect` fails visibly once that is full, instead of the
+/// connection being accepted and closed with its payload already written: a
+/// sender that outruns a slow consumer loses nothing.
 #[cfg(unix)]
 async fn accept_unix(
     listener: tokio::net::UnixListener,
     serve: LocalAccept<crate::unix::UnixLocal>,
 ) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            tracing::debug!("unix binding closed; accept loop ending");
+        // The semaphore is never closed, so this only fails if it were.
+        let Ok(place) = Arc::clone(&serve.admitted).acquire_owned().await else {
             return;
+        };
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // Descriptor or memory exhaustion passes, and a socket that
+                // died before it was accepted concerns nobody but its peer:
+                // neither ends the binding, which would stay dead after the
+                // cause was gone.
+                if let Some(held_back) = serve.refusals.pass() {
+                    tracing::warn!(error = %e, held_back, "accepting a unix connection failed; retrying");
+                }
+                serve.exec.sleep(ACCEPT_RETRY).await;
+                continue;
+            }
         };
         if serve.shared.drain.is_draining() {
             // Admission stopped: the same rule as on every other binding
@@ -1027,7 +1120,7 @@ async fn accept_unix(
         // The accepted socket carries the runtime its halves write their
         // end-of-payload marker on, exactly as a pipe instance does.
         let stream = crate::unix::UnixLocal::accepted(stream, serve.exec.clone());
-        serve.exec.spawn(serve.clone_for().serve(stream));
+        serve.exec.spawn(serve.clone_for().serve(stream, place));
     }
 }
 
@@ -1046,6 +1139,19 @@ async fn accept_pipe(
 ) {
     let mut listening = first;
     loop {
+        // A place is taken before a client is accepted, for the reason
+        // `accept_unix` gives: the surplus waits on the pipe, which a
+        // client sees as busy, instead of being accepted and dropped.
+        let place = tokio::select! {
+            place = Arc::clone(&serve.admitted).acquire_owned() => match place {
+                Ok(place) => place,
+                Err(_) => return,
+            },
+            _ = &mut stop => {
+                tracing::debug!("pipe binding dropped; accept loop ending");
+                return;
+            }
+        };
         let connected = tokio::select! {
             connected = listening.connect() => connected,
             _ = &mut stop => {
@@ -1054,26 +1160,45 @@ async fn accept_pipe(
             }
         };
         if let Err(e) = connected {
-            tracing::debug!(error = %e, "pipe accept failed; accept loop ending");
-            return;
+            // A failed connect leaves this instance in no state to be trusted:
+            // wait, take a fresh one if one can be made, and ask again.
+            if let Some(held_back) = serve.refusals.pass() {
+                tracing::warn!(error = %e, held_back, "pipe accept failed; retrying");
+            }
+            tokio::select! {
+                () = serve.exec.sleep(ACCEPT_RETRY) => {}
+                _ = &mut stop => return,
+            }
+            if let Ok(fresh) = binding.next_instance() {
+                listening = fresh;
+            }
+            continue;
         }
-        let accepted = std::mem::replace(
-            &mut listening,
+        // The next listening instance is made before the accepted one is
+        // served; failing to make it is waited out, not the end of the
+        // binding.
+        let next = loop {
             match binding.next_instance() {
-                Ok(next) => next,
+                Ok(next) => break next,
                 Err(e) => {
-                    tracing::warn!(error = %e, "pipe instance not created; accept loop ending");
-                    return;
+                    if let Some(held_back) = serve.refusals.pass() {
+                        tracing::warn!(error = %e, held_back, "pipe instance not created; retrying");
+                    }
+                    tokio::select! {
+                        () = serve.exec.sleep(ACCEPT_RETRY) => {}
+                        _ = &mut stop => return,
+                    }
                 }
-            },
-        );
+            }
+        };
+        let accepted = std::mem::replace(&mut listening, next);
         if serve.shared.drain.is_draining() {
             // Admission stopped: the accepted instance is dropped, which
             // disconnects the client.
             continue;
         }
         let stream = crate::pipe::PipeStream::accepted(accepted, serve.exec.clone());
-        serve.exec.spawn(serve.clone_for().serve(stream));
+        serve.exec.spawn(serve.clone_for().serve(stream, place));
     }
 }
 
@@ -1227,6 +1352,70 @@ impl OpenConns {
     }
 }
 
+/// How often a refusal is let through to the log.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Lets one log record through per interval and counts the ones it held back,
+/// so a flood of refusals is one line a second and not one per packet.
+struct LogThrottle {
+    every: Duration,
+    state: Mutex<ThrottleState>,
+}
+
+struct ThrottleState {
+    next: Option<Instant>,
+    held_back: u64,
+}
+
+impl LogThrottle {
+    fn new(every: Duration) -> LogThrottle {
+        LogThrottle {
+            every,
+            state: Mutex::new(ThrottleState {
+                next: None,
+                held_back: 0,
+            }),
+        }
+    }
+
+    /// `Some(n)` when the caller should log now, `n` being how many records
+    /// were held back since the last one that passed.
+    fn pass(&self) -> Option<u64> {
+        self.pass_at(Instant::now())
+    }
+
+    fn pass_at(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.next {
+            Some(next) if now < next => {
+                state.held_back += 1;
+                None
+            }
+            _ => {
+                state.next = Some(now + self.every);
+                Some(std::mem::take(&mut state.held_back))
+            }
+        }
+    }
+}
+
+/// One unit of a shared count, given back when this drops, however the task
+/// that holds it ends.
+struct Counted(Arc<AtomicUsize>);
+
+impl Counted {
+    fn take(counter: &Arc<AtomicUsize>) -> Counted {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Counted(Arc::clone(counter))
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Accepts connections until the endpoint is closed.
 ///
 /// Everything it needs is already on the listener it serves: the namespace to
@@ -1234,6 +1423,15 @@ impl OpenConns {
 /// decides the limits and whose executor runs the connections. Holding the
 /// listener for as long as a binding accepts is the honest lifetime — a
 /// binding without its namespace serves nothing.
+///
+/// **What an Initial costs is decided before it is accepted.** Accepting one
+/// builds the connection's state and runs the server half of the TLS
+/// handshake for a source that has not proved the address it wrote, so every
+/// refusal below is made on the `Incoming` itself and builds nothing: a
+/// binding at `max_connections` or `max_handshakes` refuses
+/// (`CONNECTION_REFUSED`), and above `retry_above_handshakes` an Initial from
+/// an unvalidated address is answered with a stateless Retry, so a flood from
+/// spoofed sources allocates nothing and a real dialler pays one round trip.
 async fn accept_connections(
     endpoint: quinn::Endpoint,
     listener: Arc<ListenerInner>,
@@ -1244,12 +1442,16 @@ async fn accept_connections(
     let limits = config.limits;
     let max_connections = config.max_connections;
     let max_connections_per_peer = config.max_connections_per_peer;
+    let max_handshakes = config.max_handshakes;
+    let retry_above = config.retry_above_handshakes;
     let guarantees = config.guarantees;
     let exec = listener.runtime.exec.clone();
     let shared = listener.runtime.shared();
     let namespace = Arc::clone(&listener.namespace);
     let subs = Arc::clone(&listener.subs);
     let live = Arc::new(AtomicUsize::new(0));
+    let handshaking = Arc::new(AtomicUsize::new(0));
+    let refusals = Arc::new(LogThrottle::new(REFUSAL_LOG_INTERVAL));
     while let Some(incoming) = endpoint.accept().await {
         // A draining runtime admits nothing new: the handshake is refused
         // outright rather than accepted and then closed
@@ -1259,34 +1461,60 @@ async fn accept_connections(
             continue;
         }
         if live.load(Ordering::Relaxed) >= max_connections {
-            // Complete the handshake, then say why: a bare refusal leaves the
-            // peer unable to distinguish overload from a routing mistake.
-            tracing::warn!(max = max_connections, "connection limit reached; refusing");
-            exec.spawn(async move {
-                if let Ok(conn) = incoming.await {
-                    conn.close(
-                        VarInt::from_u32(codes::LIMIT_EXCEEDED as u32),
-                        b"connection limit reached",
-                    );
-                }
-            });
+            if let Some(held_back) = refusals.pass() {
+                tracing::warn!(
+                    max = max_connections,
+                    held_back,
+                    "connection limit reached; refusing"
+                );
+            }
+            incoming.refuse();
+            continue;
+        }
+        let in_progress = handshaking.load(Ordering::Relaxed);
+        if in_progress >= max_handshakes {
+            if let Some(held_back) = refusals.pass() {
+                tracing::warn!(
+                    max = max_handshakes,
+                    held_back,
+                    "handshake limit reached; refusing"
+                );
+            }
+            incoming.refuse();
+            continue;
+        }
+        if in_progress >= retry_above && !incoming.remote_address_validated() {
+            // An address that has not been validated may always be asked to
+            // prove itself, so the Retry cannot be refused; an Initial handed
+            // back anyway is turned away rather than accepted unvalidated.
+            if let Err(unretried) = incoming.retry() {
+                unretried.into_incoming().refuse();
+            }
             continue;
         }
 
         let namespace = Arc::clone(&namespace);
         let subs = Arc::clone(&subs);
-        let live = Arc::clone(&live);
-        live.fetch_add(1, Ordering::Relaxed);
+        let live = Counted::take(&live);
+        let handshake = Counted::take(&handshaking);
         let exec_for_conn = exec.clone();
         let shared = Arc::clone(&shared);
         let peers = Arc::clone(&peers);
         let open = Arc::clone(&open);
+        let refusals = Arc::clone(&refusals);
         exec.spawn(async move {
-            match incoming.await {
+            let _live = live;
+            let connected = incoming.await;
+            drop(handshake);
+            match connected {
                 Ok(conn) => {
                     open.insert(&conn);
                     let remote = conn.remote_address();
-                    let conn_id = conn.stable_id();
+                    // `quinn`'s own id: it keys the two tables below, which
+                    // hold a handle on the connection and so keep the id from
+                    // being handed out again. Everything that outlives the
+                    // connection keys on the link's serial instead.
+                    let quic_id = conn.stable_id();
                     // The per-peer ceiling can only be applied here: the
                     // identity exists once the handshake is complete, and one
                     // peer now holds one connection per endpoint path it
@@ -1295,11 +1523,14 @@ async fn accept_connections(
                     // (`docs/decisions/0002-control-and-bulk-separation.md` §7).
                     let peer = crate::tls::peer_fingerprint(&conn);
                     if !peers.admit(peer, &conn, max_connections_per_peer) {
-                        tracing::warn!(
-                            %remote,
-                            max = max_connections_per_peer,
-                            "per-peer connection limit reached; refusing"
-                        );
+                        if let Some(held_back) = refusals.pass() {
+                            tracing::warn!(
+                                %remote,
+                                max = max_connections_per_peer,
+                                held_back,
+                                "per-peer connection limit reached; refusing"
+                            );
+                        }
                         conn.close(
                             VarInt::from_u32(codes::LIMIT_EXCEEDED as u32),
                             b"per-peer connection limit reached",
@@ -1309,7 +1540,7 @@ async fn accept_connections(
                         // The handle must outlive the connection: it owns the
                         // actor's control channel.
                         let ctx = ConnCtx::spawn(
-                            Link::Quic(conn.clone()),
+                            Link::Quic(QuicLink::new(conn.clone())),
                             limits,
                             namespace,
                             Some(Arc::clone(&subs)),
@@ -1317,20 +1548,20 @@ async fn accept_connections(
                             guarantees,
                             shared,
                         );
+                        let serial = ctx.conn.stable_id();
                         let reason = conn.closed().await;
                         // A peer that goes away takes its subscriptions with
                         // it; otherwise connection churn would grow the
                         // registry.
-                        subs.remove_connection(conn_id);
+                        subs.remove_connection(serial);
                         crate::conn::drop_consumers(&ctx).await;
-                        peers.release(peer, conn_id);
+                        peers.release(peer, quic_id);
                         tracing::debug!(%remote, %reason, "connection closed");
                     }
-                    open.remove(conn_id);
+                    open.remove(quic_id);
                 }
                 Err(e) => tracing::debug!(error = %e, "handshake failed"),
             }
-            live.fetch_sub(1, Ordering::Relaxed);
         });
     }
     tracing::debug!("binding stopped accepting");
@@ -1380,5 +1611,47 @@ mod tests {
         // Unregistering an unknown path is not an error.
         ns.unregister("/s");
         ns.register("/s", Route::Pub).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+
+    /// A flood of refusals is one log record per interval, and the record
+    /// says how many were held back.
+    #[test]
+    fn a_log_throttle_passes_one_record_per_interval_and_counts_the_rest() {
+        let throttle = LogThrottle::new(Duration::from_secs(1));
+        let start = Instant::now();
+        assert_eq!(throttle.pass_at(start), Some(0));
+        for _ in 0..5 {
+            assert_eq!(throttle.pass_at(start + Duration::from_millis(500)), None);
+        }
+        assert_eq!(
+            throttle.pass_at(start + Duration::from_millis(1500)),
+            Some(5)
+        );
+        assert_eq!(throttle.pass_at(start + Duration::from_millis(1600)), None);
+    }
+
+    /// A raw consumer is recorded per filter: a repeat is not a new
+    /// subscription, a filter the connection never held frees nothing, and the
+    /// path stays reportable until its last filter goes.
+    #[test]
+    fn a_consumer_is_recorded_per_filter_and_reported_with_its_last_path() {
+        let ns = Namespace::new();
+        assert!(ns.note_consumer(7, "/q", "a"));
+        assert!(!ns.note_consumer(7, "/q", "a"));
+        assert!(ns.note_consumer(7, "/q", "b"));
+        assert!(!ns.forget_consumer(7, "/q", "never"));
+        assert!(ns.forget_consumer(7, "/q", "a"));
+        assert!(!ns.forget_consumer(7, "/q", "a"));
+
+        let (tx, _rx) = mpsc::channel(1);
+        ns.register("/q", Route::Raw(tx)).expect("register");
+        // "b" is still held, so closing the connection reports the path.
+        assert_eq!(ns.take_consumer_routes(7).len(), 1);
+        assert!(ns.take_consumer_routes(7).is_empty());
     }
 }

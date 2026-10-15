@@ -35,7 +35,7 @@ use crate::conn::{ConnCtx, ConnHandle, conn_error};
 use crate::listener::Namespace;
 use crate::runtime::{Exec, Shared};
 use crate::tls;
-use crate::transport::Link;
+use crate::transport::{Link, QuicLink};
 
 /// The port a dial uses, and the refusal a `Single` runtime owes a portless
 /// URL.
@@ -279,7 +279,7 @@ impl ClientPool {
         // path here so fanned-out copies have somewhere to go. It is not the
         // listener's namespace — a client serves nothing on its own account.
         let handle = ConnCtx::spawn(
-            Link::Quic(conn),
+            Link::Quic(QuicLink::new(conn)),
             config.limits,
             Arc::new(Namespace::new()),
             None,

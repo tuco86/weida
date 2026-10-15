@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use quinn::rustls::pki_types::CertificateDer;
@@ -413,7 +413,9 @@ impl IdentitySource {
         self.emit(event);
     }
 
-    fn refresh_if_due(&self) {
+    /// Runs the due check of a file source, reloading when the interval has
+    /// passed. A caller that compares generations runs it first.
+    pub(crate) fn refresh_if_due(&self) {
         let Kind::Files(files) = &self.inner.kind else {
             return;
         };
@@ -434,6 +436,15 @@ impl IdentitySource {
 
     fn is_static(&self) -> bool {
         matches!(self.inner.kind, Kind::Static)
+    }
+
+    /// A weak handle to this source, for a background task that must end
+    /// when the application drops its last strong handle.
+    /// See [`WeakIdentitySource`].
+    pub fn downgrade(&self) -> WeakIdentitySource {
+        WeakIdentitySource {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 }
 
@@ -512,6 +523,30 @@ impl std::fmt::Debug for IdentitySource {
                     .ok(),
             )
             .finish_non_exhaustive()
+    }
+}
+
+/// A handle to an [`IdentitySource`] that does not keep it alive.
+///
+/// A background task that renews an identity holds one of these, not a
+/// strong handle: once the application drops its last strong handle the task
+/// sees that through [`WeakIdentitySource::upgrade`] and ends, rather than
+/// keeping the source and its key alive for the life of the process.
+#[derive(Clone)]
+pub struct WeakIdentitySource {
+    inner: Weak<IdentityInner>,
+}
+
+impl WeakIdentitySource {
+    /// The source, if any strong handle to it is still alive.
+    pub fn upgrade(&self) -> Option<IdentitySource> {
+        self.inner.upgrade().map(|inner| IdentitySource { inner })
+    }
+}
+
+impl std::fmt::Debug for WeakIdentitySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakIdentitySource").finish_non_exhaustive()
     }
 }
 
@@ -648,6 +683,15 @@ impl TrustSource {
             .expect("trust poisoned")
             .is_empty()
     }
+
+    /// A weak handle to this source, for a background task that must end
+    /// when the application drops its last strong handle.
+    /// See [`WeakTrustSource`].
+    pub fn downgrade(&self) -> WeakTrustSource {
+        WeakTrustSource {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
 }
 
 impl From<Trust> for TrustSource {
@@ -696,6 +740,30 @@ impl std::fmt::Debug for TrustSource {
     }
 }
 
+/// A handle to a [`TrustSource`] that does not keep it alive.
+///
+/// A background task that refreshes anchors or pins holds one of these, not
+/// a strong handle: once the application drops its last strong handle the
+/// task sees that through [`WeakTrustSource::upgrade`] and ends, rather than
+/// keeping the source alive for the life of the process.
+#[derive(Clone)]
+pub struct WeakTrustSource {
+    inner: Weak<TrustInner>,
+}
+
+impl WeakTrustSource {
+    /// The source, if any strong handle to it is still alive.
+    pub fn upgrade(&self) -> Option<TrustSource> {
+        self.inner.upgrade().map(|inner| TrustSource { inner })
+    }
+}
+
+impl std::fmt::Debug for WeakTrustSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakTrustSource").finish_non_exhaustive()
+    }
+}
+
 /// The certificate chain a peer presented in the TLS handshake: DER, leaf
 /// first, as it arrived. weida parsed only the leaf's public key, whose
 /// fingerprint is the peer; what the rest certifies is the application's to
@@ -733,5 +801,40 @@ impl std::fmt::Debug for PeerChain {
             .field("certs", &self.0.len())
             .field("bytes", &self.0.iter().map(|c| c.len()).sum::<usize>())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_weak_identity_source_lives_only_while_a_strong_handle_does() {
+        let strong = IdentitySource::from(Identity::from_pem(Vec::new(), Vec::new()));
+        let weak = strong.downgrade();
+        let upgraded = weak.upgrade().expect("a strong handle is alive");
+        assert_eq!(upgraded, strong);
+        drop(strong);
+        assert!(
+            weak.upgrade().is_some(),
+            "the handle upgraded from the weak one keeps the source alive"
+        );
+        drop(upgraded);
+        assert!(weak.upgrade().is_none(), "no strong handle is left");
+    }
+
+    #[test]
+    fn a_weak_trust_source_lives_only_while_a_strong_handle_does() {
+        let strong = TrustSource::from_trust(Trust::default());
+        let weak = strong.downgrade();
+        let upgraded = weak.upgrade().expect("a strong handle is alive");
+        assert_eq!(upgraded, strong);
+        drop(strong);
+        assert!(
+            weak.upgrade().is_some(),
+            "the handle upgraded from the weak one keeps the source alive"
+        );
+        drop(upgraded);
+        assert!(weak.upgrade().is_none(), "no strong handle is left");
     }
 }

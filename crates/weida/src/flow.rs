@@ -416,7 +416,12 @@ impl FlowTable {
             self.count_unknown(1);
             return;
         };
-        let payload = datagram.slice(offset..);
+        // A copy, deliberately: a slice of `datagram` would pin the whole
+        // receive buffer it came from — one UDP read, up to a GRO batch —
+        // for as long as the ring keeps it, while the ring charges only the
+        // payload, so a flood of one-byte datagrams would hold far more than
+        // `flow_queue_bytes` says.
+        let payload = Bytes::copy_from_slice(&datagram[offset..]);
         let inbound = lock(&self.inbound);
         if let Some(flow) = inbound.get(&id) {
             let flow = Arc::clone(flow);
@@ -690,8 +695,14 @@ async fn bind(conn: &ConnHandle, path: &str, meta: &FlowMeta) -> Result<Binding,
         topic: meta.topic.clone(),
         ..FlowHeader::new(path, id)
     };
+    // Refused before anything is written: a label no peer would read, or a
+    // header longer than the peer said it reads, would make it close the
+    // connection every other transfer shares.
+    header.check().map_err(|_| Error::LimitExceeded)?;
+    let encoded = header.encode();
+    crate::conn::check_header_len(conn, encoded.len())?;
     let mut send = conn.open_uni().await?;
-    send.write_all(&encode_frame(FrameKind::Flow, &header.encode()))
+    send.write_all(&encode_frame(FrameKind::Flow, &encoded))
         .await?;
 
     let end = Arc::new(OnceLock::new());
@@ -1052,20 +1063,26 @@ async fn run_stream(
     let mut pending: Vec<u8> = Vec::new();
     let mut scratch = vec![0u8; 4096];
     loop {
-        while let Ok((len, used)) = decode_varint(&pending) {
+        // Every complete record is taken before the buffer is trimmed, and it
+        // is trimmed once: trimming per record moves the whole remainder each
+        // time, so a peer writing empty records would make every read a
+        // quadratic amount of copying.
+        let mut at = 0;
+        while let Ok((len, used)) = decode_varint(&pending[at..]) {
             if len > LOCAL_MAX_DATAGRAM as u64 {
                 return violation(ctx, "FLOW record longer than 1200 bytes");
             }
-            let end = used + len as usize;
+            let end = at + used + len as usize;
             if pending.len() < end {
                 break;
             }
             // A copy, deliberately: a slice of `pending` would pin the whole
             // read buffer for as long as the consumer leaves it queued, and
             // the ring's byte cap would stop meaning what it says.
-            inbound.push(Bytes::copy_from_slice(&pending[used..end]));
-            pending.drain(..end);
+            inbound.push(Bytes::copy_from_slice(&pending[at + used..end]));
+            at = end;
         }
+        pending.drain(..at);
         tokio::select! {
             read = stream.read(&mut scratch) => match read {
                 Ok(Some(n)) => pending.extend_from_slice(&scratch[..n]),

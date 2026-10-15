@@ -43,8 +43,9 @@ pub(crate) struct UnixEndpoint {
 /// One end of a unix-socket connection, and the runtime its halves report on.
 ///
 /// The `Exec` is here for the same reason it is on the pipe's stream: ending a
-/// payload is synchronous at the call site and a write is not, so the marker
-/// goes out on a task ([`ChunkWriter::end`]).
+/// payload is synchronous at the call site, so the marker is written in place
+/// when the socket takes it at once and on a task only when it does not
+/// ([`ChunkWriter::end`]).
 pub(crate) struct UnixLocal {
     io: UnixStream,
     exec: Exec,

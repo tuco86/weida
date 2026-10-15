@@ -322,11 +322,15 @@ impl ClientVerifier {
         let generation = self.trust.generation();
         let mut cached = self.cached.lock().expect("trust cache poisoned");
         if cached.0 != generation {
+            // A failed rebuild is recorded under the generation that failed,
+            // so it is not attempted again, nor reported again, until the
+            // source changes. The previous trust stays in force meanwhile.
             match ClientGeneration::build(&self.trust.current(), &self.provider) {
                 Ok(built) => *cached = (generation, Arc::new(built)),
-                // Unreadable anchors: the previous trust stays in force and
-                // the source reported it.
-                Err(e) => self.trust.report_failure(e.to_string()),
+                Err(e) => {
+                    cached.0 = generation;
+                    self.trust.report_failure(e.to_string());
+                }
             }
         }
         Arc::clone(&cached.1)
@@ -595,21 +599,28 @@ impl LiveKey {
     }
 
     fn current(&self) -> Option<Arc<CertifiedKey>> {
-        // `loaded()` is also where a file source's due check runs.
-        let loaded = self.source.loaded();
+        // The due check of a file source runs before the generation is read,
+        // so a reload it performs is seen by this handshake.
+        self.source.refresh_if_due();
         let generation = self.source.generation();
         let mut cached = self.cached.lock().expect("key cache poisoned");
         if cached.0 == generation {
             return Some(Arc::clone(&cached.1));
         }
+        // The identity is copied only when it changed: an unchanged source
+        // costs no copy of the key material.
+        let loaded = self.source.loaded();
         match certified_key(&self.provider, &loaded.identity) {
             Ok(key) => {
                 *cached = (generation, Arc::clone(&key));
                 Some(key)
             }
-            // The source accepted material rustls cannot use; the previous
-            // key stays in service and the source reported the failure.
+            // The source accepted material rustls cannot use. The previous key
+            // stays in service, and the failure is recorded under this
+            // generation so it is reported once and not retried until the
+            // source changes again.
             Err(e) => {
+                cached.0 = generation;
                 self.source.report_failure(e.to_string());
                 Some(Arc::clone(&cached.1))
             }
@@ -669,6 +680,14 @@ pub(crate) fn server_config(
     };
     let mut crypto = builder.with_cert_resolver(Arc::new(key));
     crypto.alpn_protocols = vec![tls.alpn.token().to_vec()];
+    // A resumed handshake takes the client chain from the stored session and
+    // never calls the client verifier, so a trust withdrawn or a certificate
+    // that expired since the session was issued would still be accepted. No
+    // tickets and no stored sessions keep every handshake a full one, which
+    // the verifier judges. weida's own clients never resume, so nothing else
+    // pays for this.
+    crypto.send_tls13_tickets = 0;
+    crypto.session_storage = Arc::new(quinn::rustls::server::NoServerSessionStorage {});
 
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|e| tls_err("building the QUIC server crypto", e))?;

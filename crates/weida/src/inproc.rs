@@ -163,8 +163,6 @@ fn closed_error(code: u64, local: bool) -> Error {
     }
 }
 
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-
 impl LocalConn {
     /// Builds the two ends of one connection.
     fn pair(max_streams: usize, buffer: usize) -> (LocalConn, LocalConn) {
@@ -181,7 +179,10 @@ impl LocalConn {
         // One budget per connection, shared by both directions: what the cap
         // bounds is the live transfers on this connection.
         let slots = Arc::new(Semaphore::new(max_streams));
-        let id = NEXT_ID.fetch_add(2, Ordering::Relaxed);
+        let (id, peer_id) = (
+            crate::transport::next_serial(),
+            crate::transport::next_serial(),
+        );
         (
             LocalConn {
                 id,
@@ -194,7 +195,7 @@ impl LocalConn {
                 buffer,
             },
             LocalConn {
-                id: id + 1,
+                id: peer_id,
                 uni_to_peer: a_uni_tx,
                 bi_to_peer: a_bi_tx,
                 uni_from_peer: tokio::sync::Mutex::new(b_uni_rx),
@@ -439,17 +440,6 @@ impl LocalRecv {
             return Ok(None);
         }
         Ok(Some(read))
-    }
-
-    pub(crate) async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            match self.read(&mut buf[filled..]).await? {
-                Some(n) => filled += n,
-                None => return Err(Error::Protocol("stream ended mid-header".into())),
-            }
-        }
-        Ok(())
     }
 
     /// Refuses the rest of the payload, the local `STOP_SENDING`.

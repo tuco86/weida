@@ -351,7 +351,7 @@ impl SubRegistry {
             paths: RwLock::new(HashMap::new()),
             per_conn: RwLock::new(HashMap::new()),
             limits,
-            sequencer: Sequencer::new(ordering),
+            sequencer: Sequencer::new(ordering, limits.max_sequence_scopes),
             next_stream: AtomicU64::new(0),
         }
     }

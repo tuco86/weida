@@ -32,8 +32,8 @@ use crate::reconnect::{EVENT_QUEUE, GiveUp, OutboxFull, PeerEvent, PeerEvents, R
 use crate::runtime::RuntimeInner;
 use crate::segment::{CopyTarget, SegmentTerms, SegmentTopics, open_segment};
 use crate::transfer::{
-    IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta,
-    outgoing_header, write_data_preamble,
+    DataHead, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta,
+    outgoing_header,
 };
 
 /// What a pattern does on every connection its peer establishes, first dial
@@ -600,10 +600,11 @@ impl Peer {
     ) -> Result<(OutgoingTransfer, ReplyStream), Error> {
         let (conn, path) = self.shared.pick().await?;
         let (header, trace, cursors) = outgoing_header(&conn, Some(&path), &meta, None)?;
+        let head = DataHead::new(&conn, &header)?;
         let (mut send, recv) = conn.open_bi().await?;
         // The peer learns of the stream with this write, so it never sees a
         // bidirectional stream it cannot classify.
-        write_data_preamble(&mut send, &header).await?;
+        head.write(&mut send).await?;
         Ok((
             OutgoingTransfer::new(send, trace, Arc::clone(&conn), cursors),
             ReplyStream::new(recv, conn),
@@ -740,6 +741,10 @@ async fn watch_slot(
         None => return,
     };
     let proved = conn.peer.clone();
+    // Redial attempts since the last connection that stayed up, carried across
+    // losses; see below for what "stayed up" means.
+    let mut attempt = 0u32;
+    let mut up_since = std::time::Instant::now();
     loop {
         let reason = tokio::select! {
             reason = conn.conn.closed() => reason,
@@ -762,7 +767,15 @@ async fn watch_slot(
         }
         drop(shared);
 
-        let mut attempt = 0u32;
+        // A connection that lived at least as long as the longest wait the
+        // policy ever imposes (`max`) earned a fresh schedule. One that did
+        // not is a success in name only — a server that accepts, says HELLO
+        // and closes, or a crash loop — and the schedule goes on from where
+        // it stopped, so such a peer sees redials slow down instead of a
+        // fresh handshake every `initial` for as long as it keeps doing it.
+        if up_since.elapsed() >= policy.max {
+            attempt = 0;
+        }
         conn = loop {
             attempt += 1;
             let Some(shared) = weak.upgrade() else { return };
@@ -849,6 +862,7 @@ async fn watch_slot(
                 }
             }
         };
+        up_since = std::time::Instant::now();
         let Some(shared) = weak.upgrade() else { return };
         shared.redialled(id, ConnHandle::clone(&conn));
         shared.emit(PeerEvent::Connected {
@@ -1021,8 +1035,9 @@ pub(crate) async fn open_exchange_on(
     meta: TransferMeta,
 ) -> Result<(OutgoingTransfer, ReplyStream), Error> {
     let (header, trace, cursors) = outgoing_header(conn, Some(path), &meta, None)?;
+    let head = DataHead::new(conn, &header)?;
     let (mut send, recv) = conn.open_bi().await?;
-    write_data_preamble(&mut send, &header).await?;
+    head.write(&mut send).await?;
     Ok((
         OutgoingTransfer::new(send, trace, ConnHandle::clone(conn), cursors),
         ReplyStream::new(recv, ConnHandle::clone(conn)),
@@ -1047,8 +1062,9 @@ pub(crate) async fn open_transfer_on(
     // omitted; under `PerProducer` this is the number the peer's gap
     // detector and reassembler read.
     header.sequence = conn.sequencer.next(path);
+    let head = DataHead::new(conn, &header)?;
     let mut stream = conn.open_uni().await?;
-    write_data_preamble(&mut stream, &header).await?;
+    head.write(&mut stream).await?;
     Ok(OutgoingTransfer::new(
         stream,
         trace,
@@ -1083,15 +1099,18 @@ pub enum Incoming {
     Exchange(IncomingRequest),
     /// A consumer subscribed to this path with one filter.
     ///
-    /// One event per SUBSCRIBE frame, so a consumer holding several filters
-    /// arrives several times with the same [`Consumer::id`].
+    /// One event per filter, so a consumer holding several filters arrives
+    /// several times with the same [`Consumer::id`]. A repeated SUBSCRIBE of
+    /// a filter the connection already holds is not announced again.
     Subscribed(Consumer),
     /// A consumer stated the absolute delivery limit of one subscription.
     Credit(CreditGrant),
     /// A subscription ended: UNSUBSCRIBE, or the connection went away.
     ///
-    /// A closed connection reports `filter: None` — it ends every
-    /// subscription that connection held, and the peer is gone, so there is
+    /// An UNSUBSCRIBE names a filter the connection really held; one that
+    /// matches nothing is ignored. A closed connection reports
+    /// `filter: None` — it ends every subscription that connection still
+    /// held, on every path it consumed on, and the peer is gone, so there is
     /// nothing to enumerate them against.
     Unsubscribed {
         /// Which consumer.
@@ -1107,9 +1126,11 @@ pub enum Incoming {
 
 /// Identifies one consuming connection on one path.
 ///
-/// Stable for the life of the connection and never reused while it lives; it
-/// is the peer's QUIC connection id, so it says nothing about *who* the peer
-/// is — that is `IncomingMeta::peer`, proved in the handshake.
+/// A number this process gave the connection when it was made, never reused
+/// for another one while the process lives, so an id a queue still holds
+/// after its connection is gone — a credit with no subscription behind it,
+/// say — can never name a later connection. It says nothing about *who* the
+/// peer is — that is `IncomingMeta::peer`, proved in the handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConsumerId(pub(crate) usize);
 
@@ -1184,8 +1205,9 @@ impl Consumer {
         // a token preamble, so opening first pays for a connection and a
         // stream slot that an error the code already knew about then resets.
         let (header, trace, cursors) = outgoing_header(&self.conn, Some(&self.path), &meta, None)?;
+        let head = crate::transfer::DataHead::new(&self.conn, &header)?;
         let mut send = self.conn.open_uni().await?;
-        crate::transfer::write_data_preamble(&mut send, &header).await?;
+        head.write(&mut send).await?;
         Ok(OutgoingTransfer::new(
             send,
             trace,

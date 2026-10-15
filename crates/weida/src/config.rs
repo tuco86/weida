@@ -54,8 +54,16 @@ pub struct RuntimeConfig {
     /// exist in the code yet, and a second profile nothing reads would be
     /// worse than none.
     pub limits: Limits,
-    /// Concurrently accepted connections per binding. Excess connections are
-    /// closed immediately with `LIMIT_EXCEEDED`.
+    /// Concurrently accepted connections per binding. A QUIC Initial that
+    /// arrives at the cap is refused (`CONNECTION_REFUSED`) before its
+    /// handshake is accepted, so the dialler sees a refused connection and
+    /// the binding builds no state for it. On a local socket transport the
+    /// cap counts live local connections: each takes a place before it is
+    /// accepted and keeps it for as long as it lives (a control connection
+    /// for the life of its peer, a transfer or parked connection until its
+    /// last half is gone), so a surplus connection waits in the kernel's
+    /// queue instead of being accepted and closed, and a sender that outruns
+    /// a slow consumer loses nothing.
     ///
     /// Per binding rather than per connection, which is why it is here and
     /// not in [`Limits`].
@@ -167,6 +175,28 @@ pub struct RuntimeConfig {
     /// [`GuaranteeSet::backpressure`], because a puller has no say in how
     /// its pusher waits.
     pub outbox_full: OutboxFull,
+    /// Handshakes one QUIC binding runs at once, counted from the moment an
+    /// Initial is accepted until its handshake completes or fails.
+    ///
+    /// Accepting an Initial builds the connection's state and runs the
+    /// server half of the TLS handshake before the dialler has proved the
+    /// address it wrote, so what a spoofed or silent source can make a
+    /// binding hold is this count and nothing else: an Initial that finds
+    /// the binding at the cap is refused (`CONNECTION_REFUSED`) before any
+    /// state exists for it. A completed handshake no longer counts here and
+    /// is bounded by [`RuntimeConfig::max_connections`] instead.
+    pub max_handshakes: usize,
+    /// Handshakes in progress from which a QUIC binding answers an Initial
+    /// from an address it has not validated with a stateless Retry instead
+    /// of accepting it.
+    ///
+    /// A Retry makes the dialler prove it can receive at the address it
+    /// wrote and costs it one round trip, so below this count an Initial is
+    /// accepted at once and a quiet binding adds no latency; above it only
+    /// a source that answered gets a handshake, and a flood from spoofed
+    /// sources allocates nothing. `0` retries every dial from an
+    /// unvalidated address, `usize::MAX` never does.
+    pub retry_above_handshakes: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -188,6 +218,8 @@ impl Default for RuntimeConfig {
             outbox_messages: 1000,
             outbox_full: OutboxFull::default(),
             outbox_bytes: 8 * 1024 * 1024,
+            max_handshakes: 256,
+            retry_above_handshakes: 64,
         }
     }
 }
@@ -603,6 +635,8 @@ mod tests {
         assert_eq!(c.max_connections_per_peer, 64);
         assert_eq!(c.endpoint_queue, 256);
         assert_eq!(c.max_resolved_addresses, 8);
+        assert_eq!(c.max_handshakes, 256);
+        assert_eq!(c.retry_above_handshakes, 64);
     }
 
     #[test]

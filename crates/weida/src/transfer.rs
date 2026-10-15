@@ -221,38 +221,37 @@ pub struct IncomingMeta {
 }
 
 impl IncomingMeta {
+    /// Takes the decoded header apart into the metadata: the strings and the
+    /// report move, nothing is cloned, because the header has no other use
+    /// once the receiver has read the numbers it routes by.
     pub(crate) fn from_header(
-        header: &DataHeader,
+        header: DataHeader,
         peer: Option<PeerIdentity>,
         peer_chain: Option<PeerChain>,
     ) -> IncomingMeta {
+        let trace = header
+            .traceparent
+            .as_deref()
+            .and_then(|v| TraceContext::parse_traceparent(v).ok());
+        let layer = header.segment.map(|_| header.layer.unwrap_or(0));
         IncomingMeta {
-            endpoint: header.endpoint.clone(),
+            endpoint: header.endpoint,
             content_len: header.content_len,
-            content_type: header.content_type.clone(),
-            trace: header
-                .traceparent
-                .as_deref()
-                .and_then(|v| TraceContext::parse_traceparent(v).ok()),
-            tracestate: header.tracestate.clone(),
-            topic: header.topic.clone(),
+            content_type: header.content_type,
+            trace,
+            tracestate: header.tracestate,
+            topic: header.topic,
             peer,
             peer_chain,
             sequence: header.sequence,
             gap: None,
             achieved: header.achieved,
-            report: header.report.clone(),
+            report: header.report,
             report_mode: header.report_mode,
             report_id: header.report_id,
             segment: header.segment,
-            layer: header.segment.map(|_| header.layer.unwrap_or(0)),
+            layer,
         }
-    }
-
-    /// Attaches what the connection's gap detector observed.
-    pub(crate) fn with_gap(mut self, gap: Option<Gap>) -> IncomingMeta {
-        self.gap = gap;
-        self
     }
 }
 
@@ -294,8 +293,12 @@ pub fn new_trace() -> TraceContext {
 ///
 /// `report_id` is the id [`outgoing_header`] allocated, and it must be `Some`
 /// exactly when `meta.report` is non-empty — the decoder refuses either half
-/// without the other (`docs/PROTOCOL.md` §6.2). The level cap is enforced
-/// here rather than at each pattern, so every send path inherits it.
+/// without the other (`docs/PROTOCOL.md` §6.2). The level cap and every other
+/// rule the decoder enforces ([`DataHeader::check`]: the text caps, the layer
+/// range, the report rules) are enforced here rather than at each pattern, so
+/// every send path inherits them and a label no peer would read fails the
+/// send with [`Error::LimitExceeded`] instead of closing the shared
+/// connection at the receiver.
 pub(crate) fn data_header(
     endpoint: Option<&str>,
     meta: &TransferMeta,
@@ -331,6 +334,7 @@ pub(crate) fn data_header(
         segment: None,
         layer: None,
     };
+    header.check().map_err(|_| Error::LimitExceeded)?;
     Ok((header, trace))
 }
 
@@ -761,8 +765,9 @@ impl IncomingTransfer {
     /// Reads the whole remaining payload, refusing to exceed `max_bytes`.
     ///
     /// Over the cap the rest of the payload is refused with
-    /// `STOP_SENDING(REJECTED)` and [`Error::LimitExceeded`] is returned: the
-    /// bytes are never buffered first.
+    /// `STOP_SENDING(REJECTED)` and [`Error::LimitExceeded`] is returned: at
+    /// most one byte past the cap is ever buffered, and the buffer grows
+    /// with the bytes that arrive, never with a length the sender claims.
     ///
     /// This is a convenience for small payloads; streaming users should use
     /// [`AsyncRead`] instead. Use it on a borrowed body
@@ -770,20 +775,25 @@ impl IncomingTransfer {
     /// by-value form.
     pub async fn read_capped(&mut self, max_bytes: usize) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
         loop {
-            match self.stream.read(&mut chunk).await {
-                Ok(Some(0)) => continue,
-                Ok(Some(n)) => {
-                    if out.len() + n > max_bytes {
+            // One byte past the cap is asked for, so that a payload of
+            // exactly `max_bytes` and one that exceeds it are told apart
+            // without reading more than the cap allows.
+            let want = (max_bytes - out.len()).saturating_add(1);
+            match self.stream.read_into(&mut out, want).await {
+                Ok(Some(_)) => {
+                    if out.len() > max_bytes {
                         self.done = true;
                         self.stream.stop(codes::REJECTED);
                         return Err(Error::LimitExceeded);
                     }
-                    out.extend_from_slice(&chunk[..n]);
                 }
                 Ok(None) => {
                     self.done = true;
+                    // The buffer doubled its way up: hand over what was
+                    // received, not the slack, because whoever keeps the
+                    // message (a queue charging by capacity) pays for it.
+                    out.shrink_to_fit();
                     return Ok(out);
                 }
                 Err(e) => {
@@ -797,6 +807,12 @@ impl IncomingTransfer {
     /// Consuming form of [`IncomingTransfer::read_capped`].
     pub async fn collect(mut self, max_bytes: usize) -> Result<Vec<u8>, Error> {
         self.read_capped(max_bytes).await
+    }
+
+    /// The metadata, shared: a handle that outlives a borrow of the transfer
+    /// (the dispatcher reads its path while it hands the transfer over).
+    pub(crate) fn meta_arc(&self) -> Arc<IncomingMeta> {
+        Arc::clone(&self.meta)
     }
 }
 
@@ -983,7 +999,7 @@ impl IncomingRequest {
         // from its own id space and the requester reports on it.
         let (header, trace, cursors) =
             outgoing_header(&self.reply.conn, None, &meta, self.meta.tracestate.clone())?;
-        write_data_preamble(&mut send, &header).await?;
+        write_data_head(&self.reply.conn, &mut send, &header).await?;
         Ok(OutgoingTransfer::new(
             send,
             trace,
@@ -1069,12 +1085,55 @@ fn data_frame(header: &DataHeader) -> (Vec<u8>, usize) {
 }
 
 /// Writes the preamble and DATA header of an outgoing transfer.
+///
+/// Refuses a header the decoder would refuse ([`DataHeader::check`]) with
+/// [`Error::LimitExceeded`] before anything is written. A caller that holds
+/// the connection uses [`write_data_head`], which also holds the header to
+/// what the peer said it reads.
 pub(crate) async fn write_data_preamble(
     stream: &mut SendHalf,
     header: &DataHeader,
 ) -> Result<(), Error> {
+    header.check().map_err(|_| Error::LimitExceeded)?;
     let (buf, start) = data_frame(header);
     stream.write_all(&buf[start..]).await
+}
+
+/// A DATA frame head that has been checked and framed and not yet written.
+///
+/// Built **before** a stream is opened, so a header the peer would not read
+/// fails the send with nothing opened and nothing written: a stream opened
+/// and dropped empty is a peer that sees a stream end inside its preamble.
+pub(crate) struct DataHead {
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl DataHead {
+    /// Refuses a header the decoder would refuse ([`DataHeader::check`]) and
+    /// one longer than the `max_header_bytes` the peer's HELLO stated: its
+    /// preamble parser closes the connection over one, and every other
+    /// transfer on it with it.
+    pub(crate) fn new(conn: &ConnHandle, header: &DataHeader) -> Result<DataHead, Error> {
+        header.check().map_err(|_| Error::LimitExceeded)?;
+        let (buf, start) = data_frame(header);
+        crate::conn::check_header_len(conn, buf.len() - weida_protocol::MAX_PREAMBLE_LEN)?;
+        Ok(DataHead { buf, start })
+    }
+
+    pub(crate) async fn write(self, stream: &mut SendHalf) -> Result<(), Error> {
+        stream.write_all(&self.buf[self.start..]).await
+    }
+}
+
+/// Like [`write_data_preamble`], for a stream that already exists (a reply
+/// half): the head is checked against the peer's `max_header_bytes` first.
+pub(crate) async fn write_data_head(
+    conn: &ConnHandle,
+    stream: &mut SendHalf,
+    header: &DataHeader,
+) -> Result<(), Error> {
+    DataHead::new(conn, header)?.write(stream).await
 }
 
 /// The reply half of an exchange the requester is waiting on.
@@ -1115,7 +1174,7 @@ impl ReplyStream {
             FrameKind::Data => {
                 let header = DataHeader::decode(&header)?;
                 let meta = Arc::new(IncomingMeta::from_header(
-                    &header,
+                    header,
                     self.conn.peer.clone(),
                     self.conn.peer_chain.clone(),
                 ));
@@ -1322,14 +1381,50 @@ mod tests {
     fn incoming_meta_ignores_a_malformed_traceparent() {
         let mut header = DataHeader::addressed("/x");
         header.traceparent = Some("not-a-traceparent".into());
-        let meta = IncomingMeta::from_header(&header, None, None);
+        let meta = IncomingMeta::from_header(header.clone(), None, None);
         assert!(meta.trace.is_none());
 
         let good = new_trace();
         header.traceparent = Some(good.to_traceparent());
         assert_eq!(
-            IncomingMeta::from_header(&header, None, None).trace,
+            IncomingMeta::from_header(header, None, None).trace,
             Some(good)
         );
+    }
+
+    /// A label no peer would read fails the send instead of travelling: a
+    /// receiver that meets one closes the connection, and every other
+    /// transfer on it with it.
+    #[test]
+    fn a_header_the_decoder_would_refuse_fails_the_send() {
+        use weida_protocol::header::limits::{
+            MAX_CONTENT_TYPE_BYTES, MAX_ENDPOINT_BYTES, MAX_TOPIC_BYTES, MAX_TRACESTATE_BYTES,
+        };
+
+        let at_cap = TransferMeta::default().with_topic("t".repeat(MAX_TOPIC_BYTES));
+        assert!(data_header(Some("/t"), &at_cap, None, None).is_ok());
+
+        let long_topic = TransferMeta::default().with_topic("t".repeat(MAX_TOPIC_BYTES + 1));
+        assert!(matches!(
+            data_header(Some("/t"), &long_topic, None, None),
+            Err(Error::LimitExceeded)
+        ));
+        let long_type =
+            TransferMeta::default().with_content_type("c".repeat(MAX_CONTENT_TYPE_BYTES + 1));
+        assert!(matches!(
+            data_header(Some("/t"), &long_type, None, None),
+            Err(Error::LimitExceeded)
+        ));
+        let long_path = format!("/{}", "p".repeat(MAX_ENDPOINT_BYTES));
+        assert!(matches!(
+            data_header(Some(&long_path), &TransferMeta::default(), None, None),
+            Err(Error::LimitExceeded)
+        ));
+        // A reply inherits the request's tracestate, which the decoder capped.
+        let long_state = Some("s".repeat(MAX_TRACESTATE_BYTES + 1));
+        assert!(matches!(
+            data_header(None, &TransferMeta::default(), long_state, None),
+            Err(Error::LimitExceeded)
+        ));
     }
 }

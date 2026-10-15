@@ -13,16 +13,15 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use weida_core::{Error, ErrorCode, Limits, LossCause, PeerIdentity};
 use weida_protocol::header::{GuaranteeSet, MAX_CURSOR_RECORD_LEN};
 use weida_protocol::{
     Agreed, CAPABILITY_DATAGRAM, CAPABILITY_PATH_REPORT, CreditHeader, CursorHeader, DataHeader,
-    ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError, SubscriptionHeader,
-    codes, decode_cursor_record, encode_frame, negotiate, parse_preamble,
+    ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, SubscriptionHeader, codes,
+    decode_cursor_record, encode_frame, negotiate, parse_preamble,
 };
 
-use crate::cursor::CursorSet;
 use crate::dedup::DedupWindow;
 use crate::identity::PeerChain;
 use crate::listener::{Namespace, Route};
@@ -112,6 +111,12 @@ pub(crate) struct ConnCtx {
     /// one fixed-size slot ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
     /// §4.5).
     pub remote: crate::report::RemoteSlot,
+    /// One slot per inbound stream that may be reading its frame head at a
+    /// time: [`Limits::max_header_streams`]. A stream takes one for the read
+    /// of its preamble and one for the read of its header and holds none
+    /// while it waits for negotiation, so the buffers a connection holds for
+    /// frame heads are bounded by the slots, not by the peer's stream budget.
+    pub header_slots: Semaphore,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -143,7 +148,7 @@ impl ConnCtx {
             subs,
             exec: exec.clone(),
             guarantees,
-            sequencer: Sequencer::new(guarantees.ordering),
+            sequencer: Sequencer::new(guarantees.ordering, limits.max_sequence_scopes),
             gaps: GapDetector::new(guarantees.ordering, limits.max_sequence_scopes),
             reorder: Reassembler::new(
                 guarantees.ordering,
@@ -164,6 +169,7 @@ impl ConnCtx {
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
             segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
             remote: crate::report::RemoteSlot::default(),
+            header_slots: Semaphore::new(limits.max_header_streams.max(1)),
         });
 
         // Once per connection, never per message: a drain collects the
@@ -287,6 +293,23 @@ impl ConnCtx {
                 "reaped settled receipts to make room for another stream"
             );
         }
+    }
+}
+
+/// Refuses a header of `len` bytes that the peer's HELLO said it would not
+/// read.
+///
+/// Its preamble parser closes the connection over one, taking every other
+/// transfer on it along, so a sender checks the length it is about to write
+/// ([`Agreed::check_header_len`]). Before negotiation nothing is known and
+/// nothing is refused; every sender of a connection waits for it, or answers
+/// something that did.
+pub(crate) fn check_header_len(ctx: &ConnCtx, len: usize) -> Result<(), Error> {
+    match ctx.agreed_now() {
+        Some(agreed) => agreed
+            .check_header_len(len)
+            .map_err(|_| Error::LimitExceeded),
+        None => Ok(()),
     }
 }
 
@@ -546,12 +569,11 @@ async fn accept_bi_loop(ctx: ConnHandle) {
 /// §4.3). A replier answers on the same connection; everything else is a
 /// one-way transfer and the write half is dropped.
 async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Result<(), Error> {
-    let preamble = match read_preamble(&mut recv, ctx.limits.max_header_bytes).await {
+    let preamble = match read_preamble_within(ctx, &mut recv).await {
         Ok(preamble) => preamble,
         Err(Error::Protocol(reason)) => return violation(ctx, &reason),
-        Err(e) => return Err(e),
+        Err(e) => return refuse_head(recv, send, e),
     };
-    let header = read_header(&mut recv, &preamble).await?;
 
     // Nothing but HELLO may be interpreted before negotiation completes,
     // which is the rule `handle_stream` states for QUIC — and it matters
@@ -563,6 +585,10 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
     if preamble.kind != FrameKind::Hello {
         ctx.negotiated().await?;
     }
+    let header = match read_header_within(ctx, &mut recv, &preamble).await {
+        Ok(header) => header,
+        Err(e) => return refuse_head(recv, send, e),
+    };
 
     match preamble.kind {
         // HELLO belongs to the control connection and nowhere else: a peer
@@ -591,57 +617,40 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
                 Ok(h) => h,
                 Err(e) => return violation(ctx, &e.to_string()),
             };
-            let Some(path) = decoded.endpoint.clone() else {
+            let Some(path) = decoded.endpoint.as_deref() else {
                 return violation(ctx, "DATA on a local connection must name an endpoint");
             };
-            let route = ctx.namespace.lookup(&path);
-            match route {
+            match ctx.namespace.lookup(path) {
                 // A reply is expected: the exchange rides this connection in
                 // both directions.
                 Some(Route::Request(queue)) => {
-                    let request = IncomingRequest::new(
-                        IncomingTransfer::new(
-                            recv,
-                            Arc::new(IncomingMeta::from_header(
-                                &decoded,
-                                ctx.peer.clone(),
-                                ctx.peer_chain.clone(),
-                            )),
-                            Arc::clone(ctx),
-                        ),
-                        send,
-                        Arc::clone(ctx),
-                    );
-                    if queue.send(request).await.is_err() {
-                        tracing::debug!(path, "endpoint went away while dispatching");
+                    let request = request_for(ctx, decoded, recv, send);
+                    if let Err(gone) = queue.send(request).await {
+                        tracing::debug!(
+                            path = ?gone.0.meta().endpoint,
+                            "endpoint went away while dispatching"
+                        );
                     }
                     Ok(())
                 }
                 Some(Route::Raw(queue)) => {
-                    let request = IncomingRequest::new(
-                        IncomingTransfer::new(
-                            recv,
-                            Arc::new(IncomingMeta::from_header(
-                                &decoded,
-                                ctx.peer.clone(),
-                                ctx.peer_chain.clone(),
-                            )),
-                            Arc::clone(ctx),
-                        ),
-                        send,
-                        Arc::clone(ctx),
-                    );
-                    if queue.send(Incoming::Exchange(request)).await.is_err() {
-                        tracing::debug!(path, "acceptor went away while dispatching");
+                    let request = request_for(ctx, decoded, recv, send);
+                    if let Err(gone) = queue.send(Incoming::Exchange(request)).await
+                        && let Incoming::Exchange(request) = gone.0
+                    {
+                        tracing::debug!(
+                            path = ?request.meta().endpoint,
+                            "acceptor went away while dispatching"
+                        );
                     }
                     Ok(())
                 }
                 // Nothing writes back on a puller or publisher path, so the
                 // write half goes away with the chance to reply; the refusal
-                // of an unknown or mismatched path is `handle_data`'s.
+                // of an unknown or mismatched path is `dispatch`'s.
                 _ => {
                     drop(send);
-                    handle_data(ctx, recv, &header).await
+                    dispatch_data(ctx, recv, decoded).await
                 }
             }
         }
@@ -695,7 +704,6 @@ async fn handle_cursor(ctx: &ConnHandle, mut stream: RecvHalf, header: &[u8]) ->
     // record plus one read.
     let mut buf = [0u8; 64];
     let mut pending: Vec<u8> = Vec::with_capacity(64 + MAX_CURSOR_RECORD_LEN);
-    let mut set = CursorSet::default();
     loop {
         match stream.read(&mut buf).await {
             Ok(Some(0)) => continue,
@@ -707,9 +715,7 @@ async fn handle_cursor(ctx: &ConnHandle, mut stream: RecvHalf, header: &[u8]) ->
                     Err(e) => return violation(ctx, &e.to_string()),
                 } {
                     at += used;
-                    if set.advance(level, offset) {
-                        tx.send_replace(set);
-                    }
+                    tx.send_if_modified(|shared| shared.advance(level, offset));
                 }
                 pending.drain(..at);
             }
@@ -735,49 +741,144 @@ async fn handle_cursor(ctx: &ConnHandle, mut stream: RecvHalf, header: &[u8]) ->
     Ok(())
 }
 
-/// Reads one preamble byte by byte, enforcing the header cap before allocating.
-async fn read_preamble(stream: &mut RecvHalf, max_header_bytes: u64) -> Result<Preamble, Error> {
-    // The preamble is at most ten bytes, and the header length cap is checked
-    // inside `parse_preamble` before anything is allocated.
-    let mut scratch = [0u8; MAX_PREAMBLE_LEN];
-    let mut have = 0usize;
-    loop {
-        match parse_preamble(&scratch[..have], max_header_bytes) {
-            Ok((preamble, used)) => {
-                debug_assert_eq!(used, have, "the preamble is read byte by byte");
-                return Ok(preamble);
-            }
-            Err(PreambleError::Incomplete) => {
-                if have == scratch.len() {
-                    return Err(Error::Protocol(
-                        "preamble exceeds its maximum length".into(),
-                    ));
-                }
-                match stream.read(&mut scratch[have..have + 1]).await? {
-                    Some(0) => continue,
-                    Some(n) => have += n,
-                    None => return Err(Error::Protocol("stream ended inside the preamble".into())),
-                }
-            }
-            Err(e) => return Err(Error::Protocol(e.to_string())),
+/// The header bytes a frame head keeps without the heap: a typical DATA
+/// header is about 70 bytes, and a trace context adds 58.
+const INLINE_HEADER: usize = 192;
+
+/// How much of a larger header's buffer is committed before the bytes for it
+/// have arrived.
+const HEADER_STEP: usize = 2048;
+
+/// The header bytes of one frame.
+///
+/// Held inline up to [`INLINE_HEADER`] and on the heap above it, where the
+/// buffer grows as bytes arrive: the length a preamble announces is the
+/// peer's number, and memory follows the bytes the peer has actually sent,
+/// which `quinn`'s windows already bound.
+pub(crate) enum HeaderBytes {
+    Inline {
+        buf: [u8; INLINE_HEADER],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl std::ops::Deref for HeaderBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            HeaderBytes::Inline { buf, len } => &buf[..*len],
+            HeaderBytes::Heap(bytes) => bytes,
         }
     }
 }
 
-async fn read_header(stream: &mut RecvHalf, preamble: &Preamble) -> Result<Vec<u8>, Error> {
-    let mut header = vec![0u8; preamble.header_len as usize];
-    stream.read_exact(&mut header).await?;
-    Ok(header)
+/// Fills `buf` from `stream`. The stream ending first is the peer ending it
+/// inside something it began.
+async fn fill(stream: &mut RecvHalf, buf: &mut [u8], part: &str) -> Result<(), Error> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]).await? {
+            Some(0) => continue,
+            Some(n) => filled += n,
+            None => return Err(Error::Protocol(format!("stream ended inside the {part}"))),
+        }
+    }
+    Ok(())
+}
+
+/// Reads one preamble, enforcing the header cap before anything is
+/// allocated.
+async fn read_preamble(stream: &mut RecvHalf, max_header_bytes: u64) -> Result<Preamble, Error> {
+    let mut head = [0u8; MAX_PREAMBLE_LEN];
+    // Magic, kind and the first byte of the length. Its two high bits say how
+    // many bytes the length takes in all, so the second read is exactly the
+    // remainder and the preamble never takes a byte of the header.
+    fill(stream, &mut head[..3], "preamble").await?;
+    let end = 2 + (1usize << (head[2] >> 6));
+    fill(stream, &mut head[3..end], "preamble").await?;
+    parse_preamble(&head[..end], max_header_bytes)
+        .map(|(preamble, _)| preamble)
+        .map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// Reads the header a preamble announced, whose length the preamble has
+/// already held to `max_header_bytes`.
+async fn read_header(stream: &mut RecvHalf, preamble: &Preamble) -> Result<HeaderBytes, Error> {
+    let len = usize::try_from(preamble.header_len)
+        .map_err(|_| Error::Protocol("header length does not fit this platform".into()))?;
+    if len <= INLINE_HEADER {
+        let mut buf = [0u8; INLINE_HEADER];
+        fill(stream, &mut buf[..len], "header").await?;
+        return Ok(HeaderBytes::Inline { buf, len });
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while bytes.len() < len {
+        let start = bytes.len();
+        bytes.resize(start + (len - start).min(HEADER_STEP), 0);
+        match stream.read(&mut bytes[start..]).await? {
+            Some(n) => bytes.truncate(start + n),
+            None => return Err(Error::Protocol("stream ended inside the header".into())),
+        }
+    }
+    Ok(HeaderBytes::Heap(bytes))
 }
 
 /// Reads a whole frame head: preamble plus the header bytes it announces.
+///
+/// Without a deadline of its own: whoever waits for a reply (the requester)
+/// is waiting on a peer that may be computing, and the bound on that wait is
+/// the caller's.
 pub(crate) async fn read_frame(
     stream: &mut RecvHalf,
     max_header_bytes: u64,
-) -> Result<(Preamble, Vec<u8>), Error> {
+) -> Result<(Preamble, HeaderBytes), Error> {
     let preamble = read_preamble(stream, max_header_bytes).await?;
     let header = read_header(stream, &preamble).await?;
     Ok((preamble, header))
+}
+
+/// Runs one read of an inbound stream's frame head under the header phase's
+/// two bounds: a free header slot, and the header deadline counted from the
+/// moment the slot was taken.
+///
+/// Both exist for the stream that opens and then says nothing: it holds a
+/// unit of its peer's stream credit and a task for as long as it likes, and
+/// the QUIC idle timer does not end it while the peer keeps pinging.
+async fn in_header_phase<T>(
+    ctx: &ConnCtx,
+    read: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    let Ok(_slot) = ctx.header_slots.acquire().await else {
+        return Err(Error::ConnectionLost(LossCause::LocallyClosed));
+    };
+    let deadline = Duration::from_millis(ctx.limits.header_timeout_ms);
+    ctx.exec.within(deadline, read).await.unwrap_or_else(|| {
+        Err(Error::Transport(
+            "the frame head did not arrive in time".into(),
+        ))
+    })
+}
+
+async fn read_preamble_within(ctx: &ConnCtx, stream: &mut RecvHalf) -> Result<Preamble, Error> {
+    in_header_phase(ctx, read_preamble(stream, ctx.limits.max_header_bytes)).await
+}
+
+async fn read_header_within(
+    ctx: &ConnCtx,
+    stream: &mut RecvHalf,
+    preamble: &Preamble,
+) -> Result<HeaderBytes, Error> {
+    in_header_phase(ctx, read_header(stream, preamble)).await
+}
+
+/// Ends an inbound stream whose frame head did not arrive: the peer is told
+/// with `STOP_SENDING`, and the connection stays, because a stalled stream
+/// is not a malformed one.
+fn refuse_stream(mut stream: RecvHalf, error: Error) -> Result<(), Error> {
+    stream.stop(codes::CANCELED);
+    Err(error)
 }
 
 /// Reads the preamble and header of one inbound unidirectional stream, then
@@ -787,18 +888,23 @@ async fn handle_stream(
     agreed_tx: &watch::Sender<Option<Agreed>>,
     mut stream: RecvHalf,
 ) -> Result<(), Error> {
-    let preamble = match read_preamble(&mut stream, ctx.limits.max_header_bytes).await {
+    let preamble = match read_preamble_within(ctx, &mut stream).await {
         Ok(preamble) => preamble,
         Err(Error::Protocol(reason)) => return violation(ctx, &reason),
-        Err(e) => return Err(e),
+        Err(e) => return refuse_stream(stream, e),
     };
 
-    // Nothing but HELLO may be interpreted before negotiation completes.
+    // Nothing but HELLO may be interpreted before negotiation completes. A
+    // stream parked here holds no header slot: the HELLO that ends the wait
+    // may be behind it.
     if preamble.kind != FrameKind::Hello {
         ctx.negotiated().await?;
     }
 
-    let header = read_header(&mut stream, &preamble).await?;
+    let header = match read_header_within(ctx, &mut stream, &preamble).await {
+        Ok(header) => header,
+        Err(e) => return refuse_stream(stream, e),
+    };
 
     match preamble.kind {
         FrameKind::Hello => handle_hello(ctx, agreed_tx, &header),
@@ -851,7 +957,7 @@ async fn handle_subscription(
         // A client connection serves no publishers. Nothing to do, and nothing
         // wrong with the peer's frame.
         tracing::debug!(
-            endpoint = %header.endpoint,
+            endpoint = ?header.endpoint,
             "ignoring a subscription frame: this side publishes nothing"
         );
         return Ok(());
@@ -880,27 +986,39 @@ async fn handle_subscription(
 
     if let Some(Route::Raw(queue)) = ctx.namespace.lookup(&header.endpoint) {
         if subscribe {
-            if subs.reserve(conn_id).is_err() {
-                return too_many_subscriptions(ctx);
+            // One reservation per filter this connection holds on the path.
+            // A repeated SUBSCRIBE changes nothing: it is not counted twice
+            // and the queue is not told twice.
+            if ctx
+                .namespace
+                .note_consumer(conn_id, &header.endpoint, &header.filter)
+            {
+                if subs.reserve(conn_id).is_err() {
+                    return too_many_subscriptions(ctx);
+                }
+                let consumer = Consumer::new(
+                    Arc::clone(ctx),
+                    Arc::from(header.endpoint.as_str()),
+                    header.filter,
+                );
+                if queue.send(Incoming::Subscribed(consumer)).await.is_err() {
+                    tracing::debug!(endpoint = ?header.endpoint, "acceptor went away; subscription dropped");
+                }
             }
-            ctx.namespace.note_consumer(conn_id, &header.endpoint);
-            let consumer = Consumer::new(
-                Arc::clone(ctx),
-                Arc::from(header.endpoint.as_str()),
-                header.filter,
-            );
-            if queue.send(Incoming::Subscribed(consumer)).await.is_err() {
-                tracing::debug!(endpoint = %header.endpoint, "acceptor went away; subscription dropped");
-            }
-        } else {
+        } else if ctx
+            .namespace
+            .forget_consumer(conn_id, &header.endpoint, &header.filter)
+        {
+            // Only a filter this connection really holds gives a reservation
+            // back: releasing for an UNSUBSCRIBE that matches nothing would
+            // let a peer walk the count down and subscribe without limit.
             subs.release(conn_id);
-            ctx.namespace.forget_consumer(conn_id, &header.endpoint);
             let gone = Incoming::Unsubscribed {
                 id: ConsumerId::from_conn(conn_id),
                 filter: Some(header.filter),
             };
             if queue.send(gone).await.is_err() {
-                tracing::debug!(endpoint = %header.endpoint, "acceptor went away; unsubscribe dropped");
+                tracing::debug!(endpoint = ?header.endpoint, "acceptor went away; unsubscribe dropped");
             }
         }
         return Ok(());
@@ -948,7 +1066,7 @@ async fn handle_credit(ctx: &ConnHandle, header: &[u8]) -> Result<(), Error> {
     };
     let Some(Route::Raw(queue)) = ctx.namespace.lookup(&header.endpoint) else {
         tracing::debug!(
-            endpoint = %header.endpoint,
+            endpoint = ?header.endpoint,
             "ignoring a credit frame: no queue serves this path"
         );
         return Ok(());
@@ -959,7 +1077,7 @@ async fn handle_credit(ctx: &ConnHandle, header: &[u8]) -> Result<(), Error> {
         limit: header.limit,
     });
     if queue.send(grant).await.is_err() {
-        tracing::debug!(endpoint = %header.endpoint, "acceptor went away; credit dropped");
+        tracing::debug!(endpoint = ?header.endpoint, "acceptor went away; credit dropped");
     }
     Ok(())
 }
@@ -982,16 +1100,26 @@ pub(crate) async fn drop_consumers(ctx: &ConnHandle) {
             filter: None,
         };
         if queue.send(gone).await.is_err() {
-            tracing::debug!(%path, "acceptor went away before its consumer did");
+            tracing::debug!(path = ?path, "acceptor went away before its consumer did");
         }
     }
 }
 
+/// Applies the peer's HELLO.
+///
+/// A side sends exactly one (`docs/PROTOCOL.md` §2.2). A second would
+/// rewrite the parameters that live traffic already runs under and, where
+/// path reports were agreed, start another report task each time: a rate
+/// the peer chooses, where §6.10 says it cannot. So it is a violation, and
+/// the agreement is stored by whichever HELLO gets there first.
 fn handle_hello(
     ctx: &ConnHandle,
     agreed_tx: &watch::Sender<Option<Agreed>>,
     header: &[u8],
 ) -> Result<(), Error> {
+    if agreed_tx.borrow().is_some() {
+        return violation(ctx, "a second HELLO on one connection");
+    }
     let theirs = match Hello::decode(header) {
         Ok(h) => h,
         Err(e) => return violation(ctx, &e.to_string()),
@@ -999,12 +1127,23 @@ fn handle_hello(
     let ours = hello_for(ctx.limits, ctx.guarantees, ctx.conn.is_quic());
     match negotiate(&ours, &theirs) {
         Ok(agreed) => {
+            // Two HELLOs can both reach this point; only the first to store
+            // its result is the HELLO.
+            let first = agreed_tx.send_if_modified(|slot| {
+                if slot.is_some() {
+                    return false;
+                }
+                *slot = Some(agreed);
+                true
+            });
+            if !first {
+                return violation(ctx, "a second HELLO on one connection");
+            }
             tracing::debug!(
                 version = agreed.version,
                 send_max_header_bytes = agreed.send_max_header_bytes,
                 "negotiated"
             );
-            let _ = agreed_tx.send(Some(agreed));
             if agreed.path_report {
                 ctx.exec
                     .spawn(crate::report::send_reports(ConnHandle::clone(ctx)));
@@ -1029,30 +1168,52 @@ async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Resul
         Ok(h) => h,
         Err(e) => return violation(ctx, &e.to_string()),
     };
-    let Some(path) = header.endpoint.clone() else {
+    dispatch_data(ctx, stream, header).await
+}
+
+/// Routes one decoded one-way DATA header and the stream behind it.
+///
+/// Shared by the QUIC dispatcher and the local one, which has already
+/// decoded the header to look the route up and must not decode it twice.
+async fn dispatch_data(
+    ctx: &ConnHandle,
+    mut stream: RecvHalf,
+    header: DataHeader,
+) -> Result<(), Error> {
+    // The numbers the receiver routes by are copied out first: the metadata
+    // then takes the header's strings over, so nothing is cloned and what
+    // is checked below is read straight from the metadata.
+    let (sequence, producer) = (header.sequence, header.producer);
+    let mut meta = Arc::new(IncomingMeta::from_header(
+        header,
+        ctx.peer.clone(),
+        ctx.peer_chain.clone(),
+    ));
+    let Some(path) = meta.endpoint.as_deref() else {
         return violation(ctx, "DATA on a unidirectional stream must name an endpoint");
     };
 
-    // The scope is the topic for a published copy and the path otherwise,
-    // which is the `(producer, endpoint or topic)` scope of decision 0001
-    // §7.1. Both the dedup window and the gap detector key on it.
-    let scope = header.topic.as_deref().unwrap_or(path.as_str());
+    // The scope is the pair (path, topic) for a transfer that carries a topic
+    // and the path alone otherwise: the `(producer, endpoint or topic)`
+    // scope of decision 0001 §7.1, with the endpoint kept because two
+    // publishers that both publish one topic number their copies
+    // independently. Both the dedup window and the gap detector key on it.
+    let topic = meta.topic.as_deref();
 
     // Deduplication sits between the wire and everything else: a repeat is
     // read to EOF and thrown away, so the sender sees an ordinary receipt and
     // neither the application nor the gap detector ever sees the message
     // twice. A dedup window saves the application, not the bandwidth — the
     // bytes crossed the wire before anything could know they were a repeat.
-    if ctx
-        .dedup
-        .is_duplicate(header.producer, scope, header.sequence)
-    {
+    if ctx.dedup.is_duplicate(producer, path, topic, sequence) {
         ctx.shared.duplicates.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(path, sequence = ?header.sequence, "duplicate suppressed");
-        return drain(stream).await;
+        tracing::debug!(path, sequence = ?sequence, "duplicate suppressed");
+        // Read to EOF rather than dropped: dropping the stream would reset
+        // it, and the sender would read that as a refusal
+        // ([FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4) — which a
+        // successfully deduplicated message is not.
+        return stream.discard().await;
     }
-
-    let meta = IncomingMeta::from_header(&header, ctx.peer.clone(), ctx.peer_chain.clone());
 
     // Reassemble mode: hold this arrival if the numbers before it have not
     // come yet, and dispatch whatever run that completes. Held transfers are
@@ -1062,28 +1223,30 @@ async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Resul
     if ctx.reorder.enabled() {
         let held = Held {
             stream,
-            meta,
-            path: path.clone(),
+            meta: Arc::clone(&meta),
         };
-        for (held, gap) in ctx.reorder.admit(scope, header.sequence, held) {
-            let transfer = IncomingTransfer::new(
-                held.stream,
-                Arc::new(held.meta.with_gap(gap)),
-                Arc::clone(ctx),
-            );
-            dispatch(ctx, &held.path, transfer).await;
+        let released = ctx.reorder.admit(path, topic, sequence, held);
+        drop(meta);
+        for (held, gap) in released {
+            let mut meta = held.meta;
+            if gap.is_some() {
+                Arc::make_mut(&mut meta).gap = gap;
+            }
+            dispatch(
+                ctx,
+                IncomingTransfer::new(held.stream, meta, Arc::clone(ctx)),
+            )
+            .await;
         }
         return Ok(());
     }
 
     // Detect mode: report what is missing and deliver what arrived.
-    let gap = header.sequence.and_then(|seq| ctx.gaps.observe(scope, seq));
-    dispatch(
-        ctx,
-        &path,
-        IncomingTransfer::new(stream, Arc::new(meta.with_gap(gap)), Arc::clone(ctx)),
-    )
-    .await;
+    let gap = sequence.and_then(|seq| ctx.gaps.observe(path, topic, seq));
+    if gap.is_some() {
+        Arc::make_mut(&mut meta).gap = gap;
+    }
+    dispatch(ctx, IncomingTransfer::new(stream, meta, Arc::clone(ctx))).await;
     Ok(())
 }
 
@@ -1091,11 +1254,11 @@ async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Resul
 ///
 /// The payload is **not** here: a held transfer is an unread `RecvStream`,
 /// which is what keeps reassembly inside the "core transport does not require
-/// payload materialization" invariant (`docs/INVARIANTS.md`).
+/// payload materialization" invariant (`docs/INVARIANTS.md`). The path it
+/// was addressed to is `meta.endpoint`.
 pub(crate) struct Held {
     stream: RecvHalf,
-    meta: IncomingMeta,
-    path: String,
+    meta: Arc<IncomingMeta>,
 }
 
 /// The refusal a stream earns when the path it names cannot serve it —
@@ -1183,7 +1346,14 @@ pub(crate) fn refusal_for(route: Option<&Route>, wanted: Wanted) -> Option<Refus
 ///
 /// Every refusal here comes from [`refusal_for`] or a [`Refusal`] constant;
 /// no stop code is written out at a call site.
-async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
+async fn dispatch(ctx: &ConnHandle, transfer: IncomingTransfer) {
+    // The path is read through a handle of its own, so it stays borrowable
+    // while the transfer moves on to whatever serves it.
+    let meta = transfer.meta_arc();
+    let Some(path) = meta.endpoint.as_deref() else {
+        transfer.refuse(Refusal::UNKNOWN.stop);
+        return;
+    };
     let route = ctx.namespace.lookup(path);
     if let Some(refusal) = refusal_for(route.as_ref(), Wanted::OneWay) {
         tracing::debug!(path, ?refusal, "the path does not serve a one-way transfer");
@@ -1252,32 +1422,47 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
     }
 }
 
-/// Reads a stream to EOF and discards it.
-///
-/// Used for a suppressed duplicate: dropping the stream instead would reset
-/// it, and the sender would read that as a refusal
-/// ([FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4) — which a
-/// successfully deduplicated message is not.
-async fn drain(mut stream: RecvHalf) -> Result<(), Error> {
-    // Heap, not stack: this future is awaited inline by `handle_data`, which
-    // `handle_stream` awaits inline, which `accept_uni_loop` spawns — and a
-    // generator is as large as its largest state, not the states it takes.
-    // An array here made every inbound unidirectional stream's boxed future
-    // 8 KiB larger whether it deduplicated anything or not.
-    let mut scratch = vec![0u8; 8 * 1024];
-    while stream.read(&mut scratch).await?.is_some() {}
-    Ok(())
+/// Wraps an arrived exchange: the request body and the reply half, with the
+/// metadata the header gave, moved out of it rather than copied.
+fn request_for(
+    ctx: &ConnHandle,
+    header: DataHeader,
+    recv: RecvHalf,
+    send: SendHalf,
+) -> IncomingRequest {
+    IncomingRequest::new(
+        IncomingTransfer::new(
+            recv,
+            Arc::new(IncomingMeta::from_header(
+                header,
+                ctx.peer.clone(),
+                ctx.peer_chain.clone(),
+            )),
+            Arc::clone(ctx),
+        ),
+        send,
+        Arc::clone(ctx),
+    )
+}
+
+/// Ends a stream whose frame head did not arrive: both halves are refused,
+/// so a peer that opened an exchange and went quiet learns that it was
+/// turned away instead of waiting for a reply that is not coming.
+fn refuse_head(mut recv: RecvHalf, mut send: SendHalf, error: Error) -> Result<(), Error> {
+    recv.stop(codes::CANCELED);
+    send.reset(codes::CANCELED);
+    Err(error)
 }
 
 /// Dispatches one exchange arriving on a bidirectional stream.
 ///
 /// Only DATA may open one. A misroute is answered on the reply half with a
 /// real ERROR frame, which is the whole reason the reply half exists.
-async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Result<(), Error> {
-    let preamble = match read_preamble(&mut recv, ctx.limits.max_header_bytes).await {
+async fn handle_bi(ctx: &ConnHandle, mut send: SendHalf, mut recv: RecvHalf) -> Result<(), Error> {
+    let preamble = match read_preamble_within(ctx, &mut recv).await {
         Ok(preamble) => preamble,
         Err(Error::Protocol(reason)) => return violation(ctx, &reason),
-        Err(e) => return Err(e),
+        Err(e) => return refuse_head(recv, send, e),
     };
     if preamble.kind != FrameKind::Data {
         return violation(
@@ -1287,49 +1472,54 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
     }
     ctx.negotiated().await?;
 
-    let header = read_header(&mut recv, &preamble).await?;
+    let header = match read_header_within(ctx, &mut recv, &preamble).await {
+        Ok(header) => header,
+        Err(e) => return refuse_head(recv, send, e),
+    };
     let header = match DataHeader::decode(&header) {
         Ok(h) => h,
         Err(e) => return violation(ctx, &e.to_string()),
     };
-    let Some(path) = header.endpoint.clone() else {
+    let Some(path) = header.endpoint.as_deref() else {
         return violation(
             ctx,
             "the initiating half of an exchange must name an endpoint",
         );
     };
 
-    let route = ctx.namespace.lookup(&path);
-    let request = IncomingRequest::new(
-        IncomingTransfer::new(
-            recv,
-            Arc::new(IncomingMeta::from_header(
-                &header,
-                ctx.peer.clone(),
-                ctx.peer_chain.clone(),
-            )),
-            Arc::clone(ctx),
-        ),
-        send,
-        Arc::clone(ctx),
-    );
+    let route = ctx.namespace.lookup(path);
     if let Some(refusal) = refusal_for(route.as_ref(), Wanted::Exchange) {
-        tracing::debug!(path, ?refusal, "the path does not serve an exchange");
-        request.refuse_coded(refusal.code, refusal.stop).await;
+        tracing::debug!(path = ?path, ?refusal, "the path does not serve an exchange");
+        // Said on the reply half as a real ERROR frame, and the request half
+        // is stopped so a payload still being written is not accepted. A
+        // refusal builds no metadata and no request: nothing here is kept.
+        recv.stop(refusal.stop);
+        if let Err(e) = write_error_frame(&mut send, refusal.code).await {
+            tracing::debug!(error = %e, "failed to refuse an exchange");
+        }
         return Ok(());
     }
+    let request = request_for(ctx, header, recv, send);
     match route {
         // Backpressure again: a full accept queue stalls this task, and the
         // peer feels it through flow control. If the endpoint went away, the
         // request's own destructor reports NO_REPLY.
         Some(Route::Request(queue)) => {
-            if queue.send(request).await.is_err() {
-                tracing::debug!(path, "endpoint went away while dispatching");
+            if let Err(gone) = queue.send(request).await {
+                tracing::debug!(
+                    path = ?gone.0.meta().endpoint,
+                    "endpoint went away while dispatching"
+                );
             }
         }
         Some(Route::Raw(queue)) => {
-            if queue.send(Incoming::Exchange(request)).await.is_err() {
-                tracing::debug!(path, "acceptor went away while dispatching");
+            if let Err(gone) = queue.send(Incoming::Exchange(request)).await
+                && let Incoming::Exchange(request) = gone.0
+            {
+                tracing::debug!(
+                    path = ?request.meta().endpoint,
+                    "acceptor went away while dispatching"
+                );
             }
         }
         // `refusal_for` above already refused these.

@@ -7,10 +7,11 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{Certs, Server, raw};
-use weida::{Error, Runtime, RuntimeConfig, TransferMeta, codes};
+use weida::{Error, Incoming, Runtime, RuntimeConfig, TransferMeta, codes};
 use weida_protocol::header::{GuaranteeSet, OrderingMode};
 use weida_protocol::{
     CreditHeader, DataHeader, ErrorHeader, FlowHeader, FrameKind, Hello, MAGIC, SubscriptionHeader,
@@ -890,4 +891,473 @@ async fn an_exchange_before_hello_is_parked_not_rejected() {
     assert_eq!(preamble.kind, FrameKind::Data);
     handler.await.expect("handler");
     assert!(conn.close_reason().is_none(), "the connection must survive");
+}
+
+// --- header phase, subscriptions and consumer identity -------------------
+
+/// Ceiling for each await in the tests below. A healthy connection settles in
+/// milliseconds, so a misbehaving one fails fast instead of at the suite's
+/// fifteen-second ceiling.
+const SHORT_DEADLINE: Duration = Duration::from_secs(5);
+
+async fn bounded<F: Future>(f: F) -> F::Output {
+    tokio::time::timeout(SHORT_DEADLINE, f)
+        .await
+        .expect("operation timed out")
+}
+
+/// Dials `server` from a raw endpoint and completes the QUIC handshake.
+async fn dial(endpoint: &quinn::Endpoint, server: &Server) -> quinn::Connection {
+    bounded(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake")
+}
+
+/// Opens a unidirectional stream and writes a DATA preamble that announces a
+/// 16 KiB header, then nothing: a frame head that never completes. The stream
+/// is returned so the caller decides when it ends.
+async fn stalled_head(conn: &quinn::Connection) -> quinn::SendStream {
+    let mut stream = conn.open_uni().await.expect("open uni");
+    let mut bytes = Vec::new();
+    encode_preamble(FrameKind::Data, 16 * 1024, &mut bytes);
+    stream.write_all(&bytes).await.expect("write preamble");
+    stream
+}
+
+/// Sends one SUBSCRIBE or UNSUBSCRIBE frame for `filter` on `endpoint`.
+async fn send_subscription(
+    conn: &quinn::Connection,
+    kind: FrameKind,
+    endpoint: &str,
+    filter: &str,
+) {
+    let header = SubscriptionHeader::new(endpoint, filter).encode();
+    raw::send_frame(conn, kind, &header).await;
+}
+
+/// Reads the whole capture as text.
+fn captured_text(captured: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&captured.lock().expect("capture lock")).into_owned()
+}
+
+/// A tracing writer that keeps every byte in memory.
+#[derive(Clone)]
+struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("capture lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_frame_head_is_stopped_at_the_deadline_and_the_connection_survives() {
+    let limits = weida::Limits {
+        header_timeout_ms: 300,
+        ..weida::Limits::default()
+    };
+    let server = Server::start_with(limits).await;
+    let _puller = server.listener.puller("/jobs").expect("puller");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = dial(&endpoint, &server).await;
+    raw::send_hello(&conn).await;
+
+    let stalled = stalled_head(&conn).await;
+    let stopped = bounded(stalled.stopped()).await.expect("stream stopped");
+    assert_eq!(
+        stopped.map(quinn::VarInt::into_inner),
+        Some(codes::CANCELED),
+        "a stalled head is stopped with CANCELED"
+    );
+    assert!(
+        conn.close_reason().is_none(),
+        "a stalled stream is not a malformed one: the connection must survive"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_header_holds_its_slot_until_the_deadline() {
+    // One header slot per connection: the stalled head takes it, so a complete
+    // frame on another stream waits until the stalled head is stopped.
+    let limits = weida::Limits {
+        max_header_streams: 1,
+        header_timeout_ms: 1500,
+        ..weida::Limits::default()
+    };
+    let server = Server::start_with(limits).await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = dial(&endpoint, &server).await;
+    raw::send_hello(&conn).await;
+
+    let _stalled = stalled_head(&conn).await;
+    // Unidirectional streams are unordered: let the server take the slot for
+    // the stalled head before the valid frame is written.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let header = DataHeader::addressed("/jobs").encode();
+    let mut bytes = Vec::new();
+    encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(b"valid payload");
+    let mut valid = conn.open_uni().await.expect("open uni");
+    valid.write_all(&bytes).await.expect("write frame");
+    valid.finish().expect("finish");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), puller.recv())
+            .await
+            .is_err(),
+        "the valid frame was delivered while the stalled head held the only slot"
+    );
+
+    let transfer = bounded(puller.recv())
+        .await
+        .expect("recv after the stalled head expired");
+    let body = bounded(transfer.collect(1024)).await.expect("collect");
+    assert_eq!(body, b"valid payload");
+}
+
+#[tokio::test]
+async fn a_second_hello_closes_the_connection() {
+    let server = Server::start().await;
+    let endpoint = raw::client_endpoint(&server.certs);
+
+    // Control: one HELLO is the whole negotiation and the connection stays.
+    let control = dial(&endpoint, &server).await;
+    raw::send_hello(&control).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        control.close_reason().is_none(),
+        "one HELLO must keep the connection"
+    );
+
+    let conn = dial(&endpoint, &server).await;
+    raw::send_hello(&conn).await;
+    raw::send_hello(&conn).await;
+    assert_eq!(
+        bounded(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn an_unsubscribe_without_a_subscription_frees_no_reservation() {
+    let limits = weida::Limits {
+        max_subscriptions: 8,
+        ..weida::Limits::default()
+    };
+    let server = Server::start_with(limits).await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+    let _acceptor = server.listener.acceptor("/q").expect("acceptor");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = dial(&endpoint, &server).await;
+    raw::send_hello(&conn).await;
+
+    // The connection reaches its cap on a publisher's path.
+    for i in 0..8 {
+        send_subscription(&conn, FrameKind::Subscribe, "/md", &format!("f{i}.")).await;
+    }
+    bounded(async {
+        while publisher.filter_count() != 8 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+
+    // Eight UNSUBSCRIBEs for filters this connection never held, on a queue's
+    // path. None of them may give a reservation back.
+    for i in 0..8 {
+        send_subscription(&conn, FrameKind::Unsubscribe, "/q", &format!("never{i}.")).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    send_subscription(&conn, FrameKind::Subscribe, "/md", "f8.").await;
+    assert_eq!(
+        bounded(raw::closed_code(&conn)).await,
+        codes::LIMIT_EXCEEDED,
+        "the ninth subscription must hit the cap"
+    );
+}
+
+#[tokio::test]
+async fn a_queue_consumer_with_a_second_filter_is_reported_gone_with_its_connection() {
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/q").expect("acceptor");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = dial(&endpoint, &server).await;
+    raw::send_hello(&conn).await;
+
+    send_subscription(&conn, FrameKind::Subscribe, "/q", "a").await;
+    send_subscription(&conn, FrameKind::Subscribe, "/q", "b").await;
+
+    // Both announcements are read before the UNSUBSCRIBE is sent: the server
+    // may process the frames in any order, so the UNSUBSCRIBE must not
+    // overtake the SUBSCRIBE it cancels.
+    let mut filters = Vec::new();
+    let mut id = None;
+    for _ in 0..2 {
+        match bounded(acceptor.accept()).await.expect("accept") {
+            Incoming::Subscribed(consumer) => {
+                assert_eq!(*id.get_or_insert(consumer.id()), consumer.id());
+                filters.push(consumer.filter().to_owned());
+            }
+            other => panic!("expected Subscribed, got {other:?}"),
+        }
+    }
+    let id = id.expect("a consumer");
+    filters.sort();
+    assert_eq!(filters, vec!["a", "b"]);
+
+    send_subscription(&conn, FrameKind::Unsubscribe, "/q", "a").await;
+    match bounded(acceptor.accept()).await.expect("accept") {
+        Incoming::Unsubscribed {
+            id: gone,
+            filter: Some(filter),
+        } => {
+            assert_eq!(gone, id);
+            assert_eq!(filter, "a");
+        }
+        other => panic!("expected Unsubscribed for \"a\", got {other:?}"),
+    }
+
+    // The filter "b" is still held, so the close must still report the consumer.
+    conn.close(quinn::VarInt::from_u32(0), b"gone");
+    match bounded(acceptor.accept()).await.expect("accept") {
+        Incoming::Unsubscribed {
+            id: gone,
+            filter: None,
+        } => assert_eq!(gone, id),
+        other => panic!("expected the connection's end for {id:?}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_subscribe_is_counted_and_announced_once() {
+    let limits = weida::Limits {
+        max_subscriptions: 2,
+        ..weida::Limits::default()
+    };
+    let server = Server::start_with(limits).await;
+    let acceptor = server.listener.acceptor("/q").expect("acceptor");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = dial(&endpoint, &server).await;
+    raw::send_hello(&conn).await;
+
+    // Three copies of "a" are one subscription: the cap of two still has room
+    // for "b".
+    for filter in ["a", "a", "a", "b"] {
+        send_subscription(&conn, FrameKind::Subscribe, "/q", filter).await;
+    }
+
+    let mut announced = Vec::new();
+    for _ in 0..2 {
+        match bounded(acceptor.accept()).await.expect("accept") {
+            Incoming::Subscribed(consumer) => announced.push(consumer.filter().to_owned()),
+            other => panic!("expected Subscribed, got {other:?}"),
+        }
+    }
+    announced.sort();
+    assert_eq!(announced, vec!["a", "b"]);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), acceptor.accept())
+            .await
+            .is_err(),
+        "a repeated SUBSCRIBE was announced again"
+    );
+    assert!(
+        conn.close_reason().is_none(),
+        "a repeated SUBSCRIBE must not close the connection"
+    );
+}
+
+#[tokio::test]
+async fn a_header_longer_than_the_peer_reads_is_refused_before_it_is_written() {
+    let certs = Certs::generate();
+    let client = client_for();
+
+    // A peer that reads 64-byte headers only. Every stream the sender opens is
+    // read to its end: a stream that ends with no bytes is one opened for a
+    // send that was then refused, and a receiver treats it as a violation.
+    let (report_tx, report_rx) = tokio::sync::oneshot::channel::<(Option<String>, usize, bool)>();
+    let addr = raw_server(&certs, move |conn| async move {
+        raw::send_frame(&conn, FrameKind::Hello, &Hello::v0(64, 8).encode()).await;
+        let mut empty = 0usize;
+        let topic = loop {
+            let mut stream = bounded(conn.accept_uni()).await.expect("accept uni");
+            let bytes = bounded(stream.read_to_end(64 * 1024))
+                .await
+                .expect("read stream");
+            if bytes.is_empty() {
+                empty += 1;
+                continue;
+            }
+            let (preamble, used) =
+                weida_protocol::parse_preamble(&bytes, 16 * 1024).expect("preamble");
+            if preamble.kind == FrameKind::Data {
+                let end = used + preamble.header_len as usize;
+                let header = DataHeader::decode(&bytes[used..end]).expect("decode DATA header");
+                break header.topic;
+            }
+        };
+        let _ = report_tx.send((topic, empty, conn.close_reason().is_none()));
+    });
+
+    let pusher = client.pusher(certs.client_tls());
+    bounded(pusher.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
+        .await
+        .expect("connect");
+    let oversized = TransferMeta::default().with_topic("t".repeat(100));
+    let err = bounded(pusher.send_with(oversized, b"refused"))
+        .await
+        .expect_err("a header the peer cannot read must not be sent");
+    assert!(
+        matches!(err, Error::LimitExceeded),
+        "expected LimitExceeded, got {err:?}"
+    );
+    bounded(pusher.send_with(TransferMeta::default().with_topic("t"), b"short"))
+        .await
+        .expect("a short topic is sent");
+
+    let (topic, empty, open) = bounded(report_rx).await.expect("the peer reported");
+    assert_eq!(
+        empty, 0,
+        "a refused send opened a stream and finished it with no bytes"
+    );
+    assert_eq!(
+        topic.as_deref(),
+        Some("t"),
+        "the refused header reached the peer"
+    );
+    assert!(open, "the refused send must not close the connection");
+
+    // Subscriber half: a filter above the 256-byte cap fails on the sender's
+    // side, and the connection carrying the short filter survives it.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (sub_tx, sub_rx) = tokio::sync::oneshot::channel::<bool>();
+    let addr = raw_server(&certs, move |conn| async move {
+        raw::send_frame(&conn, FrameKind::Hello, &Hello::v0(64, 8).encode()).await;
+        let (_stream, header) = bounded(raw::accept_frame(&conn, FrameKind::Subscribe)).await;
+        let header = SubscriptionHeader::decode(&header).expect("decode SUBSCRIBE");
+        assert_eq!(header.filter, "a");
+        let _ = bounded(release_rx).await;
+        let _ = sub_tx.send(conn.close_reason().is_none());
+    });
+
+    let subscriber = client.subscriber(certs.client_tls());
+    bounded(subscriber.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
+        .await
+        .expect("connect");
+    bounded(subscriber.subscribe("a"))
+        .await
+        .expect("a short filter is sent");
+    let too_long = "a".repeat(257);
+    assert!(
+        bounded(subscriber.subscribe(&too_long)).await.is_err(),
+        "a filter above the cap must be refused"
+    );
+    release_tx.send(()).expect("release the peer");
+    assert!(
+        bounded(sub_rx).await.expect("the peer reported"),
+        "a refused filter must not close the connection"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_supplied_strings_are_logged_on_one_line() {
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&captured);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || LogSink(Arc::clone(&writer)))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    // Thread-local: the test runtime is current-thread, so the server's tasks
+    // log into this subscriber.
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = Server::start().await;
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = dial(&endpoint, &server).await;
+    raw::send_hello(&conn).await;
+
+    // A CREDIT for a path with no queue, whose endpoint carries a line break
+    // and a forged record. The frame is ignored, and the ignore is logged.
+    let credit = CreditHeader::new("/x\n[ERROR] forged", "", 7);
+    raw::send_frame(&conn, FrameKind::Credit, &credit.encode()).await;
+    bounded(async {
+        while !captured_text(&captured).contains("forged") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    let text = captured_text(&captured);
+    assert!(
+        !text.lines().any(|line| line.starts_with("[ERROR]")),
+        "a peer string forged a log line:\n{text}"
+    );
+    let record = text
+        .lines()
+        .find(|line| line.contains("forged"))
+        .expect("the credit record");
+    assert!(
+        record.contains("ignoring a credit frame"),
+        "the credit record is not on one line:\n{text}"
+    );
+    assert!(
+        conn.close_reason().is_none(),
+        "an ignored frame keeps the connection"
+    );
+}
+
+#[tokio::test]
+async fn consumer_ids_are_never_reused_across_connections() {
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/q").expect("acceptor");
+    let endpoint = raw::client_endpoint(&server.certs);
+
+    let mut ids = Vec::new();
+    for _ in 0..200 {
+        let conn = dial(&endpoint, &server).await;
+        raw::send_hello(&conn).await;
+        send_subscription(&conn, FrameKind::Subscribe, "/q", "").await;
+        let consumer = match bounded(acceptor.accept()).await.expect("accept") {
+            Incoming::Subscribed(consumer) => consumer,
+            other => panic!("expected Subscribed, got {other:?}"),
+        };
+        let id = consumer.id();
+        drop(consumer);
+        ids.push(id);
+
+        conn.close(quinn::VarInt::from_u32(0), b"next");
+        match bounded(acceptor.accept()).await.expect("accept") {
+            Incoming::Unsubscribed {
+                id: gone,
+                filter: None,
+            } => assert_eq!(gone, id),
+            other => panic!("expected the connection's end for {id:?}, got {other:?}"),
+        }
+    }
+
+    let mut distinct = ids.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "a consumer id was handed out twice"
+    );
 }

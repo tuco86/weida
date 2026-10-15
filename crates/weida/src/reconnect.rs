@@ -29,14 +29,23 @@ use weida_core::{Fingerprint, LossCause, PeerIdentity};
 /// because that is not the peer the address named (0031 §4.7).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconnectPolicy {
-    /// Delay before the first redial. Doubles on every failed attempt.
+    /// Delay before the first redial. Doubles on every failed attempt, and on
+    /// every connection that did not stay up (see [`ReconnectPolicy::max`]).
     pub initial: Duration,
     /// Ceiling on the delay between attempts.
+    ///
+    /// It is also what "stayed up" means: a connection that lived at least
+    /// this long earns a fresh schedule, and one that closed sooner — a server
+    /// that accepts, says HELLO and hangs up, or a crash loop — continues the
+    /// schedule where it stopped. Such a peer is redialled ever more slowly
+    /// instead of at [`ReconnectPolicy::initial`] for as long as it keeps
+    /// doing it.
     pub max: Duration,
     /// Whether each delay is drawn uniformly from the upper half of its
     /// computed value rather than used exactly.
     pub jitter: bool,
-    /// Attempts after one loss before the slot is given up; `None` retries
+    /// Attempts since the last connection that stayed up (see
+    /// [`ReconnectPolicy::max`]) before the slot is given up; `None` retries
     /// for as long as the endpoint lives.
     pub max_attempts: Option<u32>,
     /// Give the slot up when the peer closed the connection deliberately
@@ -188,7 +197,7 @@ pub enum PeerEvent {
     Retrying {
         /// The address as it was dialled.
         url: Arc<str>,
-        /// Which attempt since the loss, from 1.
+        /// Which attempt since the last connection that stayed up, from 1.
         attempt: u32,
         /// How long the runtime waits before it. On an in-process address
         /// this is the policy's number, but the wait ends as soon as the bus

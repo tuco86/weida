@@ -132,6 +132,23 @@ pub struct Limits {
     /// controller than a media profile
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §6).
     pub congestion: Congestion,
+
+    /// How long one inbound stream may take to deliver its preamble and then
+    /// its header, each read counted from the moment a header slot was free
+    /// for it, in milliseconds. A stream that stalls inside its frame head
+    /// is stopped with `CANCELED` at the deadline and the connection
+    /// survives: the peer opened a stream and then said nothing, which holds
+    /// a unit of its stream credit and a task for as long as it likes
+    /// otherwise, and the QUIC idle timer does not help against a peer that
+    /// keeps the connection alive with its own pings. The wait for the
+    /// peer's HELLO is not counted ([`Limits::hello_timeout_ms`] bounds it).
+    pub header_timeout_ms: u64,
+    /// Inbound streams one connection may have reading their frame head at
+    /// once; the rest wait for a free slot without holding a buffer. With
+    /// `max_header_bytes` this is the worst case of header memory per
+    /// connection ([`Limits::worst_case_header_memory`]), independent of how
+    /// many streams the peer's stream budget lets it open.
+    pub max_header_streams: usize,
 }
 
 /// A QUIC congestion controller, as `quinn` implements them.
@@ -154,11 +171,16 @@ pub const DEFAULT_DATAGRAM_RECEIVE_BYTES: usize = 65_536;
 impl Limits {
     /// Worst-case header memory a single hostile connection can pin, in bytes.
     ///
-    /// Both stream budgets count: a peer may open its full uni *and* bidi
-    /// allowance, and every accepted stream starts with one header.
+    /// Only [`Limits::max_header_streams`] streams read a frame head at once
+    /// and the others wait without a buffer, and a header buffer grows with
+    /// the bytes that actually arrive, so the bound is the header cap times
+    /// the smaller of that count and the stream budgets (a peer may open its
+    /// full uni *and* bidi allowance, which is the other way to reach it).
     pub const fn worst_case_header_memory(&self) -> u64 {
-        self.max_header_bytes
-            * (self.max_concurrent_uni_streams as u64 + self.max_concurrent_bidi_streams as u64)
+        let budget =
+            self.max_concurrent_uni_streams as u64 + self.max_concurrent_bidi_streams as u64;
+        let reading = self.max_header_streams as u64;
+        self.max_header_bytes * if reading < budget { reading } else { budget }
     }
 }
 
@@ -189,6 +211,8 @@ impl Default for Limits {
             flow_early_bytes: 4_096,
             flow_early_hold: Duration::from_secs(1),
             congestion: Congestion::Cubic,
+            header_timeout_ms: 10_000,
+            max_header_streams: 64,
         }
     }
 }
@@ -223,10 +247,20 @@ mod tests {
         assert_eq!(l.flow_early_bytes, 4 << 10);
         assert_eq!(l.flow_early_hold, Duration::from_secs(1));
         assert_eq!(l.congestion, Congestion::Cubic);
+        assert_eq!(l.header_timeout_ms, 10_000);
+        assert_eq!(l.max_header_streams, 64);
     }
 
     #[test]
-    fn worst_case_header_memory_is_48_mib() {
-        assert_eq!(Limits::default().worst_case_header_memory(), 48 << 20);
+    fn worst_case_header_memory_follows_the_header_phase_cap() {
+        // 16 KiB * 64 streams reading their head at once.
+        assert_eq!(Limits::default().worst_case_header_memory(), 1 << 20);
+        // A budget smaller than the cap is the tighter bound.
+        let few = Limits {
+            max_concurrent_uni_streams: 2,
+            max_concurrent_bidi_streams: 1,
+            ..Limits::default()
+        };
+        assert_eq!(few.worst_case_header_memory(), 3 * 16 * 1024);
     }
 }

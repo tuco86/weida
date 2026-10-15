@@ -116,6 +116,8 @@ token binds connections and resumes nothing: no subscriptions, no sequence
 position, no dedup window, and it is meaningless once the control connection
 closes, which is why it is not the session state §11 excludes [0012 §4.5].
 
+**A local connection keeps its place for its life.** Each local connection takes one of the binding's `max_connections` places before it is accepted, and keeps it while it lives: a control connection for as long as its link does, a transfer or parked connection until its last half is gone. Its preamble must arrive within `hello_timeout_ms`, or the socket is closed. The dialling side keeps its control connection open for the life of the link, and the accepting side watches that connection: when it ends, the accepting side closes the link with `SHUTDOWN` and the peer's subscriptions and group go with it, so a peer that exits without a word is noticed without a keep-alive.
+
 A server has no way to *dial* a peer that dialled it, so a stream toward such
 a peer rides a connection that peer parked in advance: a subscriber over a
 socket transport opens `Limits::max_parked_reverse` reverse connections and
@@ -338,6 +340,7 @@ a defect because it lets a remote peer choose the allocation size.
 - A REPORT stream (§6.10) from a peer when not both HELLOs listed capability code `2`, a second
   REPORT stream from the peer on one connection, a REPORT record longer than 256 bytes, or a
   REPORT record truncated at FIN.
+- A second HELLO on one connection. Its parameters are not negotiated again: the agreed set is the first HELLO's alone.
 
 These rules are symmetric: they apply identically to streams received by the QUIC client
 and by the QUIC server. All network input is hostile (master doc §81 rule 18); neither role
@@ -1503,6 +1506,8 @@ Per connection (`Limits`):
 | Field | Default | Bound enforced |
 | --- | --- | --- |
 | `max_header_bytes` | `16384` | largest header a peer may make this side buffer; checked before allocation (§3.1) |
+| `header_timeout_ms` | `10000` | time an inbound stream may take to deliver its preamble, and then its header, counted from the moment it takes a header slot; a stream that misses it is stopped with `STOP_SENDING(CANCELED)` and the connection survives |
+| `max_header_streams` | `64` | inbound streams that may hold a header slot, that is read a frame head, at once; the rest wait without holding a buffer. Worst-case header memory is this count times `max_header_bytes` (below) |
 | `max_concurrent_uni_streams` | `2048` | QUIC `TransportConfig::max_concurrent_uni_streams`; bounds parked/in-flight one-way stream tasks per connection |
 | `max_concurrent_bidi_streams` | `1024` | QUIC `TransportConfig::max_concurrent_bidi_streams`; bounds live exchanges per connection |
 | `stream_receive_window` | 1 MiB | per-stream QUIC flow-control window; bounds unread payload buffered per stream |
@@ -1512,7 +1517,7 @@ Per connection (`Limits`):
 | `hello_timeout_ms` | 10 s | time a connection may exist without a processed peer HELLO |
 | `max_subscriptions` | `256` | subscription filters one peer connection may hold, summed over paths; exceeding it closes the connection with `LIMIT_EXCEEDED` (§6.4) |
 | `subscriber_buffer_bytes` | 8 MiB | payload bytes a publisher will hold queued for one subscriber; a message that does not fit is dropped for that subscriber (§9.5) |
-| `max_sequence_scopes` | `1024` | producer scopes — paths and topics — a receiver tracks per connection for gap detection or reassembly under `PerProducer` ordering; the peer names the scopes, so at the cap a new one is simply not tracked |
+| `max_sequence_scopes` | `1024` | producer scopes, `(path, topic)` pairs, a receiver tracks per connection for gap detection or reassembly under `PerProducer` ordering; the peer names the scopes, so at the cap the least recently used scope that holds no transfer is forgotten to make room, and a new scope is untracked only when every tracked scope holds one |
 | `max_reorder_hold` | `256` | transfers a receiver holds back at once, over all scopes, under `PerProducer(reassemble)`; at the cap the oldest held transfer is released out of order with its gap reported (§6.5, [GUARANTEES.md](GUARANTEES.md) §3). A held transfer is an unread stream, so the bytes it pins are bounded again by `stream_receive_window` and `connection_receive_window` |
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
 | `max_local_streams` | `255` | live transfers on one **local** connection (§2.1), where the stream is the OS object and there is no multiplexing; an `open` at the cap waits for a live transfer to end, exactly as a QUIC `open` waits on the peer's stream budget, rather than refusing. The number was chosen as Windows' named-pipe instance range [0010 §4.2]; the pipe itself is created with `PIPE_UNLIMITED_INSTANCES`, so this per-peer count is the only ceiling on every platform |
@@ -1530,7 +1535,9 @@ Per runtime (`RuntimeConfig`):
 
 | Field | Default | Bound enforced |
 | --- | --- | --- |
-| `max_connections` | `1024` | connections accepted per server binding; excess connections are closed immediately with `LIMIT_EXCEEDED` |
+| `max_connections` | `1024` | live connections per server binding. On QUIC an Initial that arrives at the cap is refused with `CONNECTION_REFUSED` before its handshake is accepted, so nothing is built for it; on a local transport the surplus waits in the kernel's backlog until a place frees (§2.1) |
+| `max_handshakes` | `256` | QUIC handshakes a binding runs at once, from the moment an Initial is accepted until its handshake completes or fails; an Initial past it is refused with `CONNECTION_REFUSED` before anything is built. A completed handshake is counted by `max_connections`, not by this |
+| `retry_above_handshakes` | `64` | handshakes in progress from which an Initial from an address the peer has not validated is answered with a stateless Retry instead of being accepted, so a flood from spoofed sources allocates nothing and a real dialler pays one round trip |
 | `max_connections_per_peer` | `64` | connections one **peer** may hold on one binding, counted by the fingerprint it proved; the excess connection is closed with `LIMIT_EXCEEDED`. It exists because one connection per dialled path (§2.5) lets the dialling side choose the count, and 64 connections to one peer measured about 50 MiB of transport state on the pair ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.8). Connections that proved no identity are each their own peer and are bounded only by `max_connections` (§2.5) |
 | `endpoint_queue` | `256` | depth of the accept channel per registered endpoint |
 | `max_resolved_addresses` | `8` | addresses a dialling endpoint will try for one hostname, in the resolver's order; a resolver answer is remote input, so its length needs a ceiling |
@@ -1540,13 +1547,13 @@ Per runtime (`RuntimeConfig`):
 Worst-case hostile per-connection header memory is bounded by
 
 ```text
-max_header_bytes * (max_concurrent_uni_streams + max_concurrent_bidi_streams)
-        = 16 KiB * (2048 + 1024) = 48 MiB
+max_header_bytes * min(max_header_streams, max_concurrent_uni_streams + max_concurrent_bidi_streams)
+        = 16 KiB * min(64, 2048 + 1024) = 1 MiB
 ```
 
-Both stream budgets count: a peer may open its full unidirectional *and* bidirectional
-allowance, and every accepted stream starts with one header. This is the governing number
-for hostile-peer memory sizing in v0.
+The stream budgets still bound how many streams a peer may have open, but only `max_header_streams`
+of them hold a frame-head buffer at once, so a peer that opens its full allowance pins at most that
+many heads. This is the governing number for hostile-peer memory sizing in v0.
 
 `max_concurrent_bidi_streams` is the concurrency ceiling for inbound requests: a peer cannot
 hold more live exchanges than this, and the transport enforces it, on the side that pays for it.

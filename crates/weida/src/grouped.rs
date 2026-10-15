@@ -55,6 +55,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use weida_core::{Error, LossCause, PeerIdentity};
 use weida_protocol::codes;
 
+use crate::runtime::Exec;
+
 /// First byte of a control connection.
 const KIND_CONTROL: u8 = 0x01;
 /// First byte of a transfer connection, followed by the 16-byte group token.
@@ -125,6 +127,11 @@ pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send + Sized + 'static
 /// Both halves of one transfer connection.
 pub(crate) type Halves<S> = (LocalSend<S>, LocalRecv<S>);
 
+/// One place of the binding's `max_connections`. A local connection keeps its
+/// place for as long as it lives: a control connection for the life of its
+/// link, a transfer or parked connection until its last half is gone.
+pub(crate) type Place = OwnedSemaphorePermit;
+
 /// The peers a binding has admitted, keyed by their group token.
 pub(crate) struct Groups<S: Stream> {
     entries: StdMutex<HashMap<[u8; TOKEN_LEN], Group<S>>>,
@@ -142,6 +149,11 @@ struct Group<S: Stream> {
     /// Credentials of the control connection: what a transfer connection must
     /// match [0012 §4.2].
     principal: S::Principal,
+    /// One permit per transfer connection admitted for this peer that is
+    /// still alive, out of [`LIVE_CAP`]: what a link whose peer's control
+    /// connection ended waits on before it closes, so that what the peer
+    /// sent before it exited is still delivered.
+    live: Arc<Semaphore>,
     transfers: mpsc::UnboundedSender<Halves<S>>,
     /// Connections this peer parked for streams in the other direction
     /// [0012 §4.4]. Shared with the peer's link, which is what spends them.
@@ -171,7 +183,9 @@ impl<S: Stream> ReversePool<S> {
     }
 
     /// Takes a parked connection in, or refuses it because a bound says so.
-    fn park(&self, send: S::Writer) -> bool {
+    /// `place` is the binding's place for the connection; it stays with the
+    /// write half for as long as that half lives, spent or not.
+    fn park(&self, send: S::Writer, place: Place) -> bool {
         let mut parked = self.parked.lock().expect("reverse pool poisoned");
         if parked.len() >= self.max {
             return false;
@@ -179,7 +193,7 @@ impl<S: Stream> ReversePool<S> {
         let Some(slot) = StreamSlot::try_acquire(&self.slots) else {
             return false;
         };
-        parked.push_back(LocalSend::new(send, Some(Arc::new(slot))));
+        parked.push_back(LocalSend::new(send, Some(Arc::new(slot))).placed(Arc::new(place)));
         true
     }
 
@@ -208,6 +222,7 @@ impl<S: Stream> Groups<S> {
                 token,
                 Group {
                     principal,
+                    live: Arc::new(Semaphore::new(LIVE_CAP)),
                     transfers,
                     reverse,
                 },
@@ -241,16 +256,49 @@ impl<S: Stream> Groups<S> {
     }
 
     /// Hands a transfer connection to its peer.
-    fn admit(&self, token: &[u8; TOKEN_LEN], principal: &S::Principal, halves: Halves<S>) -> bool {
+    ///
+    /// The connection keeps its `place` until both of its halves are gone,
+    /// so what a peer can have queued on a binding is bounded by the
+    /// binding's `max_connections`, not by the descriptor limit of the
+    /// process. It is **not** refused for being one of many: a sender that
+    /// outruns a slow consumer is a documented case that waits and loses
+    /// nothing (`docs/GUARANTEES.md` §6), and the dialling side frees its own
+    /// slot at its FIN, so only the accepting side sees the backlog. What
+    /// bounds it is the accept loop, which takes a place before it accepts a
+    /// connection and so leaves the surplus waiting in the kernel's queue.
+    fn admit(
+        &self,
+        token: &[u8; TOKEN_LEN],
+        principal: &S::Principal,
+        stream: S,
+        place: Place,
+    ) -> bool {
         self.with_group(token, principal, |group| {
+            // A slot of the peer's live count, held until both halves are gone.
+            let Some(live) = StreamSlot::try_acquire(&group.live) else {
+                return false;
+            };
+            let live = Arc::new(live);
+            let place = Arc::new(place);
+            let (recv, send) = stream.split();
+            let halves = (
+                LocalSend::new(send, Some(Arc::clone(&live))).placed(Arc::clone(&place)),
+                LocalRecv::new(recv, Some(live)).placed(place),
+            );
             group.transfers.send(halves).is_ok()
         })
         .unwrap_or(false)
     }
 
     /// Parks a reverse connection for its peer, if a bound leaves room.
-    fn park(&self, token: &[u8; TOKEN_LEN], principal: &S::Principal, send: S::Writer) -> bool {
-        self.with_group(token, principal, |group| group.reverse.park(send))
+    fn park(
+        &self,
+        token: &[u8; TOKEN_LEN],
+        principal: &S::Principal,
+        send: S::Writer,
+        place: Place,
+    ) -> bool {
+        self.with_group(token, principal, |group| group.reverse.park(send, place))
             .unwrap_or(false)
     }
 }
@@ -264,6 +312,9 @@ pub(crate) enum Accepted<S: Stream> {
 
 /// Reads the local preamble of an accepted connection and asks the kernel
 /// who sent it.
+///
+/// Waits on the peer for as long as the caller lets it: the accepting side
+/// bounds this with a deadline.
 pub(crate) async fn read_accepted<S: Stream>(mut stream: S) -> Result<Accepted<S>, Error> {
     let mut kind = [0u8; 1];
     stream.read_exact(&mut kind).await.map_err(Error::Io)?;
@@ -289,12 +340,17 @@ pub(crate) async fn read_accepted<S: Stream>(mut stream: S) -> Result<Accepted<S
 
 /// Serves one accepted control connection: issues the token and builds the
 /// accepting side's link.
+///
+/// `exec` runs the watch over the peer's control connection, which is how
+/// the link learns that a peer left without saying so (see
+/// [`Grouped::accept_uni`]).
 pub(crate) async fn accept_control<S: Stream>(
     mut stream: S,
     principal: S::Principal,
     groups: Arc<Groups<S>>,
     max_streams: usize,
     max_parked: usize,
+    exec: Exec,
 ) -> Result<Grouped<S>, Error> {
     let token = random_token();
     stream.write_all(&token).await.map_err(Error::Io)?;
@@ -303,6 +359,7 @@ pub(crate) async fn accept_control<S: Stream>(
         Side::Accept {
             groups: Arc::clone(&groups),
             token,
+            exec,
         },
         stream,
         Some(principal.clone()),
@@ -326,9 +383,10 @@ pub(crate) fn admit_reverse<S: Stream>(
     token: &[u8; TOKEN_LEN],
     principal: &S::Principal,
     stream: S,
+    place: Place,
 ) -> bool {
     let (_recv, send) = stream.split();
-    groups.park(token, principal, send)
+    groups.park(token, principal, send, place)
 }
 
 /// Hands an accepted transfer connection to the peer its token names, if the
@@ -338,13 +396,9 @@ pub(crate) fn admit_transfer<S: Stream>(
     token: &[u8; TOKEN_LEN],
     principal: &S::Principal,
     stream: S,
+    place: Place,
 ) -> bool {
-    let (recv, send) = stream.split();
-    groups.admit(
-        token,
-        principal,
-        (LocalSend::new(send, None), LocalRecv::new(recv, None)),
-    )
+    groups.admit(token, principal, stream, place)
 }
 
 /// Dials `endpoint`, completing the control handshake of [0012 §4.1].
@@ -386,7 +440,157 @@ enum Side<S: Stream> {
     Accept {
         groups: Arc<Groups<S>>,
         token: [u8; TOKEN_LEN],
+        /// Runs the watch over the peer's control connection.
+        exec: Exec,
     },
+}
+
+/// Everything that says a link is closed, shared with what closes it from
+/// another task: the watch over the peer's control connection.
+struct Closing<S: Stream> {
+    code: AtomicU64,
+    notify: Notify,
+    /// On the accepting side, the group this link registered. It leaves the
+    /// binding's table when the link closes: a token that names a closed link
+    /// admits nothing.
+    group: Option<(Arc<Groups<S>>, [u8; TOKEN_LEN])>,
+}
+
+impl<S: Stream> Closing<S> {
+    fn new(side: &Side<S>) -> Closing<S> {
+        Closing {
+            code: AtomicU64::new(NO_CODE),
+            notify: Notify::new(),
+            group: match side {
+                Side::Accept { groups, token, .. } => Some((Arc::clone(groups), *token)),
+                Side::Dial { .. } => None,
+            },
+        }
+    }
+
+    /// Closes with `code`; `true` for the call that did.
+    fn close(&self, code: u64) -> bool {
+        if self
+            .code
+            .compare_exchange(NO_CODE, code, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if let Some((groups, token)) = &self.group {
+            groups.remove(token);
+        }
+        self.notify.notify_waiters();
+        true
+    }
+
+    fn reason(&self) -> Option<Error> {
+        let code = self.code.load(Ordering::Acquire);
+        (code != NO_CODE).then(|| match code {
+            codes::NEGOTIATION_FAILED => {
+                Error::Negotiation("peer closed the connection: negotiation failed".into())
+            }
+            _ => Error::ConnectionLost(LossCause::PeerClosed),
+        })
+    }
+
+    /// Resolves once the link is closed.
+    async fn wait(&self) {
+        loop {
+            // Created before the state is read, so a close that lands in
+            // between is not missed.
+            let closed = self.notify.notified();
+            if self.reason().is_some() {
+                return;
+            }
+            closed.await;
+        }
+    }
+}
+
+/// The most transfer connections one peer's live count can hold; waiting for
+/// all of them back is waiting for the peer's admitted transfers to finish.
+const LIVE_CAP: usize = u32::MAX as usize;
+
+/// The longest a link whose peer's control connection ended waits for the
+/// transfers the peer had already sent before it closes anyway.
+const PEER_GONE_LINGER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long nothing may have been admitted for such a link before it closes:
+/// the peer's last connections can still be between the kernel's accept queue
+/// and their admission when its control connection is seen to end.
+const PEER_GONE_QUIET: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How often such a link looks at what is still admitted for it. It looks
+/// rather than waits for every permit, because a task waiting for all of them
+/// would take the free ones as they appear and refuse the peer's late
+/// connections.
+const PEER_GONE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl<S: Stream> Groups<S> {
+    /// The live count of the group `token` names, if there still is one.
+    fn live(&self, token: &[u8; TOKEN_LEN]) -> Option<Arc<Semaphore>> {
+        self.entries
+            .lock()
+            .expect("group registry poisoned")
+            .get(token)
+            .map(|group| Arc::clone(&group.live))
+    }
+}
+
+/// What a peer's control read half is handed to once the HELLO has been read
+/// from it: a task that reads until the peer's end goes away and then closes
+/// the link.
+struct ControlWatch<S: Stream> {
+    closing: Arc<Closing<S>>,
+    exec: Exec,
+}
+
+impl<S: Stream> ControlWatch<S> {
+    fn spawn(self, mut io: S::Reader) {
+        let ControlWatch { closing, exec } = self;
+        let linger = exec.clone();
+        exec.spawn(async move {
+            // Nothing legitimate follows the HELLO on this connection, so
+            // whatever arrives is discarded: what matters is the end.
+            let mut scratch = [0u8; 64];
+            loop {
+                tokio::select! {
+                    read = io.read(&mut scratch) => match read {
+                        Ok(n) if n > 0 => {}
+                        _ => break,
+                    },
+                    () = closing.wait() => return,
+                }
+            }
+            // The peer's end is gone, and a sender that pushes and exits is
+            // an ordinary peer: what it already sent is still delivered. The
+            // link closes once the transfers admitted for it are done and
+            // nothing more has arrived for a quiet moment, or after a bound
+            // for one that never completes.
+            let live = closing
+                .group
+                .as_ref()
+                .and_then(|(groups, token)| groups.live(token));
+            if let Some(live) = live {
+                let settled = async {
+                    let mut idle = std::time::Duration::ZERO;
+                    while idle < PEER_GONE_QUIET {
+                        linger.sleep(PEER_GONE_TICK).await;
+                        if live.available_permits() == LIVE_CAP {
+                            idle += PEER_GONE_TICK;
+                        } else {
+                            idle = std::time::Duration::ZERO;
+                        }
+                    }
+                };
+                let _ = linger.within(PEER_GONE_LINGER, settled).await;
+            }
+            if closing.close(codes::SHUTDOWN) {
+                tracing::debug!("a local peer's control connection ended; closing its link");
+            }
+        });
+    }
 }
 
 /// One local peer: its control connection plus the transfer connections
@@ -398,6 +602,12 @@ pub(crate) struct Grouped<S: Stream> {
     /// [0012 §4.1].
     control_send: StdMutex<Option<S::Writer>>,
     control_recv: StdMutex<Option<S::Reader>>,
+    /// The dialling side's control write half after its HELLO, which stays
+    /// open for as long as the link does. The accepting side reads the other
+    /// end of it, and its end is how a peer that exited without a word is
+    /// noticed: a local transport has no keep-alive and no idle timeout to
+    /// learn it from.
+    control_hold: Arc<StdMutex<Option<S::Writer>>>,
     /// Transfer connections the peer opened, for the accepting side.
     transfers: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<Halves<S>>>>,
     /// Connections this peer parked for us, for the accepting side: the only
@@ -413,11 +623,12 @@ pub(crate) struct Grouped<S: Stream> {
     peer: Option<S::Principal>,
     /// One permit per live local connection: `max_local_streams` of them, and
     /// an `open` with none free waits for one rather than failing
-    /// (`docs/GUARANTEES.md` §6). The parked reverse pool shares this budget.
+    /// (`docs/GUARANTEES.md` §6). The parked reverse pool shares this budget,
+    /// and on the accepting side so does every transfer connection admitted
+    /// for the peer.
     slots: Arc<Semaphore>,
     max_parked: usize,
-    closed: AtomicU64,
-    closed_notify: Notify,
+    closing: Arc<Closing<S>>,
     id: usize,
 }
 
@@ -450,8 +661,6 @@ impl Deficit {
     }
 }
 
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-
 impl<S: Stream> Grouped<S> {
     fn new(
         side: Side<S>,
@@ -462,10 +671,12 @@ impl<S: Stream> Grouped<S> {
     ) -> Grouped<S> {
         let (recv, send) = control.split();
         let (parked_tx, parked_rx) = mpsc::unbounded_channel();
+        let closing = Arc::new(Closing::new(&side));
         Grouped {
             side,
             control_send: StdMutex::new(Some(send)),
             control_recv: StdMutex::new(Some(recv)),
+            control_hold: Arc::new(StdMutex::new(None)),
             transfers: tokio::sync::Mutex::new(None),
             reverse: None,
             parked_tx,
@@ -474,9 +685,8 @@ impl<S: Stream> Grouped<S> {
             peer,
             slots: Arc::new(Semaphore::new(max_streams)),
             max_parked,
-            closed: AtomicU64::new(NO_CODE),
-            closed_notify: Notify::new(),
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            closing,
+            id: crate::transport::next_serial(),
         }
     }
 
@@ -489,38 +699,25 @@ impl<S: Stream> Grouped<S> {
     }
 
     pub(crate) fn close_reason(&self) -> Option<Error> {
-        let code = self.closed.load(Ordering::Acquire);
-        (code != NO_CODE).then(|| match code {
-            codes::NEGOTIATION_FAILED => {
-                Error::Negotiation("peer closed the connection: negotiation failed".into())
-            }
-            _ => Error::ConnectionLost(LossCause::PeerClosed),
-        })
+        self.closing.reason()
     }
 
     pub(crate) fn close(&self, code: u64, _reason: &str) {
-        if self
-            .closed
-            .compare_exchange(NO_CODE, code, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        if self.closing.close(code) {
             // Dropping the control halves is the close on the wire: there is
             // no frame for it and no code to carry [0012 §4.7].
             self.control_send.lock().expect("poisoned").take();
             self.control_recv.lock().expect("poisoned").take();
-            if let Side::Accept { groups, token, .. } = &self.side {
-                groups.remove(token);
-            }
-            self.closed_notify.notify_waiters();
+            self.control_hold.lock().expect("poisoned").take();
         }
     }
 
     pub(crate) async fn closed(&self) -> Error {
         loop {
+            self.closing.wait().await;
             if let Some(reason) = self.close_reason() {
                 return reason;
             }
-            self.closed_notify.notified().await;
         }
     }
 
@@ -580,10 +777,18 @@ impl<S: Stream> Grouped<S> {
     /// Hands out the control connection's write half, once.
     ///
     /// This is the one stream each side has toward the other without dialling
-    /// anything, and both sides spend it on HELLO ([0012 §4.1]).
+    /// anything, and both sides spend it on HELLO ([0012 §4.1]). The
+    /// dialling side's does not end with it: that half is kept open for the
+    /// life of the link, because the accepting side watches the other end.
     pub(crate) fn open_control(&self) -> Result<LocalSend<S>, Error> {
         match self.take_control_send() {
-            Some(send) => Ok(LocalSend::new(send, None)),
+            Some(send) => {
+                let mut send = LocalSend::new(send, None);
+                if matches!(self.side, Side::Dial { .. }) {
+                    send.keep = Some(Arc::clone(&self.control_hold));
+                }
+                Ok(send)
+            }
             None => Err(Error::Transport("control stream already used".into())),
         }
     }
@@ -642,9 +847,23 @@ impl<S: Stream> Grouped<S> {
     /// unidirectional stream is on QUIC [0012 §4.4]. A transfer connection
     /// the peer *opened* is not one of these - that is `accept_bi`, and it
     /// is dispatched by path too [0012 §4.3].
+    ///
+    /// On the accepting side the control read half is handed to a watch when
+    /// the HELLO has been read from it: the peer keeps its end open for as
+    /// long as it lives, so that end going away is how a peer that left
+    /// without a word is noticed, and the link closes with it. Nothing else
+    /// would: a local transport has no keep-alive and no idle timeout, and
+    /// the control connection carries nothing after the HELLOs.
     pub(crate) async fn accept_uni(&self) -> Result<LocalRecv<S>, Error> {
         if let Some(recv) = self.control_recv.lock().expect("poisoned").take() {
-            return Ok(LocalRecv::new(recv, None));
+            let mut recv = LocalRecv::new(recv, None);
+            if let Side::Accept { exec, .. } = &self.side {
+                recv.watch = Some(ControlWatch {
+                    closing: Arc::clone(&self.closing),
+                    exec: exec.clone(),
+                });
+            }
+            return Ok(recv);
         }
         let mut parked = self.parked_rx.lock().await;
         tokio::select! {
@@ -759,6 +978,11 @@ impl StreamSlot {
 pub(crate) struct LocalSend<S: Stream> {
     io: Option<S::Writer>,
     _slot: Option<Arc<StreamSlot>>,
+    /// The binding's place for this connection, shared with its other half.
+    _place: Option<Arc<Place>>,
+    /// Set on the dialling side's control stream: where its half goes when
+    /// the HELLO is done, instead of being ended and closed.
+    keep: Option<Arc<StdMutex<Option<S::Writer>>>>,
 }
 
 impl<S: Stream> LocalSend<S> {
@@ -766,7 +990,15 @@ impl<S: Stream> LocalSend<S> {
         LocalSend {
             io: Some(io),
             _slot: slot,
+            _place: None,
+            keep: None,
         }
+    }
+
+    /// Ties the binding's place for this connection to this half.
+    fn placed(mut self, place: Arc<Place>) -> LocalSend<S> {
+        self._place = Some(place);
+        self
     }
 
     pub(crate) fn io_mut(&mut self) -> Option<&mut S::Writer> {
@@ -786,10 +1018,19 @@ impl<S: Stream> LocalSend<S> {
     }
 
     /// Ends the payload: the FIN the reader sees.
+    ///
+    /// The control stream's is the exception. Its HELLO is a whole frame and
+    /// the reader needs nothing after it, so the half is parked in the link
+    /// instead of ended: closing it would be the peer's end of the control
+    /// connection going away, which is what the accepting side reads as the
+    /// peer having left.
     pub(crate) fn finish(&mut self) -> Result<(), Error> {
         match self.io.take() {
             Some(io) => {
-                S::finish(io);
+                match &self.keep {
+                    Some(keep) => *keep.lock().expect("poisoned") = Some(io),
+                    None => S::finish(io),
+                }
                 Ok(())
             }
             None => Err(Error::Transport("stream already closed".into())),
@@ -832,10 +1073,15 @@ impl<S: Stream> Drop for LocalSend<S> {
 pub(crate) struct LocalRecv<S: Stream> {
     io: Option<S::Reader>,
     _slot: Option<Arc<StreamSlot>>,
+    /// The binding's place for this connection, shared with its other half.
+    _place: Option<Arc<Place>>,
     /// Set on a parked reverse connection: the pool this one was taken from
     /// wants a replacement once the peer has spent it [0012 §4.4].
     deficit: Option<Arc<Deficit>>,
     spent: bool,
+    /// Set on the accepting side's control read half: what it is handed to
+    /// when it is dropped, instead of being refused.
+    watch: Option<ControlWatch<S>>,
 }
 
 impl<S: Stream> LocalRecv<S> {
@@ -843,9 +1089,17 @@ impl<S: Stream> LocalRecv<S> {
         LocalRecv {
             io: Some(io),
             _slot: slot,
+            _place: None,
             deficit: None,
             spent: false,
+            watch: None,
         }
+    }
+
+    /// Ties the binding's place for this connection to this half.
+    fn placed(mut self, place: Arc<Place>) -> LocalRecv<S> {
+        self._place = Some(place);
+        self
     }
 
     pub(crate) fn io_mut(&mut self) -> Option<&mut S::Reader> {
@@ -878,17 +1132,6 @@ impl<S: Stream> LocalRecv<S> {
         Ok((read > 0).then_some(read))
     }
 
-    pub(crate) async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            match self.read(&mut buf[filled..]).await? {
-                Some(n) => filled += n,
-                None => return Err(Error::Protocol("stream ended mid-header".into())),
-            }
-        }
-        Ok(())
-    }
-
     /// Refuses the rest of the payload.
     pub(crate) fn stop(&mut self, code: u64) {
         if let Some(io) = self.io.take() {
@@ -900,11 +1143,15 @@ impl<S: Stream> LocalRecv<S> {
 impl<S: Stream> Drop for LocalRecv<S> {
     /// A parked connection that dies without ever carrying a copy still has
     /// to be replaced, or the pool shrinks silently. A reader that walks away
-    /// mid-payload refuses the rest of it.
+    /// mid-payload refuses the rest of it, except the control connection's,
+    /// which is watched until the peer's end goes away.
     fn drop(&mut self) {
         self.spend();
         if let Some(io) = self.io.take() {
-            S::stop(io, codes::CANCELED);
+            match self.watch.take() {
+                Some(watch) => watch.spawn(io),
+                None => S::stop(io, codes::CANCELED),
+            }
         }
     }
 }

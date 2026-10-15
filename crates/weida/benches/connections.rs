@@ -314,10 +314,9 @@ fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
 
 /// Where the server refuses, and with what (`docs/IMPLEMENTATION.md` §4.9).
 ///
-/// `max_connections` is checked before the handshake is accepted, but the
-/// refusal is deliberately *not* silent: the server completes the handshake and
-/// then closes with `LIMIT_EXCEEDED`, so the peer can tell overload from a
-/// routing mistake (`crates/weida/src/listener.rs`).
+/// `max_connections` is checked before the handshake is accepted: the server
+/// answers the Initial with `CONNECTION_REFUSED` and builds nothing for it, so
+/// the dialler's connect fails at once (`crates/weida/src/listener.rs`).
 fn report_connection_limit(rt: &tokio::runtime::Runtime) {
     let harness = rt.block_on(harness_with(RuntimeConfig {
         max_connections: LIMIT,

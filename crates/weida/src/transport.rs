@@ -20,7 +20,9 @@
 //! the stream-kind vocabulary, and the two codes that can cross a stream
 //! (`STOP_SENDING` and `RESET_STREAM`, or their local equivalents).
 
+use std::ops::Deref;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use quinn::VarInt;
@@ -32,11 +34,51 @@ use crate::identity::PeerChain;
 use crate::inproc::{LocalConn, LocalRecv, LocalSend};
 use weida_protocol::LOCAL_MAX_DATAGRAM;
 
+/// The next connection serial. One counter serves every transport, because
+/// one listener serves QUIC, in-process and local peers through the same
+/// subscription tables, which key on it.
+static NEXT_SERIAL: AtomicUsize = AtomicUsize::new(1);
+
+/// A serial no other connection of this process has had or will have.
+pub(crate) fn next_serial() -> usize {
+    NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A QUIC connection and the serial this process numbered it with.
+///
+/// `quinn`'s own `stable_id` is the address of the connection's state, which
+/// the allocator hands out again once the connection is gone. Anything that
+/// outlives a connection and keys on its id — a consumer's credit held by a
+/// queue, a paired endpoint's claim — would then be inherited by an unrelated
+/// connection that happens to land on the same address, so identity here is
+/// the serial and never the address.
+pub(crate) struct QuicLink {
+    conn: quinn::Connection,
+    serial: usize,
+}
+
+impl QuicLink {
+    pub(crate) fn new(conn: quinn::Connection) -> QuicLink {
+        QuicLink {
+            conn,
+            serial: next_serial(),
+        }
+    }
+}
+
+impl Deref for QuicLink {
+    type Target = quinn::Connection;
+
+    fn deref(&self) -> &quinn::Connection {
+        &self.conn
+    }
+}
+
 /// One connection: a QUIC connection, one in-process link, or one peer's
 /// group of local connections — `AF_UNIX` or named pipe
 /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)).
 pub(crate) enum Link {
-    Quic(quinn::Connection),
+    Quic(QuicLink),
     Local(LocalConn),
     /// Boxed: a grouped link carries its pools and channels inline and would
     /// otherwise dwarf the other variants.
@@ -154,11 +196,12 @@ impl Link {
         }
     }
 
-    /// An identifier stable for the life of this connection, for the
-    /// subscription registry.
+    /// An identifier unique to this connection for the life of the process:
+    /// the key of the subscription registry and of every table that outlives
+    /// the connection's handle. A serial, never an address.
     pub(crate) fn stable_id(&self) -> usize {
         match self {
-            Link::Quic(conn) => conn.stable_id(),
+            Link::Quic(conn) => conn.serial,
             Link::Local(conn) => conn.stable_id(),
             #[cfg(unix)]
             Link::Unix(conn) => conn.stable_id(),
@@ -499,18 +542,70 @@ impl RecvHalf {
         }
     }
 
-    pub(crate) async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        match self {
-            RecvHalf::Quic(r) => r
-                .read_exact(buf)
-                .await
-                .map_err(|e| Error::Protocol(format!("truncated header: {e}"))),
-            RecvHalf::Local(r) => r.read_exact(buf).await,
-            #[cfg(unix)]
-            RecvHalf::Unix(r) => r.read_exact(buf).await,
-            #[cfg(windows)]
-            RecvHalf::Pipe(r) => r.read_exact(buf).await,
+    /// Appends what is available to `out`, at most `max` bytes; `None` at
+    /// the end of the payload.
+    ///
+    /// On QUIC the bytes come as `quinn`'s own chunk and are copied once, into
+    /// `out`: no scratch buffer sits between, and nothing is zero-filled to
+    /// make room. A local transport reads into the spare end of `out`, which
+    /// it has to zero first because its readers take initialised memory.
+    pub(crate) async fn read_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        max: usize,
+    ) -> Result<Option<usize>, Error> {
+        /// How much of `out` a local read may fill at once.
+        const LOCAL_STEP: usize = 16 * 1024;
+
+        if let RecvHalf::Quic(r) = self {
+            return match r.read_chunk(max, true).await.map_err(read_error)? {
+                Some(chunk) => {
+                    out.extend_from_slice(&chunk.bytes);
+                    Ok(Some(chunk.bytes.len()))
+                }
+                None => Ok(None),
+            };
         }
+        let start = out.len();
+        out.resize(start + max.min(LOCAL_STEP), 0);
+        let read = self.read(&mut out[start..]).await;
+        match read {
+            Ok(Some(n)) => {
+                out.truncate(start + n);
+                Ok(Some(n))
+            }
+            Ok(None) => {
+                out.truncate(start);
+                Ok(None)
+            }
+            Err(e) => {
+                out.truncate(start);
+                Err(e)
+            }
+        }
+    }
+
+    /// Reads the rest of the payload and throws it away.
+    ///
+    /// On QUIC nothing is copied and no buffer is allocated: each chunk is
+    /// dropped as it arrives. A local transport needs a buffer to read into,
+    /// which is the only reason it is not the same loop.
+    pub(crate) async fn discard(&mut self) -> Result<(), Error> {
+        if let RecvHalf::Quic(r) = self {
+            while r
+                .read_chunk(usize::MAX, true)
+                .await
+                .map_err(read_error)?
+                .is_some()
+            {}
+            return Ok(());
+        }
+        // Heap, not stack: this future is awaited inline by `handle_data`,
+        // which `handle_stream` awaits inline, which the accept loop spawns,
+        // and a generator is as large as its largest state.
+        let mut scratch = vec![0u8; 8 * 1024];
+        while self.read(&mut scratch).await?.is_some() {}
+        Ok(())
     }
 
     /// Refuses the rest of the payload: `STOP_SENDING`, or its local
