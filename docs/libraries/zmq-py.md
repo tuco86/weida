@@ -82,6 +82,7 @@ Differences from pyzmq's option surface:
 | Naming | `sock.setsockopt(zmq.SNDHWM, 1000)`, or the `sock.sndhwm` property | `options.set("ZMQ_SNDHWM", 1000)` — libzmq's own name as a string, because a refusal has to be able to name the option it refused |
 | When | on a live socket, at any time | at construction: `Socket(context, options)`. An option that cannot be delivered fails before the socket exists |
 | Durations | milliseconds, with `-1` and `0` as three different sentinels | **seconds**, with `None` for the sentinel, and each row's documentation names which libzmq value the `None` is |
+| `ZMQ_TCP_KEEPALIVE` and its three tuning options | integers, `-1` for the OS default | `None` or `-1`, `False` or `0`, `True` or `1` for the switch; `_IDLE` and `_INTVL` in whole seconds (`None` for `-1`) and `_CNT` a count from 1. A tuning option set while the keepalive is not on is refused at construction with `EINVAL`, where libzmq ignores it in silence |
 | Reading back | `sock.getsockopt(...)` | absent: no getter. The table's `binding` field says where a value lives; the values a caller set are the caller's |
 | `zmq.Context` options (`zmq.IO_THREADS`, `zmq.MAX_SOCKETS`) | `ctx.set(...)` | `ContextOptions` plus keyword arguments; `ZMQ_IO_THREADS` is refused and replaced by `worker_threads` |
 

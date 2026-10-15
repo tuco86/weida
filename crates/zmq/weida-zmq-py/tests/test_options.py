@@ -33,6 +33,10 @@ HONOURED_SOCKET_VALUES = {
     "ZMQ_HEARTBEAT_IVL": 1.0,
     "ZMQ_HEARTBEAT_TIMEOUT": 3.0,
     "ZMQ_HEARTBEAT_TTL": 4.0,
+    "ZMQ_TCP_KEEPALIVE": True,
+    "ZMQ_TCP_KEEPALIVE_IDLE": 60.0,
+    "ZMQ_TCP_KEEPALIVE_INTVL": 10.0,
+    "ZMQ_TCP_KEEPALIVE_CNT": 5,
     "ZMQ_IMMEDIATE": True,
     "ZMQ_BACKLOG": 42,
     "ZMQ_ROUTING_ID": b"worker-3",
@@ -126,7 +130,7 @@ def test_every_row_is_honoured_or_refused_and_never_ignored():
 @pytest.mark.parametrize(
     "name,reason",
     [
-        ("ZMQ_TCP_KEEPALIVE", "absent"),
+        ("ZMQ_TOS", "absent"),
         ("ZMQ_WSS_TRUST_SYSTEM", "no transport"),
         ("ZMQ_ROUTER_NOTIFY", "draft only"),
         ("ZMQ_IPC_FILTER_UID", "deprecated in favour of ZAP"),
@@ -262,3 +266,27 @@ def test_the_context_options_and_the_keyword_arguments_agree():
     assert (
         weida_zmq.Context(options=context_options, max_sockets=9).max_sockets == 9
     )
+
+
+def test_a_keepalive_tuning_option_without_the_keepalive_is_refused_at_construction():
+    """libzmq ignores `_IDLE`, `_INTVL` and `_CNT` unless `ZMQ_TCP_KEEPALIVE` is 1;
+    this library refuses the combination where the socket is built."""
+
+    async def refused():
+        context = weida_zmq.Context()
+        options = weida_zmq.SocketOptions()
+        options.set("ZMQ_TCP_KEEPALIVE_IDLE", 60.0)
+        with pytest.raises(weida_zmq.EINVAL) as err:
+            weida_zmq.PullSocket(context, options)
+        assert "ZMQ_TCP_KEEPALIVE" in err.value.cause
+
+        options.set("ZMQ_TCP_KEEPALIVE", True)
+        weida_zmq.PullSocket(context, options)
+
+        # The sentinels are libzmq's: -1 and None leave it to the OS, 0 is off.
+        for value in (None, -1, 0, False, 1, True):
+            weida_zmq.SocketOptions().set("ZMQ_TCP_KEEPALIVE", value)
+        with pytest.raises(weida_zmq.EINVAL):
+            weida_zmq.SocketOptions().set("ZMQ_TCP_KEEPALIVE", 2)
+
+    run(refused())

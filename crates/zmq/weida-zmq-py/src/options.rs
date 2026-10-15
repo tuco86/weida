@@ -11,7 +11,7 @@
 //!
 //! # Refused means refused where it is set
 //!
-//! `SocketOptions.set("ZMQ_TCP_KEEPALIVE", 1)` raises `EINVAL` at that line,
+//! `SocketOptions.set("ZMQ_TOS", 1)` raises `EINVAL` at that line,
 //! with the table's reason in the message. It does not raise later, at a
 //! send that behaves differently from the C program the caller is porting,
 //! and it does not do nothing.
@@ -211,6 +211,23 @@ fn flag(name: &str, value: &Bound<'_, PyAny>) -> Result<bool> {
         .map_err(|_| Error::EINVAL(format!("{name} takes True or False").into()))
 }
 
+/// libzmq's three-valued switch, `ZMQ_TCP_KEEPALIVE`'s: `None` or `-1` leaves
+/// the setting to the operating system, `0` or `False` is off, `1` or `True`
+/// is on.
+fn switch(name: &str, value: &Bound<'_, PyAny>) -> Result<Option<bool>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    match value.extract::<i64>() {
+        Ok(-1) => Ok(None),
+        Ok(0) => Ok(Some(false)),
+        Ok(1) => Ok(Some(true)),
+        _ => Err(Error::EINVAL(
+            format!("{name} takes None or -1, False or 0, True or 1").into(),
+        )),
+    }
+}
+
 /// Text.
 fn text(name: &str, value: &Bound<'_, PyAny>) -> Result<String> {
     value
@@ -310,6 +327,16 @@ impl PySocketOptions {
             "ZMQ_HEARTBEAT_IVL" => options.heartbeat_ivl = seconds(name, value)?,
             "ZMQ_HEARTBEAT_TIMEOUT" => options.heartbeat_timeout = seconds(name, value)?,
             "ZMQ_HEARTBEAT_TTL" => options.heartbeat_ttl = seconds(name, value)?,
+            "ZMQ_TCP_KEEPALIVE" => options.tcp_keepalive = switch(name, value)?,
+            "ZMQ_TCP_KEEPALIVE_IDLE" => options.tcp_keepalive_idle = seconds(name, value)?,
+            "ZMQ_TCP_KEEPALIVE_INTVL" => options.tcp_keepalive_intvl = seconds(name, value)?,
+            "ZMQ_TCP_KEEPALIVE_CNT" => {
+                options.tcp_keepalive_cnt = if value.is_none() {
+                    None
+                } else {
+                    Some(count(name, value)?)
+                };
+            }
             "ZMQ_IMMEDIATE" => options.immediate = flag(name, value)?,
             "ZMQ_BACKLOG" => options.backlog = count(name, value)?,
             "ZMQ_ROUTING_ID" | "ZMQ_IDENTITY" => {
