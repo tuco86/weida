@@ -15,7 +15,7 @@ use common::{Harness, Transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use weida::{Incoming, Limits, RuntimeConfig};
-use weida_protocol::{FrameKind, Hello, SubscriptionHeader, encode_frame};
+use weida_protocol::{DataHeader, FrameKind, Hello, SubscriptionHeader, encode_frame};
 
 /// Ceiling on any single await in these tests.
 const BOUND: Duration = Duration::from_secs(10);
@@ -209,5 +209,151 @@ async fn connections_over_max_connections_wait_for_a_place() {
         .expect("the token once a place is free");
 
     drop((idle_a, idle_b, third));
+    within(harness.shutdown()).await;
+}
+
+/// A refused transfer is drained in the background so that its sender
+/// finishes and learns of the refusal from the reply. The drain owns the
+/// descriptor, so the connection's place must stay taken for as long as the
+/// drain lives; otherwise a peer that has its connections refused and keeps
+/// them open makes the binding hold as many descriptors as the process may
+/// open, with the places never running out.
+#[tokio::test]
+async fn a_refused_transfer_keeps_its_place_until_its_drain_has_ended() {
+    // Two places: the control connection and the transfer.
+    let harness = Harness::start_with(
+        Transport::Unix,
+        RuntimeConfig {
+            max_connections: 2,
+            ..RuntimeConfig::default()
+        },
+    )
+    .await;
+    let path = unix_socket(&harness);
+
+    let (mut control, token) = dial_control(&path).await;
+    within(control.write_all(&chunk(&hello_frame())))
+        .await
+        .expect("control HELLO");
+
+    // A transfer to a path nothing serves, left open and never ended.
+    let mut transfer = dial_transfer(&path, &token).await;
+    let head = encode_frame(FrameKind::Data, &DataHeader::addressed("/nowhere").encode());
+    within(transfer.write_all(&chunk(&head)))
+        .await
+        .expect("DATA head");
+    // More than the socket buffers hold: the writes complete only once the
+    // server reads and discards them, which is the refusal having happened.
+    let body = chunk(&[0u8; 64 * 1024]);
+    for _ in 0..64 {
+        within(transfer.write_all(&body))
+            .await
+            .expect("a refused payload is drained, not left to block its sender");
+    }
+
+    // The drain still reads that socket, so its place is still taken: a third
+    // connection waits for one instead of being served.
+    let mut third = within(UnixStream::connect(&path)).await.expect("connect");
+    within(third.write_all(&[KIND_CONTROL]))
+        .await
+        .expect("control byte");
+    let mut token_buf = [0u8; 16];
+    let early = tokio::time::timeout(Duration::from_millis(300), third.read(&mut token_buf)).await;
+    assert!(
+        early.is_err(),
+        "a place was given back while a drain still held the refused socket: {early:?}"
+    );
+
+    // The peer ends the connection, the drain ends with it, and the place is
+    // free again.
+    drop(transfer);
+    within_for(Duration::from_secs(5), third.read_exact(&mut token_buf))
+        .await
+        .expect("the token once the drain let go of its place");
+
+    drop((control, third));
+    within(harness.shutdown()).await;
+}
+
+/// A local connection that consumed on a queue nobody is reading owes that
+/// queue a notice when it closes, and the notice waits for room. The wait
+/// must not keep the connection's place of `max_connections`: a binding
+/// whose queue is stuck would otherwise stop serving anyone new.
+#[tokio::test]
+async fn a_closed_local_consumer_waiting_to_be_announced_does_not_hold_a_place() {
+    // Three places: the consumer's control connection, and the control and
+    // transfer connections of the peer that fills the queue.
+    let harness = Harness::start_with(
+        Transport::Unix,
+        RuntimeConfig {
+            max_connections: 3,
+            endpoint_queue: 1,
+            ..RuntimeConfig::default()
+        },
+    )
+    .await;
+    let acceptor = harness.listener.acceptor("/q").expect("acceptor");
+    let path = unix_socket(&harness);
+
+    // A consumer subscribes. Reading its event once proves it was recorded,
+    // and leaves the queue's single slot free.
+    let (mut consumer, token) = dial_control(&path).await;
+    within(consumer.write_all(&chunk(&hello_frame())))
+        .await
+        .expect("consumer HELLO");
+    let mut subscribe = dial_transfer(&path, &token).await;
+    let frame = encode_frame(
+        FrameKind::Subscribe,
+        &SubscriptionHeader::new("/q", "").encode(),
+    );
+    within(subscribe.write_all(&chunk(&frame)))
+        .await
+        .expect("SUBSCRIBE");
+    within(subscribe.write_all(&[CHUNK_FIN]))
+        .await
+        .expect("FIN");
+    let id = match within(acceptor.accept()).await.expect("accept") {
+        Incoming::Subscribed(consumer) => consumer.id(),
+        other => panic!("expected the subscription, got {other:?}"),
+    };
+    drop(subscribe);
+
+    // Another peer fills that slot with a transfer nobody reads.
+    let (mut filler, filler_token) = dial_control(&path).await;
+    within(filler.write_all(&chunk(&hello_frame())))
+        .await
+        .expect("filler HELLO");
+    let mut transfer = dial_transfer(&path, &filler_token).await;
+    let mut data = encode_frame(FrameKind::Data, &DataHeader::addressed("/q").encode());
+    data.extend_from_slice(b"payload");
+    within(transfer.write_all(&chunk(&data)))
+        .await
+        .expect("DATA");
+    within(transfer.write_all(&[CHUNK_FIN])).await.expect("FIN");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The consumer exits. Its notice cannot be delivered, so it waits.
+    drop(consumer);
+
+    // The place it held is given out again, though the notice still waits.
+    let (_fourth, _) =
+        within_for(Duration::from_secs(5), async { dial_control(&path).await }).await;
+
+    // The notice itself is not lost: it follows the transfer once the queue
+    // is read. A local connection says nothing of a reply, so a path with an
+    // acceptor receives its DATA as an exchange.
+    assert!(matches!(
+        within(acceptor.accept()).await.expect("accept"),
+        Incoming::Exchange(_)
+    ));
+    match within(acceptor.accept()).await.expect("accept") {
+        Incoming::Unsubscribed {
+            id: gone,
+            filter: None,
+        } => assert_eq!(gone, id),
+        other => panic!("expected the consumer's departure, got {other:?}"),
+    }
+
+    drop((filler, transfer));
     within(harness.shutdown()).await;
 }

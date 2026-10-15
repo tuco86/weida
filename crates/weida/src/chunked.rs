@@ -37,6 +37,12 @@
 //! the refusal from the reply. A drain gives up on a peer that goes quiet for
 //! `DRAIN_IDLE`, which releases the stream; a payload that keeps flowing is
 //! drained to its FIN however long it runs.
+//!
+//! A drain, and an end marker the stream did not take at once, run on a task
+//! that owns the OS handle, outliving the half that started it. Each is given
+//! what the caller counts the connection against (`hold`) and drops it after
+//! the handle, so a binding's `max_connections` bounds the descriptors it
+//! holds and not only the halves still in hand.
 
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker, ready};
@@ -142,12 +148,15 @@ impl<W: AsyncWrite + Unpin + Send + 'static> ChunkWriter<W> {
     /// it at once, and on the runtime for whatever it did not take.
     ///
     /// The callers of `finish` and `reset` are synchronous, so the task is the
-    /// fallback, not the path.
+    /// fallback, not the path. It owns the stream until the peer has read the
+    /// rest of the marker, which a peer that never reads makes for ever, and
+    /// it is why `hold` is here: it is dropped after the stream, so what it
+    /// counts is not given back while the descriptor is still open.
     ///
     /// A chunk left half-written cannot be ended cleanly — the reader is owed
     /// bytes this side no longer has — so nothing is written and the reader
     /// sees the connection close when the last half goes.
-    pub(crate) fn end(mut self, marker: Marker) {
+    pub(crate) fn end<H: Send + 'static>(mut self, marker: Marker, hold: H) {
         let Some(mut io) = self.io.take() else {
             return;
         };
@@ -183,11 +192,11 @@ impl<W: AsyncWrite + Unpin + Send + 'static> ChunkWriter<W> {
         self.exec.spawn(async move {
             if let Err(e) = io.write_all(&bytes[written..len]).await {
                 tracing::debug!(error = %e, "local stream end marker not written");
-                return;
-            }
-            if let Err(e) = io.flush().await {
+            } else if let Err(e) = io.flush().await {
                 tracing::debug!(error = %e, "local stream end marker not flushed");
             }
+            drop(io);
+            drop(hold);
         });
     }
 
@@ -332,13 +341,17 @@ impl<R: AsyncRead + Unpin + Send + 'static> ChunkReader<R> {
     ///
     /// Each read waits at most `DRAIN_IDLE` for the peer's next bytes: a peer
     /// that stalls releases the descriptor, and a payload that keeps flowing
-    /// drains to its FIN however long it is.
-    pub(crate) fn drain(self) {
-        self.drain_within(DRAIN_IDLE);
+    /// drains to its FIN however long it is. `hold` is dropped after the
+    /// descriptor, whenever the drain ends.
+    pub(crate) fn drain<H: Send + 'static>(self, hold: H) {
+        self.drain_within(DRAIN_IDLE, hold);
     }
 
-    fn drain_within(mut self, idle: Duration) {
+    fn drain_within<H: Send + 'static>(mut self, idle: Duration, hold: H) {
         if matches!(self.state, ReadState::Ended) || self.io.is_none() {
+            // Nothing left to read: the handle goes first, and `hold` as this
+            // returns.
+            drop(self);
             return;
         }
         let exec = self.exec.clone();
@@ -349,10 +362,12 @@ impl<R: AsyncRead + Unpin + Send + 'static> ChunkReader<R> {
                 match timer.within(idle, self.read(&mut scratch)).await {
                     Some(Ok(n)) if n > 0 => {}
                     // The FIN or the end of the stream, a failure, or a peer
-                    // that went quiet: in every case the reader is dropped.
-                    _ => return,
+                    // that went quiet: in every case the reader is let go.
+                    _ => break,
                 }
             }
+            drop(self);
+            drop(hold);
         });
     }
 
@@ -771,7 +786,7 @@ mod tests {
         };
         let mut writer = ChunkWriter::new(sink, exec());
         writer.write_all(b"abc").await.expect("write");
-        writer.end(Marker::Fin);
+        writer.end(Marker::Fin, ());
         // Nothing awaits between `end` and this check, so a task spawned by
         // `end` cannot have run yet.
         let mut expected = data_chunk(b"abc");
@@ -790,7 +805,7 @@ mod tests {
         let exec = exec();
         let writer = ChunkWriter::new(sink, exec.clone());
         let code = 0x0102_0304_0506_0708_u64;
-        writer.end(Marker::Reset(code));
+        writer.end(Marker::Reset(code), ());
         assert_eq!(taken.lock().expect("sink").len(), 4);
         exec.within(WAIT, async {
             while taken.lock().expect("sink").len() < 9 {
@@ -850,7 +865,7 @@ mod tests {
             },
             exec.clone(),
         );
-        reader.drain_within(Duration::from_millis(50));
+        reader.drain_within(Duration::from_millis(50), ());
         let delivered = exec
             .within(WAIT, dropped)
             .await
@@ -885,7 +900,7 @@ mod tests {
             },
             exec.clone(),
         );
-        reader.drain_within(Duration::from_millis(200));
+        reader.drain_within(Duration::from_millis(200), ());
         let delivered = exec
             .within(WAIT, dropped)
             .await
@@ -897,5 +912,100 @@ mod tests {
             .expect("bounded")
             .expect("join")
             .expect("write");
+    }
+
+    /// Appends its name to a shared log when it is dropped: the order in which
+    /// a stream and what counts its connection are let go.
+    struct Dropped {
+        name: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Dropped {
+        fn new(name: &'static str, log: &Arc<Mutex<Vec<&'static str>>>) -> Dropped {
+            Dropped {
+                name,
+                log: Arc::clone(log),
+            }
+        }
+    }
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.log.lock().expect("log").push(self.name);
+        }
+    }
+
+    /// A reader that logs when it is dropped.
+    struct Traced<T> {
+        inner: T,
+        _dropped: Dropped,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for Traced<T> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    async fn logged(log: &Arc<Mutex<Vec<&'static str>>>, entries: usize) {
+        while log.lock().expect("log").len() < entries {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drain_lets_go_of_what_counts_the_connection_after_the_handle() {
+        let exec = exec();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (mut tx, rx) = tokio::io::duplex(WIRE_CAP);
+        // A payload that promises ten bytes, delivers three and goes quiet.
+        tx.write_all(&[CHUNK_DATA, 10, 0, 0, 0, 1, 2, 3])
+            .await
+            .expect("write");
+        let reader = ChunkReader::new(
+            Traced {
+                inner: rx,
+                _dropped: Dropped::new("handle", &log),
+            },
+            exec.clone(),
+        );
+        reader.drain_within(Duration::from_millis(50), Dropped::new("hold", &log));
+        assert!(
+            log.lock().expect("log").is_empty(),
+            "the drain owns both until it ends"
+        );
+        exec.within(WAIT, logged(&log, 2))
+            .await
+            .expect("the drain gave up on the stalled peer");
+        assert_eq!(*log.lock().expect("log"), ["handle", "hold"]);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn an_end_marker_finished_on_a_task_holds_what_counts_the_connection() {
+        let exec = exec();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let taken = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink {
+            taken: Arc::clone(&taken),
+            limit: 4,
+            stall_at: Some(4),
+        };
+        let writer = ChunkWriter::new(sink, exec.clone());
+        writer.end(Marker::Reset(7), Dropped::new("hold", &log));
+        assert_eq!(taken.lock().expect("sink").len(), 4);
+        assert!(
+            log.lock().expect("log").is_empty(),
+            "the task still owns the stream, so it still holds"
+        );
+        exec.within(WAIT, logged(&log, 1))
+            .await
+            .expect("the task finished the marker and let go");
+        assert_eq!(taken.lock().expect("sink").len(), 9);
     }
 }

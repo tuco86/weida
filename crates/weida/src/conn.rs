@@ -18,8 +18,8 @@ use weida_core::{Error, ErrorCode, Limits, LossCause, PeerIdentity};
 use weida_protocol::header::{GuaranteeSet, MAX_CURSOR_RECORD_LEN};
 use weida_protocol::{
     Agreed, CAPABILITY_DATAGRAM, CAPABILITY_PATH_REPORT, CreditHeader, CursorHeader, DataHeader,
-    ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, SubscriptionHeader, codes,
-    decode_cursor_record, encode_frame, negotiate, parse_preamble,
+    ErrorHeader, FlowHeader, FrameKind, HeaderError, Hello, MAX_PREAMBLE_LEN, Preamble, ReportHead,
+    SubscriptionHeader, codes, decode_cursor_record, encode_frame, negotiate, parse_preamble,
 };
 
 use crate::dedup::DedupWindow;
@@ -112,10 +112,12 @@ pub(crate) struct ConnCtx {
     /// §4.5).
     pub remote: crate::report::RemoteSlot,
     /// One slot per inbound stream that may be reading its frame head at a
-    /// time: [`Limits::max_header_streams`]. A stream takes one for the read
-    /// of its preamble and one for the read of its header and holds none
-    /// while it waits for negotiation, so the buffers a connection holds for
-    /// frame heads are bounded by the slots, not by the peer's stream budget.
+    /// time: [`Limits::header_slots`]. A stream takes one for the read of its
+    /// preamble and one for the read and decode of its header, and holds none
+    /// while it waits for negotiation. The raw header bytes are gone before
+    /// the slot is given back, so the buffers a connection holds for frame
+    /// heads are bounded by the slots: not by the peer's stream budget, and
+    /// not by what its streams go on to do.
     pub header_slots: Semaphore,
     agreed: watch::Receiver<Option<Agreed>>,
 }
@@ -169,7 +171,7 @@ impl ConnCtx {
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
             segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
             remote: crate::report::RemoteSlot::default(),
-            header_slots: Semaphore::new(limits.max_header_streams.max(1)),
+            header_slots: Semaphore::new(limits.header_slots()),
         });
 
         // Once per connection, never per message: a drain collects the
@@ -498,9 +500,10 @@ async fn hello_deadline(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agr
 
 /// Accepts inbound unidirectional streams and spawns one task per stream.
 ///
-/// Concurrency is bounded by the QUIC `max_concurrent_uni_streams` limit, so no
-/// extra semaphore is needed: the peer cannot create more parse tasks than the
-/// transport lets it open streams.
+/// The tasks are bounded by the QUIC `max_concurrent_uni_streams` limit: the
+/// peer cannot create more parse tasks than the transport lets it open
+/// streams. What those tasks hold for their frame heads is bounded
+/// separately, by [`ConnCtx::header_slots`].
 async fn accept_uni_loop(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agreed>>>) {
     loop {
         match ctx.conn.accept_uni().await {
@@ -585,38 +588,35 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
     if preamble.kind != FrameKind::Hello {
         ctx.negotiated().await?;
     }
-    let header = match read_header_within(ctx, &mut recv, &preamble).await {
-        Ok(header) => header,
+    let head = match read_head_within(ctx, &mut recv, &preamble).await {
+        Ok(Ok(head)) => head,
+        Ok(Err(e)) => return violation(ctx, &e.to_string()),
         Err(e) => return refuse_head(recv, send, e),
     };
 
-    match preamble.kind {
+    match head {
         // HELLO belongs to the control connection and nowhere else: a peer
         // that sends one here has not understood the grouping [0012 §4.1].
-        FrameKind::Hello => violation(ctx, "HELLO is legal only on the control connection"),
-        FrameKind::Error => violation(ctx, "ERROR is legal only in answer to a request"),
-        FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
-        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
-        FrameKind::Credit => handle_credit(ctx, &header).await,
+        Head::Hello(_) => violation(ctx, "HELLO is legal only on the control connection"),
+        Head::Error => violation(ctx, "ERROR is legal only in answer to a request"),
+        Head::Subscribe(header) => handle_subscription(ctx, header, true).await,
+        Head::Unsubscribe(header) => handle_subscription(ctx, header, false).await,
+        Head::Credit(header) => handle_credit(ctx, header).await,
         // A report about a transfer we sent on this connection. Both
         // dispatchers route it to the same place, so QUIC, inproc and the two
         // grouped local transports share one implementation.
-        FrameKind::Cursor => {
+        Head::Cursor(header) => {
             drop(send);
-            handle_cursor(ctx, recv, &header).await
+            handle_cursor(ctx, recv, header).await
         }
-        FrameKind::Flow => {
+        Head::Flow(header) => {
             drop(send);
-            crate::flow::handle_flow(ctx, recv, &header).await
+            crate::flow::handle_flow(ctx, recv, header).await
         }
         // A path report rides QUIC only (`docs/PROTOCOL.md` §6.10): a local
         // transport has no path, and its HELLO never lists code 2.
-        FrameKind::Report => violation(ctx, "REPORT is legal only on QUIC"),
-        FrameKind::Data => {
-            let decoded = match DataHeader::decode(&header) {
-                Ok(h) => h,
-                Err(e) => return violation(ctx, &e.to_string()),
-            };
+        Head::Report => violation(ctx, "REPORT is legal only on QUIC"),
+        Head::Data(decoded) => {
             let Some(path) = decoded.endpoint.as_deref() else {
                 return violation(ctx, "DATA on a local connection must name an endpoint");
             };
@@ -690,11 +690,11 @@ fn refuse_cursor(mut stream: RecvHalf) -> Result<(), Error> {
 /// * a record truncated at FIN **is** a violation. A record is at most
 ///   `MAX_CURSOR_RECORD_LEN` bytes and a sender writes whole records, so half
 ///   of one at FIN is a codec bug rather than a race.
-async fn handle_cursor(ctx: &ConnHandle, mut stream: RecvHalf, header: &[u8]) -> Result<(), Error> {
-    let head = match CursorHeader::decode(header) {
-        Ok(head) => head,
-        Err(e) => return violation(ctx, &e.to_string()),
-    };
+async fn handle_cursor(
+    ctx: &ConnHandle,
+    mut stream: RecvHalf,
+    head: CursorHeader,
+) -> Result<(), Error> {
     let Some(tx) = ctx.reports.claim(head.report_id) else {
         return refuse_cursor(stream);
     };
@@ -772,6 +772,47 @@ impl std::ops::Deref for HeaderBytes {
             HeaderBytes::Heap(bytes) => bytes,
         }
     }
+}
+
+/// A frame head decoded as its kind says, which is what every dispatcher
+/// works from.
+///
+/// It is made under the header slot, with the raw bytes still in hand
+/// ([`read_header_within`]), and the bytes are gone when it exists: a FLOW or
+/// a REPORT stream lives as long as its peer lets it, a SUBSCRIBE waits on a
+/// full queue, and none of them can be holding up to `max_header_bytes` of a
+/// peer's padding while they do.
+enum Head {
+    Hello(Hello),
+    Data(DataHeader),
+    /// Never decoded: it is a violation wherever it arrives on a stream the
+    /// dispatchers read, and its content would change nothing about that.
+    Error,
+    Subscribe(SubscriptionHeader),
+    Unsubscribe(SubscriptionHeader),
+    Credit(CreditHeader),
+    Cursor(CursorHeader),
+    Flow(FlowHeader),
+    /// The REPORT head frame carries nothing; its records follow it.
+    Report,
+}
+
+/// Decodes the header bytes of a frame of `kind`.
+fn decode_head(kind: FrameKind, bytes: &[u8]) -> Result<Head, HeaderError> {
+    Ok(match kind {
+        FrameKind::Hello => Head::Hello(Hello::decode(bytes)?),
+        FrameKind::Data => Head::Data(DataHeader::decode(bytes)?),
+        FrameKind::Error => Head::Error,
+        FrameKind::Subscribe => Head::Subscribe(SubscriptionHeader::decode(bytes)?),
+        FrameKind::Unsubscribe => Head::Unsubscribe(SubscriptionHeader::decode(bytes)?),
+        FrameKind::Credit => Head::Credit(CreditHeader::decode(bytes)?),
+        FrameKind::Cursor => Head::Cursor(CursorHeader::decode(bytes)?),
+        FrameKind::Flow => Head::Flow(FlowHeader::decode(bytes)?),
+        FrameKind::Report => {
+            ReportHead::decode(bytes)?;
+            Head::Report
+        }
+    })
 }
 
 /// Fills `buf` from `stream`. The stream ending first is the peer ending it
@@ -865,12 +906,40 @@ async fn read_preamble_within(ctx: &ConnCtx, stream: &mut RecvHalf) -> Result<Pr
     in_header_phase(ctx, read_preamble(stream, ctx.limits.max_header_bytes)).await
 }
 
-async fn read_header_within(
+/// Reads the header a preamble announced and decodes it, under one header
+/// slot.
+///
+/// The raw bytes are dropped inside the slot, as soon as `decode` has run: a
+/// peer pads a header with keys the decoder skips, up to `max_header_bytes`,
+/// and what a stream keeps while it is dispatched, parked on a full queue or
+/// reading its payload for hours, is the decoded header, bounded by the
+/// protocol's text caps. The memory a connection holds for frame heads is
+/// therefore the slots times `max_header_bytes`
+/// ([`Limits::worst_case_header_memory`]) whatever its streams go on to do.
+///
+/// `Err` is a head that did not arrive; `Ok(Err(_))` is one that did and does
+/// not decode, which is a violation.
+async fn read_header_within<T>(
     ctx: &ConnCtx,
     stream: &mut RecvHalf,
     preamble: &Preamble,
-) -> Result<HeaderBytes, Error> {
-    in_header_phase(ctx, read_header(stream, preamble)).await
+    decode: impl FnOnce(&[u8]) -> Result<T, HeaderError>,
+) -> Result<Result<T, HeaderError>, Error> {
+    in_header_phase(ctx, async {
+        let header = read_header(stream, preamble).await?;
+        Ok(decode(&header))
+    })
+    .await
+}
+
+/// [`read_header_within`] for a stream that may open with any frame kind.
+async fn read_head_within(
+    ctx: &ConnCtx,
+    stream: &mut RecvHalf,
+    preamble: &Preamble,
+) -> Result<Result<Head, HeaderError>, Error> {
+    let kind = preamble.kind;
+    read_header_within(ctx, stream, preamble, |bytes| decode_head(kind, bytes)).await
 }
 
 /// Ends an inbound stream whose frame head did not arrive: the peer is told
@@ -901,27 +970,28 @@ async fn handle_stream(
         ctx.negotiated().await?;
     }
 
-    let header = match read_header_within(ctx, &mut stream, &preamble).await {
-        Ok(header) => header,
+    let head = match read_head_within(ctx, &mut stream, &preamble).await {
+        Ok(Ok(head)) => head,
+        Ok(Err(e)) => return violation(ctx, &e.to_string()),
         Err(e) => return refuse_stream(stream, e),
     };
 
-    match preamble.kind {
-        FrameKind::Hello => handle_hello(ctx, agreed_tx, &header),
-        FrameKind::Data => handle_data(ctx, stream, &header).await,
+    match head {
+        Head::Hello(theirs) => handle_hello(ctx, agreed_tx, &theirs),
+        Head::Data(header) => dispatch_data(ctx, stream, header).await,
         // ERROR answers a request, and a request always arrives on a
         // bidirectional stream, so its reply half is the only place an ERROR
         // can legitimately appear.
-        FrameKind::Error => violation(
+        Head::Error => violation(
             ctx,
             "ERROR is legal only on the reply half of a bidirectional stream",
         ),
-        FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
-        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
-        FrameKind::Credit => handle_credit(ctx, &header).await,
-        FrameKind::Cursor => handle_cursor(ctx, stream, &header).await,
-        FrameKind::Flow => crate::flow::handle_flow(ctx, stream, &header).await,
-        FrameKind::Report => crate::report::receive_reports(ctx, stream, &header).await,
+        Head::Subscribe(header) => handle_subscription(ctx, header, true).await,
+        Head::Unsubscribe(header) => handle_subscription(ctx, header, false).await,
+        Head::Credit(header) => handle_credit(ctx, header).await,
+        Head::Cursor(header) => handle_cursor(ctx, stream, header).await,
+        Head::Flow(header) => crate::flow::handle_flow(ctx, stream, header).await,
+        Head::Report => crate::report::receive_reports(ctx, stream).await,
     }
 }
 
@@ -946,13 +1016,9 @@ pub(crate) fn violation(ctx: &ConnHandle, reason: &str) -> Result<(), Error> {
 /// `max_subscriptions` bound is the same number either way.
 async fn handle_subscription(
     ctx: &ConnHandle,
-    header: &[u8],
+    header: SubscriptionHeader,
     subscribe: bool,
 ) -> Result<(), Error> {
-    let header = match SubscriptionHeader::decode(header) {
-        Ok(h) => h,
-        Err(e) => return violation(ctx, &e.to_string()),
-    };
     let Some(subs) = ctx.subs.as_ref() else {
         // A client connection serves no publishers. Nothing to do, and nothing
         // wrong with the peer's frame.
@@ -995,6 +1061,17 @@ async fn handle_subscription(
             {
                 if subs.reserve(ctx).is_err() {
                     return too_many_subscriptions(ctx);
+                }
+                // The record is made, and the connection may have closed
+                // before it was: `drop_consumers` takes a connection's records
+                // only once the close is visible, so either this check sees
+                // the close or that call sees the record. A record made after
+                // it ran is one nothing removes, and the queue would be told
+                // of a consumer whose end it has already been told of.
+                if ctx.conn.close_reason().is_some() {
+                    ctx.namespace
+                        .forget_consumer(conn_id, &header.endpoint, &header.filter);
+                    return Ok(());
                 }
                 let consumer = Consumer::new(
                     Arc::clone(ctx),
@@ -1059,11 +1136,7 @@ fn too_many_subscriptions(ctx: &ConnHandle) -> Result<(), Error> {
 /// resetting the stream: credit is idempotent state, not a transfer, and the
 /// frame has no reply half to refuse on — the same position SUBSCRIBE takes
 /// for a path no publisher has claimed yet.
-async fn handle_credit(ctx: &ConnHandle, header: &[u8]) -> Result<(), Error> {
-    let header = match CreditHeader::decode(header) {
-        Ok(h) => h,
-        Err(e) => return violation(ctx, &e.to_string()),
-    };
+async fn handle_credit(ctx: &ConnHandle, header: CreditHeader) -> Result<(), Error> {
     let Some(Route::Raw(queue)) = ctx.namespace.lookup(&header.endpoint) else {
         tracing::debug!(
             endpoint = ?header.endpoint,
@@ -1082,25 +1155,59 @@ async fn handle_credit(ctx: &ConnHandle, header: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Tells every queue this connection consumed on that the consumer is gone.
+/// What a closed connection owes the queues it consumed on: a notice, per
+/// queue, that its consumer is gone.
 ///
-/// Called once, when the connection closes. A queue needs this and a
-/// publisher does not: a publisher forgets a subscriber, while a queue owes
-/// something for what it handed that consumer and has to decide what to do
-/// with it (0018 §4.7). The table is emptied by the same call, so a second
-/// close reports nothing.
-pub(crate) async fn drop_consumers(ctx: &ConnHandle) {
+/// A queue needs this and a publisher does not: a publisher forgets a
+/// subscriber, while a queue owes something for what it handed that consumer
+/// and has to decide what to do with it (0018 §4.7).
+///
+/// It holds the queues and the consumer's id and **nothing of the
+/// connection**. A queue that is full and unread makes [`Departure::announce`]
+/// wait for as long as its application likes, and that wait must not keep a
+/// dead connection, or anything that counts it, alive with it.
+pub(crate) struct Departure {
+    id: ConsumerId,
+    queues: Vec<(Arc<str>, mpsc::Sender<Incoming>)>,
+}
+
+/// Takes what `ctx`'s connection owes the queues it consumed on.
+///
+/// Called once, when the connection closes. The table is emptied by the same
+/// call, so a second close reports nothing.
+pub(crate) fn take_departure(ctx: &ConnCtx) -> Departure {
     let conn_id = ctx.conn.stable_id();
-    for (path, route) in ctx.namespace.take_consumer_routes(conn_id) {
-        let Route::Raw(queue) = route else {
-            continue;
-        };
-        let gone = Incoming::Unsubscribed {
-            id: ConsumerId::from_conn(conn_id),
-            filter: None,
-        };
-        if queue.send(gone).await.is_err() {
-            tracing::debug!(path = ?path, "acceptor went away before its consumer did");
+    let queues = ctx
+        .namespace
+        .take_consumer_routes(conn_id)
+        .into_iter()
+        .filter_map(|(path, route)| match route {
+            Route::Raw(queue) => Some((path, queue)),
+            _ => None,
+        })
+        .collect();
+    Departure {
+        id: ConsumerId::from_conn(conn_id),
+        queues,
+    }
+}
+
+impl Departure {
+    /// Whether there is nobody to tell.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queues.is_empty()
+    }
+
+    /// Tells every queue, waiting for room in each.
+    pub(crate) async fn announce(self) {
+        for (path, queue) in self.queues {
+            let gone = Incoming::Unsubscribed {
+                id: self.id,
+                filter: None,
+            };
+            if queue.send(gone).await.is_err() {
+                tracing::debug!(path = ?path, "acceptor went away before its consumer did");
+            }
         }
     }
 }
@@ -1115,17 +1222,13 @@ pub(crate) async fn drop_consumers(ctx: &ConnHandle) {
 fn handle_hello(
     ctx: &ConnHandle,
     agreed_tx: &watch::Sender<Option<Agreed>>,
-    header: &[u8],
+    theirs: &Hello,
 ) -> Result<(), Error> {
     if agreed_tx.borrow().is_some() {
         return violation(ctx, "a second HELLO on one connection");
     }
-    let theirs = match Hello::decode(header) {
-        Ok(h) => h,
-        Err(e) => return violation(ctx, &e.to_string()),
-    };
     let ours = hello_for(ctx.limits, ctx.guarantees, ctx.conn.is_quic());
-    match negotiate(&ours, &theirs) {
+    match negotiate(&ours, theirs) {
         Ok(agreed) => {
             // Two HELLOs can both reach this point; only the first to store
             // its result is the HELLO.
@@ -1158,23 +1261,11 @@ fn handle_hello(
     }
 }
 
-/// Dispatches a one-way transfer arriving on a unidirectional stream.
-///
-/// A misroute is answered with `STOP_SENDING`, not with a frame: there is no
-/// reply half here to carry one, and the stop code says everything an ERROR
-/// header would have.
-async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Result<(), Error> {
-    let header = match DataHeader::decode(header) {
-        Ok(h) => h,
-        Err(e) => return violation(ctx, &e.to_string()),
-    };
-    dispatch_data(ctx, stream, header).await
-}
-
 /// Routes one decoded one-way DATA header and the stream behind it.
 ///
-/// Shared by the QUIC dispatcher and the local one, which has already
-/// decoded the header to look the route up and must not decode it twice.
+/// Shared by the QUIC dispatcher and the local one. A misroute is answered
+/// with `STOP_SENDING`, not with a frame: there is no reply half here to
+/// carry one, and the stop code says everything an ERROR header would have.
 async fn dispatch_data(
     ctx: &ConnHandle,
     mut stream: RecvHalf,
@@ -1472,13 +1563,10 @@ async fn handle_bi(ctx: &ConnHandle, mut send: SendHalf, mut recv: RecvHalf) -> 
     }
     ctx.negotiated().await?;
 
-    let header = match read_header_within(ctx, &mut recv, &preamble).await {
-        Ok(header) => header,
+    let header = match read_header_within(ctx, &mut recv, &preamble, DataHeader::decode).await {
+        Ok(Ok(header)) => header,
+        Ok(Err(e)) => return violation(ctx, &e.to_string()),
         Err(e) => return refuse_head(recv, send, e),
-    };
-    let header = match DataHeader::decode(&header) {
-        Ok(h) => h,
-        Err(e) => return violation(ctx, &e.to_string()),
     };
     let Some(path) = header.endpoint.as_deref() else {
         return violation(
@@ -1535,10 +1623,20 @@ async fn handle_bi(ctx: &ConnHandle, mut send: SendHalf, mut recv: RecvHalf) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Refusal, Wanted, refusal_for};
-    use crate::listener::{PairOwner, Route};
+    use super::{
+        ConnCtx, ConnHandle, Refusal, Wanted, handle_subscription, read_header_within,
+        read_preamble_within, refusal_for, take_departure,
+    };
+    use crate::listener::{Namespace, PairOwner, Route};
+    use crate::pubsub::SubRegistry;
+    use crate::runtime::{Exec, Shared};
+    use crate::transport::{Link, RecvHalf};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
     use tokio::sync::mpsc;
+    use weida_core::Limits;
+    use weida_protocol::header::{GuaranteeSet, OrderingMode};
+    use weida_protocol::{DataHeader, FrameKind, SubscriptionHeader, encode_frame};
 
     fn transfer() -> Route {
         Route::Transfer(mpsc::channel(1).0)
@@ -1638,5 +1736,102 @@ mod tests {
         assert_eq!(Refusal::PAIR_TAKEN.stop, codes::LIMIT_EXCEEDED);
         assert_ne!(Refusal::UNKNOWN, Refusal::WRONG_SHAPE);
         assert_ne!(Refusal::WRONG_SHAPE, Refusal::PAIR_TAKEN);
+    }
+
+    /// A connection a namespace can hold consumer records for: the accepted
+    /// end of an in-process link. The dialled end comes back too, because
+    /// dropping it ends the link.
+    async fn connection(
+        namespace: &Arc<Namespace>,
+        subs: &Arc<SubRegistry>,
+        bus: &str,
+    ) -> (ConnHandle, crate::inproc::LocalConn) {
+        let mut dials = crate::inproc::bind(bus).expect("bus");
+        let dialled = crate::inproc::dial(bus, 255, 1024).expect("dial");
+        let accepted = dials.recv().await.expect("accepted end");
+        let shared = Arc::new(Shared {
+            duplicates: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
+            drain: crate::drain::DrainState::new(),
+        });
+        let ctx = ConnCtx::spawn(
+            Link::Local(accepted),
+            Limits::default(),
+            Arc::clone(namespace),
+            Some(Arc::clone(subs)),
+            Exec::current().expect("a tokio runtime"),
+            GuaranteeSet::CORE,
+            shared,
+        );
+        (ctx, dialled)
+    }
+
+    /// A SUBSCRIBE whose connection closed before it was handled: the accept
+    /// task has taken the connection's records already, so a record made now
+    /// is one nothing removes, and the queue must not be told of a consumer
+    /// whose end it has been told of.
+    #[tokio::test]
+    async fn a_queue_subscription_handled_after_its_connection_closed_leaves_no_record() {
+        let namespace = Arc::new(Namespace::new());
+        let subs = Arc::new(SubRegistry::new(Limits::default(), OrderingMode::None));
+        let (queue, mut announced) = mpsc::channel(8);
+        namespace
+            .register("/q", Route::Raw(queue))
+            .expect("register");
+        let (ctx, _dialled) = connection(&namespace, &subs, "conn-unit-closed-subscribe").await;
+        let conn_id = ctx.conn.stable_id();
+        ctx.conn.close(
+            weida_protocol::codes::SHUTDOWN,
+            "closed before its SUBSCRIBE was handled",
+        );
+        // What the accept task does once the close is visible.
+        take_departure(&ctx).announce().await;
+
+        handle_subscription(&ctx, SubscriptionHeader::new("/q", "a.#"), true)
+            .await
+            .expect("nothing is wrong with the frame");
+        assert!(
+            namespace.take_consumer_routes(conn_id).is_empty(),
+            "a record made now would never be removed"
+        );
+        assert!(
+            announced.try_recv().is_err(),
+            "the queue is told of nothing"
+        );
+    }
+
+    /// The raw header bytes are decoded, and dropped, while the stream still
+    /// holds its header slot: what a connection holds for frame heads is
+    /// bounded by its slots, whatever its streams go on to do afterwards.
+    #[tokio::test]
+    async fn a_header_is_decoded_while_its_slot_is_held() {
+        let namespace = Arc::new(Namespace::new());
+        let subs = Arc::new(SubRegistry::new(Limits::default(), OrderingMode::None));
+        let (ctx, dialled) = connection(&namespace, &subs, "conn-unit-header-slot").await;
+        // A stream toward the dialled end, whose receiving half is ours to read.
+        let mut send = ctx.open_uni().await.expect("open");
+        let frame = encode_frame(FrameKind::Data, &DataHeader::addressed("/q").encode());
+        send.write_all(&frame).await.expect("write");
+        let mut recv = RecvHalf::Local(dialled.accept_uni().await.expect("accept"));
+        let preamble = read_preamble_within(&ctx, &mut recv)
+            .await
+            .expect("preamble");
+
+        let free = ctx.header_slots.available_permits();
+        let mut during = None;
+        let header = read_header_within(&ctx, &mut recv, &preamble, |bytes| {
+            during = Some(ctx.header_slots.available_permits());
+            DataHeader::decode(bytes)
+        })
+        .await
+        .expect("the head arrived")
+        .expect("it decodes");
+        assert_eq!(header.endpoint.as_deref(), Some("/q"));
+        assert_eq!(during, Some(free - 1), "decoded while the slot was held");
+        assert_eq!(
+            ctx.header_slots.available_permits(),
+            free,
+            "and the slot is given back after"
+        );
     }
 }

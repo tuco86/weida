@@ -31,7 +31,7 @@ use weida_core::{Error, LocalPrincipal, LossCause, PeerIdentity};
 use weida_runtime::{Exec, peer_credentials};
 
 use crate::chunked::{ChunkReader, ChunkWriter, Marker};
-use crate::grouped::Stream;
+use crate::grouped::{Claims, Stream};
 
 /// What a dial needs: the socket path and the runtime whose tasks write the
 /// end-of-payload marker.
@@ -143,21 +143,23 @@ impl Stream for UnixLocal {
 
     /// A FIN chunk, which is what tells the reader the payload is complete —
     /// and the *only* thing that does.
-    fn finish(writer: Self::Writer) {
-        writer.end(Marker::Fin);
+    fn finish(writer: Self::Writer, claims: Claims) {
+        writer.end(Marker::Fin, claims);
     }
 
     /// A RESET chunk carrying the code, so an abandoned transfer is reported
     /// by name instead of arriving as a payload that looks whole.
-    fn reset(writer: Self::Writer, code: u64) {
-        writer.end(Marker::Reset(code));
+    fn reset(writer: Self::Writer, code: u64, claims: Claims) {
+        writer.end(Marker::Reset(code), claims);
     }
 
     /// A reader that stops **drains**: closing the read half would give the
     /// writer an `EPIPE` with no code, so the rest of the payload is read and
-    /// discarded and the refusal travels in the reply [0012 §4.7].
-    fn stop(reader: Self::Reader, _code: u64) {
-        reader.drain();
+    /// discarded and the refusal travels in the reply [0012 §4.7]. The drain
+    /// keeps the connection's claims, so its place of `max_connections` is
+    /// not given back while it still holds the descriptor.
+    fn stop(reader: Self::Reader, _code: u64, claims: Claims) {
+        reader.drain(claims);
     }
 
     fn read_error(error: std::io::Error) -> Error {

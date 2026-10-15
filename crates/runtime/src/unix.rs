@@ -38,8 +38,8 @@ static STAGING: AtomicU64 = AtomicU64::new(0);
 /// does.
 ///
 /// Hold it beside the [`UnixListener`] it was bound with. Dropping it removes
-/// the node it bound — and only that node — which is what keeps the *next*
-/// bind of the same path out of the unlink-then-bind race below.
+/// the node it bound — and only that node — so the *next* bind of the same
+/// path finds nothing to replace.
 #[derive(Debug)]
 pub struct BoundUnixSocket {
     path: PathBuf,
@@ -87,6 +87,33 @@ impl BoundUnixSocket {
     ///    with whatever `umask` allows, which is whatever the process
     ///    happened to inherit.
     pub fn bind(path: &Path) -> Result<(BoundUnixSocket, UnixListener), Error> {
+        Self::bind_node(path, false)
+    }
+
+    /// Binds `path` like [`bind`](Self::bind), but takes the endpoint over
+    /// from a live listener instead of refusing it.
+    ///
+    /// This is libzmq's `ipc://` behaviour: "if a second process binds to an
+    /// endpoint already bound by a process, this will succeed and the first
+    /// process will lose its binding" (`docs/research/zeromq.md` §8). The
+    /// first listener keeps the connections it has accepted and stops
+    /// receiving new ones, because the path now names the new node. Everything
+    /// else is as in [`bind`](Self::bind): the node is built in the private
+    /// directory and `rename`d over the old one, so it is never visible with a
+    /// mode `umask` chose, and anything that is not a socket is still refused.
+    ///
+    /// Only a protocol whose own semantics are "the last binder wins" should
+    /// call this. Anyone who can write the directory can silence a service
+    /// with it, which is the directory hazard of [`bind`](Self::bind) made
+    /// cheaper: no probe stands in the way.
+    pub fn bind_replacing(path: &Path) -> Result<(BoundUnixSocket, UnixListener), Error> {
+        Self::bind_node(path, true)
+    }
+
+    fn bind_node(
+        path: &Path,
+        replace_live: bool,
+    ) -> Result<(BoundUnixSocket, UnixListener), Error> {
         if path.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
             return Err(Error::InvalidAddress(format!(
                 "socket path exceeds this platform's {}-byte sun_path budget: {}",
@@ -98,7 +125,7 @@ impl BoundUnixSocket {
         // that path is not ours to remove.
         let stale = match std::fs::symlink_metadata(path) {
             Ok(meta) if is_socket(&meta) => {
-                if answers(path) {
+                if !replace_live && answers(path) {
                     return Err(Error::Io(std::io::Error::new(
                         ErrorKind::AddrInUse,
                         format!("{} has a listener", path.display()),
@@ -153,9 +180,9 @@ impl BoundUnixSocket {
 
 impl Drop for BoundUnixSocket {
     fn drop(&mut self) {
-        // Leaving the node behind is what forces the next bind into
-        // unlink-then-bind; removing it on the way out keeps the common case
-        // free of that race. Only the node this value bound: a successor that
+        // Leaving the node behind is what forces the next bind to replace a
+        // stale node; removing it on the way out keeps the common case
+        // free of that replacement. Only the node this value bound: a successor that
         // replaced it has a node of its own at the same path, and unlinking by
         // path would delete the successor's endpoint.
         let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
@@ -307,7 +334,7 @@ mod tests {
     }
 
     /// Claim: the node goes away with the binding, so the next bind of the
-    /// same path is not an unlink-then-bind at all.
+    /// same path has nothing to replace.
     #[tokio::test]
     async fn the_node_is_removed_on_drop() {
         let path = dir("drop").join("s");
@@ -356,6 +383,93 @@ mod tests {
             .expect("the first listener accepts")
             .expect("the accept task ran")
             .expect("an accepted connection");
+    }
+
+    /// Claim: `bind_replacing` takes the path from a live listener: new
+    /// connections reach the second binder, in mode `0600`, and dropping the
+    /// first guard afterwards leaves the second's node alone.
+    #[tokio::test]
+    async fn bind_replacing_takes_a_live_socket_over() {
+        let path = dir("takeover").join("s");
+        let (first, _first_listener) = BoundUnixSocket::bind(&path).expect("first bind");
+        let (_second, second_listener) =
+            BoundUnixSocket::bind_replacing(&path).expect("takes the live node");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, SOCKET_MODE, "mode {mode:o}");
+
+        drop(first);
+        let accepting = tokio::spawn(async move { second_listener.accept().await.map(|_| ()) });
+        UnixStream::connect(&path)
+            .await
+            .expect("the second binder owns the path");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting)
+            .await
+            .expect("the second binder accepts")
+            .expect("the accept task ran")
+            .expect("an accepted connection");
+    }
+
+    /// Claim: taking a live node over still leaves nothing behind, still
+    /// refuses what is not a socket, and still honours the path budget.
+    #[tokio::test]
+    async fn bind_replacing_keeps_the_other_hygiene() {
+        let dir = dir("takeover-hygiene");
+        let path = dir.join("s");
+        let (_first, _first_listener) = BoundUnixSocket::bind(&path).expect("first bind");
+        let (_second, _second_listener) = BoundUnixSocket::bind_replacing(&path).expect("takeover");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("directory")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("s")]);
+
+        let file = dir.join("f");
+        std::fs::write(&file, b"not a socket").expect("write");
+        let err = BoundUnixSocket::bind_replacing(&file).unwrap_err();
+        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
+        assert_eq!(std::fs::read(&file).expect("read"), b"not a socket");
+
+        let long = dir.join("x".repeat(MAX_SOCKET_PATH_BYTES + 1));
+        let err = BoundUnixSocket::bind_replacing(&long).unwrap_err();
+        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
+    }
+
+    /// Claim: replacing a live node never shows the path in a mode `umask`
+    /// chose, nor absent: the node is renamed over, not unlinked first.
+    #[tokio::test]
+    async fn a_takeover_is_never_visible_in_the_mode_umask_gave_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const TAKEOVERS: usize = 200;
+        let path = dir("takeover-window").join("s");
+        let mut held = vec![BoundUnixSocket::bind(&path).expect("first bind")];
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (path, done) = (path.clone(), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut bad = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.permissions().mode() & 0o777 != SOCKET_MODE => {
+                            bad.push(format!("mode {:o}", meta.permissions().mode() & 0o777));
+                        }
+                        Ok(_) => {}
+                        Err(_) => bad.push("absent".to_owned()),
+                    }
+                }
+                bad
+            })
+        };
+        for _ in 0..TAKEOVERS {
+            held.push(BoundUnixSocket::bind_replacing(&path).expect("takeover"));
+        }
+        done.store(true, Ordering::Relaxed);
+        let bad = watcher.join().expect("the watcher ran");
+        assert!(bad.is_empty(), "the path was not 0600 and present: {bad:?}");
     }
 
     /// Claim: a guard removes the node it bound and not the one that replaced

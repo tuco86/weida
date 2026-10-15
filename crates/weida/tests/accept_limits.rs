@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use common::{Server, raw};
 use tokio::net::UdpSocket;
-use weida::RuntimeConfig;
+use weida::{Incoming, RuntimeConfig};
+use weida_protocol::{DataHeader, FrameKind, SubscriptionHeader, encode_frame};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -226,4 +227,86 @@ async fn a_quiet_binding_accepts_an_initial_without_a_retry() {
         0xF0,
         "a quiet binding sends no Retry: the first packet was {first:#04x}"
     );
+}
+
+/// A connection that consumed on a queue nobody is reading owes that queue a
+/// notice when it closes, and the notice waits for room. The wait must not
+/// keep the dead connection counted against `max_connections`: a binding
+/// whose queue is stuck would otherwise refuse every new peer once as many
+/// closed ones as it admits are waiting.
+#[tokio::test]
+async fn a_closed_consumer_waiting_to_be_announced_does_not_hold_a_place() {
+    let server = Server::start_with_config(RuntimeConfig {
+        max_connections: 2,
+        endpoint_queue: 1,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let acceptor = server.listener.acceptor("/q").expect("acceptor");
+    let endpoint = raw::client_endpoint(&server.certs);
+
+    // A consumer subscribes. Reading its event once proves it was recorded,
+    // and leaves the queue's single slot free.
+    let consumer = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("the first connection fits");
+    raw::send_hello(&consumer).await;
+    raw::send_frame(
+        &consumer,
+        FrameKind::Subscribe,
+        &SubscriptionHeader::new("/q", "").encode(),
+    )
+    .await;
+    let id = match within(acceptor.accept()).await.expect("accept") {
+        Incoming::Subscribed(consumer) => consumer.id(),
+        other => panic!("expected the subscription, got {other:?}"),
+    };
+
+    // Another peer fills that slot with a transfer nobody reads.
+    let filler = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("the second connection fits");
+    raw::send_hello(&filler).await;
+    let mut transfer = encode_frame(FrameKind::Data, &DataHeader::addressed("/q").encode());
+    transfer.extend_from_slice(b"payload");
+    raw::send_raw(&filler, &transfer).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The consumer goes away. Its notice cannot be delivered, so it waits.
+    consumer.close(quinn::VarInt::from_u32(0), b"gone");
+
+    // The place it held is given out again, though the notice still waits.
+    let mut freed = false;
+    for _ in 0..100 {
+        match endpoint
+            .connect(server.addr, "127.0.0.1")
+            .expect("connect")
+            .await
+        {
+            Ok(_) => {
+                freed = true;
+                break;
+            }
+            Err(e) => assert!(is_refused(&e), "{e:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        freed,
+        "a closed connection kept its place while its notice waited for the queue"
+    );
+
+    // The notice itself is not lost: it follows the transfer once the queue
+    // is read.
+    assert!(matches!(
+        within(acceptor.accept()).await.expect("accept"),
+        Incoming::Stream(_)
+    ));
+    match within(acceptor.accept()).await.expect("accept") {
+        Incoming::Unsubscribed {
+            id: gone,
+            filter: None,
+        } => assert_eq!(gone, id),
+        other => panic!("expected the consumer's departure, got {other:?}"),
+    }
 }

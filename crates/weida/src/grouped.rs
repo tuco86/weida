@@ -112,13 +112,20 @@ pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send + Sized + 'static
     fn identity(principal: &Self::Principal) -> PeerIdentity;
 
     /// Ends the payload on `writer`: the FIN the reader sees.
-    fn finish(writer: Self::Writer);
+    ///
+    /// `claims` is what the connection counts itself against. A transport
+    /// that finishes the write on a task keeps it with that task, so it is
+    /// released with the OS handle and not before.
+    fn finish(writer: Self::Writer, claims: Claims);
 
-    /// Abandons the payload on `writer` with `code`.
-    fn reset(writer: Self::Writer, code: u64);
+    /// Abandons the payload on `writer` with `code`; `claims` as for
+    /// [`finish`](Stream::finish).
+    fn reset(writer: Self::Writer, code: u64, claims: Claims);
 
-    /// Refuses the rest of the payload on `reader` with `code`.
-    fn stop(reader: Self::Reader, code: u64);
+    /// Refuses the rest of the payload on `reader` with `code`. A transport
+    /// that drains keeps `claims` with the drain until it has let go of the
+    /// handle.
+    fn stop(reader: Self::Reader, code: u64, claims: Claims);
 
     /// A read error as the transport reports it.
     fn read_error(error: std::io::Error) -> Error;
@@ -129,7 +136,10 @@ pub(crate) type Halves<S> = (LocalSend<S>, LocalRecv<S>);
 
 /// One place of the binding's `max_connections`. A local connection keeps its
 /// place for as long as it lives: a control connection for the life of its
-/// link, a transfer or parked connection until its last half is gone.
+/// link, a transfer or parked connection until its last half is gone and
+/// until every task that took over a half's descriptor (a drain, an end
+/// marker still being written) has let go of it, so that the places bound the
+/// descriptors and not only the halves still in hand.
 pub(crate) type Place = OwnedSemaphorePermit;
 
 /// The peers a binding has admitted, keyed by their group token.
@@ -510,7 +520,9 @@ impl<S: Stream> Closing<S> {
 
 /// The most transfer connections one peer's live count can hold; waiting for
 /// all of them back is waiting for the peer's admitted transfers to finish.
-const LIVE_CAP: usize = u32::MAX as usize;
+/// What a semaphore counts is the platform's own ceiling: a constant above it
+/// panics the first time a local peer's group is made.
+const LIVE_CAP: usize = Semaphore::MAX_PERMITS;
 
 /// The longest a link whose peer's control connection ended waits for the
 /// transfers the peer had already sent before it closes anyway.
@@ -621,11 +633,14 @@ pub(crate) struct Grouped<S: Stream> {
     /// Parked connections that have been spent and need replacing.
     deficit: Arc<Deficit>,
     peer: Option<S::Principal>,
-    /// One permit per live local connection: `max_local_streams` of them, and
-    /// an `open` with none free waits for one rather than failing
-    /// (`docs/GUARANTEES.md` §6). The parked reverse pool shares this budget,
-    /// and on the accepting side so does every transfer connection admitted
-    /// for the peer.
+    /// One permit per live local connection that counts against
+    /// `max_local_streams`: a transfer this side opens, and a connection
+    /// parked for the reverse pool, held by whichever side keeps it. An `open`
+    /// with none free waits for one rather than failing
+    /// (`docs/GUARANTEES.md` §6). A transfer connection the *peer* opens
+    /// toward the accepting side does not draw on it: `Groups::admit` counts
+    /// it against the group's live count and the binding's `max_connections`
+    /// places.
     slots: Arc<Semaphore>,
     max_parked: usize,
     closing: Arc<Closing<S>>,
@@ -974,12 +989,28 @@ impl StreamSlot {
     }
 }
 
+/// What one local connection is counted against while its descriptor is
+/// open: its slot of `max_local_streams` and, on the accepting side, its place
+/// of the binding's `max_connections`. Both halves hold the same ones, so
+/// they come back when the last holder lets go.
+///
+/// A half that hands its OS handle to a task of its own hands its claims
+/// along ([`Stream::stop`], [`Stream::finish`], [`Stream::reset`]). Without
+/// that, a drain still reading a refused transfer would hold a descriptor
+/// the count no longer includes, and a peer that never ends it could make the
+/// binding hold as many as the process may open instead of as many as it
+/// admits.
+#[derive(Default)]
+pub(crate) struct Claims {
+    _slot: Option<Arc<StreamSlot>>,
+    _place: Option<Arc<Place>>,
+}
+
 /// The writing half of one local stream.
 pub(crate) struct LocalSend<S: Stream> {
     io: Option<S::Writer>,
-    _slot: Option<Arc<StreamSlot>>,
-    /// The binding's place for this connection, shared with its other half.
-    _place: Option<Arc<Place>>,
+    /// The connection's slot and place, shared with its other half.
+    claims: Claims,
     /// Set on the dialling side's control stream: where its half goes when
     /// the HELLO is done, instead of being ended and closed.
     keep: Option<Arc<StdMutex<Option<S::Writer>>>>,
@@ -989,15 +1020,17 @@ impl<S: Stream> LocalSend<S> {
     fn new(io: S::Writer, slot: Option<Arc<StreamSlot>>) -> LocalSend<S> {
         LocalSend {
             io: Some(io),
-            _slot: slot,
-            _place: None,
+            claims: Claims {
+                _slot: slot,
+                _place: None,
+            },
             keep: None,
         }
     }
 
     /// Ties the binding's place for this connection to this half.
     fn placed(mut self, place: Arc<Place>) -> LocalSend<S> {
-        self._place = Some(place);
+        self.claims._place = Some(place);
         self
     }
 
@@ -1029,7 +1062,7 @@ impl<S: Stream> LocalSend<S> {
             Some(io) => {
                 match &self.keep {
                     Some(keep) => *keep.lock().expect("poisoned") = Some(io),
-                    None => S::finish(io),
+                    None => S::finish(io, std::mem::take(&mut self.claims)),
                 }
                 Ok(())
             }
@@ -1040,7 +1073,7 @@ impl<S: Stream> LocalSend<S> {
     /// Abandons the payload.
     pub(crate) fn reset(&mut self, code: u64) {
         if let Some(io) = self.io.take() {
-            S::reset(io, code);
+            S::reset(io, code, std::mem::take(&mut self.claims));
         }
     }
 
@@ -1064,7 +1097,7 @@ impl<S: Stream> Drop for LocalSend<S> {
     /// A half dropped without `finish` or `reset` is an abandoned payload.
     fn drop(&mut self) {
         if let Some(io) = self.io.take() {
-            S::reset(io, codes::CANCELED);
+            S::reset(io, codes::CANCELED, std::mem::take(&mut self.claims));
         }
     }
 }
@@ -1072,9 +1105,8 @@ impl<S: Stream> Drop for LocalSend<S> {
 /// The reading half of one local stream.
 pub(crate) struct LocalRecv<S: Stream> {
     io: Option<S::Reader>,
-    _slot: Option<Arc<StreamSlot>>,
-    /// The binding's place for this connection, shared with its other half.
-    _place: Option<Arc<Place>>,
+    /// The connection's slot and place, shared with its other half.
+    claims: Claims,
     /// Set on a parked reverse connection: the pool this one was taken from
     /// wants a replacement once the peer has spent it [0012 §4.4].
     deficit: Option<Arc<Deficit>>,
@@ -1088,8 +1120,10 @@ impl<S: Stream> LocalRecv<S> {
     fn new(io: S::Reader, slot: Option<Arc<StreamSlot>>) -> LocalRecv<S> {
         LocalRecv {
             io: Some(io),
-            _slot: slot,
-            _place: None,
+            claims: Claims {
+                _slot: slot,
+                _place: None,
+            },
             deficit: None,
             spent: false,
             watch: None,
@@ -1098,7 +1132,7 @@ impl<S: Stream> LocalRecv<S> {
 
     /// Ties the binding's place for this connection to this half.
     fn placed(mut self, place: Arc<Place>) -> LocalRecv<S> {
-        self._place = Some(place);
+        self.claims._place = Some(place);
         self
     }
 
@@ -1135,7 +1169,7 @@ impl<S: Stream> LocalRecv<S> {
     /// Refuses the rest of the payload.
     pub(crate) fn stop(&mut self, code: u64) {
         if let Some(io) = self.io.take() {
-            S::stop(io, code);
+            S::stop(io, code, std::mem::take(&mut self.claims));
         }
     }
 }
@@ -1150,8 +1184,32 @@ impl<S: Stream> Drop for LocalRecv<S> {
         if let Some(io) = self.io.take() {
             match self.watch.take() {
                 Some(watch) => watch.spawn(io),
-                None => S::stop(io, codes::CANCELED),
+                None => S::stop(io, codes::CANCELED, std::mem::take(&mut self.claims)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live count is a semaphore, and tokio refuses one larger than its
+    /// platform's ceiling with a panic: on a 32-bit target the first local
+    /// control connection would have taken its accept task down. The settle
+    /// check of a link whose peer left compares against the same constant.
+    #[test]
+    fn the_live_count_fits_the_platforms_semaphore() {
+        const _: () = assert!(LIVE_CAP <= Semaphore::MAX_PERMITS);
+        let live = Semaphore::new(LIVE_CAP);
+        assert_eq!(live.available_permits(), LIVE_CAP);
+        let transfer = live.try_acquire().expect("a permit for a transfer");
+        assert_ne!(
+            live.available_permits(),
+            LIVE_CAP,
+            "a live transfer is visible"
+        );
+        drop(transfer);
+        assert_eq!(live.available_permits(), LIVE_CAP, "and gone once it ends");
     }
 }

@@ -481,10 +481,13 @@ impl Listener {
     /// `SOCK_STREAM` on a filesystem path, no TLS and no credentials of our
     /// own: the peer is proved by the kernel instead
     /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
-    /// §4.4, §4.5). The socket file is replaced if a crash left one, and its
-    /// mode is set to `0600` explicitly rather than inherited from `umask` —
-    /// but **the directory is what makes that safe**: unlink-then-bind has a
-    /// substitution race that only directory ownership and permissions close
+    /// §4.4, §4.5). A live listener on the path is refused
+    /// ([`ErrorKind::AddrInUse`](std::io::ErrorKind::AddrInUse)); a socket
+    /// file a crash left behind is replaced. The socket is bound in a private
+    /// `0700` directory next to `path`, given mode `0600` there rather than
+    /// inheriting `umask`, and renamed into place, so it is never visible with
+    /// another mode. **The directory is still what makes that safe**:
+    /// whoever can write it can rename over the node afterwards
     /// (`docs/research/ipc.md` §1.2, §7), so `path` MUST live in a directory
     /// this process owns and no other user may write.
     ///
@@ -502,9 +505,10 @@ impl Listener {
             // no reactor of its own.
             let _guard = exec.enter();
             // The bind hygiene — the `sun_path` budget, the socket-type
-            // check, unlink-then-bind and the explicit mode — is
-            // `weida-runtime`'s, because `ipc://` on any protocol needs the
-            // same four answers [0010 §4.5].
+            // check, the live-listener probe, the private-directory bind
+            // and rename, and the explicit mode — is `weida-runtime`'s,
+            // because `ipc://` on any protocol needs the same answers
+            // [0010 §4.5].
             weida_runtime::BoundUnixSocket::bind(path)?
         };
         exec.spawn(accept_unix(
@@ -565,7 +569,9 @@ impl Listener {
             shared: self.inner.runtime.shared(),
             link,
             admitted: Arc::new(Semaphore::new(max_connections)),
-
+            departing: Arc::new(Semaphore::new(
+                max_connections.clamp(1, Semaphore::MAX_PERMITS),
+            )),
             refusals: Arc::new(LogThrottle::new(REFUSAL_LOG_INTERVAL)),
         }
     }
@@ -972,6 +978,9 @@ struct LocalAccept<S: crate::grouped::Stream> {
     /// local process can make a binding hold is this count, not the
     /// descriptor limit of the whole process.
     admitted: Arc<Semaphore>,
+    /// How many closed connections may wait, as a task of their own, for a
+    /// queue to take the notice that their consumer is gone ([`depart`]).
+    departing: Arc<Semaphore>,
     /// One record a second for everything an accept loop turns away or trips
     /// over, so a flood is not a flood of log lines.
     refusals: Arc<LogThrottle>,
@@ -990,7 +999,7 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
             shared: Arc::clone(&self.shared),
             link: self.link,
             admitted: Arc::clone(&self.admitted),
-
+            departing: Arc::clone(&self.departing),
             refusals: Arc::clone(&self.refusals),
         }
     }
@@ -1049,9 +1058,13 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
                 let conn_id = ctx.conn.stable_id();
                 let reason = ctx.conn.closed().await;
                 self.subs.remove_connection(conn_id);
-                crate::conn::drop_consumers(&ctx).await;
+                let departure = crate::conn::take_departure(&ctx);
                 tracing::debug!(%reason, "local connection closed");
-                drop(place);
+                depart(departure, &self.departing, move || {
+                    drop(ctx);
+                    drop(place);
+                })
+                .await;
             }
             Accepted::Transfer(token, stream, principal) => {
                 // The connection keeps its place until both of its halves are
@@ -1236,8 +1249,10 @@ async fn accept_local(
             let conn_id = ctx.conn.stable_id();
             let reason = ctx.conn.closed().await;
             subs.remove_connection(conn_id);
-            crate::conn::drop_consumers(&ctx).await;
+            let departure = crate::conn::take_departure(&ctx);
             tracing::debug!(%reason, "local connection closed");
+            drop(ctx);
+            departure.announce().await;
         });
     }
 }
@@ -1416,6 +1431,42 @@ impl Drop for Counted {
     }
 }
 
+/// Tells the queues a closed connection consumed on that it is gone, and runs
+/// `release`, which gives back everything that counted the connection.
+///
+/// A queue that is full and unread makes the telling wait for as long as its
+/// application likes. A connection that waited holding everything it is
+/// counted against would stay in every table that limits live ones: its share
+/// of `max_connections`, its peer's share of `max_connections_per_peer`, a
+/// local place. So `release` runs first, and what waits is a [`Departure`],
+/// which holds the queues and an id and nothing of the connection.
+///
+/// `departing` bounds how many of those waits there are, to `max_connections`.
+/// Past it the connection keeps what counts it until its queues have taken
+/// the notice, which bounds the tasks at twice what the binding admits and
+/// still loses no notice: a queue owes something for what it handed that
+/// consumer, and has to be told.
+async fn depart(
+    departure: crate::conn::Departure,
+    departing: &Arc<Semaphore>,
+    release: impl FnOnce() + Send,
+) {
+    if departure.is_empty() {
+        release();
+        return;
+    }
+    match Arc::clone(departing).try_acquire_owned() {
+        Ok(_wait) => {
+            release();
+            departure.announce().await;
+        }
+        Err(_) => {
+            departure.announce().await;
+            release();
+        }
+    }
+}
+
 /// Accepts connections until the endpoint is closed.
 ///
 /// Everything it needs is already on the listener it serves: the namespace to
@@ -1452,6 +1503,9 @@ async fn accept_connections(
     let live = Arc::new(AtomicUsize::new(0));
     let handshaking = Arc::new(AtomicUsize::new(0));
     let refusals = Arc::new(LogThrottle::new(REFUSAL_LOG_INTERVAL));
+    let departing = Arc::new(Semaphore::new(
+        max_connections.clamp(1, Semaphore::MAX_PERMITS),
+    ));
     while let Some(incoming) = endpoint.accept().await {
         // A draining runtime admits nothing new: the handshake is refused
         // outright rather than accepted and then closed
@@ -1502,8 +1556,8 @@ async fn accept_connections(
         let peers = Arc::clone(&peers);
         let open = Arc::clone(&open);
         let refusals = Arc::clone(&refusals);
+        let departing = Arc::clone(&departing);
         exec.spawn(async move {
-            let _live = live;
             let connected = incoming.await;
             drop(handshake);
             match connected {
@@ -1535,6 +1589,7 @@ async fn accept_connections(
                             VarInt::from_u32(codes::LIMIT_EXCEEDED as u32),
                             b"per-peer connection limit reached",
                         );
+                        open.remove(quic_id);
                     } else {
                         tracing::debug!(%remote, "connection accepted");
                         // The handle must outlive the connection: it owns the
@@ -1554,11 +1609,15 @@ async fn accept_connections(
                         // it; otherwise connection churn would grow the
                         // registry.
                         subs.remove_connection(serial);
-                        crate::conn::drop_consumers(&ctx).await;
-                        peers.release(peer, quic_id);
+                        let departure = crate::conn::take_departure(&ctx);
                         tracing::debug!(%remote, %reason, "connection closed");
+                        depart(departure, &departing, move || {
+                            peers.release(peer, quic_id);
+                            open.remove(quic_id);
+                            drop((ctx, conn, live));
+                        })
+                        .await;
                     }
-                    open.remove(quic_id);
                 }
                 Err(e) => tracing::debug!(error = %e, "handshake failed"),
             }

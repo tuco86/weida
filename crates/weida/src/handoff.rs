@@ -365,7 +365,11 @@ fn plausible(destination: SocketAddr, src_ip: Option<IpAddr>, contents: &[u8]) -
         && src_ip.is_none_or(unicast)
 }
 
+/// Whether `ip` could be a single client's address. An IPv4-mapped IPv6
+/// address is judged as the IPv4 address it names, because a dual-stack
+/// socket, which is what a QUIC binding on `[::]` is, sends it as that.
 fn unicast(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
     !(ip.is_multicast() || ip.is_unspecified() || ip == IpAddr::V4(Ipv4Addr::BROADCAST))
 }
 
@@ -543,15 +547,28 @@ mod tests {
             "10.0.0.7:0",
             "[ff02::1]:5000",
             "[::]:5000",
+            "[::ffff:224.0.0.1]:5000",
+            "[::ffff:255.255.255.255]:5000",
+            "[::ffff:0.0.0.0]:5000",
         ] {
             let held = held_datagram(destination, vec![0x40, 1, 2, 3]);
             assert_invalid_data(&encode(local, &[held]));
         }
-        for source in ["224.0.0.1", "0.0.0.0", "ff02::1"] {
+        for source in [
+            "224.0.0.1",
+            "0.0.0.0",
+            "ff02::1",
+            "::ffff:224.0.0.1",
+            "::ffff:255.255.255.255",
+            "::ffff:0.0.0.0",
+        ] {
             let mut held = held_datagram("10.0.0.7:5000", vec![0x40, 1, 2, 3]);
             held.src_ip = Some(source.parse().unwrap());
             assert_invalid_data(&encode(local, &[held]));
         }
+        // A dual-stack client's own address is an ordinary unicast one.
+        let mapped = held_datagram("[::ffff:10.0.0.7]:5000", vec![0x40, 1, 2, 3]);
+        assert!(decode(&encode(local, &[mapped])).is_ok());
     }
 
     #[test]

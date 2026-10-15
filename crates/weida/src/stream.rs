@@ -1060,10 +1060,15 @@ pub(crate) async fn open_transfer_on(
     let (mut header, trace, cursors) = outgoing_header(conn, Some(path), meta, None)?;
     // Under `core` ordering the sequencer is never touched and the key is
     // omitted; under `PerProducer` this is the number the peer's gap
-    // detector and reassembler read.
-    header.sequence = conn.sequencer.next(path);
+    // detector and reassembler read. It is on loan until the transfer starts:
+    // a header the peer would refuse, or an open that fails or is given up
+    // on, sends nothing, and a number nobody carries would read as a lost
+    // transfer.
+    let number = conn.sequencer.issue(path);
+    header.sequence = number.number();
     let head = DataHead::new(conn, &header)?;
     let mut stream = conn.open_uni().await?;
+    number.spend();
     head.write(&mut stream).await?;
     Ok(OutgoingTransfer::new(
         stream,
@@ -1222,6 +1227,33 @@ impl Consumer {
         transfer.write_all(body).await?;
         transfer.finish()?;
         Ok(())
+    }
+
+    /// Closes the connection this consumer subscribed on, with `code` and a
+    /// human-readable `reason`.
+    ///
+    /// For a queue that must act on a consumer that stopped taking
+    /// deliveries. Dropping the subscription alone leaves the consumer
+    /// holding a connection that is open and a subscription that is gone,
+    /// and nothing tells it so; a closed connection is the one signal every
+    /// client already reacts to, and a [`Subscriber`](crate::Subscriber)
+    /// that redials subscribes again. Every other subscription of the same
+    /// connection ends with it, on every path.
+    ///
+    /// `code` is one of [`crate::codes`], which are what `docs/PROTOCOL.md`
+    /// §7 defines for `CONNECTION_CLOSE`; a value too large for a QUIC
+    /// varint is sent as [`crate::codes::INTERNAL`]. `reason` is for the
+    /// peer's logs and is not interpreted. Closing an already closed
+    /// connection does nothing.
+    pub fn close(&self, code: u64, reason: &str) {
+        /// The largest value a QUIC varint carries (RFC 9000 §16).
+        const MAX_CODE: u64 = (1 << 62) - 1;
+        let code = if code > MAX_CODE {
+            weida_protocol::codes::INTERNAL
+        } else {
+            code
+        };
+        self.conn.conn.close(code, reason);
     }
 }
 

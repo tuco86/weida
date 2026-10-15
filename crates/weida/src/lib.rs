@@ -112,8 +112,8 @@ pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
 pub use stats::{ConnectionStats, PathStats, RemoteStats, TransportStats, UdpCounts};
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 pub use transfer::{
-    Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream,
-    TransferMeta, new_trace,
+    ConnectionId, Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer,
+    ReplyStream, TransferMeta, new_trace,
 };
 pub use weida_core::{
     Address, Congestion, DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT, EndpointAddr, Error,

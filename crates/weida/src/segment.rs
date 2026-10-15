@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use weida_core::Error;
 use weida_protocol::{DataHeader, codes};
 
@@ -520,6 +520,43 @@ struct LayerTx {
     finished: Arc<AtomicBool>,
 }
 
+impl LayerTx {
+    /// Queues `chunk` for the layer's writer; `permit` is the budget the
+    /// chunk is charged against.
+    ///
+    /// The bytes are counted as queued **before** the writer can see the
+    /// chunk. The writer gives back what it wrote against that count, and
+    /// never more than the count holds, because a cut may have taken it
+    /// already. A count made after the send could land after the writer's
+    /// release, find nothing to return and leave a charge for a chunk that is
+    /// gone, which nothing gives back. A chunk the queue refuses takes its
+    /// count back, and its permit with it.
+    ///
+    /// On success the permit is spent: the writer or a cut returns its
+    /// bytes.
+    fn queue(
+        &self,
+        chunk: Bytes,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), mpsc::error::TrySendError<SegItem>> {
+        let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        self.queued.fetch_add(len, Ordering::AcqRel);
+        match self.tx.try_send(SegItem::Chunk(chunk)) {
+            Ok(()) => {
+                permit.forget();
+                Ok(())
+            }
+            Err(refused) => {
+                // This thread added `len` and only a cut on this thread
+                // clears the count, so it still holds at least `len`.
+                self.queued.fetch_sub(len, Ordering::AcqRel);
+                drop(permit);
+                Err(refused)
+            }
+        }
+    }
+}
+
 /// The sending side of one copy, kept by the [`Segment`].
 struct CopyTx {
     spec: Arc<CopySpec>,
@@ -748,17 +785,12 @@ impl Segment {
             let Some(tx) = copy.layers[index].as_ref() else {
                 continue;
             };
-            match tx.tx.try_send(SegItem::Chunk(chunk.clone())) {
+            match tx.queue(chunk.clone(), permit) {
                 Ok(()) => {
-                    // Given back by the writer once the bytes are written,
-                    // or by a cut that takes them first.
-                    permit.forget();
-                    tx.queued.fetch_add(u64::from(len), Ordering::AcqRel);
                     copy.ctl.total.fetch_add(u64::from(len), Ordering::AcqRel);
                     took += 1;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    drop(permit);
                     copy.cut(layer, DropCause::SubscriberQueue);
                 }
                 // The layer's task already ended and cut what it had to.
@@ -1185,5 +1217,142 @@ mod tests {
         // its next, 1.
         end(&copy_a);
         assert_eq!(topics.next(&c).ok(), Some(1));
+    }
+
+    /// A layer's sending side with room for `depth` chunks, the writer's end
+    /// of its queue, and a budget of `budget` bytes.
+    fn layer_with(
+        depth: usize,
+        budget: usize,
+    ) -> (LayerTx, mpsc::Receiver<SegItem>, Arc<Semaphore>) {
+        let (tx, rx) = mpsc::channel(depth);
+        let layer = LayerTx {
+            tx,
+            queued: Arc::new(AtomicU64::new(0)),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        (layer, rx, Arc::new(Semaphore::new(budget)))
+    }
+
+    fn chunk(len: u32) -> Bytes {
+        Bytes::from(vec![0u8; len as usize])
+    }
+
+    fn charge(budget: &Arc<Semaphore>, len: u32) -> OwnedSemaphorePermit {
+        Arc::clone(budget)
+            .try_acquire_many_owned(len)
+            .expect("room in the budget")
+    }
+
+    #[test]
+    fn a_queued_chunk_is_counted_and_its_bytes_return_when_it_is_written() {
+        let (layer, mut rx, budget) = layer_with(2, 100);
+        layer.queue(chunk(10), charge(&budget, 10)).expect("queued");
+        assert_eq!(layer.queued.load(Ordering::Acquire), 10);
+        assert_eq!(budget.available_permits(), 90);
+
+        let Ok(SegItem::Chunk(written)) = rx.try_recv() else {
+            panic!("the queued chunk");
+        };
+        release(&layer.queued, written.len(), &budget);
+        assert_eq!(layer.queued.load(Ordering::Acquire), 0);
+        assert_eq!(budget.available_permits(), 100);
+    }
+
+    #[test]
+    fn a_chunk_the_queue_refuses_is_neither_counted_nor_charged() {
+        let (layer, mut rx, budget) = layer_with(1, 100);
+        layer.queue(chunk(10), charge(&budget, 10)).expect("queued");
+        let refused = layer.queue(chunk(10), charge(&budget, 10));
+        assert!(matches!(refused, Err(mpsc::error::TrySendError::Full(_))));
+        // Only the chunk that is in the queue is counted and charged: a
+        // count left behind by the refused one would be returned to the
+        // budget a second time by the next cut.
+        assert_eq!(layer.queued.load(Ordering::Acquire), 10);
+        assert_eq!(budget.available_permits(), 90);
+
+        let Ok(SegItem::Chunk(written)) = rx.try_recv() else {
+            panic!("the queued chunk");
+        };
+        release(&layer.queued, written.len(), &budget);
+        assert_eq!(layer.queued.load(Ordering::Acquire), 0);
+        assert_eq!(budget.available_permits(), 100);
+    }
+
+    #[test]
+    fn a_chunk_for_a_layer_whose_writer_has_ended_is_neither_counted_nor_charged() {
+        let (layer, rx, budget) = layer_with(1, 100);
+        drop(rx);
+        let refused = layer.queue(chunk(10), charge(&budget, 10));
+        assert!(matches!(refused, Err(mpsc::error::TrySendError::Closed(_))));
+        assert_eq!(layer.queued.load(Ordering::Acquire), 0);
+        assert_eq!(budget.available_permits(), 100);
+    }
+
+    /// One sender and one writer on threads of their own: `chunks` chunks of
+    /// one byte through a budget of [`RACE_BUDGET`]. The writer spins rather
+    /// than parks, so it has each chunk within nanoseconds of the send and
+    /// returns its bytes the moment it has it, which is the interleaving a
+    /// count made after the send loses. Returns what the layer's count and
+    /// the budget hold once everything is written.
+    fn race_round(chunks: usize) -> (u64, usize) {
+        let (layer, mut rx, budget) = layer_with(COPY_QUEUE, RACE_BUDGET);
+        let queued = Arc::clone(&layer.queued);
+        let returned = Arc::clone(&budget);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            loop {
+                match rx.try_recv() {
+                    Ok(SegItem::Chunk(chunk)) => release(&queued, chunk.len(), &returned),
+                    Ok(SegItem::Finish) => {}
+                    Err(mpsc::error::TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+            let _ = done_tx.send(());
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut sent = 0;
+        while sent < chunks {
+            assert!(
+                Instant::now() < deadline,
+                "the writer stopped returning budget"
+            );
+            let Ok(permit) = Arc::clone(&budget).try_acquire_many_owned(1) else {
+                std::thread::yield_now();
+                continue;
+            };
+            match layer.queue(chunk(1), permit) {
+                Ok(()) => sent += 1,
+                // The queue is full: the writer has not caught up yet.
+                Err(mpsc::error::TrySendError::Full(_)) => std::thread::yield_now(),
+                Err(mpsc::error::TrySendError::Closed(_)) => panic!("the writer ended early"),
+            }
+        }
+        let queued = Arc::clone(&layer.queued);
+        drop(layer);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer drained the queue");
+        writer.join().expect("the writer thread");
+        (queued.load(Ordering::Acquire), budget.available_permits())
+    }
+
+    const RACE_BUDGET: usize = 64;
+
+    /// Whatever the schedule, the budget is whole and nothing is counted as
+    /// queued once every chunk is written. Several rounds, each on threads of
+    /// its own, because where the two land decides how often the writer's
+    /// release falls inside the sender's window.
+    #[test]
+    fn a_writer_that_releases_at_once_never_strands_budget() {
+        for round in 0..10 {
+            let (counted, available) = std::thread::spawn(|| race_round(200_000))
+                .join()
+                .expect("the sender thread");
+            assert_eq!(counted, 0, "round {round}: bytes still counted as queued");
+            assert_eq!(available, RACE_BUDGET, "round {round}: budget stranded");
+        }
     }
 }

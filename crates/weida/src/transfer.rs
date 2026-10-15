@@ -697,6 +697,18 @@ impl std::fmt::Debug for Delivery {
     }
 }
 
+/// Identifies one connection of this process.
+///
+/// A number the process gave the connection when it was made, never reused
+/// for another one while the process lives — a serial, not an address and
+/// not derived from one. It tells connections apart without saying where they
+/// are or who is on them: that is [`IncomingMeta::peer`], proved in the
+/// handshake, and a peer that proved nothing cannot be told from another by
+/// it. The same connection has the same number as the
+/// [`ConsumerId`](crate::ConsumerId) of its subscriptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConnectionId(usize);
+
 /// An inbound transfer: one receive stream plus the metadata that described
 /// it.
 ///
@@ -730,6 +742,15 @@ impl IncomingTransfer {
     /// Metadata from the DATA header.
     pub fn meta(&self) -> &IncomingMeta {
         &self.meta
+    }
+
+    /// The connection this transfer arrived on.
+    ///
+    /// For accounting that has to tell connections apart: one proved key may
+    /// hold several, and every anonymous peer looks like every other by
+    /// [`IncomingMeta::peer`].
+    pub fn connection(&self) -> ConnectionId {
+        ConnectionId(self.conn.conn.stable_id())
     }
 
     /// A reporter for the levels the sender ordered, if it ordered any.
@@ -925,6 +946,15 @@ impl IncomingRequest {
     /// Metadata from the request's DATA header.
     pub fn meta(&self) -> &IncomingMeta {
         &self.meta
+    }
+
+    /// The connection this request arrived on.
+    ///
+    /// For accounting that has to tell connections apart: one proved key may
+    /// hold several, and every anonymous peer looks like every other by
+    /// [`IncomingMeta::peer`].
+    pub fn connection(&self) -> ConnectionId {
+        ConnectionId(self.reply.conn.conn.stable_id())
     }
 
     /// The request payload, borrowed.

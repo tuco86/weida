@@ -38,7 +38,7 @@ use weida_core::{Error, PeerIdentity, WindowsPrincipal};
 use weida_runtime::Exec;
 
 use crate::chunked::{ChunkReader, ChunkWriter, Marker};
-use crate::grouped::Stream;
+use crate::grouped::{Claims, Stream};
 
 /// What a dial needs: the pipe's OS path and the runtime whose timer waits
 /// out a busy pipe.
@@ -185,16 +185,16 @@ impl Stream for PipeStream {
         PeerIdentity::Windows(principal.clone())
     }
 
-    fn finish(writer: Self::Writer) {
-        writer.end(Marker::Fin);
+    fn finish(writer: Self::Writer, claims: Claims) {
+        writer.end(Marker::Fin, claims);
     }
 
-    fn reset(writer: Self::Writer, code: u64) {
-        writer.end(Marker::Reset(code));
+    fn reset(writer: Self::Writer, code: u64, claims: Claims) {
+        writer.end(Marker::Reset(code), claims);
     }
 
-    fn stop(reader: Self::Reader, _code: u64) {
-        reader.drain();
+    fn stop(reader: Self::Reader, _code: u64, claims: Claims) {
+        reader.drain(claims);
     }
 
     fn read_error(error: std::io::Error) -> Error {

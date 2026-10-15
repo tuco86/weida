@@ -1103,6 +1103,7 @@ impl SubRegistry {
             exec,
             max_chunk,
             refused: false,
+            interrupted: false,
             finished: false,
         }
     }
@@ -1211,6 +1212,11 @@ pub struct FanOut {
     /// `open` found the topic above the DATA header's cap: nothing was
     /// opened, and every write fails.
     refused: bool,
+    /// A [`FanOut::write_within`] was dropped while it waited: the chunk is
+    /// queued for some copies and not for the rest, and the call that knew
+    /// which is gone, so no copy may be finished. Set for the wait and
+    /// cleared by the call that sees it through.
+    interrupted: bool,
     finished: bool,
 }
 
@@ -1237,6 +1243,7 @@ impl FanOut {
             exec: None,
             max_chunk,
             refused,
+            interrupted: false,
             finished: false,
         }
     }
@@ -1279,6 +1286,13 @@ impl FanOut {
     /// buffer regardless of subscriber count, and the payload is never held
     /// whole anywhere.
     ///
+    /// **A call that is dropped while it waits abandons the transfer.** By
+    /// then the chunk is queued for the subscribers that had room and not for
+    /// the rest, and the outcome that said which is gone with the call. No
+    /// copy may be finished after that, so later writes fail with
+    /// [`Error::Canceled`] and [`FanOut::finish`] resets every copy and
+    /// counts none.
+    ///
     /// Fails with [`Error::LimitExceeded`] for a chunk larger than
     /// `Limits::subscriber_buffer_bytes`: such a chunk could never be
     /// enqueued for anybody, and the point of this API is that the *payload*
@@ -1291,8 +1305,8 @@ impl FanOut {
         let chunk = chunk.into();
         let want = self.want(&chunk)?;
         // The targets stay in `self` until the chunk's outcome is known for
-        // all of them, so a call that is dropped while it waits leaves the
-        // fan-out whole and its drop still aborts every copy.
+        // all of them, so a call that is dropped while it waits still leaves
+        // every copy to the fan-out's drop, which aborts it.
         let mut reach = Vec::with_capacity(self.targets.len());
         let mut waiting = Vec::new();
         for (at, target) in self.targets.iter().enumerate() {
@@ -1305,8 +1319,13 @@ impl FanOut {
             }
         }
         if !waiting.is_empty() {
+            // From here on the chunk is queued for some copies and not for the
+            // rest, and only this call knows which. If it is dropped while it
+            // waits, the flag stays set and the transfer cannot be finished.
+            self.interrupted = true;
             self.wait_for_room(&waiting, &mut reach, want, limit, &chunk)
                 .await;
+            self.interrupted = false;
         }
         let mut kept = Vec::with_capacity(self.targets.len());
         for (mut target, reach) in std::mem::take(&mut self.targets).into_iter().zip(reach) {
@@ -1389,7 +1408,9 @@ impl FanOut {
     /// arrive whole wants [`FanOut::write_within`].
     ///
     /// Fails with [`Error::LimitExceeded`] for a chunk larger than
-    /// `Limits::subscriber_buffer_bytes`, as [`FanOut::write_within`] does.
+    /// `Limits::subscriber_buffer_bytes`, as [`FanOut::write_within`] does,
+    /// and with [`Error::Canceled`] after a `write_within` that was dropped
+    /// while it waited.
     pub fn write_now(&mut self, chunk: impl Into<Bytes>) -> Result<usize, Error> {
         let chunk = chunk.into();
         let want = self.want(&chunk)?;
@@ -1409,8 +1430,12 @@ impl FanOut {
     }
 
     /// The chunk's size in budget permits, or the refusal that spares every
-    /// copy a wait that could never end.
+    /// copy a wait that could never end, or a write onto a transfer that a
+    /// dropped `write_within` left with some copies short of a chunk.
     fn want(&self, chunk: &Bytes) -> Result<u32, Error> {
+        if self.interrupted {
+            return Err(Error::Canceled);
+        }
         if self.refused || chunk.len() > self.max_chunk {
             return Err(Error::LimitExceeded);
         }
@@ -1443,7 +1468,14 @@ impl FanOut {
     /// behind them. A fan-out copy carries no receipt — nobody holds a
     /// `Delivery` for it — so the transport acknowledgement is awaited by the
     /// drain and by nothing else (`docs/decisions/0009-drain.md` §4.2).
+    ///
+    /// A fan-out whose [`FanOut::write_within`] was dropped while it waited
+    /// resets every copy instead and counts none.
     pub fn finish(mut self) -> usize {
+        if self.interrupted {
+            // Not finished, so the drop below aborts every copy.
+            return 0;
+        }
         self.finished = true;
         let id = self.id;
         let delivered = self.targets.len();
@@ -1985,5 +2017,51 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// A `write_within` dropped while it waits has queued its chunk for the
+    /// subscribers that had room and not for the rest. Finishing the transfer
+    /// would hand the short ones a FIN after a hole, which they would take
+    /// for a whole payload.
+    #[tokio::test]
+    async fn a_write_dropped_while_it_waited_leaves_nothing_to_finish() {
+        let registry = registry(Limits {
+            subscriber_buffer_bytes: 8192,
+            ..Limits::default()
+        });
+        let (fast, _fast_end) = connection(&registry, "pubsub-unit-dropped-write-fast").await;
+        let (slow, _slow_end) = connection(&registry, "pubsub-unit-dropped-write-slow").await;
+        registry.subscribe("/md", &fast, "#".to_owned()).unwrap();
+        registry.subscribe("/md", &slow, "#".to_owned()).unwrap();
+        // Only the slow one subscribes here, and nobody reads the other end
+        // of its link, so this message stays charged to its budget.
+        registry
+            .subscribe("/only-slow", &slow, "#".to_owned())
+            .unwrap();
+        let spent = Bytes::from(vec![7u8; 5000]);
+        assert_eq!(
+            registry
+                .publish("/only-slow", "t", spent, None, 5000)
+                .unwrap(),
+            1
+        );
+
+        let mut fan_out = registry.open("/md", "t", None);
+        assert_eq!(fan_out.subscribers(), 2);
+        // The fast subscriber takes the chunk; the slow one has 3192 bytes of
+        // room for 4000 and waits, longer than the caller will.
+        let chunk = Bytes::from(vec![1u8; 4000]);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            fan_out.write_within(chunk, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(dropped.is_err(), "the write was still waiting for room");
+
+        assert!(matches!(
+            fan_out.write_now(Bytes::from_static(b"x")),
+            Err(Error::Canceled)
+        ));
+        assert_eq!(fan_out.finish(), 0, "no copy is finished after a hole");
     }
 }

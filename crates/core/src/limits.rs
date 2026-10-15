@@ -144,10 +144,12 @@ pub struct Limits {
     /// peer's HELLO is not counted ([`Limits::hello_timeout_ms`] bounds it).
     pub header_timeout_ms: u64,
     /// Inbound streams one connection may have reading their frame head at
-    /// once; the rest wait for a free slot without holding a buffer. With
-    /// `max_header_bytes` this is the worst case of header memory per
-    /// connection ([`Limits::worst_case_header_memory`]), independent of how
-    /// many streams the peer's stream budget lets it open.
+    /// once, and at least one; the rest wait for a free slot without holding
+    /// a buffer. A head is read, decoded and its raw bytes dropped inside one
+    /// slot, so with `max_header_bytes` this is the worst case of header
+    /// memory per connection ([`Limits::worst_case_header_memory`]),
+    /// independent of how many streams the peer's stream budget lets it open
+    /// and of what they do once their head is read.
     pub max_header_streams: usize,
 }
 
@@ -169,17 +171,38 @@ pub enum Congestion {
 pub const DEFAULT_DATAGRAM_RECEIVE_BYTES: usize = 65_536;
 
 impl Limits {
-    /// Worst-case header memory a single hostile connection can pin, in bytes.
+    /// Inbound streams that may read a frame head at once: the configured
+    /// [`Limits::max_header_streams`], and never fewer than one, because a
+    /// connection that read no head could serve nothing.
+    pub const fn header_slots(&self) -> usize {
+        if self.max_header_streams == 0 {
+            1
+        } else {
+            self.max_header_streams
+        }
+    }
+
+    /// Worst-case memory a single hostile connection can pin in raw frame-head
+    /// bytes, in bytes.
     ///
-    /// Only [`Limits::max_header_streams`] streams read a frame head at once
-    /// and the others wait without a buffer, and a header buffer grows with
-    /// the bytes that actually arrive, so the bound is the header cap times
-    /// the smaller of that count and the stream budgets (a peer may open its
-    /// full uni *and* bidi allowance, which is the other way to reach it).
+    /// A stream holds a frame head in memory only while it holds one of the
+    /// [`Limits::header_slots`] slots: the bytes are decoded and dropped
+    /// before the slot is given back. So at most that many heads are in
+    /// memory at once, however many streams the peer opens (up to its stream
+    /// budgets, uni *and* bidi) and whatever those streams do after their
+    /// head: wait on a full queue, or live as long as a FLOW or REPORT stream
+    /// does. A buffer grows with the bytes that actually arrive, so the bound
+    /// is the header cap times the smaller of the slots and the stream
+    /// budgets.
+    ///
+    /// What a stream keeps after its head is decoded is not counted here: the
+    /// decoded header, whose text fields have caps of their own (a few KiB at
+    /// most, `docs/PROTOCOL.md` §10), is part of the stream's state, which the
+    /// stream budgets bound.
     pub const fn worst_case_header_memory(&self) -> u64 {
         let budget =
             self.max_concurrent_uni_streams as u64 + self.max_concurrent_bidi_streams as u64;
-        let reading = self.max_header_streams as u64;
+        let reading = self.header_slots() as u64;
         self.max_header_bytes * if reading < budget { reading } else { budget }
     }
 }
@@ -262,5 +285,16 @@ mod tests {
             ..Limits::default()
         };
         assert_eq!(few.worst_case_header_memory(), 3 * 16 * 1024);
+    }
+
+    #[test]
+    fn a_connection_always_has_a_header_slot() {
+        let none = Limits {
+            max_header_streams: 0,
+            ..Limits::default()
+        };
+        assert_eq!(none.header_slots(), 1);
+        assert_eq!(none.worst_case_header_memory(), 16 * 1024);
+        assert_eq!(Limits::default().header_slots(), 64);
     }
 }

@@ -117,19 +117,12 @@ pub(crate) async fn send_reports(ctx: ConnHandle) {
 /// only REPORT stream, no record is longer than 256 bytes and none ends at
 /// FIN half written. Anything else closes the connection with
 /// `PROTOCOL_VIOLATION`.
-pub(crate) async fn receive_reports(
-    ctx: &ConnHandle,
-    mut stream: RecvHalf,
-    header: &[u8],
-) -> Result<(), Error> {
+pub(crate) async fn receive_reports(ctx: &ConnHandle, mut stream: RecvHalf) -> Result<(), Error> {
     if !ctx.agreed_now().is_some_and(|agreed| agreed.path_report) {
         return violation(ctx, "REPORT without agreed capability 2");
     }
     if ctx.remote.claimed.swap(true, Ordering::AcqRel) {
         return violation(ctx, "a second REPORT stream on one connection");
-    }
-    if let Err(e) = ReportHead::decode(header) {
-        return violation(ctx, &e.to_string());
     }
     // A record is at most 256 bytes plus a two-byte prefix, and every
     // complete one is consumed at once, so `pending` never holds more than

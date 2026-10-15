@@ -1275,6 +1275,74 @@ async fn a_header_longer_than_the_peer_reads_is_refused_before_it_is_written() {
     client.shutdown().await;
 }
 
+/// A header the peer's `max_header_bytes` cannot take is refused before
+/// anything is sent, and it must not use up a producer sequence number: the
+/// receiver reads a number that nobody sent as a transfer it lost, and in
+/// reassemble mode holds the transfers behind it back for it.
+#[tokio::test]
+async fn a_refused_header_does_not_use_up_a_sequence_number() {
+    let certs = Certs::generate();
+    let ordered = GuaranteeSet {
+        ordering: OrderingMode::PerProducerDetect,
+        ..GuaranteeSet::CORE
+    };
+    let client = Runtime::new(RuntimeConfig {
+        guarantees: ordered,
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
+
+    // A peer that reads 64-byte headers only, and agrees on the ordering.
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Option<u64>>();
+    let addr = raw_server(&certs, move |conn| async move {
+        let hello = Hello {
+            guarantees_offered: Some(ordered),
+            guarantees_required: Some(ordered),
+            ..Hello::v0(64, 8)
+        };
+        raw::send_frame(&conn, FrameKind::Hello, &hello.encode()).await;
+        let sequence = loop {
+            let mut stream = bounded(conn.accept_uni()).await.expect("accept uni");
+            let bytes = bounded(stream.read_to_end(64 * 1024))
+                .await
+                .expect("read stream");
+            let (preamble, used) =
+                weida_protocol::parse_preamble(&bytes, 16 * 1024).expect("preamble");
+            if preamble.kind == FrameKind::Data {
+                let end = used + preamble.header_len as usize;
+                break DataHeader::decode(&bytes[used..end])
+                    .expect("decode DATA header")
+                    .sequence;
+            }
+        };
+        let _ = seen_tx.send(sequence);
+    });
+
+    let pusher = client.pusher(certs.client_tls());
+    bounded(pusher.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
+        .await
+        .expect("connect");
+    let oversized = TransferMeta::default().with_topic("t".repeat(100));
+    let err = bounded(pusher.send_with(oversized, b"refused"))
+        .await
+        .expect_err("a header the peer cannot read must not be sent");
+    assert!(
+        matches!(err, Error::LimitExceeded),
+        "expected LimitExceeded, got {err:?}"
+    );
+    bounded(pusher.send_with(TransferMeta::default().with_topic("t"), b"short"))
+        .await
+        .expect("a short topic is sent");
+
+    let sequence = bounded(seen_rx).await.expect("the peer reported");
+    assert_eq!(
+        sequence,
+        Some(0),
+        "the refused transfer took a number the peer never saw"
+    );
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn peer_supplied_strings_are_logged_on_one_line() {
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));

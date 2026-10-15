@@ -352,8 +352,9 @@ impl Harness {
             Transport::Unix => {
                 static SOCKET: AtomicU32 = AtomicU32::new(0);
                 // A short path in a private directory: `sun_path` is 107
-                // bytes on Linux and 104 on macOS, and the directory is what
-                // closes the unlink-then-bind race [0010 §4.5].
+                // bytes on Linux and 104 on macOS, and a directory nobody else
+                // may write is what keeps another user from renaming over the
+                // node after the bind [0010 §4.5].
                 let dir = std::env::temp_dir().join(format!("weida-{}", std::process::id()));
                 std::fs::create_dir_all(&dir).expect("socket directory");
                 {

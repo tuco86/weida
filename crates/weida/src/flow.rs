@@ -972,15 +972,11 @@ pub(crate) async fn datagram_reader(ctx: ConnHandle) {
 pub(crate) async fn handle_flow(
     ctx: &ConnHandle,
     mut stream: RecvHalf,
-    header: &[u8],
+    header: FlowHeader,
 ) -> Result<(), Error> {
     if !ctx.negotiated().await?.datagrams {
         return violation(ctx, "FLOW without the datagram capability");
     }
-    let header = match FlowHeader::decode(header) {
-        Ok(header) => header,
-        Err(e) => return violation(ctx, &e.to_string()),
-    };
     let route = ctx.namespace.lookup(&header.endpoint);
     if let Some(refusal) = refusal_for(route.as_ref(), Wanted::Flow) {
         tracing::debug!(

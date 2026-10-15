@@ -116,7 +116,7 @@ token binds connections and resumes nothing: no subscriptions, no sequence
 position, no dedup window, and it is meaningless once the control connection
 closes, which is why it is not the session state §11 excludes [0012 §4.5].
 
-**A local connection keeps its place for its life.** Each local connection takes one of the binding's `max_connections` places before it is accepted, and keeps it while it lives: a control connection for as long as its link does, a transfer or parked connection until its last half is gone. Its preamble must arrive within `hello_timeout_ms`, or the socket is closed. The dialling side keeps its control connection open for the life of the link, and the accepting side watches that connection: when it ends, the accepting side closes the link with `SHUTDOWN` and the peer's subscriptions and group go with it, so a peer that exits without a word is noticed without a keep-alive.
+**A local connection keeps its place for its life.** Each local connection takes one of the binding's `max_connections` places before it is accepted, and keeps it while it lives: a control connection for as long as its link does, a transfer or parked connection until its last half is gone and nothing in the background, a drain still reading a refused transfer or an end marker still being written, owns its descriptor. A closed connection gives its place back before the queues it consumed on are told it is gone, so a queue that nobody reads cannot keep dead connections counted. Its preamble must arrive within `hello_timeout_ms`, or the socket is closed. The dialling side keeps its control connection open for the life of the link, and the accepting side watches that connection: when it ends, the accepting side closes the link with `SHUTDOWN` and the peer's subscriptions and group go with it, so a peer that exits without a word is noticed without a keep-alive.
 
 A server has no way to *dial* a peer that dialled it, so a stream toward such
 a peer rides a connection that peer parked in advance: a subscriber over a
@@ -605,6 +605,10 @@ the same one and a copy a subscriber lost shows up as a hole in its own sequence
 (`crates/weida/src/pubsub.rs`, both the whole-message and the streamed path). Under `core` — what
 every peer that declares nothing offers and requires — no sender sets it, so a `core` connection
 sees the key never. That is not "unused": it is a key whose presence is decided by negotiation.
+A dialling sender takes its number for a transfer only once the transfer starts: a header the
+peer's `max_header_bytes` would refuse, an open that fails, and a send the caller gives up on all
+put nothing on the wire, so the next transfer on the scope takes the number again instead of
+showing the receiver a gap that was never there.
 
 `producer` is genuinely unwritten by anything in this repository, and deliberately: the receiver
 already knows the sending peer's proved fingerprint from the handshake, so the key names a
@@ -1511,7 +1515,7 @@ Per connection (`Limits`):
 | --- | --- | --- |
 | `max_header_bytes` | `16384` | largest header a peer may make this side buffer; checked before allocation (§3.1) |
 | `header_timeout_ms` | `10000` | time an inbound stream may take to deliver its preamble, and then its header, counted from the moment it takes a header slot; a stream that misses it is stopped with `STOP_SENDING(CANCELED)` and the connection survives |
-| `max_header_streams` | `64` | inbound streams that may hold a header slot, that is read a frame head, at once; the rest wait without holding a buffer. Worst-case header memory is this count times `max_header_bytes` (below) |
+| `max_header_streams` | `64` | inbound streams that may hold a header slot, that is read a frame head, at once (at least one); the rest wait without holding a buffer. A head is decoded inside its slot and its raw bytes dropped before the slot is given back. Worst-case header memory is this count times `max_header_bytes` (below) |
 | `max_concurrent_uni_streams` | `2048` | QUIC `TransportConfig::max_concurrent_uni_streams`; bounds parked/in-flight one-way stream tasks per connection |
 | `max_concurrent_bidi_streams` | `1024` | QUIC `TransportConfig::max_concurrent_bidi_streams`; bounds live exchanges per connection |
 | `stream_receive_window` | 1 MiB | per-stream QUIC flow-control window; bounds unread payload buffered per stream |
@@ -1556,8 +1560,11 @@ max_header_bytes * min(max_header_streams, max_concurrent_uni_streams + max_conc
 ```
 
 The stream budgets still bound how many streams a peer may have open, but only `max_header_streams`
-of them hold a frame-head buffer at once, so a peer that opens its full allowance pins at most that
-many heads. This is the governing number for hostile-peer memory sizing in v0.
+of them hold a frame-head buffer at once, because a head is decoded and its raw bytes dropped inside
+its slot: a stream parked on a full queue, or alive as a FLOW or REPORT stream, keeps the decoded
+header only, whose text the field caps of §6.2 bound (1664 bytes for a DATA header) and which is part of
+the stream's state, counted by the stream budgets. A peer that opens its full allowance pins at most
+that many raw heads. This is the governing number for hostile-peer memory sizing in v0.
 
 `max_concurrent_bidi_streams` is the concurrency ceiling for inbound requests: a peer cannot
 hold more live exchanges than this, and the transport enforces it, on the side that pays for it.

@@ -201,6 +201,39 @@ impl Sequencer {
         Some(0)
     }
 
+    /// Takes the next number for `scope` as a loan: it goes back unless the
+    /// caller says a transfer carries it ([`Issued::spend`]).
+    ///
+    /// For a sender that takes its number before it knows the transfer will
+    /// start. A header the peer would refuse, a stream that cannot be
+    /// opened, a send the caller gives up on: none of them puts a number on
+    /// the wire, and the receiver would read a number nobody sent as a
+    /// transfer it lost (or, in reassemble mode, hold the next transfers
+    /// back for it).
+    pub(crate) fn issue<'a>(&'a self, scope: &'a str) -> Issued<'a> {
+        Issued {
+            sequencer: self,
+            scope,
+            number: self.next(scope),
+        }
+    }
+
+    /// Takes back `number`, which [`Sequencer::next`] issued for `scope` and
+    /// no transfer carries, so the next transfer on the scope takes it again.
+    ///
+    /// Only the latest number can be taken back. A sender that took one
+    /// after it numbered a transfer that may already be on its way, and the
+    /// number left behind is then a hole, which is what a lost transfer is:
+    /// the receiver reports it.
+    fn retract(&self, scope: &str, number: u64) {
+        let mut counters = self.counters.lock().expect("sequencer poisoned");
+        if let Some(position) = counters.map.get_mut(scope)
+            && position.next == number.wrapping_add(1)
+        {
+            position.next = number;
+        }
+    }
+
     #[cfg(test)]
     fn tracked_scopes(&self) -> usize {
         self.counters.lock().expect("sequencer poisoned").map.len()
@@ -214,6 +247,36 @@ impl Sequencer {
             .map
             .capacity()
             > 0
+    }
+}
+
+/// A number on loan from a [`Sequencer`]: given back when this drops, unless
+/// [`Issued::spend`] was called first.
+pub(crate) struct Issued<'a> {
+    sequencer: &'a Sequencer,
+    scope: &'a str,
+    number: Option<u64>,
+}
+
+impl Issued<'_> {
+    /// The number, or `None` when ordering is off or the scope could not be
+    /// tracked (the transfer is then sent unnumbered).
+    pub(crate) fn number(&self) -> Option<u64> {
+        self.number
+    }
+
+    /// The transfer that carries this number has started: it is not given
+    /// back.
+    pub(crate) fn spend(mut self) {
+        self.number = None;
+    }
+}
+
+impl Drop for Issued<'_> {
+    fn drop(&mut self) {
+        if let Some(number) = self.number {
+            self.sequencer.retract(self.scope, number);
+        }
     }
 }
 
@@ -438,8 +501,13 @@ impl<T> Reassembler<T> {
     /// Everything else is held until the numbers before it have arrived — or
     /// until the hold is full, which releases the oldest held transfer out of
     /// order and reports the numbers it skipped as a `Gap`, the behaviour
-    /// `docs/GUARANTEES.md` §3 states. Reassembly is never silently weakened:
-    /// the application is told.
+    /// `docs/GUARANTEES.md` §3 states. That is the weakening the application
+    /// is told of. The scope table's cap weakens reassembly without a word,
+    /// as `docs/PROTOCOL.md` §10 and `docs/INVARIANTS.md` say: a scope
+    /// forgotten to make room starts again at the first number it next sees,
+    /// so what still straggles in from before is delivered as it comes, with
+    /// no `Gap`, and a new scope is passed through untracked while every
+    /// tracked scope holds a transfer.
     pub(crate) fn admit(
         &self,
         path: &str,
@@ -673,6 +741,50 @@ mod tests {
         assert_eq!(sequencer.next("b"), Some(0));
         assert_eq!(sequencer.next("a"), Some(2));
         assert_eq!(sequencer.tracked_scopes(), 2);
+    }
+
+    #[test]
+    fn a_number_nothing_carried_is_taken_again() {
+        let sequencer = Sequencer::new(OrderingMode::PerProducerDetect, 1024);
+        let first = sequencer.issue("a");
+        assert_eq!(first.number(), Some(0));
+        drop(first);
+        let second = sequencer.issue("a");
+        assert_eq!(
+            second.number(),
+            Some(0),
+            "a transfer that never started leaves its number to the next"
+        );
+        second.spend();
+        assert_eq!(sequencer.next("a"), Some(1));
+    }
+
+    #[test]
+    fn a_number_overtaken_by_a_later_one_stays_a_hole() {
+        let sequencer = Sequencer::new(OrderingMode::PerProducerDetect, 1024);
+        let slow = sequencer.issue("a");
+        let fast = sequencer.issue("a");
+        assert_eq!((slow.number(), fast.number()), (Some(0), Some(1)));
+        fast.spend();
+        drop(slow);
+        // 1 may be on its way, so 0 is a hole the receiver reports like any
+        // other lost transfer, and nothing is renumbered.
+        assert_eq!(sequencer.next("a"), Some(2));
+    }
+
+    #[test]
+    fn a_transfer_that_gets_no_number_has_none_to_give_back() {
+        let off = Sequencer::new(OrderingMode::None, 1024);
+        assert_eq!(off.issue("a").number(), None);
+
+        let full = Sequencer::new(OrderingMode::PerProducerDetect, 1);
+        full.issue("a").spend();
+        assert_eq!(full.issue("b").number(), None, "the table is at its cap");
+        assert_eq!(
+            full.next("a"),
+            Some(1),
+            "an unnumbered scope takes nothing back from a tracked one"
+        );
     }
 
     #[test]
