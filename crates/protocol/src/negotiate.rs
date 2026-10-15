@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::header::{GuaranteeSet, Hello};
+use crate::header::{GuaranteeSet, HeaderError, Hello};
 
 /// Capability code `1`, `datagram`: the sender reads QUIC DATAGRAM frames and
 /// FLOW streams (`docs/PROTOCOL.md` §6.1). A FLOW stream or a datagram is
@@ -39,6 +39,24 @@ pub struct Agreed {
     /// Both HELLOs listed [`CAPABILITY_PATH_REPORT`], so each side sends one
     /// REPORT stream on this connection.
     pub path_report: bool,
+}
+
+impl Agreed {
+    /// Refuses an encoded header of `len` bytes that the peer would not read.
+    ///
+    /// `send_max_header_bytes` is the peer's `max_header_bytes`; a longer
+    /// header makes its preamble parser close the connection
+    /// (`docs/PROTOCOL.md` §3.2), so a sender checks the length it is about to
+    /// write rather than learn it from the close.
+    pub fn check_header_len(&self, len: usize) -> Result<(), HeaderError> {
+        if len as u64 > self.send_max_header_bytes {
+            return Err(HeaderError::HeaderTooLong {
+                len,
+                max: self.send_max_header_bytes,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Why negotiation failed.
@@ -185,6 +203,19 @@ mod tests {
         assert_eq!(agreed.version, 0);
         // The send cap comes from the peer's advertised receive cap.
         assert_eq!(agreed.send_max_header_bytes, 4096);
+    }
+
+    #[test]
+    fn a_header_longer_than_the_peer_accepts_is_refused() {
+        let agreed = negotiate(&Hello::v0(16384, 1024), &Hello::v0(4096, 512)).unwrap();
+        assert_eq!(agreed.check_header_len(4096), Ok(()));
+        assert_eq!(
+            agreed.check_header_len(4097),
+            Err(HeaderError::HeaderTooLong {
+                len: 4097,
+                max: 4096
+            })
+        );
     }
 
     #[test]
@@ -386,6 +417,59 @@ mod tests {
         );
         assert_eq!(agreed.guarantees.durability, None);
         assert!(agreed.guarantees.is_core());
+    }
+
+    #[test]
+    fn an_axis_the_peer_never_declared_is_not_reached() {
+        let stored = |durability| GuaranteeSet {
+            acknowledgement: Acknowledgement::Stored,
+            durability,
+            ..GuaranteeSet::CORE
+        };
+        let replicated = |replicas| GuaranteeSet {
+            acknowledgement: Acknowledgement::Replicated,
+            replicas,
+            ..GuaranteeSet::CORE
+        };
+        for (wanted, undeclared) in [
+            (stored(Some(Durability::Flushed)), stored(None)),
+            (replicated(Some(3)), replicated(None)),
+        ] {
+            let err = negotiate(
+                &declaring(wanted, wanted),
+                &declaring(undeclared, GuaranteeSet::CORE),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                NegotiateError::GuaranteeNotOffered {
+                    peers_requirement: false
+                }
+            );
+            // The peer's side of the same requirement.
+            let err = negotiate(
+                &declaring(undeclared, GuaranteeSet::CORE),
+                &declaring(wanted, wanted),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                NegotiateError::GuaranteeNotOffered {
+                    peers_requirement: true
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_axis_both_sides_declared_survives_the_intersection() {
+        let stored = GuaranteeSet {
+            acknowledgement: Acknowledgement::Stored,
+            durability: Some(Durability::Flushed),
+            ..GuaranteeSet::CORE
+        };
+        let agreed = negotiate(&declaring(stored, stored), &declaring(stored, stored)).unwrap();
+        assert_eq!(agreed.guarantees, stored);
     }
 
     #[test]

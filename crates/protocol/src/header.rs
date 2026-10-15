@@ -30,14 +30,17 @@ use crate::varint::{VarintError, decode_varint, encode_varint};
 /// (`docs/PROTOCOL.md` §6); the list and depth caps are defensive
 /// implementation limits documented in the same section.
 pub mod limits {
-    /// Cap for the DATA `endpoint` field.
-    pub const MAX_ENDPOINT_BYTES: usize = 512;
+    /// Cap for the DATA `endpoint` field: the endpoint path cap, defined once
+    /// in `weida-core` because the local constructors enforce the same length.
+    pub const MAX_ENDPOINT_BYTES: usize = weida_core::MAX_PATH_BYTES;
     /// Cap for the DATA `content_type` field.
     pub const MAX_CONTENT_TYPE_BYTES: usize = 256;
-    /// Cap for the DATA `traceparent` field.
-    pub const MAX_TRACEPARENT_BYTES: usize = 128;
-    /// Cap for the DATA `tracestate` field.
-    pub const MAX_TRACESTATE_BYTES: usize = 512;
+    /// Cap for the DATA `traceparent` field, defined once beside the
+    /// `traceparent` codec in `weida-core`.
+    pub const MAX_TRACEPARENT_BYTES: usize = weida_core::trace::MAX_TRACEPARENT_BYTES;
+    /// Cap for the DATA `tracestate` field, defined once beside the
+    /// `traceparent` codec in `weida-core`.
+    pub const MAX_TRACESTATE_BYTES: usize = weida_core::trace::MAX_TRACESTATE_BYTES;
     /// Cap for the DATA `topic` field.
     pub const MAX_TOPIC_BYTES: usize = 256;
     /// Length of the DATA `producer` field: a raw 32-byte digest.
@@ -207,11 +210,20 @@ pub mod filter {
         }
     }
 
-    /// Checks `filter` against the grammar.
+    /// Checks `filter` against the cap and the grammar.
     ///
     /// The empty filter is legal and matches every topic. One pass, no
-    /// allocation.
+    /// allocation. The 256 B cap is the one the decoder enforces, checked
+    /// here too so a sender refuses a filter every conformant peer would
+    /// close the connection over.
     pub fn validate(filter: &str) -> Result<(), HeaderError> {
+        if filter.len() > super::limits::MAX_FILTER_BYTES {
+            return Err(HeaderError::StringTooLong {
+                key: super::subscription_key::FILTER,
+                len: filter.len(),
+                max: super::limits::MAX_FILTER_BYTES,
+            });
+        }
         let mut segments = filter.split(SEPARATOR).peekable();
         while let Some(segment) = segments.next() {
             let is_last = segments.peek().is_none();
@@ -718,13 +730,22 @@ impl GuaranteeSet {
             acknowledgement,
             // A dimension the weakened acknowledgement cannot carry is
             // dropped rather than kept: dropping is what "weaker" means here,
-            // and keeping it would produce a set §6.5 forbids.
-            durability: keeps_durability
-                .then_some(self.durability.or(other.durability))
-                .flatten(),
-            replicas: (acknowledgement == Acknowledgement::Replicated)
-                .then_some(self.replicas.or(other.replicas))
-                .flatten(),
+            // and keeping it would produce a set §6.5 forbids. An axis one
+            // side never declared is no promise at all, so it is dropped too:
+            // carrying the other side's value would let `reaches` accept a
+            // requirement the peer never stated (§6.5, "never a quieter
+            // success"). When both declared it, the checks above made the
+            // values equal.
+            durability: if keeps_durability {
+                self.durability.and(other.durability)
+            } else {
+                None
+            },
+            replicas: if acknowledgement == Acknowledgement::Replicated {
+                self.replicas.and(other.replicas)
+            } else {
+                None
+            },
             ordering: self.ordering.min(other.ordering),
             deduplication,
             // A shorter window is the weaker promise.
@@ -881,6 +902,16 @@ pub enum HeaderError {
     /// carries key `14` without key `13` (`docs/PROTOCOL.md` §6.2 key `14`,
     /// §6.4 key `3`).
     InvalidLayer(&'static str),
+    /// An encoded header is longer than the receiver accepts (HELLO key `1`,
+    /// `docs/PROTOCOL.md` §6.1). Returned by [`crate::Agreed::check_header_len`]
+    /// on the send side; no decoder produces it, because the preamble parser
+    /// refuses an over-long header before any of it is read.
+    HeaderTooLong {
+        /// Encoded header length.
+        len: usize,
+        /// The receiver's `max_header_bytes`.
+        max: u64,
+    },
     /// A REPORT record is longer than [`limits::MAX_PATH_RECORD_BYTES`]
     /// (`docs/PROTOCOL.md` §6.10).
     InvalidPathReport(&'static str),
@@ -919,6 +950,12 @@ impl std::fmt::Display for HeaderError {
             HeaderError::InvalidReport(reason) => write!(f, "invalid report: {reason}"),
             HeaderError::InvalidLayer(reason) => write!(f, "invalid layer: {reason}"),
             HeaderError::InvalidPathReport(reason) => write!(f, "invalid path report: {reason}"),
+            HeaderError::HeaderTooLong { len, max } => {
+                write!(
+                    f,
+                    "header of {len} bytes exceeds the peer's {max} byte limit"
+                )
+            }
         }
     }
 }
@@ -928,6 +965,18 @@ impl std::error::Error for HeaderError {}
 impl From<HeaderError> for Error {
     fn from(e: HeaderError) -> Error {
         Error::Protocol(e.to_string())
+    }
+}
+
+/// Refuses `value` when it is longer than `max` bytes, naming `key`.
+fn check_text(key: u64, value: Option<&str>, max: usize) -> Result<(), HeaderError> {
+    match value {
+        Some(s) if s.len() > max => Err(HeaderError::StringTooLong {
+            key,
+            len: s.len(),
+            max,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -1514,6 +1563,65 @@ impl DataHeader {
         DataHeader::default()
     }
 
+    /// Checks the rules the decoder enforces, so a sender can refuse a header
+    /// before it makes every conformant peer close the connection.
+    ///
+    /// Covers the text caps of [`limits`], the layer range and its need for a
+    /// segment, and the report rules [`DataHeader::encode`] cannot report: at
+    /// most [`limits::MAX_REPORT_LEVELS`] distinct levels, and key `9` present
+    /// exactly when key `10` is. Whether the encoded header fits the peer's
+    /// `max_header_bytes` is [`crate::Agreed::check_header_len`].
+    pub fn check(&self) -> Result<(), HeaderError> {
+        check_text(
+            data_key::ENDPOINT,
+            self.endpoint.as_deref(),
+            limits::MAX_ENDPOINT_BYTES,
+        )?;
+        check_text(
+            data_key::CONTENT_TYPE,
+            self.content_type.as_deref(),
+            limits::MAX_CONTENT_TYPE_BYTES,
+        )?;
+        check_text(
+            data_key::TRACEPARENT,
+            self.traceparent.as_deref(),
+            limits::MAX_TRACEPARENT_BYTES,
+        )?;
+        check_text(
+            data_key::TRACESTATE,
+            self.tracestate.as_deref(),
+            limits::MAX_TRACESTATE_BYTES,
+        )?;
+        check_text(
+            data_key::TOPIC,
+            self.topic.as_deref(),
+            limits::MAX_TOPIC_BYTES,
+        )?;
+        if let Some(layer) = self.layer {
+            if layer > limits::MAX_LAYER {
+                return Err(HeaderError::InvalidLayer("layer above 15"));
+            }
+            if self.segment.is_none() {
+                return Err(HeaderError::InvalidLayer("layer without segment"));
+            }
+        }
+        if !self.report.is_empty() {
+            if self.report_id.is_none() {
+                return Err(HeaderError::InvalidReport("report without report_id"));
+            }
+            // The encoder writes distinct levels, so the cap counts those.
+            let mut distinct: Vec<u64> = self.report.iter().map(|l| l.to_wire()).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() > limits::MAX_REPORT_LEVELS {
+                return Err(HeaderError::InvalidReport("too many report levels"));
+            }
+        } else if self.report_id.is_some() {
+            return Err(HeaderError::InvalidReport("report_id without report"));
+        }
+        Ok(())
+    }
+
     /// Encodes the header.
     ///
     /// Key `10` goes out in the canonical form §6.2 makes normative —
@@ -1524,12 +1632,10 @@ impl DataHeader {
     /// peer, and there would be no way to tell the caller so.
     ///
     /// The report's other two rules stay the caller's for exactly that
-    /// reason — both need an error, and this function has none to give. At
-    /// most [`limits::MAX_REPORT_LEVELS`] distinct levels, and key `9`
-    /// present exactly when key `10` is: `weida`'s `data_header` refuses an
-    /// oversized order with `Error::LimitExceeded` and allocates the report
-    /// id alongside the order, so no caller reaches this encoder with either
-    /// mistake.
+    /// reason — both need an error, and this function has none to give;
+    /// [`DataHeader::check`] is where they fail. At most
+    /// [`limits::MAX_REPORT_LEVELS`] distinct levels, and key `9` present
+    /// exactly when key `10` is.
     ///
     /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
@@ -1788,6 +1894,24 @@ impl SubscriptionHeader {
         }
     }
 
+    /// Checks the endpoint and filter caps, the filter grammar and the layer
+    /// range: everything the decoder refuses that the encoder cannot.
+    pub fn check(&self) -> Result<(), HeaderError> {
+        check_text(
+            subscription_key::ENDPOINT,
+            Some(&self.endpoint),
+            limits::MAX_ENDPOINT_BYTES,
+        )?;
+        filter::validate(&self.filter)?;
+        if self
+            .max_layer
+            .is_some_and(|layer| layer > limits::MAX_LAYER)
+        {
+            return Err(HeaderError::InvalidLayer("max_layer above 15"));
+        }
+        Ok(())
+    }
+
     /// Allocating form of [`Self::encode_into`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1894,6 +2018,36 @@ impl FlowHeader {
             tracestate: None,
             topic: None,
         }
+    }
+
+    /// Checks the text caps of the decoder, so a sender can refuse a header
+    /// every conformant peer would close the connection over.
+    pub fn check(&self) -> Result<(), HeaderError> {
+        check_text(
+            flow_key::ENDPOINT,
+            Some(&self.endpoint),
+            limits::MAX_ENDPOINT_BYTES,
+        )?;
+        check_text(
+            flow_key::CONTENT_TYPE,
+            self.content_type.as_deref(),
+            limits::MAX_CONTENT_TYPE_BYTES,
+        )?;
+        check_text(
+            flow_key::TRACEPARENT,
+            self.traceparent.as_deref(),
+            limits::MAX_TRACEPARENT_BYTES,
+        )?;
+        check_text(
+            flow_key::TRACESTATE,
+            self.tracestate.as_deref(),
+            limits::MAX_TRACESTATE_BYTES,
+        )?;
+        check_text(
+            flow_key::TOPIC,
+            self.topic.as_deref(),
+            limits::MAX_TOPIC_BYTES,
+        )
     }
 
     /// Allocating form of [`Self::encode_into`].
@@ -2017,6 +2171,16 @@ impl CreditHeader {
             filter: filter.into(),
             limit,
         }
+    }
+
+    /// Checks the endpoint cap, the filter cap and the filter grammar.
+    pub fn check(&self) -> Result<(), HeaderError> {
+        check_text(
+            credit_key::ENDPOINT,
+            Some(&self.endpoint),
+            limits::MAX_ENDPOINT_BYTES,
+        )?;
+        filter::validate(&self.filter)
     }
 
     /// Allocating form of [`Self::encode_into`].
@@ -3009,6 +3173,107 @@ mod tests {
                 "key {key} at cap"
             );
         }
+    }
+
+    #[test]
+    fn check_refuses_what_the_decoder_refuses() {
+        let filter_cap = limits::MAX_FILTER_BYTES;
+        assert!(filter::validate(&"a".repeat(filter_cap)).is_ok());
+        assert_eq!(
+            filter::validate(&"a".repeat(filter_cap + 1)),
+            Err(HeaderError::StringTooLong {
+                key: subscription_key::FILTER,
+                len: filter_cap + 1,
+                max: filter_cap
+            })
+        );
+
+        let cases: [(u64, usize); 5] = [
+            (data_key::ENDPOINT, limits::MAX_ENDPOINT_BYTES),
+            (data_key::CONTENT_TYPE, limits::MAX_CONTENT_TYPE_BYTES),
+            (data_key::TRACEPARENT, limits::MAX_TRACEPARENT_BYTES),
+            (data_key::TRACESTATE, limits::MAX_TRACESTATE_BYTES),
+            (data_key::TOPIC, limits::MAX_TOPIC_BYTES),
+        ];
+        for (key, max) in cases {
+            for len in [max, max + 1] {
+                let text = "a".repeat(len);
+                let mut data = DataHeader::reply();
+                let mut flow = FlowHeader::new("/f", 1);
+                match key {
+                    data_key::ENDPOINT => {
+                        data.endpoint = Some(text.clone());
+                        flow.endpoint = text;
+                    }
+                    data_key::CONTENT_TYPE => {
+                        data.content_type = Some(text.clone());
+                        flow.content_type = Some(text);
+                    }
+                    data_key::TRACEPARENT => {
+                        data.traceparent = Some(text.clone());
+                        flow.traceparent = Some(text);
+                    }
+                    data_key::TRACESTATE => {
+                        data.tracestate = Some(text.clone());
+                        flow.tracestate = Some(text);
+                    }
+                    _ => {
+                        data.topic = Some(text.clone());
+                        flow.topic = Some(text);
+                    }
+                }
+                assert_eq!(
+                    data.check(),
+                    DataHeader::decode(&data.encode()).map(|_| ()),
+                    "data key {key} len {len}"
+                );
+                assert_eq!(
+                    flow.check(),
+                    FlowHeader::decode(&flow.encode()).map(|_| ()),
+                    "flow key {key} len {len}"
+                );
+            }
+        }
+
+        for len in [limits::MAX_ENDPOINT_BYTES, limits::MAX_ENDPOINT_BYTES + 1] {
+            let subscription = SubscriptionHeader::new("a".repeat(len), "x");
+            assert_eq!(
+                subscription.check(),
+                SubscriptionHeader::decode(&subscription.encode()).map(|_| ())
+            );
+            let credit = CreditHeader::new("a".repeat(len), "x", 1);
+            assert_eq!(
+                credit.check(),
+                CreditHeader::decode(&credit.encode()).map(|_| ())
+            );
+        }
+    }
+
+    #[test]
+    fn data_check_covers_the_report_and_layer_rules() {
+        let mut header = DataHeader::addressed("/t");
+        header.report = vec![CursorLevel::Known(Acknowledgement::Accepted)];
+        assert_eq!(
+            header.check(),
+            Err(HeaderError::InvalidReport("report without report_id"))
+        );
+        header.report_id = Some(1);
+        assert_eq!(header.check(), Ok(()));
+        header.report.clear();
+        assert_eq!(
+            header.check(),
+            Err(HeaderError::InvalidReport("report_id without report"))
+        );
+        let mut header = DataHeader::addressed("/t");
+        header.layer = Some(1);
+        assert_eq!(
+            header.check(),
+            Err(HeaderError::InvalidLayer("layer without segment"))
+        );
+        header.segment = Some(0);
+        assert_eq!(header.check(), Ok(()));
+        header.layer = Some(limits::MAX_LAYER + 1);
+        assert!(matches!(header.check(), Err(HeaderError::InvalidLayer(_))));
     }
 
     #[test]

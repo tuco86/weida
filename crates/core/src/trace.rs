@@ -82,15 +82,15 @@ fn decode_hex(src: &[u8], dst: &mut [u8]) -> Result<(), TraceError> {
     Ok(())
 }
 
-fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+/// Writes `bytes` as lowercase hex into `dst`, which holds exactly two digits
+/// per byte.
+fn put_hex(dst: &mut [u8], bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for b in bytes {
-        f.write_str(
-            core::str::from_utf8(&[HEX[(*b >> 4) as usize], HEX[(*b & 0x0f) as usize]])
-                .expect("hex digits are ascii"),
-        )?;
+    debug_assert_eq!(dst.len(), bytes.len() * 2);
+    let (pairs, _remainder) = dst.as_chunks_mut::<2>();
+    for (pair, b) in pairs.iter_mut().zip(bytes) {
+        *pair = [HEX[(*b >> 4) as usize], HEX[(*b & 0x0f) as usize]];
     }
-    Ok(())
 }
 
 impl TraceContext {
@@ -141,7 +141,17 @@ impl TraceContext {
 
     /// Formats the context as a version-`00` `traceparent` value.
     pub fn to_traceparent(&self) -> String {
-        self.to_string()
+        self.render().as_str().to_owned()
+    }
+
+    fn render(&self) -> Rendered {
+        let mut out = [b'-'; TRACEPARENT_LEN];
+        out[0] = b'0';
+        out[1] = b'0';
+        put_hex(&mut out[3..35], &self.trace_id);
+        put_hex(&mut out[36..52], &self.span_id);
+        put_hex(&mut out[53..55], &[self.flags]);
+        Rendered(out)
     }
 
     /// The trace id as 32 lowercase hex digits, for log fields.
@@ -201,12 +211,16 @@ fn push_hex(s: &mut String, bytes: &[u8]) {
 
 impl fmt::Display for TraceContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("00-")?;
-        write_hex(f, &self.trace_id)?;
-        f.write_str("-")?;
-        write_hex(f, &self.span_id)?;
-        f.write_str("-")?;
-        write_hex(f, &[self.flags])
+        f.write_str(self.render().as_str())
+    }
+}
+
+/// A rendered `traceparent`: fixed size, lowercase ASCII by construction.
+struct Rendered([u8; TRACEPARENT_LEN]);
+
+impl Rendered {
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.0).expect("a traceparent is ascii")
     }
 }
 

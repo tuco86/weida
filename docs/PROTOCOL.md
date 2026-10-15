@@ -821,6 +821,10 @@ Rules:
   `replicas` axes it qualified are **dropped** rather than carried: dropping is what "weaker"
   means here, and keeping them would produce a set this section forbids. The same holds for
   `dedup_window_ms` when `deduplication` weakens to `None`.
+- An axis one side did not declare is no promise: when `acknowledgement` is `Stored` or
+  `Replicated` on both sides but only one side states `durability` (or `replicas`), the
+  effective set carries no value for that axis, so a requirement on it is not reached and
+  negotiation fails (§2.3 step 6). The value one side stated is never adopted for the other.
 - An unknown map key MUST be skipped, per §5. That is how a later version adds a dimension
   without breaking this one — and it is also why a peer MUST NOT infer agreement from a key it
   skipped: what binds is the intersection of §2.3, computed over the dimensions both sides
