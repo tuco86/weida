@@ -70,6 +70,7 @@ variants!(
     Closed,
     Local,
     IdleTimeout,
+    WriteTimeout,
     HandshakeTimeout,
     ConnectionGone,
     Configuration,

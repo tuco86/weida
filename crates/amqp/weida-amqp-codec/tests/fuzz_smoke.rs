@@ -17,7 +17,10 @@
 //! process rather than fail it.
 
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
-use weida_amqp_codec::{DecodeError, Limits, Performative, SaslFrame, Value, decode, encode};
+use weida_amqp_codec::message::Message;
+use weida_amqp_codec::{
+    Array, DecodeError, ElementKind, Limits, Performative, SaslFrame, Value, codes, decode, encode,
+};
 
 const ITERATIONS: usize = 100_000;
 
@@ -26,6 +29,7 @@ const ITERATIONS: usize = 100_000;
 const LIMITS: Limits = Limits {
     max_elements: 32,
     max_depth: 6,
+    max_zero_width_elements: 16,
 };
 
 /// Deterministic xorshift64* generator: no dependency, reproducible failures.
@@ -180,8 +184,8 @@ fn fuzz_smoke_value() {
                     written.len() <= used,
                     "the canonical form is never wider than what arrived"
                 );
-                let (again, used2) =
-                    decode::value(&written, Limits::BODY).expect("the re-encoding decodes");
+                let (again, used2) = decode::value(&written, LIMITS)
+                    .expect("the re-encoding decodes under the same limits");
                 assert_eq!(used2, written.len());
                 check(&again, 0);
                 assert_eq!(
@@ -329,7 +333,9 @@ fn fuzz_smoke_frame() {
                             let (again, used2) =
                                 Performative::decode(&written, LIMITS).expect("decodes");
                             assert_eq!(used2, written.len());
-                            assert_eq!(again, performative);
+                            let mut twice = Vec::new();
+                            again.encode(&mut twice).expect("re-encodes");
+                            assert_eq!(twice, written, "a fixed point over octets");
                         }
                     }
                     FrameKind::Sasl => {
@@ -417,4 +423,278 @@ fn a_frame_size_field_is_never_believed() {
         frame::decode(&hostile, u32::MAX),
         Err(DecodeError::Incomplete { .. })
     ));
+}
+
+/// An `array32` of `count` elements: `constructor` is the element constructor
+/// and `elements` the untyped octets of the elements.
+fn array32(count: u32, constructor: &[u8], elements: &[u8]) -> Vec<u8> {
+    let size = (4 + constructor.len() + elements.len()) as u32;
+    let mut bytes = vec![codes::ARRAY32];
+    bytes.extend_from_slice(&size.to_be_bytes());
+    bytes.extend_from_slice(&count.to_be_bytes());
+    bytes.extend_from_slice(constructor);
+    bytes.extend_from_slice(elements);
+    bytes
+}
+
+/// A `list32` of already-encoded items.
+fn list32(items: &[Vec<u8>]) -> Vec<u8> {
+    let body = items.concat();
+    let size = (4 + body.len()) as u32;
+    let mut bytes = vec![codes::LIST32];
+    bytes.extend_from_slice(&size.to_be_bytes());
+    bytes.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&body);
+    bytes
+}
+
+/// `inner` as the element of an enclosing array of arrays: the same octets
+/// without the constructor the enclosing array already carries.
+fn as_element(inner: &[u8]) -> &[u8] {
+    &inner[1..]
+}
+
+/// `n` copies of `inner` as the elements of an enclosing array of arrays.
+fn elements_of(n: usize, inner: &[u8]) -> Vec<u8> {
+    (0..n)
+        .flat_map(|_| as_element(inner).iter().copied())
+        .collect()
+}
+
+/// Every `Value` in a decoded tree, a described value's inner value included.
+fn nodes(value: &Value<'_>) -> usize {
+    1 + match value {
+        Value::List(items) => items.iter().map(nodes).sum(),
+        Value::Map(entries) => entries.iter().map(|(k, v)| nodes(k) + nodes(v)).sum(),
+        Value::Array(array) => array.items().iter().map(nodes).sum(),
+        Value::Described(described) => nodes(&described.value),
+        _ => 0,
+    }
+}
+
+/// Decodes `input`, and if it is accepted checks the node bound and that its
+/// canonical encoding is accepted again under the same limits. Returns whether
+/// it was accepted.
+///
+/// The bound: each octet of input owns at most two nodes (a described array
+/// element is a wrapper with no octets of its own around an inner value that
+/// owns at least one), and each unit of the zero-width allowance admits two
+/// more (a zero-width element's wrapper and its inner value). So a tree has at
+/// most `2 * input.len() + 2 * max_zero_width_elements` nodes.
+fn check_accepted(input: &[u8], limits: Limits) -> bool {
+    let Ok((value, _)) = decode::value(input, limits) else {
+        return false;
+    };
+    let count = nodes(&value);
+    let bound = 2 * input.len() + 2 * limits.max_zero_width_elements as usize;
+    assert!(
+        count <= bound,
+        "{count} nodes from {} octets exceed {bound} under {limits:?}",
+        input.len()
+    );
+    let written = encode::to_vec(&value).expect("an accepted value re-encodes");
+    let (again, used) = decode::value(&written, limits)
+        .expect("the canonical form is accepted under the same limits");
+    assert_eq!(used, written.len());
+    assert_eq!(encode::to_vec(&again).expect("re-encodes"), written);
+    true
+}
+
+#[test]
+fn zero_width_arrays_are_refused_once_the_budget_is_spent() {
+    let nulls = array32(4096, &[codes::NULL], &[]);
+    let flat = array32(65_536, &[codes::NULL], &[]);
+    let nested = array32(64, &[codes::ARRAY32], &elements_of(64, &nulls));
+    let leaves = array32(4096, &[codes::NULL], &[]);
+    let middle = array32(16, &[codes::ARRAY32], &elements_of(16, &leaves));
+    let deep = array32(2, &[codes::ARRAY32], &elements_of(2, &middle));
+
+    // Breadth alone is the header's own bound, not the budget's.
+    assert_eq!(
+        decode::value(&flat, Limits::DEFAULT),
+        Err(DecodeError::ElementCountExceeded {
+            declared: 65_536,
+            cap: 4096,
+        })
+    );
+    assert_eq!(
+        decode::value(&flat, Limits::BODY).map(|(_, used)| used),
+        Err(DecodeError::ZeroWidthElementsExceeded {
+            declared: 65_536,
+            cap: 256,
+        })
+    );
+    for limits in [Limits::DEFAULT, Limits::BODY] {
+        for hostile in [&nested, &deep] {
+            assert!(
+                matches!(
+                    decode::value(hostile, limits),
+                    Err(DecodeError::ZeroWidthElementsExceeded { declared: 4096, .. })
+                ),
+                "nesting must not multiply the budget under {limits:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn legal_arrays_still_decode_and_round_trip() {
+    let booleans: Vec<u8> = (0..1000).map(|i| (i % 2) as u8).collect();
+    let symbols: Vec<u8> = (0..4096).flat_map(|_| [1u8, b'a']).collect();
+    let described: Vec<u8> = (0..3u32).flat_map(|i| i.to_be_bytes()).collect();
+    for (bytes, count) in [
+        (array32(1000, &[codes::BOOLEAN], &booleans), 1000),
+        (array32(4096, &[codes::SYM8], &symbols), 4096),
+        (
+            array32(
+                3,
+                &[codes::DESCRIBED, codes::SMALLULONG, 0x24, codes::UINT],
+                &described,
+            ),
+            3,
+        ),
+    ] {
+        let (value, used) = decode::value(&bytes, Limits::DEFAULT).expect("a legal array");
+        assert_eq!(used, bytes.len());
+        let Value::Array(array) = &value else {
+            panic!("expected an array");
+        };
+        assert_eq!(array.items().len(), count);
+        let written = encode::to_vec(&value).expect("re-encodes");
+        assert_eq!(
+            decode::value(&written, Limits::DEFAULT).expect("decodes").0,
+            value
+        );
+    }
+}
+
+#[test]
+fn an_array_of_nulls_up_to_the_budget_round_trips() {
+    let nulls = Value::Array(Array::new(
+        ElementKind::Primitive(codes::NULL),
+        vec![Value::Null; 16],
+    ));
+    let written = encode::to_vec(&nulls).expect("encodes");
+    let (back, used) =
+        decode::value(&written, Limits::DEFAULT).expect("sixteen nulls are within the budget");
+    assert_eq!(used, written.len());
+    assert_eq!(back, nulls);
+}
+
+#[test]
+fn a_composite_has_one_allowance_across_its_fields() {
+    let mut bytes = vec![codes::DESCRIBED, codes::SMALLULONG, 0x10];
+    bytes.extend(list32(&[
+        array32(10, &[codes::NULL], &[]),
+        array32(10, &[codes::NULL], &[]),
+    ]));
+    let mut composite = decode::composite(&bytes, Limits::DEFAULT).expect("a composite");
+    composite
+        .fields
+        .next_value()
+        .expect("ten nulls are within the budget");
+    assert_eq!(
+        composite.fields.next_value(),
+        Err(DecodeError::ZeroWidthElementsExceeded {
+            declared: 10,
+            cap: 16,
+        })
+    );
+}
+
+#[test]
+fn a_message_shares_one_allowance_across_its_sections() {
+    // An `amqp-sequence` section whose value is a list of one array of `count`
+    // nulls. Each section is within the allowance on its own.
+    let section = |count: u32| {
+        let mut bytes = vec![codes::DESCRIBED, codes::SMALLULONG, 0x76];
+        bytes.extend(list32(&[array32(count, &[codes::NULL], &[])]));
+        bytes
+    };
+    let spread: Vec<u8> = (0..25).flat_map(|_| section(10)).collect();
+    assert_eq!(
+        Message::decode(&spread, Limits::BODY).map(|decoded| decoded.used),
+        Ok(spread.len()),
+        "250 nulls in 25 sections are within the 256 allowance"
+    );
+    let over: Vec<u8> = (0..26).flat_map(|_| section(10)).collect();
+    assert_eq!(
+        Message::decode(&over, Limits::BODY).map(|decoded| decoded.used),
+        Err(DecodeError::ZeroWidthElementsExceeded {
+            declared: 10,
+            cap: 256,
+        }),
+        "260 nulls in 26 sections exceed the shared allowance"
+    );
+    assert!(
+        Message::decode(&section(256), Limits::BODY).is_ok(),
+        "the same total in one array is within the allowance"
+    );
+}
+
+/// A random `array32` of zero-width or described elements, nested up to
+/// `depth` levels, so the zero-width budget is exercised rather than missed.
+fn random_array(rng: &mut Rng, depth: u32) -> Vec<u8> {
+    let count = rng.below(40) as u32;
+    match rng.below(4) {
+        0 => array32(count, &[codes::NULL], &[]),
+        1 => array32(
+            count,
+            &[codes::DESCRIBED, codes::SMALLULONG, 0x24, codes::LIST0],
+            &[],
+        ),
+        2 => {
+            let booleans: Vec<u8> = (0..count).map(|_| rng.byte() & 1).collect();
+            array32(count, &[codes::BOOLEAN], &booleans)
+        }
+        _ if depth == 0 => array32(count, &[codes::TRUE], &[]),
+        _ => {
+            let n = rng.below(4) as u32;
+            let mut elements = Vec::new();
+            for _ in 0..n {
+                elements.extend_from_slice(as_element(&random_array(rng, depth - 1)));
+            }
+            array32(n, &[codes::ARRAY32], &elements)
+        }
+    }
+}
+
+#[test]
+fn the_tree_is_bounded_by_the_input_and_the_budget() {
+    let mut rng = Rng::new(0x7EE_51DE);
+    let mut accepted = 0usize;
+    // The hostile shapes under a budget that admits them, so the bound is
+    // checked on a tree that is really built.
+    let generous = Limits {
+        max_elements: 65_536,
+        max_depth: 16,
+        max_zero_width_elements: 300_000,
+    };
+    for input in [
+        array32(65_536, &[codes::NULL], &[]),
+        array32(
+            64,
+            &[codes::ARRAY32],
+            &elements_of(64, &array32(4096, &[codes::NULL], &[])),
+        ),
+    ] {
+        assert!(check_accepted(&input, generous));
+        assert!(!check_accepted(&input, Limits::BODY));
+    }
+    for round in 0..2000 {
+        let input = if round % 2 == 0 {
+            random_array(&mut rng, 2)
+        } else {
+            rng.plausible(48)
+        };
+        for limits in [LIMITS, Limits::DEFAULT] {
+            if check_accepted(&input, limits) {
+                accepted += 1;
+            }
+        }
+    }
+    assert!(
+        accepted > 200,
+        "only {accepted} of 4000 decodes were accepted"
+    );
 }

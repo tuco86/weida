@@ -319,6 +319,16 @@ async fn the_sasl_plain_dialog_runs_inside_the_512_octet_frame() {
     .await
     .expect("the handshake finished")
     .expect("authenticated");
+
+    // The connection keeps its options for its whole life, and applications
+    // log both: neither print may carry the password.
+    let printed = format!(
+        "{connection:?} {:?} {:#?}",
+        connection.options(),
+        connection.options()
+    );
+    assert!(!printed.contains("secret"), "{printed}");
+    assert!(printed.contains("guest"), "the identity is not a secret");
     tokio::time::timeout(DEADLINE, connection.close())
         .await
         .unwrap()
@@ -849,5 +859,104 @@ impl TlsServer {
         })
         .unwrap();
         self.write(&out).await;
+    }
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn a_server_that_goes_silent_during_the_tls_handshake_is_given_up_on() {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    // Both ways of reaching TLS end in the same handshake, and in both a
+    // server that accepts the connection and then says nothing would hold the
+    // caller for as long as the OS allows.
+    for mode in [weida_amqp::TlsMode::Direct, weida_amqp::TlsMode::Layered] {
+        let exec = Exec::current().unwrap();
+        let (listener, port) = scripted().await;
+        let layered = matches!(mode, weida_amqp::TlsMode::Layered);
+        let server = tokio::spawn(async move {
+            let mut server = accept(&listener).await;
+            if layered {
+                // The clear-text header exchange is answered; the handshake
+                // after it never is.
+                assert_eq!(server.read_header().await, ProtocolHeader::TLS);
+                server.send_header(ProtocolHeader::TLS).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(server);
+        });
+
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut options = options();
+        options.tls = mode;
+        options.handshake_timeout = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            DEADLINE,
+            Connection::connect_tls(&exec, "127.0.0.1", port, options, config),
+        )
+        .await
+        .expect("connect_tls returned instead of waiting on the peer")
+        .expect_err("a silent server has not completed a handshake");
+        assert!(
+            matches!(error, Error::HandshakeTimeout { step } if step.contains("TLS")),
+            "{mode:?}: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{mode:?} took {:?} with a 200 ms deadline",
+            started.elapsed()
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_begin_that_races_the_peers_close_reports_the_peers_condition() {
+    // The refusal comes straight behind the open, so whether the client's
+    // `begin` is taken before or after the driver has seen it is a race. Both
+    // outcomes must say the same thing: the caller asked for a session on a
+    // connection the peer refused, and the condition is the only explanation
+    // the protocol carries.
+    for _ in 0..25 {
+        let exec = Exec::current().unwrap();
+        let (listener, port) = scripted().await;
+        let server = tokio::spawn(async move {
+            let mut server = accept(&listener).await;
+            assert_eq!(server.read_header().await, ProtocolHeader::AMQP);
+            server.send_header(ProtocolHeader::AMQP).await;
+            let (_, name, _) = server.read_named().await;
+            assert_eq!(name, "open");
+            server.send_open(None).await;
+            server
+                .send_close(Some(
+                    weida_amqp_codec::AmqpError::new(condition::RESOURCE_LIMIT_EXCEEDED)
+                        .described("too many connections"),
+                ))
+                .await;
+            server
+        });
+        let connection = tokio::time::timeout(
+            DEADLINE,
+            Connection::connect(&exec, "127.0.0.1", port, options()),
+        )
+        .await
+        .expect("the handshake finished")
+        .expect("opened");
+        let error = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+            .await
+            .expect("begin returned instead of waiting")
+            .expect_err("the peer closed the connection");
+        match error {
+            Error::Closed(Some(condition)) => {
+                assert_eq!(condition.condition, condition::RESOURCE_LIMIT_EXCEEDED);
+            }
+            other => panic!("expected the peer's condition, got {other}"),
+        }
+        server.abort();
     }
 }

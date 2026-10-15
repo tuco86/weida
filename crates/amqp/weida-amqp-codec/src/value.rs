@@ -5,7 +5,12 @@
 //! is a slice of the caller's buffer, so the only allocation on the way in is
 //! the `Vec` a list, map or array needs for its elements — and that `Vec` is
 //! never reserved before the declared count has been checked against
-//! [`Limits::max_elements`](crate::Limits::max_elements).
+//! [`Limits::max_elements`](crate::Limits::max_elements), and an array of
+//! zero-width elements is charged to
+//! [`Limits::max_zero_width_elements`](crate::Limits::max_zero_width_elements)
+//! before anything is reserved for it. A decoded tree holds at most two
+//! `Value`s (48 octets each) per input octet, plus two per unit of that
+//! allowance.
 //!
 //! One value, many encodings, one canonical encoding. `uint` has three forms
 //! (`0x70`, `0x52`, `0x43`) and a decoder must read all three; an encoder

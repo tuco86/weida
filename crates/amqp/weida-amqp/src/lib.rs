@@ -62,14 +62,24 @@
 //! * **Every remote-influenced table has a named bound.** Where the protocol
 //!   supplies one this crate uses it — the session table is bounded by
 //!   `channel-max` ([`ConnectionOptions::max_sessions`]), the link table by
-//!   the peer's `handle-max`, a link's messages by its credit and a session's
+//!   the peer's `handle-max` and by the `handle-max` this end advertised, a
+//!   link's messages by the credit its receiver granted and a session's
 //!   frames by its window — and where it does not, the bound is ours and says
 //!   so: [`connection::OUTGOING_QUEUE`] for frames queued for the driver,
-//!   [`link::LINK_QUEUE`] for frames queued for one link,
-//!   [`link::DEFAULT_MAX_MESSAGE_SIZE`] for a message a peer would otherwise
-//!   send one bounded frame at a time, [`sasl::MAX_ROUNDS`] for the
-//!   challenge/response loop Part 5 leaves unbounded, and
-//!   [`ConnectionOptions::max_resolved_addresses`] for the resolver's answer.
+//!   [`transport::OUTBOX_HIGH_WATER`] for octets queued for a peer that is
+//!   not reading, [`link::MAX_QUEUED_REPORTS`] for what a link tells a
+//!   handle that never reads, [`link::DEFAULT_MAX_MESSAGE_SIZE`] for a
+//!   message a peer would otherwise send one bounded frame at a time,
+//!   [`settlement::DEFAULT_MAX_UNSETTLED`] for the deliveries a link keeps
+//!   state for, [`sasl::MAX_ROUNDS`] for the challenge/response loop Part 5
+//!   leaves unbounded, and [`ConnectionOptions::max_resolved_addresses`] for
+//!   the resolver's answer.
+//! * **The driver waits for no peer and no application.** It is one task for
+//!   every session and link of a connection, so it reads, writes, times out
+//!   and closes inside one `select!`, with a clock
+//!   ([`ConnectionOptions::write_timeout`]) that fails a connection whose
+//!   peer has stopped reading; and what it tells an application goes into a
+//!   queue it never waits on. See [`connection`].
 //! * **Identity types stay apart** [0013 §4.4 item 6]. A SASL identity and
 //!   weida's proved `Fingerprint` are different claims about different
 //!   things, and no conversion between them exists in this workspace.
@@ -90,6 +100,7 @@ pub mod error;
 pub mod link;
 pub mod options;
 pub mod owned;
+mod queue;
 pub mod sasl;
 pub mod session;
 pub mod settlement;

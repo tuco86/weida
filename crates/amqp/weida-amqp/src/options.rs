@@ -18,9 +18,16 @@
 //! | `idle_time_out` | unset (never) | [`DEFAULT_IDLE_TIME_OUT`] | A connection that never times out holds its resources until the OS notices |
 //! | `channel_max` | `65535` | [`DEFAULT_CHANNEL_MAX`] | Each session is a live table entry, and 65536 of them is a number nobody asked for |
 //!
-//! All three are settable back to the specification's value, and none of them
-//! is silent.
+//! Two bounds are ours where the protocol has none and are not changed
+//! defaults, because the specification has nothing to change them from:
+//! [`ConnectionOptions::handshake_timeout`] for every step before `open` has
+//! been read, and [`ConnectionOptions::write_timeout`] for a peer that stops
+//! reading once the connection is up.
+//!
+//! All three changed defaults are settable back to the specification's
+//! value, and none of them is silent.
 
+use std::fmt;
 use std::time::Duration;
 
 use weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE;
@@ -81,6 +88,18 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// transport. The specification names no number; this is it.
 pub const DEFAULT_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long the socket may take no octets at all while output waits for it.
+///
+/// **Ours, because the protocol gives a writer no deadline.** A peer that
+/// keeps the connection open and stops reading fills the kernel's send
+/// buffer, after which a write waits for as long as the peer chooses. The
+/// clock restarts whenever the socket takes anything, so a slow reader is not
+/// a stalled one; only no progress at all for this long fails the connection
+/// with [`Error::WriteTimeout`]. Shorter than [`DEFAULT_IDLE_TIME_OUT`] so
+/// that a peer that has stopped reading is found before one that has merely
+/// gone quiet.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Addresses a hostname may expand to.
 ///
 /// A resolver answer is remote input, so the count is capped
@@ -101,7 +120,13 @@ pub const SECURE_PORT: u16 = 5671;
 /// choice is between *this* setting and what the server offered: a client
 /// configured for `PLAIN` against a server offering only `ANONYMOUS` is a
 /// configuration error rather than a silent downgrade.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+///
+/// `Debug` is written by hand and prints `PLAIN`'s password as
+/// `"<redacted>"`: this type is held by [`ConnectionOptions`], which a
+/// [`Connection`](crate::Connection) keeps for its whole life, so a derived
+/// `Debug` would put the password into every `{:?}`, `dbg!` and `tracing`
+/// field that touches either.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum Sasl {
     /// No SASL layer at all: the header is `AMQP %d0 1.0.0` and `open`
     /// follows immediately.
@@ -146,6 +171,24 @@ impl Sasl {
             Self::Plain { .. } => weida_amqp_codec::sasl::PLAIN,
             Self::External { .. } => weida_amqp_codec::sasl::EXTERNAL,
         })
+    }
+}
+
+impl fmt::Debug for Sasl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Anonymous => f.write_str("Anonymous"),
+            Self::Plain { username, .. } => f
+                .debug_struct("Plain")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::External { authzid } => f
+                .debug_struct("External")
+                .field("authzid", authzid)
+                .finish(),
+        }
     }
 }
 
@@ -206,9 +249,14 @@ pub struct ConnectionOptions {
     pub tls_server_name: Option<String>,
     /// Per-step handshake deadline. See [`DEFAULT_HANDSHAKE_TIMEOUT`].
     pub handshake_timeout: Duration,
-    /// How long `close` waits for the peer's answer. See
+    /// How long `close` waits for the peer's answer, and how long what is
+    /// still queued gets to leave once the connection is ending. See
     /// [`DEFAULT_CLOSE_BUDGET`].
     pub close_budget: Duration,
+    /// How long the socket may take no octets at all while output waits for
+    /// it before the connection fails with [`Error::WriteTimeout`]. See
+    /// [`DEFAULT_WRITE_TIMEOUT`].
+    pub write_timeout: Duration,
     /// How many addresses a hostname may expand to.
     pub max_resolved_addresses: usize,
 }
@@ -231,6 +279,7 @@ impl ConnectionOptions {
             tls_server_name: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             close_budget: DEFAULT_CLOSE_BUDGET,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             max_resolved_addresses: DEFAULT_MAX_RESOLVED_ADDRESSES,
         }
     }
@@ -281,6 +330,13 @@ impl ConnectionOptions {
             return Err(Error::Configuration(
                 "handshake_timeout must be non-zero: the protocol gives no deadline \
                  of its own, so zero would mean no handshake can ever finish"
+                    .into(),
+            ));
+        }
+        if self.write_timeout.is_zero() {
+            return Err(Error::Configuration(
+                "write_timeout must be non-zero: zero would call every write a \
+                 stall before the socket had a chance to take it"
                     .into(),
             ));
         }
@@ -386,5 +442,36 @@ mod tests {
             .mechanism(),
             Some("EXTERNAL")
         );
+    }
+
+    #[test]
+    fn a_password_never_reaches_a_debug_print() {
+        let sasl = Sasl::Plain {
+            username: "svc".into(),
+            password: "hunter2".into(),
+        };
+        let printed = format!("{sasl:?} {sasl:#?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(
+            printed.contains("svc"),
+            "the identity is not a secret: {printed}"
+        );
+
+        // The type that holds it, and everything that holds that, prints it
+        // the same way: a derived `Debug` anywhere above would undo the
+        // redaction.
+        let mut options = ConnectionOptions::new("c1");
+        options.sasl = sasl;
+        let printed = format!("{options:?} {options:#?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+    }
+
+    #[test]
+    fn a_zero_write_timeout_is_refused_where_it_is_configured() {
+        let mut options = ConnectionOptions::new("c1");
+        assert_eq!(options.write_timeout, DEFAULT_WRITE_TIMEOUT);
+        options.write_timeout = Duration::ZERO;
+        let error = options.validate().expect_err("refused");
+        assert!(error.to_string().contains("write_timeout"), "{error}");
     }
 }

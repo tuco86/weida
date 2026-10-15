@@ -422,6 +422,9 @@ impl<'a> Message<'a> {
 
     /// Decodes an annotated message from a `transfer` payload.
     ///
+    /// Every section draws on one zero-width allowance, so a message of many
+    /// small arrays is bounded as a whole, by `Limits::max_zero_width_elements`.
+    ///
     /// ```
     /// use weida_amqp_codec::{Limits, message::{Body, Message}};
     ///
@@ -441,9 +444,11 @@ impl<'a> Message<'a> {
         let mut last = "the start of the message";
         let mut bare_from: Option<usize> = None;
         let mut bare_to = 0usize;
+        let mut zero_width = limits.max_zero_width_elements;
 
         while at < input.len() {
-            let (descriptor, value, used) = decode::described(&input[at..], limits)?;
+            let (descriptor, value, used) =
+                decode::described_within(&input[at..], limits, &mut zero_width)?;
             let code = match resolve(&descriptor) {
                 Some(code) => code,
                 // Not a section this codec knows. The message ends here as
@@ -512,16 +517,26 @@ impl<'a> Message<'a> {
                         }
                     }
                 }
-                0x76 => match &mut message.body {
-                    Body::Empty => message.body = Body::Sequence(vec![value]),
-                    Body::Sequence(sections) => sections.push(value),
-                    other => {
-                        return Err(DecodeError::MixedBodySections {
-                            had: other.name(),
-                            found: "amqp-sequence",
+                0x76 => {
+                    // An `amqp-sequence` is a list of application values; a bare
+                    // value is what `amqp-value` is for.
+                    if !matches!(value, Value::List(_)) {
+                        return Err(DecodeError::WrongType {
+                            field: "amqp-sequence",
+                            code: value.canonical_code(),
                         });
                     }
-                },
+                    match &mut message.body {
+                        Body::Empty => message.body = Body::Sequence(vec![value]),
+                        Body::Sequence(sections) => sections.push(value),
+                        other => {
+                            return Err(DecodeError::MixedBodySections {
+                                had: other.name(),
+                                found: "amqp-sequence",
+                            });
+                        }
+                    }
+                }
                 0x77 => match &message.body {
                     Body::Empty => message.body = Body::Value(value),
                     other => {
@@ -784,7 +799,9 @@ impl Reassembly {
 
     /// Discards whatever has accumulated.
     pub fn reset(&mut self) {
-        self.payload.clear();
+        // Released rather than cleared: an aborted delivery must not keep its
+        // buffer pinned to the link until the next one arrives.
+        self.payload = Vec::new();
         self.delivery_id = None;
         self.delivery_tag = None;
         self.message_format = None;
@@ -856,7 +873,7 @@ impl Reassembly {
                 });
             }
         }
-        self.payload.reserve(payload.len());
+        self.reserve_for(payload.len());
         self.payload.extend_from_slice(payload);
 
         if transfer.more {
@@ -881,6 +898,31 @@ impl Reassembly {
             return Err(DecodeError::InterleavedDelivery);
         }
         Ok(())
+    }
+
+    /// Makes room for `incoming` more octets.
+    ///
+    /// Growth is geometric, but under a `max-message-size` it stops at that
+    /// size. The caller has checked the bound already, so the target is never
+    /// below what is needed, and a message that reaches the limit does not
+    /// hold up to twice it while the buffer doubles.
+    fn reserve_for(&mut self, incoming: usize) {
+        let needed = self.payload.len() + incoming;
+        if needed <= self.payload.capacity() {
+            return;
+        }
+        if self.max_message_size == 0 {
+            self.payload.reserve(incoming);
+            return;
+        }
+        let bound = usize::try_from(self.max_message_size).unwrap_or(usize::MAX);
+        let target = self
+            .payload
+            .capacity()
+            .saturating_mul(2)
+            .max(needed)
+            .min(bound);
+        self.payload.reserve_exact(target - self.payload.len());
     }
 }
 
@@ -1261,6 +1303,60 @@ mod tests {
             assembler.payload().len(),
             10,
             "the refused fragment was not appended"
+        );
+    }
+
+    #[test]
+    fn growth_stops_at_the_message_size_bound() {
+        // Geometric growth would take the buffer to 4 MB here, past the 3 MiB
+        // bound the message may not exceed.
+        let bound: usize = 3 << 20;
+        let mut assembler = Reassembly::new(bound as u64);
+        let chunk = vec![0u8; 1_000_000];
+        for _ in 0..3 {
+            assembler.accept(&fragment(true), &chunk).unwrap();
+        }
+        assert_eq!(assembler.payload().len(), 3_000_000);
+        assert!(
+            assembler.payload.capacity() <= bound,
+            "capacity {} is above the bound {bound}",
+            assembler.payload.capacity()
+        );
+    }
+
+    #[test]
+    fn an_aborted_reassembly_releases_its_buffer() {
+        // Fifteen mebibytes of continuation frames under a 16 MiB bound, then an
+        // abort: the buffer goes with the delivery.
+        let mut assembler = Reassembly::new(16 << 20);
+        let frame = vec![0u8; 64 << 10];
+        for _ in 0..240 {
+            assembler.accept(&fragment(true), &frame).unwrap();
+        }
+        assert_eq!(assembler.payload().len(), 15 << 20);
+        let mut aborted = fragment(true);
+        aborted.aborted = true;
+        assert_eq!(assembler.accept(&aborted, &[]), Ok(Progress::Aborted));
+        assert_eq!(assembler.payload.capacity(), 0);
+        assert!(assembler.payload().is_empty());
+    }
+
+    #[test]
+    fn an_amqp_sequence_section_must_hold_a_list() {
+        // A bare `uint` in an `amqp-sequence` is not a list of application values.
+        let bytes = [
+            codes::DESCRIBED,
+            codes::SMALLULONG,
+            0x76,
+            codes::SMALLUINT,
+            1,
+        ];
+        assert_eq!(
+            Message::decode(&bytes, Limits::BODY).map(|decoded| decoded.used),
+            Err(DecodeError::WrongType {
+                field: "amqp-sequence",
+                code: codes::SMALLUINT,
+            })
         );
     }
 

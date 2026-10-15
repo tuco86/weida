@@ -21,6 +21,7 @@
 
 use std::fmt;
 use std::io;
+use std::time::Duration;
 
 use weida_amqp_codec::protocol_header::{ProtocolId, Version};
 use weida_amqp_codec::{DecodeError, EncodeError, SaslCode};
@@ -109,8 +110,11 @@ pub enum Error {
     /// is the one `weida-runtime` speaks at its boundary.
     Runtime(weida_core::Error),
 
-    /// A peer's octets could not be decoded. The remedy is
-    /// `close(amqp:decode-error)`, and this client sends it before reporting.
+    /// A peer's octets could not be decoded. The remedy is a `close`: with
+    /// `amqp:connection:framing-error` where the frame itself was malformed
+    /// (a size beyond what was agreed, a header that cannot be one) and with
+    /// `amqp:decode-error` where the frame was sound and its body was not;
+    /// this client sends it before reporting (see [`Error::wire_condition`]).
     Decode(DecodeError),
 
     /// Something this client tried to send cannot be encoded: a frame above
@@ -176,6 +180,17 @@ pub enum Error {
         after_ms: u32,
     },
 
+    /// The socket took no octets at all for `after` while output was waiting
+    /// for it: the peer has stopped reading.
+    ///
+    /// Nothing is written in answer, because writing is exactly what does not
+    /// work. The clock restarts whenever the socket takes anything, so a peer
+    /// that reads slowly is not a stalled one.
+    WriteTimeout {
+        /// How long the socket took nothing.
+        after: Duration,
+    },
+
     /// A step of the handshake did not finish inside its deadline.
     HandshakeTimeout {
         /// Which step, as the specification names it.
@@ -200,6 +215,13 @@ impl Error {
     pub fn wire_condition(&self) -> Option<&'static str> {
         use weida_amqp_codec::types::condition as c;
         Some(match self {
+            Self::Decode(
+                DecodeError::FrameTooSmall { .. }
+                | DecodeError::FrameTooLarge { .. }
+                | DecodeError::DataOffsetTooSmall { .. }
+                | DecodeError::ExtendedHeaderOverrunsFrame { .. }
+                | DecodeError::UnknownFrameType(_),
+            ) => c::CONNECTION_FRAMING_ERROR,
             Self::Decode(_) | Self::BadProtocolHeader(_) => c::DECODE_ERROR,
             Self::Encode(_) => c::FRAME_SIZE_TOO_SMALL,
             Self::IdleTimeout { .. } => c::CONNECTION_FORCED,
@@ -241,6 +263,11 @@ impl fmt::Display for Error {
             Self::IdleTimeout { after_ms } => {
                 write!(f, "no frame within the {after_ms} ms idle threshold")
             }
+            Self::WriteTimeout { after } => write!(
+                f,
+                "the socket accepted no octets for {after:?} while output was waiting: \
+                 the peer has stopped reading"
+            ),
             Self::HandshakeTimeout { step } => write!(f, "{step} did not finish in time"),
             Self::ConnectionGone => f.write_str("the connection is gone"),
             Self::Configuration(why) => write!(f, "configuration: {why}"),
@@ -328,5 +355,41 @@ mod tests {
         // A peer-initiated close has nothing to send back: `close` is the
         // last thing ever written, and the peer already wrote it.
         assert_eq!(Error::Closed(None).wire_condition(), None);
+    }
+
+    #[test]
+    fn a_malformed_frame_is_a_framing_error_and_a_malformed_body_a_decode_error() {
+        for malformed in [
+            DecodeError::FrameTooLarge {
+                size: 4096,
+                max: 512,
+            },
+            DecodeError::FrameTooSmall { size: 3 },
+            DecodeError::DataOffsetTooSmall { doff: 1 },
+            DecodeError::UnknownFrameType(9),
+        ] {
+            assert_eq!(
+                Error::Decode(malformed).wire_condition(),
+                Some(condition::CONNECTION_FRAMING_ERROR),
+                "{malformed}"
+            );
+        }
+        assert_eq!(
+            Error::Decode(DecodeError::InvalidUtf8).wire_condition(),
+            Some(condition::DECODE_ERROR)
+        );
+    }
+
+    #[test]
+    fn a_stalled_write_has_nothing_to_send() {
+        let stalled = Error::WriteTimeout {
+            after: Duration::from_secs(10),
+        };
+        assert_eq!(
+            stalled.wire_condition(),
+            None,
+            "the peer is not reading, so a close would go nowhere"
+        );
+        assert!(stalled.to_string().contains("stopped reading"), "{stalled}");
     }
 }

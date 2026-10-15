@@ -18,6 +18,7 @@ use weida_amqp_codec::{Limits, decode};
 const LIMITS: Limits = Limits {
     max_elements: 64,
     max_depth: 8,
+    max_zero_width_elements: 16,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -43,6 +44,9 @@ fuzz_target!(|data: &[u8]| {
         assert!(declared <= LIMITS.max_elements);
 
         let mut seen = 0u32;
+        // A field that fails to decode ends the walk early, so the fields the
+        // header still owes are not consumed and the count is not zero then.
+        let mut cut_short = false;
         for _ in 0..declared.saturating_add(4) {
             match composite.fields.next_value() {
                 Ok(value) => {
@@ -52,9 +56,14 @@ fuzz_target!(|data: &[u8]| {
                         assert!(value.is_null(), "past the declared count, every field is null");
                     }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    cut_short = true;
+                    break;
+                }
             }
         }
-        assert_eq!(composite.fields.remaining(), 0);
+        if !cut_short {
+            assert_eq!(composite.fields.remaining(), 0);
+        }
     }
 });

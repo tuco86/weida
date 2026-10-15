@@ -8,7 +8,9 @@
 //! restricted types, trailing-null trimming — is what gets explored.
 //!
 //! Properties: decoding never panics; an accepted performative re-encodes and
-//! decodes back to the same value; the round trip is stable over octets, so a
+//! the re-encoding decodes again, to the same canonical octets. The octets are
+//! compared, not the values, because a decoded float may be a NaN, which equals
+//! nothing, itself included; the round trip is stable over octets, so a
 //! peer's wider encoding of a field becomes this crate's canonical one and
 //! then stops changing.
 
@@ -32,7 +34,7 @@ fn exercise(input: &[u8]) {
     let (again, used2) =
         Performative::decode(&written, Limits::DEFAULT).expect("the re-encoding decodes");
     assert_eq!(used2, written.len());
-    assert_eq!(again, performative);
+    // Compared over octets, for the NaN reason in the module documentation.
     assert_eq!(again.descriptor(), performative.descriptor());
 
     let mut twice = Vec::new();

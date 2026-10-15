@@ -123,7 +123,7 @@ pub struct SaslMechanisms<'a> {
 }
 
 /// `sasl-init`, `0x41`: the client's choice (Part 5 §5.3.3.2).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SaslInit<'a> {
     /// Mandatory. One of the mechanisms the server offered; the client MUST
     /// authenticate "using the highest-level security profile it can handle
@@ -147,7 +147,7 @@ pub struct SaslOutcome<'a> {
 }
 
 /// One SASL body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SaslFrame<'a> {
     /// `sasl-mechanisms`, server to client, first.
     Mechanisms(SaslMechanisms<'a>),
@@ -159,6 +159,49 @@ pub enum SaslFrame<'a> {
     Response(&'a [u8]),
     /// `sasl-outcome`, server to client, last.
     Outcome(SaslOutcome<'a>),
+}
+
+/// What `Debug` prints in place of a secret's octets: how many there are.
+struct Redacted(usize);
+
+impl core::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "<redacted: {} octets>", self.0)
+    }
+}
+
+/// `initial_response` is where PLAIN puts its password, so `Debug` shows the
+/// length of the response and nothing of its octets.
+impl core::fmt::Debug for SaslInit<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SaslInit")
+            .field("mechanism", &self.mechanism)
+            .field(
+                "initial_response",
+                &self
+                    .initial_response
+                    .map(|response| Redacted(response.len())),
+            )
+            .field("hostname", &self.hostname)
+            .finish()
+    }
+}
+
+/// A `Response` is the client's answer to a challenge, which can be a
+/// credential, so `Debug` shows its length and nothing of its octets.
+impl core::fmt::Debug for SaslFrame<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Mechanisms(body) => f.debug_tuple("Mechanisms").field(body).finish(),
+            Self::Init(body) => f.debug_tuple("Init").field(body).finish(),
+            Self::Challenge(challenge) => f.debug_tuple("Challenge").field(challenge).finish(),
+            Self::Response(response) => f
+                .debug_tuple("Response")
+                .field(&Redacted(response.len()))
+                .finish(),
+            Self::Outcome(body) => f.debug_tuple("Outcome").field(body).finish(),
+        }
+    }
 }
 
 impl<'a> SaslFrame<'a> {
@@ -534,5 +577,40 @@ mod tests {
                     .any(|(code, _)| *code == sasl)
             );
         }
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_credential() {
+        let response = plain_response("user", "hunter2");
+        let init = SaslFrame::Init(SaslInit {
+            mechanism: PLAIN,
+            initial_response: Some(&response),
+            hostname: Some("broker"),
+        });
+        let shown = format!("{init:?}");
+        assert!(
+            shown.contains("PLAIN") && shown.contains("broker"),
+            "the other fields print normally: {shown}"
+        );
+        assert!(
+            !shown.contains("hunter2"),
+            "the password is printed: {shown}"
+        );
+        assert!(
+            !shown.contains(&format!("{response:?}")),
+            "the octets are printed: {shown}"
+        );
+
+        let secret: &[u8] = b"hunter2";
+        let shown = format!("{:?}", SaslFrame::Response(secret));
+        assert!(
+            !shown.contains("hunter2"),
+            "the response is printed: {shown}"
+        );
+        assert!(
+            !shown.contains(&format!("{secret:?}")),
+            "the response octets are printed: {shown}"
+        );
+        assert!(shown.contains("7 octets"), "the length is kept: {shown}");
     }
 }

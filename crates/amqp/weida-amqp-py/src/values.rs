@@ -97,11 +97,24 @@ impl PyDelivery {
         Ok(match &message.body {
             Body::Empty => None,
             Body::Data(sections) => {
-                let mut joined = Vec::new();
-                for section in sections {
-                    joined.extend_from_slice(section);
-                }
-                Some(py_bytes(py, &joined).into_any())
+                // One section, the common case, is copied once, straight into
+                // the `bytes`. Several are joined in place, so no intermediate
+                // buffer holds the whole body a second time.
+                let bytes = match sections.as_slice() {
+                    [only] => py_bytes(py, only),
+                    many => {
+                        let total: usize = many.iter().map(|section| section.len()).sum();
+                        PyBytes::new_with(py, total, |buffer| {
+                            let mut at = 0;
+                            for section in many {
+                                buffer[at..at + section.len()].copy_from_slice(section);
+                                at += section.len();
+                            }
+                            Ok(())
+                        })?
+                    }
+                };
+                Some(bytes.into_any())
             }
             Body::Value(value) => Some(value_to_py(py, value)?),
             // One entry per `amqp-sequence` section, each of which is itself

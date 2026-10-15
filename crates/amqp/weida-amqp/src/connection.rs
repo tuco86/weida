@@ -50,19 +50,55 @@
 //!   empty frame every half of it when it has nothing else to send, which is
 //!   the same halving the specification recommends for the advertisement and
 //!   for the same reason — a keep-alive that arrives exactly at the deadline
-//!   arrives too late.
+//!   arrives too late. The period has a floor ([`MIN_KEEPALIVE`]): the peer
+//!   chooses the number, and a peer that asks for a frame every millisecond
+//!   is not owed a thousand writes a second.
 //! * **Ours to enforce**: [`ConnectionOptions::idle_time_out`]. On expiry
 //!   this client closes with `amqp:connection:forced` and an explanation,
 //!   which is what Part 2 §2.4.5 says a peer SHOULD do, and only then drops
 //!   the transport.
+//!
+//! # One task, and it never waits for a peer or for an application
+//!
+//! Every session and link of a connection is served by one driver task, so
+//! anything that task waits for, they all wait for. It therefore waits for
+//! three things only: the socket's readiness, its timers and its inputs.
+//!
+//! * **Writing never blocks it.** Every frame is queued in an outbox
+//!   and goes out as the socket takes it,
+//!   inside the same `select!` that reads, so a peer that has stopped reading
+//!   cannot stop the connection from reading, answering, timing out or
+//!   closing. A stall clock restarts whenever the socket takes anything; no
+//!   progress for [`ConnectionOptions::write_timeout`] fails the connection
+//!   with [`Error::WriteTimeout`]. Past
+//!   [`OUTBOX_HIGH_WATER`](crate::transport::OUTBOX_HIGH_WATER) queued octets
+//!   the driver stops reading the peer and stops taking frames from local
+//!   senders, which bounds what a peer that never reads can make it hold.
+//! * **No application is waited for.** What a link or a session tells its
+//!   handle goes into a queue the driver never waits on
+//!   (`crate::queue`), and what bounds those queues is where their
+//!   contents come from: a delivery is queued only against credit the
+//!   application granted itself, and everything else is state the handle can
+//!   also ask for.
+//! * **Reading is inline.** The reader is polled by the same `select!`, so it
+//!   is dropped with the driver: a peer that goes silent cannot leave a
+//!   half-open socket and a task behind.
+//!
+//! Ending the connection is bounded the same way: what is still queued —
+//! `close` above all — gets [`ConnectionOptions::close_budget`] to leave, and
+//! so does closing the transport.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::time::Instant;
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::message::Reassembly;
-use weida_amqp_codec::performative::{Close, End, Open, Performative};
+use weida_amqp_codec::performative::{
+    Attach, Begin, Close, Detach, Disposition, End, Flow, Open, Performative, Transfer,
+};
 use weida_amqp_codec::protocol_header::{ProtocolHeader, ProtocolId};
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{Limits, Role};
@@ -70,14 +106,14 @@ use weida_runtime::Exec;
 
 use crate::credit::Credit;
 use crate::error::{Condition, Error, Result};
-use crate::link::{self, Incoming, Link, LinkOptions, Links};
+use crate::link::{self, Incoming, Link, LinkEvent, LinkOptions, LinkState, Links};
 use crate::options::{ConnectionOptions, Sasl, TlsMode, multiple};
 use crate::sasl;
 use crate::session::{
-    self, Entry, SESSION_QUEUE, Session, SessionEvent, SessionOptions, SessionState, Shared, Table,
+    self, Entry, Session, SessionEvent, SessionOptions, SessionState, Shared, Table,
 };
 use crate::settlement::{DEFAULT_MAX_UNSETTLED, Outcome, Settlement, Unsettled};
-use crate::transport::{self, FrameReader, FrameWriter, Wire};
+use crate::transport::{self, FrameReader, FrameWriter, Outbox, Step, Wire};
 use crate::window::Windows;
 
 /// How many outgoing frames may be queued for the driver before a sender
@@ -88,6 +124,16 @@ use crate::window::Windows;
 /// told. Backpressure on the sender is the honest answer, and it is what the
 /// session window and link credit do one layer up.
 pub const OUTGOING_QUEUE: usize = 64;
+
+/// The least period between the empty frames this client sends to keep a peer's
+/// idle threshold from expiring, whatever the peer asked for.
+///
+/// **A bound of ours.** The period is half of the peer's `open.idle-time-out`,
+/// and the peer chooses that number: without a floor a value of 1 millisecond
+/// makes this client write and flush every half millisecond for as long as the
+/// connection lives. 50 ms is twenty frames a second, which a peer that wants
+/// them can have, and below the 100 ms period a 200 ms threshold asks for.
+pub const MIN_KEEPALIVE: Duration = Duration::from_millis(50);
 
 /// What the peer said in its `open`, owned.
 ///
@@ -317,7 +363,13 @@ impl Connection {
                 // handshake. A server that answers with anything else has
                 // refused the layering, and that is the same demand a `%d3`
                 // answer is.
-                wire.write_protocol_header(ProtocolHeader::TLS).await?;
+                step(
+                    exec,
+                    &options,
+                    "sending the TLS protocol header",
+                    wire.write_protocol_header(ProtocolHeader::TLS),
+                )
+                .await?;
                 let answer = step(
                     exec,
                     &options,
@@ -329,7 +381,18 @@ impl Connection {
             }
         }
 
-        let stream = transport::upgrade_tls(wire.into_stream(), config, &server_name).await?;
+        // The handshake is the first thing after TCP connect in the direct
+        // form and the first thing after the header in the layered one, and
+        // a server that accepts the connection and then says nothing, or
+        // drips a `ServerHello`, would otherwise hold the caller for as long
+        // as the OS allows.
+        let stream = step(
+            exec,
+            &options,
+            "the TLS handshake",
+            transport::upgrade_tls(wire.into_stream(), config, &server_name),
+        )
+        .await?;
         Self::establish(exec, Wire::new(stream), options, None).await
     }
 
@@ -348,7 +411,13 @@ impl Connection {
         let options = Arc::new(options);
 
         if options.sasl != Sasl::None {
-            wire.write_protocol_header(ProtocolHeader::SASL).await?;
+            step(
+                exec,
+                &options,
+                "sending the SASL protocol header",
+                wire.write_protocol_header(ProtocolHeader::SASL),
+            )
+            .await?;
             let answer = step(
                 exec,
                 &options,
@@ -361,7 +430,13 @@ impl Connection {
         }
 
         // `AMQP %d0 1.0.0`, either directly or after the layer above.
-        wire.write_protocol_header(ProtocolHeader::AMQP).await?;
+        step(
+            exec,
+            &options,
+            "sending the AMQP protocol header",
+            wire.write_protocol_header(ProtocolHeader::AMQP),
+        )
+        .await?;
         let answer = step(
             exec,
             &options,
@@ -381,7 +456,7 @@ impl Connection {
             Performative::Open(local_open).encode(body)
         })?;
         wire.queue().extend_from_slice(&out);
-        wire.flush().await?;
+        step(exec, &options, "sending open", wire.flush()).await?;
 
         let remote = {
             let frame = step(exec, &options, "the peer's open", wire.read_frame()).await?;
@@ -454,11 +529,15 @@ impl Connection {
             return Err(refusal);
         }
         let (reply, wait) = oneshot::channel();
-        self.inner
+        if self
+            .inner
             .commands
             .send(Command::Begin { options, reply })
             .await
-            .map_err(|_| Error::ConnectionGone)?;
+            .is_err()
+        {
+            return Err(self.gone().await);
+        }
         match self
             .inner
             .exec
@@ -466,11 +545,29 @@ impl Connection {
             .await
         {
             Some(Ok(result)) => result,
-            Some(Err(_)) => Err(Error::ConnectionGone),
+            Some(Err(_)) => Err(self.gone().await),
             None => Err(Error::HandshakeTimeout {
                 step: "the answering begin",
             }),
         }
+    }
+
+    /// The error for an operation that found the driver gone.
+    ///
+    /// The peer's own condition where it gave one: a command that raced the
+    /// peer's `close` is refused for the same reason one that came a moment
+    /// later is, and a caller that asked for a session on a connection the
+    /// peer refused wants to read `amqp:resource-limit-exceeded`, not a
+    /// synonym for silence. The driver publishes the final state a moment
+    /// after it stops taking commands, so this waits for it, within the
+    /// close budget.
+    async fn gone(&self) -> Error {
+        self.inner
+            .exec
+            .within(self.inner.options.close_budget, self.closed())
+            .await
+            .and_then(|state| state.refusal())
+            .unwrap_or(Error::ConnectionGone)
     }
 
     /// What the peer said in its `open`.
@@ -516,7 +613,9 @@ impl Connection {
     /// SHOULD keep reading until the partner's `close` arrives, and SHOULD
     /// apply a timeout before dropping the transport. The timeout is
     /// [`ConnectionOptions::close_budget`], and it is finite for the same
-    /// reason every close budget in this repository is.
+    /// reason every close budget in this repository is: when it runs out the
+    /// driver drops the transport whether or not the peer answered, and
+    /// whether or not the peer was reading.
     ///
     /// Idempotent: closing a closed connection is `Ok(())`, because a caller
     /// that races its own shutdown should not have to hold a lock to be
@@ -540,6 +639,8 @@ impl Connection {
         {
             return Ok(());
         }
+        // The driver enforces the same budget itself, so this is the caller's
+        // bound on the wait and not the only one.
         match self
             .inner
             .exec
@@ -602,6 +703,17 @@ fn check_header(answer: ProtocolHeader, requested: ProtocolId) -> Result<()> {
     Ok(())
 }
 
+/// The period between keep-alive frames for a peer that asked for
+/// `idle_time_out` milliseconds: half of it, so that a frame is never exactly
+/// at the deadline, and never below [`MIN_KEEPALIVE`]. `None` where the peer
+/// asked for no timeout.
+fn keepalive_period(idle_time_out: Option<u32>) -> Option<Duration> {
+    idle_time_out
+        .map(|ms| Duration::from_millis(u64::from(ms)) / 2)
+        .filter(|period| !period.is_zero())
+        .map(|period| period.max(MIN_KEEPALIVE))
+}
+
 /// The task that owns the wire once the handshake is done.
 struct Driver {
     exec: Exec,
@@ -618,201 +730,102 @@ struct Driver {
 
 impl Driver {
     async fn run(mut self, mut reader: FrameReader, mut writer: FrameWriter) {
+        let write_timeout = self.options.write_timeout;
+        let close_budget = self.options.close_budget;
         // Ours to send: an empty frame at half the interval the peer asked
         // for. Ours to enforce: our own threshold, measured from the last
         // frame that arrived.
-        //
-        // Both are deadlines that outlive a turn of the loop below, not
-        // timers built inside it. A `Sleep` created in the loop body restarts
-        // from zero whenever any *other* `select!` branch completes, so
-        // neither sentence above would hold under traffic: a connection with
-        // commands flowing would never emit the empty frame and the peer
-        // would close on its own threshold, and its read threshold would
-        // never be reached however long the peer had been silent, because
-        // this side's own sends kept postponing it.
-        let keepalive = self
-            .remote
-            .idle_time_out
-            .map(|ms| Duration::from_millis(u64::from(ms)) / 2)
-            .filter(|d| !d.is_zero());
+        let keepalive = keepalive_period(self.remote.idle_time_out);
         let deadline = self.options.idle_time_out;
 
-        let (frames_tx, mut frames) = mpsc::channel::<Result<Vec<u8>>>(4);
-        self.exec.spawn(async move {
-            loop {
-                let next = reader.next_frame().await;
-                let failed = next.is_err();
-                if frames_tx.send(next).await.is_err() || failed {
-                    return;
-                }
-            }
-        });
-
+        let mut out = Outbox::new(writer.max_frame_size());
         let mut closing = false;
         let mut close_done: Option<oneshot::Sender<Result<()>>> = None;
-        let outcome: State;
 
-        // Both start from the handshake — a peer that says nothing at all
-        // after its `open` must still be timed out — and are re-armed at the
-        // top of each turn from the event their rule names: `tick` from the
-        // last frame *this side* wrote, which the writer records for every
-        // path that writes one, and `expiry` from the last frame that
-        // arrived. Re-arming beats rebuilding: a `Sleep` is one slot on the
-        // timer wheel either way, and resetting it here is the only place
-        // that has to be read to see what each deadline measures.
-        let mut last_frame = tokio::time::Instant::now();
+        // Four clocks, each one a `Sleep` that outlives a turn of the loop and
+        // is moved only by the event it measures. A `Sleep` built inside the
+        // loop would restart whenever any *other* branch completed, so under
+        // traffic a keep-alive would never be sent, an idle threshold would
+        // never be reached and a stalled write would never be noticed.
+        //
+        // * `tick` — the last time this side wrote anything — moves when the
+        //   socket takes octets;
+        // * `expiry` — the last frame that arrived — moves when one does, and
+        //   nowhere else, so a connection whose peer has silently gone is
+        //   timed out even while this side keeps sending;
+        // * `stall` runs only while the socket owes something, and moves when
+        //   it takes something, so it measures *no progress* and not a slow
+        //   reader;
+        // * `close_by` runs from the moment `close` is queued.
+        //
+        // The guards on the arms disable them when they do not apply, so an
+        // unarmed `Sleep` is never awaited.
+        let started = Instant::now();
         let mut tick = std::pin::pin!(self.exec.sleep(Duration::ZERO));
         let mut expiry = std::pin::pin!(self.exec.sleep(Duration::ZERO));
+        let mut stall = std::pin::pin!(self.exec.sleep(write_timeout));
+        let mut close_by = std::pin::pin!(self.exec.sleep(close_budget));
+        if let Some(period) = keepalive {
+            tick.as_mut().reset(started + period);
+        }
+        if let Some(period) = deadline {
+            expiry.as_mut().reset(started + period);
+        }
+        let mut owed_before = false;
 
-        loop {
-            // The guards on the two timer arms disable them when the
-            // connection asked for no timeout, so an unarmed `Sleep` is never
-            // awaited.
-            if let Some(period) = keepalive {
-                tick.as_mut().reset(writer.last_write() + period);
+        // The state the connection ended in, and whether what is queued
+        // should still be given the chance to leave: true where a `close` is
+        // in the queue behind it.
+        let (outcome, flush): (State, bool) = loop {
+            // Output appearing after a quiet spell starts the stall clock.
+            let owes = out.owes();
+            if owes && !owed_before {
+                stall.as_mut().reset(Instant::now() + write_timeout);
             }
-            if let Some(period) = deadline {
-                expiry.as_mut().reset(last_frame + period);
-            }
+            owed_before = owes;
 
+            // Not `biased`: with any one arm first, a source that is always
+            // ready would starve the rest — commands the read, the read the
+            // timers — and what the driver must never be is starved by one
+            // peer or one application.
             tokio::select! {
-                biased;
-
-                command = self.rx.recv() => match command {
-                    Some(Command::Begin { options, reply }) => {
-                        if closing {
-                            let _ = reply.send(Err(Error::ConnectionGone));
-                            continue;
-                        }
-                        if let Err(error) = self.begin(options, reply, &mut writer).await {
-                            outcome = State::Failed(error.to_string());
-                            break;
+                // The socket takes some of what is queued, or, once it has
+                // all of it, a TLS session pushes out the last record. One
+                // step either way, so that this arm is also the progress the
+                // stall clock measures.
+                progress = writer.step(out.pending()), if out.owes() => match progress {
+                    Ok(Step::Wrote(taken)) => {
+                        out.took(taken);
+                        let now = Instant::now();
+                        stall.as_mut().reset(now + write_timeout);
+                        if let Some(period) = keepalive {
+                            tick.as_mut().reset(now + period);
                         }
                     }
-
-                    Some(Command::Close { error, done }) => {
-                        // Everything already handed to the driver is written
-                        // first. "`close` MUST be the last frame ever
-                        // written" makes it *last*; it is not a licence to
-                        // drop a transfer a sender had already completed
-                        // (Part 2 §2.4.3).
-                        if let Err(error) = self.flush_outbound(&mut writer).await {
-                            let _ = done.send(Err(error));
-                            outcome = State::Closed(None);
-                            break;
-                        }
-                        let result = write_close(&mut writer, error.as_ref()).await;
-                        closing = true;
-                        self.state.send_replace(State::Closing);
-                        if let Err(error) = result {
-                            let _ = done.send(Err(error));
-                            outcome = State::Closed(None);
-                            break;
-                        }
-                        close_done = Some(done);
+                    Ok(Step::Flushed) => {
+                        out.flushed();
+                        stall.as_mut().reset(Instant::now() + write_timeout);
                     }
-                    // Every handle is gone and nobody asked for a close.
-                    // Part 2 §2.4.3 wants one written anyway: a connection
-                    // dropped without it leaves the peer to discover the
-                    // loss by timeout.
-                    None => {
-                        if !closing {
-                            let _ = self.flush_outbound(&mut writer).await;
-                            let _ = write_close(&mut writer, None).await;
-                        }
-                        let _ = writer.shutdown().await;
-                        outcome = State::Closed(None);
-                        break;
-                    }
+                    Err(error) => break (State::Failed(error.to_string()), false),
                 },
 
-                out = self.outbound_rx.recv() => match out {
-                    Some(Outbound::Frame(bytes)) => {
-                        // `close` MUST be the last thing ever written, so a
-                        // session frame that raced the close is dropped
-                        // rather than written after it.
-                        if closing {
-                            continue;
-                        }
-                        if let Err(error) = writer.send(&bytes).await {
-                            outcome = State::Failed(error.to_string());
-                            break;
-                        }
-                    }
-                    Some(Outbound::Attach {
-                        channel,
-                        options,
-                        reply,
-                    }) => {
-                        if closing {
-                            let _ = reply.send(Err(Error::ConnectionGone));
-                            continue;
-                        }
-                        if let Err(error) =
-                            self.attach(channel, *options, reply, &mut writer).await
-                        {
-                            outcome = State::Failed(error.to_string());
-                            break;
-                        }
-                    }
-                    // Only the driver's own clone is left, which cannot
-                    // happen while the driver runs.
-                    None => continue,
-                },
+                // Output has been waiting and the socket has taken nothing.
+                () = stall.as_mut(), if out.owes() => {
+                    break (
+                        State::Failed(Error::WriteTimeout { after: write_timeout }.to_string()),
+                        false,
+                    );
+                }
 
-                incoming = frames.recv() => match incoming {
-                    Some(Ok(bytes)) => {
-                        // The one event the read threshold measures from. It
-                        // moves here and nowhere else, so a connection whose
-                        // peer has silently gone is timed out even while this
-                        // side keeps sending.
-                        last_frame = tokio::time::Instant::now();
-                        match self.handle(&bytes, &mut writer, closing).await {
-                            Ok(None) => {}
-                            Ok(Some(state)) => {
-                                if let Some(done) = close_done.take() {
-                                    let _ = done.send(Ok(()));
-                                }
-                                outcome = state;
-                                break;
-                            }
-                            Err(error) => {
-                                if let Some(done) = close_done.take() {
-                                    let _ = done.send(Err(Error::ConnectionGone));
-                                }
-                                outcome = State::Failed(error.to_string());
-                                break;
-                            }
-                        }
+                // `close` was queued and the peer has not answered inside the
+                // budget. The caller's own wait is bounded by the same number;
+                // this is the driver's, so the transport is dropped whether
+                // or not anybody is still waiting.
+                () = close_by.as_mut(), if closing => {
+                    if let Some(done) = close_done.take() {
+                        let _ = done.send(Ok(()));
                     }
-                    gone => {
-                        let message = match gone {
-                            Some(Err(error)) => error.to_string(),
-                            _ => "the frame reader stopped".to_owned(),
-                        };
-                        if let Some(done) = close_done.take() {
-                            // The peer went away without answering, which is
-                            // the case the close budget exists for.
-                            let _ = done.send(Ok(()));
-                            outcome = State::Closed(None);
-                        } else {
-                            outcome = State::Failed(message);
-                        }
-                        break;
-                    }
-                },
-
-                () = tick.as_mut(), if keepalive.is_some() => {
-                    if closing {
-                        continue;
-                    }
-                    // An empty frame: a header, no body, no meaning beyond
-                    // liveness. Channel 0, which the specification says it
-                    // SHOULD be and MUST be before `open` has been received.
-                    if let Err(error) = writer.send(&frame::empty(0)).await {
-                        outcome = State::Failed(error.to_string());
-                        break;
-                    }
+                    break (State::Closed(None), false);
                 }
 
                 () = expiry.as_mut(), if deadline.is_some() => {
@@ -821,22 +834,123 @@ impl Driver {
                     ).unwrap_or(u32::MAX);
                     // SHOULD close with an error explaining why, and MAY then
                     // drop the socket.
-                    let _ = write_close(
-                        &mut writer,
-                        Some(&Condition::described(
-                            condition::CONNECTION_FORCED,
-                            format!("no frame within the {after_ms} ms idle threshold"),
-                        )),
-                    )
-                    .await;
-                    let _ = writer.shutdown().await;
-                    outcome = State::Failed(
-                        Error::IdleTimeout { after_ms }.to_string(),
-                    );
-                    break;
+                    if !closing {
+                        let _ = queue_close(
+                            &mut out,
+                            Some(&Condition::described(
+                                condition::CONNECTION_FORCED,
+                                format!("no frame within the {after_ms} ms idle threshold"),
+                            )),
+                        );
+                    }
+                    break (State::Failed(Error::IdleTimeout { after_ms }.to_string()), true);
                 }
+
+                // Read inline rather than through a forwarding task:
+                // `next_frame` is cancel-safe, so a `select!` that drops it
+                // keeps every octet it had buffered, and the reader goes when
+                // the driver does. Not read while the peer is not reading
+                // what is already queued for it.
+                incoming = reader.next_frame(), if !out.congested() => match incoming {
+                    Ok(frame) => {
+                        // The one event the read threshold measures from.
+                        if let Some(period) = deadline {
+                            expiry.as_mut().reset(Instant::now() + period);
+                        }
+                        match self.handle(frame, &mut out, closing) {
+                            Ok(None) => {}
+                            Ok(Some(state)) => {
+                                if let Some(done) = close_done.take() {
+                                    let _ = done.send(Ok(()));
+                                }
+                                break (state, true);
+                            }
+                            Err(error) => {
+                                if let Some(done) = close_done.take() {
+                                    let _ = done.send(Err(Error::ConnectionGone));
+                                }
+                                // Part 2 §2.4.3: tell the peer why, where the
+                                // fault was in what it sent.
+                                let told = !closing && tell_why(&mut out, &error);
+                                break (State::Failed(error.to_string()), told);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(done) = close_done.take() {
+                            // The peer went away without answering, which is
+                            // the case the close budget exists for.
+                            let _ = done.send(Ok(()));
+                            break (State::Closed(None), false);
+                        }
+                        let told = !closing && tell_why(&mut out, &error);
+                        break (State::Failed(error.to_string()), told);
+                    }
+                },
+
+                // An empty frame: a header, no body, no meaning beyond
+                // liveness. Channel 0, which the specification says it SHOULD
+                // be and MUST be before `open` has been received. Only while
+                // the socket owes nothing: queued output is the heartbeat.
+                () = tick.as_mut(), if keepalive.is_some() && !closing && !out.owes() => {
+                    out.push(&frame::empty(0));
+                }
+
+                command = self.rx.recv() => match command {
+                    Some(Command::Begin { options, reply }) => {
+                        if closing {
+                            let _ = reply.send(Err(Error::ConnectionGone));
+                            continue;
+                        }
+                        self.begin(options, reply, &mut out);
+                    }
+
+                    Some(Command::Close { error, done }) => {
+                        if closing {
+                            let _ = done.send(Ok(()));
+                            continue;
+                        }
+                        // Everything already handed to the driver is written
+                        // first. "`close` MUST be the last frame ever
+                        // written" makes it *last*; it is not a licence to
+                        // drop a transfer a sender had already completed
+                        // (Part 2 §2.4.3).
+                        self.flush_outbound(&mut out);
+                        if let Err(error) = queue_close(&mut out, error.as_ref()) {
+                            let _ = done.send(Err(error));
+                            break (State::Closed(None), true);
+                        }
+                        closing = true;
+                        self.state.send_replace(State::Closing);
+                        close_by.as_mut().reset(Instant::now() + close_budget);
+                        close_done = Some(done);
+                    }
+
+                    // Every handle is gone and nobody asked for a close.
+                    // Part 2 §2.4.3 wants one written anyway: a connection
+                    // dropped without it leaves the peer to discover the
+                    // loss by timeout.
+                    None => {
+                        if !closing {
+                            self.flush_outbound(&mut out);
+                            let _ = queue_close(&mut out, None);
+                        }
+                        break (State::Closed(None), true);
+                    }
+                },
+
+                queued = self.outbound_rx.recv(), if !out.congested() => match queued {
+                    Some(first) => {
+                        if let Err(error) = self.take_outbound(first, &mut out, closing) {
+                            break (State::Failed(error.to_string()), false);
+                        }
+                    }
+                    // Only the driver's own clone is left, which cannot
+                    // happen while the driver runs.
+                    None => continue,
+                },
             }
-        }
+        };
 
         // "Sessions also end automatically when the connection closes or is
         // interrupted" (Part 2 §2.5.2). Telling each one is what lets a
@@ -852,59 +966,144 @@ impl Driver {
         };
         for entry in self.sessions.drain() {
             *entry.shared.state.lock().expect("not poisoned") = SessionState::Ended(ended.clone());
-            let _ = entry.events.send(SessionEvent::Ended(ended.clone())).await;
+            end_session(entry, ended.clone());
         }
-        let _ = writer.shutdown().await;
-        self.state.send_replace(outcome);
+
+        // What is still queued — `close` above all — gets the budget to leave
+        // and no more: a peer that has stopped reading is the case this
+        // bounds, and there is nothing to wait for if the write itself
+        // failed.
+        if flush {
+            let _ = self
+                .exec
+                .within(close_budget, transport::drain(&mut writer, &mut out))
+                .await;
+        }
+        // A failure is known now and does not wait on the transport closing.
+        let failed = matches!(outcome, State::Failed(_));
+        if failed {
+            self.state.send_replace(outcome.clone());
+        }
+        // Closing the transport can wait on a peer as well — a TLS session
+        // writes its closing alert first — so it is given what a close is
+        // given.
+        let _ = self.exec.within(close_budget, writer.shutdown()).await;
+        if !failed {
+            self.state.send_replace(outcome);
+        }
     }
 
-    /// Writes everything already queued, without waiting for more.
+    /// Moves what is already waiting in the senders' queue into the outbox,
+    /// without waiting for more.
     ///
-    /// Called before `close` so that a frame a caller had already handed
-    /// over is not overtaken by it. Only what is queued *now* is written: a
-    /// frame offered after the close was asked for is still dropped, because
-    /// by then `close` is the last frame and that is the whole rule.
-    async fn flush_outbound(&mut self, writer: &mut FrameWriter) -> Result<()> {
-        while let Ok(out) = self.outbound_rx.try_recv() {
-            match out {
-                Outbound::Frame(bytes) => writer.send(&bytes).await?,
+    /// Called before `close` so that a frame a caller had already handed over
+    /// is not overtaken by it. Only what is queued *now* is taken: a frame
+    /// offered after the close was asked for is still dropped, because by then
+    /// `close` is the last frame and that is the whole rule.
+    fn flush_outbound(&mut self, out: &mut Outbox) {
+        while let Ok(item) = self.outbound_rx.try_recv() {
+            match item {
+                Outbound::Frame(bytes) => out.push(&bytes),
                 Outbound::Attach { reply, .. } => {
                     let _ = reply.send(Err(Error::ConnectionGone));
                 }
+            }
+        }
+    }
+
+    /// One thing a session or link handed over, and whatever else is already
+    /// waiting behind it, all into the outbox: frames queued in one turn leave
+    /// in one write.
+    fn take_outbound(&mut self, first: Outbound, out: &mut Outbox, closing: bool) -> Result<()> {
+        let mut next = Some(first);
+        while let Some(item) = next.take() {
+            match item {
+                // `close` MUST be the last thing ever written, so a session
+                // frame that raced the close is dropped rather than written
+                // after it.
+                Outbound::Frame(bytes) => {
+                    if !closing {
+                        out.push(&bytes);
+                    }
+                }
+                Outbound::Attach {
+                    channel,
+                    options,
+                    reply,
+                } => {
+                    if closing {
+                        let _ = reply.send(Err(Error::ConnectionGone));
+                    } else {
+                        self.attach(channel, *options, reply, out)?;
+                    }
+                }
+            }
+            if !out.congested() {
+                next = self.outbound_rx.try_recv().ok();
             }
         }
         Ok(())
     }
 
     /// One incoming frame. `Ok(Some(state))` ends the connection.
-    async fn handle(
-        &mut self,
-        bytes: &[u8],
-        writer: &mut FrameWriter,
-        closing: bool,
-    ) -> Result<Option<State>> {
-        let frame = frame::decode(
-            bytes,
-            writer.max_frame_size().max(self.options.max_frame_size),
+    ///
+    /// Nothing here waits: what the frame calls for is queued on the outbox
+    /// and the application is told through queues the driver never waits on.
+    fn handle(&mut self, frame: Bytes, out: &mut Outbox, closing: bool) -> Result<Option<State>> {
+        let decoded = frame::decode(
+            &frame,
+            out.max_frame_size().max(self.options.max_frame_size),
         )?;
-        if frame.is_empty() {
+        let channel = decoded.header.channel;
+        // SASL ended before the first AMQP frame, so a frame of the other
+        // type is not one this layer reads; and an empty one is a keep-alive
+        // only at the AMQP layer, where Part 5 §5.3.1 makes it fatal at the
+        // other.
+        if decoded.header.kind != FrameKind::Amqp {
+            return Ok(refuse(
+                out,
+                Condition::described(
+                    condition::CONNECTION_FRAMING_ERROR,
+                    format!(
+                        "a frame of type 0x{:02x} arrived after the SASL layer had ended; \
+                         only AMQP frames (type 0x00) are allowed",
+                        decoded.header.kind.octet()
+                    ),
+                ),
+            ));
+        }
+        if decoded.is_empty() {
             // The keep-alive. Nothing to do but have received it, which the
             // idle deadline already noticed by being reset.
             return Ok(None);
         }
-        let (performative, used) = Performative::decode(frame.body, Limits::DEFAULT)?;
+        let (performative, used) = Performative::decode(decoded.body, Limits::DEFAULT)?;
         // Everything after the performative in the same body is the
         // `transfer` payload, byte for byte — Part 2 §2.7.5 defines it as
-        // exactly that and nothing parses it here.
-        let payload = &frame.body[used..];
+        // exactly that and nothing parses it here. A slice of the frame, not
+        // a copy of it.
+        let payload = frame.slice(decoded.header.body_offset() + used..);
         match performative {
             Performative::Close(Close { error }) => {
+                // Connection control is on channel 0.
+                if channel != 0 && !closing {
+                    return Ok(refuse(
+                        out,
+                        Condition::described(
+                            condition::CONNECTION_FRAMING_ERROR,
+                            format!(
+                                "close arrived on channel {channel}, and connection control \
+                                 is on channel 0"
+                            ),
+                        ),
+                    ));
+                }
                 let condition = error.as_ref().map(Condition::from_codec);
                 if !closing {
                     // Simultaneous close is legal at both levels; the only
                     // observable difference is which error each side reports
                     // (Part 2 §2.4.4). Answering is what makes it orderly.
-                    let _ = write_close(writer, None).await;
+                    let _ = queue_close(out, None);
                 }
                 Ok(Some(State::Closed(condition)))
             }
@@ -919,22 +1118,26 @@ impl Driver {
                 );
                 Ok(None)
             }
-            other => {
-                self.route(frame.header.channel, other, payload, bytes, writer)
-                    .await
-            }
+            Performative::Open(_) => Ok(refuse(
+                out,
+                Condition::described(
+                    condition::ILLEGAL_STATE,
+                    "a second open arrived on a connection that is already open".to_owned(),
+                ),
+            )),
+            other => self.route(channel, other, payload, out),
         }
     }
 
     /// Begins a session: lowest free outgoing channel, `begin` on the wire,
     /// and the caller parked until the answer ties the two numberings
     /// together.
-    async fn begin(
+    fn begin(
         &mut self,
         options: SessionOptions,
         reply: oneshot::Sender<Result<Session>>,
-        writer: &mut FrameWriter,
-    ) -> Result<()> {
+        out: &mut Outbox,
+    ) {
         // The bound is the peer's `channel-max`: it is the number that says
         // which channels the peer will accept, and ours says nothing about
         // what we may use.
@@ -946,7 +1149,7 @@ impl Driver {
                     self.remote.channel_max
                 ),
             ))));
-            return Ok(());
+            return;
         };
 
         let windows = Windows::new(0, options.incoming_window, options.outgoing_window);
@@ -954,11 +1157,11 @@ impl Driver {
             Ok(bytes) => bytes,
             Err(error) => {
                 let _ = reply.send(Err(error));
-                return Ok(());
+                return;
             }
         };
 
-        let (events, rx) = mpsc::channel(SESSION_QUEUE);
+        let (events, rx) = session::events();
         self.sessions.insert(
             channel,
             Entry {
@@ -977,7 +1180,7 @@ impl Driver {
                 rx: Some(rx),
             },
         );
-        writer.send(&bytes).await
+        out.push(&bytes);
     }
 
     /// Attaches a link: lowest free handle, `attach` on the wire, and the
@@ -986,12 +1189,12 @@ impl Driver {
     /// A link whose name and direction are already attached steals the
     /// incumbent, which is detached with `amqp:link:stolen` first
     /// (Part 2 §2.6.1).
-    async fn attach(
+    fn attach(
         &mut self,
         channel: u16,
         options: LinkOptions,
         reply: oneshot::Sender<Result<Link>>,
-        writer: &mut FrameWriter,
+        out: &mut Outbox,
     ) -> Result<()> {
         // Read before the table is borrowed: the bound is the peer's
         // `handle-max` from its answering `begin`, and the frame ceiling is
@@ -1016,14 +1219,9 @@ impl Driver {
                     options.name
                 ),
             );
-            let _ = write_detach(writer, channel, incumbent, true, Some(&condition)).await;
+            let _ = write_detach(out, channel, incumbent, true, Some(&condition));
             if let Some(loser) = entry.links.remove(incumbent, true) {
-                *loser.shared.state.lock().expect("not poisoned") =
-                    crate::link::LinkState::Detached(Some(condition.clone()));
-                let _ = loser
-                    .events
-                    .send(crate::link::LinkEvent::Detached(Some(condition)))
-                    .await;
+                end_link(loser, Some(condition));
             }
         }
 
@@ -1042,8 +1240,15 @@ impl Driver {
                 return Ok(());
             }
         };
+        let frame_budget = match link::frame_budget(handle, outgoing_frame_size) {
+            Ok(budget) => budget,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        };
 
-        let (events, rx) = mpsc::channel(link::LINK_QUEUE);
+        let (events, rx) = link::events();
         let credit = match options.role {
             // A sender starts where its own `attach.initial-delivery-count`
             // said and with no credit at all: nothing may go out until the
@@ -1058,19 +1263,20 @@ impl Driver {
         let session = Arc::clone(&entry.shared);
         entry.links.insert(
             handle,
-            crate::link::Entry {
-                shared: Arc::new(crate::link::Shared {
+            link::Entry {
+                shared: Arc::new(link::Shared {
                     name: options.name.clone(),
                     role: options.role,
                     output_handle: handle,
                     channel,
-                    state: Mutex::new(crate::link::LinkState::Attaching),
+                    state: Mutex::new(LinkState::Attaching),
                     negotiated: Mutex::new(None),
                     input_handle: Mutex::new(None),
                     credit: Mutex::new(credit),
                     session,
                     flow: Notify::new(),
                     max_frame_size: outgoing_frame_size,
+                    frame_budget,
                     next_tag: Mutex::new(0),
                     unsettled: Mutex::new(Unsettled::new(DEFAULT_MAX_UNSETTLED)),
                 }),
@@ -1080,9 +1286,11 @@ impl Driver {
                 rx: Some(rx),
                 options: Box::new(options),
                 reassembly: Reassembly::new(ours),
+                delivery_settled: false,
             },
         );
-        writer.send(&bytes).await
+        out.push(&bytes);
+        Ok(())
     }
 
     /// The `handle-max` the peer advertised for this session.
@@ -1097,27 +1305,27 @@ impl Driver {
     }
 
     /// One frame for a session, or for a channel that has none.
-    async fn route(
+    fn route(
         &mut self,
         channel: u16,
         performative: Performative<'_>,
-        payload: &[u8],
-        bytes: &[u8],
-        writer: &mut FrameWriter,
+        payload: Bytes,
+        out: &mut Outbox,
     ) -> Result<Option<State>> {
         // A channel above what we advertised is a framing error and the
         // specification says so: "out-of-range channel MUST close the
         // connection with amqp:connection:framing-error" (Part 2 §2.7.1).
         if channel > self.options.channel_max {
-            let condition = Condition::described(
-                condition::CONNECTION_FRAMING_ERROR,
-                format!(
-                    "channel {channel} is above the channel-max of {} this connection advertised",
-                    self.options.channel_max
+            return Ok(refuse(
+                out,
+                Condition::described(
+                    condition::CONNECTION_FRAMING_ERROR,
+                    format!(
+                        "channel {channel} is above the channel-max of {} this connection advertised",
+                        self.options.channel_max
+                    ),
                 ),
-            );
-            let _ = write_close(writer, Some(&condition)).await;
-            return Ok(Some(State::Closed(Some(condition))));
+            ));
         }
 
         // The answering `begin` is the one frame that arrives on a channel
@@ -1127,36 +1335,35 @@ impl Driver {
             && let Some(ours) = begin.remote_channel
             && !self.sessions.is_mapped(channel)
         {
-            return self.complete_begin(channel, ours, begin);
+            return Ok(self.complete_begin(channel, ours, begin, out));
         }
 
-        if self.sessions.by_incoming(channel).is_none() {
+        let Some(entry) = self.sessions.by_incoming(channel) else {
             // In range, but no session was ever begun on it. The
             // specification names no condition for this case - it covers
             // only the out-of-range one above - so the condition is ours and
             // the description says which channel it was.
-            let condition = Condition::described(
-                session::UNMAPPED_CHANNEL_CONDITION,
-                format!(
-                    "{} arrived on channel {channel}, which is not mapped to a session",
-                    performative.name()
+            return Ok(refuse(
+                out,
+                Condition::described(
+                    session::UNMAPPED_CHANNEL_CONDITION,
+                    format!(
+                        "{} arrived on channel {channel}, which is not mapped to a session",
+                        performative.name()
+                    ),
                 ),
-            );
-            let _ = write_close(writer, Some(&condition)).await;
-            return Ok(Some(State::Closed(Some(condition))));
-        }
+            ));
+        };
 
         // A session that sent or received `end(error=...)` discards
         // everything until the partner's `end`. Counted and logged, never
         // acted upon.
-        let discarding = self.sessions.by_incoming(channel).is_some_and(|entry| {
-            entry
-                .shared
-                .state
-                .lock()
-                .expect("not poisoned")
-                .is_discarding()
-        });
+        let discarding = entry
+            .shared
+            .state
+            .lock()
+            .expect("not poisoned")
+            .is_discarding();
         if discarding && !matches!(performative, Performative::End(_)) {
             tracing::debug!(
                 channel,
@@ -1166,153 +1373,160 @@ impl Driver {
             return Ok(None);
         }
 
-        // `attach`, `detach` and `disposition` belong to the link layer, and
-        // they are taken first because they change tables the session's own
-        // bookkeeping does not touch. A `disposition` names no handle at all
-        // — it names a range of delivery-ids and a role — so it is the one
-        // frame that has to be offered to every link of the session.
-        match &performative {
-            Performative::Attach(attach) => {
-                return self.route_attach(channel, attach, writer).await;
-            }
-            Performative::Detach(detach) => {
-                return self.route_detach(channel, detach, writer).await;
-            }
+        // `attach`, `detach` and `disposition` belong to the link layer: they
+        // change tables the session's own bookkeeping does not touch. A
+        // `disposition` names no handle at all — it names a range of
+        // delivery-ids and a role — so it is the one frame that has to be
+        // offered to every link of the session.
+        match performative {
+            Performative::Attach(attach) => self.route_attach(channel, &attach, out),
+            Performative::Detach(detach) => self.route_detach(channel, &detach, out),
             Performative::Disposition(disposition) => {
-                return self.route_disposition(channel, disposition, writer).await;
+                self.route_disposition(channel, disposition, out)
             }
-            _ => {}
-        }
-
-        let entry = self
-            .sessions
-            .by_incoming(channel)
-            .expect("checked just above");
-        match &performative {
-            Performative::Flow(flow) => {
-                entry
-                    .shared
-                    .windows
-                    .lock()
-                    .expect("not poisoned")
-                    .apply_flow(session::remote_flow_of_flow(flow));
-                // The session window may have grown, and a sender parked on
-                // it is parked on its link. Every `flow` refreshes session
-                // state whether or not it names a handle, so every `flow`
-                // wakes them.
-                entry.links.wake_all();
+            Performative::Flow(flow) => self.route_flow(channel, &flow, out),
+            Performative::Transfer(transfer) => {
+                self.route_transfer(channel, &transfer, payload, out)
             }
-            Performative::Transfer(_) => {
-                let violation = {
-                    let mut windows = entry.shared.windows.lock().expect("not poisoned");
-                    let id = windows.next_incoming_id;
-                    windows.record_received(id)
-                };
-                if let Err(violation) = violation {
-                    // Part 2 §2.8.17: `end` the session with
-                    // `amqp:session:window-violation`.
-                    let condition = Condition::described(
-                        condition::SESSION_WINDOW_VIOLATION,
-                        violation.to_string(),
-                    );
-                    let outgoing = entry.shared.outgoing_channel;
-                    *entry.shared.state.lock().expect("not poisoned") =
-                        SessionState::Discarding(condition.clone());
-                    let _ = write_end(writer, outgoing, Some(&condition)).await;
-                    return Ok(None);
-                }
-            }
-            Performative::End(End { error }) => {
-                let condition = error.as_ref().map(Condition::from_codec);
-                let outgoing = entry.shared.outgoing_channel;
-                let answered = matches!(
-                    *entry.shared.state.lock().expect("not poisoned"),
-                    SessionState::Ending | SessionState::Discarding(_)
-                );
-                *entry.shared.state.lock().expect("not poisoned") =
-                    SessionState::Ended(condition.clone());
-                let events = entry.events.clone();
-                if !answered {
-                    // Answering is what makes it orderly; simultaneous `end`
-                    // is legal and the only difference is which condition
-                    // each side reports.
-                    let _ = write_end(writer, outgoing, None).await;
-                }
-                // "Sessions also end automatically when the connection
-                // closes"; a session ending takes its links with it for the
-                // same reason.
-                if let Some(session) = self.sessions.remove(outgoing) {
-                    drain_links(session, condition.clone()).await;
-                }
-                let _ = events.send(SessionEvent::Ended(condition)).await;
-                return Ok(None);
-            }
-            _ => {}
-        }
-
-        // A frame naming a handle goes to the link; anything else goes to
-        // the session.
-        if let Some(handle) = addressed_handle(&performative) {
-            let attached = self
-                .sessions
-                .by_incoming(channel)
-                .is_some_and(|entry| entry.links.by_input(handle).is_some());
-            if attached {
-                return self
-                    .route_to_link(channel, handle, &performative, payload, bytes, writer)
-                    .await;
-            }
-            let Some(entry) = self.sessions.by_incoming(channel) else {
-                return Ok(None);
-            };
-            if entry.links.was_detached(handle) {
-                // A frame for a link that was cleanly detached is a race with
-                // the `detach`, not a fault: the peer's frame may already have
-                // been in flight when the two crossed. `fe2o3-amqp`'s
-                // acceptor really does send a `flow` for a handle it has just
-                // detached, and ending the session over it would make every
-                // orderly link close a coin toss.
-                tracing::debug!(
-                    handle,
-                    performative = performative.name(),
-                    "discarding a frame for a link that was already detached"
-                );
-                return Ok(None);
-            }
-            // Two different conditions, and the specification distinguishes
-            // them. A handle detached **with an error**: "any later input on
-            // that handle or its delivery-ids MUST end the session with
-            // `amqp:session:errant-link`" (Part 2 §2.6.5). A handle never
-            // attached at all: `amqp:session:unattached-handle` (§2.8.17).
-            let condition = if entry.links.was_errant(handle) {
+            Performative::End(end) => self.route_end(channel, &end, out),
+            // A second `begin` or `open` for a session that has begun, or a
+            // `close` that was not caught above: not frames this state
+            // permits.
+            other => Ok(refuse(
+                out,
                 Condition::described(
-                    condition::SESSION_ERRANT_LINK,
+                    condition::ILLEGAL_STATE,
                     format!(
-                        "{} arrived on handle {handle}, whose link was detached with an error",
-                        performative.name()
+                        "{} arrived on channel {channel}, whose session has already begun",
+                        other.name()
                     ),
-                )
-            } else {
-                Condition::described(
-                    condition::SESSION_UNATTACHED_HANDLE,
-                    format!(
-                        "{} arrived on handle {handle}, which is not an attached link",
-                        performative.name()
-                    ),
-                )
-            };
-            let outgoing = entry.shared.outgoing_channel;
+                ),
+            )),
+        }
+    }
+
+    /// A `flow` from the peer: the session's windows, and, where it names a
+    /// handle, the link's credit.
+    fn route_flow(
+        &mut self,
+        channel: u16,
+        flow: &Flow<'_>,
+        out: &mut Outbox,
+    ) -> Result<Option<State>> {
+        let Some(entry) = self.sessions.by_incoming(channel) else {
+            return Ok(None);
+        };
+        entry
+            .shared
+            .windows
+            .lock()
+            .expect("not poisoned")
+            .apply_flow(session::remote_flow_of_flow(flow));
+        // The session window may have grown, and a sender parked on it is
+        // parked on its link. Every `flow` refreshes session state whether or
+        // not it names a handle, so every `flow` wakes them.
+        entry.links.wake_all();
+
+        // A `flow` without a handle is a session-level update, and the
+        // windows above are all there is to do with it.
+        let Some(handle) = flow.handle else {
+            return Ok(None);
+        };
+        let outgoing = entry.shared.outgoing_channel;
+        // A snapshot, because an answering `flow` carries the session's three
+        // mandatory fields and the link must not hold the window lock while
+        // it builds one.
+        let windows = *entry.shared.windows.lock().expect("not poisoned");
+        let Some(link) = entry.links.by_input(handle) else {
+            return Ok(unattached(entry, handle, "flow", out));
+        };
+        let answer = link.accept_flow(flow, &windows);
+        let credit = link.credit();
+        link.events.push(LinkEvent::Flow(credit));
+        if let Some(answer) = answer {
+            write_flow(out, outgoing, answer)?;
+        }
+        Ok(None)
+    }
+
+    /// A `transfer` from the peer: counted against the session's incoming
+    /// window, then handed to the link it names.
+    fn route_transfer(
+        &mut self,
+        channel: u16,
+        transfer: &Transfer<'_>,
+        payload: Bytes,
+        out: &mut Outbox,
+    ) -> Result<Option<State>> {
+        let Some(entry) = self.sessions.by_incoming(channel) else {
+            return Ok(None);
+        };
+        let outgoing = entry.shared.outgoing_channel;
+        let violation = {
+            let mut windows = entry.shared.windows.lock().expect("not poisoned");
+            let id = windows.next_incoming_id;
+            windows.record_received(id)
+        };
+        if let Err(violation) = violation {
+            // Part 2 §2.8.17: `end` the session with
+            // `amqp:session:window-violation`.
+            let condition =
+                Condition::described(condition::SESSION_WINDOW_VIOLATION, violation.to_string());
             *entry.shared.state.lock().expect("not poisoned") =
                 SessionState::Discarding(condition.clone());
-            let _ = write_end(writer, outgoing, Some(&condition)).await;
+            let _ = write_end(out, outgoing, Some(&condition));
             return Ok(None);
         }
 
-        let entry = self
-            .sessions
-            .by_incoming(channel)
-            .expect("checked just above");
-        let _ = entry.events.send(SessionEvent::Frame(bytes.to_vec())).await;
+        let handle = transfer.handle;
+        let Some(link) = entry.links.by_input(handle) else {
+            return Ok(unattached(entry, handle, "transfer", out));
+        };
+        let output = link.shared.output_handle;
+        match link.accept_transfer(transfer, payload) {
+            Incoming::Nothing => {}
+            Incoming::Delivery(delivery) => link.events.push(LinkEvent::Delivery(delivery)),
+            Incoming::Refused(condition) => {
+                // "An errored link endpoint MUST be detached with
+                // detach(error=...) and destroyed", and its handle is
+                // poisoned for the life of the session so that a late frame
+                // for the dead link cannot land on a live one.
+                let _ = write_detach(out, outgoing, output, true, Some(&condition));
+                if let Some(link) = entry.links.remove(output, true) {
+                    end_link(link, Some(condition));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// An `end` from the peer.
+    fn route_end(
+        &mut self,
+        channel: u16,
+        end: &End<'_>,
+        out: &mut Outbox,
+    ) -> Result<Option<State>> {
+        let Some(entry) = self.sessions.by_incoming(channel) else {
+            return Ok(None);
+        };
+        let condition = end.error.as_ref().map(Condition::from_codec);
+        let outgoing = entry.shared.outgoing_channel;
+        let answered = matches!(
+            *entry.shared.state.lock().expect("not poisoned"),
+            SessionState::Ending | SessionState::Discarding(_)
+        );
+        *entry.shared.state.lock().expect("not poisoned") = SessionState::Ended(condition.clone());
+        if !answered {
+            // Answering is what makes it orderly; simultaneous `end` is legal
+            // and the only difference is which condition each side reports.
+            let _ = write_end(out, outgoing, None);
+        }
+        // "Sessions also end automatically when the connection closes"; a
+        // session ending takes its links with it for the same reason.
+        if let Some(session) = self.sessions.remove(outgoing) {
+            end_session(session, condition);
+        }
         Ok(None)
     }
 
@@ -1324,19 +1538,18 @@ impl Driver {
     /// of the session in the addressed direction, and a link that holds none
     /// of the ids simply does nothing. That is also where idempotence comes
     /// from: a repeated `disposition` finds nothing to change.
-    async fn route_disposition(
+    fn route_disposition(
         &mut self,
         channel: u16,
-        disposition: &weida_amqp_codec::performative::Disposition<'_>,
-        writer: &mut FrameWriter,
+        disposition: Disposition<'_>,
+        out: &mut Outbox,
     ) -> Result<Option<State>> {
         let first = disposition.first;
         // "The highest delivery-id covered; unset means `first` alone."
         let last = disposition.last.unwrap_or(first);
-        let state = match &disposition.state {
-            Some(value) => Some(weida_amqp_codec::state::DeliveryState::from_value(
-                value.clone(),
-            )?),
+        // Moved, not cloned: the performative is this frame's own.
+        let state = match disposition.state {
+            Some(value) => Some(weida_amqp_codec::state::DeliveryState::from_value(value)?),
             None => None,
         };
         let outcome = match &state {
@@ -1348,20 +1561,21 @@ impl Driver {
             return Ok(None);
         };
         let outgoing = session.shared.outgoing_channel;
-        let mut owed: Vec<(u32, u32, Outcome)> = Vec::new();
-        let mut reports: Vec<(mpsc::Sender<crate::link::LinkEvent>, u32, Outcome, bool)> =
-            Vec::new();
+        let mut owed: Vec<(u32, Outcome)> = Vec::new();
         for link in session.links.addressed(disposition.role) {
             let second = link.second_mode();
-            let events = link.events.clone();
-            let handle = link.shared.output_handle;
+            let sender = link.shared.role == Role::Sender;
             for (delivery_id, settlement) in
                 link.accept_disposition(first, last, outcome.as_ref(), disposition.settled)
             {
                 match settlement {
                     Settlement::Nothing | Settlement::Progress => {}
                     Settlement::Settled(outcome) => {
-                        reports.push((events.clone(), delivery_id, outcome, true));
+                        link.events.push(LinkEvent::Outcome {
+                            delivery_id,
+                            outcome,
+                            settled: true,
+                        });
                     }
                     Settlement::Provisional(outcome) => {
                         // `rcv-settle-mode=second`: the receiver published an
@@ -1370,163 +1584,70 @@ impl Driver {
                         // because the application has nothing left to decide
                         // — and once written, the delivery is over here, so
                         // the report is final.
-                        let final_here = second && link.shared.role == Role::Sender;
+                        let final_here = second && sender;
                         if final_here {
-                            owed.push((handle, delivery_id, outcome.clone()));
+                            owed.push((delivery_id, outcome.clone()));
+                            // Settled here as well now, so the delivery is
+                            // over at this end.
+                            link.settle_here(delivery_id);
                         }
-                        reports.push((events.clone(), delivery_id, outcome, final_here));
+                        link.events.push(LinkEvent::Outcome {
+                            delivery_id,
+                            outcome,
+                            settled: final_here,
+                        });
                     }
                 }
             }
         }
-
-        for (_, delivery_id, outcome) in &owed {
-            write_disposition(
-                writer,
-                outgoing,
-                Role::Sender,
-                *delivery_id,
-                Some(outcome),
-                true,
-            )
-            .await?;
-        }
-        if !owed.is_empty() {
-            // Settled here as well now, so the delivery is over at this end.
-            if let Some(session) = self.sessions.by_incoming(channel) {
-                for (handle, delivery_id, _) in &owed {
-                    if let Some(link) = session.links.get_mut(*handle) {
-                        link.settle_here(*delivery_id);
-                    }
-                }
-            }
-        }
-        for (events, delivery_id, outcome, settled) in reports {
-            let _ = events
-                .send(crate::link::LinkEvent::Outcome {
-                    delivery_id,
-                    outcome,
-                    settled,
-                })
-                .await;
-        }
-        Ok(None)
-    }
-
-    /// One frame for a link that is attached: a `transfer`, a `flow` naming a
-    /// handle, or anything else this layer does not read.
-    ///
-    /// The work is done in two halves on purpose. The first borrows the link
-    /// out of the session table and decides; the second writes and, where the
-    /// link must go, takes it out of the table — which cannot happen while
-    /// the borrow is alive.
-    async fn route_to_link(
-        &mut self,
-        channel: u16,
-        handle: u32,
-        performative: &Performative<'_>,
-        payload: &[u8],
-        bytes: &[u8],
-        writer: &mut FrameWriter,
-    ) -> Result<Option<State>> {
-        let Some(session) = self.sessions.by_incoming(channel) else {
-            return Ok(None);
-        };
-        let outgoing = session.shared.outgoing_channel;
-        // A snapshot, because an answering `flow` carries the session's three
-        // mandatory fields and the link must not hold the window lock while
-        // it builds one.
-        let windows = *session.shared.windows.lock().expect("not poisoned");
-        let Some(link) = session.links.by_input(handle) else {
-            return Ok(None);
-        };
-        let events = link.events.clone();
-        let output = link.shared.output_handle;
-        let decision = match performative {
-            Performative::Transfer(transfer) => {
-                Decision::Incoming(link.accept_transfer(transfer, payload))
-            }
-            Performative::Flow(flow) => {
-                Decision::Flow(link.accept_flow(flow, &windows), link.credit())
-            }
-            _ => Decision::Frame,
-        };
-
-        match decision {
-            Decision::Incoming(Incoming::Nothing) => {}
-            Decision::Incoming(Incoming::Delivery(delivery)) => {
-                if !delivery.settled {
-                    // The sender has not settled, so this end keeps state for
-                    // the delivery until the application says what happened.
-                    // A delivery that arrived settled is recorded nowhere:
-                    // there is nothing to answer and nothing the answer could
-                    // change.
-                    if let Some(session) = self.sessions.by_incoming(channel)
-                        && let Some(link) = session.links.by_input(handle)
-                    {
-                        link.arrived(delivery.delivery_id, delivery.delivery_tag.clone());
-                    }
-                }
-                let _ = events
-                    .send(crate::link::LinkEvent::Delivery(delivery))
-                    .await;
-            }
-            Decision::Incoming(Incoming::Refused(condition)) => {
-                // "An errored link endpoint MUST be detached with
-                // detach(error=...) and destroyed", and its handle is
-                // poisoned for the life of the session so that a late frame
-                // for the dead link cannot land on a live one.
-                let _ = write_detach(writer, outgoing, output, true, Some(&condition)).await;
-                if let Some(session) = self.sessions.by_incoming(channel)
-                    && let Some(link) = session.links.remove(output, true)
-                {
-                    *link.shared.state.lock().expect("not poisoned") =
-                        crate::link::LinkState::Detached(Some(condition.clone()));
-                }
-                let _ = events
-                    .send(crate::link::LinkEvent::Detached(Some(condition)))
-                    .await;
-            }
-            Decision::Flow(answer, credit) => {
-                let _ = events.send(crate::link::LinkEvent::Flow(credit)).await;
-                if let Some(answer) = answer {
-                    write_flow(writer, outgoing, answer).await?;
-                }
-            }
-            Decision::Frame => {
-                let _ = events
-                    .send(crate::link::LinkEvent::Frame(bytes.to_vec()))
-                    .await;
-            }
-        }
+        write_owed(out, outgoing, &owed)?;
         Ok(None)
     }
 
     /// An `attach` from the peer: either the answer to ours, or an
     /// unsolicited one.
-    async fn route_attach(
+    fn route_attach(
         &mut self,
         channel: u16,
-        attach: &weida_amqp_codec::performative::Attach<'_>,
-        writer: &mut FrameWriter,
+        attach: &Attach<'_>,
+        out: &mut Outbox,
     ) -> Result<Option<State>> {
-        let entry = self
-            .sessions
-            .by_incoming(channel)
-            .expect("the caller checked the channel");
+        let Some(entry) = self.sessions.by_incoming(channel) else {
+            return Ok(None);
+        };
         let outgoing = entry.shared.outgoing_channel;
+
+        // A handle above the `handle-max` this end advertised is what that
+        // number exists to refuse: "out-of-range handle MUST close the
+        // connection with amqp:connection:framing-error" (Part 2 §2.7.2). It
+        // is also what keeps the table the peer's handles are mapped in as
+        // small as the bound says.
+        let handle_max = entry.shared.options.handle_max;
+        if attach.handle > handle_max {
+            return Ok(refuse(
+                out,
+                Condition::described(
+                    condition::CONNECTION_FRAMING_ERROR,
+                    format!(
+                        "attach on handle {}, above the handle-max of {handle_max} this session advertised",
+                        attach.handle
+                    ),
+                ),
+            ));
+        }
 
         // "Attaching on a handle already in use MUST be answered with an
         // immediate close carrying amqp:session:handle-in-use"
         // (Part 2 §2.6.2). The handle space in question is the *input* one:
         // the peer's own numbering.
         if entry.links.input_in_use(attach.handle) {
-            let condition = Condition::described(
-                condition::SESSION_HANDLE_IN_USE,
-                format!("handle {} is already attached", attach.handle),
-            );
-            let _ = write_close(writer, Some(&condition)).await;
-            return Ok(Some(State::Closed(Some(condition))));
+            return Ok(refuse(
+                out,
+                Condition::described(
+                    condition::SESSION_HANDLE_IN_USE,
+                    format!("handle {} is already attached", attach.handle),
+                ),
+            ));
         }
 
         // The answer is correlated by *name*, because the two ends choose
@@ -1538,9 +1659,8 @@ impl Driver {
             // a node" and a client is not a broker — so the specified refusal
             // is an answering `attach` with the terminus null followed by an
             // immediate `detach` (Part 2 §2.6.3).
-            let refusal = refuse_attach(channel, attach)?;
-            writer.send(&refusal).await?;
-            let _ = write_detach(writer, outgoing, attach.handle, true, None).await;
+            refuse_attach(out, outgoing, attach)?;
+            let _ = write_detach(out, outgoing, attach.handle, true, None);
             tracing::debug!(
                 link = attach.name,
                 handle = attach.handle,
@@ -1552,6 +1672,34 @@ impl Driver {
         let Some(link) = entry.links.get_mut(ours) else {
             return Ok(None);
         };
+
+        // A link that has already been answered is attached: a second
+        // `attach` for it from the peer is the peer taking the link over, and
+        // the endpoint it takes it from is closed with `amqp:link:stolen`
+        // (Part 2 §2.6.1). Mapping the new handle onto it as well would let
+        // one link accumulate a handle per frame, and would reset its credit
+        // and its negotiated modes under an application that is using them.
+        if link
+            .shared
+            .input_handle
+            .lock()
+            .expect("not poisoned")
+            .is_some()
+        {
+            let condition = Condition::described(
+                link::STOLEN,
+                format!("link {} was attached again by the peer", attach.name),
+            );
+            let _ = write_detach(out, outgoing, ours, true, Some(&condition));
+            if let Some(loser) = entry.links.remove(ours, true) {
+                end_link(loser, Some(condition));
+            }
+            // The new `attach` names a link this end no longer has.
+            refuse_attach(out, outgoing, attach)?;
+            let _ = write_detach(out, outgoing, attach.handle, true, None);
+            return Ok(None);
+        }
+
         let negotiated = match link::negotiate(&link.options, attach) {
             Ok(negotiated) => negotiated,
             Err(error) => {
@@ -1574,7 +1722,7 @@ impl Driver {
                 .expect("not poisoned")
                 .seen_sender_attach(attach.initial_delivery_count.unwrap_or_default());
         }
-        *link.shared.state.lock().expect("not poisoned") = crate::link::LinkState::Attached;
+        *link.shared.state.lock().expect("not poisoned") = LinkState::Attached;
         let handed = match (link.pending.take(), link.rx.take()) {
             (Some(reply), Some(rx)) => {
                 let handle = Link::new(Arc::clone(&link.shared), link.outbound.clone(), rx);
@@ -1603,16 +1751,15 @@ impl Driver {
     /// application holds the link until it arrives waits forever without it.
     /// `fe2o3-amqp`'s acceptor is such a peer: its `close()` does not return
     /// until the answering `detach` lands.
-    async fn route_detach(
+    fn route_detach(
         &mut self,
         channel: u16,
-        detach: &weida_amqp_codec::performative::Detach<'_>,
-        writer: &mut FrameWriter,
+        detach: &Detach<'_>,
+        out: &mut Outbox,
     ) -> Result<Option<State>> {
-        let entry = self
-            .sessions
-            .by_incoming(channel)
-            .expect("the caller checked the channel");
+        let Some(entry) = self.sessions.by_incoming(channel) else {
+            return Ok(None);
+        };
         let outgoing = entry.shared.outgoing_channel;
         let condition = detach.error.as_ref().map(Condition::from_codec);
         let Some(link) = entry.links.by_input(detach.handle) else {
@@ -1627,23 +1774,19 @@ impl Driver {
         // would be a frame for a link that no longer exists at the peer.
         let answered = matches!(
             *link.shared.state.lock().expect("not poisoned"),
-            crate::link::LinkState::Detaching | crate::link::LinkState::Detached(_)
+            LinkState::Detaching | LinkState::Detached(_)
         );
-        *link.shared.state.lock().expect("not poisoned") =
-            crate::link::LinkState::Detached(condition.clone());
-        let events = link.events.clone();
         // An errored endpoint's handle is never reused, because the peer is
         // entitled to still be sending frames for it.
         let errored = condition.is_some();
-        entry.links.remove(output, errored);
+        if let Some(link) = entry.links.remove(output, errored) {
+            end_link(link, condition);
+        }
         if !answered {
             // The same `closed` flag the peer used: answering `closed=true`
             // with `closed=false` would claim the deliveries are still live.
-            let _ = write_detach(writer, outgoing, output, detach.closed, None).await;
+            let _ = write_detach(out, outgoing, output, detach.closed, None);
         }
-        let _ = events
-            .send(crate::link::LinkEvent::Detached(condition))
-            .await;
         Ok(None)
     }
 
@@ -1653,8 +1796,9 @@ impl Driver {
         &mut self,
         incoming: u16,
         ours: u16,
-        begin: &weida_amqp_codec::performative::Begin<'_>,
-    ) -> Result<Option<State>> {
+        begin: &Begin<'_>,
+        out: &mut Outbox,
+    ) -> Option<State> {
         let exec = self.exec.clone();
         let attach_timeout = self.options.handshake_timeout;
         let Some(entry) = self.sessions.get_mut(ours) else {
@@ -1665,8 +1809,24 @@ impl Driver {
                 remote_channel = ours,
                 "an answering begin named a channel with no session"
             );
-            return Ok(None);
+            return None;
         };
+        // The answer to a `begin` is one frame. A second one for a session
+        // that has already been answered is not a repeat to ignore: it would
+        // re-run the window arithmetic under a session in use, and would turn
+        // one that is ending back into one that is begun.
+        if entry.pending.is_none() {
+            return refuse(
+                out,
+                Condition::described(
+                    condition::ILLEGAL_STATE,
+                    format!(
+                        "a begin on channel {incoming} answered channel {ours}, \
+                         whose session has already begun"
+                    ),
+                ),
+            );
+        }
         *entry.shared.incoming_channel.lock().expect("not poisoned") = Some(incoming);
         entry
             .shared
@@ -1690,9 +1850,6 @@ impl Driver {
                 let _ = reply.send(Ok(session));
                 true
             }
-            // A second `begin` for a session already answered. The peer is
-            // confused; the mapping is already right and there is nobody
-            // waiting.
             _ => false,
         };
         self.sessions.map_incoming(incoming, ours);
@@ -1703,54 +1860,92 @@ impl Driver {
             sessions = self.sessions.len(),
             "session begun"
         );
-        Ok(None)
+        None
     }
 }
 
-/// What the driver decided about one frame while it held the link, so that
-/// the writing and the table surgery happen after the borrow has ended.
-#[derive(Debug)]
-enum Decision {
-    /// A `transfer`, accounted for and reassembled as far as it goes.
-    Incoming(Incoming),
-    /// A `flow`: the answer this end owes, if any, and the credit state the
-    /// application should see.
-    Flow(
-        Option<weida_amqp_codec::performative::Flow<'static>>,
-        Credit,
-    ),
-    /// Anything else naming a handle, handed over whole.
-    Frame,
-}
-
-/// The handle a frame names, where it names one.
+/// Closes the connection because of `condition`: `close` is the last thing
+/// this end writes, and the connection ends as closed with that condition.
 ///
-/// `flow` may carry link state on top of session state and may not, which is
-/// why its handle is an `Option` and `transfer` and `flow` are not treated
-/// alike: a `disposition` names no handle at all, it names a range of
-/// delivery-ids on the session.
-const fn addressed_handle(performative: &Performative<'_>) -> Option<u32> {
-    match performative {
-        Performative::Transfer(transfer) => Some(transfer.handle),
-        Performative::Flow(flow) => flow.handle,
-        _ => None,
-    }
+/// A failure to queue it is ignored, because the connection is ending either
+/// way and there is nothing better to do with the failure.
+fn refuse(out: &mut Outbox, condition: Condition) -> Option<State> {
+    let _ = queue_close(out, Some(&condition));
+    Some(State::Closed(Some(condition)))
 }
 
-/// Tells every link of an ending session that it is over.
+/// Queues `close(condition)` for a peer whose octets could not be read, where
+/// the error names a condition; `false` where there is nothing to say or the
+/// transport is what failed.
+fn tell_why(out: &mut Outbox, error: &Error) -> bool {
+    let Some(code) = error.wire_condition() else {
+        return false;
+    };
+    if !matches!(error, Error::Decode(_)) {
+        return false;
+    }
+    queue_close(out, Some(&Condition::described(code, error.to_string()))).is_ok()
+}
+
+/// A frame naming a handle that is not an attached link.
+///
+/// Two different conditions, and the specification distinguishes them. A
+/// handle detached **with an error**: "any later input on that handle or its
+/// delivery-ids MUST end the session with `amqp:session:errant-link`"
+/// (Part 2 §2.6.5). A handle never attached at all:
+/// `amqp:session:unattached-handle` (§2.8.17). A handle cleanly detached is
+/// neither: the peer's frame may already have been in flight when the two
+/// crossed, and `fe2o3-amqp`'s acceptor really does send a `flow` for a
+/// handle it has just detached, so ending the session over it would make
+/// every orderly link close a coin toss.
+fn unattached(entry: &mut Entry, handle: u32, what: &str, out: &mut Outbox) -> Option<State> {
+    if entry.links.was_detached(handle) {
+        tracing::debug!(
+            handle,
+            performative = what,
+            "discarding a frame for a link that was already detached"
+        );
+        return None;
+    }
+    let condition = if entry.links.was_errant(handle) {
+        Condition::described(
+            condition::SESSION_ERRANT_LINK,
+            format!("{what} arrived on handle {handle}, whose link was detached with an error"),
+        )
+    } else {
+        Condition::described(
+            condition::SESSION_UNATTACHED_HANDLE,
+            format!("{what} arrived on handle {handle}, which is not an attached link"),
+        )
+    };
+    let outgoing = entry.shared.outgoing_channel;
+    *entry.shared.state.lock().expect("not poisoned") = SessionState::Discarding(condition.clone());
+    let _ = write_end(out, outgoing, Some(&condition));
+    None
+}
+
+/// Tells a link that it is over, and wakes whatever is parked on it.
+///
+/// The state first, so that what wakes finds the link gone; then the event,
+/// which closes the queue behind it, so that a handle reading events finds out
+/// rather than waiting on a queue nobody will push to again.
+fn end_link(link: link::Entry, condition: Option<Condition>) {
+    *link.shared.state.lock().expect("not poisoned") = LinkState::Detached(condition.clone());
+    link.events.push(LinkEvent::Detached(condition));
+    link.shared.flow.notify_waiters();
+}
+
+/// Tells every link of an ending session, and then the session, that it is
+/// over.
 ///
 /// A session ending destroys its link endpoints, so a caller holding a
-/// [`Link`] finds out here rather than waiting on a channel nobody will send
-/// on again.
-async fn drain_links(mut session: session::Entry, condition: Option<Condition>) {
+/// [`Link`] finds out here rather than waiting on a queue nobody will push to
+/// again.
+fn end_session(mut session: Entry, condition: Option<Condition>) {
     for link in session.links.drain() {
-        *link.shared.state.lock().expect("not poisoned") =
-            crate::link::LinkState::Detached(condition.clone());
-        let _ = link
-            .events
-            .send(crate::link::LinkEvent::Detached(condition.clone()))
-            .await;
+        end_link(link, condition.clone());
     }
+    session.events.push(SessionEvent::Ended(condition));
 }
 
 /// The specified refusal of an `attach` this client cannot honour: an
@@ -1760,135 +1955,124 @@ async fn drain_links(mut session: session::Entry, condition: Option<Condition>) 
 /// that field null, which establishes a link to a nonexistent terminus, and
 /// MUST then immediately detach." An error code would be inventing one; this
 /// is the absence the specification asks for.
-fn refuse_attach(
-    channel: u16,
-    theirs: &weida_amqp_codec::performative::Attach<'_>,
-) -> Result<Vec<u8>> {
-    let mut answer = weida_amqp_codec::performative::Attach::new(
-        theirs.name,
-        theirs.handle,
-        theirs.role.opposite(),
-    );
+fn refuse_attach(out: &mut Outbox, channel: u16, theirs: &Attach<'_>) -> Result<()> {
+    let mut answer = Attach::new(theirs.name, theirs.handle, theirs.role.opposite());
     // Both termini null: nothing was created.
     answer.source = None;
     answer.target = None;
-    if answer.role == weida_amqp_codec::Role::Sender {
+    if answer.role == Role::Sender {
         answer.initial_delivery_count = Some(0);
     }
-    let mut bytes = Vec::new();
-    frame::write(&mut bytes, FrameKind::Amqp, channel, u32::MAX, |body| {
-        Performative::Attach(answer).encode(body)
-    })?;
-    Ok(bytes)
+    out.frame(channel, |body| Performative::Attach(answer).encode(body))?;
+    Ok(())
 }
 
-/// Writes `detach` on one session's outgoing channel.
-async fn write_detach(
-    writer: &mut FrameWriter,
+/// Queues `detach` on one session's outgoing channel.
+fn write_detach(
+    out: &mut Outbox,
     channel: u16,
     handle: u32,
     closed: bool,
     error: Option<&Condition>,
 ) -> Result<()> {
-    let mut out = Vec::new();
     let codec = error.map(Condition::as_codec);
-    frame::write(
-        &mut out,
-        FrameKind::Amqp,
-        channel,
-        writer.max_frame_size(),
-        |body| {
-            Performative::Detach(weida_amqp_codec::performative::Detach {
-                handle,
-                closed,
-                error: codec,
-            })
-            .encode(body)
-        },
-    )?;
-    writer.send(&out).await
+    out.frame(channel, |body| {
+        Performative::Detach(Detach {
+            handle,
+            closed,
+            error: codec,
+        })
+        .encode(body)
+    })?;
+    Ok(())
 }
 
-/// Writes `flow` on one session's outgoing channel.
+/// Queues `flow` on one session's outgoing channel.
 ///
 /// The driver writes this one rather than the link handle, because the two
 /// cases that produce it are answers the *driver* owes: an `echo` asking for
 /// our state, and the report a drained sender MUST send. Neither waits for an
 /// application to notice.
-async fn write_flow(
-    writer: &mut FrameWriter,
-    channel: u16,
-    flow: weida_amqp_codec::performative::Flow<'_>,
-) -> Result<()> {
-    let mut out = Vec::new();
-    frame::write(
-        &mut out,
-        FrameKind::Amqp,
-        channel,
-        writer.max_frame_size(),
-        |body| Performative::Flow(flow).encode(body),
-    )?;
-    writer.send(&out).await
+fn write_flow(out: &mut Outbox, channel: u16, flow: Flow<'_>) -> Result<()> {
+    out.frame(channel, |body| Performative::Flow(flow).encode(body))?;
+    Ok(())
 }
 
-/// Writes `disposition` on one session's outgoing channel.
+/// Queues the settling `disposition`s the driver owes, one frame for every run
+/// of consecutive delivery-ids that were answered the same way.
 ///
-/// The driver writes this one because the case that produces it is not the
+/// The driver writes these because the case that produces them is not the
 /// application's: under `rcv-settle-mode=second` the sender MUST settle once
-/// the receiver has published its outcome, and nothing is left to decide.
-async fn write_disposition(
-    writer: &mut FrameWriter,
-    channel: u16,
-    role: Role,
-    delivery_id: u32,
-    outcome: Option<&Outcome>,
-    settled: bool,
-) -> Result<()> {
-    let state = outcome.map(Outcome::to_state);
-    let mut disposition = weida_amqp_codec::performative::Disposition::new(role, delivery_id);
-    disposition.settled = settled;
-    disposition.state = state
-        .as_ref()
-        .map(weida_amqp_codec::state::DeliveryState::to_value);
-    let mut out = Vec::new();
-    frame::write(
-        &mut out,
-        FrameKind::Amqp,
-        channel,
-        writer.max_frame_size(),
-        |body| Performative::Disposition(disposition).encode(body),
-    )?;
-    writer.send(&out).await
+/// the receiver has published its outcome, and nothing is left to decide. A
+/// range is one frame, which is what keeps one incoming range `disposition`
+/// from becoming a frame per delivery.
+fn write_owed(out: &mut Outbox, channel: u16, owed: &[(u32, Outcome)]) -> Result<()> {
+    let mut at = 0;
+    while at < owed.len() {
+        let (first, outcome) = &owed[at];
+        let mut last = *first;
+        let mut end = at + 1;
+        while end < owed.len() && owed[end].0 == last.wrapping_add(1) && owed[end].1 == *outcome {
+            last = owed[end].0;
+            end += 1;
+        }
+        let state = outcome.to_state();
+        let mut disposition = Disposition::new(Role::Sender, *first);
+        disposition.last = (last != *first).then_some(last);
+        disposition.settled = true;
+        disposition.state = Some(weida_amqp_codec::state::DeliveryState::to_value(&state));
+        out.frame(channel, |body| {
+            Performative::Disposition(disposition).encode(body)
+        })?;
+        at = end;
+    }
+    Ok(())
 }
 
-/// Writes `end` on one session's outgoing channel.
-async fn write_end(
-    writer: &mut FrameWriter,
-    channel: u16,
-    error: Option<&Condition>,
-) -> Result<()> {
-    let mut out = Vec::new();
+/// Queues `end` on one session's outgoing channel.
+fn write_end(out: &mut Outbox, channel: u16, error: Option<&Condition>) -> Result<()> {
     let codec = error.map(Condition::as_codec);
-    frame::write(
-        &mut out,
-        FrameKind::Amqp,
-        channel,
-        writer.max_frame_size(),
-        |body| Performative::End(End { error: codec }).encode(body),
-    )?;
-    writer.send(&out).await
+    out.frame(channel, |body| {
+        Performative::End(End { error: codec }).encode(body)
+    })?;
+    Ok(())
 }
 
-/// Writes `close`, which is the last thing ever written on a connection.
-async fn write_close(writer: &mut FrameWriter, error: Option<&Condition>) -> Result<()> {
-    let mut out = Vec::new();
+/// Queues `close`, which is the last thing ever written on a connection.
+fn queue_close(out: &mut Outbox, error: Option<&Condition>) -> Result<()> {
     let codec = error.map(Condition::as_codec);
-    frame::write(
-        &mut out,
-        FrameKind::Amqp,
-        0,
-        writer.max_frame_size(),
-        |body| Performative::Close(Close { error: codec }).encode(body),
-    )?;
-    writer.send(&out).await
+    out.frame(0, |body| {
+        Performative::Close(Close { error: codec }).encode(body)
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_keepalive_is_half_the_threshold() {
+        assert_eq!(
+            keepalive_period(Some(200)),
+            Some(Duration::from_millis(100)),
+            "a keep-alive exactly at the deadline arrives too late"
+        );
+        assert_eq!(keepalive_period(None), None, "no threshold, no keep-alive");
+        assert_eq!(keepalive_period(Some(0)), None);
+    }
+
+    #[test]
+    fn a_peer_cannot_make_the_keepalive_a_busy_loop() {
+        // The peer picks this number, and one millisecond would make half of
+        // it a write every half millisecond for the life of the connection.
+        for asked in [1, 2, 10, 99] {
+            assert_eq!(
+                keepalive_period(Some(asked)),
+                Some(MIN_KEEPALIVE),
+                "idle-time-out {asked} ms"
+            );
+        }
+        assert!(keepalive_period(Some(u32::MAX)).is_some_and(|period| period > MIN_KEEPALIVE));
+    }
 }

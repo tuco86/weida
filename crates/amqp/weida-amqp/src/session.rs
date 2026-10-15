@@ -51,18 +51,9 @@ use weida_amqp_codec::types::condition;
 use crate::error::{Condition, Error, Result};
 use crate::link::{Link, LinkOptions, Links};
 use crate::options::multiple;
+use crate::queue::{self, Queued};
 use crate::window::{DEFAULT_WINDOW, RemoteFlow, Windows};
 use weida_runtime::Exec;
-
-/// How many frames may be queued for one session before the driver waits.
-///
-/// **A bound of ours.** The session's own `incoming-window` bounds how many
-/// `transfer` frames may be in flight, but `attach`, `flow`, `disposition`
-/// and `detach` are outside that window entirely — the specification puts no
-/// limit on them at all. This is the limit, and reaching it applies
-/// backpressure to the connection driver rather than growing a queue nobody
-/// bounded.
-pub const SESSION_QUEUE: usize = 64;
 
 /// `begin.handle-max` this client advertises, bounding the link table.
 ///
@@ -132,20 +123,32 @@ impl SessionState {
 }
 
 /// What a session hands to the layer above it.
+///
+/// One event, and the state it reports is also in [`Session::state`]: the
+/// connection driver never waits for an application to read anything, so an
+/// event is only ever something an application can also find out by asking.
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
-    /// A frame for this session, whole and undecoded.
-    ///
-    /// Undecoded on purpose: the connection driver decodes each frame far
-    /// enough to do the session's own bookkeeping — complete a `begin`, apply
-    /// a `flow` to the windows, count a `transfer` against the incoming
-    /// window — and the link layer decodes it again for the fields only a
-    /// link can interpret. One extra decode of a small performative against
-    /// one owned mirror of all nine of them is a trade this crate makes
-    /// deliberately.
-    Frame(Vec<u8>),
     /// The session ended.
     Ended(Option<Condition>),
+}
+
+impl Queued for SessionEvent {
+    fn is_report(&self) -> bool {
+        false
+    }
+
+    fn absorb(&mut self, next: Self) -> Option<Self> {
+        Some(next)
+    }
+}
+
+/// The queue a session's one event travels in.
+///
+/// No report bound, because [`SessionEvent::Ended`] is not a report: there is
+/// one of it, and it is sent when the session is gone.
+pub(crate) fn events() -> (queue::Sender<SessionEvent>, queue::Receiver<SessionEvent>) {
+    queue::channel(0)
 }
 
 /// The state a session's handle and the connection driver share.
@@ -168,7 +171,7 @@ pub struct Session {
     /// Frames on their way out, routed through the connection driver so that
     /// `close` stays the last thing ever written.
     outbound: mpsc::Sender<crate::connection::Outbound>,
-    events: mpsc::Receiver<SessionEvent>,
+    events: queue::Receiver<SessionEvent>,
     /// The reactor, for bounding the wait on an answering `attach`. The
     /// protocol gives no deadline for it, so the deadline is ours.
     exec: Exec,
@@ -179,7 +182,7 @@ impl Session {
     pub(crate) fn new(
         shared: Arc<Shared>,
         outbound: mpsc::Sender<crate::connection::Outbound>,
-        events: mpsc::Receiver<SessionEvent>,
+        events: queue::Receiver<SessionEvent>,
         exec: Exec,
         attach_timeout: Duration,
     ) -> Self {
@@ -358,14 +361,14 @@ pub(crate) struct Entry {
     /// bound on this session's link table, and the peer's number rather
     /// than ours.
     pub(crate) remote_handle_max: u32,
-    pub(crate) events: mpsc::Sender<SessionEvent>,
+    pub(crate) events: queue::Sender<SessionEvent>,
     /// The caller waiting for the answering `begin`.
     pub(crate) pending: Option<oneshot::Sender<Result<Session>>>,
     /// The outbound channel a handed-out `Session` writes through, kept so
     /// that the handle can be built once the answer arrives.
     pub(crate) outbound: mpsc::Sender<crate::connection::Outbound>,
     /// The receiver half, held until the handle is built.
-    pub(crate) rx: Option<mpsc::Receiver<SessionEvent>>,
+    pub(crate) rx: Option<queue::Receiver<SessionEvent>>,
 }
 
 impl Table {
@@ -480,7 +483,7 @@ mod tests {
     use super::*;
 
     fn entry(channel: u16) -> Entry {
-        let (events, rx) = mpsc::channel(4);
+        let (events, rx) = events();
         let (outbound, _) = mpsc::channel(4);
         Entry {
             shared: Arc::new(Shared {

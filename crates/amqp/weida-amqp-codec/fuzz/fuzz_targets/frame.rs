@@ -2,7 +2,7 @@
 //!
 //! Properties: decoding never panics; an accepted frame is inside the
 //! ceiling; its body is inside the frame; a performative decoded from that
-//! body re-encodes to something a decoder reads back as the same value.
+//! body re-encodes to something a decoder reads back to the same octets.
 //!
 //! The ceiling is the pre-negotiation 512, which is the one AMQP applies
 //! before `open` has been read. A four-byte `SIZE` field can declare 4 GiB
@@ -41,7 +41,10 @@ fuzz_target!(|data: &[u8]| {
                     let (again, used2) = Performative::decode(&written, Limits::DEFAULT)
                         .expect("the re-encoding decodes");
                     assert_eq!(used2, written.len());
-                    assert_eq!(again, performative);
+                    let mut twice = Vec::new();
+                    again.encode(&mut twice).expect("re-encodes");
+                    // Over octets, not values: a decoded float may be a NaN.
+                    assert_eq!(twice, written, "the canonical encoding is a fixed point");
                 }
             }
             frame::FrameKind::Sasl => {

@@ -62,7 +62,7 @@
 
 use weida_amqp_codec::Role;
 
-use crate::window::serial_distance;
+use crate::window::{serial_distance, serial_gt};
 
 /// One link endpoint's credit state (Part 2 §2.6.7).
 ///
@@ -84,6 +84,12 @@ pub struct Credit {
     /// Whether the partner's `attach` has been seen. A receiver's
     /// `flow.delivery-count` MUST NOT be set before then.
     seen_remote_attach: bool,
+    /// A receiver's: the highest delivery-limit it has ever told the sender
+    /// it may send up to. The sender may still be acting on a limit this end
+    /// has since lowered, so what it sends up to this is in flight rather
+    /// than excess; anything past it was never granted, which is what
+    /// [`Credit::record_received`] refuses.
+    announced_limit: u32,
 }
 
 impl Credit {
@@ -101,6 +107,7 @@ impl Credit {
             drain: false,
             initial_delivery_count,
             seen_remote_attach: false,
+            announced_limit: 0,
         }
     }
 
@@ -116,6 +123,7 @@ impl Credit {
             drain: false,
             initial_delivery_count: 0,
             seen_remote_attach: false,
+            announced_limit: 0,
         }
     }
 
@@ -191,6 +199,7 @@ impl Credit {
         let credit = self.link_credit;
         self.delivery_count = initial_delivery_count;
         self.link_credit = credit;
+        self.announced_limit = initial_delivery_count.wrapping_add(credit);
     }
 
     /// A **sender**: applies a receiver's `flow`.
@@ -266,6 +275,10 @@ impl Credit {
     pub const fn grant(&mut self, credit: u32) {
         debug_assert!(matches!(self.role, Role::Receiver));
         self.link_credit = credit;
+        let limit = self.delivery_limit();
+        if serial_gt(limit, self.announced_limit) {
+            self.announced_limit = limit;
+        }
     }
 
     /// A **receiver**: asks the sender to drain.
@@ -276,21 +289,25 @@ impl Credit {
 
     /// A **receiver**: accounts for one message that arrived.
     ///
-    /// Returns `false` where the message arrived with no credit outstanding.
-    /// That is a real case rather than a broken peer: a receiver that lowers
-    /// its limit while transfers are in flight will see the excess, and the
-    /// specification lets it either handle them normally or detach with
-    /// `amqp:link:transfer-limit-exceeded`. This client handles them, because
-    /// dropping a message that was sent under credit we had granted would
-    /// lose it.
+    /// `true` where the message is within what this end has told the sender
+    /// it may send, and `false` where it is past every limit this end ever
+    /// announced — a sender that ignores credit, or a delivery nobody granted
+    /// room for. The count advances either way, because the sequence is the
+    /// sender's and it moved.
+    ///
+    /// A message past the *current* credit but within an earlier, higher
+    /// limit is `true`: a receiver that lowers its limit while transfers are
+    /// in flight will see them, and they were sent under credit it had
+    /// granted. The specification lets it handle those, and this client
+    /// does, because dropping a message sent under granted credit would lose
+    /// it; what it does not handle is a message that was never granted, which
+    /// is `amqp:link:transfer-limit-exceeded`.
     pub fn record_received(&mut self) -> bool {
         debug_assert_eq!(self.role, Role::Receiver);
-        self.delivery_count = self.delivery_count.wrapping_add(1);
-        if self.link_credit == 0 {
-            return false;
-        }
-        self.link_credit -= 1;
-        true
+        let before = self.delivery_count;
+        self.delivery_count = before.wrapping_add(1);
+        self.link_credit = self.link_credit.saturating_sub(1);
+        serial_gt(self.announced_limit, before)
     }
 
     /// A **receiver**: applies a sender's `flow`.
@@ -448,16 +465,58 @@ mod tests {
     }
 
     #[test]
-    fn a_receiver_beyond_its_credit_reports_it_and_keeps_the_message() {
+    fn a_receiver_past_everything_it_granted_reports_it() {
         let mut credit = Credit::receiver();
         credit.seen_sender_attach(0);
         credit.grant(1);
         assert!(credit.record_received());
         assert!(
             !credit.record_received(),
-            "past the limit, and said so rather than dropped"
+            "past the limit, and said so: the caller refuses the delivery"
         );
         assert_eq!(credit.delivery_count(), 2, "the count still advanced");
+    }
+
+    #[test]
+    fn a_receiver_that_never_granted_anything_refuses_the_first_delivery() {
+        let mut credit = Credit::receiver();
+        credit.seen_sender_attach(7);
+        assert!(!credit.record_received());
+    }
+
+    #[test]
+    fn what_was_in_flight_when_credit_was_lowered_is_still_accepted() {
+        let mut credit = Credit::receiver();
+        credit.seen_sender_attach(0);
+        credit.grant(5);
+        assert!(credit.record_received());
+        assert!(credit.record_received());
+        // `stop()`: the limit drops to what has arrived, while the sender may
+        // already have sent up to the limit it was told about.
+        credit.grant(0);
+        assert_eq!(credit.link_credit(), 0);
+        for _ in 0..3 {
+            assert!(
+                credit.record_received(),
+                "sent under credit this end had granted"
+            );
+        }
+        assert!(
+            !credit.record_received(),
+            "the sixth was never granted, however the limit moved in between"
+        );
+    }
+
+    #[test]
+    fn the_announced_limit_follows_serial_arithmetic_across_the_wrap() {
+        let mut credit = Credit::receiver();
+        credit.seen_sender_attach(u32::MAX - 1);
+        credit.grant(3);
+        for _ in 0..3 {
+            assert!(credit.record_received());
+        }
+        assert_eq!(credit.delivery_count(), 1, "wrapped");
+        assert!(!credit.record_received());
     }
 
     #[test]

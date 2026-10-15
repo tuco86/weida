@@ -36,11 +36,12 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::time::Instant;
-use weida_amqp_codec::frame::{self, Frame, MIN_FRAME_SIZE};
+use weida_amqp_codec::frame::{self, Frame, FrameKind, MIN_FRAME_SIZE};
 use weida_amqp_codec::protocol_header::{self, LEN as HEADER_LEN, ProtocolHeader};
+use weida_amqp_codec::{DecodeError, EncodeError};
 use weida_runtime::Exec;
 
 use crate::error::{Error, Result};
@@ -323,17 +324,17 @@ impl Wire {
     #[must_use]
     pub fn split(self) -> (FrameReader, FrameWriter) {
         let (read, write) = tokio::io::split(self.stream);
+        let mut buf = BytesMut::with_capacity(READ_CHUNK);
+        buf.extend_from_slice(&self.read[self.from..]);
         (
             FrameReader {
                 read,
-                buf: self.read,
-                from: self.from,
+                buf,
                 max_frame_size: self.max_frame_size,
             },
             FrameWriter {
                 write,
                 max_frame_size: self.max_frame_size,
-                last_write: Instant::now(),
             },
         )
     }
@@ -344,17 +345,29 @@ impl Wire {
     }
 }
 
+/// How much one read asks the kernel for, and so how large a read buffer is.
+///
+/// A frame is read into a buffer this size and a delivery is a slice of the
+/// frame it arrived in, so a delivery the application holds keeps the whole
+/// buffer alive: this is the most one held delivery can pin beyond its own
+/// octets, and `credit granted x READ_CHUNK` is the most a peer can make an
+/// application pin by sending small messages one buffer apart. A frame larger
+/// than this gets a buffer of its own size.
+pub const READ_CHUNK: usize = 64 * 1024;
+
 /// Reads whole frames from one half of a split wire.
 ///
-/// Hands back each frame as an owned `Vec<u8>` rather than a borrow. One
-/// allocation per frame, deliberately: the borrow would tie the driver's
-/// whole loop to the reader's buffer, and the driver has to be able to hold a
-/// frame while writing an answer to it.
+/// Frames come out of one shared read buffer as [`Bytes`], not copies: a frame
+/// is the octets the kernel handed over, and a one-frame delivery reaches the
+/// application as a slice of it. The buffer belongs to the reader alone, so
+/// [`FrameReader::next_frame`] can be dropped half-way — as the driver's
+/// `select!` does whenever another branch is ready first — without losing an
+/// octet: everything read so far is in the buffer, and the next call goes on
+/// from there.
 #[derive(Debug)]
 pub struct FrameReader {
     read: tokio::io::ReadHalf<Stream>,
-    buf: Vec<u8>,
-    from: usize,
+    buf: BytesMut,
     max_frame_size: u32,
 }
 
@@ -367,39 +380,53 @@ impl FrameReader {
     /// The next whole frame, header included.
     ///
     /// The ceiling is applied to the declared `SIZE` from the eight-octet
-    /// header alone, before the body is waited for.
-    pub async fn next_frame(&mut self) -> Result<Vec<u8>> {
-        fill_to(
-            &mut self.read,
-            &mut self.buf,
-            &mut self.from,
-            MIN_FRAME_SIZE as usize,
-        )
-        .await?;
-        let header = frame::decode_header(&self.buf[self.from..], self.max_frame_size)?;
-        let size = header.size as usize;
-        fill_to(&mut self.read, &mut self.buf, &mut self.from, size).await?;
-        let bytes = self.buf[self.from..self.from + size].to_vec();
-        self.from += size;
-        Ok(bytes)
+    /// header alone, before the body is waited for, and the buffer is sized
+    /// from the same header: nothing the peer declares is reserved beyond what
+    /// that ceiling admits.
+    ///
+    /// Cancel-safe.
+    pub async fn next_frame(&mut self) -> Result<Bytes> {
+        loop {
+            let want = match frame::decode_header(&self.buf, self.max_frame_size) {
+                Ok(header) => {
+                    let size = header.size as usize;
+                    if self.buf.len() >= size {
+                        return Ok(self.buf.split_to(size).freeze());
+                    }
+                    size
+                }
+                Err(DecodeError::Incomplete { .. }) => MIN_FRAME_SIZE as usize,
+                Err(error) => return Err(error.into()),
+            };
+            let missing = want - self.buf.len();
+            if self.buf.capacity() - self.buf.len() < missing.max(MIN_READ) {
+                self.buf.reserve(missing.max(READ_CHUNK));
+            }
+            if self.read.read_buf(&mut self.buf).await? == 0 {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the peer closed the transport",
+                )));
+            }
+        }
     }
 }
 
+/// The least spare room worth a read: below it the buffer is topped up first,
+/// so a read is never a handful of octets.
+const MIN_READ: usize = 4096;
+
 /// Writes to one half of a split wire.
+///
+/// Two calls and no more, both cancel-safe: [`FrameWriter::write`] hands the
+/// stream as much as it will take in one go, and [`FrameWriter::flush`] pushes
+/// out whatever a TLS session still holds. The caller owns the octets and the
+/// clock — the driver's outbox — because a write that waits on a peer is exactly
+/// what must not be able to hold up the task that also reads.
 #[derive(Debug)]
 pub struct FrameWriter {
     write: tokio::io::WriteHalf<Stream>,
     max_frame_size: u32,
-    /// When this side last put a frame on the wire.
-    ///
-    /// The connection driver's keep-alive is "an empty frame at half the
-    /// interval the peer asked for", and *every* frame counts towards it
-    /// (Part 2 §2.4.5), not only the empty one. Recorded here because the
-    /// driver writes from five places — a `begin`, an `attach`, a session's
-    /// frame, the answers to an incoming frame, and the keep-alive itself —
-    /// and a clock kept in only some of them would let a talkative
-    /// connection heartbeat for no reason or a quiet one not at all.
-    last_write: Instant,
 }
 
 impl FrameWriter {
@@ -414,34 +441,209 @@ impl FrameWriter {
         self.max_frame_size
     }
 
-    /// Writes `bytes` and flushes.
-    pub async fn send(&mut self, bytes: &[u8]) -> Result<()> {
-        self.write.write_all(bytes).await?;
+    /// Hands the stream as much of `bytes` as it will take now, and says how
+    /// much that was.
+    ///
+    /// One write. If the future is dropped before it completes nothing was
+    /// written, which is what makes it usable as a `select!` branch.
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<usize> {
+        let taken = self.write.write(bytes).await?;
+        if taken == 0 && !bytes.is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "the transport accepted no octets",
+            )));
+        }
+        Ok(taken)
+    }
+
+    /// Pushes out what the stream is still holding: a TLS session buffers a
+    /// record until told to send it. Nothing for a plain socket.
+    pub async fn flush(&mut self) -> Result<()> {
         self.write.flush().await?;
-        self.last_write = Instant::now();
         Ok(())
     }
 
-    /// When this side last wrote, for a keep-alive deadline to measure from.
-    #[must_use]
-    pub const fn last_write(&self) -> Instant {
-        self.last_write
+    /// One turn of getting queued octets to the peer: a write if `pending` has
+    /// anything in it, and the flush that follows the last of them otherwise.
+    ///
+    /// One future, because the driver's `select!` builds every branch's
+    /// future at once and a writer can be borrowed by one of them only. Both
+    /// halves are cancel-safe, so the whole is.
+    pub(crate) async fn step(&mut self, pending: &[u8]) -> Result<Step> {
+        if pending.is_empty() {
+            self.flush().await?;
+            Ok(Step::Flushed)
+        } else {
+            Ok(Step::Wrote(self.write(pending).await?))
+        }
     }
 
     /// Closes the write half, which is what "`close` is the last thing ever
-    /// written" comes to in practice.
+    /// written" comes to in practice. A TLS session writes its closing alert
+    /// first, which is a write like any other and can wait on a peer, so the
+    /// caller bounds this one too.
     pub async fn shutdown(&mut self) -> Result<()> {
         self.write.shutdown().await?;
         Ok(())
     }
 }
 
+/// What one [`FrameWriter::step`] did.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Step {
+    /// The stream took this many octets.
+    Wrote(usize),
+    /// The stream was flushed.
+    Flushed,
+}
+
+/// How many octets may be queued for the peer before the driver stops taking
+/// more from anywhere.
+///
+/// **A bound of ours.** Everything the connection writes is queued in an
+/// outbox and goes out as the socket takes it; a peer that has stopped
+/// reading leaves it queued. Past this the driver stops reading the peer and
+/// stops taking frames from local senders, so what a stalled peer can make it
+/// hold is this plus the answers to one frame, and the stall clock
+/// ([`ConnectionOptions::write_timeout`]) ends the connection if it lasts.
+pub const OUTBOX_HIGH_WATER: usize = 256 * 1024;
+
+/// Octets queued for the peer, and how far the socket has taken them.
+///
+/// Frames are built straight into the buffer — [`frame::write`] appends and
+/// backfills the size, with no scratch buffer — and leave in whatever
+/// batches the socket accepts, so frames queued in one turn of the driver go
+/// out in one `write` rather than one per frame.
+#[derive(Debug)]
+pub(crate) struct Outbox {
+    buf: Vec<u8>,
+    /// How much of `buf` the socket has taken.
+    sent: usize,
+    /// Whether octets have gone to the stream since it was last flushed.
+    dirty: bool,
+    /// The largest frame the peer will take.
+    max_frame_size: u32,
+}
+
+impl Outbox {
+    pub(crate) const fn new(max_frame_size: u32) -> Self {
+        Self {
+            buf: Vec::new(),
+            sent: 0,
+            dirty: false,
+            max_frame_size,
+        }
+    }
+
+    /// The bound a frame this client sends must stay inside.
+    pub(crate) const fn max_frame_size(&self) -> u32 {
+        self.max_frame_size
+    }
+
+    /// Queues an AMQP frame on `channel`, its body written by `build`.
+    ///
+    /// Nothing is queued where `build` fails or the frame is above the
+    /// peer's `max-frame-size`.
+    pub(crate) fn frame<F>(
+        &mut self,
+        channel: u16,
+        build: F,
+    ) -> std::result::Result<(), EncodeError>
+    where
+        F: FnOnce(&mut Vec<u8>) -> std::result::Result<(), EncodeError>,
+    {
+        frame::write(
+            &mut self.buf,
+            FrameKind::Amqp,
+            channel,
+            self.max_frame_size,
+            build,
+        )
+    }
+
+    /// Queues a frame built elsewhere.
+    pub(crate) fn push(&mut self, frame: &[u8]) {
+        self.buf.extend_from_slice(frame);
+    }
+
+    /// What the socket has not taken yet.
+    pub(crate) fn pending(&self) -> &[u8] {
+        &self.buf[self.sent..]
+    }
+
+    /// Whether anything is waiting for the socket.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.sent < self.buf.len()
+    }
+
+    /// How many octets are waiting for the socket.
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len() - self.sent
+    }
+
+    /// Whether so much is waiting that nothing more should be taken in.
+    pub(crate) fn congested(&self) -> bool {
+        self.len() >= OUTBOX_HIGH_WATER
+    }
+
+    /// Records that the socket took `taken` octets.
+    pub(crate) fn took(&mut self, taken: usize) {
+        self.sent += taken;
+        self.dirty = true;
+        if self.sent == self.buf.len() {
+            self.buf.clear();
+            self.sent = 0;
+            // A burst should not leave a large buffer behind for good.
+            if self.buf.capacity() > 4 * OUTBOX_HIGH_WATER {
+                self.buf.shrink_to(OUTBOX_HIGH_WATER);
+            }
+        } else if self.sent >= self.buf.len() / 2 && self.sent >= MIN_READ {
+            // Never let the dead prefix outgrow what is still waiting.
+            self.buf.drain(..self.sent);
+            self.sent = 0;
+        }
+    }
+
+    /// Whether the stream was written to and has not been flushed since.
+    pub(crate) fn needs_flush(&self) -> bool {
+        self.dirty && !self.has_pending()
+    }
+
+    /// Records that the stream was flushed.
+    pub(crate) fn flushed(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Whether the socket still owes something: octets it has not taken, or
+    /// a flush. What the stall clock runs while it is true.
+    pub(crate) fn owes(&self) -> bool {
+        self.has_pending() || self.dirty
+    }
+}
+
+/// Gives the socket everything queued, and flushes it.
+///
+/// For ending a connection, where the octets still queued — `close` above all
+/// — should leave if the peer will take them; the caller bounds how long that
+/// may take.
+pub(crate) async fn drain(writer: &mut FrameWriter, out: &mut Outbox) -> Result<()> {
+    while out.has_pending() {
+        let taken = writer.write(out.pending()).await?;
+        out.took(taken);
+    }
+    if out.needs_flush() {
+        writer.flush().await?;
+        out.flushed();
+    }
+    Ok(())
+}
+
 /// Ensures at least `want` unconsumed octets sit in `buf` at or after
 /// `from`.
 ///
-/// Shared by [`Wire`] and [`FrameReader`], because the buffering rule is the
-/// same before and after the split and writing it twice would let the two
-/// drift.
+/// For [`Wire`], the handshake's reader. The driver's reader keeps its own
+/// buffer, because a frame there is handed out as a slice of it.
 async fn fill_to<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,

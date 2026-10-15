@@ -20,6 +20,10 @@ categories.workspace = true
 weida-core.workspace = true
 weida-runtime.workspace = true
 tokio.workspace = true
+# Receive buffers and delivery payloads: a frame is read once into a shared
+# buffer and a delivery is a slice of it, so the common one-frame message is
+# never copied. Already in the tree through tokio.
+bytes.workspace = true
 # The sans-I/O AMQP 1.0 codec: the type system, the frame header, the nine
 # performatives, the five SASL bodies, the message sections and the delivery
 # states. Reused rather than reimplemented; its own manifest stays empty

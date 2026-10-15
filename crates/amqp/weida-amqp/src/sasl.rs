@@ -86,8 +86,11 @@ pub(crate) async fn dialog(
         Sasl::External { authzid } => Some(authzid.as_bytes().to_vec()),
     };
 
-    send(
+    send_within(
+        exec,
         wire,
+        options,
+        "sending sasl-init",
         &SaslFrame::Init(SaslInit {
             mechanism,
             initial_response: initial.as_deref(),
@@ -109,7 +112,14 @@ pub(crate) async fn dialog(
                     challenge = challenge.len(),
                     "a SASL challenge this mechanism has no answer for"
                 );
-                send(wire, &SaslFrame::Response(&[])).await?;
+                send_within(
+                    exec,
+                    wire,
+                    options,
+                    "sending sasl-response",
+                    &SaslFrame::Response(&[]),
+                )
+                .await?;
             }
             SaslBody::Outcome(code) => {
                 return if code.is_ok() {
@@ -202,6 +212,25 @@ fn expect_sasl_frame(frame: &weida_amqp_codec::Frame<'_>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Writes one SASL frame inside the handshake deadline: a server that accepts
+/// the connection and never reads is the case, and nothing in the protocol
+/// would end the wait.
+async fn send_within(
+    exec: &Exec,
+    wire: &mut Wire,
+    options: &Arc<ConnectionOptions>,
+    step: &'static str,
+    body: &SaslFrame<'_>,
+) -> Result<()> {
+    match exec
+        .within(options.handshake_timeout, send(wire, body))
+        .await
+    {
+        Some(result) => result,
+        None => Err(Error::HandshakeTimeout { step }),
+    }
 }
 
 async fn send(wire: &mut Wire, body: &SaslFrame<'_>) -> Result<()> {

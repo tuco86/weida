@@ -14,6 +14,11 @@
 //! [`DecodeError::ElementCountExceeded`], not an allocation and not a read
 //! past the end.
 //!
+//! Zero-width array elements (`null`, `true`, `false`, `uint0`, `ulong0` and
+//! `list0`) occupy no octets, so the input cannot bound them. Their count is
+//! charged to [`Limits::max_zero_width_elements`] from the array header, and
+//! one allowance covers the whole decode, so nesting cannot multiply it.
+//!
 //! # What "incomplete" means
 //!
 //! A decoder reading from a stream cannot tell a truncated value from a value
@@ -32,7 +37,8 @@ use crate::value::{Array, Described, Descriptor, ElementKind, Value};
 ///
 /// Returns the value and how many octets it occupied. Variable-width data is
 /// borrowed from `input`; a list, map or array allocates one `Vec`, never
-/// before its declared count has been checked against `limits.max_elements`.
+/// before its declared count has been checked against `limits.max_elements`,
+/// and an array of zero-width elements draws on `limits.max_zero_width_elements`.
 ///
 /// ```
 /// use weida_amqp_codec::{Limits, Value, decode};
@@ -47,7 +53,8 @@ use crate::value::{Array, Described, Descriptor, ElementKind, Value};
 /// assert_eq!(decode::value(&wide, Limits::DEFAULT).expect("a ulong").0, Value::Ulong(42));
 /// ```
 pub fn value(input: &[u8], limits: Limits) -> Result<(Value<'_>, usize), DecodeError> {
-    value_at(input, limits, 0)
+    let mut zero_width = limits.max_zero_width_elements;
+    value_at(input, limits, 0, &mut zero_width)
 }
 
 /// Decodes one described value from the front of `input`, refusing anything
@@ -61,6 +68,17 @@ pub fn described(
     input: &[u8],
     limits: Limits,
 ) -> Result<(Descriptor<'_>, Value<'_>, usize), DecodeError> {
+    let mut zero_width = limits.max_zero_width_elements;
+    described_within(input, limits, &mut zero_width)
+}
+
+/// [`described`] under a zero-width allowance the caller already holds, so
+/// that a message can decode all of its sections against one allowance.
+pub(crate) fn described_within<'a>(
+    input: &'a [u8],
+    limits: Limits,
+    zero_width: &mut u32,
+) -> Result<(Descriptor<'a>, Value<'a>, usize), DecodeError> {
     need(input, 0, 1)?;
     if input[0] != codes::DESCRIBED {
         return Err(DecodeError::WrongType {
@@ -69,7 +87,7 @@ pub fn described(
         });
     }
     let (descriptor, used) = descriptor_at(&input[1..])?;
-    let (value, body) = value_at(&input[1 + used..], limits, 1)?;
+    let (value, body) = value_at(&input[1 + used..], limits, 1, zero_width)?;
     Ok((descriptor, value, 1 + used + body))
 }
 
@@ -87,6 +105,9 @@ pub struct ListCursor<'a> {
     remaining: u32,
     limits: Limits,
     depth: u32,
+    /// Zero-width elements this composite may still produce, from its own
+    /// allowance: one composite has one allowance, whatever its fields hold.
+    zero_width: u32,
 }
 
 impl<'a> ListCursor<'a> {
@@ -96,6 +117,7 @@ impl<'a> ListCursor<'a> {
             remaining: count,
             limits,
             depth,
+            zero_width: limits.max_zero_width_elements,
         }
     }
 
@@ -112,7 +134,7 @@ impl<'a> ListCursor<'a> {
         if self.remaining == 0 {
             return Ok(Value::Null);
         }
-        let (value, used) = value_at(self.rest, self.limits, self.depth + 1)?;
+        let (value, used) = value_at(self.rest, self.limits, self.depth + 1, &mut self.zero_width)?;
         self.rest = &self.rest[used..];
         self.remaining -= 1;
         Ok(value)
@@ -371,15 +393,34 @@ fn compound_body(
 /// A `list` or `map` element occupies at least one octet — its own
 /// constructor — so the element region bounds the count and the reservation
 /// is bounded by the input. An `array` element may occupy none (an array of
-/// `null`), so there the reservation is capped and the `Vec` grows; the
-/// declared count is still refused above `max_elements` before this is
-/// reached.
+/// `null`); its count was charged to the zero-width allowance before this is
+/// reached, so the reservation is bounded by the caller's limit instead.
 fn reserve_bounded<T>(items: &mut Vec<T>, count: u32, region: usize) {
     let count = usize::try_from(count).unwrap_or(usize::MAX);
     items.reserve(count.min(region.max(1)));
 }
 
-fn value_at(input: &[u8], limits: Limits, depth: u32) -> Result<(Value<'_>, usize), DecodeError> {
+/// Spends `count` zero-width elements from the allowance of one decode.
+///
+/// Refused from the declared count alone, before anything is reserved for the
+/// array, as `max_elements` is.
+fn spend_zero_width(zero_width: &mut u32, count: u32, limits: Limits) -> Result<(), DecodeError> {
+    if count > *zero_width {
+        return Err(DecodeError::ZeroWidthElementsExceeded {
+            declared: count,
+            cap: limits.max_zero_width_elements,
+        });
+    }
+    *zero_width -= count;
+    Ok(())
+}
+
+fn value_at<'a>(
+    input: &'a [u8],
+    limits: Limits,
+    depth: u32,
+    zero_width: &mut u32,
+) -> Result<(Value<'a>, usize), DecodeError> {
     if !limits.admits_depth(depth) {
         return Err(DecodeError::DepthExceeded {
             cap: limits.max_depth,
@@ -390,7 +431,7 @@ fn value_at(input: &[u8], limits: Limits, depth: u32) -> Result<(Value<'_>, usiz
 
     if code == codes::DESCRIBED {
         let (descriptor, used) = descriptor_at(&input[1..])?;
-        let (value, body) = value_at(&input[1 + used..], limits, depth + 1)?;
+        let (value, body) = value_at(&input[1 + used..], limits, depth + 1, zero_width)?;
         return Ok((
             Value::Described(Box::new(Described { descriptor, value })),
             1 + used + body,
@@ -416,7 +457,7 @@ fn value_at(input: &[u8], limits: Limits, depth: u32) -> Result<(Value<'_>, usiz
         | codes::ARRAY8
         | codes::ARRAY32 => {
             let (body, count, header) = compound_body(&input[1..], code, limits)?;
-            let value = compound_value(body, count, code, limits, depth)?;
+            let value = compound_value(body, count, code, limits, depth, zero_width)?;
             Ok((value, 1 + header + body.len()))
         }
         other => Err(DecodeError::UnknownFormatCode(other)),
@@ -431,6 +472,7 @@ fn compound_value<'a>(
     code: u8,
     limits: Limits,
     depth: u32,
+    zero_width: &mut u32,
 ) -> Result<Value<'a>, DecodeError> {
     let value = match code {
         codes::LIST8 | codes::LIST32 => {
@@ -438,7 +480,7 @@ fn compound_value<'a>(
             reserve_bounded(&mut items, count, body.len());
             let mut rest = body;
             for _ in 0..count {
-                let (item, used) = value_at(rest, limits, depth + 1)?;
+                let (item, used) = value_at(rest, limits, depth + 1, zero_width)?;
                 items.push(item);
                 rest = &rest[used..];
             }
@@ -450,9 +492,9 @@ fn compound_value<'a>(
             reserve_bounded(&mut entries, count / 2, body.len());
             let mut rest = body;
             for _ in 0..count / 2 {
-                let (key, used) = value_at(rest, limits, depth + 1)?;
+                let (key, used) = value_at(rest, limits, depth + 1, zero_width)?;
                 rest = &rest[used..];
-                let (val, used) = value_at(rest, limits, depth + 1)?;
+                let (val, used) = value_at(rest, limits, depth + 1, zero_width)?;
                 rest = &rest[used..];
                 entries.push((key, val));
             }
@@ -461,12 +503,24 @@ fn compound_value<'a>(
         }
         codes::ARRAY8 | codes::ARRAY32 => {
             let (element, ctor) = array_constructor(body)?;
+            let element_code = element.code();
+            // A zero-width element costs the input nothing, so its count is
+            // charged before a `Vec` is reserved or one element is built.
+            if codes::fixed_width(element_code) == Some(0) {
+                spend_zero_width(zero_width, count, limits)?;
+            }
             let mut rest = &body[ctor..];
             let mut items = Vec::new();
             reserve_bounded(&mut items, count, rest.len());
-            let element_code = element.code();
+            // A described element's wrapper sits one level below the array and
+            // its inner value one level below the wrapper, as in the tree
+            // built here, so the inner value is the one the depth check sees.
+            let inner_depth = match element {
+                ElementKind::Primitive(_) => depth + 1,
+                ElementKind::Described(..) => depth + 2,
+            };
             for _ in 0..count {
-                let (item, used) = untyped(rest, element_code, limits, depth + 1)?;
+                let (item, used) = untyped(rest, element_code, limits, inner_depth, zero_width)?;
                 rest = &rest[used..];
                 items.push(match element {
                     ElementKind::Primitive(_) => item,
@@ -502,12 +556,13 @@ fn exact(code: u8, body: &[u8], rest: &[u8]) -> Result<(), DecodeError> {
 
 /// One element of an array, read under the array's shared constructor.
 /// `input` starts at the element's untyped data.
-fn untyped(
-    input: &[u8],
+fn untyped<'a>(
+    input: &'a [u8],
     code: u8,
     limits: Limits,
     depth: u32,
-) -> Result<(Value<'_>, usize), DecodeError> {
+    zero_width: &mut u32,
+) -> Result<(Value<'a>, usize), DecodeError> {
     if !limits.admits_depth(depth) {
         return Err(DecodeError::DepthExceeded {
             cap: limits.max_depth,
@@ -528,7 +583,7 @@ fn untyped(
         | codes::ARRAY8
         | codes::ARRAY32 => {
             let (body, count, header) = compound_body(input, code, limits)?;
-            let value = compound_value(body, count, code, limits, depth)?;
+            let value = compound_value(body, count, code, limits, depth, zero_width)?;
             Ok((value, header + body.len()))
         }
         other => Err(DecodeError::UnknownFormatCode(other)),
@@ -672,6 +727,7 @@ mod tests {
         let shallow = Limits {
             max_elements: 16,
             max_depth: 4,
+            max_zero_width_elements: 16,
         };
         assert_eq!(
             value(&bytes, shallow),
@@ -910,5 +966,78 @@ mod tests {
                 (Value::Symbol("k"), Value::Uint(2)),
             ])
         );
+    }
+
+    #[test]
+    fn a_flat_array_of_nulls_is_refused_before_it_is_built() {
+        // The audit's reproducer: an array32 of 65 536 nulls, nine octets.
+        let hostile = [0xf0, 0, 0, 0, 5, 0, 1, 0, 0, codes::NULL];
+        assert_eq!(
+            value(&hostile, Limits::BODY),
+            Err(DecodeError::ZeroWidthElementsExceeded {
+                declared: 65_536,
+                cap: 256,
+            })
+        );
+    }
+
+    #[test]
+    fn a_described_array_element_is_charged_and_depth_checked_as_built() {
+        // The `value` fuzz crash: six described values, then an array8 whose
+        // elements are described `list0`. The tree holds the inner `list0` at
+        // depth 8, so a bound of 8 must refuse it, and a bound of 9 must not.
+        let bytes = [
+            0x00, 0x44, 0x00, 0x53, 0x00, 0x00, 0x53, 0x00, 0x00, 0x53, 0x02, 0x00, 0x53, 0x04,
+            0x00, 0x44, 0xe0, 0x05, 0x04, 0x00, 0x53, 0x2d, 0x45, 0x00, 0x53, 0x00, 0x29, 0x9b,
+            0x60, 0x14,
+        ];
+        let fuzzed = Limits {
+            max_elements: 64,
+            max_depth: 8,
+            max_zero_width_elements: 16,
+        };
+        assert_eq!(
+            value(&bytes, fuzzed),
+            Err(DecodeError::DepthExceeded { cap: 8 })
+        );
+        for limits in [
+            Limits {
+                max_depth: 9,
+                ..fuzzed
+            },
+            Limits::DEFAULT,
+        ] {
+            let (decoded, used) = value(&bytes, limits).expect("admitted at this depth");
+            assert_eq!(used, 23, "the array ends at octet 23");
+            let Value::Described(outer) = decoded else {
+                panic!("expected a described value");
+            };
+            assert!(outer.descriptor.is(0), "the outer descriptor is ulong0");
+        }
+    }
+
+    #[test]
+    fn a_described_zero_width_element_is_charged_per_element() {
+        // Each element is a described `null`: no octets of its own, and the
+        // wrapper and the null are both nodes, so the count is charged.
+        let bytes = [
+            0xf0,
+            0,
+            0,
+            0,
+            8,
+            0,
+            0,
+            0,
+            0x11,
+            codes::DESCRIBED,
+            codes::SMALLULONG,
+            0x24,
+            codes::NULL,
+        ];
+        assert!(matches!(
+            value(&bytes, Limits::DEFAULT),
+            Err(DecodeError::ZeroWidthElementsExceeded { declared: 17, .. })
+        ));
     }
 }

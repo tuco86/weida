@@ -33,9 +33,13 @@
 //!
 //! # Who bounds the map
 //!
-//! A **receiver's** map is bounded by the protocol: it can only grow by a
-//! delivery arriving, and a delivery can only arrive against link credit the
-//! receiver itself granted. An application that never settles runs out of
+//! A **receiver's** map is bounded by the protocol, and the bound is enforced:
+//! it can only grow by a delivery arriving, and a delivery that arrives past
+//! every limit the receiver ever announced is refused with
+//! `amqp:link:transfer-limit-exceeded`, as is an unsettled one that finds the
+//! map full (`amqp:resource-limit-exceeded`). A delivery is never handed to
+//! the application without being recorded here, which is what lets every
+//! acknowledgement be written. An application that never settles runs out of
 //! credit and the sender stalls, which is the designed behaviour.
 //!
 //! A **sender's** map has no such bound — the receiver may keep granting
@@ -50,7 +54,7 @@ use weida_amqp_codec::state::DeliveryState;
 
 use crate::error::Condition;
 use crate::owned::OwnedValue;
-use crate::window::{serial_distance, serial_gt};
+use crate::window::serial_distance;
 
 /// How many unsettled deliveries one link keeps before `send` waits.
 ///
@@ -245,12 +249,47 @@ pub struct Unsettled {
     max: usize,
 }
 
+/// The longest `delivery-tag` there is: Part 3 §3.2.1 bounds it at 32 octets
+/// and the codec refuses a longer one on the way in, so every tag a link
+/// holds fits here without an allocation of its own.
+pub(crate) const MAX_TAG: usize = 32;
+
+#[derive(Clone, Copy)]
+struct Tag {
+    len: u8,
+    octets: [u8; MAX_TAG],
+}
+
+impl Tag {
+    fn new(tag: &[u8]) -> Option<Self> {
+        let len = u8::try_from(tag.len())
+            .ok()
+            .filter(|len| usize::from(*len) <= MAX_TAG)?;
+        let mut octets = [0u8; MAX_TAG];
+        octets[..tag.len()].copy_from_slice(tag);
+        Some(Self { len, octets })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.octets[..usize::from(self.len)]
+    }
+}
+
+impl std::fmt::Debug for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
 #[derive(Debug)]
 struct Record {
-    tag: Vec<u8>,
+    tag: Tag,
     ours: Option<Outcome>,
     theirs: Option<Outcome>,
     settled_here: bool,
+    /// Whether a provisional answer has been reported for this delivery, so
+    /// that a peer repeating its `disposition` is not reported twice.
+    reported: bool,
 }
 
 impl Unsettled {
@@ -281,11 +320,21 @@ impl Unsettled {
         self.by_id.len() < self.max
     }
 
-    /// Records a delivery as unsettled. `false` where the map is full.
-    pub fn insert(&mut self, delivery_id: u32, tag: Vec<u8>) -> bool {
+    /// How many deliveries the map holds at most.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.max
+    }
+
+    /// Records a delivery as unsettled. `false` where the map is full, or
+    /// where `tag` is longer than the 32 octets a `delivery-tag` can be.
+    pub fn insert(&mut self, delivery_id: u32, tag: &[u8]) -> bool {
         if !self.has_room() {
             return false;
         }
+        let Some(tag) = Tag::new(tag) else {
+            return false;
+        };
         self.by_id.insert(
             delivery_id,
             Record {
@@ -293,6 +342,7 @@ impl Unsettled {
                 ours: None,
                 theirs: None,
                 settled_here: false,
+                reported: false,
             },
         );
         true
@@ -301,13 +351,9 @@ impl Unsettled {
     /// This end's view of one delivery.
     #[must_use]
     pub fn get(&self, delivery_id: u32) -> Option<Pending> {
-        self.by_id.get(&delivery_id).map(|record| Pending {
-            delivery_id,
-            delivery_tag: record.tag.clone(),
-            ours: record.ours.clone(),
-            theirs: record.theirs.clone(),
-            settled_here: record.settled_here,
-        })
+        self.by_id
+            .get(&delivery_id)
+            .map(|record| record.pending(delivery_id))
     }
 
     /// Every unsettled delivery, in delivery-id order.
@@ -315,31 +361,34 @@ impl Unsettled {
     pub fn pending(&self) -> Vec<Pending> {
         self.by_id
             .iter()
-            .map(|(delivery_id, record)| Pending {
-                delivery_id: *delivery_id,
-                delivery_tag: record.tag.clone(),
-                ours: record.ours.clone(),
-                theirs: record.theirs.clone(),
-                settled_here: record.settled_here,
-            })
+            .map(|(delivery_id, record)| record.pending(*delivery_id))
             .collect()
     }
 
-    /// The delivery-ids this end holds that fall in `first..=last`.
+    /// The delivery-ids this end holds that fall in `first..=last`, in serial
+    /// order.
     ///
     /// Serial arithmetic, because a delivery-id is an RFC 1982 serial number:
-    /// a range that wraps is an ordinary range and not an empty one. Both
-    /// tests are needed — [`serial_distance`] saturates at zero, so without
-    /// the [`serial_gt`] guard an id *before* `first` would look like `first`
-    /// itself and be swept into the range.
+    /// a range that wraps is an ordinary range and not an empty one, and a
+    /// `last` that is not after `first` names `first` alone. The range is a
+    /// walk of the ordered map, never of the whole of it: one id costs one
+    /// lookup whatever the map holds, which matters because every
+    /// acknowledgement the application writes and every `disposition` a peer
+    /// sends asks.
     #[must_use]
     pub fn ids_in(&self, first: u32, last: u32) -> Vec<u32> {
         let span = serial_distance(last, first);
-        self.by_id
-            .keys()
-            .copied()
-            .filter(|id| !serial_gt(first, *id) && serial_distance(*id, first) <= span)
-            .collect()
+        let end = first.wrapping_add(span);
+        let mut ids = Vec::new();
+        if end >= first {
+            ids.extend(self.by_id.range(first..=end).map(|(id, _)| *id));
+        } else {
+            // Across the wrap: the top of the space, then the bottom, which
+            // is also the order the ids were issued in.
+            ids.extend(self.by_id.range(first..).map(|(id, _)| *id));
+            ids.extend(self.by_id.range(..=end).map(|(id, _)| *id));
+        }
+        ids
     }
 
     /// Publishes this end's outcome for a delivery, and settles where asked.
@@ -377,6 +426,11 @@ impl Unsettled {
     /// `outcome` is `None` where the frame carried no state at all or a
     /// non-terminal `received` — the map takes the outcome already converted,
     /// so that nothing here depends on the codec and nothing here can fail.
+    ///
+    /// A provisional answer is reported **once**. The outcome the peer first
+    /// published is terminal, so a repeat of it carries nothing new, and
+    /// reporting each one would let a peer that repeats a `disposition`
+    /// fill whatever the application has not read.
     pub fn record_theirs(
         &mut self,
         delivery_id: u32,
@@ -403,7 +457,28 @@ impl Unsettled {
             self.by_id.remove(&delivery_id);
             return known.map_or(Settlement::Nothing, Settlement::Settled);
         }
-        known.map_or(Settlement::Progress, Settlement::Provisional)
+        if record.reported {
+            return Settlement::Nothing;
+        }
+        match known {
+            Some(outcome) => {
+                record.reported = true;
+                Settlement::Provisional(outcome)
+            }
+            None => Settlement::Progress,
+        }
+    }
+}
+
+impl Record {
+    fn pending(&self, delivery_id: u32) -> Pending {
+        Pending {
+            delivery_id,
+            delivery_tag: self.tag.as_slice().to_vec(),
+            ours: self.ours.clone(),
+            theirs: self.theirs.clone(),
+            settled_here: self.settled_here,
+        }
     }
 }
 
@@ -413,8 +488,8 @@ mod tests {
 
     fn map() -> Unsettled {
         let mut map = Unsettled::new(4);
-        assert!(map.insert(1, b"t-1".to_vec()));
-        assert!(map.insert(2, b"t-2".to_vec()));
+        assert!(map.insert(1, b"t-1"));
+        assert!(map.insert(2, b"t-2"));
         map
     }
 
@@ -509,11 +584,31 @@ mod tests {
         assert_eq!(map.get(1).unwrap().theirs, Some(Outcome::Accepted));
         // A second, different state from the same peer does not replace the
         // first: an outcome once published is terminal.
+        let _ = map.record_theirs(1, Some(&Outcome::Released), false);
+        assert_eq!(map.get(1).unwrap().theirs, Some(Outcome::Accepted));
+    }
+
+    #[test]
+    fn a_repeated_provisional_disposition_is_reported_once() {
+        let mut map = map();
         assert_eq!(
-            map.record_theirs(1, Some(&Outcome::Released), false),
+            map.record_theirs(1, Some(&Outcome::Accepted), false),
             Settlement::Provisional(Outcome::Accepted)
         );
-        assert_eq!(map.get(1).unwrap().theirs, Some(Outcome::Accepted));
+        // Each repeat would otherwise be one more report for the application
+        // to read, and a peer can send them as fast as it can write.
+        for _ in 0..100 {
+            assert_eq!(
+                map.record_theirs(1, Some(&Outcome::Accepted), false),
+                Settlement::Nothing
+            );
+            assert_eq!(map.record_theirs(1, None, false), Settlement::Nothing);
+        }
+        // The final answer is still reported.
+        assert_eq!(
+            map.record_theirs(1, Some(&Outcome::Accepted), true),
+            Settlement::Settled(Outcome::Accepted)
+        );
     }
 
     #[test]
@@ -551,27 +646,79 @@ mod tests {
     #[test]
     fn a_range_is_serial_and_wraps() {
         let mut map = Unsettled::new(8);
-        assert!(map.insert(u32::MAX - 1, b"a".to_vec()));
-        assert!(map.insert(u32::MAX, b"b".to_vec()));
-        assert!(map.insert(0, b"c".to_vec()));
-        assert!(map.insert(1, b"d".to_vec()));
-        let mut covered = map.ids_in(u32::MAX, 0);
-        covered.sort_unstable();
+        assert!(map.insert(u32::MAX - 1, b"a"));
+        assert!(map.insert(u32::MAX, b"b"));
+        assert!(map.insert(0, b"c"));
+        assert!(map.insert(1, b"d"));
         assert_eq!(
-            covered,
-            vec![0, u32::MAX],
-            "a range across the wrap is an ordinary range"
+            map.ids_in(u32::MAX, 0),
+            vec![u32::MAX, 0],
+            "a range across the wrap is an ordinary range, in the order the ids were issued"
+        );
+        assert_eq!(
+            map.ids_in(u32::MAX - 1, 1),
+            vec![u32::MAX - 1, u32::MAX, 0, 1]
         );
         assert_eq!(map.ids_in(7, 9), Vec::<u32>::new());
+        assert_eq!(
+            map.ids_in(1, 0),
+            vec![1],
+            "a last that is not after first names first alone"
+        );
+    }
+
+    #[test]
+    fn a_single_id_costs_one_lookup_and_not_a_walk_of_the_map() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn filled(n: u32) -> Unsettled {
+            let mut map = Unsettled::new(usize::try_from(n).unwrap());
+            for id in 0..n {
+                assert!(map.insert(id, b"tag"));
+            }
+            map
+        }
+        // Two map sizes and the same number of calls: what a walk of the map
+        // costs grows with the size, and an ordered lookup does not. The
+        // comparison is the ratio, so it holds on a loaded machine, and the
+        // margin is wide: a walk is ~64x apart here, a lookup ~1x.
+        let small = filled(64);
+        let large = filled(4096);
+        let calls = 20_000u32;
+        let run = |map: &Unsettled| {
+            let started = Instant::now();
+            for call in 0..calls {
+                let id = black_box(call % 64);
+                black_box(map.ids_in(id, id));
+            }
+            started.elapsed()
+        };
+        let _warm = (run(&small), run(&large));
+        let small_time = run(&small);
+        let large_time = run(&large);
+        assert!(
+            large_time < small_time * 8 + std::time::Duration::from_millis(50),
+            "64 entries took {small_time:?}, 4096 took {large_time:?}"
+        );
+    }
+
+    #[test]
+    fn a_tag_longer_than_the_protocol_allows_is_not_recorded() {
+        let mut map = Unsettled::new(4);
+        assert!(map.insert(1, &[7u8; 32]));
+        assert_eq!(map.get(1).unwrap().delivery_tag, vec![7u8; 32]);
+        assert!(!map.insert(2, &[7u8; 33]));
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn the_map_is_bounded_and_says_so() {
         let mut map = Unsettled::new(2);
-        assert!(map.insert(1, b"a".to_vec()));
-        assert!(map.insert(2, b"b".to_vec()));
+        assert!(map.insert(1, b"a"));
+        assert!(map.insert(2, b"b"));
         assert!(!map.has_room());
-        assert!(!map.insert(3, b"c".to_vec()), "refused, not grown");
+        assert!(!map.insert(3, b"c"), "refused, not grown");
         let _ = map.record_theirs(1, Some(&Outcome::Accepted), true);
         assert!(map.has_room(), "settling is what makes room");
     }

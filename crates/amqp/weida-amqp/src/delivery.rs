@@ -19,15 +19,19 @@
 //! Both are here because settling needs the first and recovering needs the
 //! second.
 
+use bytes::Bytes;
 use weida_amqp_codec::message::{Decoded, Message};
 use weida_amqp_codec::{DecodeError, Limits};
 
 /// What the sender put on the wire, reassembled.
 ///
-/// The payload is owned: it was gathered from frames whose buffers are gone by
-/// the time the application sees it, so there is nothing left to borrow from.
-/// [`Delivery::message`] decodes it and borrows from *this*, which is why it
-/// takes `&self` and hands back a value tied to it.
+/// The payload is shared, not copied: a delivery that arrived in one `transfer`
+/// frame is a slice of the buffer that frame was read into, and one that took
+/// several is the buffer they were gathered in. Either way it outlives the
+/// frame by holding the buffer, which is why a delivery the application keeps
+/// pins up to [`READ_CHUNK`](crate::transport::READ_CHUNK) octets beyond its
+/// own. [`Delivery::message`] decodes it and borrows from *this*, which is why
+/// it takes `&self` and hands back a value tied to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivery {
     /// The session-scoped id a `disposition` names.
@@ -44,7 +48,7 @@ pub struct Delivery {
     /// Our own handle for the link it arrived on, so an application holding
     /// several can tell them apart.
     pub handle: u32,
-    payload: Vec<u8>,
+    payload: Bytes,
 }
 
 impl Delivery {
@@ -54,7 +58,7 @@ impl Delivery {
         message_format: u32,
         settled: bool,
         handle: u32,
-        payload: Vec<u8>,
+        payload: Bytes,
     ) -> Self {
         Self {
             delivery_id,

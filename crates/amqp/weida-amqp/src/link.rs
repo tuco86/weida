@@ -72,29 +72,40 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot};
 use weida_amqp_codec::message::{Message, Progress, Reassembly};
 use weida_amqp_codec::performative::{Attach, Detach, Disposition, Flow, Performative, Transfer};
 use weida_amqp_codec::state::DeliveryState;
 use weida_amqp_codec::types::condition;
-use weida_amqp_codec::{ReceiverSettleMode, Role, SenderSettleMode};
+use weida_amqp_codec::{DecodeError, ReceiverSettleMode, Role, SenderSettleMode};
 
 use crate::credit::Credit;
 use crate::delivery::{Delivery, Sent};
 use crate::error::{Condition, Error, Result};
 use crate::options::multiple;
-use crate::settlement::{Outcome, Pending, Settlement, Unsettled};
+use crate::queue::{self, Queued};
+use crate::settlement::{MAX_TAG, Outcome, Pending, Settlement, Unsettled};
 use crate::terminus::{Source, Target};
 use crate::window::Windows;
 
-/// How many frames may be queued for one link before the driver waits.
+/// How many reports — outcomes and credit updates — a link keeps for a reader
+/// that has not come.
 ///
-/// **A bound of ours.** Link credit bounds *messages* and the session window
-/// bounds *transfer frames*, but `attach`, `detach` and `disposition` are
-/// outside both, and the specification bounds them nowhere. Reaching this
-/// applies backpressure to the connection driver rather than growing a queue
-/// nobody bounded.
-pub const LINK_QUEUE: usize = 64;
+/// **A bound of ours.** The connection driver never waits for an application
+/// to read what a link tells it, so nothing is queued against a capacity; what
+/// bounds the queue is where its contents come from. A delivery is queued only
+/// against credit the application granted itself. An outcome or a credit
+/// update is also held in the link's own state, so once this many are waiting
+/// the oldest is let go and the current state is still one call away
+/// ([`Link::unsettled`], [`Link::credit`]). An application that reads its
+/// events never loses one.
+pub const MAX_QUEUED_REPORTS: usize = 1024;
+
+/// The queue a link's events travel in.
+pub(crate) fn events() -> (queue::Sender<LinkEvent>, queue::Receiver<LinkEvent>) {
+    queue::channel(MAX_QUEUED_REPORTS)
+}
 
 /// How this end settles and when, plus what the peer actually created.
 ///
@@ -266,6 +277,10 @@ pub enum LinkEvent {
     /// `settled` is the difference between a provisional answer and a final
     /// one: `false` means the peer published the outcome but has not settled,
     /// which under `rcv-settle-mode=second` is the middle of the dance.
+    ///
+    /// A report: one that has not been read when [`MAX_QUEUED_REPORTS`] more
+    /// have arrived is let go, and the state it described is still in
+    /// [`Link::unsettled`].
     Outcome {
         /// Which delivery.
         delivery_id: u32,
@@ -274,17 +289,37 @@ pub enum LinkEvent {
         /// Whether the delivery is now settled at both ends.
         settled: bool,
     },
-    /// A frame for this link this layer does not read.
-    Frame(Vec<u8>),
     /// The peer's `flow` changed this link's credit state, and the new state
     /// is the one [`Link::credit`] reports.
     ///
     /// Worth an event rather than only a field, because a receiver draining a
     /// link is *waiting* for this: credit reaching zero with no delivery in
-    /// between is the definite answer that there was nothing to get.
+    /// between is the definite answer that there was nothing to get. Events
+    /// are queued in the order the link saw things in, so a delivery that
+    /// arrived before the `flow` is read before it.
+    ///
+    /// A report, and one that supersedes the one directly before it: several
+    /// `flow` frames with nothing between them are one event carrying the
+    /// latest state.
     Flow(Credit),
     /// The link detached.
     Detached(Option<Condition>),
+}
+
+impl Queued for LinkEvent {
+    fn is_report(&self) -> bool {
+        matches!(self, Self::Outcome { .. } | Self::Flow(_))
+    }
+
+    fn absorb(&mut self, next: Self) -> Option<Self> {
+        match (&mut *self, next) {
+            (Self::Flow(have), Self::Flow(newer)) => {
+                *have = newer;
+                None
+            }
+            (_, next) => Some(next),
+        }
+    }
 }
 
 /// The state a link's handle and the connection driver share.
@@ -311,8 +346,14 @@ pub(crate) struct Shared {
     /// waits here rather than polling.
     pub(crate) flow: Notify,
     /// The largest frame the peer will accept, which is what decides where a
-    /// message is split.
     pub(crate) max_frame_size: u32,
+    /// How many payload octets fit in one frame of a delivery on this link.
+    ///
+    /// Measured once, when the link is attached: the first frame's
+    /// performative is the largest one a delivery carries and it depends only
+    /// on the handle and the tag's length, so encoding it per message told
+    /// nothing new.
+    pub(crate) frame_budget: usize,
     /// The next delivery-tag this end will choose.
     pub(crate) next_tag: Mutex<u64>,
     /// The deliveries this end still holds state for.
@@ -328,14 +369,14 @@ pub(crate) struct Shared {
 pub struct Link {
     shared: Arc<Shared>,
     outbound: mpsc::Sender<crate::connection::Outbound>,
-    events: mpsc::Receiver<LinkEvent>,
+    events: queue::Receiver<LinkEvent>,
 }
 
 impl Link {
     pub(crate) fn new(
         shared: Arc<Shared>,
         outbound: mpsc::Sender<crate::connection::Outbound>,
-        events: mpsc::Receiver<LinkEvent>,
+        events: queue::Receiver<LinkEvent>,
     ) -> Self {
         Self {
             shared,
@@ -413,7 +454,7 @@ impl Link {
             match self.events.recv().await? {
                 LinkEvent::Delivery(delivery) => return Some(delivery),
                 LinkEvent::Detached(_) => return None,
-                LinkEvent::Frame(_) | LinkEvent::Flow(_) | LinkEvent::Outcome { .. } => {}
+                LinkEvent::Flow(_) | LinkEvent::Outcome { .. } => {}
             }
         }
     }
@@ -451,14 +492,50 @@ impl Link {
     /// `delivery-count + link-credit`, so granting 10 twice grants 10 and a
     /// `flow` that is duplicated or overtaken cannot inflate anything. Clears
     /// `drain`, because a grant and a drain are opposite requests.
+    ///
+    /// Refused where the sender could then deliver more unsettled messages
+    /// than this end can keep state for: the receiver's unsettled map is
+    /// bounded ([`DEFAULT_MAX_UNSETTLED`](crate::settlement::DEFAULT_MAX_UNSETTLED)),
+    /// a delivery that arrives unsettled when it is full is refused with
+    /// `amqp:resource-limit-exceeded`, and the way for an application never to
+    /// meet that is to grant no more than it holds room for. A link whose
+    /// sender settles everything as it sends records nothing, so its credit
+    /// is not limited by the map.
     pub async fn grant_credit(&self, credit: u32) -> Result<()> {
         self.role_must_be(Role::Receiver, "grant credit")?;
+        self.check_room_for(credit)?;
         {
             let mut state = self.shared.credit.lock().expect("not poisoned");
             state.grant(credit);
             state.set_drain(false);
         }
         self.send_flow(false).await
+    }
+
+    /// Refuses a grant of `credit` where the unsettled map could not hold what
+    /// it lets arrive.
+    fn check_room_for(&self, credit: u32) -> Result<()> {
+        let settles_on_send = matches!(
+            self.negotiated().map(|n| n.snd_settle_mode),
+            Some(SenderSettleMode::Settled)
+        );
+        if settles_on_send {
+            return Ok(());
+        }
+        let (held, capacity) = {
+            let map = self.shared.unsettled.lock().expect("not poisoned");
+            (map.len(), map.capacity())
+        };
+        let room = capacity.saturating_sub(held);
+        if usize::try_from(credit).is_ok_and(|credit| credit <= room) {
+            return Ok(());
+        }
+        Err(Error::Configuration(format!(
+            "granting {credit} credit on link {} could let the sender deliver more unsettled \
+             messages than this end can keep state for: it holds {held} of at most {capacity}, \
+             so at most {room} may be granted until some are settled",
+            self.shared.name
+        )))
     }
 
     /// A **receiver**: asks the sender to drain.
@@ -586,7 +663,16 @@ impl Link {
     /// cover deliveries from many links of the session provided they all have
     /// this role", and a receiver acknowledging a batch writes one frame
     /// rather than one per message. Deliveries in the range that this end no
-    /// longer holds are simply not there — that is idempotence, not an error.
+    /// longer holds are simply not there — that is idempotence, not an error:
+    /// one it already settled, one the sender settled as it sent it, and one
+    /// that was never delivered all need no frame, and `Ok` is the true
+    /// answer for each. Every delivery this end *did* hand to the
+    /// application unsettled is held, because a delivery that could not be
+    /// recorded is refused instead of delivered.
+    ///
+    /// An error where the acknowledgement could not reach the peer: the
+    /// connection is gone, or the link has detached and the peer destroyed
+    /// what it held for these deliveries, so they will be offered again.
     pub async fn settle(&self, first: u32, last: u32, outcome: &Outcome) -> Result<()> {
         // A sender may also publish a state — that is the `second` dance's
         // second half — but naming an outcome is the receiver's move.
@@ -594,9 +680,18 @@ impl Link {
             self.negotiated().map(|n| n.rcv_settle_mode),
             Some(ReceiverSettleMode::Second)
         );
+        let detached = match self.state() {
+            LinkState::Detached(condition) => Some(condition),
+            _ => None,
+        };
         let covered = {
             let mut map = self.shared.unsettled.lock().expect("not poisoned");
             let covered = map.ids_in(first, last);
+            if let Some(condition) = detached
+                && !covered.is_empty()
+            {
+                return Err(Error::Closed(condition));
+            }
             for id in &covered {
                 // Under `second` this end does *not* settle yet: it publishes
                 // the outcome and waits for the sender to settle first, which
@@ -678,7 +773,9 @@ impl Link {
     /// is what makes a large message dribble out under a tight window instead
     /// of violating it.
     pub async fn send(&self, message: &Message<'_>) -> Result<Sent> {
-        self.send_payload(&message.to_vec()?).await
+        let mut payload = Vec::with_capacity(SEND_PAYLOAD_ROOM);
+        message.encode(&mut payload)?;
+        self.send_payload(&payload).await
     }
 
     /// A **sender**: sends already-encoded message sections.
@@ -690,7 +787,7 @@ impl Link {
         self.role_must_be(Role::Sender, "send")?;
         let settled = matches!(self.settle_mode(), SenderSettleMode::Settled);
         let tag = self.next_tag();
-        let budget = self.frame_budget(&tag)?;
+        let budget = self.shared.frame_budget;
 
         // One unit of link credit, for the message. Taken before the first
         // frame and not per frame: "one unit of link-credit permits the
@@ -737,7 +834,7 @@ impl Link {
                         .unsettled
                         .lock()
                         .expect("not poisoned")
-                        .insert(delivery_id, tag.clone());
+                        .insert(delivery_id, &tag);
                 }
             }
             let fragment = &payload[offset..end];
@@ -771,7 +868,7 @@ impl Link {
 
         Ok(Sent {
             delivery_id,
-            delivery_tag: tag,
+            delivery_tag: tag.to_vec(),
             frames,
             settled,
         })
@@ -808,33 +905,11 @@ impl Link {
     /// without a random source — and the field allows 32 octets, so eight is
     /// a quarter of the budget for a number that cannot repeat before the
     /// connection has outlived everything.
-    fn next_tag(&self) -> Vec<u8> {
+    fn next_tag(&self) -> [u8; TAG_LEN] {
         let mut next = self.shared.next_tag.lock().expect("not poisoned");
         let tag = *next;
         *next = next.wrapping_add(1);
-        tag.to_be_bytes().to_vec()
-    }
-
-    /// How many payload octets fit in one frame of this delivery.
-    ///
-    /// Measured rather than guessed: the first frame's performative is the
-    /// largest one the delivery will carry — it is the frame with the id, the
-    /// tag and the format — so encoding it once and subtracting gives a
-    /// budget every frame of the delivery fits inside.
-    fn frame_budget(&self, tag: &[u8]) -> Result<usize> {
-        let mut probe = Transfer::new(self.shared.output_handle);
-        probe.delivery_id = Some(u32::MAX);
-        probe.delivery_tag = Some(tag);
-        probe.message_format = Some(0);
-        probe.settled = Some(true);
-        probe.more = true;
-        let mut scratch = Vec::new();
-        Performative::Transfer(probe).encode(&mut scratch)?;
-        let ceiling = self
-            .shared
-            .max_frame_size
-            .max(weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE) as usize;
-        Ok(ceiling.saturating_sub(FRAME_HEADER + scratch.len()).max(1))
+        tag.to_be_bytes()
     }
 
     /// Waits until this link has credit **and room to remember the delivery**,
@@ -948,7 +1023,9 @@ impl Link {
     /// Encodes one frame: a performative and, for a `transfer`, the payload
     /// that follows it in the same body.
     fn frame(&self, performative: Performative<'_>, payload: &[u8]) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
+        // Sized for the whole frame up front, so that building it never
+        // reallocates and the payload is copied exactly once.
+        let mut bytes = Vec::with_capacity(FRAME_HEADER + FRAME_PERFORMATIVE_ROOM + payload.len());
         weida_amqp_codec::frame::write(
             &mut bytes,
             weida_amqp_codec::frame::FrameKind::Amqp,
@@ -1024,10 +1101,10 @@ pub(crate) struct Links {
 #[derive(Debug)]
 pub(crate) struct Entry {
     pub(crate) shared: Arc<Shared>,
-    pub(crate) events: mpsc::Sender<LinkEvent>,
+    pub(crate) events: queue::Sender<LinkEvent>,
     pub(crate) pending: Option<oneshot::Sender<Result<Link>>>,
     pub(crate) outbound: mpsc::Sender<crate::connection::Outbound>,
-    pub(crate) rx: Option<mpsc::Receiver<LinkEvent>>,
+    pub(crate) rx: Option<queue::Receiver<LinkEvent>>,
     /// What we asked for, kept so that the answering `attach` can be read
     /// against it: the settle modes we own are ours and the ones we do not
     /// are the peer's, and only this tells them apart.
@@ -1036,6 +1113,14 @@ pub(crate) struct Entry {
     /// **this** end advertised: the bound is ours to enforce, because it is
     /// our buffer the frames land in.
     pub(crate) reassembly: Reassembly,
+    /// Whether any frame of the delivery being received said it was settled.
+    ///
+    /// "For subsequent transfers in a multi-transfer delivery if the settled
+    /// flag is left unset then it MUST be interpreted as true if and only if
+    /// the value of the settled flag on any of the preceding transfers for
+    /// the delivery is true" (Part 2 §2.7.5), so the last frame's flag alone
+    /// does not say whether the delivery is settled.
+    pub(crate) delivery_settled: bool,
 }
 
 /// What one incoming frame for a link amounts to.
@@ -1053,11 +1138,20 @@ pub(crate) enum Incoming {
 impl Entry {
     /// One `transfer` frame for this link.
     ///
-    /// Three things happen here and the order matters: the delivery's
-    /// identity is checked, the payload is appended **under the
-    /// `max-message-size` bound**, and the receiver's credit is spent once
-    /// per delivery rather than once per frame.
-    pub(crate) fn accept_transfer(&mut self, transfer: &Transfer<'_>, payload: &[u8]) -> Incoming {
+    /// Four things happen here and the order matters. The delivery's identity
+    /// is checked. The receiver's credit is spent, once per delivery rather
+    /// than once per frame, and a delivery that no credit this end ever
+    /// granted covers is refused: the bound on what a sender can make this
+    /// end hold is the credit it granted itself. The unsettled map is
+    /// checked for room, because a delivery handed to the application that
+    /// could not be recorded could never be acknowledged. And the payload is
+    /// taken **under the `max-message-size` bound**.
+    ///
+    /// A delivery that fits one frame, which is nearly all of them, is handed
+    /// on as a slice of the frame it arrived in: nothing is reassembled and
+    /// nothing is copied. Only one that takes several frames is gathered in
+    /// a buffer of its own.
+    pub(crate) fn accept_transfer(&mut self, transfer: &Transfer<'_>, payload: Bytes) -> Incoming {
         if self.shared.role == Role::Sender {
             // A sending link has no incoming deliveries; the peer has the
             // roles the wrong way round and there is nothing to reassemble.
@@ -1075,7 +1169,8 @@ impl Entry {
         // forbids outright: "deliveries on one link MUST NOT interleave".
         // Reported here rather than left to the payload check, because the
         // octets of two messages concatenated are not a message.
-        let interleaving = self.reassembly.in_progress()
+        let in_progress = self.reassembly.in_progress();
+        let interleaving = in_progress
             && transfer
                 .delivery_tag
                 .is_some_and(|tag| self.reassembly.delivery_tag() != Some(tag));
@@ -1089,64 +1184,146 @@ impl Entry {
             ));
         }
 
-        let first = !self.reassembly.in_progress();
-        if first {
-            let within = self
+        if !in_progress {
+            // The first frame of a delivery is where its credit and its room
+            // are spent.
+            if !self
                 .shared
                 .credit
                 .lock()
                 .expect("not poisoned")
-                .record_received();
-            if !within {
-                // The specification lets a receiver either handle the excess
-                // or detach with `amqp:link:transfer-limit-exceeded`. This
-                // client handles it: the sender sent under credit we had
-                // granted and then withdrew, and dropping the message would
-                // lose it.
-                tracing::debug!(
-                    link = self.shared.name,
-                    "a delivery arrived past the credit this end had granted"
-                );
+                .record_received()
+            {
+                // "The sender MUST NOT exceed the delivery-limit", and the
+                // receiver may handle the excess or detach with
+                // `amqp:link:transfer-limit-exceeded`. Past every limit this
+                // end ever announced there is nothing to handle it against:
+                // taking it would make the number of deliveries a link holds
+                // the sender's choice and not the receiver's.
+                return Incoming::Refused(Condition::described(
+                    condition::LINK_TRANSFER_LIMIT_EXCEEDED,
+                    format!(
+                        "a delivery arrived on link {} past every limit this end had granted",
+                        self.shared.name
+                    ),
+                ));
+            }
+            self.delivery_settled = false;
+            if transfer.settled != Some(true)
+                && !self
+                    .shared
+                    .unsettled
+                    .lock()
+                    .expect("not poisoned")
+                    .has_room()
+            {
+                return Incoming::Refused(Condition::described(
+                    condition::RESOURCE_LIMIT_EXCEEDED,
+                    format!(
+                        "link {} holds as many unsettled deliveries as it can keep state for, \
+                         and another arrived",
+                        self.shared.name
+                    ),
+                ));
             }
         }
+        if transfer.settled == Some(true) {
+            self.delivery_settled = true;
+        }
 
-        match self.reassembly.accept(transfer, payload) {
+        // One frame is the whole delivery: no reassembly, and the payload is
+        // the frame's own octets.
+        if !in_progress && !transfer.more && !transfer.aborted {
+            let max = self.reassembly.max_message_size();
+            let size = payload.len() as u64;
+            if max != 0 && size > max {
+                return Incoming::Refused(Condition::described(
+                    condition::LINK_MESSAGE_SIZE_EXCEEDED,
+                    DecodeError::MessageTooLarge { size, max }.to_string(),
+                ));
+            }
+            return self.complete(
+                transfer.delivery_id.unwrap_or_default(),
+                transfer.delivery_tag.unwrap_or_default(),
+                transfer.message_format.unwrap_or_default(),
+                payload,
+            );
+        }
+
+        match self.reassembly.accept(transfer, &payload) {
             Ok(Progress::Incomplete { .. }) => Incoming::Nothing,
             Ok(Progress::Aborted) => {
                 // "Discard everything transferred for this delivery"; it is
                 // implicitly settled, so there is nothing to answer either.
                 tracing::debug!(link = self.shared.name, "the sender aborted a delivery");
+                self.delivery_settled = false;
                 Incoming::Nothing
             }
             Ok(Progress::Complete) => {
                 let delivery_id = self.reassembly.delivery_id().unwrap_or_default();
-                let tag = self.reassembly.delivery_tag().unwrap_or_default().to_vec();
                 let format = self.reassembly.message_format().unwrap_or_default();
-                let settled = transfer.settled.unwrap_or(false);
-                Incoming::Delivery(Delivery::new(
-                    delivery_id,
-                    tag,
-                    format,
-                    settled,
-                    self.shared.output_handle,
-                    self.reassembly.take(),
-                ))
+                let mut tag = [0u8; MAX_TAG];
+                let held = self.reassembly.delivery_tag().unwrap_or_default();
+                let len = held.len().min(MAX_TAG);
+                tag[..len].copy_from_slice(&held[..len]);
+                let payload = Bytes::from(self.reassembly.take());
+                self.complete(delivery_id, &tag[..len], format, payload)
             }
             Err(error) => {
                 // `MessageTooLarge` is the one that matters: the codec
                 // refused it before the buffer grew, and
                 // `amqp:link:message-size-exceeded` is the condition that
                 // exists so a receiver can say no.
-                let condition =
-                    if matches!(error, weida_amqp_codec::DecodeError::MessageTooLarge { .. }) {
-                        condition::LINK_MESSAGE_SIZE_EXCEEDED
-                    } else {
-                        condition::NOT_ALLOWED
-                    };
+                let condition = if matches!(error, DecodeError::MessageTooLarge { .. }) {
+                    condition::LINK_MESSAGE_SIZE_EXCEEDED
+                } else {
+                    condition::NOT_ALLOWED
+                };
                 self.reassembly.reset();
+                self.delivery_settled = false;
                 Incoming::Refused(Condition::described(condition, error.to_string()))
             }
         }
+    }
+
+    /// A delivery all of whose octets are in: recorded where it has to be, and
+    /// handed to the application.
+    fn complete(
+        &mut self,
+        delivery_id: u32,
+        tag: &[u8],
+        message_format: u32,
+        payload: Bytes,
+    ) -> Incoming {
+        let settled = std::mem::take(&mut self.delivery_settled);
+        // The sender has not settled, so this end keeps state for the
+        // delivery until the application says what happened. One that
+        // arrived settled is recorded nowhere: there is nothing to answer
+        // and nothing the answer could change.
+        if !settled
+            && !self
+                .shared
+                .unsettled
+                .lock()
+                .expect("not poisoned")
+                .insert(delivery_id, tag)
+        {
+            return Incoming::Refused(Condition::described(
+                condition::RESOURCE_LIMIT_EXCEEDED,
+                format!(
+                    "link {} could not record delivery {delivery_id}: its unsettled map is full",
+                    self.shared.name
+                ),
+            ));
+        }
+        Incoming::Delivery(Delivery::new(
+            delivery_id,
+            tag.to_vec(),
+            message_format,
+            settled,
+            self.shared.output_handle,
+            payload,
+        ))
     }
 
     /// The peer's `flow` for this link.
@@ -1192,20 +1369,12 @@ impl Entry {
         self.shared.flow.notify_waiters();
     }
 
-    /// Records a delivery that arrived unsettled, so that the application's
-    /// `disposition` has something to name.
-    pub(crate) fn arrived(&self, delivery_id: u32, tag: Vec<u8>) {
-        self.shared
-            .unsettled
-            .lock()
-            .expect("not poisoned")
-            .insert(delivery_id, tag);
-    }
-
     /// Applies a `disposition` covering `first..=last` to this link.
     ///
     /// Returns what each delivery amounted to, paired with its id, so that
-    /// the driver can answer and report without holding the map.
+    /// the driver can answer and report without holding the map. Nothing is
+    /// allocated where this link holds none of the ids, which is most of the
+    /// links a session-wide `disposition` is offered to.
     pub(crate) fn accept_disposition(
         &mut self,
         first: u32,
@@ -1215,6 +1384,9 @@ impl Entry {
     ) -> Vec<(u32, Settlement)> {
         let mut map = self.shared.unsettled.lock().expect("not poisoned");
         let covered = map.ids_in(first, last);
+        if covered.is_empty() {
+            return Vec::new();
+        }
         let applied = covered
             .into_iter()
             .map(|id| {
@@ -1489,6 +1661,43 @@ pub(crate) fn flow_frame(
 /// Eight octets: `SIZE`, `DOFF`, `TYPE` and two type-specific bytes.
 const FRAME_HEADER: usize = 8;
 
+/// Room reserved in a frame buffer for the performative ahead of the payload.
+///
+/// A `transfer` carrying its identity is the largest performative a link
+/// writes with a payload and is about thirty octets; the rest are shorter.
+/// A guess that is a little high costs a few spare octets, and one that is
+/// low costs one reallocation, so it is not measured per frame.
+const FRAME_PERFORMATIVE_ROOM: usize = 64;
+
+/// What a typical message encodes to, reserved up front so that encoding one
+/// rarely reallocates. A larger message grows the buffer as it must.
+const SEND_PAYLOAD_ROOM: usize = 256;
+
+/// The delivery-tags this end chooses: a counter, eight octets.
+const TAG_LEN: usize = 8;
+
+/// How many payload octets fit in one frame of a delivery on `handle`.
+///
+/// Measured rather than guessed: the first frame's performative is the
+/// largest one the delivery will carry — it is the frame with the id, the
+/// tag and the format — so encoding it once and subtracting gives a budget
+/// every frame of the delivery fits inside. It depends only on the handle,
+/// the tag's length and the peer's frame ceiling, none of which change while
+/// the link lives, so it is worked out when the link is attached.
+pub(crate) fn frame_budget(handle: u32, max_frame_size: u32) -> Result<usize> {
+    let tag = [0u8; TAG_LEN];
+    let mut probe = Transfer::new(handle);
+    probe.delivery_id = Some(u32::MAX);
+    probe.delivery_tag = Some(&tag);
+    probe.message_format = Some(0);
+    probe.settled = Some(true);
+    probe.more = true;
+    let mut scratch = Vec::with_capacity(FRAME_PERFORMATIVE_ROOM);
+    Performative::Transfer(probe).encode(&mut scratch)?;
+    let ceiling = max_frame_size.max(weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE) as usize;
+    Ok(ceiling.saturating_sub(FRAME_HEADER + scratch.len()).max(1))
+}
+
 /// The word for a role, for an error message a person has to read.
 const fn role_name(role: Role) -> &'static str {
     match role {
@@ -1515,7 +1724,7 @@ mod tests {
     }
 
     fn entry(name: &str, role: Role, handle: u32) -> Entry {
-        let (events, rx) = mpsc::channel(4);
+        let (events, rx) = events();
         let (outbound, _) = mpsc::channel(4);
         Entry {
             shared: Arc::new(Shared {
@@ -1533,6 +1742,7 @@ mod tests {
                 session: session_shared(),
                 flow: Notify::new(),
                 max_frame_size: weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE,
+                frame_budget: 400,
                 next_tag: Mutex::new(0),
                 unsettled: Mutex::new(Unsettled::new(crate::settlement::DEFAULT_MAX_UNSETTLED)),
             }),
@@ -1542,6 +1752,7 @@ mod tests {
             rx: Some(rx),
             options: Box::new(LinkOptions::sender(name, Target::at("q"))),
             reassembly: Reassembly::new(DEFAULT_MAX_MESSAGE_SIZE),
+            delivery_settled: false,
         }
     }
 

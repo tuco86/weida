@@ -87,6 +87,19 @@ pub enum DecodeError {
         cap: u32,
     },
 
+    /// A decode declared more zero-width array elements than the caller's
+    /// [`Limits::max_zero_width_elements`](crate::Limits::max_zero_width_elements)
+    /// allows, summed over every array read so far. Reported from the array
+    /// header, before the elements are reserved or built, because an array of
+    /// `null` costs no octets per element and is otherwise unbounded by the
+    /// input.
+    ZeroWidthElementsExceeded {
+        /// What the header declared, in zero-width elements.
+        declared: u32,
+        /// The caller's allowance for one decode.
+        cap: u32,
+    },
+
     /// A `string` was not UTF-8.
     InvalidUtf8,
 
@@ -305,6 +318,12 @@ impl fmt::Display for DecodeError {
                 write!(f, "declared {declared} elements, cap is {cap}")
             }
             Self::DepthExceeded { cap } => write!(f, "nesting deeper than {cap}"),
+            Self::ZeroWidthElementsExceeded { declared, cap } => {
+                write!(
+                    f,
+                    "{declared} zero-width array elements exceed the budget of {cap} per decode"
+                )
+            }
             Self::InvalidUtf8 => f.write_str("string is not UTF-8"),
             Self::NonAsciiSymbol => f.write_str("symbol is not ASCII"),
             Self::InvalidChar(value) => {

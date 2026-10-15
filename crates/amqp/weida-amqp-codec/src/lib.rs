@@ -72,7 +72,14 @@
 //! announce 2^32-1 elements. Every decode entry point therefore takes
 //! [`Limits`] as an **argument**, and the declared count is refused from the
 //! header alone — before a single element is looked at and before anything is
-//! reserved. Nothing in this crate reserves memory on behalf of a peer.
+//! reserved. Zero-width array elements (`null`, `true`, `false`, `uint0`,
+//! `ulong0`, `list0`) occupy no octets, so their count is charged from the
+//! array header to [`Limits::max_zero_width_elements`], one allowance per
+//! decode that every array of the decode shares. Nothing else is reserved on a
+//! peer's count: what remains is proportional to the input, one [`Value`] of
+//! 48 octets per octet at worst, and about 120 octets of heap per described
+//! array element (its wrapper and its inner value), plus two `Value`s per unit
+//! of the zero-width allowance.
 //!
 //! The connection-level bounds — `max-frame-size` with its 512-octet floor,
 //! `channel-max`, `handle-max`, `max-message-size` — belong to the frame and
