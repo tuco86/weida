@@ -294,6 +294,129 @@ async fn stalled_publishes_keep_their_order() {
     assert_eq!(publish.topic, "b", "the oldest waiting publish goes first");
 }
 
+/// A publish whose future was dropped while it waited for the quota is not
+/// sent when the quota frees: its caller was told it did not happen, and a
+/// retry would otherwise be a duplicate.
+#[tokio::test]
+async fn a_cancelled_stalled_publish_is_never_sent() {
+    let server = Server::start(vec![
+        Act::Send(connack(Properties {
+            receive_maximum: Some(1),
+            ..Properties::new()
+        })),
+        Act::Expect, // A, unanswered: the quota is spent
+        Act::Idle(Duration::from_millis(800)),
+        Act::Send(bytes(&Packet::Puback(Puback::new(1)))),
+        Act::Expect, // what the freed quota admits
+        Act::Idle(Duration::from_millis(500)),
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let (client, _events) = within(Client::connect(
+        &context,
+        &server.address(),
+        harness::options("cancelled"),
+    ))
+    .await
+    .expect("connects");
+    let client = Arc::new(client);
+
+    let first = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            let _ = client
+                .publish(Message::new("a", "x").at(QoS::AtLeastOnce))
+                .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(100),
+        client.publish(Message::new("b", "x").at(QoS::AtLeastOnce)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the publish is stalled and times out");
+    let last = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            let _ = client
+                .publish(Message::new("c", "x").at(QoS::AtLeastOnce))
+                .await;
+        })
+    };
+
+    let started = Instant::now();
+    let next = loop {
+        let seen = server.seen_bytes().await;
+        if let Some(next) = seen.get(2) {
+            break next.clone();
+        }
+        assert!(started.elapsed() < DEADLINE, "nothing followed the PUBACK");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let Packet::Publish(publish) = decode(&next) else {
+        panic!("a publish follows the acknowledgement");
+    };
+    assert_eq!(publish.topic, "c", "the cancelled publish was skipped");
+    first.abort();
+    last.abort();
+}
+
+/// The queue of publishes waiting for the quota is bounded, and the entries of
+/// dropped futures do not count against the bound: a loop of timed-out
+/// publishes against a server that stopped acknowledging does not grow it,
+/// and a live one is refused once the queue holds as many as are allowed.
+#[tokio::test]
+async fn the_stalled_queue_is_bounded_and_forgets_cancelled_publishes() {
+    let server = Server::start(vec![
+        Act::Send(connack(Properties {
+            receive_maximum: Some(1),
+            ..Properties::new()
+        })),
+        Act::Expect, // A, unanswered: the quota is spent
+        Act::Idle(Duration::from_secs(5)),
+    ])
+    .await;
+    let mut options = harness::options("bounded");
+    options.limits.max_inflight = 2;
+    let context = Context::new().expect("ambient");
+    let (client, _events) = within(Client::connect(&context, &server.address(), options))
+        .await
+        .expect("connects");
+    let client = Arc::new(client);
+    let publish = |topic: &'static str| {
+        let client = Arc::clone(&client);
+        async move {
+            client
+                .publish(Message::new(topic, "x").at(QoS::AtLeastOnce))
+                .await
+        }
+    };
+
+    let mut waiting = vec![tokio::spawn(publish("a"))];
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    waiting.push(tokio::spawn(publish("live-1")));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..6 {
+        let cancelled = tokio::time::timeout(Duration::from_millis(30), publish("gone")).await;
+        assert!(cancelled.is_err(), "stalled, so it times out");
+    }
+    waiting.push(tokio::spawn(publish("live-2")));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let refused = within(publish("one-too-many")).await;
+    assert!(
+        matches!(refused, Err(Error::QuotaExhausted { .. })),
+        "{refused:?}"
+    );
+    for handle in &waiting {
+        assert!(!handle.is_finished(), "the live publishes still wait");
+    }
+    for handle in waiting {
+        handle.abort();
+    }
+}
+
 /// One PUBLISH with more User Properties than this client keeps is delivered
 /// with the first of them and says so, is acknowledged like any other, and
 /// costs the connection nothing.
@@ -432,7 +555,7 @@ async fn publishes_within(stream: &mut TcpStream, window: Duration) -> Vec<u16> 
 fn stored(topic: &str, payload: Vec<u8>) -> Arc<StoredPublish> {
     Arc::new(StoredPublish {
         topic: topic.into(),
-        payload,
+        payload: payload.into(),
         qos: QoS::AtLeastOnce,
         retain: false,
         payload_format_indicator: None,

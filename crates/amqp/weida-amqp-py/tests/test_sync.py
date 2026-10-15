@@ -12,6 +12,9 @@ The peer runs in its own thread with its own asyncio loop, because the point
 of this surface is that the *client's* thread has none.
 """
 
+import asyncio
+import os
+import signal
 import threading
 import time
 
@@ -191,3 +194,37 @@ def test_the_two_surfaces_raise_the_same_classes():
     with pytest.raises(weida_amqp.Configuration):
         sync.connect("127.0.0.1", 1, max_frame_size=511)
     assert issubclass(weida_amqp.Configuration, weida_amqp.AmqpError)
+
+
+def test_ctrl_c_ends_next_delivery_and_the_next_delivery_is_not_lost():
+    """Ctrl-C ends a wait with no deadline, and the delivery that arrives after
+    it is the one the next call gets: the call polls its own future, so an
+    interrupted one can have consumed nothing."""
+    go = threading.Event()
+
+    async def script(peer):
+        await peer.handshake()
+        await peer.answer_begin()
+        await peer.answer_attach(role_is_sender=True)
+        await peer.read_performative()  # the flow
+        await asyncio.to_thread(go.wait, DEADLINE)
+        await peer.send_transfer(data_section(b"after the interrupt"))
+        await peer.expect_close()
+
+    port, _ = peer_thread(script)
+    connection = sync.connect("127.0.0.1", port, container_id="test")
+    session = connection.begin()
+    receiver = session.attach("invoices", "receiver", "/queues/invoices")
+    receiver.grant_credit(1)
+
+    threading.Timer(0.4, os.kill, (os.getpid(), signal.SIGINT)).start()
+    with pytest.raises(KeyboardInterrupt):
+        receiver.next_delivery()
+    go.set()
+
+    delivery = receiver.next_delivery(timeout=DEADLINE)
+    assert delivery is not None
+    assert delivery.body() == b"after the interrupt"
+    receiver.accept(delivery.delivery_id)
+
+    connection.close()

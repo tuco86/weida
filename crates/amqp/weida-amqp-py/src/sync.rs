@@ -26,16 +26,24 @@
 //!
 //! # The operation runs on the reactor, and this thread waits for it
 //!
-//! Each call spawns the library's future on the connection's reactor and
-//! blocks on the join handle. Two reasons, and the second is the load-bearing
-//! one:
+//! Each call but one spawns the library's future on the connection's reactor
+//! and blocks on the join handle, with the wait [`interruptible`]. Two
+//! reasons, and the second is the load-bearing one:
 //!
 //! * the reactor's threads drive the connection, so a caller that parked one
 //!   of them would be waiting for a worker that is waiting for it;
 //! * AMQP's own operations use **timers** — the handshake deadline, the idle
 //!   timeout, a receive bound — and a tokio timer only runs inside a tokio
-//!   context. A future polled by `futures::executor::block_on` off the
-//!   runtime would panic the first time it armed one.
+//!   context, which a future polled by `futures::executor::block_on` off the
+//!   runtime would not have.
+//!
+//! **`next_delivery` is the one that is polled here instead**, on the calling
+//! thread, inside the runtime's context ([`interruptible`] enters it). It
+//! takes a delivery off the link, and a task that took one after its caller
+//! was interrupted would be holding a delivery nobody can read: consumed from
+//! the link, never settled, its credit spent. A future polled by the thread
+//! that waits for it consumes only what that thread is about to return, so a
+//! Ctrl-C that drops it has dropped nothing.
 //!
 //! # The GIL is released while blocked
 //!
@@ -50,7 +58,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use weida_amqp::session::SessionOptions;
 use weida_amqp::{Connection, Error, Link, Session};
-use weida_py_core::{Bridge, Slot, duration};
+use weida_py_core::{Bridge, Slot, duration, interruptible};
 use weida_runtime::OwnedReactor;
 
 use crate::connection::{drive, open, options_from};
@@ -282,16 +290,16 @@ impl SyncLink {
             .map(|seconds| duration("timeout", seconds))
             .transpose()
             .map_err(|error| errors::configuration(py, error.to_string()))?;
-        let slot = Arc::clone(&self.inner);
-        let exec = self.bridge.exec().clone();
-        let delivery = drive(py, self.bridge.exec(), async move {
+        let slot = &self.inner;
+        let exec = self.bridge.exec();
+        let delivery = interruptible(py, exec, move || async move {
             let mut link = slot.acquire().await;
             match limit {
-                None => Ok(next_of(&mut link).await),
+                None => next_of(&mut link).await,
                 // A bound that elapses leaves the link usable: the receive is
                 // dropped at its await point, and AMQP has no receive deadline
                 // for the library to keep.
-                Some(limit) => Ok(exec.within(limit, next_of(&mut link)).await.flatten()),
+                Some(limit) => exec.within(limit, next_of(&mut link)).await.flatten(),
             }
         })?;
         Ok(delivery.map(PyDelivery::of))

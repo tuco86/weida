@@ -24,15 +24,13 @@
 //! exactly where no test looked.
 
 use std::pin::Pin;
-use std::sync::Arc;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use weida_py_core::Errno;
+use weida_py_core::{Errno, Live, Retirable};
 use weida_zmq::{Device, Multipart, ProxyStatistics, Result};
 
 use crate::errors::errno_of;
-use crate::lease::{Lease, Slot};
 
 /// A boxed future, so that an `async fn` in a trait can be dyn-compatible.
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -48,7 +46,7 @@ pub trait ErasedDevice: Send {
 }
 
 /// A leased socket as an erased device.
-struct Leased<S: Device + Send + 'static>(Lease<S>);
+struct Leased<S: Device + Send + 'static>(Live<S>);
 
 impl<S: Device + Send + 'static> ErasedDevice for Leased<S> {
     fn receives(&self) -> bool {
@@ -88,9 +86,9 @@ pub type Leasing = Pin<Box<dyn Future<Output = Result<Erased, Errno>> + Send + '
 
 /// Builds the leasing future for one socket class. Called from the socket
 /// macro, which is the only place that has the slot.
-pub fn leasing<S: Device + Send + 'static>(slot: &Arc<Slot<S>>) -> Leasing {
-    let slot = Arc::clone(slot);
-    Box::pin(async move { Ok(Erased(Box::new(Leased(slot.acquire().await?)))) })
+pub fn leasing<S: Device + Send + 'static>(slot: &Retirable<S>) -> Leasing {
+    let slot = slot.clone();
+    Box::pin(async move { Ok(Erased(Box::new(Leased(crate::ops::lease(&slot).await?)))) })
 }
 
 /// Takes a socket of this module as a device end.

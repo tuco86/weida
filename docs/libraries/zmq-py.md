@@ -63,7 +63,8 @@ call.
 | `zmq.curve_keypair()` | `weida_zmq.curve_keypair()` | present |
 | GSSAPI | — | absent: libzmq's own manual deprecates it in favour of ZAP, and the options are refused with that reason |
 | `zmq.auth`, `zmq.auth.thread.ThreadAuthenticator` | — | absent as a *framework*: ZAP here is a REP socket the application binds to `inproc://zeromq.zap.01`, which is what 27/ZAP is. A handler is ~10 lines of Python (`tests/test_security.py::ZapHandler`) and needs no thread of its own. What pyzmq's authenticator adds — an allow/deny list, a password file, a certificate directory — is policy this binding does not ship. |
-| `CurveKey`, `RoutingId`, `ZapUserId` as types | present | distinct Python types with no conversion between them and none to any weida identity |
+| `CurveKey`, `RoutingId`, `ZapUserId` as types | present | distinct Python types with no conversion between them and none to any weida identity. `CurveKey` is one type for the public and the secret half, so it treats every key as a secret: its `repr` names the type and prints no octets, `hash()` is keyed per process, and `==` compares every octet (`test_security.py::test_a_curve_key_never_shows_its_octets_in_a_repr_or_a_str`) |
+| `zmq.Socket.close()` from another thread while `recv()` is parked | `sync` sockets: the parked call raises `ENOTSOCK` and `close()` returns | present: a wait with no deadline ends on `close()` from any thread and on Ctrl-C on the main one (`test_sync.py::test_close_from_another_thread_ends_a_receive_with_no_deadline`, `test_ctrl_c_ends_a_receive_with_no_peer_and_no_deadline`); every other call on the socket queues behind a parked receive, as two coroutines do on the asyncio surface |
 
 ## 5. Options
 

@@ -145,7 +145,9 @@ pub enum Error {
     /// "At zero the sender MUST NOT send further QoS > 0 PUBLISH packets"
     /// ([MQTT-4.9.0-2]) [mqtt5 §5]. Exhaustion "stalls the sender rather than
     /// exceeding it", so a publish path waits for room; this variant is for a
-    /// caller that asked not to wait.
+    /// caller that asked not to wait, and for a publish that found the queue
+    /// of waiting ones full ([`crate::Limits::max_inflight`] entries or
+    /// [`crate::Limits::max_inflight_bytes`] bytes).
     QuotaExhausted {
         /// The ceiling in force: the server's `Receive Maximum`.
         quota: u16,

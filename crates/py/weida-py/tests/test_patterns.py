@@ -169,6 +169,39 @@ def test_a_streamed_transfer_is_written_and_read_in_pieces():
     run(exchange())
 
 
+def test_a_read_ceiling_is_a_bound_on_the_piece_and_not_an_allocation():
+    """`read(2**40)` used to ask the allocator for a terabyte and abort the
+    interpreter; a ceiling this large is a read of whatever is there."""
+
+    async def exchange():
+        _server, binding, url = await served("/ingest")
+        puller = binding.puller("/ingest")
+
+        client = weida.Runtime()
+        pusher = client.pusher(weida.Trust.by_address())
+        await pusher.connect(url)
+
+        async def drain():
+            stream, _meta = await puller.recv_stream()
+            pieces = []
+            for ceiling in (2**40, 2**63, 2**64 - 1, 1 << 20):
+                piece = await stream.read(ceiling)
+                assert len(piece) <= 1 << 20
+                pieces.append(piece)
+            while piece := await stream.read(2**40):
+                pieces.append(piece)
+            return b"".join(pieces)
+
+        draining = asyncio.create_task(drain())
+        out = await pusher.open()
+        await out.write(b"d" * 3000)
+        await out.finish()
+
+        assert await draining == b"d" * 3000
+
+    run(exchange())
+
+
 def test_a_streamed_exchange_reads_the_reply_while_writing():
     async def exchange():
         _server, binding, url = await served("/echo")

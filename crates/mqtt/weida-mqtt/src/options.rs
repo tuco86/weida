@@ -138,7 +138,8 @@ pub struct ConnectOptions {
     pub limits: Limits,
     /// How long the whole connect may take: resolving the address, dialling,
     /// the TLS handshake, the CONNECT, the AUTH exchange and the CONNACK.
-    /// Unquantified by the specification [mqtt5 §1]; finite here.
+    /// Unquantified by the specification [mqtt5 §1]; finite here. Non-zero
+    /// and at most [`MAX_TIMEOUT`], as are the two below.
     pub connect_timeout: Duration,
     /// How long to wait for a PINGRESP before treating the connection as
     /// dead. Unquantified by the specification [mqtt5 §1]; see the module
@@ -253,12 +254,16 @@ impl ConnectOptions {
     /// # Errors
     ///
     /// [`Error::Configuration`] for [`Limits`] faults, a Keep Alive that
-    /// does not fit, an interval above [`MAX_INTERVAL`], and
+    /// does not fit, an interval above [`MAX_INTERVAL`], a timeout that is
+    /// zero or above [`MAX_TIMEOUT`], and
     /// `Authentication Data` without `Authentication Method`, which is a
     /// Protocol Error on the wire ([MQTT-3.1.2-33]) [mqtt5 §1].
     pub fn validate(&self) -> Result<()> {
         self.limits.validate()?;
         self.keep_alive_seconds()?;
+        check_timeout("connect_timeout", Some(self.connect_timeout))?;
+        check_timeout("ping_timeout", self.ping_timeout)?;
+        check_timeout("write_timeout", self.write_timeout)?;
 
         if self.authentication_data.is_some() && self.authentication_method.is_none() {
             return Err(Error::Configuration(
@@ -304,6 +309,13 @@ impl ConnectOptions {
 
 /// The least a default write timeout is, whatever the PINGRESP wait is.
 const MIN_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest `connect_timeout`, `ping_timeout` or `write_timeout` may be:
+/// one year. Each is added to an `Instant` to make a deadline, which panics
+/// where the sum does not fit, so a value like `Duration::MAX` meaning
+/// "never" would abort the connection task; a year is far past any real
+/// wait and far inside what every platform's clock holds.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 impl std::fmt::Debug for ConnectOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -384,6 +396,21 @@ pub(crate) fn interval_seconds(name: &str, interval: Option<Duration>) -> Result
 
 fn check_interval(name: &str, interval: Option<Duration>) -> Result<()> {
     interval_seconds(name, interval).map(|_| ())
+}
+
+/// A deadline's duration, or a refusal: zero would make every wait expire
+/// before it began, and a value above [`MAX_TIMEOUT`] cannot be added to an
+/// `Instant`.
+fn check_timeout(name: &str, timeout: Option<Duration>) -> Result<()> {
+    match timeout {
+        Some(timeout) if timeout.is_zero() => Err(Error::Configuration(format!(
+            "{name} of zero would expire every wait before it began"
+        ))),
+        Some(timeout) if timeout > MAX_TIMEOUT => Err(Error::Configuration(format!(
+            "{name} {timeout:?} exceeds the {MAX_TIMEOUT:?} a deadline may be set that far ahead"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +525,33 @@ mod tests {
         assert!(options.validate().is_err());
         options.authentication_method = Some("SCRAM-SHA-1".into());
         assert!(options.validate().is_ok());
+    }
+
+    /// A zero deadline expires before it began, and `Duration::MAX` for
+    /// "never" panics when added to an `Instant`: both are refused where the
+    /// options are checked.
+    #[test]
+    fn a_timeout_that_cannot_be_a_deadline_is_refused() {
+        let faults: [fn(&mut ConnectOptions, Duration); 3] = [
+            |options, value| options.connect_timeout = value,
+            |options, value| options.ping_timeout = Some(value),
+            |options, value| options.write_timeout = Some(value),
+        ];
+        for set in faults {
+            let mut options = ConnectOptions::new("a");
+            for refused in [
+                Duration::ZERO,
+                MAX_TIMEOUT + Duration::from_secs(1),
+                Duration::MAX,
+            ] {
+                set(&mut options, refused);
+                assert!(options.validate().is_err(), "{refused:?}");
+            }
+            set(&mut options, MAX_TIMEOUT);
+            assert!(options.validate().is_ok());
+            // The far end of what is accepted is a real deadline.
+            let _ = std::time::Instant::now() + MAX_TIMEOUT;
+        }
     }
 
     #[test]

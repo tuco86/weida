@@ -3779,6 +3779,7 @@ dependencies = [
 name = "weida-py"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
+ "bytes",
  "pyo3",
  "tokio",
  "weida",

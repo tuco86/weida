@@ -14,32 +14,52 @@
 //! #   request = replier.accept(1 << 20); request.reply(request.payload)
 //! ```
 //!
-//! # It implements nothing, and the `block_on` is not here
+//! # It is the facade, and the waits that cannot be interrupted are not
 //!
 //! This module is `weida::blocking` — not a link, because a feature-gated
 //! item is a hard rustdoc error in the configuration that lacks it —
-//! with argument conversion around it, and
-//! that is the whole of it. The facade is where the `block_on` lives, where
-//! the reactor is owned, and where the one refusal that matters is made: a
-//! call from inside a Tokio runtime would park the worker that has to drive
-//! what it is waiting for, so every entry point there checks for an ambient
-//! runtime and fails with `weida.Runtime` instead of deadlocking. A Python
-//! process has no ambient runtime, so the check is silent here — and it stays
-//! correct in a process that embeds one.
+//! with argument conversion around it. The facade is where the owned
+//! reactor lives and where the one refusal that matters is made: a call from
+//! inside a Tokio runtime would park the worker that has to drive what it is
+//! waiting for, so every entry point there checks for an ambient runtime and
+//! fails with `weida.Runtime` instead of deadlocking. A Python process has no
+//! ambient runtime, so the check is silent here — and it stays correct in a
+//! process that embeds one.
 //!
-//! Building the `block_on` again in this file would have been the second
-//! implementation [0013](../../../../docs/decisions/0013-competitor-libraries.md)
-//! §4.4 exists to prevent, and the order the other five bindings used —
-//! library facade first, binding `sync` module second — is what avoids it
-//! ([0014](../../../../docs/decisions/0014-parallel-libraries.md) §2).
+//! The facade drives its futures with `futures::executor::block_on`, and a
+//! thread parked there never returns to the interpreter: Ctrl-C,
+//! `signal.alarm` and every other signal handler would wait for the peer to
+//! speak, and a silent peer would leave the process unkillable. So the calls
+//! that wait on a peer — `accept`, `recv`, `recv_reporting` and `request`,
+//! and the `reply` and report calls that wait for the transport — are driven
+//! here instead, on the asynchronous endpoint the facade hands out for what it
+//! does not wrap, by [`weida_py_core::interruptible`]. What is written twice
+//! is the few `await`s of each call (the facade's own, including its receive
+//! deadline), never a protocol: HELLO, negotiation, dispatch and every limit
+//! are the library's.
+//!
+//! Everything else is the facade's call, with the GIL released.
 //!
 //! # The GIL is released while a call waits
 //!
-//! Every call below runs inside [`Python::detach`], so other Python threads
-//! run while one is parked in `accept` or `recv`. A blocking binding that
-//! held the GIL would make a second thread pointless, and the usual shape of
-//! a synchronous messaging program — one thread per endpoint — would be a
-//! program that serves one endpoint at a time.
+//! Every call below runs with the GIL released ([`Python::detach`]), so other
+//! Python threads run while one is parked in `accept` or `recv`. A blocking
+//! binding that held the GIL would make a second thread pointless, and the
+//! usual shape of a synchronous messaging program — one thread per endpoint —
+//! would be a program that serves one endpoint at a time.
+//!
+//! No lock is ever waited for with the GIL held while another thread holds it
+//! across a wait: a lock that is held for the length of a call is taken inside
+//! the released section, and what a getter reads is kept where no waiting call
+//! holds it.
+//!
+//! # What ends a wait that has no deadline
+//!
+//! Ctrl-C, on the main thread: it asks Python every 100 ms whether a signal
+//! handler has something to raise, and `KeyboardInterrupt` ends the call. The
+//! transfer being read when it arrives is dropped, which resets it — what
+//! cancelling an `asyncio.Task` does to the same future. A thread that is not
+//! the main one cannot receive a signal and waits for its peer.
 //!
 //! # What has no synchronous form here
 //!
@@ -55,36 +75,37 @@
 //!
 //! `Cursors.changed(seconds)` takes a **deadline** where the asyncio
 //! `Cursors.changed()` takes nothing. There `asyncio.wait_for` bounds the
-//! wait and composes; here a parked thread is interrupted by nothing — and
-//! the wait is genuinely unbounded, because a peer that never reports opens
-//! no stream, a report that never starts never ends, and a connection both
-//! sides keep alive never closes. A deadline that passes raises
+//! wait and composes; here the wait is bounded by an argument — a peer that
+//! never reports opens no stream, a report that never starts never ends, and a
+//! connection both sides keep alive never closes. A deadline that passes raises
 //! `TimeoutError`, the builtin, because it is **not** the end of the report:
 //! returning `None` for it would make a caller stop reading a verdict that is
 //! still coming.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use weida::blocking;
-use weida_py_core::{payload_of, py_bytes};
+use weida_py_core::{interruptible, payload_of, py_bytes};
 
 use crate::cursors::{level_of, reporting_meta, set_of};
 use crate::errors::raise;
+use crate::lock::locked;
 use crate::values::{
     PyConnectionStats, PyDishDrops, PyIdentity, PyIncomingMeta, PySurvey, PyTrust,
 };
 
+/// What a call on a spent runtime, request or report is told.
+fn spent_error(what: &str) -> weida::Error {
+    weida::Error::Runtime(format!("this {what} was already shut down"))
+}
+
 /// What a call on a spent runtime gets.
 fn spent<T>(py: Python<'_>, what: &str) -> PyResult<T> {
-    raise(
-        py,
-        Err(weida::Error::Runtime(format!(
-            "this {what} was already shut down"
-        ))),
-    )
+    raise(py, Err(spent_error(what)))
 }
 
 /// A latency budget in seconds, or none.
@@ -98,12 +119,158 @@ fn seconds(py: Python<'_>, max_age: Option<f64>) -> PyResult<Option<std::time::D
     )
 }
 
+/// What a call that waits on a peer takes from the runtime its endpoint
+/// belongs to: the executor it waits with, and the receive deadline.
+///
+/// Cloned into every endpoint when the endpoint is made, from the facade's own
+/// runtime, so a call needs nothing from the interpreter's side to know whose
+/// clock it is on.
+#[derive(Clone)]
+struct Waiter {
+    runtime: weida::Runtime,
+}
+
+impl Waiter {
+    fn of(runtime: &blocking::Runtime) -> Waiter {
+        Waiter {
+            runtime: runtime.runtime().clone(),
+        }
+    }
+
+    /// Drives the future `work` builds with the GIL released, until it
+    /// finishes or a Python signal handler raises, and maps the library's
+    /// failure onto its class.
+    ///
+    /// A signal drops the future where it stands, which is what cancelling an
+    /// `asyncio.Task` does to the same future on the asyncio surface: a
+    /// receive that had not produced its transfer leaves it queued.
+    fn wait<F, T>(&self, py: Python<'_>, work: impl FnOnce() -> F + Send) -> PyResult<T>
+    where
+        F: Future<Output = Result<T, weida::Error>>,
+        T: Send,
+    {
+        // What the facade refuses at every entry point: parking a reactor
+        // worker on a call that needs a reactor worker.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return raise(
+                py,
+                Err(weida::Error::Runtime(
+                    "weida.sync blocks the calling thread and was called from inside a Tokio \
+                     runtime, which would deadlock: use the asynchronous API there, or call this \
+                     from a thread the runtime does not own"
+                        .to_owned(),
+                )),
+            );
+        }
+        raise(py, interruptible(py, self.runtime.exec(), work)?)
+    }
+
+    /// Awaits one body under `RuntimeConfig::receive_timeout`. Past it the
+    /// body is dropped, which stops a transfer's stream, and the result is
+    /// `Expired`.
+    async fn bounded<T>(
+        &self,
+        body: impl Future<Output = Result<T, weida::Error>>,
+    ) -> Result<T, weida::Error> {
+        match self.runtime.config().receive_timeout {
+            None => body.await,
+            Some(limit) => self
+                .runtime
+                .exec()
+                .within(limit, body)
+                .await
+                .unwrap_or(Err(weida::Error::Expired)),
+        }
+    }
+
+    /// A transfer read whole, at most `max_bytes`, with the metadata it
+    /// arrived with.
+    async fn collected(
+        &self,
+        transfer: weida::IncomingTransfer,
+        max_bytes: usize,
+    ) -> Result<blocking::Message, weida::Error> {
+        let meta = transfer.meta().clone();
+        let payload = self.bounded(transfer.collect(max_bytes)).await?;
+        Ok(blocking::Message { payload, meta })
+    }
+
+    /// [`collected`](Waiter::collected), and the reporter the sender ordered,
+    /// if it ordered one.
+    async fn collected_reporting(
+        &self,
+        transfer: weida::IncomingTransfer,
+        max_bytes: usize,
+    ) -> Result<(blocking::Message, Option<weida::Reporter>), weida::Error> {
+        let meta = transfer.meta().clone();
+        // Taken before the payload: `collect` consumes the transfer.
+        let reporter = transfer.reporter();
+        let payload = self.bounded(transfer.collect(max_bytes)).await?;
+        Ok((blocking::Message { payload, meta }, reporter))
+    }
+
+    /// A request whose body is read whole, at most `max_bytes`.
+    async fn accepted(
+        &self,
+        mut request: weida::IncomingRequest,
+        max_bytes: usize,
+    ) -> Result<Accepted, weida::Error> {
+        let meta = request.meta().clone();
+        let payload = self.bounded(request.take_body().collect(max_bytes)).await?;
+        Ok(Accepted {
+            request,
+            message: blocking::Message { payload, meta },
+        })
+    }
+}
+
 /// `weida.sync.Runtime`: a reactor of the library's own, driven by its caller.
 #[pyclass(frozen, name = "Runtime", module = "weida.sync")]
 pub struct SyncRuntime {
     /// `None` after `shutdown` or `drain`, both of which consume the facade's
     /// runtime.
-    runtime: Mutex<Option<blocking::Runtime>>,
+    ///
+    /// A read lock for every call that uses the runtime and the write lock
+    /// for the two that consume it, and **every lock is taken inside a
+    /// released section** ([`SyncRuntime::with`]): a `bind` holds its read
+    /// lock for as long as the socket takes to bind, and a thread that waited
+    /// for it with the GIL held would keep the binding thread from ever
+    /// getting the GIL back to let go.
+    runtime: RwLock<Option<blocking::Runtime>>,
+}
+
+impl SyncRuntime {
+    /// Runs `body` on the live runtime, with the GIL released from before the
+    /// lock is taken until after it is let go, or says the runtime is spent.
+    fn with<T: Send>(
+        &self,
+        py: Python<'_>,
+        body: impl FnOnce(&blocking::Runtime) -> T + Send,
+    ) -> PyResult<T> {
+        let outcome = py.detach(|| {
+            let guard = self.runtime.read().unwrap_or_else(PoisonError::into_inner);
+            guard.as_ref().map(body)
+        });
+        match outcome {
+            Some(done) => Ok(done),
+            None => spent(py, "runtime"),
+        }
+    }
+
+    /// Takes the runtime out for good, waiting for the calls that are using it
+    /// to finish first, or says it is spent.
+    fn take(&self, py: Python<'_>) -> PyResult<blocking::Runtime> {
+        let taken = py.detach(|| {
+            self.runtime
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        });
+        match taken {
+            Some(runtime) => Ok(runtime),
+            None => spent(py, "runtime"),
+        }
+    }
 }
 
 #[pymethods]
@@ -130,7 +297,7 @@ impl SyncRuntime {
         };
         let runtime = raise(py, py.detach(|| blocking::Runtime::new(config)))?;
         Ok(SyncRuntime {
-            runtime: Mutex::new(Some(runtime)),
+            runtime: RwLock::new(Some(runtime)),
         })
     }
 
@@ -142,14 +309,13 @@ impl SyncRuntime {
                 .map_err(|e| weida::Error::InvalidAddress(format!("{addr:?}: {e}"))),
         )?;
         let fingerprint = raise(py, identity.identity.fingerprint())?.to_string();
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        let Some(runtime) = guard.as_ref() else {
-            return spent(py, "runtime");
-        };
-        let binding = raise(
-            py,
-            py.detach(|| runtime.bind_quic(socket, identity.identity.clone())),
-        )?;
+        let (binding, waiter) = self.with(py, move |runtime| {
+            (
+                runtime.bind_quic(socket, identity.identity.clone()),
+                Waiter::of(runtime),
+            )
+        })?;
+        let binding = raise(py, binding)?;
         let local = binding
             .local_addr()
             .expect("a QUIC binding has an address")
@@ -159,89 +325,77 @@ impl SyncRuntime {
             url_base: format!("weida://{fingerprint}@{local}"),
             local,
             fingerprint: Some(fingerprint),
+            waiter,
         })
     }
 
     /// Binds an in-process bus, which a client in this process dials as
     /// `weida+inproc://<bus>/<path>`.
     fn bind_inproc(&self, py: Python<'_>, bus: &str) -> PyResult<SyncBinding> {
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        let Some(runtime) = guard.as_ref() else {
-            return spent(py, "runtime");
-        };
-        let binding = raise(py, runtime.bind_inproc(bus))?;
+        let name = bus.to_owned();
+        let (binding, waiter) = self.with(py, move |runtime| {
+            (runtime.bind_inproc(&name), Waiter::of(runtime))
+        })?;
+        let binding = raise(py, binding)?;
         Ok(SyncBinding {
             binding,
             local: bus.to_owned(),
             fingerprint: None,
             url_base: format!("weida+inproc://{bus}"),
+            waiter,
         })
     }
 
     /// A requester on this runtime.
     fn requester(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncRequester> {
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        match guard.as_ref() {
-            Some(runtime) => Ok(SyncRequester {
-                endpoint: runtime.requester(trust.trust.clone()),
-            }),
-            None => spent(py, "runtime"),
-        }
+        let trust = trust.trust;
+        self.with(py, move |runtime| SyncRequester {
+            endpoint: runtime.requester(trust),
+            waiter: Waiter::of(runtime),
+        })
     }
 
     /// A pusher on this runtime.
     fn pusher(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncPusher> {
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        match guard.as_ref() {
-            Some(runtime) => Ok(SyncPusher {
-                endpoint: runtime.pusher(trust.trust.clone()),
-            }),
-            None => spent(py, "runtime"),
-        }
+        let trust = trust.trust;
+        self.with(py, move |runtime| SyncPusher {
+            endpoint: runtime.pusher(trust),
+        })
     }
 
     /// A subscriber on this runtime.
     fn subscriber(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncSubscriber> {
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        match guard.as_ref() {
-            Some(runtime) => Ok(SyncSubscriber {
-                endpoint: runtime.subscriber(trust.trust.clone()),
-            }),
-            None => spent(py, "runtime"),
-        }
+        let trust = trust.trust;
+        self.with(py, move |runtime| SyncSubscriber {
+            endpoint: runtime.subscriber(trust),
+            waiter: Waiter::of(runtime),
+        })
     }
 
     /// A dialling pair on this runtime.
     fn pair(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncPaired> {
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        match guard.as_ref() {
-            Some(runtime) => Ok(SyncPaired {
-                endpoint: runtime.pair(trust.trust.clone()),
-            }),
-            None => spent(py, "runtime"),
-        }
+        let trust = trust.trust;
+        self.with(py, move |runtime| SyncPaired {
+            endpoint: runtime.pair(trust),
+            waiter: Waiter::of(runtime),
+        })
     }
 
     /// A surveyor on this runtime.
     fn surveyor(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncSurveyor> {
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        match guard.as_ref() {
-            Some(runtime) => Ok(SyncSurveyor {
-                endpoint: runtime.surveyor(trust.trust.clone()),
-            }),
-            None => spent(py, "runtime"),
-        }
+        let trust = trust.trust;
+        self.with(py, move |runtime| SyncSurveyor {
+            endpoint: runtime.surveyor(trust),
+        })
     }
 
     /// A dish on this runtime.
     fn dish(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncDish> {
-        let guard = self.runtime.lock().expect("runtime lock poisoned");
-        match guard.as_ref() {
-            Some(runtime) => Ok(SyncDish {
-                endpoint: runtime.dish(trust.trust.clone()),
-            }),
-            None => spent(py, "runtime"),
-        }
+        let trust = trust.trust;
+        self.with(py, move |runtime| SyncDish {
+            endpoint: runtime.dish(trust),
+            waiter: Waiter::of(runtime),
+        })
     }
 
     /// Stops admitting work and waits up to `deadline` seconds for finished
@@ -253,23 +407,15 @@ impl SyncRuntime {
             std::time::Duration::try_from_secs_f64(deadline)
                 .map_err(|e| weida::Error::Runtime(format!("deadline: {e}"))),
         )?;
-        let taken = self.runtime.lock().expect("runtime lock poisoned").take();
-        match taken {
-            Some(runtime) => {
-                let drained = raise(py, py.detach(|| runtime.drain(seconds)))?;
-                Ok((drained.delivered, drained.outstanding))
-            }
-            None => spent(py, "runtime"),
-        }
+        let runtime = self.take(py)?;
+        let drained = raise(py, py.detach(move || runtime.drain(seconds)))?;
+        Ok((drained.delivered, drained.outstanding))
     }
 
     /// Closes every connection without waiting for anything in flight.
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
-        let taken = self.runtime.lock().expect("runtime lock poisoned").take();
-        match taken {
-            Some(runtime) => raise(py, py.detach(|| runtime.shutdown())),
-            None => spent(py, "runtime"),
-        }
+        let runtime = self.take(py)?;
+        raise(py, py.detach(move || runtime.shutdown()))
     }
 
     fn __repr__(&self) -> String {
@@ -288,6 +434,8 @@ pub struct SyncBinding {
     fingerprint: Option<String>,
     /// What a client's URL starts with, before the path.
     url_base: String,
+    /// Handed to the endpoints registered here, which wait on their peers.
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -312,6 +460,7 @@ impl SyncBinding {
     fn replier(&self, py: Python<'_>, path: &str) -> PyResult<SyncReplier> {
         Ok(SyncReplier {
             endpoint: raise(py, self.binding.replier(path))?,
+            waiter: self.waiter.clone(),
         })
     }
 
@@ -319,6 +468,7 @@ impl SyncBinding {
     fn puller(&self, py: Python<'_>, path: &str) -> PyResult<SyncPuller> {
         Ok(SyncPuller {
             endpoint: raise(py, self.binding.puller(path))?,
+            waiter: self.waiter.clone(),
         })
     }
 
@@ -333,6 +483,7 @@ impl SyncBinding {
     fn pair(&self, py: Python<'_>, path: &str) -> PyResult<SyncPaired> {
         Ok(SyncPaired {
             endpoint: raise(py, self.binding.pair(path))?,
+            waiter: self.waiter.clone(),
         })
     }
 
@@ -340,6 +491,7 @@ impl SyncBinding {
     fn respondent(&self, py: Python<'_>, path: &str) -> PyResult<SyncRespondent> {
         Ok(SyncRespondent {
             endpoint: raise(py, self.binding.respondent(path))?,
+            waiter: self.waiter.clone(),
         })
     }
 
@@ -347,6 +499,7 @@ impl SyncBinding {
     fn bus(&self, py: Python<'_>, path: &str, trust: PyTrust) -> PyResult<SyncBusMember> {
         Ok(SyncBusMember {
             endpoint: raise(py, self.binding.bus(path, trust.trust.clone()))?,
+            waiter: self.waiter.clone(),
         })
     }
 
@@ -366,6 +519,7 @@ impl SyncBinding {
 #[pyclass(frozen, name = "Requester", module = "weida.sync")]
 pub struct SyncRequester {
     endpoint: blocking::Requester,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -382,6 +536,9 @@ impl SyncRequester {
     }
 
     /// Sends `payload` and returns the reply, at most `max_reply_bytes`.
+    ///
+    /// Waits for the reply as long as the peer takes, and Ctrl-C ends the
+    /// wait; see the module documentation.
     fn request<'py>(
         &self,
         py: Python<'py>,
@@ -389,10 +546,14 @@ impl SyncRequester {
         max_reply_bytes: usize,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
         let body = payload_of(payload)?;
-        let reply = raise(
-            py,
-            py.detach(|| self.endpoint.request(&body, max_reply_bytes)),
-        )?;
+        let reply = self.waiter.wait(py, || async {
+            let reply = self
+                .endpoint
+                .endpoint()
+                .request_with(weida::TransferMeta::default(), &body)
+                .await?;
+            self.waiter.bounded(reply.collect(max_reply_bytes)).await
+        })?;
         Ok(py_bytes(py, &reply))
     }
 
@@ -435,9 +596,7 @@ impl SyncPusher {
         let body = payload_of(payload)?;
         let meta = reporting_meta(py, Some(body.len() as u64), report, mode)?;
         let cursors = raise(py, py.detach(|| self.endpoint.send_reporting(meta, &body)))?;
-        Ok(cursors.map(|cursors| SyncCursors {
-            cursors: Mutex::new(cursors),
-        }))
+        Ok(cursors.map(SyncCursors::new))
     }
 
     fn __repr__(&self) -> String {
@@ -449,6 +608,7 @@ impl SyncPusher {
 #[pyclass(frozen, name = "Subscriber", module = "weida.sync")]
 pub struct SyncSubscriber {
     endpoint: blocking::Subscriber,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -475,12 +635,18 @@ impl SyncSubscriber {
 
     /// Waits for the next published message, at most `max_bytes`, and
     /// returns `(payload, meta)`.
+    ///
+    /// Waits as long as the peer takes, and Ctrl-C ends the wait; see the
+    /// module documentation.
     fn recv<'py>(
         &self,
         py: Python<'py>,
         max_bytes: usize,
     ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
-        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        let message = self.waiter.wait(py, || async {
+            let transfer = self.endpoint.endpoint().recv().await?;
+            self.waiter.collected(transfer, max_bytes).await
+        })?;
         Ok((
             py_bytes(py, &message.payload),
             PyIncomingMeta::of(&message.meta),
@@ -496,6 +662,7 @@ impl SyncSubscriber {
 #[pyclass(frozen, name = "Replier", module = "weida.sync")]
 pub struct SyncReplier {
     endpoint: blocking::Replier,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -506,10 +673,17 @@ impl SyncReplier {
     }
 
     /// Waits for the next request and reads its body, at most `max_bytes`.
+    ///
+    /// Waits as long as the peer takes, and Ctrl-C ends the wait; see the
+    /// module documentation.
     fn accept(&self, py: Python<'_>, max_bytes: usize) -> PyResult<SyncRequest> {
-        let request = raise(py, py.detach(|| self.endpoint.accept(max_bytes)))?;
+        let accepted = self.waiter.wait(py, || async {
+            let request = self.endpoint.endpoint().accept().await?;
+            self.waiter.accepted(request, max_bytes).await
+        })?;
         Ok(SyncRequest {
-            request: Mutex::new(Some(request)),
+            request: Mutex::new(Some(accepted)),
+            waiter: self.waiter.clone(),
         })
     }
 
@@ -518,10 +692,26 @@ impl SyncReplier {
     }
 }
 
+/// An accepted request whose body is already read, and the reply it owes:
+/// what `weida::blocking::Request` is, built here because the call that waits
+/// for one is driven here.
+///
+/// Dropping it without a reply causes ERROR `{NO_REPLY}` on the reply half,
+/// exactly as the facade's does and for the same reason: a requester never
+/// waits out an idle timeout for an answer nobody will send.
+struct Accepted {
+    request: weida::IncomingRequest,
+    message: blocking::Message,
+}
+
 /// `weida.sync.Request`: an accepted exchange and the reply it owes.
 #[pyclass(frozen, name = "Request", module = "weida.sync")]
 pub struct SyncRequest {
-    request: Mutex<Option<blocking::Request>>,
+    /// `None` once answered. Taken, never held, for the length of a call: a
+    /// getter on another thread must not wait for a reply that is waiting for
+    /// its transport.
+    request: Mutex<Option<Accepted>>,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -529,9 +719,9 @@ impl SyncRequest {
     /// The request payload.
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let guard = self.request.lock().expect("request lock poisoned");
+        let guard = locked(&self.request);
         match guard.as_ref() {
-            Some(request) => Ok(py_bytes(py, &request.message().payload)),
+            Some(accepted) => Ok(py_bytes(py, &accepted.message.payload)),
             None => spent(py, "request"),
         }
     }
@@ -539,9 +729,9 @@ impl SyncRequest {
     /// What the DATA header said, including the proved peer.
     #[getter]
     fn meta(&self, py: Python<'_>) -> PyResult<PyIncomingMeta> {
-        let guard = self.request.lock().expect("request lock poisoned");
+        let guard = locked(&self.request);
         match guard.as_ref() {
-            Some(request) => Ok(PyIncomingMeta::of(&request.message().meta)),
+            Some(accepted) => Ok(PyIncomingMeta::of(&accepted.message.meta)),
             None => spent(py, "request"),
         }
     }
@@ -549,18 +739,29 @@ impl SyncRequest {
     /// Answers with `payload`.
     fn reply(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<()> {
         let body = payload_of(payload)?;
-        let taken = self.request.lock().expect("request lock poisoned").take();
+        let taken = locked(&self.request).take();
         match taken {
-            Some(request) => raise(py, py.detach(|| request.reply(&body))),
+            Some(accepted) => self.waiter.wait(py, move || async move {
+                let mut out = accepted
+                    .request
+                    .reply(weida::TransferMeta::default().with_content_len(body.len() as u64))
+                    .await?;
+                out.write_all(&body).await?;
+                out.finish()?;
+                Ok(())
+            }),
             None => spent(py, "request"),
         }
     }
 
     /// Declines the request, so the requester gets `weida.Rejected`.
     fn refuse(&self, py: Python<'_>) -> PyResult<()> {
-        let taken = self.request.lock().expect("request lock poisoned").take();
+        let taken = locked(&self.request).take();
         match taken {
-            Some(request) => raise(py, py.detach(|| request.refuse(weida::ErrorCode::Rejected))),
+            Some(accepted) => self.waiter.wait(py, move || async move {
+                accepted.request.refuse(weida::ErrorCode::Rejected).await;
+                Ok(())
+            }),
             None => spent(py, "request"),
         }
     }
@@ -574,6 +775,7 @@ impl SyncRequest {
 #[pyclass(frozen, name = "Puller", module = "weida.sync")]
 pub struct SyncPuller {
     endpoint: blocking::Puller,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -585,12 +787,18 @@ impl SyncPuller {
 
     /// Waits for the next transfer and reads it, at most `max_bytes`,
     /// returning `(payload, meta)`.
+    ///
+    /// Waits as long as the peer takes, and Ctrl-C ends the wait; see the
+    /// module documentation.
     fn recv<'py>(
         &self,
         py: Python<'py>,
         max_bytes: usize,
     ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
-        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        let message = self.waiter.wait(py, || async {
+            let transfer = self.endpoint.endpoint().recv().await?;
+            self.waiter.collected(transfer, max_bytes).await
+        })?;
         Ok((
             py_bytes(py, &message.payload),
             PyIncomingMeta::of(&message.meta),
@@ -612,13 +820,14 @@ impl SyncPuller {
         PyIncomingMeta,
         Option<SyncReporter>,
     )> {
-        let (message, reporter) = raise(py, py.detach(|| self.endpoint.recv_reporting(max_bytes)))?;
+        let (message, reporter) = self.waiter.wait(py, || async {
+            let transfer = self.endpoint.endpoint().recv().await?;
+            self.waiter.collected_reporting(transfer, max_bytes).await
+        })?;
         Ok((
             py_bytes(py, &message.payload),
             PyIncomingMeta::of(&message.meta),
-            reporter.map(|reporter| SyncReporter {
-                reporter: Mutex::new(Some(reporter)),
-            }),
+            reporter.map(|reporter| SyncReporter::new(reporter, self.waiter.clone())),
         ))
     }
 
@@ -666,6 +875,7 @@ impl SyncPublisher {
 #[pyclass(frozen, name = "Paired", module = "weida.sync")]
 pub struct SyncPaired {
     endpoint: blocking::Paired,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -705,19 +915,23 @@ impl SyncPaired {
         let body = payload_of(payload)?;
         let meta = reporting_meta(py, Some(body.len() as u64), report, mode)?;
         let cursors = raise(py, py.detach(|| self.endpoint.send_reporting(meta, &body)))?;
-        Ok(cursors.map(|cursors| SyncCursors {
-            cursors: Mutex::new(cursors),
-        }))
+        Ok(cursors.map(SyncCursors::new))
     }
 
     /// Waits for the next transfer from the peer, at most `max_bytes`, and
     /// returns `(payload, meta)`.
+    ///
+    /// Waits as long as the peer takes, and Ctrl-C ends the wait; see the
+    /// module documentation.
     fn recv<'py>(
         &self,
         py: Python<'py>,
         max_bytes: usize,
     ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
-        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        let message = self.waiter.wait(py, || async {
+            let transfer = self.endpoint.endpoint().recv().await?;
+            self.waiter.collected(transfer, max_bytes).await
+        })?;
         Ok((
             py_bytes(py, &message.payload),
             PyIncomingMeta::of(&message.meta),
@@ -735,13 +949,14 @@ impl SyncPaired {
         PyIncomingMeta,
         Option<SyncReporter>,
     )> {
-        let (message, reporter) = raise(py, py.detach(|| self.endpoint.recv_reporting(max_bytes)))?;
+        let (message, reporter) = self.waiter.wait(py, || async {
+            let transfer = self.endpoint.endpoint().recv().await?;
+            self.waiter.collected_reporting(transfer, max_bytes).await
+        })?;
         Ok((
             py_bytes(py, &message.payload),
             PyIncomingMeta::of(&message.meta),
-            reporter.map(|reporter| SyncReporter {
-                reporter: Mutex::new(Some(reporter)),
-            }),
+            reporter.map(|reporter| SyncReporter::new(reporter, self.waiter.clone())),
         ))
     }
 
@@ -812,6 +1027,7 @@ impl SyncSurveyor {
 #[pyclass(frozen, name = "Respondent", module = "weida.sync")]
 pub struct SyncRespondent {
     endpoint: blocking::Respondent,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -824,11 +1040,16 @@ impl SyncRespondent {
     /// Waits for the next question and reads it, at most `max_bytes`.
     ///
     /// Hands back the same `weida.sync.Request` a replier does: a question is
-    /// an exchange.
+    /// an exchange. Waits as long as the peer takes, and Ctrl-C ends the wait;
+    /// see the module documentation.
     fn accept(&self, py: Python<'_>, max_bytes: usize) -> PyResult<SyncRequest> {
-        let request = raise(py, py.detach(|| self.endpoint.accept(max_bytes)))?;
+        let accepted = self.waiter.wait(py, || async {
+            let request = self.endpoint.endpoint().accept().await?;
+            self.waiter.accepted(request, max_bytes).await
+        })?;
         Ok(SyncRequest {
-            request: Mutex::new(Some(request)),
+            request: Mutex::new(Some(accepted)),
+            waiter: self.waiter.clone(),
         })
     }
 
@@ -841,6 +1062,7 @@ impl SyncRespondent {
 #[pyclass(frozen, name = "BusMember", module = "weida.sync")]
 pub struct SyncBusMember {
     endpoint: blocking::BusMember,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -875,12 +1097,18 @@ impl SyncBusMember {
 
     /// Waits for the next message from another member, at most `max_bytes`,
     /// and returns `(payload, meta)`.
+    ///
+    /// Waits as long as the peer takes, and Ctrl-C ends the wait; see the
+    /// module documentation.
     fn recv<'py>(
         &self,
         py: Python<'py>,
         max_bytes: usize,
     ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
-        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        let message = self.waiter.wait(py, || async {
+            let transfer = self.endpoint.endpoint().recv().await?;
+            self.waiter.collected(transfer, max_bytes).await
+        })?;
         Ok((
             py_bytes(py, &message.payload),
             PyIncomingMeta::of(&message.meta),
@@ -976,7 +1204,7 @@ impl SyncSegment {
     /// it; returns how many copies took it.
     fn write_layer(&self, py: Python<'_>, layer: u8, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
         let body = payload_of(chunk)?;
-        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        let mut guard = locked(&self.segment);
         match guard.as_mut() {
             Some(segment) => raise(py, segment.write_layer(layer, &body)),
             None => spent(py, "segment"),
@@ -985,7 +1213,7 @@ impl SyncSegment {
 
     /// Ends layer `layer` on every copy that has it open.
     fn finish_layer(&self, py: Python<'_>, layer: u8) -> PyResult<()> {
-        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        let mut guard = locked(&self.segment);
         match guard.as_mut() {
             Some(segment) => {
                 segment.finish_layer(layer);
@@ -998,9 +1226,7 @@ impl SyncSegment {
     /// Ends every layer still open; returns how many copies still hold
     /// layer 0.
     fn finish(&self) -> usize {
-        self.segment
-            .lock()
-            .expect("segment lock poisoned")
+        locked(&self.segment)
             .take()
             .map_or(0, blocking::Segment::finish)
     }
@@ -1010,6 +1236,7 @@ impl SyncSegment {
 #[pyclass(frozen, name = "Dish", module = "weida.sync")]
 pub struct SyncDish {
     endpoint: blocking::Dish,
+    waiter: Waiter,
 }
 
 #[pymethods]
@@ -1047,20 +1274,31 @@ impl SyncDish {
     /// Waits for the next segment: `("segment", payload, meta)` for a stream
     /// segment read whole, at most `max_bytes`, or
     /// `("datagram", topic, segment, payload)`.
+    ///
+    /// Waits as long as the radio takes, and Ctrl-C ends the wait; see the
+    /// module documentation.
     fn recv<'py>(&self, py: Python<'py>, max_bytes: usize) -> PyResult<Bound<'py, PyAny>> {
-        let delivered = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
-        match delivered {
-            blocking::Delivered::Segment(message) => {
-                let blocking::Message { payload, meta } = *message;
-                crate::patterns::Heard::Segment(payload, Box::new(PyIncomingMeta::of(&meta)))
+        let heard = self.waiter.wait(py, || async {
+            match self.endpoint.endpoint().recv().await? {
+                weida::Received::Segment(transfer) => {
+                    let message = self.waiter.collected(transfer, max_bytes).await?;
+                    Ok(crate::patterns::Heard::Segment(
+                        message.payload,
+                        Box::new(PyIncomingMeta::of(&message.meta)),
+                    ))
+                }
+                weida::Received::Datagram {
+                    topic,
+                    segment,
+                    payload,
+                } => Ok(crate::patterns::Heard::Datagram(
+                    topic.to_string(),
+                    segment,
+                    payload,
+                )),
             }
-            blocking::Delivered::Datagram {
-                topic,
-                segment,
-                payload,
-            } => crate::patterns::Heard::Datagram(topic, segment, payload),
-        }
-        .into_pyobject(py)
+        })?;
+        heard.into_pyobject(py)
     }
 
     /// Radios connected.
@@ -1082,39 +1320,44 @@ impl SyncDish {
 /// shape rather than a trick.
 #[pyclass(frozen, name = "Cursors", module = "weida.sync")]
 pub struct SyncCursors {
-    /// `&mut` on the facade's side; a `std` mutex is right here because no
-    /// guard crosses an await on this surface.
+    /// `&mut` on the facade's side, and held for the whole of a `changed`, so
+    /// it is only ever taken inside a released section. Nothing that reads
+    /// waits for it.
     cursors: Mutex<blocking::Cursors>,
+    /// The latest set, replaced whenever `changed` sees one. What
+    /// `snapshot` and `offset` read, so that neither waits behind a `changed`
+    /// that is parked for its whole deadline with the GIL held by the reader.
+    latest: Mutex<weida::CursorSet>,
+}
+
+impl SyncCursors {
+    fn new(cursors: blocking::Cursors) -> SyncCursors {
+        SyncCursors {
+            latest: Mutex::new(cursors.snapshot()),
+            cursors: Mutex::new(cursors),
+        }
+    }
 }
 
 #[pymethods]
 impl SyncCursors {
     /// The latest set as `{level: offset}`, without waiting.
     fn snapshot(&self) -> BTreeMap<u64, u64> {
-        set_of(
-            self.cursors
-                .lock()
-                .expect("cursors lock poisoned")
-                .snapshot(),
-        )
+        set_of(*locked(&self.latest))
     }
 
     /// The latest offset for `level`, or `None` if it was never reported.
     fn offset(&self, py: Python<'_>, level: u64) -> PyResult<Option<u64>> {
         let level = level_of(py, level)?;
-        Ok(self
-            .cursors
-            .lock()
-            .expect("cursors lock poisoned")
-            .offset(level))
+        Ok(locked(&self.latest).offset(level))
     }
 
     /// Waits up to `deadline` seconds for the next change and returns the new
     /// set, or `None` once no further cursors are coming.
     ///
     /// The deadline is **mandatory**, unlike the asyncio `Cursors.changed`:
-    /// there `asyncio.wait_for` bounds the wait and composes, while a parked
-    /// thread is interrupted by nothing. A deadline that passes with nothing
+    /// there `asyncio.wait_for` bounds the wait and composes, and here the
+    /// argument does. A deadline that passes with nothing
     /// new raises `TimeoutError` — the builtin, as `socket.settimeout` does —
     /// because it is **not** the end of the report and returning `None` for
     /// it would make a caller stop reading a verdict that is still coming.
@@ -1127,10 +1370,10 @@ impl SyncCursors {
         let reported = raise(
             py,
             py.detach(|| {
-                self.cursors
-                    .lock()
-                    .expect("cursors lock poisoned")
-                    .changed(deadline)
+                let mut cursors = locked(&self.cursors);
+                let reported = cursors.changed(deadline);
+                *locked(&self.latest) = cursors.snapshot();
+                reported
             }),
         )?;
         match reported {
@@ -1151,8 +1394,30 @@ impl SyncCursors {
 #[pyclass(frozen, name = "Reporter", module = "weida.sync")]
 pub struct SyncReporter {
     /// `None` after `finish`, which consumes the reporter: a report ends
-    /// once.
-    reporter: Mutex<Option<blocking::Reporter>>,
+    /// once. Held for the length of a `report`, so taken only inside the
+    /// released section: a call on another thread queues behind it there, and
+    /// the getters below do not need it at all.
+    reporter: Mutex<Option<weida::Reporter>>,
+    /// What the sender ordered, fixed when it did, so that reading it never
+    /// waits behind a `report`.
+    levels: Vec<u64>,
+    mode: u64,
+    /// Set by `finish`, from when the getters refuse as they did when the
+    /// reporter was gone.
+    finished: AtomicBool,
+    waiter: Waiter,
+}
+
+impl SyncReporter {
+    fn new(reporter: weida::Reporter, waiter: Waiter) -> SyncReporter {
+        SyncReporter {
+            levels: reporter.levels().iter().map(|l| l.to_wire()).collect(),
+            mode: reporter.mode().to_wire(),
+            reporter: Mutex::new(Some(reporter)),
+            finished: AtomicBool::new(false),
+            waiter,
+        }
+    }
 }
 
 #[pymethods]
@@ -1160,42 +1425,49 @@ impl SyncReporter {
     /// The levels the sender ordered, ascending.
     #[getter]
     fn levels(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
-        let guard = self.reporter.lock().expect("reporter lock poisoned");
-        match guard.as_ref() {
-            Some(reporter) => Ok(reporter.levels().iter().map(|l| l.to_wire()).collect()),
-            None => spent(py, "report"),
+        if self.finished.load(Ordering::SeqCst) {
+            return spent(py, "report");
         }
+        Ok(self.levels.clone())
     }
 
     /// The mode the sender asked for.
     #[getter]
     fn mode(&self, py: Python<'_>) -> PyResult<u64> {
-        let guard = self.reporter.lock().expect("reporter lock poisoned");
-        match guard.as_ref() {
-            Some(reporter) => Ok(reporter.mode().to_wire()),
-            None => spent(py, "report"),
+        if self.finished.load(Ordering::SeqCst) {
+            return spent(py, "report");
         }
+        Ok(self.mode)
     }
 
     /// Reports that `level` has reached `offset`.
     ///
     /// A level the sender did not order is ignored rather than refused.
+    // The guard is held across the call on purpose: a report borrows the
+    // reporter for as long as it runs, the future is polled on this thread
+    // only, and a second report must queue behind it.
+    #[allow(clippy::await_holding_lock)]
     fn report(&self, py: Python<'_>, level: u64, offset: u64) -> PyResult<()> {
         let level = level_of(py, level)?;
-        let mut guard = self.reporter.lock().expect("reporter lock poisoned");
-        match guard.as_mut() {
-            Some(reporter) => raise(py, py.detach(|| reporter.report(level, offset))),
-            None => spent(py, "report"),
-        }
+        self.waiter.wait(py, || async {
+            let mut guard = locked(&self.reporter);
+            match guard.as_mut() {
+                Some(reporter) => reporter.report(level, offset).await,
+                None => Err(spent_error("report")),
+            }
+        })
     }
 
     /// Flushes the latest offset per level and ends the cursor stream.
     fn finish(&self, py: Python<'_>) -> PyResult<()> {
-        let taken = self.reporter.lock().expect("reporter lock poisoned").take();
-        match taken {
-            Some(reporter) => raise(py, py.detach(|| reporter.finish())),
-            None => spent(py, "report"),
-        }
+        self.finished.store(true, Ordering::SeqCst);
+        self.waiter.wait(py, || async {
+            let taken = locked(&self.reporter).take();
+            match taken {
+                Some(reporter) => reporter.finish().await,
+                None => Err(spent_error("report")),
+            }
+        })
     }
 
     fn __repr__(&self) -> String {

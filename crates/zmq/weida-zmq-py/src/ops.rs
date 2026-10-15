@@ -26,15 +26,13 @@
 //! busy with another coroutine's operation, which is the same answer as a full
 //! queue and for the same reason: this call was told not to wait.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use weida_py_core::{Bridge, Errno};
+use weida_py_core::{Bridge, Errno, Live, Retirable, duration};
 use weida_zmq::{Multipart, Published, Result, Sent};
 
-use crate::errors::{errno_of, to_py};
-use crate::lease::Slot;
+use crate::errors::{errno_of, retired, to_py};
 use crate::values::{PyMultipart, PyPublished, PySent, message_from};
 
 /// A socket type that receives: blocking, bounded, or not at all.
@@ -323,25 +321,21 @@ pub fn apply_subscriptions<S: ApplySubscriptions>(
 
 /// A timeout in seconds, as the library's `Duration`.
 ///
-/// Refused where it is given rather than rounded: a negative or infinite
-/// number of seconds is not a bound, and libzmq's `-1` for "wait forever" is
-/// spelled `None` here because Python has a word for it.
+/// Refused where it is given rather than rounded: a negative, infinite or
+/// absurdly large number of seconds is not a bound, and libzmq's `-1` for
+/// "wait forever" is spelled `None` here because Python has a word for it.
 fn limit(py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<Duration>> {
     match timeout {
         None => Ok(None),
-        Some(seconds) if seconds.is_finite() && seconds >= 0.0 => {
-            Ok(Some(Duration::from_secs_f64(seconds)))
-        }
-        Some(seconds) => Err(to_py(
-            py,
-            &Errno::new(
-                "EINVAL",
-                format!(
-                    "a timeout is a finite, non-negative number of seconds, not {seconds}; \
-                     omit it to wait as long as ZMQ_SNDTIMEO/ZMQ_RCVTIMEO allow"
+        Some(seconds) => duration("a timeout", seconds).map(Some).map_err(|bad| {
+            to_py(
+                py,
+                &Errno::new(
+                    "EINVAL",
+                    format!("{bad}; omit it to wait as long as ZMQ_SNDTIMEO/ZMQ_RCVTIMEO allow"),
                 ),
-            ),
-        )),
+            )
+        }),
     }
 }
 
@@ -356,17 +350,36 @@ fn busy(py: Python<'_>) -> PyErr {
     )
 }
 
+/// Takes the socket, waiting behind whoever has it.
+///
+/// # Errors
+///
+/// `ENOTSOCK` once the socket was split: its slot is retired and the socket
+/// lives on in its halves.
+pub async fn lease<S>(slot: &Retirable<S>) -> std::result::Result<Live<S>, Errno> {
+    slot.acquire().await.map_err(retired)
+}
+
+/// [`lease`] without waiting: `None` when another coroutine has the socket.
+///
+/// # Errors
+///
+/// `ENOTSOCK` once the socket was split.
+pub fn try_lease<S>(slot: &Retirable<S>) -> std::result::Result<Option<Live<S>>, Errno> {
+    slot.try_acquire().map_err(retired)
+}
+
 /// `await sock.recv(timeout=None)`.
 pub fn recv<'py, S: Receive>(
     py: Python<'py>,
     bridge: &Bridge,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     timeout: Option<f64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let limit = limit(py, timeout)?;
-    let slot = Arc::clone(socket);
+    let slot = socket.clone();
     bridge.awaitable(py, async move {
-        let mut socket = slot.acquire().await?;
+        let mut socket = lease(&slot).await?;
         let received = match limit {
             Some(limit) => socket.receive_within(limit).await,
             None => socket.receive().await,
@@ -376,11 +389,8 @@ pub fn recv<'py, S: Receive>(
 }
 
 /// `sock.recv_nowait()`.
-pub fn recv_nowait<S: Receive>(py: Python<'_>, socket: &Arc<Slot<S>>) -> PyResult<PyMultipart> {
-    let Some(mut socket) = socket
-        .try_acquire()
-        .map_err(|errno| crate::errors::to_py(py, &errno))?
-    else {
+pub fn recv_nowait<S: Receive>(py: Python<'_>, socket: &Retirable<S>) -> PyResult<PyMultipart> {
+    let Some(mut socket) = try_lease(socket).map_err(|errno| to_py(py, &errno))? else {
         return Err(busy(py));
     };
     socket
@@ -393,15 +403,15 @@ pub fn recv_nowait<S: Receive>(py: Python<'_>, socket: &Arc<Slot<S>>) -> PyResul
 pub fn send<'py, S: Transmit>(
     py: Python<'py>,
     bridge: &Bridge,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     message: &Bound<'py, PyAny>,
     timeout: Option<f64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let message = message_from(message)?;
     let limit = limit(py, timeout)?;
-    let slot = Arc::clone(socket);
+    let slot = socket.clone();
     bridge.awaitable(py, async move {
-        let mut socket = slot.acquire().await?;
+        let mut socket = lease(&slot).await?;
         match limit {
             Some(limit) => socket.transmit_within(message, limit).await,
             None => socket.transmit(message).await,
@@ -413,14 +423,11 @@ pub fn send<'py, S: Transmit>(
 /// `sock.send_nowait(message)` for a socket type that blocks.
 pub fn send_nowait<S: Transmit>(
     py: Python<'_>,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     message: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let message = message_from(message)?;
-    let Some(mut socket) = socket
-        .try_acquire()
-        .map_err(|errno| crate::errors::to_py(py, &errno))?
-    else {
+    let Some(mut socket) = try_lease(socket).map_err(|errno| to_py(py, &errno))? else {
         return Err(busy(py));
     };
     socket
@@ -432,13 +439,13 @@ pub fn send_nowait<S: Transmit>(
 pub fn send_reporting<'py, S: Report>(
     py: Python<'py>,
     bridge: &Bridge,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     message: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let message = message_from(message)?;
-    let slot = Arc::clone(socket);
+    let slot = socket.clone();
     bridge.awaitable(py, async move {
-        slot.acquire()
+        lease(&slot)
             .await?
             .transmit(message)
             .await
@@ -450,14 +457,11 @@ pub fn send_reporting<'py, S: Report>(
 /// `sock.send_nowait(message)` for a socket type that reports a drop.
 pub fn send_reporting_nowait<S: ReportNow>(
     py: Python<'_>,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     message: &Bound<'_, PyAny>,
 ) -> PyResult<PySent> {
     let message = message_from(message)?;
-    let Some(mut socket) = socket
-        .try_acquire()
-        .map_err(|errno| crate::errors::to_py(py, &errno))?
-    else {
+    let Some(mut socket) = try_lease(socket).map_err(|errno| to_py(py, &errno))? else {
         return Err(busy(py));
     };
     socket
@@ -470,27 +474,24 @@ pub fn send_reporting_nowait<S: ReportNow>(
 pub fn publish<'py, S: Publish>(
     py: Python<'py>,
     bridge: &Bridge,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     message: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let message = message_from(message)?;
-    let slot = Arc::clone(socket);
+    let slot = socket.clone();
     bridge.awaitable(py, async move {
-        Ok::<PyPublished, Errno>(PyPublished::of(slot.acquire().await?.publish(message)))
+        Ok::<PyPublished, Errno>(PyPublished::of(lease(&slot).await?.publish(message)))
     })
 }
 
 /// `sock.send_nowait(message)` for a publisher, which never waits anyway.
 pub fn publish_nowait<S: Publish>(
     py: Python<'_>,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     message: &Bound<'_, PyAny>,
 ) -> PyResult<PyPublished> {
     let message = message_from(message)?;
-    let Some(mut socket) = socket
-        .try_acquire()
-        .map_err(|errno| crate::errors::to_py(py, &errno))?
-    else {
+    let Some(mut socket) = try_lease(socket).map_err(|errno| to_py(py, &errno))? else {
         return Err(busy(py));
     };
     Ok(PyPublished::of(socket.publish(message)))
@@ -500,12 +501,12 @@ pub fn publish_nowait<S: Publish>(
 pub fn subscribe<'py, S: Subscribe>(
     py: Python<'py>,
     bridge: &Bridge,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     prefix: Vec<u8>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let slot = Arc::clone(socket);
+    let slot = socket.clone();
     bridge.awaitable(py, async move {
-        slot.acquire().await?.subscribe(&prefix).map_err(errno_of)
+        lease(&slot).await?.subscribe(&prefix).map_err(errno_of)
     })
 }
 
@@ -513,11 +514,11 @@ pub fn subscribe<'py, S: Subscribe>(
 pub fn unsubscribe<'py, S: Subscribe>(
     py: Python<'py>,
     bridge: &Bridge,
-    socket: &Arc<Slot<S>>,
+    socket: &Retirable<S>,
     prefix: Vec<u8>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let slot = Arc::clone(socket);
+    let slot = socket.clone();
     bridge.awaitable(py, async move {
-        slot.acquire().await?.unsubscribe(&prefix).map_err(errno_of)
+        lease(&slot).await?.unsubscribe(&prefix).map_err(errno_of)
     })
 }

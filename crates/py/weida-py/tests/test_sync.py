@@ -6,6 +6,10 @@ the GIL is released while a call waits, so the thread that serves and the
 thread that requests make progress at the same time.
 """
 
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -349,3 +353,104 @@ def test_connection_stats_over_quic_and_in_process():
     client.shutdown()
     server.shutdown()
     local.shutdown()
+
+
+def test_a_bind_on_one_thread_never_freezes_a_call_on_another():
+    """`bind` used to keep the runtime's lock across its released section, so
+    a second thread that took the same lock with the GIL held waited for a
+    thread that needed the GIL to finish: both parked, for good. The scenario
+    runs in a child so that the failure is a timeout and not a hung suite."""
+    script = (
+        "import threading\n"
+        "import weida\n"
+        "from weida import sync\n"
+        "runtime = sync.Runtime()\n"
+        "identity = weida.Identity.generate()\n"
+        "trust = weida.Trust.by_address()\n"
+        "done = threading.Event()\n"
+        "def bind():\n"
+        "    for _ in range(150):\n"
+        "        runtime.bind('127.0.0.1:0', identity)\n"
+        "    done.set()\n"
+        "def build():\n"
+        "    while not done.is_set():\n"
+        "        runtime.requester(trust)\n"
+        "threads = [threading.Thread(target=bind), threading.Thread(target=build)]\n"
+        "for thread in threads: thread.start()\n"
+        "for thread in threads: thread.join()\n"
+        "print('finished')\n"
+    )
+    finished = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert finished.returncode == 0, finished.stderr
+    assert "finished" in finished.stdout
+
+
+@pytest.mark.parametrize("call", ["replier.accept(1 << 20)", "puller.recv(1 << 20)"])
+def test_ctrl_c_ends_a_wait_with_no_peer_and_no_deadline(call):
+    # A child parks in the call on an endpoint nobody has dialled; the parent
+    # interrupts it once it says it is waiting. The wait must end with
+    # KeyboardInterrupt rather than hold the process until a peer speaks.
+    script = (
+        "import weida\n"
+        "from weida import sync\n"
+        "runtime = sync.Runtime()\n"
+        "binding = runtime.bind('127.0.0.1:0', weida.Identity.generate())\n"
+        "replier = binding.replier('/in')\n"
+        "puller = binding.puller('/pull')\n"
+        "print('waiting', flush=True)\n"
+        f"{call}\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "waiting"
+        time.sleep(0.5)
+        child.send_signal(signal.SIGINT)
+        _, stderr = child.communicate(timeout=5)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+    assert "KeyboardInterrupt" in stderr
+
+
+def test_an_interrupted_accept_leaves_the_next_request_for_the_next_accept():
+    """Ctrl-C ends the wait and nothing else: the exchange that arrives after
+    it is the one the next `accept` gets, not one a dead wait ate."""
+    server = sync.Runtime()
+    binding = server.bind("127.0.0.1:0", weida.Identity.generate())
+    replier = binding.replier("/echo")
+
+    def interrupt():
+        time.sleep(0.4)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    interrupting = threading.Thread(target=interrupt, daemon=True)
+    interrupting.start()
+    with pytest.raises(KeyboardInterrupt):
+        replier.accept(CAP)
+    interrupting.join(DEADLINE)
+
+    def serve():
+        request = replier.accept(CAP)
+        request.reply(request.payload[::-1])
+
+    answering = threading.Thread(target=serve, daemon=True)
+    answering.start()
+    client = sync.Runtime()
+    requester = client.requester(weida.Trust.by_address())
+    requester.connect(binding.url("/echo"))
+    assert requester.request(b"abc", CAP) == b"cba"
+    answering.join(DEADLINE)
+    assert not answering.is_alive()
+    client.shutdown()
+    server.shutdown()

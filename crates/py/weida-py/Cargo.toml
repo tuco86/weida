@@ -43,6 +43,10 @@ weida-core.workspace = true
 # which is what a streamed transfer needs, since two coroutines may hold the
 # same handle and a write borrows it mutably. `std`'s may not.
 tokio.workspace = true
+# The datagram a dish hears is the library's own `Bytes`, and the binding
+# carries it to the one copy into a Python `bytes` rather than copying it into
+# a `Vec` first. Already in the graph through `weida`.
+bytes.workspace = true
 
 [features]
 # Off by default, and enabled by maturin through `pyproject.toml`. With it on,

@@ -22,11 +22,11 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use weida_py_core::{Bridge, Errno};
+use weida_py_core::{Bridge, Errno, Slot};
 use weida_zmq::{MonitorEvent, MonitorEvents};
 
 use crate::errors::errno_of;
-use crate::lease::Slot;
+use crate::ops::lease;
 
 /// The errno name this crate's mapper turns into `StopAsyncIteration`.
 ///
@@ -168,7 +168,7 @@ impl PyMonitor {
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let slot = Arc::clone(&self.monitor);
         self.bridge.awaitable(py, async move {
-            match slot.acquire().await?.recv().await {
+            match slot.acquire().await.recv().await {
                 Ok(event) => Ok(PyMonitorEvent::of(&event)),
                 // The socket is gone: for an `async for`, that is the end.
                 Err(weida_zmq::Error::ENOTSOCK(_)) => Err(Errno::new(
@@ -192,10 +192,10 @@ impl PyMonitor {
         pair: PyRef<'py, crate::sockets::PyPairSocket>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let monitor = Arc::clone(&self.monitor);
-        let socket = Arc::clone(pair.slot());
+        let socket = pair.slot().clone();
         self.bridge.awaitable(py, async move {
-            let events = monitor.acquire().await?.resubscribe();
-            let mut pair = socket.acquire().await?;
+            let events = monitor.acquire().await.resubscribe();
+            let mut pair = lease(&socket).await?;
             weida_zmq::serve_pair(events, &mut pair)
                 .await
                 .map_err(errno_of)
@@ -204,11 +204,7 @@ impl PyMonitor {
 
     /// `ZMQ_DONTWAIT`: the next event if one is queued.
     fn recv_nowait(&self, py: Python<'_>) -> PyResult<PyMonitorEvent> {
-        let Some(mut monitor) = self
-            .monitor
-            .try_acquire()
-            .map_err(|errno| crate::errors::to_py(py, &errno))?
-        else {
+        let Some(mut monitor) = self.monitor.try_acquire() else {
             return Err(crate::errors::to_py(
                 py,
                 &Errno::new(

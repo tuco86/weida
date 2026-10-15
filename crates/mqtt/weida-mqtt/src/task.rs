@@ -90,6 +90,55 @@ struct Stalled {
     done: PublishWaiter,
 }
 
+/// The publishes waiting for the send quota, oldest first, and what they
+/// hold.
+#[derive(Default)]
+struct StalledQueue {
+    entries: VecDeque<Stalled>,
+    /// What `entries` are charged, together.
+    bytes: usize,
+}
+
+impl StalledQueue {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether one more message of `charge` bytes fits under both ceilings.
+    /// An empty queue takes one message of any size, as the session's store
+    /// does: a bound that refused the only message would be a deadlock.
+    fn admits(&self, charge: usize, max_entries: usize, max_bytes: usize) -> bool {
+        self.entries.len() < max_entries
+            && (self.entries.is_empty() || self.bytes.saturating_add(charge) <= max_bytes)
+    }
+
+    fn push_back(&mut self, stalled: Stalled) {
+        self.bytes += stalled.message.charge();
+        self.entries.push_back(stalled);
+    }
+
+    fn push_front(&mut self, stalled: Stalled) {
+        self.bytes += stalled.message.charge();
+        self.entries.push_front(stalled);
+    }
+
+    fn pop_front(&mut self) -> Option<Stalled> {
+        let stalled = self.entries.pop_front()?;
+        self.bytes -= stalled.message.charge();
+        Some(stalled)
+    }
+
+    /// Lets go of the publishes whose caller has dropped its future.
+    fn prune(&mut self) {
+        self.entries.retain(|stalled| !stalled.done.is_closed());
+        self.bytes = self
+            .entries
+            .iter()
+            .map(|stalled| stalled.message.charge())
+            .sum();
+    }
+}
+
 /// A delivery the event queue had no room for, and what its acknowledgement is
 /// waiting on.
 ///
@@ -214,11 +263,12 @@ pub(crate) struct Task {
     /// future is still pending, the packet is not on the wire, and the moment
     /// an identifier frees the oldest waiting publish takes it — **from the
     /// front, and back to the front** where it still does not fit, so the
-    /// order the application published in is the order of the wire. Bounded by
-    /// the publishes the application has in flight, which is the number of
-    /// `publish()` futures it holds, and by the session's own ceilings on
-    /// what it stores.
-    stalled: VecDeque<Stalled>,
+    /// order the application published in is the order of the wire.
+    ///
+    /// A publish whose future the application dropped is not sent and is not
+    /// kept: [`Task::stall`] bounds the queue by count and by bytes, and
+    /// the entries of dropped futures are the first to go.
+    stalled: StalledQueue,
     /// Identifiers of messages the session held from an earlier connection
     /// whose PUBLISH is not on the wire yet because the server's `Receive
     /// Maximum` is lower than what was in flight, in the order they were
@@ -277,7 +327,7 @@ impl Task {
             subscribe_waiters: HashMap::new(),
             unsubscribe_waiters: HashMap::new(),
             waiters: HashMap::new(),
-            stalled: VecDeque::new(),
+            stalled: StalledQueue::default(),
             resumed: VecDeque::new(),
             reauthenticating: None,
             authenticator: parts.authenticator,
@@ -736,6 +786,11 @@ impl Task {
 
     /// Sends one message, or stalls it if the quota is spent.
     fn publish(&mut self, message: Box<Message>, done: PublishWaiter) {
+        // The caller gave up on this publish while its command was still in
+        // the channel; nothing of it has reached the wire, so it never will.
+        if done.is_closed() {
+            return;
+        }
         if message.qos == QoS::AtMostOnce {
             self.publish_unacknowledged(&message, done);
             return;
@@ -749,25 +804,55 @@ impl Task {
                 return;
             }
         };
-        // A new publish never overtakes one that is already waiting.
-        if !self.stalled.is_empty() || !self.resumed.is_empty() {
-            self.stalled.push_back(Stalled {
-                message: stored,
-                done,
-            });
-            return;
-        }
-        if let Some(stalled) = self.send_new(Stalled {
+        let stalled = Stalled {
             message: stored,
             done,
-        }) {
-            self.stalled.push_back(stalled);
+        };
+        // A new publish never overtakes one that is already waiting.
+        if !self.stalled.is_empty() || !self.resumed.is_empty() {
+            self.stall(stalled);
+        } else if let Some(stalled) = self.send_new(stalled) {
+            self.stall(stalled);
         }
+    }
+
+    /// Queues a publish behind the quota, or refuses it where the queue is
+    /// full.
+    ///
+    /// The queue takes commands as fast as the application sends them, so
+    /// what bounds it cannot be the number of futures the application holds:
+    /// a future dropped by a `timeout` leaves its message here. The bound is
+    /// [`Limits::max_inflight`] entries and [`Limits::max_inflight_bytes`]
+    /// bytes, the ceilings the session applies to what it stores, and the
+    /// entries whose caller has gone are let go before a live one is refused.
+    fn stall(&mut self, stalled: Stalled) {
+        let charge = stalled.message.charge();
+        let limits = &self.limits;
+        if !self
+            .stalled
+            .admits(charge, limits.max_inflight, limits.max_inflight_bytes)
+        {
+            self.stalled.prune();
+            if !self
+                .stalled
+                .admits(charge, limits.max_inflight, limits.max_inflight_bytes)
+            {
+                let quota = self.session.send_quota();
+                let _ = stalled.done.send(Err(Error::QuotaExhausted { quota }));
+                return;
+            }
+        }
+        self.stalled.push_back(stalled);
     }
 
     /// Stores and sends a message, or hands it back where the quota is spent.
     fn send_new(&mut self, stalled: Stalled) -> Option<Stalled> {
         let Stalled { message, done } = stalled;
+        // Its caller timed out or was cancelled while it waited, and sending
+        // it now would publish what the caller was told did not happen.
+        if done.is_closed() {
+            return None;
+        }
         match self.session.allocate(Arc::clone(&message)) {
             Ok(packet_id) => {
                 match self.transmit(packet_id, &message, false) {

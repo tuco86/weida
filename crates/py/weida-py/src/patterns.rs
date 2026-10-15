@@ -24,6 +24,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -33,6 +34,7 @@ use weida_py_core::{Bridge, payload_of};
 use crate::cursors::{PyCursors, PyReporter, reporting_meta};
 use crate::endpoints::{PyRequest, endpoint};
 use crate::errors::{errno_of, to_py};
+use crate::lock::locked;
 use crate::values::{PyConnectionStats, PyDishDrops, PyIncomingMeta, PySurvey};
 
 /// Turns a Python float of seconds into a deadline, or says why not.
@@ -402,7 +404,9 @@ fn max_age_of(py: Python<'_>, seconds: Option<f64>) -> PyResult<Option<Duration>
 pub(crate) enum Heard {
     /// Boxed: the flattened metadata is several times a datagram's size.
     Segment(Vec<u8>, Box<PyIncomingMeta>),
-    Datagram(String, u64, Vec<u8>),
+    /// The datagram's own buffer, so the only copy a datagram pays on the way
+    /// to Python is the one into the `bytes` object.
+    Datagram(String, u64, Bytes),
 }
 
 impl<'py> IntoPyObject<'py> for Heard {
@@ -539,7 +543,7 @@ impl PySegment {
     /// layers from the top.
     fn write_layer(&self, py: Python<'_>, layer: u8, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
         let body = payload_of(chunk)?;
-        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        let mut guard = locked(&self.segment);
         let Some(segment) = guard.as_mut() else {
             return Err(to_py(
                 py,
@@ -553,7 +557,7 @@ impl PySegment {
 
     /// Ends layer `layer` on every copy that has it open.
     fn finish_layer(&self, py: Python<'_>, layer: u8) -> PyResult<()> {
-        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        let mut guard = locked(&self.segment);
         let Some(segment) = guard.as_mut() else {
             return Err(to_py(
                 py,
@@ -567,9 +571,7 @@ impl PySegment {
     /// Ends every layer still open; returns how many copies still hold
     /// layer 0.
     fn finish(&self) -> usize {
-        self.segment
-            .lock()
-            .expect("segment lock poisoned")
+        locked(&self.segment)
             .take()
             .map_or(0, weida::Segment::finish)
     }
@@ -645,11 +647,7 @@ impl PyDish {
                     topic,
                     segment,
                     payload,
-                } => Ok(Heard::Datagram(
-                    topic.to_string(),
-                    segment,
-                    payload.to_vec(),
-                )),
+                } => Ok(Heard::Datagram(topic.to_string(), segment, payload)),
             }
         })
     }

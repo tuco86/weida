@@ -43,7 +43,8 @@
 //!   `benches/bytes_boundary.rs` rather than assumed.
 //! - [`Slot`] and [`Lease`] — one handle shared by coroutines one at a time,
 //!   which is what a `&mut self` receive needs, with the restore queue the
-//!   bridge's hand-back goes to.
+//!   bridge's hand-back goes to; [`Retirable`] is the same for a handle that
+//!   can leave for good, which a ZeroMQ socket does when it is split.
 //! - [`interruptible`] — a blocking wait for a binding's synchronous surface
 //!   that Ctrl-C can end.
 //! - [`duration()`] — a Python `float` of seconds as a `Duration` that cannot
@@ -111,4 +112,4 @@ pub use bytes::{LazyBytes, payload, payload_of, py_bytes};
 pub use duration::{BadSeconds, MAX_SECONDS, duration};
 pub use errors::{Errno, ErrnoMapper, ErrorClasses, ErrorFamily};
 pub use interrupt::interruptible;
-pub use lease::{Acquire, Lease, Slot};
+pub use lease::{Acquire, Lease, Live, Retirable, Retired, Slot};

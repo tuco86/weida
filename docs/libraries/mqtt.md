@@ -247,12 +247,13 @@ bound at all. A client is on the exposed side of each, so `Limits` names them an
 | `Limits::max_user_properties` | 64 | `User Property` is repeatable per delivery (3.3.2.3.7) and a pair's minimal wire form is five octets, so even the default 1 MiB `Maximum Packet Size` admits over 200 000 of them and a 268 MB one over 50 million; truncated and flagged like the identifiers |
 | `Limits::incoming_queue` | 1024 | deliveries held for the application; QoS 0 has no flow control at all. The socket stops being read while it is full — keep-alive, commands and `disconnect` do not stop |
 | `Limits::incoming_queue_bytes` | 8 MiB | a count is not a memory bound ([INVARIANTS.md](../INVARIANTS.md)): each delivery is charged its packet's length plus a fixed overhead, and an empty queue still admits one of any size |
-| `Limits::max_inflight`, `Limits::max_inflight_bytes` | 1024, 8 MiB | the server's `Receive Maximum` is the peer's number (65 535 when it declares none); the send quota is the smaller of it and `max_inflight`, and a publish past either stalls in order |
+| `Limits::max_inflight`, `Limits::max_inflight_bytes` | 1024, 8 MiB | the server's `Receive Maximum` is the peer's number (65 535 when it declares none); the send quota is the smaller of it and `max_inflight`, and a publish past either stalls in order. The queue of stalled publishes is held to the same two numbers; a future dropped while its publish waits withdraws it, and a live publish past them fails with `QuotaExhausted` |
 | `Limits::max_alias_bytes` | 256 KiB | a Topic Alias table holds up to 65 535 names of up to 65 535 bytes; each entry is charged its name plus a fixed overhead |
 | `Limits::max_addresses` | 8 | a resolver's answer is remote input |
 | `ConnectOptions::effective_ping_timeout` | the Keep Alive in force | "a Client SHOULD close the connection within a reasonable amount of time" with **no number** (sheet §1); the interval in force is the server's where `Server Keep Alive` overrode the client's; an unbounded wait is a hang with a rationale ([LOOP.md](../LOOP.md) §2) |
 | `ConnectOptions::connect_timeout` | 10 s | the specification puts no deadline on the CONNACK either; here it covers the whole connect — lookup, dial, TLS, CONNECT, AUTH exchange and CONNACK |
 | `ConnectOptions::write_timeout` | the larger of the PINGRESP wait and 10 s | a peer that stops reading leaves a write the socket takes nothing of; timed from the last byte taken, ended by `Timeout("write")` |
+| `MAX_TIMEOUT` | one year | `connect_timeout`, `ping_timeout` and `write_timeout` are each added to an `Instant`, which panics past what the clock holds; zero and anything above the cap are refused by `ConnectOptions::validate` |
 | `MAX_AUTH_ROUNDS` | 8 | the protocol has no round count; each round costs an `Authenticator::challenge` on the event loop and a write |
 
 Every decode entry point takes the packet-size cap as an **argument**, and the declared

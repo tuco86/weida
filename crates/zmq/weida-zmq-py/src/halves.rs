@@ -21,15 +21,13 @@
 //! *the same* direction. Each half is still one slot, leased to one
 //! operation at a time, for the same reason the whole socket was.
 
-use std::sync::Arc;
-
 use pyo3::prelude::*;
+use weida_py_core::Retirable;
 use weida_zmq::split::{
     DealerRecv, DealerSend, PairRecv, PairSend, RouterRecv, RouterSend, XPubPublish, XPubRecv,
     XSubRecv, XSubSend,
 };
 
-use crate::lease::Slot;
 use crate::values::{PyMultipart, PyPublished, PySent};
 
 /// Builds one half class with the operation methods its direction has.
@@ -171,14 +169,14 @@ macro_rules! python_half {
         #[doc = $what]
         #[pyclass(frozen, name = $python, module = "weida_zmq")]
         pub struct $class {
-            half: Arc<Slot<$rust>>,
+            half: Retirable<$rust>,
             bridge: weida_py_core::Bridge,
         }
 
         impl $class {
             pub(crate) fn new(half: $rust, bridge: weida_py_core::Bridge) -> $class {
                 $class {
-                    half: Slot::new(half),
+                    half: Retirable::new(half),
                     bridge,
                 }
             }

@@ -16,8 +16,9 @@
 //!
 //! A `weida-zmq` socket handle is `Send` and **not** `Sync`: libzmq's
 //! "applications MUST NOT use a socket from multiple threads" expressed as a
-//! type. So each socket here lives in a [`Slot`](crate::lease::Slot) and
-//! every call leases it for as long as the operation runs. Two coroutines
+//! type. So each socket here lives in a
+//! [`Retirable`](weida_py_core::Retirable) slot and every call leases it for
+//! as long as the operation runs. Two coroutines
 //! that use one socket therefore *queue*; they do not interleave and they do
 //! not race.
 //!
@@ -45,14 +46,12 @@
 //! loop costs the program. The two `_nowait` methods are the exception, and
 //! they are exempt precisely because they never wait for anything.
 
-use std::sync::Arc;
-
 use pyo3::prelude::*;
-use weida_py_core::Errno;
+use weida_py_core::{Errno, Retirable};
 
 use crate::context::Context;
-use crate::errors::errno_of;
-use crate::lease::Slot;
+use crate::errors::{errno_of, retired};
+use crate::ops::lease;
 use crate::values::{PyMultipart, PyPublished, PySent};
 
 /// What a `disconnect` threw away, in messages.
@@ -294,10 +293,10 @@ macro_rules! python_socket {
             /// it raises `ENOTSOCK` naming the split, because the socket now
             /// lives in its halves.
             fn split<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 let bridge = self.bridge.clone();
                 self.bridge.awaitable(py, async move {
-                    let socket = slot.retire().await?;
+                    let socket = slot.retire().await.map_err(retired)?;
                     let (send, recv) = socket.split();
                     Ok::<_, Errno>((
                         crate::halves::$send::new(send, bridge.clone()),
@@ -313,7 +312,7 @@ macro_rules! python_socket {
         #[doc = $what]
         #[pyclass(frozen, name = $python, module = "weida_zmq")]
         pub struct $class {
-            socket: Arc<Slot<weida_zmq::$rust>>,
+            socket: Retirable<weida_zmq::$rust>,
             bridge: weida_py_core::Bridge,
         }
 
@@ -322,7 +321,7 @@ macro_rules! python_socket {
             /// rather than an operation on it — `serve_pair` takes a PAIR,
             /// which is why only one socket type's copy of this is used.
             #[allow(dead_code)]
-            pub(crate) fn slot(&self) -> &Arc<Slot<weida_zmq::$rust>> {
+            pub(crate) fn slot(&self) -> &Retirable<weida_zmq::$rust> {
                 &self.socket
             }
 
@@ -362,7 +361,7 @@ macro_rules! python_socket {
                     )?;
                 }
                 Ok($class {
-                    socket: Slot::new(socket),
+                    socket: Retirable::new(socket),
                     bridge: context.bridge().clone(),
                 })
             }
@@ -379,9 +378,9 @@ macro_rules! python_socket {
             /// which is the only way to learn a wildcard port — libzmq's
             /// `ZMQ_LAST_ENDPOINT`.
             fn bind<'py>(&self, py: Python<'py>, endpoint: String) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
-                    slot.acquire()
+                    lease(&slot)
                         .await?
                         .bind(&endpoint)
                         .await
@@ -398,9 +397,9 @@ macro_rules! python_socket {
                 py: Python<'py>,
                 endpoint: String,
             ) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
-                    slot.acquire().await?.connect(&endpoint).map_err(errno_of)
+                    lease(&slot).await?.connect(&endpoint).map_err(errno_of)
                 })
             }
 
@@ -411,9 +410,9 @@ macro_rules! python_socket {
                 py: Python<'py>,
                 endpoint: String,
             ) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
-                    slot.acquire().await?.unbind(&endpoint).map_err(errno_of)
+                    lease(&slot).await?.unbind(&endpoint).map_err(errno_of)
                 })
             }
 
@@ -423,9 +422,9 @@ macro_rules! python_socket {
                 py: Python<'py>,
                 endpoint: String,
             ) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
-                    slot.acquire()
+                    lease(&slot)
                         .await?
                         .disconnect(&endpoint)
                         .map(|discarded| Discarded {
@@ -439,10 +438,10 @@ macro_rules! python_socket {
             /// `ZMQ_LAST_ENDPOINT`: the last endpoint bound or connected, or
             /// `None` when there has been neither.
             fn last_endpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
                     Ok::<Option<String>, Errno>(
-                        slot.acquire()
+                        lease(&slot)
                             .await?
                             .last_endpoint()
                             .map(|endpoint| endpoint.to_string()),
@@ -452,9 +451,9 @@ macro_rules! python_socket {
 
             /// Peers this socket may send to right now.
             fn peer_count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
-                    Ok::<usize, Errno>(slot.acquire().await?.peer_count())
+                    Ok::<usize, Errno>(lease(&slot).await?.peer_count())
                 })
             }
 
@@ -462,10 +461,10 @@ macro_rules! python_socket {
             /// snapshot: what the peer announced, what a ZAP handler said
             /// about it, and what the kernel says about a local one.
             fn peers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
                     Ok::<Vec<crate::identity::PyPeer>, Errno>(
-                        slot.acquire()
+                        lease(&slot)
                             .await?
                             .connections()
                             .iter()
@@ -487,11 +486,11 @@ macro_rules! python_socket {
                 py: Python<'py>,
                 events: Option<u16>,
             ) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 let bridge = self.bridge.clone();
                 let events = crate::monitor::PyMonitor::events(events);
                 self.bridge.awaitable(py, async move {
-                    let installed = slot.acquire().await?.monitor(events);
+                    let installed = lease(&slot).await?.monitor(events);
                     Ok::<crate::monitor::PyMonitor, Errno>(crate::monitor::PyMonitor::new(
                         installed, bridge,
                     ))
@@ -502,9 +501,9 @@ macro_rules! python_socket {
             /// queue. The socket's slot under `ZMQ_MAX_SOCKETS` is returned
             /// when Python collects the object.
             fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-                let slot = Arc::clone(&self.socket);
+                let slot = self.socket.clone();
                 self.bridge.awaitable(py, async move {
-                    slot.acquire().await?.close();
+                    lease(&slot).await?.close();
                     Ok::<(), Errno>(())
                 })
             }

@@ -47,10 +47,20 @@
 //! guarantee is that nothing is lost, not that the two interleave in arrival
 //! order.
 //!
+//! # A handle that leaves for good
+//!
+//! A ZeroMQ socket that is split into a sending and a receiving half is
+//! consumed by it: the object the caller still holds has nothing left to
+//! lease, and a coroutine that is already queued behind a lease must be told
+//! so rather than wait for a handle that will never come back.
+//! [`Retirable`] is a slot for that: [`Retirable::retire`] takes the handle out
+//! for good, and every acquire after it — parked or later — resolves to
+//! [`Retired`]. It is an ordinary [`Slot`] over an `Option` underneath, so the
+//! lease's wait queue and its cancellation behaviour are the same, and the
+//! plain [`Slot`], which nothing retires, keeps an acquire that cannot fail.
+//!
 //! The mechanism is shared by every binding whose receive consumes something
-//! it cannot read twice. `weida-zmq-py` keeps its own copy of this file for the
-//! moment: it additionally *retires* a slot when a socket is split into two
-//! halves, which nothing else here does, and it moves here with that state.
+//! it cannot read twice, or whose handle is used by one coroutine at a time.
 
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
@@ -272,6 +282,112 @@ impl<S, I> Drop for Lease<S, I> {
     }
 }
 
+/// What a [`Retirable`] answers once its handle has left for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retired;
+
+/// A [`Slot`] whose handle can be taken out for good.
+///
+/// Cloning shares the slot, as cloning the `Arc` a plain slot lives in does.
+pub struct Retirable<S> {
+    /// `None` for good once retired: the handle is an `Option` so that the
+    /// slot's own lease and wait queue carry the retirement, and so that a
+    /// coroutine parked in [`acquire`](Retirable::acquire) finds it when the
+    /// lease in front of it ends rather than needing a wake-up of its own.
+    slot: Arc<Slot<Option<S>>>,
+}
+
+impl<S> Clone for Retirable<S> {
+    fn clone(&self) -> Retirable<S> {
+        Retirable {
+            slot: Arc::clone(&self.slot),
+        }
+    }
+}
+
+impl<S> Retirable<S> {
+    /// A slot holding `value`.
+    pub fn new(value: S) -> Retirable<S> {
+        Retirable {
+            slot: Slot::new(Some(value)),
+        }
+    }
+
+    /// Takes the handle, waiting for whoever has it to give it back, as
+    /// [`Slot::acquire`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`Retired`] once the handle was taken out for good, including while
+    /// this call was waiting for it.
+    pub async fn acquire(&self) -> Result<Live<S>, Retired> {
+        Live::of(self.slot.acquire().await)
+    }
+
+    /// Takes the handle if it is free, and does not wait if it is not:
+    /// `Ok(None)` is "somebody else has it".
+    ///
+    /// # Errors
+    ///
+    /// [`Retired`] once the handle was taken out for good.
+    pub fn try_acquire(&self) -> Result<Option<Live<S>>, Retired> {
+        match self.slot.try_acquire() {
+            None => Ok(None),
+            Some(lease) => Live::of(lease).map(Some),
+        }
+    }
+
+    /// Takes the handle out for good, waiting for a lease in front of this
+    /// call to end first.
+    ///
+    /// # Errors
+    ///
+    /// [`Retired`] if another call retired it first.
+    pub async fn retire(&self) -> Result<S, Retired> {
+        let mut lease = self.slot.acquire().await;
+        // The lease goes back to the slot empty when it drops here, which is
+        // what retires it and wakes the acquires queued behind this one.
+        lease.take().ok_or(Retired)
+    }
+}
+
+/// Exclusive ownership of a [`Retirable`]'s handle, given back when this is
+/// dropped.
+pub struct Live<S> {
+    /// Always `Some`: [`Live::of`] refuses an empty one, and only
+    /// [`Retirable::retire`] empties the slot, which it does under a lease
+    /// of its own.
+    lease: Lease<Option<S>>,
+}
+
+impl<S> Live<S> {
+    fn of(lease: Lease<Option<S>>) -> Result<Live<S>, Retired> {
+        // An empty lease is dropped here and goes back to the slot as it was,
+        // so the next acquire queued behind it finds the same thing.
+        if lease.is_some() {
+            Ok(Live { lease })
+        } else {
+            Err(Retired)
+        }
+    }
+}
+
+impl<S> Deref for Live<S> {
+    type Target = S;
+
+    fn deref(&self) -> &S {
+        let handle: &Option<S> = &self.lease;
+        handle.as_ref().expect("a live lease holds its handle")
+    }
+}
+
+impl<S> DerefMut for Live<S> {
+    fn deref_mut(&mut self) -> &mut S {
+        let handle: &mut Option<S> = &mut self.lease;
+        handle.as_mut().expect("a live lease holds its handle")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -394,5 +510,91 @@ mod tests {
         let lease = futures::executor::block_on(slot.acquire());
         assert_eq!(*lease, 3);
         releaser.join().expect("the releasing thread finished");
+    }
+
+    #[test]
+    fn a_retired_slot_hands_out_its_handle_once_and_then_refuses() {
+        let slot = Retirable::new(5u32);
+        assert_eq!(futures::executor::block_on(slot.retire()), Ok(5));
+        assert!(futures::executor::block_on(slot.acquire()).is_err());
+        assert!(matches!(slot.try_acquire(), Err(Retired)));
+        assert_eq!(futures::executor::block_on(slot.retire()), Err(Retired));
+    }
+
+    #[test]
+    fn a_live_lease_is_given_back_and_try_acquire_does_not_wait() {
+        let slot = Retirable::new("handle");
+        let held = slot
+            .try_acquire()
+            .expect("not retired")
+            .expect("nobody holds it");
+        assert!(
+            matches!(slot.try_acquire(), Ok(None)),
+            "a busy slot is not a retired one"
+        );
+        assert_eq!(*held, "handle");
+        drop(held);
+        assert!(matches!(slot.try_acquire(), Ok(Some(_))));
+    }
+
+    #[test]
+    fn retiring_waits_for_the_lease_in_front_and_tells_every_acquire_behind_it() {
+        let slot = Retirable::new(8u32);
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let held = futures::executor::block_on(slot.acquire()).expect("not retired");
+
+        let mut retiring = Box::pin(slot.retire());
+        assert!(poll_once(&mut retiring, &flag).is_pending());
+        let mut behind = Box::pin(slot.acquire());
+        assert!(poll_once(&mut behind, &flag).is_pending());
+        // A call that was told not to wait still sees a held slot as held.
+        assert!(matches!(slot.try_acquire(), Ok(None)));
+
+        drop(held);
+        assert!(flag.0.load(Ordering::SeqCst), "the release woke a waiter");
+        // The retirement was first in line, so it takes the handle; the
+        // acquire behind it then finds the slot empty rather than parked.
+        match poll_once(&mut retiring, &flag) {
+            Poll::Ready(handle) => assert_eq!(handle, Ok(8)),
+            Poll::Pending => panic!("the handle was free"),
+        }
+        match poll_once(&mut behind, &flag) {
+            Poll::Ready(outcome) => assert!(outcome.is_err(), "the handle is gone"),
+            Poll::Pending => panic!("the retirement released the slot"),
+        }
+    }
+
+    #[test]
+    fn a_retirement_races_parked_acquires_on_other_threads_and_leaves_none_waiting() {
+        let slot = Retirable::new(3u32);
+        let held = futures::executor::block_on(slot.acquire()).expect("not retired");
+        let (done, finished) = std::sync::mpsc::channel();
+        for retires in [true, false, false] {
+            let slot = slot.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let handed = if retires {
+                    futures::executor::block_on(slot.retire()).is_ok()
+                } else {
+                    futures::executor::block_on(slot.acquire()).is_ok()
+                };
+                let _ = done.send((retires, handed));
+            });
+        }
+        // All three are parked behind `held` well within this.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(held);
+        let mut retirements = 0;
+        for _ in 0..3 {
+            let (retires, handed) = finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a parked call was never answered");
+            if retires {
+                assert!(handed, "the one retirement got the handle");
+                retirements += 1;
+            }
+        }
+        assert_eq!(retirements, 1);
+        assert!(futures::executor::block_on(slot.acquire()).is_err());
     }
 }

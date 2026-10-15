@@ -18,11 +18,24 @@
 //! | [`PyRoutingId`] | 1-255 self-asserted octets with a nonzero first one | authenticated: a peer picks its own |
 //! | [`PyZapUserId`] | whatever string a ZAP handler chose for a 200 | a weida principal, or a routing id |
 
+use std::hash::{BuildHasher, RandomState};
+use std::sync::LazyLock;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 use weida_zmq::{CurvePublicKey, CurveSecretKey, RoutingId, ZapUserId};
 
 use crate::errors::raise;
+
+/// The key every [`PyCurveKey`]'s `hash()` is computed under, drawn once per
+/// process.
+///
+/// SipHash under a key nobody outside the process knows: `hash(key)` is then a
+/// value that equal keys share and that says nothing about the octets, however
+/// many of them a log, a `dict` ordering or a debugging print shows. Hashing
+/// the octets themselves (their first eight, say) would publish 64 bits of a
+/// secret key the first time one was used as a `dict` key and printed.
+static HASH_KEY: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 
 /// A CURVE key: 32 octets, taken as bytes or as 40 characters of Z85.
 ///
@@ -30,8 +43,25 @@ use crate::errors::raise;
 /// `ZMQ_CURVE_PUBLICKEY`, `ZMQ_CURVE_SECRETKEY` and `ZMQ_CURVE_SERVERKEY`:
 /// the octets do not say which role they are for, and pretending they do
 /// would be a type that lies.
+///
+/// # What it never does with the octets
+///
+/// Because the type cannot know whether it holds a secret, it treats every
+/// key as one:
+///
+/// - `repr` and `str` name the type and print no octets, so a log line, a
+///   traceback, a REPL echo or a test's assertion diff cannot carry a secret
+///   key. [`bytes`](PyCurveKey::bytes) and [`z85`](PyCurveKey::z85) are the
+///   deliberate way to write a key down.
+/// - `hash` is keyed per process ([`HASH_KEY`]).
+/// - `==` looks at every octet however early two keys differ, so how long a
+///   comparison takes does not say how many leading octets a guess got right.
+///
+/// There is deliberately no `PartialEq`, `Eq`, `Hash` or `Debug` on the Rust
+/// type either: the derived ones would compare early, hash the octets and
+/// print them, and a later caller would not know to look.
 #[pyclass(frozen, skip_from_py_object, name = "CurveKey", module = "weida_zmq")]
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 pub struct PyCurveKey {
     octets: [u8; 32],
 }
@@ -48,6 +78,22 @@ impl PyCurveKey {
         Ok(PyCurveKey {
             octets: *key.as_bytes(),
         })
+    }
+
+    /// Whether `other` holds the same octets, comparing all of them whatever
+    /// the first difference: the accumulator is complete before it is looked
+    /// at, as `weida_zmq::CurveSecretKey`'s equality does.
+    fn matches(&self, other: &PyCurveKey) -> bool {
+        let mut difference = 0u8;
+        for (ours, theirs) in self.octets.iter().zip(&other.octets) {
+            difference |= ours ^ theirs;
+        }
+        difference == 0
+    }
+
+    /// The value `hash()` returns: [`HASH_KEY`]'s SipHash of the octets.
+    fn hashed(&self) -> u64 {
+        HASH_KEY.hash_one(self.octets)
     }
 }
 
@@ -92,19 +138,18 @@ impl PyCurveKey {
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
         match other.extract::<PyRef<'_, PyCurveKey>>() {
-            Ok(twin) => self.octets == twin.octets,
+            Ok(twin) => self.matches(&twin),
             Err(_) => false,
         }
     }
 
     fn __hash__(&self) -> u64 {
-        u64::from_le_bytes(self.octets[..8].try_into().expect("32 octets"))
+        self.hashed()
     }
 
-    /// Z85, because that is the form a key is written in — and because a
-    /// secret key printed as octets in a log is the same accident either way.
-    fn __repr__(&self) -> String {
-        format!("<weida_zmq.CurveKey {}>", self.z85())
+    /// The type and nothing of the key: see the type's documentation.
+    fn __repr__(&self) -> &'static str {
+        "<weida_zmq.CurveKey redacted>"
     }
 }
 
@@ -359,5 +404,40 @@ impl PyPeer {
                 None => String::new(),
             }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(fill: u8) -> PyCurveKey {
+        PyCurveKey { octets: [fill; 32] }
+    }
+
+    #[test]
+    fn keys_match_exactly_when_every_octet_does() {
+        assert!(key(7).matches(&key(7)));
+        for position in 0..32 {
+            let mut other = key(7);
+            other.octets[position] ^= 0x01;
+            assert!(
+                !key(7).matches(&other),
+                "a difference in octet {position} must be seen"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_keys_hash_equal_and_the_hash_is_not_the_octets() {
+        assert_eq!(key(9).hashed(), key(9).hashed());
+        let mut secret = key(0);
+        secret.octets = *b"0123456789abcdef0123456789abcdef";
+        let leading = u64::from_le_bytes(secret.octets[..8].try_into().expect("32 octets"));
+        assert_ne!(
+            secret.hashed(),
+            leading,
+            "a hash made of the leading octets would publish them"
+        );
     }
 }

@@ -69,7 +69,6 @@ mod devices;
 mod errors;
 mod halves;
 mod identity;
-mod lease;
 mod monitor;
 mod ops;
 mod options;

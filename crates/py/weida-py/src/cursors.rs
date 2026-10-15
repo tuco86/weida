@@ -41,6 +41,7 @@ use weida::{CursorLevel, CursorSet, ReportMode, Reporter, Runtime};
 use weida_py_core::{Bridge, Errno};
 
 use crate::errors::to_py;
+use crate::lock::locked;
 
 /// Every named level, as `weida` exposes it.
 ///
@@ -165,7 +166,7 @@ impl PyCursors {
 impl PyCursors {
     /// The latest set as `{level: offset}`, without waiting.
     fn snapshot(&self) -> BTreeMap<u64, u64> {
-        set_of(*self.snapshot.lock().expect("snapshot lock poisoned"))
+        set_of(*locked(&self.snapshot))
     }
 
     /// The latest offset for `level`, or `None` if it was never reported.
@@ -175,11 +176,7 @@ impl PyCursors {
     /// `weida.Protocol` for a value that is not a level.
     fn offset(&self, py: Python<'_>, level: u64) -> PyResult<Option<u64>> {
         let level = level_of(py, level)?;
-        Ok(self
-            .snapshot
-            .lock()
-            .expect("snapshot lock poisoned")
-            .offset(level))
+        Ok(locked(&self.snapshot).offset(level))
     }
 
     /// Waits for the next change and returns the new set, or `None` once no
@@ -197,7 +194,7 @@ impl PyCursors {
             let changed = cursors.lock().await.changed().await;
             match changed {
                 Some(set) => {
-                    *snapshot.lock().expect("snapshot lock poisoned") = set;
+                    *locked(&snapshot) = set;
                     Ok(Some(set_of(set)))
                 }
                 None => Ok(None),
@@ -208,7 +205,7 @@ impl PyCursors {
     fn __repr__(&self) -> String {
         format!(
             "<weida.Cursors {} level(s) reported>",
-            self.snapshot.lock().expect("snapshot lock poisoned").len()
+            locked(&self.snapshot).len()
         )
     }
 }

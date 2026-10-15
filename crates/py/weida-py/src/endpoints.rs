@@ -23,6 +23,7 @@ use weida_py_core::{Bridge, payload_of, py_bytes};
 
 use crate::cursors::{PyCursors, PyReporter, reporting_meta};
 use crate::errors::errno_of;
+use crate::lock::locked;
 use crate::streams::{PyIncomingStream, PyOutgoingStream, PyReply};
 use crate::values::{PyConnectionStats, PyIncomingMeta};
 
@@ -397,7 +398,7 @@ impl PyRequest {
     /// Takes the request for the one answer it has, or reports that it is
     /// spent.
     fn take(&self) -> PyResult<weida::IncomingRequest> {
-        let taken = self.request.lock().expect("request lock poisoned").take();
+        let taken = locked(&self.request).take();
         match taken {
             Some(request) => Ok(request),
             None => Python::attach(|py| {

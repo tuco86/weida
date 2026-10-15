@@ -96,6 +96,7 @@ use pyo3::prelude::*;
 mod cursors;
 mod endpoints;
 mod errors;
+mod lock;
 mod patterns;
 mod pubsub;
 mod runtime;

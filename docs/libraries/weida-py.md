@@ -221,7 +221,7 @@ How a **one-way** transfer gets a verdict: a Push has no reply to carry one, so 
 | `OutgoingTransfer::cursors()` → `Option<Cursors>`, once | `await pusher.send(...)` → `weida.Cursors` or `None`; `await stream.cursors()` on the streamed form | present — `endpoints.rs:198-211`, `streams.rs:122-140`. `None` means nothing was ordered, which is every ordinary send; the second `cursors()` on one stream is `None`, asserted by `test_cursors.py::test_a_streamed_transfer_orders_a_report_too` |
 | `Cursors::snapshot()`, `offset(level)`, `changed()` | `cursors.snapshot()` → `{level: offset}`, `cursors.offset(level)`, `await cursors.changed()` | present — `cursors.rs:141-205`. A set is a **dict** rather than a class: a `CursorSet` is exactly the latest absolute offset per level, and a class would add a vocabulary without adding a fact |
 | `Cursors::changed()` → `None` at the end | the same `None`, and **no `async for`** | present, with the reason `weida.Survey` gives: the only channel out of a bridged future is the exception family, so `StopAsyncIteration` would need a second one. The loop is `while (set := await cursors.changed()) is not None:` |
-| `Cursors::changed_within(deadline)` → `Reported` | `sync.Cursors.changed(seconds)` → dict, `None`, or **`TimeoutError`** | present on the synchronous surface **only**, and that asymmetry is the point (`sync.rs:829-860`): `asyncio.wait_for` bounds the asyncio call and composes, while a parked thread is interrupted by nothing — a peer that never reports opens no stream and a connection both sides keep alive never closes. The deadline is mandatory there for the reason [0009](../decisions/0009-drain.md) §4.4 gives for `drain`, and a deadline that passes raises rather than returning `None`, because it is **not** the end of the report |
+| `Cursors::changed_within(deadline)` → `Reported` | `sync.Cursors.changed(seconds)` → dict, `None`, or **`TimeoutError`** | present on the synchronous surface **only**, and that asymmetry is the point (`sync.rs`): `asyncio.wait_for` bounds the asyncio call and composes, while a thread parked in `changed` is bounded by its argument alone — a peer that never reports opens no stream and a connection both sides keep alive never closes. The deadline is mandatory there for the reason [0009](../decisions/0009-drain.md) §4.4 gives for `drain`, and a deadline that passes raises rather than returning `None`, because it is **not** the end of the report |
 | `IncomingTransfer::reporter()` → `Option<Reporter>` | `await puller.recv_reporting(max_bytes)` → `(payload, meta, reporter)`, `await paired.recv_reporting(...)`, `await stream.reporter()` | present — `endpoints.rs:433-464`, `patterns.rs:135-157`, `streams.rs:237-254`. `recv` stays a two-tuple and forgets the transfer: a receiver that reports is a receiver with stages, and it says so at the call it makes |
 | `Reporter::levels()`, `mode()`, `report(level, offset)`, `finish()` | all four — `reporter.levels`, `reporter.mode`, `await reporter.report(...)`, `await reporter.finish()` | present — `cursors.rs:207-293`. A level the sender did not order is **ignored rather than refused**, which `test_cursors.py` asserts by reporting `STORED` on a report that ordered only `ACCEPTED` and `PROCESSED` and then finding it absent from the sender's snapshot |
 | `Reporter::with_granularity(bytes, interval)` | — | absent: the granularity is the reporter's own number and never negotiated (0023 §4.5), and this binding takes the library's default. A Python reporter that wants coarser records reports less often |
@@ -252,9 +252,15 @@ How a **one-way** transfer gets a verdict: a Push has no reply to carry one, so 
 `weida.sync` is a **real submodule** placed in `sys.modules`, so `import weida.sync` works and
 a traceback names `weida.sync.Runtime` (`sync.rs:916-956`, asserted by
 `test_sync.py::test_the_submodule_is_importable_and_shares_its_values`). It implements no
-protocol behaviour: it is `weida::blocking` — where the `block_on`, the owned reactor and the
-refusal of a call from inside a Tokio runtime live (`crates/weida/src/blocking.rs:32-47`) —
-with argument conversion around it (`sync.rs:17-34`). The GIL is released on every waiting
+protocol behaviour: it is `weida::blocking` — where the owned reactor and the refusal of a call
+from inside a Tokio runtime live (`crates/weida/src/blocking.rs:32-47`) — with argument
+conversion around it (`sync.rs:17-34`), **except for the calls that wait on a peer** (`accept`,
+`recv`, `recv_reporting`, `request`, and the `reply` and report calls). The facade's `block_on`
+cannot be interrupted, so those are driven in this crate, on the asynchronous endpoint the facade
+hands out, by `weida_py_core::interruptible`: Ctrl-C ends them on the main thread
+(`test_sync.py::test_ctrl_c_ends_a_wait_with_no_peer_and_no_deadline`) and an interrupted call
+consumes nothing (`test_an_interrupted_accept_leaves_the_next_request_for_the_next_accept`).
+The GIL is released on every waiting
 call through `Python::detach` (`sync.rs:36-42`, and every `py.detach(...)` in that file), which
 is what makes one thread per endpoint the shape it is supposed to be
 (`test_sync.py::test_a_request_is_answered_with_no_event_loop` runs the serving half on a
@@ -286,7 +292,7 @@ What differs, row by row:
 | — | `blocking::Requester::endpoint()` and the other `endpoint()` accessors, which hand out the async type | absent from Python: the escape hatch the facade offers a Rust caller (`crates/weida/src/blocking.rs:459-462`) has no Python spelling, because the asyncio surface *is* the escape hatch here |
 | `await surveyor.survey(...)` → `weida.Survey` | `surveyor.survey(...)` → the **same** `weida.Survey` | present, and the same value class rather than a synchronous twin of it (`sync.rs:594-628`): the collected shape is the right one on a surface with no event loop for the reason §4.4 gives, and it happens to be the right one on both |
 | `paired.peer_count()`, `member.dropped()`, `respondent.accept()` | all three | present — `sync.rs:532-715`; the synchronous `Respondent.accept` hands back `weida.sync.Request`, the class `Replier.accept` hands back, exactly as on the asyncio surface |
-| `await cursors.changed()`, unbounded | `cursors.changed(seconds)`, **mandatory** deadline, `TimeoutError` when it passes | present as the one deliberate signature difference in this module (§4.6) — `sync.rs:829-860`. `asyncio.wait_for` bounds the asyncio call and composes; a parked thread has nothing, so the facade takes the deadline that the asyncio surface gets from its loop (`crates/weida/src/blocking.rs:336-353`, `crates/weida/src/cursor.rs:280-296`) |
+| `await cursors.changed()`, unbounded | `cursors.changed(seconds)`, **mandatory** deadline, `TimeoutError` when it passes | present as the one deliberate signature difference in this module (§4.6) — `sync.rs`. `asyncio.wait_for` bounds the asyncio call and composes; the synchronous call has no loop to compose with, so the facade takes the deadline that the asyncio surface gets from its loop (`crates/weida/src/blocking.rs:336-353`, `crates/weida/src/cursor.rs:280-296`) |
 | `await stream.reporter()`, `await stream.cursors()` | — | absent as stream calls, because `sync` has no streams (§9.3). The handles arrive from `pusher.send(report=…)` and `puller.recv_reporting(...)` instead, which is the whole-payload shape of the same thing |
 
 ## 7. The exception family
@@ -327,8 +333,8 @@ is a timeout and **a cancelled weida coroutine resets its streams**, so the peer
 than waits (`endpoints.rs:88-91`, `README.md:87-92`). A per-call timeout would be a second
 cancellation mechanism with the same effect and a worse composition: `asyncio.wait_for`,
 `asyncio.timeout` and a `TaskGroup` all compose, a keyword argument does not. The synchronous
-surface has no timeout either, and there `weida::blocking`'s own shape is the limit: a blocked
-thread is interrupted by nothing.
+surface has no timeout argument either; there Ctrl-C ends a blocked call on the main thread, and
+a thread that is not the main one waits for its peer.
 
 ### 9.2 No raw L0 surface: `Peer` and `Acceptor` are not bound
 

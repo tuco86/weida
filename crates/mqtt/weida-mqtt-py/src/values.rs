@@ -26,7 +26,8 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use weida_mqtt::{
-    Completion, Delivery, Message, PayloadFormat, QoS, RetainHandling, RetainedOrigin, Subscription,
+    Bytes, Completion, Delivery, Message, PayloadFormat, QoS, RetainHandling, RetainedOrigin,
+    Subscription,
 };
 use weida_py_core::{LazyBytes, duration, payload_of};
 
@@ -112,14 +113,16 @@ impl PyMessage {
         let (payload, payload_cell) = match payload {
             Some(value) => {
                 // A `bytes` argument is the object Python already holds, so it is
-                // the one handed back; anything else is copied once.
+                // the one handed back; anything else is copied once. The `Vec`
+                // that copy makes becomes the message's `Bytes` as it is, and a
+                // publish then clones a reference to it instead of the payload.
                 let cell = match value.cast::<PyBytes>() {
                     Ok(bytes) => LazyBytes::seeded(bytes.clone()),
                     Err(_) => LazyBytes::new(),
                 };
-                (payload_of(value)?, cell)
+                (Bytes::from(payload_of(value)?), cell)
             }
-            None => (Vec::new(), LazyBytes::new()),
+            None => (Bytes::new(), LazyBytes::new()),
         };
         let correlation_data = match correlation_data {
             Some(value) => Some(payload_of(value)?),

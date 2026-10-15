@@ -148,6 +148,7 @@ mod task;
 pub mod transport;
 
 pub use alias::{Aliased, InboundAliases, OutboundAliases};
+pub use bytes::Bytes;
 pub use client::{Client, Context, Event, Events};
 pub use connection::Authenticator;
 pub use error::{Error, Feature, Result};
@@ -157,7 +158,7 @@ pub use filter::{
 };
 pub use limits::{DEFAULT_RECEIVE_MAXIMUM, DEFAULT_TOPIC_ALIAS_MAXIMUM, Limits, ServerLimits};
 pub use message::{Completion, Delivery, DeliveryProperties, Message, RetainedOrigin};
-pub use options::{ConnectOptions, MAX_INTERVAL, MAX_KEEP_ALIVE, WillMessage};
+pub use options::{ConnectOptions, MAX_INTERVAL, MAX_KEEP_ALIVE, MAX_TIMEOUT, WillMessage};
 pub use session::{InFlight, Resend, Resumption, Session, Stage, StoredPublish};
 pub use transport::Stream;
 #[cfg(feature = "tls")]

@@ -37,12 +37,39 @@
 //! process and none is needed: `weida-runtime`'s promise that "the caller may
 //! drive the returned futures on any executor" is what the facade underneath
 //! is built on.
+//!
+//! # What ends a wait that has no deadline
+//!
+//! A `recv()` or a blocking `send()` with no timeout waits for as long as the
+//! peer does. Two things end it, and neither needs the peer:
+//!
+//! - **Ctrl-C.** On the main thread the wait asks Python every 100 ms whether
+//!   a signal handler has something to raise ([`interruptible`]), so
+//!   `KeyboardInterrupt` arrives, and the message that had not come stays
+//!   where it was. Any other thread cannot receive a signal and parks until
+//!   the socket wakes it.
+//! - **`close()` from another thread.** The thread that is parked gets
+//!   `ENOTSOCK`, which is what a call on a closed socket gets anywhere, and
+//!   `close()` returns once the socket is closed rather than after the next
+//!   message.
+//!
+//! Every other call on a socket takes the same lock, so a `send()` made from a
+//! second thread while the first is parked in `recv()` queues behind it, as it
+//! does for two coroutines on the asyncio surface. A program that reads and
+//! writes one socket from two threads at once wants two sockets, or the
+//! asyncio surface's `split()`; `close()` is the only call that does not wait
+//! its turn.
 
+use std::pin::pin;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use tokio::sync::Notify;
+use weida_py_core::{duration, interruptible};
+use weida_zmq::Context;
 use weida_zmq::blocking::BlockingContext;
 
 use crate::errors::raise;
@@ -111,17 +138,68 @@ impl SyncContext {
 fn limit(py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<Duration>> {
     match timeout {
         None => Ok(None),
-        Some(seconds) if seconds.is_finite() && seconds >= 0.0 => {
-            Ok(Some(Duration::from_secs_f64(seconds)))
-        }
-        Some(seconds) => Err(crate::errors::to_py(
-            py,
-            &weida_py_core::Errno::new(
-                "EINVAL",
-                format!("a timeout is a finite, non-negative number of seconds, not {seconds}"),
-            ),
-        )),
+        Some(seconds) => duration("a timeout", seconds).map(Some).map_err(|bad| {
+            crate::errors::to_py(py, &weida_py_core::Errno::new("EINVAL", format!("{bad}")))
+        }),
     }
+}
+
+/// How `close()` reaches a call that is parked in the socket.
+///
+/// The parked call holds the socket's lock for as long as it waits, and
+/// `close()` needs that lock, so a flag that every waiting call also listens
+/// to is the only way for `close()` to end the wait rather than queue behind
+/// it.
+struct Closing {
+    /// Set by [`begin`](Closing::begin) and never cleared: a closed socket
+    /// stays closed.
+    closed: AtomicBool,
+    /// Wakes the calls that are parked when `close()` begins.
+    parked: Notify,
+}
+
+impl Closing {
+    fn new() -> Closing {
+        Closing {
+            closed: AtomicBool::new(false),
+            parked: Notify::new(),
+        }
+    }
+
+    /// `close()` has been called: ends the waits that are parked and refuses
+    /// the ones that start.
+    fn begin(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.parked.notify_waiters();
+    }
+
+    /// Waits for `operation`, or ends with `ENOTSOCK` as soon as `close()`
+    /// begins, dropping the operation where it stands.
+    ///
+    /// Dropping is what cancelling a coroutine does to the same futures on the
+    /// asyncio surface, so every future that surface is cancelled in may be
+    /// dropped here: a receive leaves its message queued.
+    async fn until_closed<T>(
+        &self,
+        operation: impl Future<Output = weida_zmq::Result<T>>,
+    ) -> weida_zmq::Result<T> {
+        let mut woken = pin!(self.parked.notified());
+        // Registered before the flag is read, so that a `begin` between the
+        // two wakes this wait instead of slipping past it.
+        woken.as_mut().enable();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(closed());
+        }
+        tokio::select! {
+            biased;
+            () = woken => Err(closed()),
+            outcome = operation => outcome,
+        }
+    }
+}
+
+fn closed() -> weida_zmq::Error {
+    weida_zmq::Error::ENOTSOCK("the socket was closed while this call was waiting".into())
 }
 
 /// One synchronous socket class: the endpoint surface, plus its pattern's.
@@ -138,17 +216,16 @@ macro_rules! sync_socket {
             /// Receives the next message, blocking until one arrives.
             ///
             /// Bounded by `ZMQ_RCVTIMEO`, or by `timeout` seconds when one is
-            /// given. The GIL is released while waiting.
+            /// given. The GIL is released while waiting. Ctrl-C ends the wait
+            /// on the main thread, and `close()` from another thread ends it
+            /// with `ENOTSOCK`.
             #[pyo3(signature = (*, timeout=None))]
             fn recv(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyMultipart> {
                 let limit = limit(py, timeout)?;
-                let received = py.detach(|| {
-                    let mut socket = self.lock();
-                    match limit {
-                        Some(limit) => socket.recv_timeout(limit),
-                        None => socket.recv(),
-                    }
-                });
+                let received = self.wait(py, async move |socket| match limit {
+                    Some(limit) => socket.recv_timeout(limit).await,
+                    None => socket.recv().await,
+                })?;
                 raise(py, received).map(PyMultipart::of)
             }
 
@@ -168,7 +245,9 @@ macro_rules! sync_socket {
             /// Sends a message, blocking until it is queued.
             ///
             /// Bounded by `ZMQ_SNDTIMEO`, or by `timeout` seconds when one is
-            /// given. The GIL is released while waiting.
+            /// given. The GIL is released while waiting. Ctrl-C ends the wait
+            /// on the main thread, and `close()` from another thread ends it
+            /// with `ENOTSOCK`.
             #[pyo3(signature = (message, *, timeout=None))]
             fn send(
                 &self,
@@ -178,13 +257,10 @@ macro_rules! sync_socket {
             ) -> PyResult<()> {
                 let message = message_from(message)?;
                 let limit = limit(py, timeout)?;
-                let sent = py.detach(|| {
-                    let mut socket = self.lock();
-                    match limit {
-                        Some(limit) => socket.send_timeout(message, limit),
-                        None => socket.send(message),
-                    }
-                });
+                let sent = self.wait(py, async move |socket| match limit {
+                    Some(limit) => socket.send_timeout(message, limit).await,
+                    None => socket.send(message).await,
+                })?;
                 raise(py, sent)
             }
 
@@ -203,10 +279,12 @@ macro_rules! sync_socket {
             $($acc)*
 
             /// Sends a message and reports what became of it: this socket
-            /// type drops at the high-water mark rather than blocking.
+            /// type drops at the high-water mark rather than blocking, and
+            /// waits only where `ZMQ_ROUTER_MANDATORY` says to — a wait that
+            /// ends as `recv`'s does.
             fn send(&self, py: Python<'_>, message: &Bound<'_, PyAny>) -> PyResult<PySent> {
                 let message = message_from(message)?;
-                let sent = py.detach(|| self.lock().send(message));
+                let sent = self.wait(py, async move |socket| socket.send(message).await)?;
                 raise(py, sent).map(PySent::of)
             }
 
@@ -296,6 +374,13 @@ macro_rules! sync_socket {
             /// released before the lock is taken so a second Python thread
             /// runs while this one waits.
             socket: Mutex<weida_zmq::blocking::$rust>,
+            /// The reactor's clock and its runtime context, which a wait
+            /// that arms a timer needs.
+            #[allow(dead_code, reason = "a PUB never waits, so only the classes that \
+                                          receive or block read it")]
+            context: Context,
+            /// How `close()` reaches a wait that holds the lock.
+            closing: Closing,
         }
 
         impl $class {
@@ -303,6 +388,30 @@ macro_rules! sync_socket {
                 self.socket
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
+            }
+
+            /// Runs a call that may wait on a peer, with the GIL released.
+            ///
+            /// The wait ends with Python's signal handlers on the main thread
+            /// and with `close()` on any thread; see the module
+            /// documentation. Both drop the operation where it stands, which
+            /// is the cancellation the asyncio surface gives the same
+            /// futures.
+            // The guard is held across the wait on purpose: the operation
+            // borrows the socket for as long as it runs, the future is polled
+            // on this thread only, and a second call must queue behind it.
+            #[allow(clippy::await_holding_lock)]
+            #[allow(dead_code, reason = "a PUB never waits, so only the classes that \
+                                          receive or block call it")]
+            fn wait<T: Send>(
+                &self,
+                py: Python<'_>,
+                operation: impl AsyncFnOnce(&mut weida_zmq::$rust) -> weida_zmq::Result<T> + Send,
+            ) -> PyResult<weida_zmq::Result<T>> {
+                interruptible(py, self.context.exec(), || async {
+                    let mut socket = self.lock();
+                    self.closing.until_closed(operation(socket.socket())).await
+                })
             }
         }
 
@@ -323,6 +432,8 @@ macro_rules! sync_socket {
                 )?;
                 let socket = $class {
                     socket: Mutex::new(socket),
+                    context: context.inner().context().clone(),
+                    closing: Closing::new(),
                 };
                 if let Some(options) = options {
                     let applied = py.detach(|| {
@@ -383,7 +494,12 @@ macro_rules! sync_socket {
             }
 
             /// `zmq_close`.
+            ///
+            /// Ends a `recv()` or `send()` that another thread is parked in,
+            /// which raises `ENOTSOCK` there, and returns once the socket is
+            /// closed.
             fn close(&self, py: Python<'_>) {
+                self.closing.begin();
                 py.detach(|| self.lock().close());
             }
 

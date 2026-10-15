@@ -43,6 +43,7 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use weida_mqtt_codec::{
     PayloadFormat, Properties, PubackReasonCode, PubcompReasonCode, Publish, PubrecReasonCode, QoS,
 };
@@ -63,7 +64,11 @@ pub struct Message {
     pub topic: String,
     /// The payload. Opaque bytes; zero length is valid (3.3.3), and zero
     /// length with RETAIN is the delete of [MQTT-3.3.1-6].
-    pub payload: Vec<u8>,
+    ///
+    /// `Bytes`, so that the copies a message goes through — a clone to publish
+    /// it, the stored shape a QoS > 0 message becomes, a resend on a later
+    /// connection — share one allocation instead of each copying the payload.
+    pub payload: Bytes,
     /// Quality of Service. Refused above the server's `Maximum QoS`
     /// (3.2.2.3.4) before the packet reaches the wire.
     pub qos: QoS,
@@ -89,8 +94,14 @@ pub struct Message {
 
 impl Message {
     /// A QoS 0 message on `topic`.
+    ///
+    /// `payload` is anything that is `Bytes` already or becomes it without a
+    /// copy: a `Vec<u8>`, a `String`, a `&'static str` or `&'static [u8]`, or
+    /// a `Bytes` itself. A borrowed slice that is not `'static` is
+    /// `Bytes::copy_from_slice`d by the caller, once, where the copy is
+    /// visible.
     #[must_use]
-    pub fn new(topic: impl Into<String>, payload: impl Into<Vec<u8>>) -> Message {
+    pub fn new(topic: impl Into<String>, payload: impl Into<Bytes>) -> Message {
         Message {
             topic: topic.into(),
             payload: payload.into(),
@@ -132,7 +143,7 @@ impl Message {
     pub fn delete_retained(topic: impl Into<String>) -> Message {
         Message {
             topic: topic.into(),
-            payload: Vec::new(),
+            payload: Bytes::new(),
             retain: true,
             ..Message::default()
         }
@@ -560,7 +571,7 @@ mod tests {
     fn a_stored_message_keeps_every_forwarded_property() {
         let message = Message {
             topic: "a/b".into(),
-            payload: b"body".to_vec(),
+            payload: Bytes::from_static(b"body"),
             qos: QoS::ExactlyOnce,
             retain: true,
             payload_format_indicator: Some(PayloadFormat::Utf8),
@@ -599,5 +610,17 @@ mod tests {
         assert_eq!(delivery.packet_id, None, "no identifier at QoS 0");
         assert!(delivery.retain);
         assert!(!delivery.dup);
+    }
+
+    /// Publishing clones the message and a QoS > 0 publish stores it, and
+    /// neither may copy the payload: it is shared, so a large message costs
+    /// one allocation however many times it is held.
+    #[test]
+    fn a_clone_and_the_stored_shape_share_the_payload() {
+        let message = Message::new("a/b", vec![7u8; 4096]).at(QoS::AtLeastOnce);
+        let cloned = message.clone();
+        assert_eq!(message.payload.as_ptr(), cloned.payload.as_ptr());
+        let stored = message.into_stored().expect("stores");
+        assert_eq!(stored.payload.as_ptr(), cloned.payload.as_ptr());
     }
 }

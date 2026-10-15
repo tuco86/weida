@@ -13,6 +13,8 @@ by the status code alone.
 """
 
 import asyncio
+import subprocess
+import sys
 
 import pytest
 
@@ -179,6 +181,62 @@ def test_curve_keys_are_taken_as_32_bytes_or_40_characters_of_z85():
     for wrong in [b"", b"too short", b"x" * 31, "Z" * 39]:
         with pytest.raises(weida_zmq.EINVAL):
             weida_zmq.CurveKey(wrong)
+
+
+def test_a_curve_key_never_shows_its_octets_in_a_repr_or_a_str():
+    """`CurveKey` is one type for the public and the secret half, so none of
+    them may print: a log line, a traceback or an assertion diff holding the
+    secret half would be the secret on a disk."""
+    public, secret = weida_zmq.curve_keypair()
+    for key in (public, secret, weida_zmq.CurveKey(secret.z85)):
+        for text in (repr(key), str(key), f"{key}", f"{[key]}", f"{{'k': {key!r}}}"):
+            assert key.z85 not in text
+            assert key.bytes.hex() not in text.lower()
+            assert key.z85[:8] not in text
+            assert "CurveKey" in text, "it still says what it is"
+
+
+def test_a_curve_keys_hash_is_not_made_of_its_octets():
+    public, secret = weida_zmq.curve_keypair()
+    leading = int.from_bytes(secret.bytes[:8], "little")
+    assert hash(secret) not in (leading, leading - (1 << 64))
+    # Equal keys still hash equal and work as dictionary keys: a ZAP handler's
+    # allow list is a set of them.
+    twin = weida_zmq.CurveKey(secret.z85)
+    assert hash(twin) == hash(secret)
+    assert {secret: "s", public: "p"}[twin] == "s"
+    assert len({public, weida_zmq.CurveKey(public.bytes), secret}) == 2
+
+
+def test_a_curve_keys_hash_is_keyed_per_process():
+    """Two processes hash one key differently, so a hash read in one tells
+    nothing about the octets and cannot be compared with another's."""
+    program = (
+        "import weida_zmq; "
+        "print(hash(weida_zmq.CurveKey(b'0123456789abcdef0123456789abcdef')))"
+    )
+    seen = {
+        subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            timeout=DEADLINE,
+            check=True,
+        ).stdout
+        for _ in range(3)
+    }
+    assert len(seen) > 1
+
+
+def test_curve_keys_compare_by_every_octet():
+    key = weida_zmq.CurveKey(bytes(range(32)))
+    assert key == weida_zmq.CurveKey(bytes(range(32)))
+    for position in range(32):
+        other = bytearray(range(32))
+        other[position] ^= 1
+        assert key != weida_zmq.CurveKey(bytes(other)), position
+    assert key != bytes(range(32))
+    assert key != key.z85
 
 
 def test_curve_authenticates_both_ends_and_zap_sees_the_clients_key():

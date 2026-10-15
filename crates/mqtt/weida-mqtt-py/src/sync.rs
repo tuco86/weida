@@ -226,7 +226,8 @@ impl SyncClient {
         raise(py, codes).map(|codes| codes.iter().map(|code| u16::from(code.as_byte())).collect())
     }
 
-    /// Sends DISCONNECT and closes.
+    /// Sends DISCONNECT and closes. Ctrl-C ends the wait for the write the
+    /// way it ends a publish's.
     #[pyo3(signature = (reason_code = 0x00, *, session_expiry = None))]
     fn disconnect(
         &self,
@@ -240,19 +241,24 @@ impl SyncClient {
             ))
         })?;
         let expiry = limit(session_expiry)?;
-        let sent = py.detach(|| self.inner.disconnect_with(code, expiry));
+        let client = &self.inner;
+        let sent = interruptible(py, &self.exec, move || {
+            client.client().disconnect_with(code, expiry)
+        })?;
         raise(py, sent)
     }
 
     /// Sends PINGREQ now, whatever the keep-alive timer thinks.
     fn ping(&self, py: Python<'_>) -> PyResult<()> {
-        let sent = py.detach(|| self.inner.ping());
+        let client = &self.inner;
+        let sent = interruptible(py, &self.exec, move || client.client().ping())?;
         raise(py, sent)
     }
 
     /// Re-authenticates on the live connection ([MQTT-4.12.1-1]).
     fn reauthenticate(&self, py: Python<'_>) -> PyResult<()> {
-        let done = py.detach(|| self.inner.reauthenticate());
+        let client = &self.inner;
+        let done = interruptible(py, &self.exec, move || client.client().reauthenticate())?;
         raise(py, done)
     }
 

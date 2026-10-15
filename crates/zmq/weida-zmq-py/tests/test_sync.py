@@ -15,6 +15,9 @@ The GIL is released while a call blocks, which the threaded test proves: a
 second thread runs while the first is parked in `recv`.
 """
 
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -214,3 +217,98 @@ def test_lazy_pirate_abandons_rather_than_hanging():
     # Abandoned, not hung: two retries of 200 ms and no more.
     assert elapsed < 5.0, elapsed
     assert elapsed >= 0.4, elapsed
+
+
+def parked(call):
+    """Runs `call` on a thread and records how it ended."""
+    outcome = {}
+
+    def run():
+        try:
+            outcome["result"] = call()
+        except BaseException as error:  # noqa: BLE001 - the test inspects it
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    time.sleep(0.2)  # long enough to be parked in the wait
+    assert thread.is_alive(), outcome
+    return thread, outcome
+
+
+def test_close_from_another_thread_ends_a_receive_with_no_deadline():
+    """The reader-thread shutdown pattern: a thread parked in `recv()` on a
+    quiet socket, and the main thread closing the socket to stop it. `close()`
+    used to queue behind the receive for as long as no message came."""
+    context = sync.Context()
+    sink = sync.PullSocket(context)
+    sink.bind("inproc://sync-close-parked-recv")
+    reader, outcome = parked(sink.recv)
+
+    closer = threading.Thread(target=sink.close, daemon=True)
+    started = time.monotonic()
+    closer.start()
+    closer.join(timeout=5.0)
+    assert not closer.is_alive(), "close() waited for a message nobody will send"
+    assert time.monotonic() - started < 2.0
+    reader.join(timeout=5.0)
+    assert not reader.is_alive()
+    assert isinstance(outcome.get("error"), weida_zmq.ENOTSOCK), outcome
+    # And the socket stays what it is: closed.
+    with pytest.raises(weida_zmq.ENOTSOCK):
+        sink.recv(timeout=0.5)
+
+
+def test_close_from_another_thread_ends_a_send_that_has_no_room():
+    context = sync.Context()
+    source = sync.PushSocket(context)
+    source.bind("inproc://sync-close-parked-send")  # no worker, so nowhere to send
+    writer, outcome = parked(lambda: source.send(b"nobody takes this"))
+
+    closer = threading.Thread(target=source.close, daemon=True)
+    closer.start()
+    closer.join(timeout=5.0)
+    assert not closer.is_alive()
+    writer.join(timeout=5.0)
+    assert not writer.is_alive()
+    assert isinstance(outcome.get("error"), weida_zmq.ENOTSOCK), outcome
+
+
+def test_ctrl_c_ends_a_receive_with_no_peer_and_no_deadline():
+    # A child parks in `recv()` on an idle socket with no timeout; the parent
+    # interrupts it once it says it is waiting. The wait must end with
+    # KeyboardInterrupt rather than hold the process until a message comes.
+    script = (
+        "from weida_zmq import sync\n"
+        "sock = sync.PullSocket(sync.Context())\n"
+        "sock.bind('inproc://ctrl-c')\n"
+        "print('waiting', flush=True)\n"
+        "sock.recv()\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "waiting"
+        time.sleep(0.5)
+        child.send_signal(signal.SIGINT)
+        _, stderr = child.communicate(timeout=3)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+    assert "KeyboardInterrupt" in stderr
+
+
+def test_a_timeout_that_is_not_a_number_of_seconds_is_an_exception_not_a_panic():
+    # `pytest.raises(Exception)` does not catch a PanicException, which is a
+    # BaseException, so a panic fails here instead of passing.
+    context = sync.Context()
+    sink = sync.PullSocket(context)
+    sink.bind("inproc://sync-bad-timeout")
+    for seconds in (1e30, float("inf"), float("nan"), -1.0):
+        with pytest.raises(weida_zmq.EINVAL):
+            sink.recv(timeout=seconds)

@@ -31,7 +31,7 @@ fn options(clean_start: bool) -> ConnectOptions {
 fn message(topic: &str, qos: QoS) -> Arc<StoredPublish> {
     Arc::new(StoredPublish {
         topic: topic.into(),
-        payload: b"body".to_vec(),
+        payload: weida_mqtt::Bytes::from_static(b"body"),
         qos,
         retain: false,
         payload_format_indicator: None,

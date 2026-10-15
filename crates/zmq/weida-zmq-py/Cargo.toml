@@ -38,9 +38,9 @@ pyo3.workspace = true
 # needs no event loop (0013 §4.4 item 3). It is the library's own facade rather
 # than a second implementation of anything.
 weida-zmq = { workspace = true, features = ["blocking"] }
-# Two things and no more: `tokio::sync::Mutex`, which is what makes a socket
-# that is `Send + !Sync` shareable between coroutines without ever being used
-# by two at once, and `runtime::Handle`, which is the value
+# Two things and no more: `tokio::sync::Notify` and `tokio::select!`, which is
+# how `close()` on a synchronous socket ends a receive that another thread is
+# parked in (`src/sync.rs`), and `runtime::Handle`, which is the value
 # `Context::with_handle` takes — the third of the three constructors
 # (0013 §4.4) cannot be offered to Python without naming it.
 tokio.workspace = true

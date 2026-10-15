@@ -68,6 +68,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use weida_mqtt_codec::{PayloadFormat, Properties, Publish, QoS, SubackReasonCode};
 
 use crate::error::{Error, Result};
@@ -85,8 +86,9 @@ use crate::limits::Limits;
 pub struct StoredPublish {
     /// The full Topic Name. Never an alias: see the module documentation.
     pub topic: String,
-    /// The Application Message.
-    pub payload: Vec<u8>,
+    /// The Application Message, shared with the [`crate::Message`] it came
+    /// from and with every resend of it.
+    pub payload: Bytes,
     /// QoS 1 or 2. QoS 0 is never stored, because it is never resent.
     pub qos: QoS,
     /// RETAIN as published.
@@ -898,7 +900,7 @@ mod tests {
     fn stored(topic: &str, qos: QoS) -> StoredPublish {
         StoredPublish {
             topic: topic.into(),
-            payload: topic.as_bytes().to_vec(),
+            payload: Bytes::copy_from_slice(topic.as_bytes()),
             qos,
             retain: false,
             payload_format_indicator: None,
@@ -1147,7 +1149,7 @@ mod tests {
         let session = Session::new("c", &limits);
         let big = |topic: &str| {
             Arc::new(StoredPublish {
-                payload: vec![0; 1_000],
+                payload: Bytes::from(vec![0; 1_000]),
                 ..stored(topic, QoS::AtLeastOnce)
             })
         };
@@ -1169,7 +1171,7 @@ mod tests {
         // empty session.
         session.clear();
         let huge = Arc::new(StoredPublish {
-            payload: vec![0; 10_000],
+            payload: Bytes::from(vec![0; 10_000]),
             ..stored("h", QoS::AtLeastOnce)
         });
         assert!(session.allocate(huge).is_ok());
@@ -1186,7 +1188,7 @@ mod tests {
         let session = Session::new("c", &limits);
         let big = |topic: &str| {
             Arc::new(StoredPublish {
-                payload: vec![0; 1_000],
+                payload: Bytes::from(vec![0; 1_000]),
                 ..stored(topic, QoS::ExactlyOnce)
             })
         };

@@ -13,7 +13,7 @@
 //! class.
 
 use pyo3::prelude::*;
-use weida_py_core::{Errno, ErrorClasses};
+use weida_py_core::{Errno, ErrorClasses, Retired};
 use weida_zmq::Error;
 
 /// The module's exception classes, built once at import.
@@ -71,6 +71,16 @@ pub fn install(module: &Bound<'_, PyModule>) -> PyResult<()> {
 /// build the exception itself.
 pub fn errno_of(error: Error) -> Errno {
     Errno::new(name_of(&error), error.cause())
+}
+
+/// What a call on a socket that `split()` consumed gets: `ENOTSOCK`, naming
+/// the split, because the socket lives on in its halves and this object has
+/// nothing left to lease.
+pub fn retired(_: Retired) -> Errno {
+    Errno::new(
+        "ENOTSOCK",
+        "this socket was split; use the halves split() returned",
+    )
 }
 
 /// Turns an [`Errno`] into this module's exception. The

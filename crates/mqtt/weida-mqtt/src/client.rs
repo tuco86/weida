@@ -282,14 +282,7 @@ impl Client {
         options: ConnectOptions,
         session: &Session,
     ) -> Result<(Client, Events)> {
-        Client::connect_full(
-            context,
-            address,
-            options,
-            session,
-            Arc::new(NoAuthenticator),
-        )
-        .await
+        Client::connect_full(context, address, options, session, None).await
     }
 
     /// The same, answering the server's AUTH challenges through
@@ -297,9 +290,13 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// As [`Client::connect`], plus [`Error::AuthenticationMethodMismatch`]
-    /// where the server changes method mid-exchange and whatever the
-    /// authenticator itself reports.
+    /// As [`Client::connect`], plus [`Error::Configuration`] where
+    /// `options` names no `authentication_method`: without one the server
+    /// is never asked to authenticate and the authenticator would be
+    /// neither challenged nor asked to verify the server, so a verifier
+    /// that silently verifies nothing is refused instead.
+    /// [`Error::AuthenticationMethodMismatch`] where the server changes
+    /// method mid-exchange, and whatever the authenticator itself reports.
     pub async fn connect_with(
         context: &Context,
         address: &str,
@@ -307,10 +304,14 @@ impl Client {
         authenticator: Arc<dyn Authenticator>,
     ) -> Result<(Client, Events)> {
         let session = Session::new(options.client_id.clone(), &options.limits);
-        Client::connect_full(context, address, options, &session, authenticator).await
+        Client::connect_full(context, address, options, &session, Some(authenticator)).await
     }
 
     /// The one implementation the four constructors funnel through.
+    ///
+    /// `authenticator` is `None` for the constructors that take none; the
+    /// connection then refuses any proof from the server that it cannot
+    /// check.
     ///
     /// # Errors
     ///
@@ -320,9 +321,17 @@ impl Client {
         address: &str,
         options: ConnectOptions,
         session: &Session,
-        authenticator: Arc<dyn Authenticator>,
+        authenticator: Option<Arc<dyn Authenticator>>,
     ) -> Result<(Client, Events)> {
         options.validate()?;
+        if authenticator.is_some() && options.authentication_method.is_none() {
+            return Err(Error::Configuration(
+                "an Authenticator needs authentication_method: without a method no AUTH \
+                 exchange happens and the server is never verified"
+                    .into(),
+            ));
+        }
+        let authenticator = authenticator.unwrap_or_else(|| Arc::new(NoAuthenticator));
 
         // "Clean Start 1 discards any existing Session" ([MQTT-3.1.2-4]), so
         // the client's half goes before the CONNECT rather than after the
@@ -641,12 +650,19 @@ impl Client {
     /// never counted and never waits, which is the same asymmetry that leaves
     /// QoS 0 with no flow control at all.
     ///
+    /// **Dropping the future before the message is on the wire withdraws it**:
+    /// a publish that timed out while it waited for the quota is never sent,
+    /// so retrying it cannot duplicate it. Once the PUBLISH is on the wire the
+    /// exchange is session state and runs to its end whatever the caller does.
+    ///
     /// # Errors
     ///
     /// [`Error::Unavailable`] where the server declined the QoS or RETAIN,
     /// refused before the packet reaches the wire; [`Error::NotConnected`]
-    /// where the connection ended; and whatever the write or the encode
-    /// reported.
+    /// where the connection ended; [`Error::QuotaExhausted`] where the
+    /// messages already waiting for the quota number [`crate::Limits::max_inflight`]
+    /// or hold [`crate::Limits::max_inflight_bytes`]; and whatever the write or
+    /// the encode reported.
     pub async fn publish(&self, message: Message) -> Result<Completion> {
         message.check(&self.limits)?;
         let (done, wait) = oneshot::channel();

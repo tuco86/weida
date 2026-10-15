@@ -40,6 +40,17 @@ use crate::cursors::{PyCursors, PyReporter};
 use crate::errors::errno_of;
 use crate::values::PyIncomingMeta;
 
+/// The most one [`PyIncomingStream::read`] hands back, whatever ceiling it is
+/// given.
+///
+/// The ceiling is a Python argument, and a buffer the size of it is allocated
+/// and zeroed before a byte is known to be there: `read(16 << 20)` on a stream
+/// with one packet waiting would zero 16 MiB for 1.4 KB, and `read(2**40)`
+/// would abort the interpreter in the allocator instead of raising. A read may
+/// legally return fewer bytes than asked for, so the buffer is the size of a
+/// piece the transport hands over at a time, not of the caller's hope.
+const READ_PIECE_BYTES: usize = 64 * 1024;
+
 /// What a call on a spent stream gets, rather than a panic.
 fn spent(what: &str) -> Errno {
     Errno::new(
@@ -187,7 +198,10 @@ impl PyIncomingStream {
     /// Reads up to `max_bytes` of the payload, returning `b""` at the end.
     ///
     /// The ceiling bounds one piece, so a loop over `read` holds one piece at
-    /// a time and the payload has no size limit at all.
+    /// a time and the payload has no size limit at all. A piece may be
+    /// shorter than `max_bytes`, as a read of any stream may, and is never
+    /// longer than [`READ_PIECE_BYTES`]: `read(2**40)` is a read of one piece,
+    /// not an allocation of a terabyte.
     ///
     /// # Errors
     ///
@@ -200,7 +214,7 @@ impl PyIncomingStream {
             let Some(stream) = guard.as_mut() else {
                 return Ok(Vec::new());
             };
-            let mut buf = vec![0u8; max_bytes.max(1)];
+            let mut buf = vec![0u8; max_bytes.clamp(1, READ_PIECE_BYTES)];
             // `AsyncRead`'s own `read`, whose error is an `io::Error`: the
             // stream is an `AsyncRead` precisely so that a streaming caller
             // does not go through `read_capped`, and the two error types are
