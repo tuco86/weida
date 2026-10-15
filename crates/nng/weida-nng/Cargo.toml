@@ -10,6 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+autotests = false
 
 [dependencies]
 # The machine room only: the reactor, the resolver, the AF_UNIX hygiene and
@@ -104,3 +105,8 @@ blocking = ["dep:futures"]
 
 [lints]
 workspace = true
+
+# Integration tests are one binary (`tests/main.rs`): see its module docs.
+[[test]]
+name = "it"
+path = "tests/main.rs"

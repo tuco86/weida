@@ -2,7 +2,7 @@
 //! side must keep its redial schedule across those connections instead of
 //! starting it again at `initial` every time one is accepted.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

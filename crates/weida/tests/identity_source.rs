@@ -7,8 +7,6 @@
 //! says so; a bootstrapped directory yields the same key on the second start
 //! and is readable by nobody else.
 
-mod common;
-
 use std::path::Path;
 use std::time::Duration;
 

@@ -16,7 +16,14 @@ categories.workspace = true
 # it must not be able to reach for weida's types, its limits or its error
 # vocabulary. `weida-mqtt` depends on this crate and on `weida-runtime`; this
 # one depends on neither (`docs/decisions/0013-competitor-libraries.md` §4.3).
+autotests = false
+
 [dependencies]
 
 [lints]
 workspace = true
+
+# Integration tests are one binary (`tests/main.rs`): see its module docs.
+[[test]]
+name = "it"
+path = "tests/main.rs"

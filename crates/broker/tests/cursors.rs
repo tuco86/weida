@@ -15,6 +15,7 @@ use std::time::Duration;
 use weida::{Acknowledgement, CursorLevel, Pusher, Requester, TransferMeta};
 use weida_broker::{BrokerConfig, PER_MESSAGE_OVERHEAD};
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::{DEADLINE, Harness};

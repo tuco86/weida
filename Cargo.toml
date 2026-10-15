@@ -203,3 +203,14 @@ zeromq = "0.6"
 # Proves a negative the type system holds and no runtime test can see: a
 # socket shared between threads must not compile. Tests only.
 trybuild = "1"
+
+# Every integration test, example and bench is its own binary that links tokio,
+# quinn and rustls statically; with full debuginfo each weighs hundreds of MB,
+# and one gate run (seven feature configurations) filled tens of GB of disk and
+# spent most of its time in the linker. Line tables keep file and line in a
+# backtrace, which is what a failing test needs; dependencies keep none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

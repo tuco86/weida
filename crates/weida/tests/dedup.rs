@@ -5,7 +5,7 @@
 //! tests speak `weida-protocol` over bare `quinn`, exactly as the hostile
 //! suite does, to send one transfer twice inside the window and once after it.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

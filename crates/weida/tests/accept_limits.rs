@@ -6,7 +6,7 @@
 //! can drop what the server sends back, which is what a spoofed source looks
 //! like from the server's side: it never answers.
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};

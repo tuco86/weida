@@ -7,7 +7,7 @@
 //! learn which one it got, and a connection authenticated on one set of terms
 //! is never handed to an endpoint dialling on another.
 
-mod common;
+use crate::common;
 
 use std::future::Future;
 use std::time::Duration;

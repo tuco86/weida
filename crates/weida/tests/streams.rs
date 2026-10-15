@@ -13,7 +13,7 @@
 //!   that fails instead of blocking closes the channel and fails the assertion
 //!   rather than looking like a stall.
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

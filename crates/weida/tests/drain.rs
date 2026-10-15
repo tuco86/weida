@@ -7,7 +7,7 @@
 //! short and `drain` gives it its chance
 //! (`docs/decisions/0009-drain.md` §4.1, §4.2).
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

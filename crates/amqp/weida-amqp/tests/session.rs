@@ -1,6 +1,7 @@
 //! Sessions against a scripted server: the two channel numberings, `end`,
 //! `DISCARDING`, and the two kinds of wrong channel.
 
+#[path = "support/mod.rs"]
 mod support;
 
 use support::{DEADLINE, Server, accept, options, scripted};

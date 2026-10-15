@@ -5,7 +5,7 @@
 //! generates, rather than asserting a type: the claim being made is that the
 //! CONNECT travels inside TLS, and only a real handshake can carry it.
 
-mod harness;
+use crate::harness;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -22,7 +22,7 @@
 //! than hang or fail — and the second and fourth rows together are the
 //! "neither loss nor duplication" of QoS 2.
 
-mod harness;
+use crate::harness;
 
 use std::time::Duration;
 

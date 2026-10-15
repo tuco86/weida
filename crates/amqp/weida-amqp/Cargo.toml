@@ -10,6 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+autotests = false
 
 [dependencies]
 # The machine room only: the reactor, the resolver and the close budget, plus
@@ -60,3 +61,13 @@ tls = ["dep:tokio-rustls"]
 
 [lints]
 workspace = true
+
+# Integration tests are one binary (`tests/main.rs`): see its module docs.
+[[test]]
+name = "it"
+path = "tests/main.rs"
+
+# Its own process: it counts `/proc/self/fd`, which other tests in one process would move.
+[[test]]
+name = "fd_release"
+path = "tests/fd_release.rs"

@@ -2,7 +2,7 @@
 //! never reaches it: the mismatch fails the TLS handshake
 //! (`docs/PROTOCOL.md` §2.1).
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -8,7 +8,7 @@
 //! seconds, and `jitter` stays on because a policy nobody runs with jitter
 //! would not be the default one.
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

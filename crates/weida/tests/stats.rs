@@ -2,7 +2,7 @@
 //! holding a flow
 //! ([0036](../../../docs/decisions/0036-connection-statistics.md)).
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

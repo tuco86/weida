@@ -6,7 +6,7 @@
 //! the `futures-io` traits. Nothing here is a `#[tokio::test]`, and the
 //! assertion at the top of each test is that no ambient reactor exists.
 
-mod common;
+use crate::common;
 
 use std::future::Future;
 use std::time::Duration;

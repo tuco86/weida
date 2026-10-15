@@ -23,7 +23,7 @@
 //! `interop_mqtt5.rs`), because asserting it here would only be asserting our
 //! own scripted server.
 
-mod harness;
+use crate::harness;
 
 use std::time::Duration;
 

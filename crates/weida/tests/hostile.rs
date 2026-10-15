@@ -5,7 +5,7 @@
 //! application error codes and on the outcomes the local API reports. The
 //! library has no test hooks; everything below is written against the wire.
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

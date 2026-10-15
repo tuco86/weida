@@ -4,7 +4,7 @@
 //! Nothing here uses Req/Rep, Push/Pull or Pub/Sub — the point is that those
 //! are wrappers, and that the primitives underneath are public and complete.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

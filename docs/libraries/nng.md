@@ -185,7 +185,7 @@ Raw sockets and the device are the reason the tag stack is a public type
 optional dependency behind the `nng-interop` feature and the tests are `#[ignore]`d on top of
 that, because the C library is a build condition rather than a runtime one
 ([LOOP.md](../LOOP.md) §2); the command is
-`cargo test -p weida-nng --features nng-interop --test interop_nng -- --ignored`, and all
+`cargo test -p weida-nng --features nng-interop --test it interop_nng:: -- --ignored`, and all
 eleven pass.
 
 Every pairing runs in **both roles** — this library bound with NNG dialling, and this library

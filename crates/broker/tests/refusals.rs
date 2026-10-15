@@ -19,6 +19,7 @@ use weida::{
 };
 use weida_broker::{BrokerConfig, MAX_REFUSALS, QueueStats};
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::{DEADLINE, Harness, SILENCE};

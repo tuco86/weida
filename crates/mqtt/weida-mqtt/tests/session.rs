@@ -8,7 +8,7 @@
 //! stored exchange goes back on the wire, and that is checkable without a
 //! publisher.
 
-mod harness;
+use crate::harness;
 
 use std::sync::Arc;
 use std::time::Duration;

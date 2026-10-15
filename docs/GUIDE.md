@@ -34,7 +34,7 @@ Run the chapters before reading them:
 cargo run -p weida --example guide_one_transfer
 cargo run -p weida --example guide_many_peers          # --release for the timing figures
 cargo run -p weida --example guide_late_is_lost
-cargo test -p weida --test guide
+cargo test -p weida --test it guide::
 ```
 
 ---

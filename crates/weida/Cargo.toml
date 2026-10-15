@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+autotests = false
 
 [features]
 default = ["generate"]
@@ -90,3 +91,13 @@ harness = false
 
 [lints]
 workspace = true
+
+# Integration tests are one binary (`tests/main.rs`): see its module docs.
+[[test]]
+name = "it"
+path = "tests/main.rs"
+
+# Its own process: it measures the process's peak RSS, which other tests in one process would raise.
+[[test]]
+name = "large"
+path = "tests/large.rs"

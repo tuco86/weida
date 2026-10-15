@@ -9,7 +9,7 @@
 //! flows the **bound** side opens toward a peer that dialled it: the
 //! bound-side case.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

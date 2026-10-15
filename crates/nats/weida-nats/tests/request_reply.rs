@@ -12,7 +12,7 @@
 //! Every await is bounded, so a wrong turn fails the test rather than hanging
 //! the suite.
 
-mod support;
+use crate::support;
 
 use std::time::{Duration, Instant};
 

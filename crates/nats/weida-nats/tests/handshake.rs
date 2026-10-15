@@ -13,7 +13,7 @@
 //! `connect_urls` and the `ldm` drain notice, and `max_payload` enforced
 //! locally.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 

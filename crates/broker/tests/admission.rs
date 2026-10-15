@@ -13,6 +13,7 @@ use weida::{
 };
 use weida_broker::{Broker, BrokerConfig, PER_MESSAGE_OVERHEAD};
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::{DEADLINE, Harness};

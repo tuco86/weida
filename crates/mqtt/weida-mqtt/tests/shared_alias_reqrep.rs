@@ -10,7 +10,7 @@
 //! namespace CONNACK offered. Anything past that belongs to the interop tests,
 //! against a broker that actually implements it.
 
-mod harness;
+use crate::harness;
 
 use std::time::Duration;
 

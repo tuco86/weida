@@ -15,7 +15,7 @@
 
 #![cfg(feature = "blocking")]
 
-mod harness;
+use crate::harness;
 
 use std::time::Duration;
 

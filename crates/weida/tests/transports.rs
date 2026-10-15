@@ -18,7 +18,7 @@
 //! member writes on a connection it dialled itself, and `bus_over_unix` is
 //! what turns that from an argument into a fact.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -8,7 +8,7 @@
 //! partial failure leaves behind, and what a re-subscribe does to the client's
 //! own view.
 
-mod harness;
+use crate::harness;
 
 use std::sync::Arc;
 use std::time::Duration;

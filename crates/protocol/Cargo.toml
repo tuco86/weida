@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+autotests = false
 
 [dependencies]
 weida-core.workspace = true
@@ -23,3 +24,8 @@ harness = false
 
 [lints]
 workspace = true
+
+# Integration tests are one binary (`tests/main.rs`): see its module docs.
+[[test]]
+name = "it"
+path = "tests/main.rs"

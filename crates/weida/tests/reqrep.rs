@@ -3,7 +3,7 @@
 //! Every test here runs a real `quinn` endpoint pair with a freshly generated
 //! certificate. Nothing is mocked and the library exposes no test hooks.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;

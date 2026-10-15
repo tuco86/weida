@@ -4,6 +4,7 @@
 //! One scripted server per test, with the half the test is about written by
 //! hand. Every await is bounded.
 
+#[path = "support/mod.rs"]
 mod support;
 
 use std::time::Duration;

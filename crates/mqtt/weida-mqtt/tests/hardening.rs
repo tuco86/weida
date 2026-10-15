@@ -7,7 +7,7 @@
 //! drive a raw listener, because a script that reads is the one thing those
 //! cases cannot have.
 
-mod harness;
+use crate::harness;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

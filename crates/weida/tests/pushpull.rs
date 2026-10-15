@@ -5,7 +5,7 @@
 //! receipt, the round-robin peer policy, and that mixing patterns on one path
 //! is refused rather than reinterpreted.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

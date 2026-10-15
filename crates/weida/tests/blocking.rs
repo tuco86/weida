@@ -11,7 +11,7 @@
 //! one mistake that deadlocks instead of failing, and the facade refuses it.
 #![cfg(all(feature = "blocking", feature = "generate"))]
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};

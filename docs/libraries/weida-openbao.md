@@ -74,5 +74,5 @@ server in the crate — eighteen tests in about three seconds, in the gate. The 
 mode, `#[ignore]`d because the gate has no OpenBao:
 
 ```text
-cargo test -p weida-openbao --test bao_dev -- --ignored
+cargo test -p weida-openbao --test it bao_dev:: -- --ignored
 ```

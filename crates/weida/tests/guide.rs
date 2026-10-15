@@ -23,8 +23,6 @@
 //! that something is once it is not, and which counter names it — and print
 //! the numbers rather than pinning them.
 
-mod common;
-
 use std::time::Duration;
 
 use weida::Error;

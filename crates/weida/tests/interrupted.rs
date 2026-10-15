@@ -11,7 +11,7 @@
 //! > Within a connection, QUIC retransmits; when the connection ends, an
 //! > unfinished stream is gone, and weida does not resend it.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

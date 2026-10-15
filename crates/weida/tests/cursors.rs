@@ -18,7 +18,7 @@
 //! unidirectional stream and no bidirectional one" is a statement about the
 //! wire that the library's own API cannot make.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

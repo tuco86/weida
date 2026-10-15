@@ -13,7 +13,7 @@
 //! The clients here are raw `quinn` endpoints so the test controls resumption
 //! and the exact handshake sequence.
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

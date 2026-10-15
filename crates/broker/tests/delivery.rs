@@ -11,6 +11,7 @@ use std::time::Duration;
 use weida::{Requester, Runtime, RuntimeConfig, Subscriber};
 use weida_broker::BrokerConfig;
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::{DEADLINE, Harness, SILENCE};

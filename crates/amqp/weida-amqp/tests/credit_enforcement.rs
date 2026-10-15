@@ -8,6 +8,7 @@
 //! server half is the sender, so each test says what it sends and what the
 //! client has to do about it.
 
+#[path = "support/mod.rs"]
 mod support;
 
 use support::{DEADLINE, Server, accept, options, scripted};

@@ -18,6 +18,7 @@ use weida::{
 };
 use weida_broker::BrokerConfig;
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::{DEADLINE, Harness, SILENCE};

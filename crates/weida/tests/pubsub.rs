@@ -6,7 +6,7 @@
 //! subscribe/unsubscribe bookkeeping, and the drop policy that keeps a slow
 //! subscriber from stalling the publisher.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

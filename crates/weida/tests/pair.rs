@@ -8,7 +8,7 @@
 //! be false. `a_pair_talks_to_a_bare_peer_and_acceptor_on_the_same_path` is
 //! that claim, tested.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -16,6 +16,7 @@
 //! * nothing comes back — the handshake deadline, which is ours because the
 //!   protocol has none.
 
+#[path = "support/mod.rs"]
 mod support;
 
 #[cfg(feature = "tls")]

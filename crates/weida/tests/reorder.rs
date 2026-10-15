@@ -8,7 +8,7 @@
 //! rerun with the runtime doing the holding that the probe made the
 //! application do.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -3,7 +3,7 @@
 //! §4.3). What the real server does with the same requests is
 //! `tests/bao_dev.rs`, run by hand against the local binary.
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

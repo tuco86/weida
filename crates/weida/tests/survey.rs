@@ -6,7 +6,7 @@
 //! tests here are about what happens when a respondent does *not* answer the
 //! way it should.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

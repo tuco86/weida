@@ -4,7 +4,7 @@
 //! Each test names the conformance statement it is about, because that is what
 //! makes it a conformance test rather than a regression net.
 
-mod harness;
+use crate::harness;
 
 use std::sync::Arc;
 use std::time::Duration;

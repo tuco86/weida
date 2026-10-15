@@ -3,7 +3,7 @@
 //! §4.5): registration, delivery, refusal, the per-flow drop-oldest ring, and
 //! the capability that gates all of it.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

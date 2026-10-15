@@ -91,7 +91,7 @@
 //! Nothing else disagreed: no pairing and no mechanism needed an adjustment
 //! on either side beyond those three.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

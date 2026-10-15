@@ -72,7 +72,7 @@
 //!   roles, in order where order is promised, with no adjustment on either
 //!   side beyond the subscription form and the XPUB `recv` above.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

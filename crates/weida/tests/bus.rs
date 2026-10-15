@@ -10,8 +10,6 @@
 //! `every_member_sees_every_other_members_message` is what that costs, made
 //! visible.
 
-mod common;
-
 use std::time::Duration;
 
 use weida::{

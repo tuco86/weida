@@ -13,7 +13,7 @@
 //! the client's socket fills after a few kilobytes and a test does not have to
 //! push megabytes to find out what a full socket does.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 

@@ -140,7 +140,7 @@
 
 #![cfg(test)]
 
-mod harness;
+use crate::harness;
 
 use std::time::Duration;
 

@@ -8,7 +8,7 @@
 //! by giving it something. REQ and REP have no `split`, and that is asserted
 //! by the type system rather than here.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
