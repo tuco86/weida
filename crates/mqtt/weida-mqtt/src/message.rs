@@ -147,8 +147,8 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// [`Error::Unavailable`] carrying the code the server would have sent,
-    /// and [`Error::Configuration`] for a `Message Expiry Interval` a Four
+    /// [`crate::Error::Unavailable`] carrying the code the server would have
+    /// sent, and [`crate::Error::Configuration`] for a `Message Expiry Interval` a Four
     /// Byte Integer cannot carry.
     pub fn check(&self, limits: &ServerLimits) -> Result<()> {
         // A Topic Name and never a filter ([MQTT-3.3.2-2]). The zero-length
@@ -168,7 +168,7 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// [`Error::Configuration`] for an interval a Four Byte Integer cannot
+    /// [`crate::Error::Configuration`] for an interval a Four Byte Integer cannot
     /// carry.
     pub fn into_stored(self) -> Result<StoredPublish> {
         let message_expiry_interval =

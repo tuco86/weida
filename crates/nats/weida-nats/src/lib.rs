@@ -154,7 +154,7 @@
 //!   collected.
 //! * **Handing over a TLS configuration is asking for TLS.** The first `INFO`
 //!   arrives before TLS and before authentication, so an attacker on the path
-//!   can rewrite `tls_required` to `false`. [`Connection::connect_tls`]
+//!   can rewrite `tls_required` to `false`. `Connection::connect_tls`
 //!   therefore upgrades whatever the `INFO` says and refuses, before writing a
 //!   `CONNECT`, a server whose `INFO` offers no TLS at all.
 //! * **`INFO.max_payload` is enforced locally, before the wire, and only

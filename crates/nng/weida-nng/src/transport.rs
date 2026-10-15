@@ -126,7 +126,7 @@ enum Inner {
 }
 
 impl Stream {
-    /// Wraps an established TCP connection, set up as [`tune_tcp`] does.
+    /// Wraps an established TCP connection, set up as `tune_tcp` does.
     pub fn tcp(stream: TcpStream) -> Stream {
         tune_tcp(&stream);
         Stream(Inner::Tcp(stream))

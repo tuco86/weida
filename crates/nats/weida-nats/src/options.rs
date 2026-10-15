@@ -467,7 +467,7 @@ pub struct ConnectionOptions {
     ///
     /// This becomes `CONNECT.tls_required`. Useful beside
     /// [`Credentials::UserPassword`], which otherwise travels in the clear.
-    /// [`Connection::connect_tls`](crate::Connection::connect_tls) insists
+    /// `Connection::connect_tls` (feature `tls`) insists
     /// whatever this says: a caller that hands over a TLS configuration has
     /// said it wants TLS, and an `INFO` that omits the flag must not be able to
     /// talk it out of it.

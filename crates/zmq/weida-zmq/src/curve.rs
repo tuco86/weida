@@ -116,7 +116,7 @@
 //!
 //! A peer key of small order, the zero key among them, makes clamped X25519
 //! return an all-zero secret whatever the other key is, so the box it keys
-//! has a key anyone can compute. [`session_box`] refuses that output with
+//! has a key anyone can compute. `session_box` refuses that output with
 //! `EACCES`, as libsodium's `crypto_scalarmult` does. Every key a peer sends
 //! goes through it: `C'` in the `HELLO`, `S'` in the `WELCOME` and `C` in the
 //! vouch.

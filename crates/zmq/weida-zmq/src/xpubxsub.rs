@@ -506,17 +506,17 @@ mod tests {
         assert_eq!(broker.subscriber_count(), 0);
     }
 
-    /// Claim: **an XPUB owes its application an unsubscribe for exactly the
-    /// subscriptions the application was handed**, and for no others. A
-    /// subscriber's own table can hold prefixes whose notification was
-    /// dropped because the application was not reading, and an unsubscribe
-    /// for one of those, forwarded upstream by a proxy, cancels a
-    /// subscription the application never made — one that another
-    /// subscriber's may be holding. Here the notification queue holds eight
-    /// and the subscriber subscribes fifty prefixes in a burst the
-    /// application does not read: the table holds all fifty, the application
-    /// is handed eight, and when the subscriber goes it is owed those eight
-    /// back and nothing else.
+    /// Claim: **an XPUB hands its application every subscription, and owes
+    /// it an unsubscribe for exactly the subscriptions it was handed.** A
+    /// notification is never dropped: when the application is not reading,
+    /// the subscriber's session waits, so its own reads pause and its table
+    /// stops one prefix past what the queue holds. A dropped notification
+    /// would be a subscription a proxy never forwards, and an unsubscribe for
+    /// it, forwarded upstream, would cancel one another subscriber may hold.
+    /// Here the notification queue holds eight and the subscriber subscribes
+    /// fifty prefixes in a burst: the table stops at nine while nobody reads,
+    /// the application is handed all fifty once it does, and when the
+    /// subscriber goes it is owed those fifty back and nothing else.
     #[tokio::test]
     async fn a_departure_is_unsubscribed_only_for_what_the_application_was_handed() {
         use crate::pipe::{PipeConfig, QueueConfig};
@@ -529,6 +529,7 @@ mod tests {
                 pipe: PipeConfig {
                     incoming: QueueConfig {
                         hwm: 8,
+                        mute: crate::pipe::MuteAction::Drop,
                         ..PipeConfig::default().incoming
                     },
                     ..PipeConfig::default()
@@ -547,19 +548,25 @@ mod tests {
                 .subscribe(format!("topic.{n:02}"))
                 .expect("subscribe");
         }
-        wait_for(|| broker.anybody_wants(b"topic.49")).await;
+        // Eight notifications fill the queue; the ninth prefix is in the
+        // table and its notification waits, so the tenth is never read.
+        wait_for(|| broker.anybody_wants(b"topic.08")).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !broker.anybody_wants(b"topic.09"),
+            "a subscriber whose notifications wait is not read past them, even with a dropping queue configured"
+        );
 
         let mut handed = BTreeSet::new();
-        while let Ok(event) = broker.try_recv() {
+        while handed.len() < 50 {
+            let event = broker
+                .recv_timeout(Duration::from_secs(10))
+                .await
+                .expect("every notification arrives");
             let frame = event.frames()[0].as_slice();
             assert_eq!(frame[0], 1, "only subscribes so far");
             handed.insert(frame[1..].to_vec());
         }
-        assert_eq!(
-            handed.len(),
-            8,
-            "the queue held eight; the other forty-two notifications were dropped"
-        );
 
         subscriber.close();
         drop(subscriber);

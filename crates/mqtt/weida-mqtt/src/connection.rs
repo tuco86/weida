@@ -28,8 +28,8 @@
 //! (3.1.2.11.4) [mqtt5 §5].
 //!
 //! **A write is a queue, and the event loop drains it alongside everything
-//! else.** [`Writer::queue`] encodes into a buffer and returns at once;
-//! [`Writer::step`] moves some of it to the socket and is raced against reads,
+//! else.** `Writer::queue` encodes into a buffer and returns at once;
+//! `Writer::step` moves some of it to the socket and is raced against reads,
 //! commands and timers by the loop that owns the connection. A peer that stops
 //! reading therefore stops one `step` and nothing else, and the loop's
 //! deadline on it — a socket that took no byte for the write timeout — ends

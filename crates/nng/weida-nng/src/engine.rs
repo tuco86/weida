@@ -48,7 +48,7 @@
 //! reference count: the set is rebuilt when a pipe is admitted or retired,
 //! never edited, so every send and receive reads a consistent view without
 //! collecting one. What the pipes tell the socket — a message arrived,
-//! room appeared, the set changed — is [`Signals`](crate::Signals), one
+//! room appeared, the set changed — is [`Signals`], one
 //! wake-up per socket and not one future per pipe.
 //!
 //! What this module does **not** do is speak SP. A connection is handed to a
@@ -1150,7 +1150,7 @@ impl Engine {
     }
 
     /// Octets held for messages from pipes that have been retired: what
-    /// [`Engine::store_arrived`] bounds.
+    /// `Engine::store_arrived` bounds.
     pub fn leftover_bytes(&self) -> u64 {
         self.inner
             .leftovers
