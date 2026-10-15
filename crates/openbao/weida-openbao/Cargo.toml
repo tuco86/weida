@@ -25,6 +25,8 @@ tracing.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tokio-rustls.workspace = true
+# For its version floor only; see the workspace entry.
+rustls.workspace = true
 rustls-pki-types.workspace = true
 webpki-roots.workspace = true
 # The CSR a `PkiSign` source sends: built over the key it already holds, so

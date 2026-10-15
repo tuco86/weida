@@ -29,6 +29,8 @@ weida-protocol.workspace = true
 # (`docs/decisions/0013-competitor-libraries.md` §4.2).
 weida-runtime.workspace = true
 quinn.workspace = true
+# For its version floor only; see the workspace entry.
+rustls.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 futures-io.workspace = true

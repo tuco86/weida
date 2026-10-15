@@ -141,6 +141,13 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "logging",
     "tls12",
 ] }
+# Not used by name: every crate reaches rustls through `quinn::rustls` or
+# `tokio_rustls::rustls`. The direct entry exists for its floor, so that a
+# downstream lockfile cannot resolve a rustls with RUSTSEC-2026-0285, -0346,
+# -0348 or -0349 (handshake messages across encryption levels, secrets in
+# `Debug`, brotli certificate decompression before authentication, a
+# ServerHello downgrade). The published crates that speak TLS depend on it.
+rustls = { version = "0.23.46", default-features = false }
 bytes = "1"
 # The caller's executor need not be tokio: transfers implement both trait
 # families, and the `futures` dev-dependency drives the no-tokio test.
