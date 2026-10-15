@@ -5,12 +5,13 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-334 — Python bindings: no interpreter freeze, no lost result, no secret in a repr
-kind: code | size: 90 | status: in_progress 2026-10-15T02:05Z | needs: [B-325, B-326, B-327, B-328]
+kind: code | size: 90 | status: done e6ccb07 | needs: [B-325, B-326, B-327, B-328]
 acceptance: findings #1, #3, #4, #5, #7, #8, #11-#14, #17, #19 of the 2026-10-15 Python binding audit, for `weida-py-core` and the mqtt, nats, nng and amqp bindings: no getter takes a lock with the GIL held, a value computed for a cancelled asyncio task is re-stashed rather than dropped where it consumed a message, completions reach the loop without a reactor worker blocking on the GIL, unbounded blocking waits are interruptible by signals, Python-supplied durations and counts raise instead of panicking, one `Slot`/`Lease` in `weida-py-core`; each binding's `develop.sh` suite green.
+note: done in part at the session's time box: #1, #4, #8, #12, #13, #17, #19 fixed; #3 restores a consumed value in nats, mqtt, amqp (async) and nng (PULL, SUB, PAIR, BUS; the state-machine sockets document why not); #7 for nats, mqtt, amqp; #11 everywhere except mqtt's `disconnect`, `ping`, `reauthenticate`; #5 for amqp's async and sync `send`. #14 not started; the rest moved to B-335. Python suites ran in private venvs. Rust gate for the seven PyO3 crates green: clippy, 31 tests, rustdoc.
 
 ### B-335 — weida-py and weida-zmq-py: the binding findings left for after the library merges
 kind: code | size: 60 | status: ready | needs: [B-334]
-acceptance: audit findings #2 (`SyncRuntime.bind` holds its mutex across `py.detach`), #9 (`CurveKey` repr, hash and equality leak or compare a secret key), #10 (zmq sync sockets hold their mutex across a blocking `recv`, so `close` from another thread hangs), #11 for weida-py and zmq-py (the `interruptible` helper of B-334), #15, #16 (`IncomingStream.read(max_bytes)` allocates `max_bytes` up front and aborts on a huge value), #18 (poison-tolerant locks), and zmq-py moved onto `weida-py-core`'s `Lease`; both `develop.sh` suites green.
+acceptance: audit findings #2 (`SyncRuntime.bind` holds its mutex across `py.detach`), #9 (`CurveKey` repr, hash and equality leak or compare a secret key), #10 (zmq sync sockets hold their mutex across a blocking `recv`, so `close` from another thread hangs), #11 for weida-py and zmq-py and mqtt's `disconnect`/`ping`/`reauthenticate` (the `interruptible` helper of B-334), #14 (`weida_mqtt::Message::payload` as `Bytes`), #15, #16 (`IncomingStream.read(max_bytes)` allocates `max_bytes` up front and aborts on a huge value), #18 (poison-tolerant locks), #3 for amqp's sync surface, and zmq-py moved onto `weida-py-core`'s `Lease`; both `develop.sh` suites green.
 
 ### B-336 — The leftovers of the hardening pass, each with its failure
 kind: code | size: 90 | status: ready | needs: []
