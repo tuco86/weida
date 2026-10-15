@@ -40,22 +40,27 @@ impl Kv {
     }
 
     /// Reads the secret now and, with `refresh` set, keeps the returned
-    /// source current for as long as the client lives.
+    /// source current until the application drops it.
     pub async fn start(self, client: OpenBao) -> Result<IdentitySource> {
         let identity = self.fetch(&client).await?;
         let source = IdentitySource::external(identity)?;
         if let Some(refresh) = self.refresh {
-            let refreshing = source.clone();
+            let refreshing = source.downgrade();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(refresh).await;
+                    // Weak, so that the task — and the client it holds — ends
+                    // with the source it serves instead of outliving it.
+                    let Some(held) = refreshing.upgrade() else {
+                        return;
+                    };
                     match self.fetch(&client).await {
                         Ok(identity) => {
-                            if identity != refreshing.current() {
-                                let _ = refreshing.update(identity);
+                            if identity != held.current() {
+                                let _ = held.update(identity);
                             }
                         }
-                        Err(e) => refreshing.report_failure(e.to_string()),
+                        Err(e) => held.report_failure(e.to_string()),
                     }
                 }
             });
@@ -64,22 +69,27 @@ impl Kv {
     }
 
     async fn fetch(&self, client: &OpenBao) -> Result<Identity> {
-        let answer = client
+        let mut answer = client
             .get(&format!("{}/data/{}", self.mount, self.path))
             .await?;
         let data = answer
-            .get("data")
-            .and_then(|d| d.get("data"))
+            .get_mut("data")
+            .and_then(|d| d.get_mut("data"))
             .ok_or_else(|| Error::Shape("no `data.data` in the KV answer".into()))?;
-        let field = |name: &str| {
-            data.get(name)
-                .and_then(Value::as_str)
-                .map(|s| s.as_bytes().to_vec())
-                .ok_or_else(|| Error::Shape(format!("no `{name}` field in the secret")))
+        // Moved out of the answer, not copied: the key is the one thing in it a
+        // copy would leave behind in a tree that is not wiped when dropped.
+        let mut field = |name: &str| match data.get_mut(name) {
+            Some(Value::String(text)) => Ok(std::mem::take(text).into_bytes()),
+            _ => Err(Error::Shape(format!("no `{name}` field in the secret"))),
         };
-        Ok(Identity::from_pem(
-            field(&self.cert_field)?,
-            field(&self.key_field)?,
-        ))
+        let cert = field(&self.cert_field)?;
+        // One field holding both halves is a combined PEM, which weida reads
+        // for either: the same bytes twice.
+        let key = if self.key_field == self.cert_field {
+            cert.clone()
+        } else {
+            field(&self.key_field)?
+        };
+        Ok(Identity::from_pem(cert, key))
     }
 }

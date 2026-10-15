@@ -61,8 +61,38 @@
 //! the stream is reset, or the connection goes away) the message is requeued
 //! and any consumer with credit may take it. A subscription with
 //! [`BrokerConfig::max_unsettled`] deliveries outstanding is given no more,
-//! so a consumer that stops reporting stops receiving without starving the
-//! others.
+//! and neither is a connection with [`BrokerConfig::max_unsettled_per_consumer`]
+//! outstanding over all its subscriptions, so a consumer that stops reporting
+//! stops receiving without starving the others.
+//!
+//! # Peers that stall
+//!
+//! A queue is served by one loop, and **that loop never waits on a peer**. A
+//! producer's message is read in a task of its own and a delivery is written
+//! by one, each under [`BrokerConfig::io_timeout`]; the loop only starts them
+//! and reacts to how they end. A producer that stops half way through a
+//! message, and a consumer that grants credit and stops reading, therefore cost
+//! themselves a task and a deadline and cost every other producer and consumer
+//! nothing. Three bounds keep that from becoming the problem it solves:
+//!
+//! - a message is charged to `queue_bytes` **as it arrives**, in steps, so
+//!   concurrent producers cannot each be promised the whole remainder
+//!   ([`QueueStats::reserved`] shows what is promised and unused);
+//! - [`BrokerConfig::max_inflight_admissions`] admissions run at once; past
+//!   that the queue stops reading new streams until one finishes, so producers
+//!   wait on QUIC's flow control and nothing is refused for being busy;
+//! - a peer that moves bytes slower than [`MIN_PEER_RATE`] is treated as
+//!   stalled after about one window, however steadily it trickles.
+//!
+//! What a stall costs: a producer loses the message it was sending; a consumer
+//! loses its subscription, the message it was being given goes back to the
+//! head of the queue, and it resubscribes like any consumer that was removed.
+//!
+//! Messages enter a queue in the order they **finish arriving**. QUIC orders
+//! bytes within a stream and nothing between streams, and a queue that held a
+//! finished message back for an unfinished one in front of it would give a
+//! stalled producer the power this design takes from it. A producer that waits
+//! for each confirm before sending the next has its own order preserved.
 //!
 //! # Not built yet
 //!
@@ -96,9 +126,13 @@
 //! # }
 //! ```
 
+mod admission;
 mod broker;
 mod consumers;
+mod delivery;
+mod peer;
 mod queue;
 
 pub use broker::{Achieved, Broker, BrokerConfig};
+pub use peer::MIN_PEER_RATE;
 pub use queue::{PER_MESSAGE_OVERHEAD, QueueStats};

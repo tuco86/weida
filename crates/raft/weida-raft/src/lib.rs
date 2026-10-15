@@ -212,6 +212,13 @@ pub enum Error {
     LastVoter,
     /// No leader is known, or it moved more often than a request follows.
     NoLeader,
+    /// A request that would not fit [`ConsensusConfig::max_rpc_bytes`] as one
+    /// replicated entry: the followers would refuse it, and a leader that
+    /// appended it could commit neither it nor anything behind it.
+    RequestTooLarge,
+    /// The group already lists [`codec::MAX_MEMBERS`] nodes, the most a
+    /// follower decodes.
+    TooManyNodes,
     /// A forwarded request or a read barrier waited longer than
     /// [`ConsensusConfig::forward_timeout`].
     Timeout,
@@ -231,6 +238,14 @@ impl fmt::Display for Error {
             ),
             Error::LastVoter => f.write_str("the last voter cannot be removed"),
             Error::NoLeader => f.write_str("no leader is known"),
+            Error::RequestTooLarge => f.write_str(
+                "the request does not fit one replicated entry under max_rpc_bytes",
+            ),
+            Error::TooManyNodes => write!(
+                f,
+                "the group already lists {} nodes, the most a membership may hold",
+                codec::MAX_MEMBERS
+            ),
             Error::Timeout => f.write_str("the consensus operation timed out"),
             Error::Raft(text) => write!(f, "consensus engine: {text}"),
         }
@@ -295,17 +310,36 @@ pub struct ConsensusConfig {
     /// Entries kept in the log behind a snapshot. Default 1000.
     pub max_in_snapshot_log_to_keep: u64,
     /// Largest RPC message, excluding snapshot data, sent or accepted.
-    /// Default 16 MiB.
+    /// Default 16 MiB, at least [`codec::MIN_RPC_BYTES`].
+    ///
+    /// It is also what one written request may weigh: a request that, as one
+    /// log entry in an AppendEntries, would pass it is refused with
+    /// [`Error::RequestTooLarge`] where it is accepted, because the followers
+    /// refuse such an envelope and a leader that had appended it could not
+    /// commit it or anything behind it. That is
+    /// [`codec::ENTRY_ENVELOPE_OVERHEAD`] bytes less than this number.
     pub max_rpc_bytes: usize,
     /// Largest snapshot accepted from a leader. Default 256 MiB.
+    ///
+    /// At most two snapshot bodies are buffered at once, whoever sends them,
+    /// and one under a vote this node would refuse is answered without
+    /// reading its body, so a node holds at most twice this number — more
+    /// while the buffer grows — for snapshots. A snapshot offered while two
+    /// are being received is refused with `Rejected`.
     pub max_snapshot_bytes: usize,
-    /// How long a forwarded request or a read barrier may take.
+    /// How long a forwarded request or a read barrier may take, and, at
+    /// half of it, how long [`Consensus::add_node`] waits for a new node to
+    /// catch up before it answers that the node is still a learner.
     /// Default 10 s.
     pub forward_timeout: Duration,
-    /// How many raft RPCs this node serves at once; one more is refused with
-    /// `Rejected` before any of its bytes are read. With the envelope
-    /// allocated as it arrives, the raft port holds at most this many times
-    /// [`ConsensusConfig::max_rpc_bytes`] of envelopes. Default 64.
+    /// How many admitted raft RPCs this node serves at once; one more is
+    /// refused with `Rejected` before any of its bytes are read. An admitted
+    /// request is one from a key in the membership, or from any key while the
+    /// node has no membership yet; a key outside it is refused before it can
+    /// take one of these. An envelope is allocated as it arrives and decoded
+    /// into a second copy of its payload, so the raft port holds at most twice
+    /// [`ConsensusConfig::max_rpc_bytes`] per handler. Snapshot bodies are
+    /// counted apart, under [`ConsensusConfig::max_snapshot_bytes`]. Default 64.
     pub max_concurrent_rpcs: usize,
 }
 

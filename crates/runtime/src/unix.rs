@@ -10,8 +10,11 @@
 //! ([decisions/0010](../../../docs/decisions/0010-local-transport.md) §4.5,
 //! `docs/research/ipc.md` §1.2, §1.5, §7).
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::ErrorKind;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use tokio::net::{UnixListener, UnixStream};
 use weida_core::{Error, LocalPrincipal, MAX_SOCKET_PATH_BYTES};
@@ -23,15 +26,26 @@ use weida_core::{Error, LocalPrincipal, MAX_SOCKET_PATH_BYTES};
 /// process happened to inherit (`docs/research/ipc.md` §1.2, [0010 §4.5]).
 const SOCKET_MODE: u32 = 0o600;
 
+/// Mode of the private directory a socket is bound in before it is moved into
+/// place: nobody but the owner can reach a node inside it, whatever mode the
+/// node has.
+const STAGING_MODE: u32 = 0o700;
+
+/// Distinguishes the staging directories of one process.
+static STAGING: AtomicU64 = AtomicU64::new(0);
+
 /// A bound `AF_UNIX` socket file: the node exists as long as this value
 /// does.
 ///
 /// Hold it beside the [`UnixListener`] it was bound with. Dropping it removes
-/// the node, which is what keeps the *next* bind of the same path out of the
-/// unlink-then-bind race below.
+/// the node it bound — and only that node — which is what keeps the *next*
+/// bind of the same path out of the unlink-then-bind race below.
 #[derive(Debug)]
 pub struct BoundUnixSocket {
     path: PathBuf,
+    /// Device and inode of the node this value bound, so that dropping it
+    /// removes that node and not whatever has taken the path since.
+    node: (u64, u64),
 }
 
 impl BoundUnixSocket {
@@ -47,22 +61,31 @@ impl BoundUnixSocket {
     ///    (`docs/research/ipc.md` §1.1, §2.1). libzmq's `ipc://` publishes
     ///    the same limit as "113 characters including the prefix" and leaves
     ///    the rest to the caller (`docs/research/zeromq.md` §11).
-    /// 2. **The socket-type check.** Closing a socket does not remove its
-    ///    node, so a crash leaves one and `bind()` then fails with
-    ///    `EADDRINUSE`. A stale node is a socket nobody is listening on;
-    ///    anything else at that path is not ours to remove, and removing it
-    ///    anyway is how a bind deletes a caller's data.
-    /// 3. **Unlink, then bind.** The usual answer to the stale node, and it
-    ///    opens a substitution race that is closed only "unless directory
-    ///    ownership and permissions prevent endpoint substitution"
-    ///    (`docs/research/ipc.md` §1.2, §7). **The directory is therefore
-    ///    load-bearing**: the caller MUST place the socket in a directory it
-    ///    owns and that no other user may write. libzmq's `ipc://` has this
-    ///    hazard too and answers none of it — a local process can steal a
-    ///    bound endpoint.
-    /// 4. **The mode, explicitly.** `0600` set *after* bind, because a socket
-    ///    file is created with whatever `umask` allows, which is whatever the
-    ///    process happened to inherit.
+    /// 2. **The socket-type check, and a probe.** Closing a socket does not
+    ///    remove its node, so a crash leaves one and `bind()` then fails with
+    ///    `EADDRINUSE`. A stale node is a socket nobody is listening on:
+    ///    anything else at that path is not ours to remove — removing it is
+    ///    how a bind deletes a caller's data — and neither is a socket
+    ///    somebody *is* listening on, which is found out by connecting to it:
+    ///    a live listener answers, and the bind fails with
+    ///    [`ErrorKind::AddrInUse`] instead of silently taking its endpoint.
+    /// 3. **Bind in private, then move into place.** The socket is bound
+    ///    inside a `0700` directory next to the final path, given its mode
+    ///    there, and `rename`d to the final path, which replaces a stale node
+    ///    in one step. No other user can reach the node while it is bound and
+    ///    before it is `0600`, and the path is never absent between unlinking
+    ///    and binding — the substitution race of
+    ///    `docs/research/ipc.md` §1.2, §7 has no window to use. **The
+    ///    directory is still load-bearing**: the caller MUST place the socket
+    ///    in a directory it owns and that no other user may write, because
+    ///    whoever can write there can rename over the node afterwards. libzmq's
+    ///    `ipc://` has this hazard too and answers none of it. A path too close
+    ///    to the budget to leave its `sun_path` room for the private directory
+    ///    binds in place and gets its mode after, which is the window the
+    ///    private directory closes.
+    /// 4. **The mode, explicitly.** `0600`, because a socket file is created
+    ///    with whatever `umask` allows, which is whatever the process
+    ///    happened to inherit.
     pub fn bind(path: &Path) -> Result<(BoundUnixSocket, UnixListener), Error> {
         if path.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
             return Err(Error::InvalidAddress(format!(
@@ -73,22 +96,50 @@ impl BoundUnixSocket {
         }
         // A stale node is a socket nobody is listening on. Anything else at
         // that path is not ours to remove.
-        match std::fs::metadata(path) {
-            Ok(meta) if is_socket(&meta) => std::fs::remove_file(path).map_err(Error::Io)?,
+        let stale = match std::fs::symlink_metadata(path) {
+            Ok(meta) if is_socket(&meta) => {
+                if answers(path) {
+                    return Err(Error::Io(std::io::Error::new(
+                        ErrorKind::AddrInUse,
+                        format!("{} has a listener", path.display()),
+                    )));
+                }
+                true
+            }
             Ok(_) => {
                 return Err(Error::InvalidAddress(format!(
                     "{} exists and is not a socket",
                     path.display()
                 )));
             }
-            Err(_) => {}
-        }
-        let listener = UnixListener::bind(path).map_err(Error::Io)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
-            .map_err(Error::Io)?;
+            Err(_) => false,
+        };
+        let listener = match Staging::create(path)? {
+            Some(staging) => {
+                let listener = UnixListener::bind(&staging.socket).map_err(Error::Io)?;
+                std::fs::set_permissions(
+                    &staging.socket,
+                    std::fs::Permissions::from_mode(SOCKET_MODE),
+                )
+                .map_err(Error::Io)?;
+                std::fs::rename(&staging.socket, path).map_err(Error::Io)?;
+                listener
+            }
+            None => {
+                if stale {
+                    std::fs::remove_file(path).map_err(Error::Io)?;
+                }
+                let listener = UnixListener::bind(path).map_err(Error::Io)?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
+                    .map_err(Error::Io)?;
+                listener
+            }
+        };
+        let node = std::fs::symlink_metadata(path).map_err(Error::Io)?;
         Ok((
             BoundUnixSocket {
                 path: path.to_path_buf(),
+                node: (node.dev(), node.ino()),
             },
             listener,
         ))
@@ -104,8 +155,93 @@ impl Drop for BoundUnixSocket {
     fn drop(&mut self) {
         // Leaving the node behind is what forces the next bind into
         // unlink-then-bind; removing it on the way out keeps the common case
-        // free of that race.
-        let _ = std::fs::remove_file(&self.path);
+        // free of that race. Only the node this value bound: a successor that
+        // replaced it has a node of its own at the same path, and unlinking by
+        // path would delete the successor's endpoint.
+        let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if is_socket(&meta) && (meta.dev(), meta.ino()) == self.node {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// A private directory beside the final path, holding the socket until it is
+/// ready to be moved into place.
+struct Staging {
+    dir: PathBuf,
+    socket: PathBuf,
+}
+
+impl Staging {
+    /// Creates the directory, or `None` when the socket's path inside it
+    /// would be over the `sun_path` budget.
+    fn create(path: &Path) -> Result<Option<Staging>, Error> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Ok(None);
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        // The process id and a counter: short, and unique among this
+        // process's binds. A leftover of a crashed process with the same id is
+        // skipped over rather than reused.
+        for _ in 0..8 {
+            let dir = parent.join(format!(
+                ".w{:x}{:x}",
+                std::process::id(),
+                STAGING.fetch_add(1, Ordering::Relaxed)
+            ));
+            let socket = dir.join(name);
+            if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+                return Ok(None);
+            }
+            match std::fs::DirBuilder::new().mode(STAGING_MODE).create(&dir) {
+                Ok(()) => return Ok(Some(Staging { dir, socket })),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+        Err(Error::Io(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "no free staging directory name",
+        )))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // What is left when a bind failed half way, or nothing when it
+        // succeeded: the socket has been moved out by then.
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Does anything answer on the socket node at `path`?
+///
+/// One poll of a non-blocking connect settles it. A node nobody listens on
+/// refuses the connection inside that poll; a listener accepts it, which shows
+/// as a connection still being set up (or, with its backlog full, as an
+/// error that is not a refusal). Anything that cannot be told apart from a
+/// listener is treated as one: the cost of a wrong answer is a bind that
+/// fails, against an endpoint taken from a process that was using it. The
+/// connection is dropped at once, and the listener it reached sees a peer
+/// that said nothing.
+fn answers(path: &Path) -> bool {
+    let connect = UnixStream::connect(path);
+    let mut connect = std::pin::pin!(connect);
+    match connect
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(Err(e)) => {
+            !matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound)
+        }
+        Poll::Ready(Ok(_)) | Poll::Pending => true,
     }
 }
 
@@ -196,6 +332,135 @@ mod tests {
         }
         assert!(path.exists(), "the stale node must still be there");
         let (_bound, _listener) = BoundUnixSocket::bind(&path).expect("bind over the stale node");
+    }
+
+    /// Claim: a socket somebody is listening on is not taken. The second bind
+    /// fails, and the first listener still answers afterwards.
+    #[tokio::test]
+    async fn a_live_socket_is_not_taken() {
+        let path = dir("live").join("s");
+        let (_bound, listener) = BoundUnixSocket::bind(&path).expect("first bind");
+
+        let err = BoundUnixSocket::bind(&path).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == ErrorKind::AddrInUse),
+            "{err:?}"
+        );
+
+        let accepting = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        UnixStream::connect(&path)
+            .await
+            .expect("the first listener still owns the path");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting)
+            .await
+            .expect("the first listener accepts")
+            .expect("the accept task ran")
+            .expect("an accepted connection");
+    }
+
+    /// Claim: a guard removes the node it bound and not the one that replaced
+    /// it. The first listener is gone, so its node is stale and the second
+    /// bind takes the path; dropping the first guard afterwards must leave the
+    /// second's endpoint alone.
+    #[tokio::test]
+    async fn dropping_a_guard_leaves_the_node_of_its_successor() {
+        let path = dir("successor").join("s");
+        let (first, first_listener) = BoundUnixSocket::bind(&path).expect("first bind");
+        drop(first_listener);
+        let (_second, second_listener) =
+            BoundUnixSocket::bind(&path).expect("takes the stale node");
+
+        drop(first);
+        assert!(
+            path.exists(),
+            "dropping the first guard removed the second one's node"
+        );
+        let accepting = tokio::spawn(async move { second_listener.accept().await.map(|_| ()) });
+        UnixStream::connect(&path)
+            .await
+            .expect("the successor still owns the path");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting)
+            .await
+            .expect("the successor accepts")
+            .expect("the accept task ran")
+            .expect("an accepted connection");
+    }
+
+    /// Claim: no one can find the node in a mode `umask` chose while it is
+    /// being bound. A reader polls the paths that are about to be bound for
+    /// the whole run; it must never see one that is not `0600`.
+    #[tokio::test]
+    async fn a_node_is_never_visible_in_the_mode_umask_gave_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const BINDS: usize = 200;
+        let dir = dir("window");
+        let paths: Vec<PathBuf> = (0..BINDS).map(|n| dir.join(format!("s{n}"))).collect();
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (paths, done) = (paths.clone(), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut loose = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    for path in &paths {
+                        if let Ok(meta) = std::fs::symlink_metadata(path)
+                            && meta.permissions().mode() & 0o777 != SOCKET_MODE
+                        {
+                            loose.push((path.clone(), meta.permissions().mode() & 0o777));
+                        }
+                    }
+                }
+                loose
+            })
+        };
+        let mut bound = Vec::new();
+        for path in &paths {
+            bound.push(BoundUnixSocket::bind(path).expect("bind"));
+        }
+        done.store(true, Ordering::Relaxed);
+        let loose = watcher.join().expect("the watcher ran");
+        assert!(
+            loose.is_empty(),
+            "a socket was visible in a mode other than {SOCKET_MODE:o}: {loose:?}"
+        );
+    }
+
+    /// Claim: binding leaves nothing behind but the socket, and the private
+    /// directory it is bound in does not outlive the bind.
+    #[tokio::test]
+    async fn binding_leaves_nothing_but_the_socket() {
+        let dir = dir("clean");
+        let path = dir.join("s");
+        let (_bound, _listener) = BoundUnixSocket::bind(&path).expect("bind");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("directory")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("s")]);
+    }
+
+    /// Claim: a path that fits the budget but leaves no room for the private
+    /// directory still binds, with the same mode and the same protection of a
+    /// live listener.
+    #[tokio::test]
+    async fn a_path_with_no_room_to_stage_still_binds() {
+        let base = dir("tight");
+        let name = "x".repeat(MAX_SOCKET_PATH_BYTES - base.as_os_str().len() - 1);
+        let path = base.join(name);
+        assert_eq!(path.as_os_str().len(), MAX_SOCKET_PATH_BYTES);
+
+        let (_bound, _listener) = BoundUnixSocket::bind(&path).expect("bind at the budget");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, SOCKET_MODE, "mode {mode:o}");
+        let err = BoundUnixSocket::bind(&path).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == ErrorKind::AddrInUse),
+            "{err:?}"
+        );
     }
 
     /// Claim: anything at that path that is not a socket is refused, because

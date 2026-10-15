@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::error::{CheckIsLeaderError, ClientWriteError, Fatal, InitializeError, RaftError};
-use openraft::metrics::WaitError;
+use openraft::metrics::{RaftMetrics, WaitError};
 use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{ChangeMembers, Membership, Raft, SnapshotPolicy};
 use tokio::sync::Semaphore;
@@ -123,7 +123,13 @@ impl Consensus {
         let raft = Raft::new(id, Arc::new(raft_config), network.clone(), log, state)
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
-        let ops = Arc::new(Ops { raft, id });
+        network.attach(raft.metrics());
+        let ops = Arc::new(Ops {
+            raft,
+            id,
+            max_rpc_bytes: config.max_rpc_bytes,
+            catch_up: config.forward_timeout / 2,
+        });
         let server = runtime.exec().spawn(server::serve(
             replier,
             Arc::clone(&ops),
@@ -162,6 +168,12 @@ impl Consensus {
     }
 
     /// Commits `request` and returns what the state machine answered.
+    ///
+    /// Refused with [`Error::RequestTooLarge`] when the request, as one log
+    /// entry in an AppendEntries, would not fit
+    /// [`ConsensusConfig::max_rpc_bytes`](crate::ConsensusConfig::max_rpc_bytes):
+    /// the followers refuse such an entry, so a leader that appended it could
+    /// never commit it or anything behind it.
     pub async fn write(&self, request: Request) -> Result<Response, Error> {
         match self.on_leader(ForwardOp::Write(request)).await? {
             Done::Written(response) => Ok(response),
@@ -192,10 +204,21 @@ impl Consensus {
 
     /// Adds `node` to the group.
     ///
-    /// It becomes a learner first and catches up; then every member is made
-    /// a voter, unless that would make exactly two voters — a group that
-    /// tolerates no failure and doubles the quorum — in which case it stays
-    /// a [`Role::Learner`] until a third member arrives.
+    /// It becomes a learner first and catches up, for at most half of
+    /// [`ConsensusConfig::forward_timeout`](crate::ConsensusConfig::forward_timeout).
+    /// Then every learner that is replicating — this one, and any parked
+    /// earlier — is made a voter, unless that would make exactly two voters, a
+    /// group that tolerates no failure and doubles the quorum. The answer is
+    /// the role this node ended in: [`Role::Learner`] means it was not
+    /// promoted, because of that rule or because it had not caught up yet, and
+    /// calling `add_node` again for the same node promotes it once it has.
+    ///
+    /// A learner that never answers is never made a voter: a voter that is
+    /// not there raises the quorum the group needs without lowering what it
+    /// can reach.
+    ///
+    /// Refused with [`Error::TooManyNodes`] when the group already lists
+    /// [`codec::MAX_MEMBERS`] nodes, and, on the leader, only a voter may ask.
     pub async fn add_node(&self, node: Node) -> Result<Role, Error> {
         match self.on_leader(ForwardOp::AddNode(node)).await? {
             Done::Added(role) => Ok(role),
@@ -270,9 +293,19 @@ impl Consensus {
                 ForwardOutcome::ForwardToLeader(None) => return Err(Error::NoLeader),
                 ForwardOutcome::ForwardToLeader(Some(leader)) => leader,
             };
-            outcome = if leader.id()? == self.ops.id {
+            let id = leader.id()?;
+            outcome = if id == self.ops.id {
                 self.ops.execute_local(&op).await
             } else {
+                // A redirect names a node, and the peer that sent it is not
+                // the authority on where that node lives: dialling the URL it
+                // wrote would send this operation — a client's request bytes —
+                // to any host a member cared to name. The address is the one
+                // this node's own membership holds, and a node it does not
+                // list is not a leader this node follows.
+                let Some(leader) = self.ops.member(&id) else {
+                    return Err(Error::NoLeader);
+                };
                 let header =
                     header.get_or_insert_with(|| codec::encode_rpc(&Rpc::Forward(op.clone())));
                 self.network.forward(&leader, header).await?
@@ -289,18 +322,34 @@ impl Consensus {
 /// Where a proved key stands with this node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Admission {
-    /// In the effective membership, as a voter or a learner.
-    Member,
+    /// In the effective membership as a voter: one of the nodes that decide
+    /// who belongs to the group.
+    Voter,
+    /// In it as a learner: it replicates the log and votes on nothing.
+    Learner,
     /// Not in it, and the membership is not empty.
     Outsider,
     /// The membership is empty: this node is in no group yet.
     Uninitialized,
 }
 
+impl Admission {
+    /// Voter or learner.
+    pub(crate) fn is_member(self) -> bool {
+        matches!(self, Admission::Voter | Admission::Learner)
+    }
+}
+
 /// What the server task and the [`Consensus`] handle share.
 pub(crate) struct Ops {
     pub(crate) raft: Raft<TypeConfig>,
     id: NodeId,
+    /// [`ConsensusConfig::max_rpc_bytes`]: what a request may weigh as one
+    /// replicated entry, less the envelope that carries it.
+    max_rpc_bytes: usize,
+    /// How long `add_node` waits for a node it just added to catch up before
+    /// it answers that the node is still a learner.
+    catch_up: Duration,
 }
 
 impl Ops {
@@ -317,8 +366,10 @@ impl Ops {
         self.raft
             .with_raft_state(move |st| {
                 let membership = st.membership_state.effective();
-                if membership.get_node(&id).is_some() {
-                    Admission::Member
+                if membership.voter_ids().any(|voter| voter == id) {
+                    Admission::Voter
+                } else if membership.get_node(&id).is_some() {
+                    Admission::Learner
                 } else if membership.nodes().next().is_none() {
                     Admission::Uninitialized
                 } else {
@@ -336,6 +387,22 @@ impl Ops {
             .membership_config
             .membership()
             .clone()
+    }
+
+    /// The address this node's own membership lists for `id`.
+    ///
+    /// What a redirect to a leader is resolved through: a peer that says
+    /// "the leader is at this URL" is naming a node, and the address this
+    /// node dials for it is the one the group agreed on, not the one the peer
+    /// wrote.
+    pub(crate) fn member(&self, id: &NodeId) -> Option<Node> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .get_node(id)
+            .cloned()
     }
 
     /// `Some(redirect)` unless this node leads.
@@ -372,12 +439,31 @@ impl Ops {
     }
 
     /// Carries `op` out on this node, which must lead; never forwards.
+    ///
+    /// Copies the operation to keep the caller's: a client operation that may
+    /// still have to be forwarded afterwards needs it again. The server's
+    /// path, which does not, uses [`Ops::execute`].
     pub(crate) async fn execute_local(&self, op: &ForwardOp) -> ForwardOutcome {
+        self.execute(op.clone()).await
+    }
+
+    /// Carries `op` out on this node, which must lead; never forwards, and
+    /// consumes the operation, so a payload of megabytes is moved into the
+    /// log instead of copied.
+    pub(crate) async fn execute(&self, op: ForwardOp) -> ForwardOutcome {
         match op {
-            ForwardOp::Write(request) => match self.raft.client_write(request.clone()).await {
-                Ok(written) => ForwardOutcome::Done(Done::Written(written.data)),
-                Err(e) => self.write_failed(e),
-            },
+            ForwardOp::Write(request) => {
+                // The followers refuse an envelope over their own cap, and a
+                // leader that appended such an entry would retry it for ever:
+                // the entry could not commit and nothing behind it could.
+                if request.0.len() + codec::ENTRY_ENVELOPE_OVERHEAD > self.max_rpc_bytes {
+                    return ForwardOutcome::Failed(Error::RequestTooLarge);
+                }
+                match self.raft.client_write(request).await {
+                    Ok(written) => ForwardOutcome::Done(Done::Written(written.data)),
+                    Err(e) => self.write_failed(e),
+                }
+            }
             ForwardOp::ReadIndex => match self.raft.get_read_log_id().await {
                 Ok((read, _applied)) => ForwardOutcome::Done(Done::ReadIndex(read)),
                 Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
@@ -388,8 +474,8 @@ impl Ops {
                 }
                 Err(e) => ForwardOutcome::Failed(raft_error(e)),
             },
-            ForwardOp::AddNode(node) => self.add_node(node).await,
-            ForwardOp::RemoveNode(id) => self.remove_node(id).await,
+            ForwardOp::AddNode(node) => self.add_node(&node).await,
+            ForwardOp::RemoveNode(id) => self.remove_node(&id).await,
         }
     }
 
@@ -405,22 +491,54 @@ impl Ops {
         if membership.voter_ids().any(|voter| voter == id) {
             return ForwardOutcome::Done(Done::Added(Role::Voter));
         }
-        let mut members: BTreeSet<NodeId> = membership.nodes().map(|(id, _)| *id).collect();
-        members.insert(id);
-        if let Err(e) = self.raft.add_learner(id, node.clone(), true).await {
+        // A follower decodes at most `MAX_MEMBERS` nodes in a membership. A
+        // leader that appended a larger one would have it refused by every
+        // follower for ever, and could not read it back from its own store
+        // after a restart.
+        if membership.get_node(&id).is_none() && membership.nodes().count() >= codec::MAX_MEMBERS {
+            return ForwardOutcome::Failed(Error::TooManyNodes);
+        }
+        if let Err(e) = self.raft.add_learner(id, node.clone(), false).await {
             return self.write_failed(e);
         }
-        // Two voters tolerate no failure and need both for a quorum: the
-        // second member is parked as a learner until a third arrives.
-        if members.len() == 2 {
+        // The wait is this one and not `add_learner`'s own blocking mode,
+        // which gives up after half a second and returns as if the node had
+        // caught up: whether it is replicating is a question for the engine's
+        // own metrics, asked for as long as `catch_up` allows.
+        let threshold = self.raft.config().replication_lag_threshold;
+        let _ = self
+            .raft
+            .wait(Some(self.catch_up))
+            .metrics(
+                |metrics| replicating(metrics, &id, threshold),
+                "a new learner replicates",
+            )
+            .await;
+
+        // Only nodes that answer may vote. A learner that never caught up is a
+        // node that was named and is not there, and a voter that is not there
+        // raises the quorum the group has to reach without lowering what it
+        // can: with enough of them no write commits and no change completes.
+        let membership = self.membership();
+        let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
+        let learners: BTreeSet<NodeId> = membership.learner_ids().collect();
+        let metrics = self.raft.metrics().borrow().clone();
+        let Some(voters) = voters_after_add(&voters, &learners, |learner| {
+            replicating(&metrics, learner, threshold)
+        }) else {
             return ForwardOutcome::Done(Done::Added(Role::Learner));
-        }
+        };
+        let role = if voters.contains(&id) {
+            Role::Voter
+        } else {
+            Role::Learner
+        };
         match self
             .raft
-            .change_membership(ChangeMembers::ReplaceAllVoters(members), false)
+            .change_membership(ChangeMembers::ReplaceAllVoters(voters), false)
             .await
         {
-            Ok(_) => ForwardOutcome::Done(Done::Added(Role::Voter)),
+            Ok(_) => ForwardOutcome::Done(Done::Added(role)),
             Err(e) => self.write_failed(e),
         }
     }
@@ -451,6 +569,49 @@ impl Ops {
     }
 }
 
+/// Is the leader replicating to `id` closely enough for it to vote?
+///
+/// The leader's view of what the node has matched is within `threshold`
+/// entries of the end of the log — the distance openraft's own blocking
+/// `add_learner` calls "ready to join the cluster, as a voter" — **and the
+/// node has matched something**. The second half is what the first leaves out:
+/// on a log shorter than the threshold every node is "close", a node that was
+/// named and never reached included, so a distance alone would promote it.
+fn replicating(metrics: &RaftMetrics<NodeId, Node>, id: &NodeId, threshold: u64) -> bool {
+    // Entries are counted from one, so a log of one entry is one behind a node
+    // that has matched none.
+    fn next_index(index: Option<u64>) -> u64 {
+        index.map_or(0, |index| index + 1)
+    }
+    let Some(replication) = &metrics.replication else {
+        return false;
+    };
+    let Some(Some(matched)) = replication.get(id) else {
+        return false;
+    };
+    let matched = next_index(Some(matched.index));
+    next_index(metrics.last_log_index).saturating_sub(matched) <= threshold
+}
+
+/// The voters of the group after one node was added, or `None` when the
+/// membership should stay as it is.
+///
+/// The current voters, plus every learner that is replicating — the node just
+/// added and any that were parked behind the two-voter rule, which is how a
+/// third member makes the second a voter. Unchanged when no learner is ready,
+/// and when the result would be exactly two voters: a group that tolerates no
+/// failure and doubles the quorum, so the second member stays a learner until
+/// a third arrives.
+fn voters_after_add(
+    voters: &BTreeSet<NodeId>,
+    learners: &BTreeSet<NodeId>,
+    replicating: impl Fn(&NodeId) -> bool,
+) -> Option<BTreeSet<NodeId>> {
+    let mut after = voters.clone();
+    after.extend(learners.iter().filter(|learner| replicating(learner)));
+    (after.len() != voters.len() && after.len() != 2).then_some(after)
+}
+
 /// openraft's configuration from ours.
 fn engine_config(config: &ConsensusConfig) -> Result<openraft::Config, Error> {
     if config.max_payload_entries > codec::MAX_ENTRIES {
@@ -464,6 +625,14 @@ fn engine_config(config: &ConsensusConfig) -> Result<openraft::Config, Error> {
         return Err(Error::Config(format!(
             "max_concurrent_rpcs must be between 1 and {}",
             Semaphore::MAX_PERMITS
+        )));
+    }
+    if config.max_rpc_bytes < codec::MIN_RPC_BYTES {
+        return Err(Error::Config(format!(
+            "max_rpc_bytes {} is below the {} a membership of {} nodes needs to be replicated",
+            config.max_rpc_bytes,
+            codec::MIN_RPC_BYTES,
+            codec::MAX_MEMBERS
         )));
     }
     openraft::Config {

@@ -4,9 +4,12 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use weida::{ClientTls, Identity, Runtime, RuntimeConfig, Trust};
+use weida::{ClientTls, Fingerprint, Identity, Runtime, RuntimeConfig, Trust};
+use weida_raft::codec::{ENTRY_ENVELOPE_OVERHEAD, MIN_RPC_BYTES};
 use weida_raft::openraft::storage::RaftLogStorage;
-use weida_raft::{Consensus, ConsensusConfig, Error, MemoryStore, NodeId, Request, Response, Role};
+use weida_raft::{
+    Consensus, ConsensusConfig, Error, MemoryStore, Node, NodeId, Request, Response, Role,
+};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -365,4 +368,162 @@ fn the_engine_runs_on_the_runtime_that_built_it() {
         .recv_timeout(Duration::from_secs(15))
         .expect("the engine reported nothing: it never ran");
     assert_eq!(outcome, Ok(1));
+}
+
+/// A node that is in the membership and answers nothing: a key that was named
+/// and is not there.
+fn dead_node(n: u8) -> Node {
+    Node::new(format!(
+        "weida://{}@127.0.0.1:9/raft",
+        Fingerprint::from_bytes([n; 32])
+    ))
+    .expect("a well-formed node")
+}
+
+/// Claim: the leader refuses a write no follower could take, where it is
+/// accepted. The largest request that fits one replicated entry commits; one
+/// byte more is `RequestTooLarge` at once, and the group still commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_no_follower_could_take_is_refused_at_once() {
+    let mut small = config();
+    small.max_rpc_bytes = MIN_RPC_BYTES;
+    let node = TestNode::start(small).await;
+    node.consensus.bootstrap().await.expect("bootstrap");
+    let id = node.id();
+    eventually("the node leads itself", || async {
+        node.consensus.leader() == Some(id)
+    })
+    .await;
+
+    let largest = MIN_RPC_BYTES - ENTRY_ENVELOPE_OVERHEAD;
+    let refused = node.consensus.write(Request(vec![0; largest + 1])).await;
+    assert!(
+        matches!(refused, Err(Error::RequestTooLarge)),
+        "{refused:?}"
+    );
+    node.consensus
+        .write(Request(vec![0; largest]))
+        .await
+        .expect("the largest request that fits");
+    node.consensus
+        .write(Request(b"after".to_vec()))
+        .await
+        .expect("the group still commits");
+    node.consensus.shutdown().await;
+}
+
+/// Claim: a limit below what a full membership needs is refused at start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limit_too_small_to_replicate_a_membership_is_refused_at_start() {
+    let mut tiny = config();
+    tiny.max_rpc_bytes = 1024;
+    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let store = MemoryStore::default();
+    let refused = Consensus::start(
+        &runtime,
+        Identity::generate().expect("identity"),
+        store.clone(),
+        store,
+        tiny,
+    )
+    .await;
+    assert!(matches!(refused, Err(Error::Config(_))), "{refused:?}");
+}
+
+/// Claim: a learner that never answers is never made a voter. Two such nodes
+/// added to a group of one used to be promoted together by the second add,
+/// leaving a quorum no node could reach and a change that never completed;
+/// now both stay learners, and a real third member makes a working group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_learner_that_never_answers_is_never_made_a_voter() {
+    let mut quick = config();
+    quick.forward_timeout = Duration::from_secs(1);
+    let a = TestNode::start(quick).await;
+    a.consensus.bootstrap().await.expect("bootstrap");
+    let id = a.id();
+    eventually("A leads itself", || async {
+        a.consensus.leader() == Some(id)
+    })
+    .await;
+
+    for n in [1u8, 2] {
+        let role = tokio::time::timeout(DEADLINE, a.consensus.add_node(dead_node(n)))
+            .await
+            .expect("the add answers instead of waiting for a quorum that never comes")
+            .expect("added");
+        assert_eq!(role, Role::Learner, "a node that never answered voted");
+    }
+    a.consensus
+        .write(Request(b"still".to_vec()))
+        .await
+        .expect("a group of one still commits");
+
+    let b = TestNode::start(config()).await;
+    let c = TestNode::start(config()).await;
+    assert_eq!(
+        a.consensus
+            .add_node(b.consensus.node().clone())
+            .await
+            .expect("add B"),
+        Role::Learner,
+        "two voters are parked, not made"
+    );
+    assert_eq!(
+        a.consensus
+            .add_node(c.consensus.node().clone())
+            .await
+            .expect("add C"),
+        Role::Voter
+    );
+    a.consensus
+        .write(Request(b"with three voters".to_vec()))
+        .await
+        .expect("a quorum of the live voters commits");
+    for node in [a, b, c] {
+        node.consensus.shutdown().await;
+    }
+}
+
+/// Claim: a learner replicates and may write, and may not change who is in
+/// the group: its forwarded `RemoveNode` and `AddNode` are refused, and the
+/// membership stays as the voters made it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_learner_may_write_but_not_change_the_membership() {
+    let a = bootstrapped().await;
+    let b = TestNode::start(config()).await;
+    assert_eq!(
+        a.consensus
+            .add_node(b.consensus.node().clone())
+            .await
+            .expect("add B"),
+        Role::Learner
+    );
+
+    let leader = a.id();
+    eventually("B knows who leads", || async {
+        b.consensus.leader() == Some(leader)
+    })
+    .await;
+    b.consensus
+        .write(Request(b"from a learner".to_vec()))
+        .await
+        .expect("a learner's write is forwarded and committed");
+    let removal = b.consensus.remove_node(a.id()).await;
+    assert!(
+        matches!(removal, Err(Error::Weida(weida::Error::Rejected))),
+        "{removal:?}"
+    );
+    let addition = b.consensus.add_node(dead_node(7)).await;
+    assert!(
+        matches!(addition, Err(Error::Weida(weida::Error::Rejected))),
+        "{addition:?}"
+    );
+    a.consensus
+        .write(Request(b"the group is as it was".to_vec()))
+        .await
+        .expect("the voter still leads");
+    assert_eq!(a.consensus.leader(), Some(a.id()));
+
+    a.consensus.shutdown().await;
+    b.consensus.shutdown().await;
 }

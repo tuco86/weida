@@ -30,7 +30,26 @@ impl Request {
     }
 }
 
-type Handler = Box<dyn Fn(&Request) -> (u16, Value) + Send + Sync>;
+/// What a script answers with, byte for byte: for the tests that need a
+/// header the JSON form cannot carry, or a body that is not what OpenBao sends.
+pub struct Raw {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Raw {
+    /// `body` as OpenBao sends one.
+    pub fn json(status: u16, body: &Value) -> Raw {
+        Raw {
+            status,
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            body: body.to_string().into_bytes(),
+        }
+    }
+}
+
+type Handler = Box<dyn Fn(&Request) -> Raw + Send + Sync>;
 type Handlers = HashMap<(String, String), Arc<Handler>>;
 
 /// A script: path → handler. A path not in the script answers 404 with an
@@ -55,6 +74,19 @@ impl Script {
         method: &str,
         path: &str,
         handler: impl Fn(&Request) -> (u16, Value) + Send + Sync + 'static,
+    ) -> &Script {
+        self.on_raw(method, path, move |request| {
+            let (status, body) = handler(request);
+            Raw::json(status, &body)
+        })
+    }
+
+    /// Like [`Script::on`], for an answer given as bytes.
+    pub fn on_raw(
+        &self,
+        method: &str,
+        path: &str,
+        handler: impl Fn(&Request) -> Raw + Send + Sync + 'static,
     ) -> &Script {
         self.handlers.lock().expect("script poisoned").insert(
             (
@@ -83,7 +115,7 @@ impl Script {
             .collect()
     }
 
-    fn dispatch(&self, request: &Request) -> (u16, Value) {
+    fn dispatch(&self, request: &Request) -> Raw {
         self.seen
             .lock()
             .expect("seen poisoned")
@@ -96,9 +128,9 @@ impl Script {
             .cloned();
         match handler {
             Some(handler) => handler(request),
-            None => (
+            None => Raw::json(
                 404,
-                serde_json::json!({ "errors": [format!("unscripted: {} {}", request.method, request.path)] }),
+                &serde_json::json!({ "errors": [format!("unscripted: {} {}", request.method, request.path)] }),
             ),
         }
     }
@@ -197,14 +229,33 @@ async fn serve(mut stream: tokio::net::TcpStream, script: Script) {
         headers,
         body,
     };
-    let (status, answer) = script.dispatch(&request);
-    let payload = answer.to_string();
-    let response = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-        reason(status),
-        payload.len()
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
+    let answer = script.dispatch(&request);
+    // Chunked when the script says so: an answer that declares no length is
+    // the one the client has to cut without being told how long it is.
+    let chunked = answer.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding") && value.eq_ignore_ascii_case("chunked")
+    });
+    let mut head = format!("HTTP/1.1 {} {}\r\n", answer.status, reason(answer.status));
+    for (name, value) in &answer.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if !chunked {
+        head.push_str(&format!("Content-Length: {}\r\n", answer.body.len()));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let _ = stream.write_all(head.as_bytes()).await;
+    if chunked {
+        for chunk in answer.body.chunks(64 * 1024) {
+            let _ = stream
+                .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                .await;
+            let _ = stream.write_all(chunk).await;
+            let _ = stream.write_all(b"\r\n").await;
+        }
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+    } else {
+        let _ = stream.write_all(&answer.body).await;
+    }
     let _ = stream.shutdown().await;
 }
 
@@ -212,9 +263,11 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         204 => "No Content",
+        307 => "Temporary Redirect",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        500 => "Internal Server Error",
         _ => "Status",
     }
 }

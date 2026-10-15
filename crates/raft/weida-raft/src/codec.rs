@@ -73,6 +73,25 @@ pub const MAX_ENTRIES: u64 = 4096;
 /// The longest failure text a forwarded request's reply may carry, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024;
 
+/// What an AppendEntries envelope weighs beyond the payload of its one entry,
+/// as an upper bound.
+///
+/// The vote, the previous and the last log id, the entry's own log id and
+/// kind and the map and byte-string headers around them, with every integer
+/// at its widest. [`ConsensusConfig::max_rpc_bytes`](crate::ConsensusConfig::max_rpc_bytes)
+/// caps the whole envelope on the receiving side, so a request of
+/// `max_rpc_bytes - ENTRY_ENVELOPE_OVERHEAD` bytes is the largest a leader may
+/// append: one more byte and every follower refuses the envelope, for ever.
+pub const ENTRY_ENVELOPE_OVERHEAD: usize = 512;
+
+/// The smallest [`ConsensusConfig::max_rpc_bytes`](crate::ConsensusConfig::max_rpc_bytes)
+/// a node starts with.
+///
+/// A membership of [`MAX_MEMBERS`] nodes with the longest URLs, mid-change as
+/// a joint configuration, is one log entry of about 73 KiB; a limit below it
+/// would let a group grow to a membership that cannot be replicated.
+pub const MIN_RPC_BYTES: usize = 128 << 10;
+
 /// How deep an unknown key's value may nest before the decoder refuses it:
 /// the depth bound the header codec of `weida-protocol` uses for the same
 /// skip.
@@ -234,6 +253,8 @@ const FAIL_LAST_VOTER: u64 = 2;
 const FAIL_NO_LEADER: u64 = 3;
 const FAIL_RAFT: u64 = 4;
 const FAIL_INVALID_NODE: u64 = 5;
+const FAIL_REQUEST_TOO_LARGE: u64 = 6;
+const FAIL_TOO_MANY_NODES: u64 = 7;
 
 /// Encodes a request envelope.
 pub(crate) fn encode_rpc(rpc: &Rpc) -> Vec<u8> {
@@ -563,6 +584,14 @@ pub(crate) fn decode_forward_outcome(b: &[u8]) -> Result<ForwardOutcome, DecodeE
                         none(&[message.is_some()])?;
                         Error::NoLeader
                     }
+                    FAIL_REQUEST_TOO_LARGE => {
+                        none(&[message.is_some()])?;
+                        Error::RequestTooLarge
+                    }
+                    FAIL_TOO_MANY_NODES => {
+                        none(&[message.is_some()])?;
+                        Error::TooManyNodes
+                    }
                     FAIL_RAFT => Error::Raft(message.ok_or(DecodeError::MissingKey(6))?),
                     FAIL_INVALID_NODE => {
                         Error::InvalidNode(message.ok_or(DecodeError::MissingKey(6))?)
@@ -582,6 +611,8 @@ fn failure_parts(error: &Error) -> (u64, Option<String>) {
         Error::TwoVoters => (FAIL_TWO_VOTERS, None),
         Error::LastVoter => (FAIL_LAST_VOTER, None),
         Error::NoLeader => (FAIL_NO_LEADER, None),
+        Error::RequestTooLarge => (FAIL_REQUEST_TOO_LARGE, None),
+        Error::TooManyNodes => (FAIL_TOO_MANY_NODES, None),
         Error::InvalidNode(text) => (
             FAIL_INVALID_NODE,
             Some(truncate(text, MAX_MESSAGE_BYTES).to_owned()),
@@ -1780,5 +1811,101 @@ mod tests {
             Ok(())
         });
         assert_eq!(decode_entry(&bytes), Err(DecodeError::UnknownKind(7)));
+    }
+
+    /// An AppendEntries carrying `entries`, with every integer at its widest.
+    fn widest_append(entries: Vec<Entry<TypeConfig>>) -> Rpc {
+        let widest = |n: u8| log_id(u64::MAX, n, u64::MAX);
+        Rpc::AppendEntries(AppendEntriesRequest {
+            vote: Vote::new_committed(u64::MAX, id(1)),
+            prev_log_id: Some(widest(2)),
+            entries,
+            leader_commit: Some(widest(3)),
+        })
+    }
+
+    #[test]
+    fn an_envelope_around_one_entry_weighs_less_than_its_payload_plus_the_overhead() {
+        // The leader refuses a request that would not fit under the follower's
+        // cap once enveloped, so the constant has to be what the encoder
+        // writes, at every width of the byte-string header.
+        for payload in [0usize, 1, 23, 24, 255, 256, 65_535, 65_536, 1 << 20] {
+            let entry = Entry {
+                log_id: log_id(u64::MAX, 4, u64::MAX),
+                payload: EntryPayload::Normal(Request(vec![0xab; payload])),
+            };
+            let envelope = encode_rpc(&widest_append(vec![entry])).len();
+            assert!(
+                envelope <= payload + ENTRY_ENVELOPE_OVERHEAD,
+                "a payload of {payload} bytes made an envelope of {envelope}, \
+                 more than the {ENTRY_ENVELOPE_OVERHEAD} the leader allows for"
+            );
+        }
+    }
+
+    /// A membership of `count` nodes with the longest URLs, as a joint
+    /// configuration over the first and the last `count - 1` of them.
+    fn crowded_membership(count: usize) -> Membership<NodeId, Node> {
+        let node_id = |n: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(n as u64 + 1).to_be_bytes());
+            NodeId(bytes)
+        };
+        let nodes: BTreeMap<NodeId, Node> = (0..count)
+            .map(|n| {
+                let padding = "a".repeat(MAX_URL_BYTES - url(0).len());
+                (
+                    node_id(n),
+                    Node {
+                        url: format!("{}{padding}", url(0)),
+                    },
+                )
+            })
+            .collect();
+        let first: BTreeSet<NodeId> = (0..count.saturating_sub(1)).map(node_id).collect();
+        let last: BTreeSet<NodeId> = (1..count).map(node_id).collect();
+        Membership::new(vec![first, last], nodes)
+    }
+
+    #[test]
+    fn the_fullest_membership_fits_the_smallest_rpc_limit() {
+        let membership = crowded_membership(MAX_MEMBERS);
+        let entry = Entry {
+            log_id: log_id(u64::MAX, 4, u64::MAX),
+            payload: EntryPayload::Membership(membership),
+        };
+        let envelope = encode_rpc(&widest_append(vec![entry])).len();
+        assert!(
+            envelope <= MIN_RPC_BYTES,
+            "a full membership needs {envelope} bytes and the smallest limit is {MIN_RPC_BYTES}"
+        );
+    }
+
+    #[test]
+    fn a_membership_the_decoder_refuses_is_one_the_encoder_will_write() {
+        // The asymmetry the leader's cap exists for: nothing on the encoding
+        // side stops a 65th node, and every follower would answer it with a
+        // decode failure for ever.
+        let one_too_many = StoredMembership::new(None, crowded_membership(MAX_MEMBERS + 1));
+        assert!(matches!(
+            decode_membership(&encode_membership(&one_too_many)),
+            Err(DecodeError::TooLong { max, .. }) if max == MAX_MEMBERS as u64
+        ));
+        let at_the_cap = StoredMembership::new(None, crowded_membership(MAX_MEMBERS));
+        assert_eq!(
+            decode_membership(&encode_membership(&at_the_cap)).unwrap(),
+            at_the_cap
+        );
+    }
+
+    #[test]
+    fn the_leaders_refusals_cross_the_wire_by_name() {
+        for error in [Error::RequestTooLarge, Error::TooManyNodes] {
+            let name = error.to_string();
+            match rt_outcome(&ForwardOutcome::Failed(error)) {
+                ForwardOutcome::Failed(back) => assert_eq!(back.to_string(), name),
+                other => panic!("not a failure: {other:?}"),
+            }
+        }
     }
 }

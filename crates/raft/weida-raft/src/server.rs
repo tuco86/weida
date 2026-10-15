@@ -5,30 +5,89 @@
 //! **Admission.** Once a node's effective membership is non-empty, an RPC
 //! whose proved key is not in it is refused with `Rejected` before a byte of
 //! it is read; a node with an empty membership accepts engine RPCs from any
-//! key, because that is how a node being added learns its group.
+//! key, because that is how a node being added learns its group. A forwarded
+//! write or read barrier needs a member, and a forwarded membership change
+//! needs a **voter**: a learner replicates the group's log and is not one of
+//! the nodes that decides who belongs to it.
 //!
-//! **Deadlines and the cap.** The length prefix, the envelope and its end
+//! **What a stranger can cost.** The binding admits any key that proves
+//! possession of one, so who is *in* the group is only known after the engine
+//! has been asked, and what a key outside it may hold is bounded before that.
+//! A request is classified first, under [`MAX_UNADMITTED`] and the election
+//! deadline, and only then takes one of the `max_concurrent_rpcs` handler
+//! permits; so a stranger cannot spend a member's permit, and an outsider's
+//! refusal — which waits on the outsider's own flow-control credit — runs in
+//! a task of its own under [`MAX_REFUSALS`] and is *dropped* when none is
+//! free. Nothing the accept loop does waits on a peer or on the engine.
+//!
+//! **Deadlines and the caps.** The length prefix, the envelope and its end
 //! are read under [`crate::ConsensusConfig::election_timeout_max`], a snapshot
 //! body under `install_snapshot_timeout` counted from admission, a forwarded
-//! operation under `forward_timeout`, and the reply under
+//! operation under `forward_timeout`, and every refusal and the reply under
 //! `election_timeout_max` again, so no peer can hold a handler by going
-//! quiet. At most `max_concurrent_rpcs` handlers run; one more is refused.
+//! quiet. At most `max_concurrent_rpcs` handlers run; one more is refused. At
+//! most [`MAX_SNAPSHOT_BODIES`] snapshot bodies are buffered at once, and one
+//! whose vote the engine would refuse is answered before any of it is read.
 
 use std::sync::Arc;
 
 use openraft::Snapshot;
+use openraft::raft::SnapshotResponse;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout, timeout_at};
 use weida::{ErrorCode, IncomingRequest, PeerIdentity, Replier, TransferMeta};
 
 use crate::codec::{self, DecodeError, Rpc};
 use crate::consensus::{Admission, Ops};
+use crate::network::ForwardOp;
 use crate::{ConsensusConfig, NodeId};
 
 /// How much of an envelope is reserved before its bytes arrive: a claimed
 /// length costs nothing until its bytes arrive.
 const HEADER_PREALLOC: usize = 64 << 10;
+
+/// Requests the server has accepted and not yet classified.
+///
+/// A request is held here from its accept until the engine has said whether
+/// its key is in the membership, which is a round trip to the engine's own
+/// task. The cap is what keeps a flood of requests from keys that have never
+/// been heard of from queueing that many tasks on the engine, and it is held
+/// for nothing a peer controls: classification waits on the engine alone.
+const MAX_UNADMITTED: usize = 256;
+
+/// Refusals in flight at once.
+///
+/// A refusal is an ERROR frame written to the peer's own flow-control credit,
+/// and a peer that withholds credit holds the write until its deadline. The
+/// refusals of strangers are the ones a stranger can prolong at will, so they
+/// share a small pool of their own instead of the handler permits; one more
+/// than the pool holds is dropped, which the peer sees as an exchange nobody
+/// answered.
+const MAX_REFUSALS: usize = 16;
+
+/// Snapshot bodies buffered at once.
+///
+/// A snapshot body is held in memory up to
+/// [`ConsensusConfig::max_snapshot_bytes`] — many times what an envelope costs
+/// — before the engine can look at it. A leader sends one snapshot at a time
+/// to each follower, so a node receives one from its leader and, briefly across
+/// a change of leader, a second.
+const MAX_SNAPSHOT_BODIES: usize = 2;
+
+/// What the accept loop and the handlers it starts share.
+struct Server {
+    ops: Arc<Ops>,
+    config: Arc<ConsensusConfig>,
+    /// See [`MAX_UNADMITTED`].
+    unadmitted: Arc<Semaphore>,
+    /// See [`MAX_REFUSALS`].
+    refusals: Arc<Semaphore>,
+    /// One permit per admitted request being served.
+    handlers: Arc<Semaphore>,
+    /// See [`MAX_SNAPSHOT_BODIES`].
+    bodies: Semaphore,
+}
 
 /// Serves RPCs until the listener closes.
 ///
@@ -36,160 +95,263 @@ const HEADER_PREALLOC: usize = 64 << 10;
 /// heartbeat. `tokio::spawn` lands on the ambient runtime, which is the
 /// runtime's own `Exec` by the construction-site rule of the crate docs.
 ///
-/// At most [`ConsensusConfig::max_concurrent_rpcs`] run at once. A request
-/// over the cap is refused here, inline, without a task: an ERROR frame fits
-/// a fresh stream's initial credit, and the timeout covers a peer that
-/// withholds even that.
+/// At most [`ConsensusConfig::max_concurrent_rpcs`] admitted requests run at
+/// once. A request over a cap is refused without the loop waiting for it:
+/// the refusal is a task of its own with its own small cap, and past that the
+/// request is dropped.
 pub(crate) async fn serve(replier: Replier, ops: Arc<Ops>, config: Arc<ConsensusConfig>) {
-    let permits = Arc::new(Semaphore::new(config.max_concurrent_rpcs));
+    let server = Arc::new(Server {
+        handlers: Arc::new(Semaphore::new(config.max_concurrent_rpcs)),
+        unadmitted: Arc::new(Semaphore::new(MAX_UNADMITTED)),
+        refusals: Arc::new(Semaphore::new(MAX_REFUSALS)),
+        bodies: Semaphore::new(MAX_SNAPSHOT_BODIES),
+        ops,
+        config,
+    });
     while let Ok(request) = replier.accept().await {
-        match Arc::clone(&permits).try_acquire_owned() {
-            Ok(permit) => {
-                let ops = Arc::clone(&ops);
-                let config = Arc::clone(&config);
-                tokio::spawn(async move {
-                    handle(request, ops, config).await;
-                    drop(permit);
-                });
+        match Arc::clone(&server.unadmitted).try_acquire_owned() {
+            Ok(pending) => {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move { server.admit(request, pending).await });
             }
             Err(_) => {
-                tracing::debug!(cap = config.max_concurrent_rpcs, "raft RPC over the cap");
-                let _ = timeout(
-                    config.heartbeat_interval,
-                    request.refuse(ErrorCode::Rejected),
-                )
-                .await;
+                tracing::debug!(cap = MAX_UNADMITTED, "raft RPC over the pre-admission cap");
+                server.refuse_detached(request, ErrorCode::Rejected);
             }
         }
     }
 }
 
-async fn handle(mut request: IncomingRequest, ops: Arc<Ops>, config: Arc<ConsensusConfig>) {
-    // The binding requires client keys, so this is defensive.
-    let Some(proved) = request
-        .meta()
-        .peer
-        .as_ref()
-        .and_then(PeerIdentity::key)
-        .map(NodeId::from)
-    else {
-        return request.refuse(ErrorCode::Rejected).await;
-    };
+impl Server {
+    /// Classifies a request, and either refuses it or serves it.
+    async fn admit(self: Arc<Self>, request: IncomingRequest, pending: OwnedSemaphorePermit) {
+        // The binding requires client keys, so this is defensive.
+        let Some(proved) = request
+            .meta()
+            .peer
+            .as_ref()
+            .and_then(PeerIdentity::key)
+            .map(NodeId::from)
+        else {
+            drop(pending);
+            return self.refuse_detached(request, ErrorCode::Rejected);
+        };
 
-    let started = Instant::now();
-    let admission = match ops.admission(proved).await {
-        Ok(admission) => admission,
-        Err(fatal) => return internal(request, &fatal).await,
-    };
-    if admission == Admission::Outsider {
-        // Debug: the volume is chosen by whoever sends.
-        tracing::debug!(%proved, "raft RPC from a key outside the membership");
-        return request.refuse(ErrorCode::Rejected).await;
+        let classified =
+            timeout(self.config.election_timeout_max, self.ops.admission(proved)).await;
+        drop(pending);
+        let admission = match classified {
+            Ok(Ok(admission)) => admission,
+            Ok(Err(fatal)) => {
+                tracing::debug!(error = %fatal, "raft engine refused an admission check");
+                return self.refuse_detached(request, ErrorCode::Internal);
+            }
+            Err(_) => {
+                tracing::debug!(%proved, "raft engine did not classify a key in time");
+                return self.refuse_detached(request, ErrorCode::Internal);
+            }
+        };
+        if admission == Admission::Outsider {
+            // Debug: the volume is chosen by whoever sends.
+            tracing::debug!(%proved, "raft RPC from a key outside the membership");
+            return self.refuse_detached(request, ErrorCode::Rejected);
+        }
+
+        let Ok(permit) = Arc::clone(&self.handlers).try_acquire_owned() else {
+            tracing::debug!(
+                cap = self.config.max_concurrent_rpcs,
+                "raft RPC over the cap"
+            );
+            return self.refuse_detached(request, ErrorCode::Rejected);
+        };
+        self.handle(request, proved, admission).await;
+        drop(permit);
     }
 
-    let rpc = match timeout(
-        config.election_timeout_max,
-        read_rpc(&mut request, proved, config.max_rpc_bytes),
-    )
-    .await
-    {
-        Ok(Ok(rpc)) => rpc,
-        Ok(Err(code)) => return request.refuse(code).await,
-        Err(_) => {
-            tracing::debug!(%proved, "raft RPC envelope not received in time");
-            return request.refuse(ErrorCode::Rejected).await;
-        }
-    };
-
-    // The identity rule (0020 §4.4): an engine message names its sender in
-    // its vote, and that sender must be the key that proved itself in the
-    // handshake. A forwarded client operation must come from a member.
-    let claimed = match &rpc {
-        Rpc::Vote(rpc) => Some(rpc.vote.leader_id.node_id),
-        Rpc::AppendEntries(rpc) => Some(rpc.vote.leader_id.node_id),
-        Rpc::Snapshot { vote, .. } => Some(vote.leader_id.node_id),
-        Rpc::Forward(_) => None,
-    };
-    match claimed {
-        Some(claimed) if claimed != proved => {
-            tracing::warn!(%proved, %claimed, "raft RPC claims a sender other than the proved key");
-            return request.refuse(ErrorCode::Rejected).await;
-        }
-        None if admission != Admission::Member => {
-            tracing::warn!(%proved, "forwarded operation from a non-member");
-            return request.refuse(ErrorCode::Rejected).await;
-        }
-        _ => {}
+    /// Refuses a request in a task of its own, or drops it when the pool of
+    /// refusals is spent.
+    ///
+    /// For the requests that hold no handler permit: the refusal waits on the
+    /// peer, and what waits on a peer must not hold anything a member needs.
+    fn refuse_detached(&self, request: IncomingRequest, code: ErrorCode) {
+        let Ok(permit) = Arc::clone(&self.refusals).try_acquire_owned() else {
+            tracing::debug!(
+                cap = MAX_REFUSALS,
+                "raft refusals over the cap; dropping a request"
+            );
+            return;
+        };
+        let deadline = self.config.election_timeout_max;
+        tokio::spawn(async move {
+            let _ = timeout(deadline, request.refuse(code)).await;
+            drop(permit);
+        });
     }
 
-    let reply = match rpc {
-        Rpc::Vote(rpc) => match ops.raft.vote(rpc).await {
-            Ok(response) => codec::encode_vote_response(&response),
-            Err(e) => return internal(request, &e).await,
-        },
-        Rpc::AppendEntries(rpc) => match ops.raft.append_entries(rpc).await {
-            Ok(response) => codec::encode_append_response(&response),
-            Err(e) => return internal(request, &e).await,
-        },
-        Rpc::Snapshot { vote, meta } => {
-            let mut data = match ops.raft.begin_receiving_snapshot().await {
-                Ok(data) => data,
-                Err(e) => return internal(request, &e).await,
-            };
-            let cap = config.max_snapshot_bytes;
-            let mut body = request.body().take(cap as u64 + 1);
-            match timeout_at(
-                started + config.install_snapshot_timeout,
-                body.read_to_end(data.get_mut()),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => return request.refuse(ErrorCode::Rejected).await,
+    /// Refuses a request the handler already holds a permit for, for as long
+    /// as the peer lets it.
+    async fn refuse(&self, request: IncomingRequest, code: ErrorCode) {
+        let refused = timeout(self.config.election_timeout_max, request.refuse(code)).await;
+        if refused.is_err() {
+            tracing::debug!("a raft refusal was not taken in time");
+        }
+    }
+
+    /// The engine failed or stopped: no answer, an `INTERNAL` refusal.
+    async fn internal(&self, request: IncomingRequest, e: &(dyn std::fmt::Display + Sync)) {
+        tracing::debug!(error = %e, "raft engine refused an RPC");
+        self.refuse(request, ErrorCode::Internal).await;
+    }
+
+    async fn handle(&self, mut request: IncomingRequest, proved: NodeId, admission: Admission) {
+        let config = &self.config;
+        let ops = &self.ops;
+        let started = Instant::now();
+
+        let rpc = match timeout(
+            config.election_timeout_max,
+            read_rpc(&mut request, proved, config.max_rpc_bytes),
+        )
+        .await
+        {
+            Ok(Ok(rpc)) => rpc,
+            Ok(Err(code)) => return self.refuse(request, code).await,
+            Err(_) => {
+                tracing::debug!(%proved, "raft RPC envelope not received in time");
+                return self.refuse(request, ErrorCode::Rejected).await;
+            }
+        };
+
+        // The identity rule (0020 §4.4): an engine message names its sender in
+        // its vote, and that sender must be the key that proved itself in the
+        // handshake. A forwarded client operation must come from a member, and
+        // one that changes the membership from a voter.
+        let permitted = match &rpc {
+            Rpc::Vote(rpc) => claim(proved, rpc.vote.leader_id.node_id),
+            Rpc::AppendEntries(rpc) => claim(proved, rpc.vote.leader_id.node_id),
+            Rpc::Snapshot { vote, .. } => claim(proved, vote.leader_id.node_id),
+            Rpc::Forward(op) => {
+                let allowed = match op {
+                    ForwardOp::AddNode(_) | ForwardOp::RemoveNode(_) => {
+                        admission == Admission::Voter
+                    }
+                    ForwardOp::Write(_) | ForwardOp::ReadIndex => admission.is_member(),
+                };
+                if !allowed {
+                    tracing::warn!(
+                        %proved,
+                        ?admission,
+                        "forwarded operation from a node that may not send it"
+                    );
+                }
+                allowed
+            }
+        };
+        if !permitted {
+            return self.refuse(request, ErrorCode::Rejected).await;
+        }
+        let reply = match rpc {
+            Rpc::Vote(rpc) => match ops.raft.vote(rpc).await {
+                Ok(response) => codec::encode_vote_response(&response),
+                Err(e) => return self.internal(request, &e).await,
+            },
+            Rpc::AppendEntries(rpc) => match ops.raft.append_entries(rpc).await {
+                Ok(response) => codec::encode_append_response(&response),
+                Err(e) => return self.internal(request, &e).await,
+            },
+            Rpc::Snapshot { vote, meta } => {
+                // Held until the snapshot is installed: the buffer is what the
+                // cap is about.
+                let Ok(_body) = self.bodies.try_acquire() else {
+                    tracing::debug!(%proved, "raft snapshot while others are being received");
+                    return self.refuse(request, ErrorCode::Rejected).await;
+                };
+                // The engine's own first check, made before anything is
+                // buffered: a vote lower than the one this node holds is
+                // answered with that vote, which is what tells a stale leader
+                // to step down, and nothing of the body is read.
+                let current = match ops.raft.with_raft_state(|st| *st.vote_ref()).await {
+                    Ok(current) => current,
+                    Err(e) => return self.internal(request, &e).await,
+                };
+                if vote < current {
+                    tracing::debug!(%proved, "raft snapshot under a stale vote");
+                    codec::encode_snapshot_response(&SnapshotResponse { vote: current })
+                } else {
+                    let mut data = match ops.raft.begin_receiving_snapshot().await {
+                        Ok(data) => data,
+                        Err(e) => return self.internal(request, &e).await,
+                    };
+                    let cap = config.max_snapshot_bytes;
+                    let mut body = request.body().take(cap as u64 + 1);
+                    match timeout_at(
+                        started + config.install_snapshot_timeout,
+                        body.read_to_end(data.get_mut()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => return self.refuse(request, ErrorCode::Rejected).await,
+                        Err(_) => {
+                            tracing::debug!(%proved, "snapshot not received in time");
+                            return self.refuse(request, ErrorCode::Rejected).await;
+                        }
+                    }
+                    if data.get_ref().len() > cap {
+                        tracing::warn!(%proved, cap, "snapshot over the size limit");
+                        return self.refuse(request, ErrorCode::Rejected).await;
+                    }
+                    data.set_position(0);
+                    let snapshot = Snapshot {
+                        meta,
+                        snapshot: data,
+                    };
+                    match ops.raft.install_full_snapshot(vote, snapshot).await {
+                        Ok(response) => codec::encode_snapshot_response(&response),
+                        Err(e) => return self.internal(request, &e).await,
+                    }
+                }
+            }
+            // The forwarder has given up by then, and the permit must not stay
+            // held by an operation that hangs without a quorum. The operation is
+            // moved into the engine, not copied: nothing here needs it again.
+            Rpc::Forward(op) => match timeout(config.forward_timeout, ops.execute(op)).await {
+                Ok(outcome) => codec::encode_forward_outcome(&outcome),
                 Err(_) => {
-                    tracing::debug!(%proved, "snapshot not received in time");
-                    return request.refuse(ErrorCode::Rejected).await;
+                    return self
+                        .internal(request, &"forwarded operation timed out")
+                        .await;
                 }
-            }
-            if data.get_ref().len() > cap {
-                tracing::warn!(%proved, cap, "snapshot over the size limit");
-                return request.refuse(ErrorCode::Rejected).await;
-            }
-            data.set_position(0);
-            let snapshot = Snapshot {
-                meta,
-                snapshot: data,
-            };
-            match ops.raft.install_full_snapshot(vote, snapshot).await {
-                Ok(response) => codec::encode_snapshot_response(&response),
-                Err(e) => return internal(request, &e).await,
-            }
-        }
-        // The forwarder has given up by then, and the permit must not stay
-        // held by an operation that hangs without a quorum.
-        Rpc::Forward(op) => match timeout(config.forward_timeout, ops.execute_local(&op)).await {
-            Ok(outcome) => codec::encode_forward_outcome(&outcome),
-            Err(_) => return internal(request, &"forwarded operation timed out").await,
-        },
-    };
+            },
+        };
 
-    // Bounded, so a peer that stops reading cannot hold the handler.
-    let sent = timeout(config.election_timeout_max, async {
-        match request.reply(TransferMeta::default()).await {
-            Ok(mut out) => {
-                if let Err(e) = out.write_all(&reply).await {
-                    tracing::debug!(error = %e, "raft reply not written");
-                } else if let Err(e) = out.finish() {
-                    tracing::debug!(error = %e, "raft reply not finished");
+        // Bounded, so a peer that stops reading cannot hold the handler.
+        let sent = timeout(config.election_timeout_max, async {
+            match request.reply(TransferMeta::default()).await {
+                Ok(mut out) => {
+                    if let Err(e) = out.write_all(&reply).await {
+                        tracing::debug!(error = %e, "raft reply not written");
+                    } else if let Err(e) = out.finish() {
+                        tracing::debug!(error = %e, "raft reply not finished");
+                    }
                 }
+                Err(e) => tracing::debug!(error = %e, "raft reply not opened"),
             }
-            Err(e) => tracing::debug!(error = %e, "raft reply not opened"),
+        })
+        .await;
+        if sent.is_err() {
+            tracing::debug!(%proved, "raft reply not taken in time");
         }
-    })
-    .await;
-    if sent.is_err() {
-        tracing::debug!(%proved, "raft reply not taken in time");
     }
+}
+
+/// Does an engine message's claimed sender match the key that proved itself?
+fn claim(proved: NodeId, claimed: NodeId) -> bool {
+    if claimed == proved {
+        return true;
+    }
+    tracing::warn!(%proved, %claimed, "raft RPC claims a sender other than the proved key");
+    false
 }
 
 /// Reads one RPC's length prefix and envelope, and for every kind but a
@@ -245,18 +407,12 @@ async fn read_rpc(
     Ok(rpc)
 }
 
-/// The engine failed or stopped: no answer, an `INTERNAL` refusal.
-async fn internal(request: IncomingRequest, e: &(dyn std::fmt::Display + Sync)) {
-    tracing::debug!(error = %e, "raft engine refused an RPC");
-    request.refuse(ErrorCode::Internal).await;
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
     use openraft::raft::{AppendEntriesRequest, VoteRequest};
-    use openraft::{CommittedLeaderId, LogId, Vote};
+    use openraft::{CommittedLeaderId, LogId, SnapshotMeta, Vote};
     use weida::{Alpn, ClientTls, Identity, Runtime, RuntimeConfig, TransferMeta, Trust};
 
     use crate::codec::{self, Rpc};
@@ -447,6 +603,99 @@ mod tests {
             .await
             .expect("a complete vote after the stalled ones ended");
         codec::decode_vote_response(&reply).expect("a VoteResponse");
+
+        consensus.shutdown().await;
+    }
+
+    /// Opens a snapshot RPC the way a leader does — length prefix, then the
+    /// envelope — and returns the handles without sending the body or the
+    /// end, so the receiver is left waiting for bytes that do not come.
+    async fn open_snapshot(
+        requester: &weida::Requester,
+        vote: Vote<NodeId>,
+    ) -> (weida::OutgoingTransfer, weida::ReplyStream) {
+        let header = codec::encode_rpc(&Rpc::Snapshot {
+            vote,
+            meta: SnapshotMeta::default(),
+        });
+        let (mut transfer, reply) = requester.open(TransferMeta::default()).await.expect("open");
+        transfer
+            .write_all(&(header.len() as u32).to_be_bytes())
+            .await
+            .expect("the length prefix");
+        transfer.write_all(&header).await.expect("the envelope");
+        (transfer, reply)
+    }
+
+    /// Snapshot bodies are buffered up to `max_snapshot_bytes` each, so only
+    /// two are held at once: a third, however it is sent, is refused before
+    /// the engine or a buffer is involved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_two_snapshot_bodies_are_buffered_at_once() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let consensus = start(&runtime, loopback()).await;
+        let (x_id, requester) = stranger(&runtime, &consensus).await;
+        let vote = Vote::new_committed(1, x_id);
+
+        let first = open_snapshot(&requester, vote).await;
+        let second = open_snapshot(&requester, vote).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = Instant::now();
+        let third = send(
+            &requester,
+            &Rpc::Snapshot {
+                vote,
+                meta: SnapshotMeta::default(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(third, Err(weida::Error::Rejected)),
+            "a third snapshot must be refused, got {third:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        drop((first, second));
+        consensus.shutdown().await;
+    }
+
+    /// A snapshot under a vote the engine would refuse is answered with the
+    /// vote the node holds, before any of its body is read: the sender never
+    /// sends one here, and the answer still comes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_snapshot_under_a_stale_vote_is_answered_without_its_body() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let consensus = start(&runtime, loopback()).await;
+        let (x_id, requester) = stranger(&runtime, &consensus).await;
+
+        // The node takes a vote at a high term.
+        let reply = send(
+            &requester,
+            &Rpc::Vote(VoteRequest {
+                vote: Vote::new(5, x_id),
+                last_log_id: None,
+            }),
+        )
+        .await
+        .expect("a vote");
+        let held = codec::decode_vote_response(&reply)
+            .expect("a VoteResponse")
+            .vote;
+        assert_eq!(held.leader_id.term, 5);
+
+        let (_transfer, reply) = open_snapshot(&requester, Vote::new_committed(1, x_id)).await;
+        let answered = tokio::time::timeout(Duration::from_secs(2), async {
+            reply.recv().await?.collect(1 << 16).await
+        })
+        .await
+        .expect("answered while the body is still to come")
+        .expect("a reply");
+        let response = codec::decode_snapshot_response(&answered).expect("a SnapshotResponse");
+        assert_eq!(
+            response.vote, held,
+            "the answer carries the vote the node holds"
+        );
 
         consensus.shutdown().await;
     }

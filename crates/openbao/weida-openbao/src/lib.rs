@@ -22,6 +22,13 @@
 //! What this crate does not do: check revocation (no CRL, no OCSP; the TTL
 //! is the answer, and the renewal is what makes a short one affordable).
 //!
+//! What it refuses to do, because the other end of an HTTP connection is not
+//! trusted with more than it has to be: speak `http://` unless
+//! [`Config::allow_insecure`] says so, follow a redirect (which would re-send
+//! the token and the request body wherever it points), read an answer past a
+//! fixed cap, or print a credential — tokens and secret ids are a [`Secret`],
+//! wiped when dropped and redacted in `Debug`.
+//!
 //! The controller half of the hand-off, minting the wrapped token and
 //! revoking the child by its accessor, is [`OpenBao::post_wrapped`] and
 //! [`OpenBao::revoke_accessor`], driven from the unit file in
@@ -33,11 +40,13 @@ mod auth;
 mod client;
 mod kv;
 mod pki;
+mod secret;
 
 pub use auth::{Auth, HandoffSource, TokenInfo};
 pub use client::{Config, OpenBao};
 pub use kv::Kv;
 pub use pki::{PkiAnchor, PkiSign};
+pub use secret::Secret;
 
 /// Everything that can go wrong talking to OpenBao.
 #[derive(Debug)]
@@ -58,6 +67,10 @@ pub enum Error {
     HandoffStolen,
     /// An operation needed a token and the client has none.
     Unauthenticated,
+    /// The client's configuration was refused: an address that is not
+    /// `https://` while [`Config::allow_insecure`] is not set, or a value that
+    /// is not a usable number. Carries the reason.
+    Config(String),
     /// The hand-off credential could not be read from where it was said to
     /// be.
     Credential(String),
@@ -81,6 +94,7 @@ impl std::fmt::Display for Error {
                  credential first",
             ),
             Error::Unauthenticated => f.write_str("no openbao token: log in first"),
+            Error::Config(m) => write!(f, "openbao configuration refused: {m}"),
             Error::Credential(m) => write!(f, "hand-off credential unreadable: {m}"),
             Error::Shape(m) => write!(f, "unexpected openbao response: {m}"),
             Error::Tls(m) => write!(f, "openbao tls: {m}"),

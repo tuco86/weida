@@ -32,6 +32,9 @@ webpki-roots.workspace = true
 # The CSR a `PkiSign` source sends: built over the key it already holds, so
 # the fingerprint survives every renewal.
 rcgen.workspace = true
+# Wipes a token, a secret id and a key PEM from memory when the value that held
+# it is dropped; pure Rust, so `unsafe_code = "forbid"` survives it.
+zeroize.workspace = true
 
 [dev-dependencies]
 # The scripted HTTP server the tests answer from.

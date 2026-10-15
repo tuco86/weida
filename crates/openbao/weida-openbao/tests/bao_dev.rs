@@ -27,6 +27,15 @@ use weida_openbao::{Auth, Config, Error, HandoffSource, OpenBao, PkiAnchor, PkiS
 
 const ROOT: &str = "root-for-tests";
 
+/// The dev server speaks `http://` on this host, which the client only does
+/// when told to.
+fn insecure(address: &str) -> Config {
+    Config {
+        allow_insecure: true,
+        ..Config::new(address)
+    }
+}
+
 async fn within<F: Future>(f: F) -> F::Output {
     timeout(Duration::from_secs(30), f)
         .await
@@ -60,7 +69,7 @@ impl DevServer {
             .expect("bao is on PATH");
         let address = format!("http://{listen}");
         let server = DevServer { child, address };
-        let ready = OpenBao::new(Config::new(&server.address)).expect("client");
+        let ready = OpenBao::new(insecure(&server.address)).expect("client");
         within(async {
             loop {
                 if ready.login(Auth::Token(ROOT.into())).await.is_ok() {
@@ -74,7 +83,7 @@ impl DevServer {
     }
 
     fn root(&self) -> OpenBao {
-        OpenBao::new(Config::new(&self.address)).expect("client")
+        OpenBao::new(insecure(&self.address)).expect("client")
     }
 }
 
@@ -126,7 +135,7 @@ async fn the_handoff_is_redeemed_once_against_a_real_server() {
     .await
     .expect("wrapped child token");
 
-    let service = OpenBao::new(Config::new(&dev.address)).expect("client");
+    let service = OpenBao::new(insecure(&dev.address)).expect("client");
     let info = within(service.login(Auth::Handoff(HandoffSource::Token(wrapping.clone()))))
         .await
         .expect("redeem");
@@ -138,7 +147,7 @@ async fn the_handoff_is_redeemed_once_against_a_real_server() {
     );
     let accessor = service.accessor().expect("accessor");
 
-    let thief = OpenBao::new(Config::new(&dev.address)).expect("client");
+    let thief = OpenBao::new(insecure(&dev.address)).expect("client");
     let err = within(thief.login(Auth::Handoff(HandoffSource::Token(wrapping))))
         .await
         .expect_err("second redemption");

@@ -1,19 +1,17 @@
-//! The broker: queues at endpoint paths, and admission into them.
+//! The broker: queues at endpoint paths, and the loop that serves each.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
-use weida::{
-    Acceptor, Acknowledgement, ConsumerId, CursorLevel, Cursors, Error, ErrorCode, Incoming,
-    IncomingMeta, IncomingRequest, IncomingTransfer, Listener, Reporter, TransferMeta,
-};
+use weida::{Acceptor, Acknowledgement, Consumer, ConsumerId, Error, Incoming, Listener};
 
-use crate::consumers::Consumers;
-
-use crate::queue::{DeliveryId, Queue, QueueStats, QueuedMessage, Refusal};
+use crate::admission::{self, MAX_REPORTS_IN_FLIGHT};
+use crate::consumers::{Consumers, SubKey};
+use crate::delivery::{self, Dispatch};
+use crate::queue::{DeliveryId, Queue, QueueStats};
 
 /// What this broker can certify about a message, and the list is the whole
 /// list.
@@ -68,6 +66,10 @@ pub struct BrokerConfig {
     /// small enough that a thousand queues are a gigabyte rather than a
     /// swap storm. A queue at this bound refuses admission (§4.8); it never
     /// discards a message it has already confirmed.
+    ///
+    /// What counts against it is everything the queue has promised room for:
+    /// messages held, messages handed out and not yet reported on, and the
+    /// bytes of payloads that producers are still sending.
     pub queue_bytes: usize,
     /// Queues this broker will register. Default 64.
     pub max_queues: usize,
@@ -76,9 +78,12 @@ pub struct BrokerConfig {
     ///
     /// An unsettled delivery is one this broker has handed out and not seen a
     /// consumer report on. The bound is **per subscription**, which is what
-    /// the name says: one consumer that stops reporting costs its
-    /// own slots and nobody else's, and its messages stay charged against
-    /// [`BrokerConfig::queue_bytes`] until they settle or come back.
+    /// the name says: one subscription that stops reporting costs its own
+    /// slots, and its messages stay charged against
+    /// [`BrokerConfig::queue_bytes`] until they settle or come back. A
+    /// consumer holds many subscriptions, one per filter, and the number of
+    /// filters is its own to choose, so what one *connection* may hold across
+    /// all of them is [`BrokerConfig::max_unsettled_per_consumer`].
     ///
     /// It is not a credit limit. Credit is *cumulative* — the total a
     /// subscription will ever accept ([0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
@@ -94,6 +99,43 @@ pub struct BrokerConfig {
     /// and it is left legal rather than refused, but it is not a pause switch:
     /// a consumer pauses with credit, which is its own to give.
     pub max_unsettled: usize,
+    /// Deliveries one consumer **connection** may have unsettled at once, over
+    /// every filter it subscribed with. Default 1024.
+    ///
+    /// [`BrokerConfig::max_unsettled`] alone is a bound times the number of
+    /// filters a connection opens, and a connection may hold hundreds: with a
+    /// bound of 256 each, eight filters pin more of a queue than most
+    /// consumers' whole backlog, and a hostile one pins all of it. This is the
+    /// bound on the connection, whatever it subscribed to.
+    pub max_unsettled_per_consumer: usize,
+    /// Admissions one queue runs at once. Default 1024, and at least 1.
+    ///
+    /// An admission is a producer's message being read, confirmed or refused:
+    /// a task, a stream and a reservation, held for as long as the producer
+    /// takes. This prevents a flood of producers that stop mid-message from
+    /// costing the queue a task each without bound. At the limit the queue
+    /// stops reading new streams until an admission finishes, which QUIC's flow
+    /// control turns into producers waiting — nothing is refused for being
+    /// busy, and nothing waits in a buffer of the broker's own. One producer
+    /// that stops holds one admission, for at most
+    /// [`BrokerConfig::io_timeout`]; it takes as many stalled producers as this
+    /// number to make anyone else wait.
+    pub max_inflight_admissions: usize,
+    /// How long a wait on a peer may go without progress. Default 10 s.
+    ///
+    /// Every read of a producer's payload, every write of a delivery, every
+    /// confirm, refusal and cursor report waits on a peer's flow-control
+    /// credit, and a peer that never raises it would otherwise hold the task,
+    /// the stream and — for a payload — the queue's reserved bytes for ever.
+    /// A payload or delivery that moves slower than
+    /// [`crate::peer::MIN_PEER_RATE`] is cut after about one window too, so a
+    /// peer cannot hold on by sending a byte per window.
+    ///
+    /// A producer past it loses the message it was sending. A consumer past
+    /// it loses its subscription — the message it was being given goes back
+    /// to the head of the queue — and resubscribes like any consumer that was
+    /// removed: the broker has no way to speak to it outside a delivery.
+    pub io_timeout: Duration,
 }
 
 impl Default for BrokerConfig {
@@ -103,6 +145,9 @@ impl Default for BrokerConfig {
             queue_bytes: 8 * 1024 * 1024,
             max_queues: 64,
             max_unsettled: 256,
+            max_unsettled_per_consumer: 1024,
+            max_inflight_admissions: 1024,
+            io_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -121,14 +166,20 @@ impl BrokerConfig {
     }
 }
 
-/// How one outstanding delivery ended.
+/// How an outstanding delivery's write or report ended.
 ///
-/// Sent by the watcher task that holds the delivery's [`Reporter`]-side
-/// cursors, and consumed by the queue's own event loop — so a settlement is
-/// an event of the **one** loop rather than a second writer into the queue,
-/// which is the invariant every comment in this file rests on.
+/// Sent by the tasks that write a delivery and watch its report, and consumed
+/// by the queue's own event loop — so every outcome is an event of the **one**
+/// loop rather than a second writer into the queue's delivery state, which is
+/// the invariant every comment in this file rests on.
 #[derive(Debug)]
-enum Settlement {
+pub(crate) enum Event {
+    /// The bytes are out: the subscription may be given another message while
+    /// this one waits for its report.
+    Written(DeliveryId),
+    /// The write failed or the consumer stopped reading: the message goes back
+    /// and the subscription is dropped.
+    Failed(DeliveryId),
     /// The consumer reported the level the delivery ordered.
     Settled(DeliveryId),
     /// No further cursors are coming and the level never arrived: the
@@ -140,35 +191,47 @@ enum Settlement {
     Lost(DeliveryId),
 }
 
+/// Who a delivery was handed to.
+pub(crate) type Owner = SubKey<ConsumerId>;
+
+/// Events a queue's loop may have waiting from its delivery tasks.
+///
+/// A task that finds the channel full waits, which makes an outcome applied a
+/// moment later and never one lost; the loop never waits on anything a task
+/// holds. Two outcomes per delivery at most, so this is a few hundred
+/// deliveries' worth.
+const EVENT_BACKLOG: usize = 1024;
+
 /// One queue, its consumers, and the acceptor that feeds both.
-struct Served {
-    acceptor: Acceptor,
-    queue: Mutex<Queue>,
-    /// Two locks rather than one, and never held together across an `await`:
-    /// a delivery takes a message under one and a turn under the other, then
-    /// writes with neither held.
-    consumers: Mutex<Consumers>,
-    /// How a finished report reaches this queue's loop.
-    ///
-    /// Capacity is `max_unsettled`, which is the per-*subscription* bound, so
-    /// a queue with several consumers can fill it. That is deliberate and it
-    /// is harmless: the receiving end is the queue's own loop, which never
-    /// waits on anything a watcher holds, so a full channel makes a watcher
-    /// wait and nothing else — and a watcher that waits is a settlement
-    /// applied a moment later, never one lost. Sizing it by the bound rather
-    /// than by consumer count keeps the number an operator already sets the
-    /// only one there is.
-    settled: mpsc::Sender<Settlement>,
+pub(crate) struct Served {
+    pub(crate) acceptor: Acceptor,
+    /// Touched by the loop and by admission tasks, each for the length of one
+    /// synchronous step.
+    pub(crate) queue: Mutex<Queue<Owner>>,
+    /// Two locks rather than one, and never held across an `await`: a delivery
+    /// takes a message under one and a turn under the other, then writes with
+    /// neither held. Always taken in this order — queue, then consumers — so
+    /// two steps cannot deadlock against each other.
+    pub(crate) consumers: Mutex<Consumers<ConsumerId, Consumer>>,
+    /// How a finished write or report reaches this queue's loop.
+    pub(crate) events: mpsc::Sender<Event>,
     /// The other end, taken once by [`serve_queue`].
     ///
     /// It lives here rather than being passed in so that `Served` stays the
     /// one object a queue is, and it is an `Option` so that taking it is
     /// visibly once: a second serving task for one queue would be two writers
     /// to one order, which this file's whole design refuses.
-    settlements: Mutex<Option<mpsc::Receiver<Settlement>>>,
-    /// The bound, copied here so the delivery scan does not reach back into
-    /// the broker's configuration on every candidate.
-    max_unsettled: usize,
+    event_rx: Mutex<Option<mpsc::Receiver<Event>>>,
+    /// Rings when an admission put a message in the queue: the one change to
+    /// the queue the loop does not make itself, and the reason to look for a
+    /// delivery.
+    pub(crate) wake: Notify,
+    /// Admissions in flight, one permit each.
+    pub(crate) admissions: Arc<Semaphore>,
+    /// Cursor reports in flight, one permit each.
+    pub(crate) reports: Arc<Semaphore>,
+    /// See [`BrokerConfig::io_timeout`].
+    pub(crate) io_timeout: Duration,
 }
 
 struct Inner {
@@ -211,19 +274,25 @@ impl Broker {
         let mut queues = HashMap::with_capacity(config.queues.len());
         for path in &config.queues {
             let acceptor = listener.acceptor(path)?;
-            // The sender lives here so a watcher task can reach it; the
-            // receiver lives beside it and is taken once, by the one task
-            // allowed to touch this queue's state.
-            let (settled, settlements) = mpsc::channel(config.max_unsettled.max(1));
+            // The sender lives here so a task can reach it; the receiver lives
+            // beside it and is taken once, by the one task allowed to move
+            // this queue's delivery state.
+            let (events, event_rx) = mpsc::channel(EVENT_BACKLOG);
             queues.insert(
                 path.clone(),
                 Arc::new(Served {
                     acceptor,
                     queue: Mutex::new(Queue::new(config.queue_bytes)),
-                    consumers: Mutex::new(Consumers::default()),
-                    settled,
-                    settlements: Mutex::new(Some(settlements)),
-                    max_unsettled: config.max_unsettled,
+                    consumers: Mutex::new(Consumers::new(
+                        config.max_unsettled,
+                        config.max_unsettled_per_consumer,
+                    )),
+                    events,
+                    event_rx: Mutex::new(Some(event_rx)),
+                    wake: Notify::new(),
+                    admissions: Arc::new(Semaphore::new(config.max_inflight_admissions.max(1))),
+                    reports: Arc::new(Semaphore::new(MAX_REPORTS_IN_FLIGHT)),
+                    io_timeout: config.io_timeout,
                 }),
             );
         }
@@ -270,10 +339,13 @@ impl Broker {
     /// Serves every queue until the listener goes away.
     ///
     /// One task per queue, because a queue is a serialization point in any
-    /// case: it has one order and one budget, so admitting one message at a
-    /// time is the queue's own shape rather than a limitation. Backpressure is
-    /// the runtime's: a producer whose payload the broker has not started
-    /// reading is stalled by QUIC flow control, not queued in a second buffer.
+    /// case: it has one order of deliveries and one budget. That task never
+    /// waits on a peer — it starts producers' reads and consumers' writes in
+    /// tasks of their own and reacts to how they end — so a producer or a
+    /// consumer that stops answering costs itself and nobody else. Backpressure
+    /// is the budget's: a producer whose message does not fit is refused, and
+    /// so is one that arrives while the queue is already admitting as many as
+    /// it may.
     pub async fn serve(&self) {
         let mut tasks = JoinSet::new();
         // The path behind each task id. A `JoinError` carries the id of the
@@ -311,12 +383,20 @@ impl std::fmt::Debug for Broker {
     }
 }
 
-/// One queue's event loop: admission, subscriptions, credit, delivery, and
-/// the settlements its own deliveries report.
+/// One queue's event loop: subscriptions, credit, the start of admissions, and
+/// what its deliveries report.
 ///
-/// Everything the peer causes on this path arrives through one channel, so the
-/// loop needs no lock of its own between events and a delivery scan runs after
-/// whichever event could have made one possible.
+/// **Nothing in this loop waits on a peer.** Every arm either changes state
+/// under a lock held for one synchronous step or starts a task that will wait
+/// for it; an `.await` here is on the loop's own sources and nowhere else. That
+/// is what lets one producer that stops mid-message and one consumer that
+/// stops reading sit beside a healthy pair without the pair noticing: the
+/// admission or the write that is stuck is a task, bounded by a deadline, and
+/// the loop is already serving the next event.
+///
+/// Everything a consumer causes on this path arrives through one channel, so
+/// the loop needs no lock of its own between events and a delivery scan runs
+/// after whichever event could have made one possible.
 ///
 /// **The channel does not order the peer's intent.** It orders the *tasks*
 /// that reached it: every control frame rides its own unidirectional stream
@@ -327,588 +407,274 @@ impl std::fmt::Debug for Broker {
 /// is held rather than dropped ([`Consumers::grant`]) and why a subscription
 /// may arrive with credit already standing.
 ///
-/// **A settlement is an event of this loop and not a second writer.** A
-/// watcher task per outstanding delivery holds that delivery's cursors and
-/// sends one [`Settlement`] when the report resolves; the loop is what moves
-/// the queue's state, so "a queue is one order and one budget" survives the
-/// arrival of an outcome that nobody asked for. The two sources are selected
-/// rather than polled in turn, and `accept` returning an error ends the loop
-/// either way.
+/// **An outcome is an event of this loop and not a second writer.** A task per
+/// delivery writes it and a watcher holds its cursors; each sends an [`Event`]
+/// and the loop is what moves the queue's delivery state. The sources are
+/// selected rather than polled in turn, and `accept` returning an error ends
+/// the loop either way.
+///
+/// **A permit comes before the accept.** The loop reads the next stream off
+/// the transport only while it holds one of the queue's admission permits, and
+/// hands it to the admission task it starts. At the limit the loop stops
+/// reading — QUIC's flow control holds the producers back, with no message
+/// refused and none queued in a second buffer — until an admission finishes,
+/// and what an admission waits on is bounded by its deadline. Control frames
+/// share the channel, so they wait their turn behind streams while it lasts.
 async fn serve_queue(served: Arc<Served>) {
-    let mut settlements = served
-        .settlements
+    let mut events = served
+        .event_rx
         .lock()
-        .expect("settlement mutex poisoned")
+        .expect("event mutex poisoned")
         .take()
         .expect("a queue is served once");
+    let mut permit: Option<OwnedSemaphorePermit> = None;
     loop {
-        let event = tokio::select! {
-            accepted = served.acceptor.accept() => accepted,
+        let may_deliver = tokio::select! {
+            got = Arc::clone(&served.admissions).acquire_owned(), if permit.is_none() => {
+                match got {
+                    Ok(got) => {
+                        permit = Some(got);
+                        false
+                    }
+                    // A semaphore nothing closes: the arm exists so the loop
+                    // cannot spin if that ever stops being true.
+                    Err(_) => return,
+                }
+            },
+            accepted = served.acceptor.accept(), if permit.is_some() => match accepted {
+                Ok(incoming) => handle(&served, incoming, &mut permit),
+                Err(e) => {
+                    tracing::debug!(path = served.acceptor.path(), error = %e, "queue stopped serving");
+                    return;
+                }
+            },
             // `None` is unreachable while `served` lives, because `Served`
             // holds the sender: the arm exists so the loop cannot spin if
             // that ever stops being true.
-            settled = settlements.recv() => {
-                match settled {
-                    Some(settlement) => {
-                        apply(&served, settlement);
-                        pump(&served).await;
-                        continue;
-                    }
-                    None => return,
+            event = events.recv() => match event {
+                Some(event) => {
+                    apply(&served, event);
+                    true
                 }
-            }
+                None => return,
+            },
+            () = served.wake.notified() => true,
         };
-        match event {
-            Ok(Incoming::Exchange(request)) => {
-                admit_exchange(&served, request).await;
-                pump(&served).await;
-            }
-            Ok(Incoming::Stream(transfer)) => {
-                admit_transfer(&served, transfer).await;
-                pump(&served).await;
-            }
-            Ok(Incoming::Subscribed(consumer)) => {
-                tracing::debug!(
-                    path = served.acceptor.path(),
-                    filter = consumer.filter(),
-                    "a consumer subscribed"
-                );
-                let with_credit = served
-                    .consumers
-                    .lock()
-                    .expect("consumer mutex poisoned")
-                    .subscribe(consumer);
-                // Normally there is nothing to scan for: a fresh subscription
-                // has zero credit. The exception is a grant that overtook this
-                // SUBSCRIBE and was held for it — then this event is the one
-                // that made a delivery possible, and no later one would.
-                if with_credit {
-                    tracing::debug!(
-                        path = served.acceptor.path(),
-                        "a grant had arrived before its subscribe; delivering now"
-                    );
-                    pump(&served).await;
-                }
-            }
-            Ok(Incoming::Credit(grant)) => {
-                let raised = served
-                    .consumers
-                    .lock()
-                    .expect("consumer mutex poisoned")
-                    .grant(grant.id, &grant.filter, grant.limit);
-                if raised {
-                    pump(&served).await;
-                }
-            }
-            Ok(Incoming::Unsubscribed { id, filter }) => {
-                served
-                    .consumers
-                    .lock()
-                    .expect("consumer mutex poisoned")
-                    .remove(id, filter.as_deref());
-                // **The requeue of 0029 §4.6, and the only one there is.**
-                // A subscription that is gone reports nothing ever again, so
-                // whatever it held is the queue's again — that is the answer
-                // to a dead consumer, and it is why no timer exists: packet
-                // loss is QUIC's retransmission, a consumer that holds a
-                // delivery without reporting is bounded by `max_unsettled`,
-                // and this is the third case.
-                let requeued = served
-                    .queue
-                    .lock()
-                    .expect("queue mutex poisoned")
-                    .requeue_all(id, filter.as_deref());
-                if requeued > 0 {
-                    tracing::debug!(
-                        path = served.acceptor.path(),
-                        requeued,
-                        "a subscription went with deliveries outstanding"
-                    );
-                }
-                // A scan, because this event can be the one that unblocks the
-                // queue: the subscription that just left may be the consumer
-                // whose failed write ended the last round, and the messages it
-                // put back at the head are now some other consumer's to take.
-                pump(&served).await;
-            }
-            // A queue carries messages that must arrive, and a flow carries
-            // units that are worthless once late: the two do not mix, so the
-            // flow is refused rather than queued.
-            Ok(Incoming::Flow(flow)) => {
-                tracing::debug!(path = served.acceptor.path(), "refusing a datagram flow");
-                flow.refuse();
-            }
-            Err(e) => {
-                tracing::debug!(path = served.acceptor.path(), error = %e, "queue stopped serving");
-                return;
-            }
+        if may_deliver {
+            pump(&served);
         }
     }
 }
 
-/// Delivers as far as credit and messages allow.
+/// Reacts to one inbound thing, and says whether it can have made a delivery
+/// possible.
 ///
-/// One message to one consumer, each as a one-way transfer, until either the
-/// queue is empty or no matching subscription has credit left. That is the
-/// whole scheduling policy: a queue stops at the limit its consumers stated
-/// and resumes when one of them raises it
-/// ([0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
-/// §4.2).
-///
-/// **A failed write costs that consumer the rest of the round, and nobody
-/// else anything.** The message goes back to the head of the queue and the
-/// credit is given back, so retrying the same pairing immediately would spin
-/// on it forever. Abandoning the whole scan instead would strand every other
-/// message and every other consumer until some producer happened to admit
-/// another message, which on an idle queue is never. So the failing
-/// subscription is excluded for the remainder of this scan and the scan
-/// continues. The exclusion list is the termination argument: every
-/// iteration either delivers a message or removes one subscription from
-/// consideration, and both are finite.
-///
-/// **Serialized with admission, deliberately and at a cost.** A queue is one
-/// order and one budget, so its events are one loop; the cost is that a
-/// consumer whose flow-control window is full holds this queue's producers up
-/// while a write waits. Nothing here invents a timeout to paper over it: an
-/// unresponsive consumer costs its own `max_unsettled` slots and nothing
-/// else, which is the answer 0029 §4.6 settles on.
-///
-/// **A delivery is not a deletion.** Each one orders `Processed` on
-/// its own DATA header, keeps the cursors that come back, and hands the
-/// message to [`Queue::hold`] — still charged — with a watcher task on the
-/// report. The message leaves this queue only when a consumer says it may.
-async fn pump(served: &Served) {
-    // Empty in the ordinary case, so a round that delivers costs no
-    // allocation for the failures it does not have.
-    let mut failed: Vec<(ConsumerId, String)> = Vec::new();
-    loop {
-        let Some(next) = next_delivery(served, &failed) else {
-            return;
-        };
-        let (id, filter, consumer, mut message) = next;
-        let meta = TransferMeta {
-            content_type: message.content_type.clone(),
-            content_len: Some(message.body.len() as u64),
-            trace: message.trace,
-            topic: message.topic.clone(),
-            achieved: None,
-            ..TransferMeta::default()
+/// A producer's message does not: it is read in a task that takes the permit,
+/// and when it lands the task rings [`Served::wake`] — only then is there
+/// something to deliver. Anything else leaves the permit for the next accept.
+fn handle(
+    served: &Arc<Served>,
+    incoming: Incoming,
+    permit: &mut Option<OwnedSemaphorePermit>,
+) -> bool {
+    match incoming {
+        Incoming::Exchange(request) => {
+            let permit = permit.take().expect("an accept follows a permit");
+            admission::start_exchange(served, request, permit);
+            false
         }
-        // The order that makes settlement possible, and the only level this
-        // queue asks its consumer for: `Processed` is the consumer's own
-        // statement about its own hop (`GUARANTEES.md` §1).
-        .with_report([SETTLEMENT]);
-        match deliver(&consumer, meta, &message.body).await {
-            Ok(cursors) => {
-                // Counted here and not before the write, because this is the
-                // attempt: the bytes are out, a consumer has them, and a
-                // message in `unsettled` with `attempts == 1` is on its first
-                // delivery. A write that failed above never reached anybody
-                // and must not make the next delivery claim to be a repeat.
-                // The count is not on the wire yet; here it is state.
-                message.attempts += 1;
-                let delivery = served
-                    .queue
-                    .lock()
-                    .expect("queue mutex poisoned")
-                    .hold(message, id, &filter);
-                match cursors {
-                    Some(cursors) => watch(served, delivery, cursors),
-                    // No cursors means the header carried no report, which
-                    // cannot happen for a delivery this function built — but
-                    // a settlement that will never come would strand the
-                    // message and its slot, so the honest answer is to give
-                    // it back now rather than to hold it forever.
-                    None => {
-                        tracing::error!(
-                            path = served.acceptor.path(),
-                            "a delivery ordered a report and got no cursors; requeuing"
-                        );
-                        served
-                            .queue
-                            .lock()
-                            .expect("queue mutex poisoned")
-                            .requeue(delivery);
-                        failed.push((id, filter));
-                    }
-                }
-            }
-            Err(e) => {
-                // The write never landed: give the credit back, put the
-                // message where it was — at the head of the queue — and carry
-                // on without this consumer. Its subscription is removed for
-                // good by its own `Unsubscribed` event, which pumps again.
+        Incoming::Stream(transfer) => {
+            let permit = permit.take().expect("an accept follows a permit");
+            admission::start_stream(served, transfer, permit);
+            false
+        }
+        Incoming::Subscribed(consumer) => {
+            tracing::debug!(
+                path = served.acceptor.path(),
+                filter = consumer.filter(),
+                "a consumer subscribed"
+            );
+            let id = consumer.id();
+            let filter: Arc<str> = Arc::from(consumer.filter());
+            let overtaken = served
+                .consumers
+                .lock()
+                .expect("consumer mutex poisoned")
+                .subscribe(id, filter, consumer);
+            if overtaken {
                 tracing::debug!(
                     path = served.acceptor.path(),
-                    error = %e,
-                    "a delivery failed; requeuing the message and skipping the consumer"
+                    "a grant had arrived before its subscribe; delivering now"
                 );
-                served
-                    .consumers
-                    .lock()
-                    .expect("consumer mutex poisoned")
-                    .undo(id, &filter);
-                served
-                    .queue
-                    .lock()
-                    .expect("queue mutex poisoned")
-                    .push_front(message);
-                failed.push((id, filter));
             }
+            true
+        }
+        Incoming::Credit(grant) => {
+            served
+                .consumers
+                .lock()
+                .expect("consumer mutex poisoned")
+                .grant(grant.id, &grant.filter, grant.limit);
+            true
+        }
+        Incoming::Unsubscribed { id, filter } => {
+            served
+                .consumers
+                .lock()
+                .expect("consumer mutex poisoned")
+                .remove(id, filter.as_deref());
+            // **The requeue of 0029 §4.6, and the only one there is.**
+            // A subscription that is gone reports nothing ever again, so
+            // whatever it held is the queue's again — that is the answer
+            // to a dead consumer, and it is why no timer exists: packet
+            // loss is QUIC's retransmission, a consumer that holds a
+            // delivery without reporting is bounded by `max_unsettled`,
+            // and this is the third case.
+            let requeued = served
+                .queue
+                .lock()
+                .expect("queue mutex poisoned")
+                .requeue_all(|owner| {
+                    owner.id == id && filter.as_deref().is_none_or(|f| &*owner.filter == f)
+                });
+            if requeued > 0 {
+                tracing::debug!(
+                    path = served.acceptor.path(),
+                    requeued,
+                    "a subscription went with deliveries outstanding"
+                );
+            }
+            // A scan, because this event can be the one that unblocks the
+            // queue: the messages it put back at the head are now some other
+            // consumer's to take.
+            true
+        }
+        // A queue carries messages that must arrive, and a flow carries
+        // units that are worthless once late: the two do not mix, so the
+        // flow is refused rather than queued.
+        Incoming::Flow(flow) => {
+            tracing::debug!(path = served.acceptor.path(), "refusing a datagram flow");
+            flow.refuse();
+            false
         }
     }
 }
 
-/// The level a delivery orders and a settlement is.
-///
-/// One constant rather than a parameter: what a queue needs to know is that
-/// its consumer processed the message, and a queue that let an operator
-/// choose a different level would be letting them choose what "settled"
-/// means.
-const SETTLEMENT: CursorLevel = CursorLevel::Known(Acknowledgement::Processed);
-
-/// Writes one delivery and keeps the report it ordered.
-///
-/// [`weida::Consumer::deliver`] is the whole-payload convenience and it drops
-/// the cursors; this is the same three calls with the handle kept, which is
-/// the only reason it exists here rather than in `weida`.
-async fn deliver(
-    consumer: &weida::Consumer,
-    meta: TransferMeta,
-    body: &[u8],
-) -> Result<Option<Cursors>, Error> {
-    let mut transfer = consumer.open(meta).await?;
-    let cursors = transfer.cursors();
-    transfer.write_all(body).await?;
-    transfer.finish()?;
-    Ok(cursors)
-}
-
-/// Watches one delivery's report and tells the queue's loop how it ended.
-///
-/// One task per outstanding delivery, bounded by `max_unsettled` per
-/// subscription — the same shape a fan-out's writer and a survey's collector
-/// have. It holds no lock and touches no queue state: it reads cursors and
-/// sends one [`Settlement`], which is what keeps the queue's own state in one
-/// loop.
-///
-/// The wait is unbounded on purpose and bounded in fact: `changed` resolves
-/// with `None` when the reporter finishes, when the stream is reset **and**
-/// when the connection goes away, so a consumer that vanishes ends this task
-/// without a timer ([0029](https://github.com/tuco86/weida/blob/main/docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)
-/// §4.6).
-fn watch(served: &Served, delivery: DeliveryId, mut cursors: Cursors) {
-    let settled = served.settled.clone();
-    let path = served.acceptor.path().to_owned();
-    tokio::spawn(async move {
-        let outcome = loop {
-            match cursors.changed().await {
-                Some(set) if set.offset(SETTLEMENT).is_some() => {
-                    break Settlement::Settled(delivery);
-                }
-                // A level the delivery did not order, or an offset that moved
-                // on a level that is not this one: not a settlement, keep
-                // reading.
-                Some(_) => continue,
-                None => break Settlement::Lost(delivery),
-            }
-        };
-        // A closed channel means the queue stopped serving, which is the one
-        // case where nothing is owed to anybody.
-        if settled.send(outcome).await.is_err() {
-            tracing::debug!(%path, "a settlement arrived after its queue stopped");
-        }
-    });
-}
-
-/// Moves the queue's state for one settlement.
+/// Moves the queue's state for one outcome of a delivery.
 ///
 /// The only place `unsettled` shrinks, and it runs on the queue's own loop, so
 /// "one order, one budget" holds for an outcome nobody asked for as much as
-/// for an admission somebody did.
-fn apply(served: &Served, settlement: Settlement) {
+/// for an admission somebody did. An outcome for a delivery the queue no
+/// longer holds — its subscription was removed, which took the delivery back —
+/// finds nothing and changes nothing: whichever of the two arrives second is
+/// the stale one.
+fn apply(served: &Served, event: Event) {
     let mut queue = served.queue.lock().expect("queue mutex poisoned");
-    match settlement {
-        Settlement::Settled(delivery) => {
-            if queue.settle(delivery) {
+    let mut consumers = served.consumers.lock().expect("consumer mutex poisoned");
+    match event {
+        Event::Written(id) => {
+            if let Some(owner) = queue.written(id) {
+                consumers.written(owner, id);
+            }
+        }
+        Event::Settled(id) => {
+            if let Some(owner) = queue.settle(id) {
+                consumers.released(&owner, id);
                 tracing::debug!(path = served.acceptor.path(), "a delivery settled");
             }
         }
-        Settlement::Lost(delivery) => {
-            if queue.requeue(delivery) {
+        Event::Lost(id) => {
+            if let Some(owner) = queue.requeue(id) {
+                consumers.released(&owner, id);
                 tracing::debug!(
                     path = served.acceptor.path(),
                     "a report ended without a settlement; the message is the queue's again"
                 );
             }
         }
+        Event::Failed(id) => {
+            if let Some(owner) = queue.requeue(id) {
+                consumers.fail(&owner);
+                // The subscription is gone, so whatever else it held is the
+                // queue's again, as for an UNSUBSCRIBE: an entry that outlived
+                // its subscription would be charged to nobody's bound for as
+                // long as the connection stayed open.
+                let also = queue.requeue_all(|held| *held == owner);
+                tracing::debug!(
+                    path = served.acceptor.path(),
+                    also,
+                    "a delivery failed; the message is the queue's again and its consumer is dropped"
+                );
+            }
+        }
     }
 }
 
-/// Takes the first message some consumer may have, and that consumer's turn.
+/// Starts every delivery that credit and messages allow.
 ///
-/// Both locks are taken here and released before the caller writes, always in
-/// this order — queue, then consumers — so two queues cannot deadlock against
-/// each other. A message is taken **only** when a consumer for it exists: a
-/// queue with no credit keeps its messages, which is the point of a queue.
+/// One message to one consumer, each as a one-way transfer written by a task of
+/// its own, until either the queue has nothing a ready subscription selects or
+/// no subscription is ready. That is the whole scheduling policy: a queue
+/// stops at the limit its consumers stated and resumes when one of them
+/// raises it ([0003](https://github.com/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+/// §4.2).
 ///
-/// The credit pre-check is what keeps a filling queue linear. Without it, this
-/// scan asked every subscription about every held message after every
-/// admission — Θ(N²) eligible-set constructions for a queue nobody consumes,
-/// with N bounded only by `queue_bytes / PER_MESSAGE_OVERHEAD` and driven
-/// entirely by a remote producer. One pass over the subscriptions, bounded by
-/// `max_subscriptions`, answers the whole question in that case.
+/// Every iteration moves one message out of the line, so the loop ends. A
+/// delivery that later fails puts its message back and drops its subscription,
+/// and the event that says so runs this again: nobody is retried in a loop
+/// here, which is what the old per-scan exclusion list was for.
+fn pump(served: &Served) {
+    while let Some(dispatch) = take_next(served) {
+        delivery::spawn(served, dispatch);
+    }
+}
+
+/// Takes the first message some ready subscription may have, and that
+/// subscription's turn.
 ///
-/// **`max_unsettled` is enforced here, and it is the one place it can be.**
-/// A subscription with that many deliveries outstanding is not eligible, so a
-/// consumer that stops reporting stops being given messages — and the ones it
-/// already holds stay charged against the queue's budget until it reports or
-/// its subscription goes. The check is per subscription rather than per queue
-/// on purpose: one silent consumer must not starve the ones that answer.
-fn next_delivery(
-    served: &Served,
-    skip: &[(ConsumerId, String)],
-) -> Option<(ConsumerId, String, weida::Consumer, QueuedMessage)> {
+/// Both locks are taken here and released before anything is written, always
+/// in this order — queue, then consumers. A message is taken **only** when a
+/// consumer for it exists: a queue with no credit keeps its messages, which is
+/// the point of a queue.
+///
+/// **What this costs is bounded by what changed, not by what is queued.** With
+/// no ready subscription it is one comparison — however many messages wait
+/// and however many subscriptions are silent. With some, the scan starts where
+/// the last one stopped looking ([`Queue::scan_from`]), so an admission costs
+/// one message's worth of matching, and the whole line is walked again only
+/// when a subscription became ready or a message went back to the front. A
+/// consumer with a filter nothing queued selects, and a backlog nobody ready
+/// wants, were each a full pass per event.
+///
+/// **`max_unsettled` and `max_unsettled_per_consumer` are enforced by who is
+/// ready**, which is the one place they can be: a subscription at its bound is
+/// not in the set, so a consumer that stops reporting stops being given
+/// messages — and the ones it already holds stay charged against the queue's
+/// budget until it reports or its subscription goes.
+fn take_next(served: &Served) -> Option<Dispatch> {
     let mut queue = served.queue.lock().expect("queue mutex poisoned");
     let mut consumers = served.consumers.lock().expect("consumer mutex poisoned");
-    if !consumers.any_credit() {
+    if consumers.take_gained() {
+        queue.rescan();
+    }
+    if !consumers.any_ready() {
         return None;
     }
-    for index in 0..queue.len() {
+    for index in queue.scan_from()..queue.len() {
         // The topic is borrowed for exactly the length of the question, so a
         // scan that finds nothing allocates nothing.
-        let turn = {
-            let topic = queue.topic_at(index).expect("index is in range");
-            consumers.take_turn(topic, skip, &|id, filter| {
-                queue.unsettled_for(id, filter) < served.max_unsettled
-            })
-        };
-        let Some((id, filter, consumer)) = turn else {
+        let topic = queue.topic_at(index).expect("index is in range");
+        let Some(key) = consumers.pick(topic) else {
             continue;
         };
-        let message = queue.take(index).expect("index is in range");
-        return Some((id, filter, consumer, message));
+        let outgoing = queue
+            .dispatch(index, key.clone())
+            .expect("index is in range");
+        let consumer = consumers
+            .dispatch(&key, outgoing.id)
+            .expect("a picked subscription exists");
+        return Some(Dispatch { consumer, outgoing });
     }
+    queue.scanned();
     None
-}
-
-/// Admits a producer's exchange and confirms it, or refuses it on the reply
-/// half.
-///
-/// The confirm is the reply: DATA carrying the achieved level and a FIN, no
-/// payload. An exchange already has a reply half, so a publisher confirm needs
-/// no frame kind of its own — and the stream is the correlation, so the confirm
-/// names nothing (0018 §4.6).
-async fn admit_exchange(served: &Served, mut request: IncomingRequest) {
-    let Some(room) = room_for(served, request.meta()) else {
-        // Refused before a byte is read, which is what `Reject` backpressure
-        // means; `refuse` stops the request half too, so a producer still
-        // writing stops instead of filling a window nobody will read. The
-        // question is [`Queue::push`]'s own arithmetic asked in advance, so a
-        // message that fits the queue exactly is admitted with an empty
-        // payload rather than refused for having a read cap of zero.
-        request.refuse(ErrorCode::Rejected).await;
-        return;
-    };
-    let body = request.take_body();
-    // Taken before the payload is consumed: `reporter()` reads the order the
-    // producer put in its DATA header, and `read_message` consumes the
-    // transfer.
-    let reporter = body.reporter();
-    let queued = match read_message(body, request.meta(), room).await {
-        Ok(message) => message,
-        Err(ReadFailed::TooLarge) => {
-            request.refuse(ErrorCode::Rejected).await;
-            return;
-        }
-        Err(ReadFailed::Broken) => return,
-    };
-    let admitted_bytes = queued.body.len() as u64;
-    // The producer's trace, logged where it is still available: after the
-    // exchange ends nothing can reconstruct which trace a queued message
-    // belongs to, and a delivery continues it.
-    if let Some(trace) = queued.trace {
-        tracing::debug!(
-            path = served.acceptor.path(),
-            bytes = queued.body.len(),
-            trace_id = %trace.trace_id_hex(),
-            "admitted a message into a queue"
-        );
-    }
-    // The guard ends with this statement, on purpose: holding a `std::sync`
-    // lock across the confirm's `await` would make the whole loop `!Send` and,
-    // worse, hold a queue shut for a network write.
-    let admitted = served
-        .queue
-        .lock()
-        .expect("queue mutex poisoned")
-        .push(queued);
-    match admitted {
-        Ok(()) => {
-            // Both answers, and they say different things. The reply half is
-            // the application's channel and carries the confirm it always
-            // carried (DATA key `8`); the cursor is for a producer that
-            // ordered one, and a producer that ordered none pays nothing.
-            report_accepted(reporter, admitted_bytes);
-            confirm(request).await;
-        }
-        // A refusal reports **nothing**: the producer learns from the
-        // refusal, not from a missing cursor.
-        Err(Refusal::Full) => request.refuse(ErrorCode::Rejected).await,
-    }
-}
-
-/// Admits a one-way transfer, and reports a cursor if the producer ordered
-/// one.
-///
-/// This is the shape [0024](https://github.com/tuco86/weida/blob/main/docs/decisions/0024-three-families-one-back-channel.md)
-/// §4.4a exists for: a producer that orders `Accepted` gets a reliable verdict
-/// **on one unidirectional payload stream**, with no exchange and no reply
-/// half. A producer that orders nothing gets the transport receipt and nothing
-/// more — the honest spelling of `acks=0` (0018 §4.6). A refusal has
-/// nowhere to go on a unidirectional stream, so a queue with no room is a
-/// `STOP_SENDING(REJECTED)` — dropping the unread transfer — and no cursor.
-async fn admit_transfer(served: &Served, transfer: IncomingTransfer) {
-    let Some(room) = room_for(served, transfer.meta()) else {
-        // Dropping an unread payload is the refusal: the handle stops the
-        // stream with `REJECTED`, which is the only answer a unidirectional
-        // stream can carry.
-        drop(transfer);
-        return;
-    };
-    let meta = transfer.meta().clone();
-    let reporter = transfer.reporter();
-    let queued = match read_message(transfer, &meta, room).await {
-        Ok(message) => message,
-        Err(_) => return,
-    };
-    let admitted_bytes = queued.body.len() as u64;
-    if let Err(Refusal::Full) = served
-        .queue
-        .lock()
-        .expect("queue mutex poisoned")
-        .push(queued)
-    {
-        // Not a race: a queue's events are one loop, so no second admission
-        // ran between the room question and this push. What is left is the
-        // payload's own slack — [`QueuedMessage::charge`] counts the `Vec`'s
-        // allocation, and a payload read up to the cap may have reserved past
-        // it. The payload is already read, so there is no stream left to stop
-        // and **nothing is sent**: the producer that ordered a cursor sees it
-        // never arrive, which is the only answer a one-way stream has left
-        // once its FIN is in.
-        tracing::debug!(
-            path = served.acceptor.path(),
-            bytes = admitted_bytes,
-            "dropping a one-way message whose allocation overran the queue's budget"
-        );
-        return;
-    }
-    report_accepted(reporter, admitted_bytes);
-}
-
-/// How long a spawned report may wait for the producer's stream credit.
-///
-/// Not a correctness parameter: a cursor is best effort and nothing waits on
-/// it. It bounds how long a task may sit parked in `open_uni` for a peer that
-/// advertised `initial_max_streams_uni = 0` and never raised it — without it,
-/// one parked task per admitted message would be an allocation a remote
-/// producer drives and only shutdown releases.
-const REPORT_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Reports `Accepted` at the admitted body length, once, and FINs — in a task
-/// of its own.
-///
-/// `Accepted` is a **verdict rather than a prefix** (0023 §4.2): it is true of
-/// the whole message or of none of it, so there is exactly one record even in
-/// `Progress` mode and there is no granularity to configure. A level this
-/// broker cannot reach — `Stored`, with no store — is simply not reported, and
-/// the producer sees it missing rather than failed.
-///
-/// **The one thing in this loop that may be abandoned, and the one thing that
-/// must not be awaited in it.** `Reporter::report` opens the cursor stream
-/// lazily, and opening a stream blocks until the peer raises
-/// `max_concurrent_uni_streams`, with the deadline left to the caller. Awaited
-/// from [`serve_queue`] — the only driver of this queue — a single producer
-/// that orders `Accepted` and never raises its stream limit would park
-/// admission for every other producer and delivery for every consumer on the
-/// path, permanently. A cursor is best effort by construction and nothing
-/// waits on it, so it is the one thing here that may be handed to a task with
-/// a deadline and forgotten: losing it costs the producer a record it was
-/// never promised, while parking the loop costs everyone the queue.
-fn report_accepted(reporter: Option<Reporter>, bytes: u64) {
-    let Some(mut reporter) = reporter else {
-        return;
-    };
-    tokio::spawn(async move {
-        let report = async move {
-            let level = CursorLevel::Known(Achieved::Accepted.level());
-            if let Err(e) = reporter.report(level, bytes).await {
-                tracing::debug!(error = %e, "failed to report an accepted cursor");
-            }
-            if let Err(e) = reporter.finish().await {
-                tracing::debug!(error = %e, "failed to finish a cursor report");
-            }
-        };
-        let done = tokio::time::timeout(REPORT_DEADLINE, report).await;
-        if done.is_err() {
-            tracing::debug!("gave up on a cursor: the peer opened no stream for it");
-        }
-    });
-}
-
-/// Why a payload did not become a queued message.
-enum ReadFailed {
-    /// It exceeded the room the queue had; nothing was buffered past the cap.
-    TooLarge,
-    /// The peer or the connection failed mid-payload.
-    Broken,
-}
-
-/// Reads a payload under the queue's remaining budget.
-async fn read_message(
-    body: IncomingTransfer,
-    meta: &IncomingMeta,
-    room: usize,
-) -> Result<QueuedMessage, ReadFailed> {
-    let topic = meta.topic.clone();
-    let content_type = meta.content_type.clone();
-    let trace = meta.trace;
-    match body.collect(room).await {
-        Ok(body) => Ok(QueuedMessage {
-            body,
-            topic,
-            content_type,
-            attempts: 0,
-            trace,
-        }),
-        Err(Error::LimitExceeded) => Err(ReadFailed::TooLarge),
-        Err(e) => {
-            tracing::debug!(error = %e, "a producer's payload failed mid-read");
-            Err(ReadFailed::Broken)
-        }
-    }
-}
-
-/// The payload cap for the next message on this queue, or `None` when the
-/// queue has no room for a message at all.
-fn room_for(served: &Served, meta: &IncomingMeta) -> Option<usize> {
-    served
-        .queue
-        .lock()
-        .expect("queue mutex poisoned")
-        .room_for(meta)
-}
-
-/// Writes the confirm: the achieved level in the reply header, then FIN.
-async fn confirm(request: IncomingRequest) {
-    let meta = TransferMeta::default().with_achieved(Achieved::Accepted.level());
-    match request.reply(meta).await {
-        Ok(reply) => {
-            if let Err(e) = reply.finish() {
-                tracing::debug!(error = %e, "failed to finish a confirm");
-            }
-        }
-        Err(e) => tracing::debug!(error = %e, "failed to send a confirm"),
-    }
 }

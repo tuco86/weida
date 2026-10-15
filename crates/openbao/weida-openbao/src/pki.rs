@@ -4,7 +4,9 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use weida::{Identity, IdentitySource, Pem, Trust, TrustSource};
+use weida::{
+    Identity, IdentitySource, Pem, Trust, TrustSource, WeakIdentitySource, WeakTrustSource,
+};
 
 use crate::client::OpenBao;
 use crate::{Error, Result};
@@ -56,7 +58,7 @@ impl PkiSign {
     }
 
     /// Signs the key of `key_source` now, and keeps the returned source
-    /// renewed for as long as the client lives.
+    /// renewed until the application drops it.
     ///
     /// The returned source starts with the signed chain over that key. A
     /// renewal that fails is reported on its event stream as
@@ -68,10 +70,19 @@ impl PkiSign {
         client: OpenBao,
         key_source: &IdentitySource,
     ) -> Result<IdentitySource> {
+        // Local configuration, checked where it enters: a fraction that is not
+        // a number would otherwise reach the renewal task, which is the one
+        // place that must not fail.
+        if !self.renew_at.is_finite() {
+            return Err(Error::Config(format!(
+                "renew_at {} is not a fraction of the certificate's lifetime",
+                self.renew_at
+            )));
+        }
         let key = key_source.current().key;
         let (identity, expires) = self.sign(&client, &key).await?;
         let source = IdentitySource::external(identity)?;
-        let renewing = source.clone();
+        let renewing = source.downgrade();
         tokio::spawn(async move { self.renew_forever(client, key, renewing, expires).await });
         Ok(source)
     }
@@ -111,11 +122,18 @@ impl PkiSign {
             chain.push_str(ca.trim_end());
             chain.push('\n');
         }
+        // The server's number, so checked: a date past what `SystemTime` can
+        // hold would panic in the addition, and the task that renews the
+        // certificate must not be the one that dies of it.
         let expires = data
             .get("expiration")
             .and_then(Value::as_u64)
-            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
-            .ok_or_else(|| Error::Shape("no `data.expiration`".into()))?;
+            .ok_or_else(|| Error::Shape("no `data.expiration`".into()))
+            .and_then(|secs| {
+                UNIX_EPOCH
+                    .checked_add(Duration::from_secs(secs))
+                    .ok_or_else(|| Error::Shape("`data.expiration` is out of range".into()))
+            })?;
         let identity = Identity {
             cert_chain: Pem::Bytes(chain.into_bytes()),
             key: key.clone(),
@@ -123,11 +141,18 @@ impl PkiSign {
         Ok((identity, expires))
     }
 
+    /// Renews until the application drops the source it was given.
+    ///
+    /// The task holds the source weakly: a strong handle in a task that never
+    /// ends would be a source that never ends, and with it this client and the
+    /// key. It holds one only while a round is under way, and returns — and
+    /// drops the client and the key with it — the first time it wakes to find
+    /// nobody else does.
     async fn renew_forever(
         self,
         client: OpenBao,
         key: Pem,
-        source: IdentitySource,
+        source: WeakIdentitySource,
         mut expires: SystemTime,
     ) {
         let mut issued = SystemTime::now();
@@ -136,26 +161,38 @@ impl PkiSign {
                 .duration_since(issued)
                 .unwrap_or(Duration::from_secs(60));
             let renew_after = lifetime.mul_f64(self.renew_at.clamp(0.1, 0.95));
-            let due = issued + renew_after;
-            let wait = due
-                .duration_since(SystemTime::now())
-                .unwrap_or(Duration::ZERO)
-                .max(Duration::from_secs(1));
+            let wait = match issued.checked_add(renew_after) {
+                Some(due) => due
+                    .duration_since(SystemTime::now())
+                    .unwrap_or(Duration::ZERO),
+                // A certificate valid for longer than a clock can count: wait
+                // as long as the arithmetic says and no longer.
+                None => renew_after,
+            }
+            .max(Duration::from_secs(1));
             tokio::time::sleep(wait).await;
-            match self.sign(&client, &key).await {
-                Ok((identity, next)) => match source.update(identity) {
+            let Some(held) = source.upgrade() else {
+                return;
+            };
+            let retry = match self.sign(&client, &key).await {
+                Ok((identity, next)) => match held.update(identity) {
                     Ok(()) => {
                         issued = SystemTime::now();
                         expires = next;
+                        None
                     }
                     // The source reported it; retry after a fraction of what
                     // is left.
-                    Err(_) => tokio::time::sleep(retry_after(expires)).await,
+                    Err(_) => Some(retry_after(expires)),
                 },
                 Err(e) => {
-                    source.report_failure(e.to_string());
-                    tokio::time::sleep(retry_after(expires)).await;
+                    held.report_failure(e.to_string());
+                    Some(retry_after(expires))
                 }
+            };
+            drop(held);
+            if let Some(retry) = retry {
+                tokio::time::sleep(retry).await;
             }
         }
     }
@@ -172,13 +209,23 @@ fn retry_after(expires: SystemTime) -> Duration {
 
 /// A PEM certificate signing request over `key`, naming `names` and `ips`.
 fn csr_over(key: &Pem, names: &[String], ips: &[IpAddr]) -> Result<String> {
-    let key_pem = match key {
-        Pem::Bytes(bytes) => String::from_utf8(bytes.clone())
-            .map_err(|_| Error::Tls("the key is not UTF-8 PEM".into()))?,
-        Pem::File(path) => std::fs::read_to_string(path)
-            .map_err(|e| Error::Tls(format!("reading the key {}: {e}", path.display())))?,
+    // Borrowed when the key is in memory and wiped when it was read from a
+    // file: this function must not leave a second copy of a private key in
+    // memory for the allocator to hand to somebody else.
+    let read;
+    let key_pem: &str = match key {
+        Pem::Bytes(bytes) => {
+            std::str::from_utf8(bytes).map_err(|_| Error::Tls("the key is not UTF-8 PEM".into()))?
+        }
+        Pem::File(path) => {
+            read = zeroize::Zeroizing::new(
+                std::fs::read_to_string(path)
+                    .map_err(|e| Error::Tls(format!("reading the key {}: {e}", path.display())))?,
+            );
+            &read
+        }
     };
-    let key_pair = rcgen::KeyPair::from_pem(&key_pem)
+    let key_pair = rcgen::KeyPair::from_pem(key_pem)
         .map_err(|e| Error::Tls(format!("parsing the key for the CSR: {e}")))?;
     let mut sans: Vec<rcgen::SanType> = names
         .iter()
@@ -225,24 +272,28 @@ impl PkiAnchor {
         }
     }
 
-    /// Fetches the CA chain now and keeps the returned source refreshed for
-    /// as long as the client lives.
+    /// Fetches the CA chain now and keeps the returned source refreshed until
+    /// the application drops it.
     pub async fn start(self, client: OpenBao) -> Result<TrustSource> {
         let trust = self.fetch(&client).await?;
         let source = TrustSource::external(trust.clone());
-        let refreshing = source.clone();
+        let refreshing: WeakTrustSource = source.downgrade();
         tokio::spawn(async move {
             let mut last = trust;
             loop {
                 tokio::time::sleep(self.refresh).await;
+                // Weak, so that the task ends with the source it serves.
+                let Some(held) = refreshing.upgrade() else {
+                    return;
+                };
                 match self.fetch(&client).await {
                     Ok(trust) => {
                         if last != trust {
-                            refreshing.update(trust.clone());
+                            held.update(trust.clone());
                             last = trust;
                         }
                     }
-                    Err(e) => refreshing.report_failure(e.to_string()),
+                    Err(e) => held.report_failure(e.to_string()),
                 }
             }
         });

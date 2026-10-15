@@ -239,11 +239,15 @@ impl Drop for Impersonation {
         // SAFETY: no preconditions.
         if unsafe { RevertToSelf() } == 0 {
             // A thread that cannot drop the client's identity must not go on
-            // to run anything else as that identity.
-            panic!(
+            // to run anything else as that identity. A panic would not stop
+            // it: whatever runs the task catches the unwinding and the thread
+            // — a runtime worker — carries on with the client's token still
+            // attached. Only ending the process does.
+            eprintln!(
                 "RevertToSelf failed after ImpersonateNamedPipeClient: {}",
                 io::Error::last_os_error()
             );
+            std::process::abort();
         }
     }
 }

@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::client::OpenBao;
+use crate::secret::Secret;
 use crate::{Error, Result};
 
 /// What a login returned about the token it produced.
@@ -59,19 +61,24 @@ impl TokenInfo {
         })
     }
 
-    /// The token itself, from the same object.
-    fn client_token(answer: &Value) -> Result<String> {
-        answer
-            .get("auth")
-            .and_then(|a| a.get("client_token"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| Error::Shape("no `auth.client_token`".into()))
+    /// The token itself, **moved out** of the answer: a copy would leave the
+    /// original behind in a tree that is not wiped when it is dropped.
+    fn take_client_token(answer: &mut Value) -> Result<Secret> {
+        match answer
+            .get_mut("auth")
+            .and_then(|a| a.get_mut("client_token"))
+        {
+            Some(Value::String(token)) => Ok(Secret::from(std::mem::take(token))),
+            _ => Err(Error::Shape("no `auth.client_token`".into())),
+        }
     }
 }
 
 /// Where a hand-off's wrapping token is read from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its `Debug` hides a token held in memory, and it is not comparable: see
+/// [`Secret`].
+#[derive(Clone)]
 pub enum HandoffSource {
     /// A file, typically one systemd's `SetCredential=` or `LoadCredential=`
     /// placed under `$CREDENTIALS_DIRECTORY`.
@@ -81,13 +88,23 @@ pub enum HandoffSource {
     /// The token itself, already in memory. For a caller that received it
     /// some other way; nothing here reads the environment, because an
     /// environment variable is readable by every process of the uid.
-    Token(String),
+    Token(Secret),
+}
+
+impl std::fmt::Debug for HandoffSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandoffSource::File(path) => f.debug_tuple("File").field(path).finish(),
+            HandoffSource::Credential(name) => f.debug_tuple("Credential").field(name).finish(),
+            HandoffSource::Token(_) => f.write_str("Token(<redacted>)"),
+        }
+    }
 }
 
 impl HandoffSource {
-    fn read(&self) -> Result<String> {
+    fn read(&self) -> Result<Secret> {
         let path = match self {
-            HandoffSource::Token(token) => return Ok(token.trim().to_owned()),
+            HandoffSource::Token(token) => return Ok(Secret::from(token.expose().trim())),
             HandoffSource::File(path) => path.clone(),
             HandoffSource::Credential(name) => {
                 let dir = std::env::var_os("CREDENTIALS_DIRECTORY").ok_or_else(|| {
@@ -99,27 +116,32 @@ impl HandoffSource {
             }
         };
         let token = std::fs::read_to_string(&path)
+            .map(Zeroizing::new)
             .map_err(|e| Error::Credential(format!("{}: {e}", path.display())))?;
         let token = token.trim();
         if token.is_empty() {
             return Err(Error::Credential(format!("{}: empty", path.display())));
         }
-        Ok(token.to_owned())
+        Ok(Secret::from(token))
     }
 }
 
 /// How the client proves who it is.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its `Debug` hides every credential and it is not comparable: a secret that
+/// can be printed or `==`-compared ends up in a log or behind a timing
+/// difference. See [`Secret`].
+#[derive(Clone)]
 pub enum Auth {
     /// A token the process was given: `BAO_TOKEN`, a dev root, a token the
     /// operator issued. Looked up once so the client knows its TTL.
-    Token(String),
+    Token(Secret),
     /// AppRole: `auth/approle/login` with a role id and a secret id.
     AppRole {
         /// The role id.
         role_id: String,
         /// The secret id — itself often delivered wrapped.
-        secret_id: String,
+        secret_id: Secret,
         /// The mount, `approle` by default.
         mount: String,
     },
@@ -130,9 +152,24 @@ pub enum Auth {
     Handoff(HandoffSource),
 }
 
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::Token(_) => f.write_str("Token(<redacted>)"),
+            Auth::AppRole { role_id, mount, .. } => f
+                .debug_struct("AppRole")
+                .field("role_id", role_id)
+                .field("secret_id", &"<redacted>")
+                .field("mount", mount)
+                .finish(),
+            Auth::Handoff(source) => f.debug_tuple("Handoff").field(source).finish(),
+        }
+    }
+}
+
 impl Auth {
     /// AppRole on the default mount.
-    pub fn approle(role_id: impl Into<String>, secret_id: impl Into<String>) -> Auth {
+    pub fn approle(role_id: impl Into<String>, secret_id: impl Into<Secret>) -> Auth {
         Auth::AppRole {
             role_id: role_id.into(),
             secret_id: secret_id.into(),
@@ -145,7 +182,7 @@ impl Auth {
         Auth::Handoff(HandoffSource::Credential(name.into()))
     }
 
-    pub(crate) async fn login(self, client: &OpenBao) -> Result<(String, TokenInfo)> {
+    pub(crate) async fn login(self, client: &OpenBao) -> Result<(Secret, TokenInfo)> {
         match self {
             Auth::Token(token) => {
                 let probe = client.clone();
@@ -161,24 +198,20 @@ impl Auth {
                 secret_id,
                 mount,
             } => {
-                let answer = client
+                let mut answer = client
                     .post_anonymous(
                         &format!("auth/{mount}/login"),
-                        json!({ "role_id": role_id, "secret_id": secret_id }),
+                        json!({ "role_id": role_id, "secret_id": secret_id.expose() }),
                     )
                     .await?;
-                Ok((
-                    TokenInfo::client_token(&answer)?,
-                    TokenInfo::from_auth(&answer)?,
-                ))
+                let info = TokenInfo::from_auth(&answer)?;
+                Ok((TokenInfo::take_client_token(&mut answer)?, info))
             }
             Auth::Handoff(source) => {
                 let wrapping = source.read()?;
-                let answer = client.unwrap(&wrapping).await?;
-                Ok((
-                    TokenInfo::client_token(&answer)?,
-                    TokenInfo::from_auth(&answer)?,
-                ))
+                let mut answer = client.unwrap(wrapping.expose()).await?;
+                let info = TokenInfo::from_auth(&answer)?;
+                Ok((TokenInfo::take_client_token(&mut answer)?, info))
             }
         }
     }
@@ -193,5 +226,32 @@ impl TokenInfo {
             renewable: false,
             policies: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_credential_survives_a_debug_print() {
+        let approle = Auth::approle("role-1", "approle-secret-id");
+        let token = Auth::Token("tok-s3cret".into());
+        let source = HandoffSource::Token("wrap-s3cret".into());
+        let handoff = Auth::Handoff(source.clone());
+        for printed in [
+            format!("{approle:?}"),
+            format!("{approle:#?}"),
+            format!("{token:?}"),
+            format!("{source:?}"),
+            format!("{handoff:#?}"),
+        ] {
+            assert!(
+                !printed.contains("approle-secret-id") && !printed.contains("s3cret"),
+                "{printed}"
+            );
+        }
+        // What is not a secret is still said: a log line has to name the role.
+        assert!(format!("{approle:?}").contains("role-1"));
     }
 }

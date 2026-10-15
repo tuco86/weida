@@ -7,18 +7,20 @@
 //! peer that will not answer refuses the exchange with a typed error instead.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use openraft::error::{
     Fatal, NetworkError, PayloadTooLarge, RPCError, RaftError, ReplicationClosed, StreamingError,
     Timeout, Unreachable,
 };
+use openraft::metrics::RaftMetrics;
 use openraft::network::{RPCOption, RPCTypes, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::{LogId, OptionalSend, Snapshot, Vote};
+use tokio::sync::watch;
 use weida::{ClientTls, Requester, Runtime, TransferMeta};
 
 use crate::codec::{self, Rpc};
@@ -64,6 +66,9 @@ struct NetworkInner {
     tls: ClientTls,
     config: Arc<ConsensusConfig>,
     targets: Mutex<HashMap<NodeId, Arc<Target>>>,
+    /// The engine's metrics, once the engine exists: what says which nodes the
+    /// group still lists, and so which dialled targets are still wanted.
+    metrics: OnceLock<watch::Receiver<RaftMetrics<NodeId, Node>>>,
 }
 
 /// One peer, dialled at one URL.
@@ -90,8 +95,16 @@ impl Network {
                 tls,
                 config,
                 targets: Mutex::new(HashMap::new()),
+                metrics: OnceLock::new(),
             }),
         }
+    }
+
+    /// Hands the network the engine's metrics, which the engine's own
+    /// construction needs a network to produce.
+    pub(crate) fn attach(&self, metrics: watch::Receiver<RaftMetrics<NodeId, Node>>) {
+        // Set once: the engine is built once.
+        let _ = self.inner.metrics.set(metrics);
     }
 
     /// The requester toward `id` at `node`, built on first use and rebuilt
@@ -111,6 +124,22 @@ impl Network {
             && target.url == node.url
         {
             return Ok(Arc::clone(target));
+        }
+        // Making a target is the one moment the map grows, so it is the moment
+        // to drop what the group no longer lists: a learner that came and went
+        // would otherwise leave a requester and its connection behind for the
+        // life of the process, and how many nodes a group has ever listed is
+        // not bounded by how many it lists.
+        if let Some(metrics) = self.inner.metrics.get() {
+            let metrics = metrics.borrow();
+            let membership = metrics.membership_config.membership();
+            targets.retain(|other, old| {
+                let wanted = *other == id || membership.get_node(other).is_some();
+                if !wanted {
+                    old.requester.disconnect(&old.url);
+                }
+                wanted
+            });
         }
         let target = Arc::new(Target {
             url: node.url.clone(),
