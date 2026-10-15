@@ -3637,9 +3637,7 @@ version = "0.1.0-alpha.7-dev"
 name = "weida-amqp-py"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
- "futures",
  "pyo3",
- "tokio",
  "weida-amqp",
  "weida-amqp-codec",
  "weida-py-core",
@@ -3683,9 +3681,9 @@ name = "weida-mqtt-py"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
  "pyo3",
- "tokio",
  "weida-mqtt",
  "weida-py-core",
+ "weida-runtime",
 ]
 
 [[package]]
@@ -3715,7 +3713,6 @@ version = "0.1.0-alpha.7-dev"
 dependencies = [
  "futures",
  "pyo3",
- "tokio",
  "weida-nats",
  "weida-py-core",
  "weida-runtime",
@@ -3794,6 +3791,7 @@ name = "weida-py-core"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
  "criterion",
+ "futures",
  "pyo3",
  "weida-runtime",
 ]

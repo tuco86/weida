@@ -44,10 +44,9 @@ weida-mqtt = { path = "../weida-mqtt", version = "0.1.0-alpha.7-dev", default-fe
     # second implementation of any protocol behaviour (0013 §4.4 item 3).
     "blocking",
 ] }
-# One thing: `tokio::sync::Mutex`, which is what lets the delivery stream —
-# whose `next` takes `&mut self` — be shared between coroutines without ever
-# being used by two at once.
-tokio.workspace = true
+# The reactor the synchronous surface's waits run on: `Exec::within` is its
+# deadline and `interruptible` enters it for the wait.
+weida-runtime.workspace = true
 
 [features]
 # Off by default, and enabled by maturin through `pyproject.toml`. With it on,

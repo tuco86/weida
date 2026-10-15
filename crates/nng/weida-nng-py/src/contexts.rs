@@ -65,6 +65,14 @@ macro_rules! python_context {
             /// Receives this context's message, bounded by the socket's
             /// receive timeout — and, for a surveyor, by the deadline its
             /// own send started.
+            ///
+            /// A message this receive had taken when the task was cancelled
+            /// is dropped, not handed back. It is a reply, request or survey
+            /// response, and it belongs to the transaction whose state this
+            /// receive has already advanced; re-delivering it later would
+            /// pair it with the wrong state. The loss is the protocol's own
+            /// at-most-once delivery, recovered by the resend timer of REQ
+            /// or the survey deadline.
             fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
                 let context = Arc::clone(&self.context);
                 self.bridge.awaitable(py, async move {

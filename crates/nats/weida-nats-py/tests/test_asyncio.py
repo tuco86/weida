@@ -20,6 +20,7 @@ Nothing here needs a `nats-server`; `test_interop.py` is the one that does.
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -493,5 +494,69 @@ def test_the_connection_ends_when_the_server_goes_away(server):
         # Nothing further can be sent on it, and saying so is not a hang.
         with pytest.raises(weida_nats.NatsError):
             await nats.publish("orders.a", b"late")
+
+    run(exchange())
+
+# --------------------------------------------------------------------------
+# A receive cancelled after its message was taken keeps that message
+
+
+def test_a_message_taken_by_a_cancelled_next_is_not_lost(server):
+    async def exchange():
+        nats = await connected(server)
+        orders = await nats.subscribe("orders.created")
+        task = asyncio.ensure_future(orders.next())
+        await asyncio.sleep(0.05)
+        # One synchronous stretch: the cancel is requested while the loop
+        # thread is blocked, so the reactor takes the message and the delivery
+        # thread queues its completion before the loop runs the cancellation.
+        task.cancel()
+        server.send_msg("orders.created", orders.sid(), b"kept")
+        time.sleep(0.1)
+        await asyncio.sleep(0.05)
+        message = await asyncio.wait_for(orders.next(), 2)
+        assert message.payload == b"kept"
+        await nats.close()
+
+    run(exchange())
+
+
+# --------------------------------------------------------------------------
+# Bytes are converted once per message, and bounds are configuration errors
+
+
+def test_message_bytes_are_one_object_per_message(server):
+    async def exchange():
+        nats = await connected(server)
+        orders = await nats.subscribe("orders.created")
+        await nats.publish("orders.created", b"one")
+        message = await orders.next()
+        assert message.payload is message.payload
+        assert message.subject is message.subject
+        assert message.payload == b"one"
+        await nats.close()
+
+    run(exchange())
+
+
+@pytest.mark.parametrize("window", [1e30, -1.0, float("nan")])
+def test_a_bad_window_is_a_configuration_error(server, window):
+    async def exchange():
+        nats = await connected(server)
+        with pytest.raises(weida_nats.Configuration):
+            await nats.request("service.echo", b"", window)
+        await nats.close()
+
+    run(exchange())
+
+
+def test_an_unbounded_queue_is_a_configuration_error(server):
+    async def exchange():
+        with pytest.raises(weida_nats.Configuration):
+            await connected(server, subscription_queue=2**62)
+        nats = await connected(server)
+        with pytest.raises(weida_nats.Configuration):
+            await nats.request_many("service.echo", b"", 0.1, 2**62)
+        await nats.close()
 
     run(exchange())

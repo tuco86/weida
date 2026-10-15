@@ -45,31 +45,18 @@
 //! program — one thread per link — would run one link at a time.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use weida_amqp::session::SessionOptions;
 use weida_amqp::{Connection, Error, Link, Session};
-use weida_py_core::Bridge;
+use weida_py_core::{Bridge, Slot, duration};
 use weida_runtime::OwnedReactor;
 
-use crate::connection::{open, options_from};
+use crate::connection::{drive, open, options_from};
 use crate::errors;
-use crate::lease::Slot;
-use crate::values::{Outgoing, PyDelivery, PyOutcome, message_from, outcome_of};
-
-/// Runs `future` on the reactor and waits for it here, GIL released.
-fn drive<F, T>(py: Python<'_>, bridge: &Bridge, future: F) -> T
-where
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let handle = bridge.exec().spawn(future);
-    py.detach(move || {
-        futures::executor::block_on(handle).expect("the library's future does not panic")
-    })
-}
+use crate::link::{Taken, next_of};
+use crate::values::{Octets, Outgoing, PyDelivery, PyOutcome, message_from, outcome_of};
 
 /// `weida_amqp.sync.Connection`.
 #[pyclass(frozen, name = "Connection", module = "weida_amqp.sync")]
@@ -101,12 +88,9 @@ impl SyncConnection {
             options.handle_max = handles;
         }
         let connection = self.inner.clone();
-        let begun = drive(
-            py,
-            &self.bridge,
-            async move { connection.begin(options).await },
-        );
-        let session = errors::raise(py, begun)?;
+        let session = drive(py, self.bridge.exec(), async move {
+            connection.begin(options).await
+        })?;
         Ok(SyncSession {
             inner: Slot::new(session),
             bridge: self.bridge.clone(),
@@ -132,8 +116,11 @@ impl SyncConnection {
     /// Closes the connection. Idempotent.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let connection = self.inner.clone();
-        let closed = drive(py, &self.bridge, async move { connection.close().await });
-        errors::raise(py, closed)
+        drive(
+            py,
+            self.bridge.exec(),
+            async move { connection.close().await },
+        )
     }
 }
 
@@ -184,10 +171,9 @@ impl SyncSession {
             false,
         )?;
         let slot = Arc::clone(&self.inner);
-        let attached = drive(py, &self.bridge, async move {
+        let link = drive(py, self.bridge.exec(), async move {
             slot.acquire().await.attach(options).await
-        });
-        let link = errors::raise(py, attached)?;
+        })?;
         Ok(SyncLink {
             inner: Slot::new(link),
             bridge: self.bridge.clone(),
@@ -199,28 +185,24 @@ impl SyncSession {
     #[pyo3(signature = (*, echo=false))]
     fn flow(&self, py: Python<'_>, echo: bool) -> PyResult<()> {
         let slot = Arc::clone(&self.inner);
-        let flowed = drive(py, &self.bridge, async move {
+        drive(py, self.bridge.exec(), async move {
             slot.acquire().await.flow(echo).await
-        });
-        errors::raise(py, flowed)
+        })
     }
 
     /// Ends the session. Idempotent.
     fn end(&self, py: Python<'_>) -> PyResult<()> {
         let slot = Arc::clone(&self.inner);
-        let ended = drive(
-            py,
-            &self.bridge,
-            async move { slot.acquire().await.end().await },
-        );
-        errors::raise(py, ended)
+        drive(py, self.bridge.exec(), async move {
+            slot.acquire().await.end().await
+        })
     }
 }
 
 /// `weida_amqp.sync.Link`.
 #[pyclass(frozen, name = "Link", module = "weida_amqp.sync")]
 pub struct SyncLink {
-    inner: Arc<Slot<Link>>,
+    inner: Arc<Slot<Link, Taken>>,
     bridge: Bridge,
     #[allow(
         dead_code,
@@ -245,16 +227,12 @@ impl SyncLink {
         text: bool,
         durable: bool,
     ) -> PyResult<Option<PyOutcome>> {
-        let payload = if text {
-            body.extract::<String>()?.into_bytes()
-        } else {
-            weida_py_core::payload_of(body)?
-        };
+        let octets = Octets::of(body, text)?;
         let encoded = {
             let message = message_from(
                 py,
                 &Outgoing {
-                    body: &payload,
+                    body: octets.as_slice(),
                     text,
                     durable,
                     ..Outgoing::default()
@@ -263,7 +241,7 @@ impl SyncLink {
             errors::raise(py, message.to_vec().map_err(Error::Encode))?
         };
         let slot = Arc::clone(&self.inner);
-        let outcome = drive(py, &self.bridge, async move {
+        let outcome = drive(py, self.bridge.exec(), async move {
             let mut link = slot.acquire().await;
             let sent = link.send_payload(&encoded).await?;
             if sent.settled {
@@ -271,26 +249,24 @@ impl SyncLink {
                 return Ok(None);
             }
             link.settled(sent.delivery_id).await.map(Some)
-        });
-        Ok(errors::raise(py, outcome)?.map(PyOutcome::of))
+        })?;
+        Ok(outcome.map(PyOutcome::of))
     }
 
     /// Grants credit for `credit` more messages. Sets rather than adds.
     fn grant_credit(&self, py: Python<'_>, credit: u32) -> PyResult<()> {
         let slot = Arc::clone(&self.inner);
-        let granted = drive(py, &self.bridge, async move {
+        drive(py, self.bridge.exec(), async move {
             slot.acquire().await.grant_credit(credit).await
-        });
-        errors::raise(py, granted)
+        })
     }
 
     /// Drains the link: the sender consumes the remaining credit and reports.
     fn drain(&self, py: Python<'_>) -> PyResult<()> {
         let slot = Arc::clone(&self.inner);
-        let drained = drive(py, &self.bridge, async move {
+        drive(py, self.bridge.exec(), async move {
             slot.acquire().await.drain().await
-        });
-        errors::raise(py, drained)
+        })
     }
 
     /// The next delivery, waiting at most `timeout` seconds.
@@ -302,19 +278,22 @@ impl SyncLink {
     /// inventing one in the library would be inventing protocol behaviour.
     #[pyo3(signature = (timeout=None))]
     fn next_delivery(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<PyDelivery>> {
+        let limit = timeout
+            .map(|seconds| duration("timeout", seconds))
+            .transpose()
+            .map_err(|error| errors::configuration(py, error.to_string()))?;
         let slot = Arc::clone(&self.inner);
-        let limit = timeout.map(|seconds| Duration::from_secs_f64(seconds.max(0.0)));
-        let delivery = drive(py, &self.bridge, async move {
+        let exec = self.bridge.exec().clone();
+        let delivery = drive(py, self.bridge.exec(), async move {
             let mut link = slot.acquire().await;
             match limit {
-                None => link.next_delivery().await,
-                // The timer runs on the reactor, which is where this future
-                // is spawned — see the module doc.
-                Some(limit) => tokio::time::timeout(limit, link.next_delivery())
-                    .await
-                    .unwrap_or(None),
+                None => Ok(next_of(&mut link).await),
+                // A bound that elapses leaves the link usable: the receive is
+                // dropped at its await point, and AMQP has no receive deadline
+                // for the library to keep.
+                Some(limit) => Ok(exec.within(limit, next_of(&mut link)).await.flatten()),
             }
-        });
+        })?;
         Ok(delivery.map(PyDelivery::of))
     }
 
@@ -364,11 +343,9 @@ impl SyncLink {
     /// The credit state, as a dict.
     fn credit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let slot = Arc::clone(&self.inner);
-        let credit = drive(
-            py,
-            &self.bridge,
-            async move { slot.acquire().await.credit() },
-        );
+        let credit = drive(py, self.bridge.exec(), async move {
+            Ok::<_, Error>(slot.acquire().await.credit())
+        })?;
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("delivery_count", credit.delivery_count())?;
         dict.set_item("link_credit", credit.link_credit())?;
@@ -380,10 +357,9 @@ impl SyncLink {
     /// Detaches the link. Idempotent.
     fn detach(&self, py: Python<'_>) -> PyResult<()> {
         let slot = Arc::clone(&self.inner);
-        let detached = drive(py, &self.bridge, async move {
+        drive(py, self.bridge.exec(), async move {
             slot.acquire().await.detach().await
-        });
-        errors::raise(py, detached)
+        })
     }
 }
 
@@ -405,10 +381,9 @@ impl SyncLink {
             None,
         )?;
         let slot = Arc::clone(&self.inner);
-        let settled = drive(py, &self.bridge, async move {
+        drive(py, self.bridge.exec(), async move {
             slot.acquire().await.settle(first, last, &outcome).await
-        });
-        errors::raise(py, settled)
+        })
     }
 }
 
@@ -460,11 +435,7 @@ fn connect(
         sasl_anonymous,
         handshake_timeout,
     )?;
-    let host = host.to_owned();
-    // The connect runs with the GIL released; the failure becomes an exception
-    // afterwards, because building one needs the GIL back.
-    let opened = py.detach(move || open(worker_threads, &host, port, options));
-    let (inner, _exec, reactor) = errors::raise(py, opened)?;
+    let (inner, _exec, reactor) = open(py, worker_threads, host, port, options)?;
     let bridge = Bridge::new(inner.exec().clone(), errors::to_py);
     Ok(SyncConnection {
         inner,

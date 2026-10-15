@@ -109,11 +109,11 @@ impl SyncContext {
     /// open ones. Returns how many were still open when it ran out.
     ///
     /// The GIL is released while waiting, as everywhere else here.
-    fn shutdown(&self, py: Python<'_>) -> usize {
-        let context = self.inner.context().clone();
-        let blocking = self.inner.clone();
-        py.detach(|| blocking.drive(context.shutdown()))
-            .outstanding()
+    fn shutdown(&self, py: Python<'_>) -> PyResult<usize> {
+        let closed = weida_py_core::interruptible(py, self.inner.context().exec(), || {
+            self.inner.context().clone().shutdown()
+        })?;
+        Ok(closed.outstanding())
     }
 
     fn __repr__(&self) -> String {
@@ -143,7 +143,9 @@ macro_rules! sync_socket {
             /// is released while waiting.
             fn send(&self, py: Python<'_>, body: &Bound<'_, PyAny>) -> PyResult<()> {
                 let body = weida_py_core::payload_of(body)?;
-                let sent = py.detach(|| self.socket.send(body));
+                let sent = weida_py_core::interruptible(py, self.blocking.context().exec(), || {
+                    self.socket.socket().send(body)
+                })?;
                 raise(py, sent)
             }
         }, [$($rest)*]);
@@ -187,7 +189,9 @@ macro_rules! sync_socket {
             /// Bounded by the socket's `recv_timeout`; the expiry is
             /// `ETIMEDOUT`. The GIL is released while waiting.
             fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-                let received = py.detach(|| self.socket.recv());
+                let received = weida_py_core::interruptible(py, self.blocking.context().exec(), || {
+                    self.socket.socket().recv()
+                })?;
                 let message = raise(py, received)?;
                 Ok(weida_py_core::py_bytes(py, message.body()))
             }
@@ -244,7 +248,8 @@ macro_rules! sync_socket {
             /// thread each.
             fn context(&self) -> $context {
                 $context {
-                    context: self.socket.context_of(),
+                context: self.socket.context_of(),
+                blocking: self.blocking.clone(),
                 }
             }
         }, [$($rest)*]);
@@ -256,6 +261,7 @@ macro_rules! sync_socket {
         #[pyclass(frozen, name = $python, module = "weida_nng.sync")]
         pub struct $class {
             socket: weida_nng::blocking::$rust,
+            blocking: BlockingContext,
         }
 
         #[pymethods]
@@ -284,7 +290,10 @@ macro_rules! sync_socket {
                         ),
                     )?;
                 }
-                Ok($class { socket })
+                Ok($class {
+                    socket,
+                    blocking: context.inner().clone(),
+                })
             }
 
             /// The SP protocol this socket speaks, as NNG names it.
@@ -296,7 +305,9 @@ macro_rules! sync_socket {
             /// `nng_dial()`: blocks until the peer's protocol header has
             /// arrived, bounded by the handshake timeout.
             fn dial(&self, py: Python<'_>, url: &str) -> PyResult<String> {
-                let dialled = py.detach(|| self.socket.dial(url));
+                let dialled = weida_py_core::interruptible(py, self.blocking.context().exec(), || {
+                    self.socket.socket().dial(url)
+                })?;
                 raise(py, dialled).map(|dialer| dialer.url().to_string())
             }
 
@@ -308,7 +319,9 @@ macro_rules! sync_socket {
 
             /// `nng_listen()`: returns the endpoint actually bound.
             fn listen(&self, py: Python<'_>, url: &str) -> PyResult<String> {
-                let listening = py.detach(|| self.socket.listen(url));
+                let listening = weida_py_core::interruptible(py, self.blocking.context().exec(), || {
+                    self.socket.socket().listen(url)
+                })?;
                 raise(py, listening).map(|listener| listener.url().to_string())
             }
 
@@ -342,6 +355,7 @@ macro_rules! sync_context {
         #[pyclass(frozen, name = $python, module = "weida_nng.sync")]
         pub struct $class {
             context: weida_nng::blocking::$rust,
+            blocking: BlockingContext,
         }
 
         #[pymethods]
@@ -350,14 +364,20 @@ macro_rules! sync_context {
             /// `send_timeout`.
             fn send(&self, py: Python<'_>, body: &Bound<'_, PyAny>) -> PyResult<()> {
                 let body = weida_py_core::payload_of(body)?;
-                let sent = py.detach(|| self.context.send(body));
+                let sent =
+                    weida_py_core::interruptible(py, self.blocking.context().exec(), || {
+                        self.context.context().send(body)
+                    })?;
                 raise(py, sent)
             }
 
             /// Receives this context's message, blocking under the socket's
             /// `recv_timeout` and, for a surveyor, its own deadline.
             fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-                let received = py.detach(|| self.context.recv());
+                let received =
+                    weida_py_core::interruptible(py, self.blocking.context().exec(), || {
+                        self.context.context().recv()
+                    })?;
                 let message = raise(py, received)?;
                 Ok(weida_py_core::py_bytes(py, message.body()))
             }

@@ -13,20 +13,7 @@ use pyo3::prelude::*;
 use weida_mqtt::{ConnectOptions, WillMessage};
 use weida_py_core::payload_of;
 
-use crate::values::qos_of;
-
-/// Seconds as a float, refusing a negative or non-finite one.
-fn seconds(name: &str, value: Option<f64>) -> PyResult<Option<Duration>> {
-    match value {
-        None => Ok(None),
-        Some(value) if value.is_finite() && value >= 0.0 => {
-            Ok(Some(Duration::from_secs_f64(value)))
-        }
-        Some(value) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "{name} must be a non-negative number of seconds; {value} is not"
-        ))),
-    }
-}
+use crate::values::{qos_of, seconds};
 
 /// `weida_mqtt.Will`: the message the server publishes when a connection ends
 /// abnormally (3.1.2.5).

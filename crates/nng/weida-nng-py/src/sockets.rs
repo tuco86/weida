@@ -27,14 +27,40 @@
 //! both in Rust for the programs that build forwarders. What is missing is
 //! named here rather than half-offered.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pyo3::prelude::*;
 use weida_py_core::Bridge;
 
 use crate::context::Context;
 use crate::errors::errno_of;
-use crate::values::PyBroadcast;
+use crate::values::{Body, PyBroadcast};
+
+use weida_nng::Message;
+
+/// Messages a cancelled receive took off the socket and handed back, oldest
+/// first. The next receive reads these before it asks the socket again.
+type Stash = Arc<Mutex<VecDeque<Message>>>;
+
+/// The oldest stashed message, if there is one. Every critical section is a
+/// single `pop_front` or `push_front`, so a poisoned lock still guards a
+/// consistent queue and the poison is not propagated.
+fn take_stashed(stash: &Stash) -> Option<Message> {
+    stash
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop_front()
+}
+
+/// Puts a message back in front of everything stashed: it was the oldest
+/// message the socket gave out, so it must be the next one read.
+fn restore_stashed(stash: &Stash, message: Message) {
+    stash
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push_front(message);
+}
 
 /// Builds one socket class: the endpoint surface every socket has, plus
 /// whichever operations its protocol permits.
@@ -127,6 +153,53 @@ macro_rules! python_socket {
         }, [$($rest)*]);
     };
 
+    // `stashing` marks a socket whose receive takes a self-contained message
+    // off a queue, so that a cancelled receive can give the message back. It
+    // must come first in the flag list, before the receive flags it changes.
+    (@build $class:ident, $rust:ident, $python:literal, $protocol:literal, $what:literal,
+     {$($acc:tt)*}, [stashing $($rest:tt)*]) => {
+        python_socket!(@build $class, $rust, $python, $protocol, $what, {@stash $($acc)*}, [$($rest)*]);
+    };
+
+    (@build $class:ident, $rust:ident, $python:literal, $protocol:literal, $what:literal,
+     {@stash $($acc:tt)*}, [recv $($rest:tt)*]) => {
+        python_socket!(@build $class, $rust, $python, $protocol, $what, {
+            @stash
+            $($acc)*
+
+            /// Receives the next message body, whole.
+            ///
+            /// Bounded by `NNG_OPT_RECVTIMEO`; the expiry is `ETIMEDOUT`.
+            /// A cancelled task leaves the socket usable. A message the
+            /// receive had already taken when the task was cancelled is
+            /// handed back and read first by the next receive, so nothing
+            /// is lost to a cancellation.
+            fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+                let socket = Arc::clone(&self.socket);
+                let stash = Arc::clone(&self.stash);
+                let restore_to = Arc::clone(&self.stash);
+                self.bridge.awaitable_restoring(
+                    py,
+                    async move {
+                        if let Some(message) = take_stashed(&stash) {
+                            return Ok(Body(message));
+                        }
+                        socket.recv().await.map(Body).map_err(errno_of)
+                    },
+                    move |body: Body| restore_stashed(&restore_to, body.into_inner()),
+                )
+            }
+        }, [$($rest)*]);
+    };
+
+    // A receive that does not restore what it took. REP, REQ, RESPONDENT
+    // and SURVEYOR use this form: their message is a reply, request or
+    // response that belongs to a transaction whose state the receive has
+    // already advanced (the request id, the tag stack, the survey id). A
+    // message handed back later would pair with the wrong state, so it is
+    // dropped on cancel instead. That loss is the protocol's own
+    // at-most-once delivery, and REQ's resend timer and the survey
+    // deadline are what recover from it.
     (@build $class:ident, $rust:ident, $python:literal, $protocol:literal, $what:literal,
      {$($acc:tt)*}, [recv $($rest:tt)*]) => {
         python_socket!(@build $class, $rust, $python, $protocol, $what, {
@@ -135,17 +208,41 @@ macro_rules! python_socket {
             /// Receives the next message body, whole.
             ///
             /// Bounded by `NNG_OPT_RECVTIMEO`; the expiry is `ETIMEDOUT`.
-            /// A cancelled task leaves the socket usable and the message
-            /// unread.
+            /// A cancelled task leaves the socket usable. A message the
+            /// receive had already taken when the task was cancelled is
+            /// dropped, not handed back: it is a reply, request or survey
+            /// response belonging to a transaction whose state this receive
+            /// has already advanced, and re-delivering it later would pair it
+            /// with the wrong state. The loss is the protocol's own
+            /// at-most-once delivery, recovered by REQ's resend timer or the
+            /// survey deadline.
             fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
                 let socket = Arc::clone(&self.socket);
                 self.bridge.awaitable(py, async move {
                     socket
                         .recv()
                         .await
-                        .map(crate::values::Body)
+                        .map(Body)
                         .map_err(errno_of)
                 })
+            }
+        }, [$($rest)*]);
+    };
+
+    (@build $class:ident, $rust:ident, $python:literal, $protocol:literal, $what:literal,
+     {@stash $($acc:tt)*}, [try_recv $($rest:tt)*]) => {
+        python_socket!(@build $class, $rust, $python, $protocol, $what, {
+            @stash
+            $($acc)*
+
+            /// The message if one is queued, `EAGAIN` if none is. A message
+            /// given back by a cancelled receive is the next one.
+            fn recv_nowait(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyBytes>> {
+                let message = match take_stashed(&self.stash) {
+                    Some(message) => message,
+                    None => crate::errors::raise(py, self.socket.try_recv())?,
+                };
+                Ok(weida_py_core::py_bytes(py, message.body()).unbind())
             }
         }, [$($rest)*]);
     };
@@ -224,13 +321,28 @@ macro_rules! python_socket {
         }, [$($rest)*]);
     };
 
+    // The socket's own fields are chosen by the flags, so the stashing socket
+    // and the others share one body in `@finish` and differ only in these two
+    // token lists.
+    (@build $class:ident, $rust:ident, $python:literal, $protocol:literal, $what:literal,
+     {@stash $($pattern:tt)*}, []) => {
+        python_socket!(@finish $class, $rust, $python, $protocol, $what,
+            {stash: Stash,}, {stash: Arc::default(),}, {$($pattern)*});
+    };
+
     (@build $class:ident, $rust:ident, $python:literal, $protocol:literal, $what:literal,
      {$($pattern:tt)*}, []) => {
+        python_socket!(@finish $class, $rust, $python, $protocol, $what, {}, {}, {$($pattern)*});
+    };
+
+    (@finish $class:ident, $rust:ident, $python:literal, $protocol:literal, $what:literal,
+     {$($field:tt)*}, {$($init:tt)*}, {$($pattern:tt)*}) => {
         #[doc = $what]
         #[pyclass(frozen, name = $python, module = "weida_nng")]
         pub struct $class {
             socket: Arc<weida_nng::$rust>,
             bridge: Bridge,
+            $($field)*
         }
 
         impl $class {
@@ -284,6 +396,7 @@ macro_rules! python_socket {
                 Ok($class {
                     socket,
                     bridge: context.bridge().clone(),
+                    $($init)*
                 })
             }
 
@@ -393,7 +506,7 @@ python_socket!(
     "PullSocket",
     "pull",
     "A PULL socket: receive only, fair-queued over its pipes.",
-    [recv try_recv]
+    [stashing recv try_recv]
 );
 
 python_socket!(
@@ -413,7 +526,7 @@ python_socket!(
     "SubSocket",
     "sub",
     "A SUB socket: receive only, and only what matches a subscription.",
-    [recv try_recv subscribe]
+    [stashing recv try_recv subscribe]
 );
 
 python_socket!(
@@ -424,7 +537,7 @@ python_socket!(
     "A PAIR v0 socket: one peer at a time, in both directions.\n\nNo protocol \
      header at all, which is what makes v0 the legacy-compatible choice; a \
      second peer's connection is refused while one is live.",
-    [send try_send recv try_recv]
+    [stashing send try_send recv try_recv]
 );
 
 python_socket!(
@@ -435,7 +548,7 @@ python_socket!(
     "A PAIR v1 socket: one peer at a time, with a hop count.\n\nThe 32-bit \
      hop-count word in front of the body is what makes a forwarding topology \
      safe: a message past `max_ttl` hops is dropped and the pipe is kept.",
-    [send try_send recv]
+    [stashing send try_send recv]
 );
 
 python_socket!(
@@ -469,5 +582,5 @@ python_socket!(
     "A BUS socket: one hop, best effort, to every directly connected \
      peer.\n\nBUS broadcasts one hop and no further, so a mesh must be fully \
      connected for every node to see a message.",
-    [broadcast recv try_recv]
+    [stashing broadcast recv try_recv]
 );

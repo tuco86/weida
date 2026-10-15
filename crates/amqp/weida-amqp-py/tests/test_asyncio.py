@@ -266,3 +266,71 @@ async def test_a_settle_mode_name_outside_the_set_is_refused():
     with pytest.raises(weida_amqp.Configuration) as raised:
         await weida_amqp.connect("127.0.0.1", 1, sasl_anonymous=True, sasl_user="x")
     assert "two different mechanisms" in str(raised.value)
+
+
+async def test_a_receive_cancelled_while_waiting_loses_no_delivery():
+    cancelled = asyncio.Event()
+
+    async def script(peer):
+        await peer.handshake()
+        await peer.answer_begin()
+        await peer.answer_attach(role_is_sender=True)
+        await peer.read_performative()  # the flow
+        # Sent only after the first receive was cancelled: the next receive
+        # must still get it.
+        await cancelled.wait()
+        await peer.send_transfer(data_section(b"kept"), settled=True)
+        await peer.expect_close()
+
+    server, port = await with_peer(script)
+    async with server:
+        connection = await weida_amqp.connect("127.0.0.1", port, container_id="test")
+        session = await connection.begin()
+        receiver = await session.attach("invoices", "receiver", "/queues/invoices")
+        await receiver.grant_credit(1)
+
+        task = asyncio.ensure_future(receiver.next_delivery())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        cancelled.set()
+        await asyncio.sleep(0.1)
+
+        delivery = await asyncio.wait_for(receiver.next_delivery(), DEADLINE)
+        assert delivery is not None
+        assert delivery.body() == b"kept"
+        await connection.close()
+
+
+async def test_a_delivery_hands_back_the_same_objects_on_every_access():
+    async def script(peer):
+        await peer.handshake()
+        await peer.answer_begin()
+        await peer.answer_attach(role_is_sender=True)
+        await peer.read_performative()  # the flow
+        await peer.send_transfer(data_section(b"once"), settled=True)
+        await peer.expect_close()
+
+    server, port = await with_peer(script)
+    async with server:
+        connection = await weida_amqp.connect("127.0.0.1", port, container_id="test")
+        session = await connection.begin()
+        receiver = await session.attach("invoices", "receiver", "/queues/invoices")
+        await receiver.grant_credit(1)
+
+        delivery = await asyncio.wait_for(receiver.next_delivery(), DEADLINE)
+        assert delivery.payload is delivery.payload
+        assert delivery.body() is delivery.body()
+        assert delivery.delivery_tag is delivery.delivery_tag
+        assert delivery.body() == b"once"
+        await connection.close()
+
+
+@pytest.mark.parametrize("handshake_timeout", [-1, float("nan"), 1e30])
+async def test_a_timeout_the_clock_cannot_express_is_refused(handshake_timeout):
+    # Refused before any socket is opened, so the port is never dialled.
+    with pytest.raises(Exception):
+        await weida_amqp.connect(
+            "127.0.0.1", 9, container_id="test", handshake_timeout=handshake_timeout
+        )

@@ -56,17 +56,18 @@
 //! Everything else on `weida_nats.Connection` and
 //! `weida_nats.Subscription` is here under the same name, minus the `await`.
 
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use futures::executor::block_on;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule};
-use weida_nats::{Connection, Error, Subscription};
-use weida_py_core::{payload_of, py_bytes};
+use weida_nats::{Connection, Error, Message, Subscription};
+use weida_py_core::{Slot, interruptible, payload_of, py_bytes};
 
 use crate::connection::Reactor;
 use crate::errors::raise;
 use crate::options;
+use crate::subscription::next_of;
 use crate::values::{PyMessage, PyRemoteInfo, PyState, headers_of, subject_of};
 
 /// Drives one of the library's futures to completion on the **calling**
@@ -170,8 +171,11 @@ impl SyncConnection {
     ///
     /// Unbounded, and finite all the same: a connection that never drains
     /// ends, and its end is the other answer.
-    fn lame_duck_notice(&self, py: Python<'_>) -> bool {
-        py.detach(|| drive(&self.reactor, self.inner.lame_duck_notice()))
+    fn lame_duck_notice(&self, py: Python<'_>) -> PyResult<bool> {
+        let connection = self.inner.clone();
+        interruptible(py, self.reactor.exec(), move || async move {
+            connection.lame_duck_notice().await
+        })
     }
 
     /// Where this connection is, now.
@@ -180,8 +184,12 @@ impl SyncConnection {
     }
 
     /// Waits for the connection to stop being usable, and says why.
-    fn closed(&self, py: Python<'_>) -> PyState {
-        PyState::of(py.detach(|| drive(&self.reactor, self.inner.closed())))
+    fn closed(&self, py: Python<'_>) -> PyResult<PyState> {
+        let connection = self.inner.clone();
+        let state = interruptible(py, self.reactor.exec(), move || async move {
+            connection.closed().await
+        })?;
+        Ok(PyState::of(state))
     }
 
     /// `PUB <subject> <#bytes>`. Queued for the driver, which is all Core
@@ -270,8 +278,10 @@ impl SyncConnection {
         let subject = subject_of(subject)?;
         let payload = payload_of(payload)?;
         let window = options::window(py, "timeout", timeout)?;
-        let replied =
-            py.detach(|| drive(&self.reactor, self.inner.request(subject, payload, window)));
+        let connection = self.inner.clone();
+        let replied = interruptible(py, self.reactor.exec(), move || async move {
+            connection.request(subject, payload, window).await
+        })?;
         raise(py, replied).map(PyMessage::of)
     }
 
@@ -288,20 +298,23 @@ impl SyncConnection {
         let subject = subject_of(subject)?;
         let payload = payload_of(payload)?;
         let window = options::window(py, "timeout", timeout)?;
-        let replies = py.detach(|| {
-            drive(
-                &self.reactor,
-                self.inner
-                    .request_many(subject, payload, window, max_replies),
-            )
-        });
+        let max_replies = options::bounded(py, "max_replies", max_replies)?;
+        let connection = self.inner.clone();
+        let replies = interruptible(py, self.reactor.exec(), move || async move {
+            connection
+                .request_many(subject, payload, window, max_replies)
+                .await
+        })?;
         raise(py, replies).map(|replies| replies.into_iter().map(PyMessage::of).collect())
     }
 
     /// `PING`, answered when the `PONG` comes back: the only way to learn
     /// that the server has read what was written before it.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        let flushed = py.detach(|| drive(&self.reactor, self.inner.flush()));
+        let connection = self.inner.clone();
+        let flushed = interruptible(py, self.reactor.exec(), move || async move {
+            connection.flush().await
+        })?;
         raise(py, flushed)
     }
 
@@ -327,10 +340,12 @@ impl SyncConnection {
 /// `weida_nats.sync.Subscription`.
 #[pyclass(frozen, name = "Subscription", module = "weida_nats.sync")]
 pub struct SyncSubscription {
-    /// A `Mutex` and not a lease: a blocking subscription is read by one
-    /// thread at a time, and the GIL is released before the lock is taken,
-    /// so a second Python thread runs while this one waits.
-    held: Mutex<Subscription>,
+    /// A [`Slot`] rather than a mutex: a receive waits inside a future that
+    /// Ctrl-C may drop, and a lock guard cannot travel into that future. One
+    /// thread reads at a time; a second waits for the first with the GIL
+    /// released. Sync reads never restore, because a future that Ctrl-C drops
+    /// has not produced its message yet.
+    held: Arc<Slot<Subscription, Message>>,
     subject: Vec<u8>,
     queue_group: Option<Vec<u8>>,
     sid: u64,
@@ -347,15 +362,9 @@ impl SyncSubscription {
             subject: subscription.subject().to_vec(),
             queue_group: subscription.queue_group().map(<[u8]>::to_vec),
             sid: subscription.sid(),
-            held: Mutex::new(subscription),
+            held: Slot::new(subscription),
             reactor,
         }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Subscription> {
-        self.held
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -390,41 +399,51 @@ impl SyncSubscription {
     /// failure this argument exists to prevent.
     fn next_msg(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyMessage>> {
         let window = options::window(py, "timeout", timeout)?;
-        let received = py.detach(|| {
-            // The lock is taken here rather than inside an async block: the
-            // future below is polled to completion on this one thread and
-            // the guard is released when the closure returns, so nothing is
-            // held across a suspension that could move.
-            let mut subscription = self.lock();
-            let next = subscription.next();
-            match drive(&self.reactor, self.reactor.exec().within(window, next)) {
-                Some(message) => Ok(message),
-                // The library's own error value rather than an invented
-                // one, so that `next_msg` and `request` raise one class for
-                // one fact: the caller's window elapsed.
-                None => Err(Error::RequestTimeout { after: window }),
-            }
-        });
-        raise(py, received).map(|message| message.map(PyMessage::of))
+        let slot = Arc::clone(&self.held);
+        let within = self.reactor.exec().clone();
+        // A Ctrl-C drops this future where it stands, which is what cancelling
+        // the coroutine does to the same receive; see `weida_py_core::interruptible`.
+        let received = interruptible(py, self.reactor.exec(), move || async move {
+            within
+                .within(window, async move { next_of(&slot).await })
+                .await
+        })?;
+        match received {
+            Some(message) => Ok(message.map(PyMessage::of)),
+            // The library's own error value rather than an invented one, so that
+            // `next_msg` and `request` raise one class for one fact: the caller's
+            // window elapsed.
+            None => raise(py, Err(Error::RequestTimeout { after: window })),
+        }
     }
 
     /// The next message if one is already queued, and `None` if not.
     ///
-    /// Nothing to wait for, so nothing to time out.
+    /// It waits only while another thread is in `next_msg` on this subscription,
+    /// never for a message.
     fn try_next(&self, py: Python<'_>) -> Option<PyMessage> {
-        py.detach(|| self.lock().try_next()).map(PyMessage::of)
+        py.detach(|| block_on(async { self.held.acquire().await.try_next() }))
+            .map(PyMessage::of)
     }
 
     /// `UNSUB <sid>`: removes the subscription now. Messages the server had
     /// already written are still readable.
     fn unsubscribe(&self, py: Python<'_>) {
-        py.detach(|| drive(&self.reactor, self.lock().unsubscribe()));
+        py.detach(|| {
+            drive(&self.reactor, async {
+                self.held.acquire().await.unsubscribe().await
+            })
+        });
     }
 
     /// `UNSUB <sid> <max_msgs>`: removes the subscription once it has
     /// received `max_msgs` messages in total.
     fn unsubscribe_after(&self, py: Python<'_>, max_msgs: u64) {
-        py.detach(|| drive(&self.reactor, self.lock().unsubscribe_after(max_msgs)));
+        py.detach(|| {
+            drive(&self.reactor, async {
+                self.held.acquire().await.unsubscribe_after(max_msgs).await
+            })
+        });
     }
 
     fn __repr__(&self) -> String {

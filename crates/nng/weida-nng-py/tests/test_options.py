@@ -198,3 +198,14 @@ def test_recvmaxsz_is_settable_per_socket_and_bounds_a_peers_declaration():
         await ctx.shutdown()
 
     run(bounded())
+
+
+@pytest.mark.parametrize("seconds", [float("nan"), float("inf"), -1.0, 1e30])
+def test_a_timeout_no_duration_can_hold_is_einval_not_a_panic(seconds):
+    with pytest.raises(weida_nng.EINVAL):
+        weida_nng.SocketOptions(recv_timeout=seconds)
+
+
+def test_a_negative_close_budget_is_einval_not_a_panic():
+    with pytest.raises(weida_nng.EINVAL):
+        weida_nng.Context(close_budget=-1)

@@ -26,12 +26,10 @@
 //! nobody audits: `docs/libraries/amqp.md` records it as the one row this
 //! binding does not carry.
 
-use std::time::Duration;
-
 use pyo3::prelude::*;
 use weida_amqp::session::SessionOptions;
-use weida_amqp::{Connection, ConnectionOptions, Sasl, State};
-use weida_py_core::Bridge;
+use weida_amqp::{Connection, ConnectionOptions, Error, Sasl, State};
+use weida_py_core::{Bridge, duration, interruptible};
 use weida_runtime::{Exec, OwnedReactor};
 
 use crate::errors;
@@ -100,10 +98,13 @@ pub fn options_from(
         // Zero means unset on the wire, so it means unset here: a Python
         // caller writing 0 is asking for no idle timeout, not for one of zero
         // milliseconds.
-        options.idle_time_out = (seconds > 0.0).then(|| Duration::from_secs_f64(seconds));
+        let limit = duration("idle_time_out", seconds)
+            .map_err(|error| errors::configuration(py, error.to_string()))?;
+        options.idle_time_out = (!limit.is_zero()).then_some(limit);
     }
     if let Some(seconds) = handshake_timeout {
-        options.handshake_timeout = Duration::from_secs_f64(seconds);
+        options.handshake_timeout = duration("handshake_timeout", seconds)
+            .map_err(|error| errors::configuration(py, error.to_string()))?;
     }
     options.sasl = match (sasl_anonymous, sasl_user, sasl_password) {
         (true, None, None) => Sasl::Anonymous,
@@ -259,19 +260,43 @@ pub fn reactor(worker_threads: usize) -> Result<(Exec, OwnedReactor), weida_amqp
 /// that is supposed to be driving the caller's other tasks, which in a test
 /// means blocking the peer it is connecting to.
 pub fn open(
+    py: Python<'_>,
     worker_threads: usize,
     host: &str,
     port: u16,
     options: ConnectionOptions,
-) -> Result<(Connection, Exec, OwnedReactor), weida_amqp::Error> {
-    let (exec, reactor) = reactor(worker_threads)?;
+) -> PyResult<(Connection, Exec, OwnedReactor)> {
+    let (exec, reactor) = errors::raise(py, reactor(worker_threads))?;
     let connecting = exec.clone();
     let host = host.to_owned();
-    let handle =
-        exec.spawn(async move { Connection::connect(&connecting, &host, port, options).await });
-    let connection =
-        futures::executor::block_on(handle).expect("the connect future does not panic")?;
+    let connection = drive(py, &exec, async move {
+        Connection::connect(&connecting, &host, port, options).await
+    })?;
     Ok((connection, exec, reactor))
+}
+
+/// Runs a library future on `exec` and waits for it here, with the GIL released.
+///
+/// The wait is [`interruptible`]: a signal that raises (Ctrl-C) ends it by
+/// aborting the task, which is the cancellation an asyncio task gets. A task
+/// that ends without an answer, because its reactor shut down under it, is the
+/// connection being gone, so it raises `ConnectionGone` rather than panicking
+/// on the Python thread.
+pub fn drive<F, T>(py: Python<'_>, exec: &Exec, future: F) -> PyResult<T>
+where
+    F: Future<Output = Result<T, Error>> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = exec.spawn(future);
+    let abort = handle.abort_handle();
+    match interruptible(py, exec, || handle) {
+        Err(signal) => {
+            abort.abort();
+            Err(signal)
+        }
+        Ok(Ok(answer)) => errors::raise(py, answer),
+        Ok(Err(_joined)) => errors::raise(py, Err(Error::ConnectionGone)),
+    }
 }
 
 impl PyConnection {

@@ -1364,14 +1364,16 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
 - **`weida-amqp`, `weida-nats` and `weida-mqtt` duplicate their TCP+TLS `Stream`.** Each
   defines `Stream` in `transport.rs`: an enum over a `TcpStream` and a boxed `tokio_rustls`
   client stream, with the same `AsyncRead` and `AsyncWrite` impls.
-- **The Python bindings duplicate their plumbing.** `weida-zmq-py`, `weida-nats-py` and
-  `weida-amqp-py` each carry a `lease.rs`. Five of the six bindings validate a seconds
-  argument in a helper of their own, and the helpers disagree on the error (`EINVAL` in
-  `weida-zmq-py` and `weida-nng-py`, `ValueError` in `weida-mqtt-py`, the library's
-  `Configuration` in `weida-nats-py`, a weida runtime error in `weida-py`); `weida-amqp-py`
-  passes some straight to `Duration::from_secs_f64`, which panics on a negative or non-finite
-  value. `weida-nats-py` and `weida-amqp-py` each drive their synchronous surface through a
-  `drive` of their own, where the other four bind their library's `blocking` facade.
+- **The Python bindings still duplicate some plumbing.** The lease (`Slot`/`Lease`), the seconds
+  validation (`weida_py_core::duration`), the Ctrl-C-aware blocking wait
+  (`weida_py_core::interruptible`) and the cached `bytes` getter (`LazyBytes`) now live in
+  `weida-py-core`, and `weida-nats-py`, `weida-amqp-py`, `weida-mqtt-py` and `weida-nng-py` use
+  them. `weida-zmq-py` keeps its own `lease.rs` because it additionally retires a slot when a
+  socket is split, and its own seconds helpers; `weida-py` keeps a seconds helper of its own
+  (a weida runtime error rather than the bindings' `ValueError`/`EINVAL`/`Configuration`), so
+  the helpers still disagree on the error class there. `weida-nats-py` and `weida-amqp-py` each
+  drive their synchronous surface through a `drive` of their own, where the other four bind
+  their library's `blocking` facade.
 - **Decision 0016's refusal is not enforced.** [0016](decisions/0016-conflation.md) §4.5 says
   `Coalesce` backpressure and `PerProducer(reassemble)` ordering are refused together at
   configuration time. `GuaranteeSet::validate` (`crates/protocol/src/header.rs`) checks the

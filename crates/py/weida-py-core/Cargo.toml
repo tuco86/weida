@@ -30,6 +30,9 @@ weida-runtime.workspace = true
 # The bytes boundary's measurement, which 0014 §2 asks for by name: the copy
 # that cannot be avoided is measured rather than called cheap.
 criterion.workspace = true
+# A stand-in for a library's awaiting half in the tests: a channel to wait on
+# and an executor to drive the lease with, neither of which a binding needs.
+futures.workspace = true
 
 [[bench]]
 name = "bytes_boundary"

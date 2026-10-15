@@ -12,6 +12,7 @@ deadlocks fails the suite instead of hanging it (docs/LOOP.md 2).
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -283,3 +284,23 @@ def test_a_wildcard_listen_reports_the_port_it_got():
         await ctx.shutdown()
 
     run(bound())
+
+
+def test_a_message_taken_by_a_cancelled_receive_is_read_by_the_next_one():
+    async def scenario():
+        ctx = weida_nng.Context()
+        pull = weida_nng.PullSocket(ctx, options())
+        push = weida_nng.PushSocket(ctx, options())
+        url = await pull.listen("tcp://127.0.0.1:0")
+        await push.dial(url)
+
+        task = asyncio.ensure_future(pull.recv())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        push.send_nowait(b"m1")
+        time.sleep(0.1)
+        await asyncio.sleep(0.05)
+        assert await asyncio.wait_for(pull.recv(), 2) == b"m1"
+        await ctx.shutdown()
+
+    run(scenario())

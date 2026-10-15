@@ -49,30 +49,27 @@
 //! The reactor belongs to the context, so no asyncio loop exists in such a
 //! process and none is needed.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use weida_mqtt::DisconnectReasonCode;
 use weida_mqtt::blocking::{BlockingClient, BlockingContext, Deliveries};
+use weida_mqtt::{Delivery, DisconnectReasonCode, Error, Event, Events};
+use weida_py_core::{duration, interruptible};
+use weida_runtime::Exec;
 
 use crate::client;
 use crate::errors::raise;
 use crate::options::PyConnectOptions;
 use crate::values::{PyCompletion, PyDelivery, PyMessage, PySubscription};
 
-/// A timeout in seconds, refusing a negative or non-finite one.
+/// A timeout in seconds, refusing a negative, non-finite or oversized one.
 fn limit(seconds: Option<f64>) -> PyResult<Option<Duration>> {
-    match seconds {
-        None => Ok(None),
-        Some(value) if value.is_finite() && value >= 0.0 => {
-            Ok(Some(Duration::from_secs_f64(value)))
-        }
-        Some(value) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "a timeout is a finite, non-negative number of seconds, not {value}"
-        ))),
-    }
+    Ok(match seconds {
+        None => None,
+        Some(value) => Some(duration("a timeout", value)?),
+    })
 }
 
 /// `weida_mqtt.sync.Context`: a context that owns its reactor.
@@ -107,14 +104,7 @@ impl SyncContext {
         let connect_options = PyConnectOptions::resolve(options)?;
         let connected = py.detach(|| self.inner.connect(address, connect_options));
         let (client, deliveries) = raise(py, connected)?;
-        Ok((
-            SyncClient {
-                inner: Mutex::new(client),
-            },
-            SyncDeliveries {
-                inner: Mutex::new(deliveries),
-            },
-        ))
+        Ok(split(self.inner.context().exec(), client, deliveries))
     }
 
     /// Connects on a session the caller holds, which is what makes a later
@@ -134,14 +124,7 @@ impl SyncContext {
                 .connect_session(address, connect_options, &session)
         });
         let (client, deliveries) = raise(py, connected)?;
-        Ok((
-            SyncClient {
-                inner: Mutex::new(client),
-            },
-            SyncDeliveries {
-                inner: Mutex::new(deliveries),
-            },
-        ))
+        Ok(split(self.inner.context().exec(), client, deliveries))
     }
 
     fn __repr__(&self) -> String {
@@ -149,28 +132,51 @@ impl SyncContext {
     }
 }
 
-/// `weida_mqtt.sync.Client`.
-///
-/// The `Mutex` is not about the protocol: `BlockingClient`'s methods take
-/// `&self` and the library is already safe for concurrent calls. It is here
-/// because a Python object is shared by reference and two threads calling one
-/// blocking method would each want the GIL released, which `Python::detach`
-/// gives them — so the lock is what keeps two *Python* callers from
-/// interleaving two `block_on`s on one connection's command channel and
-/// reading each other's answers.
-#[pyclass(frozen, name = "Client", module = "weida_mqtt.sync")]
-pub struct SyncClient {
-    inner: Mutex<BlockingClient>,
+/// The client and the deliveries of one connection. The three values a getter
+/// reports are read once, here: they are fixed by CONNACK, so caching them
+/// means no getter, `repr` or `disconnect` waits on the connection.
+fn split(
+    exec: &Exec,
+    client: BlockingClient,
+    deliveries: Deliveries,
+) -> (SyncClient, SyncDeliveries) {
+    let (client_id, session_present, is_encrypted) = {
+        let inner = client.client();
+        (
+            inner.client_id().to_owned(),
+            inner.session_present(),
+            inner.is_encrypted(),
+        )
+    };
+    (
+        SyncClient {
+            inner: client,
+            exec: exec.clone(),
+            client_id,
+            session_present,
+            is_encrypted,
+        },
+        SyncDeliveries {
+            inner: Mutex::new(deliveries),
+            exec: exec.clone(),
+        },
+    )
 }
 
-impl SyncClient {
-    fn with<T>(&self, body: impl FnOnce(&BlockingClient) -> T) -> T {
-        let client = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        body(&client)
-    }
+/// `weida_mqtt.sync.Client`.
+///
+/// There is no lock. `BlockingClient` takes `&self` throughout and is `Sync`:
+/// the asynchronous surface shares the same `Client` across tasks through an
+/// `Arc`. Two Python threads can therefore each be blocked in their own call
+/// on one connection, and a getter never queues behind another thread's
+/// publish.
+#[pyclass(frozen, name = "Client", module = "weida_mqtt.sync")]
+pub struct SyncClient {
+    inner: BlockingClient,
+    exec: Exec,
+    client_id: String,
+    session_present: bool,
+    is_encrypted: bool,
 }
 
 #[pymethods]
@@ -182,10 +188,12 @@ impl SyncClient {
     /// would return control while the exchange continued — which the
     /// asynchronous surface's cancellation does and is honest about, and which
     /// an argument named `timeout` would not be. A caller who wants that runs
-    /// the publish on its own thread.
+    /// the publish on its own thread. Ctrl-C ends the wait the same way a
+    /// cancelled task would.
     fn publish(&self, py: Python<'_>, message: &PyMessage) -> PyResult<PyCompletion> {
+        let client = &self.inner;
         let message = message.inner().clone();
-        let published = py.detach(|| self.with(|client| client.publish(message)));
+        let published = interruptible(py, &self.exec, move || client.client().publish(message))?;
         raise(py, published).map(PyCompletion::of)
     }
 
@@ -198,18 +206,23 @@ impl SyncClient {
         subscriptions: Vec<PyRef<'_, PySubscription>>,
         subscription_id: Option<u32>,
     ) -> PyResult<Vec<u16>> {
+        let client = &self.inner;
         let subscriptions: Vec<_> = subscriptions
             .iter()
             .map(|subscription| subscription.inner().clone())
             .collect();
-        let granted =
-            py.detach(|| self.with(|client| client.subscribe_with(subscriptions, subscription_id)));
+        let granted = interruptible(py, &self.exec, move || {
+            client
+                .client()
+                .subscribe_with(subscriptions, subscription_id)
+        })?;
         raise(py, granted).map(|codes| codes.iter().map(|code| u16::from(code.as_byte())).collect())
     }
 
     /// Unsubscribes, blocking until the UNSUBACK arrives.
     fn unsubscribe(&self, py: Python<'_>, filters: Vec<String>) -> PyResult<Vec<u16>> {
-        let codes = py.detach(|| self.with(|client| client.unsubscribe(filters)));
+        let client = &self.inner;
+        let codes = interruptible(py, &self.exec, move || client.client().unsubscribe(filters))?;
         raise(py, codes).map(|codes| codes.iter().map(|code| u16::from(code.as_byte())).collect())
     }
 
@@ -227,43 +240,43 @@ impl SyncClient {
             ))
         })?;
         let expiry = limit(session_expiry)?;
-        let sent = py.detach(|| self.with(|client| client.disconnect_with(code, expiry)));
+        let sent = py.detach(|| self.inner.disconnect_with(code, expiry));
         raise(py, sent)
     }
 
     /// Sends PINGREQ now, whatever the keep-alive timer thinks.
     fn ping(&self, py: Python<'_>) -> PyResult<()> {
-        let sent = py.detach(|| self.with(|client| client.ping()));
+        let sent = py.detach(|| self.inner.ping());
         raise(py, sent)
     }
 
     /// Re-authenticates on the live connection ([MQTT-4.12.1-1]).
     fn reauthenticate(&self, py: Python<'_>) -> PyResult<()> {
-        let done = py.detach(|| self.with(|client| client.reauthenticate()));
+        let done = py.detach(|| self.inner.reauthenticate());
         raise(py, done)
     }
 
     /// The Client Identifier in force.
     #[getter]
     fn client_id(&self) -> String {
-        self.with(|client| client.client().client_id().to_owned())
+        self.client_id.clone()
     }
 
     /// `Session Present` from CONNACK.
     #[getter]
     fn session_present(&self) -> bool {
-        self.with(|client| client.client().session_present())
+        self.session_present
     }
 
     /// Whether the transport is encrypted. Always `False`: this binding is
     /// built without the library's `tls` feature.
     #[getter]
     fn is_encrypted(&self) -> bool {
-        self.with(|client| client.client().is_encrypted())
+        self.is_encrypted
     }
 
     fn __repr__(&self) -> String {
-        format!("sync.Client(client_id={:?})", self.client_id())
+        format!("sync.Client(client_id={:?})", self.client_id)
     }
 }
 
@@ -274,7 +287,26 @@ impl SyncClient {
 /// asynchronous surface's `async for`.
 #[pyclass(frozen, name = "Deliveries", module = "weida_mqtt.sync")]
 pub struct SyncDeliveries {
+    /// A receive takes `&mut Deliveries`, so the lock is what lets two Python
+    /// threads share the object. A second receive queues behind the first, as
+    /// two readers of one stream must.
     inner: Mutex<Deliveries>,
+    exec: Exec,
+}
+
+/// The next delivery, skipping the events that are not one. This is the
+/// library's own `next_delivery`, repeated here because the wait has to poll
+/// the events itself to let Ctrl-C interrupt it. `Events::next` is a channel
+/// receive, so dropping this future loses nothing.
+async fn next_delivery(events: &mut Events) -> Result<Delivery, Error> {
+    loop {
+        match events.next().await {
+            Some(Event::Delivered(delivery)) => return Ok(delivery),
+            Some(Event::Disconnected(error)) => return Err(error),
+            Some(_) => continue,
+            None => return Err(Error::NotConnected),
+        }
+    }
 }
 
 #[pymethods]
@@ -288,18 +320,24 @@ impl SyncDeliveries {
     ///
     /// The GIL is released while waiting, so a second Python thread runs.
     #[pyo3(signature = (*, timeout = None))]
+    // The guard is held across the wait on purpose: the future is polled on this
+    // thread only, and a second receive must queue behind the first one, since
+    // both would otherwise take events from the same `&mut Events`.
+    #[allow(clippy::await_holding_lock)]
     fn recv(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyDelivery> {
         let limit = limit(timeout)?;
-        let received = py.detach(|| {
-            let mut deliveries = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let exec = &self.exec;
+        let received = interruptible(py, exec, move || async move {
+            let mut deliveries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let next = next_delivery(deliveries.events());
             match limit {
-                Some(limit) => deliveries.recv_timeout(limit),
-                None => deliveries.recv(),
+                Some(limit) => match exec.within(limit, next).await {
+                    Some(received) => received,
+                    None => Err(Error::Timeout("a delivery")),
+                },
+                None => next.await,
             }
-        });
+        })?;
         raise(py, received).map(PyDelivery::of)
     }
 

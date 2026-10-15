@@ -16,7 +16,7 @@
 //! one, and a foundation that knew either could not be both. It is the same
 //! dependency-direction rule 0013 §4.2 gave `weida-runtime`, one layer up.
 //!
-//! # The four things
+//! # The things in it
 //!
 //! - [`Errno`] and [`ErrorFamily`] — a library's errno-named enum becomes one
 //!   distinct Python exception class per variant under a single base class, so
@@ -31,15 +31,23 @@
 //!   that crate owns the runtime and asks a library to register with it, and
 //!   every library here already owns one through
 //!   [`weida_runtime::Exec`]'s three constructors. The equivalent is
-//!   [`Bridge::awaitable`], about a hundred lines, and it is named here rather
-//!   than depended on.
+//!   [`Bridge::awaitable`], and it is named here rather than depended on.
 //! - Cancellation, propagated rather than swallowed. A cancelled
 //!   `asyncio.Future` aborts the task driving the Rust future, so the Rust
 //!   future is *dropped* — which in Rust is what cancelling it means, and is
-//!   how the socket it borrowed becomes usable again.
+//!   how the socket it borrowed becomes usable again. A value the future had
+//!   already produced when the task was cancelled is handed back to the
+//!   binding rather than lost ([`Bridge::awaitable_restoring`]).
 //! - [`bytes`] — the payload boundary, with the one copy each direction
 //!   forces stated where it happens and measured in
 //!   `benches/bytes_boundary.rs` rather than assumed.
+//! - [`Slot`] and [`Lease`] — one handle shared by coroutines one at a time,
+//!   which is what a `&mut self` receive needs, with the restore queue the
+//!   bridge's hand-back goes to.
+//! - [`interruptible`] — a blocking wait for a binding's synchronous surface
+//!   that Ctrl-C can end.
+//! - [`duration()`] — a Python `float` of seconds as a `Duration` that cannot
+//!   panic.
 //!
 //! # What a binding writes
 //!
@@ -78,20 +86,29 @@
 //!
 //! # The GIL
 //!
-//! Nothing here holds the GIL across an await. [`Bridge::awaitable`] returns
-//! as soon as the future is spawned; the future runs on the library's reactor
-//! with no Python state in it at all; the GIL is taken once, briefly, when the
-//! result is converted and handed to the loop. A binding's synchronous surface
-//! is the mirror image: it releases the GIL with
-//! [`Python::detach`](pyo3::Python::detach) for as long as it blocks, so a
-//! blocking call in one thread never stops Python in another.
+//! Nothing here holds the GIL across an await, and no reactor thread ever
+//! asks for it. [`Bridge::awaitable`] returns as soon as the future is
+//! spawned; the future runs on the library's reactor with no Python state in
+//! it at all; a finished future is queued, and one delivery thread takes the
+//! GIL once for the whole queue to hand the results to their loops. A
+//! binding's synchronous surface is the mirror image: it releases the GIL
+//! with [`Python::detach`](pyo3::Python::detach) for as long as it blocks
+//! ([`interruptible`] does that and keeps Ctrl-C working), so a blocking call
+//! in one thread never stops Python in another.
 
 #![warn(missing_docs)]
 
 pub mod bridge;
 pub mod bytes;
+pub mod duration;
 pub mod errors;
+mod handoff;
+pub mod interrupt;
+pub mod lease;
 
 pub use bridge::{Bridge, PyValue};
-pub use bytes::{payload, payload_of, py_bytes};
+pub use bytes::{LazyBytes, payload, payload_of, py_bytes};
+pub use duration::{BadSeconds, MAX_SECONDS, duration};
 pub use errors::{Errno, ErrnoMapper, ErrorClasses, ErrorFamily};
+pub use interrupt::interruptible;
+pub use lease::{Acquire, Lease, Slot};

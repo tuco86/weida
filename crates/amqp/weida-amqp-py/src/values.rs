@@ -22,24 +22,64 @@
 //! computed over.
 
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use weida_amqp::settlement::Outcome;
 use weida_amqp::{Condition, Delivery};
 use weida_amqp_codec::message::{Body, Message, MessageId, Properties};
 use weida_amqp_codec::{ReceiverSettleMode, SenderSettleMode, Value};
-use weida_py_core::py_bytes;
+use weida_py_core::{LazyBytes, py_bytes};
 
 use crate::errors;
 
 /// `weida_amqp.Delivery`: one message, however many frames it took.
+///
+/// The message is decoded once, on the first access to any of its sections,
+/// and the Python objects built from it are kept: `d.body() is d.body()` and
+/// `d.payload is d.payload` both hold. The dicts and lists returned are those
+/// same objects, so a caller that mutates one changes what the next call sees.
 #[pyclass(frozen, name = "Delivery", module = "weida_amqp")]
 pub struct PyDelivery {
     inner: Delivery,
+    payload_bytes: LazyBytes,
+    tag_bytes: LazyBytes,
+    decoded: PyOnceLock<Sections>,
+}
+
+/// The sections of one message as Python objects, built together because they
+/// all come from one decode.
+struct Sections {
+    header: Option<Py<PyDict>>,
+    properties: Option<Py<PyDict>>,
+    application_properties: Option<Py<PyDict>>,
+    message_annotations: Option<Py<PyDict>>,
+    delivery_annotations: Option<Py<PyDict>>,
+    footer: Option<Py<PyDict>>,
+    body: Option<Py<PyAny>>,
 }
 
 impl PyDelivery {
     pub fn of(inner: Delivery) -> PyDelivery {
-        PyDelivery { inner }
+        PyDelivery {
+            inner,
+            payload_bytes: LazyBytes::new(),
+            tag_bytes: LazyBytes::new(),
+            decoded: PyOnceLock::new(),
+        }
+    }
+
+    /// The library's delivery, for a receive that was cancelled after taking it
+    /// and must give it back to the link.
+    pub fn into_inner(self) -> Delivery {
+        self.inner
+    }
+
+    /// The sections, decoded on first use. A message that does not decode is
+    /// not cached, so the error is raised again on the next access.
+    fn sections<'py>(&self, py: Python<'py>) -> PyResult<&Sections> {
+        self.decoded
+            .get_or_try_init(py, || decode_sections(py, &self.inner))
     }
 }
 
@@ -56,7 +96,7 @@ impl PyDelivery {
     /// is why it is here beside the id.
     #[getter]
     fn delivery_tag<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        py_bytes(py, &self.inner.delivery_tag)
+        self.tag_bytes.get(py, &self.inner.delivery_tag)
     }
 
     /// Part 3 defines exactly one format and numbers it zero.
@@ -82,7 +122,7 @@ impl PyDelivery {
     /// The message's octets, every section, exactly as they arrived.
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        py_bytes(py, self.inner.payload())
+        self.payload_bytes.get(py, self.inner.payload())
     }
 
     /// The body, decoded: `bytes` for one or more `data` sections, the value
@@ -90,98 +130,44 @@ impl PyDelivery {
     /// message with no body section at all — which Part 3 does not permit and
     /// a peer may still send.
     fn body<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let message = self
-            .inner
-            .message()
-            .map_err(|error| errors::configuration(py, error.to_string()))?;
-        Ok(match &message.body {
-            Body::Empty => None,
-            Body::Data(sections) => {
-                // One section, the common case, is copied once, straight into
-                // the `bytes`. Several are joined in place, so no intermediate
-                // buffer holds the whole body a second time.
-                let bytes = match sections.as_slice() {
-                    [only] => py_bytes(py, only),
-                    many => {
-                        let total: usize = many.iter().map(|section| section.len()).sum();
-                        PyBytes::new_with(py, total, |buffer| {
-                            let mut at = 0;
-                            for section in many {
-                                buffer[at..at + section.len()].copy_from_slice(section);
-                                at += section.len();
-                            }
-                            Ok(())
-                        })?
-                    }
-                };
-                Some(bytes.into_any())
-            }
-            Body::Value(value) => Some(value_to_py(py, value)?),
-            // One entry per `amqp-sequence` section, each of which is itself
-            // a list; flattening them would lose the section boundaries the
-            // sender chose.
-            Body::Sequence(sections) => {
-                let list = PyList::empty(py);
-                for section in sections {
-                    list.append(value_to_py(py, section)?)?;
-                }
-                Some(list.into_any())
-            }
-        })
+        Ok(self
+            .sections(py)?
+            .body
+            .as_ref()
+            .map(|body| body.bind(py).clone()))
     }
 
     /// `properties`, as a dict of the thirteen fields that were present.
     fn properties<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let message = self
-            .inner
-            .message()
-            .map_err(|error| errors::configuration(py, error.to_string()))?;
-        message
-            .properties
-            .as_ref()
-            .map(|properties| properties_to_py(py, properties))
-            .transpose()
+        Ok(dict_of(py, &self.sections(py)?.properties))
     }
 
     /// `application-properties`, as a dict. The section Part 3 restricts to
     /// simple values, which is what makes it the one an intermediary filters
     /// on.
     fn application_properties<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.map_section(py, |message| message.application_properties.clone())
+        Ok(dict_of(py, &self.sections(py)?.application_properties))
     }
 
     /// `message-annotations`: what travels with the message indefinitely.
     fn message_annotations<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.map_section(py, |message| message.message_annotations.clone())
+        Ok(dict_of(py, &self.sections(py)?.message_annotations))
     }
 
     /// `delivery-annotations`: one hop only, sender to receiver.
     fn delivery_annotations<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.map_section(py, |message| message.delivery_annotations.clone())
+        Ok(dict_of(py, &self.sections(py)?.delivery_annotations))
     }
 
     /// `footer`: the values computable only once the whole bare message is
     /// seen.
     fn footer<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.map_section(py, |message| message.footer.clone())
+        Ok(dict_of(py, &self.sections(py)?.footer))
     }
 
     /// `header`, as a dict of the five fields.
     fn header<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let message = self
-            .inner
-            .message()
-            .map_err(|error| errors::configuration(py, error.to_string()))?;
-        let Some(header) = message.header else {
-            return Ok(None);
-        };
-        let dict = PyDict::new(py);
-        dict.set_item("durable", header.durable)?;
-        dict.set_item("priority", header.priority)?;
-        dict.set_item("ttl", header.ttl)?;
-        dict.set_item("first_acquirer", header.first_acquirer)?;
-        dict.set_item("delivery_count", header.delivery_count)?;
-        Ok(Some(dict))
+        Ok(dict_of(py, &self.sections(py)?.header))
     }
 
     fn __repr__(&self) -> String {
@@ -195,21 +181,87 @@ impl PyDelivery {
     }
 }
 
-impl PyDelivery {
-    /// One map-valued section, decoded on demand.
-    fn map_section<'py, F>(&self, py: Python<'py>, pick: F) -> PyResult<Option<Bound<'py, PyDict>>>
-    where
-        F: for<'a> FnOnce(&Message<'a>) -> Option<Value<'a>>,
-    {
-        let message = self
-            .inner
-            .message()
-            .map_err(|error| errors::configuration(py, error.to_string()))?;
-        let Some(value) = pick(&message) else {
-            return Ok(None);
-        };
-        Ok(Some(map_to_py(py, &value)?))
-    }
+/// Decodes a message once and builds the Python objects for its sections.
+fn decode_sections(py: Python<'_>, delivery: &Delivery) -> PyResult<Sections> {
+    let message = delivery
+        .message()
+        .map_err(|error| errors::configuration(py, error.to_string()))?;
+    let header = match &message.header {
+        Some(header) => {
+            let dict = PyDict::new(py);
+            dict.set_item("durable", header.durable)?;
+            dict.set_item("priority", header.priority)?;
+            dict.set_item("ttl", header.ttl)?;
+            dict.set_item("first_acquirer", header.first_acquirer)?;
+            dict.set_item("delivery_count", header.delivery_count)?;
+            Some(dict.unbind())
+        }
+        None => None,
+    };
+    Ok(Sections {
+        header,
+        properties: message
+            .properties
+            .as_ref()
+            .map(|properties| properties_to_py(py, properties))
+            .transpose()?
+            .map(Bound::unbind),
+        application_properties: section_dict(py, message.application_properties.as_ref())?,
+        message_annotations: section_dict(py, message.message_annotations.as_ref())?,
+        delivery_annotations: section_dict(py, message.delivery_annotations.as_ref())?,
+        footer: section_dict(py, message.footer.as_ref())?,
+        body: body_to_py(py, &message.body)?,
+    })
+}
+
+/// A map-valued section as a dict, see `map_to_py`.
+fn section_dict(py: Python<'_>, value: Option<&Value<'_>>) -> PyResult<Option<Py<PyDict>>> {
+    value
+        .map(|value| map_to_py(py, value).map(Bound::unbind))
+        .transpose()
+}
+
+/// The body as one Python object, see `PyDelivery::body`.
+fn body_to_py(py: Python<'_>, body: &Body<'_>) -> PyResult<Option<Py<PyAny>>> {
+    Ok(match body {
+        Body::Empty => None,
+        Body::Data(sections) => {
+            // One section, the common case, is copied once, straight into the
+            // `bytes`. Several are joined in place, so no intermediate buffer
+            // holds the whole body a second time.
+            let bytes = match sections.as_slice() {
+                [only] => py_bytes(py, only),
+                many => {
+                    let total: usize = many.iter().map(|section| section.len()).sum();
+                    PyBytes::new_with(py, total, |buffer| {
+                        let mut at = 0;
+                        for section in many {
+                            buffer[at..at + section.len()].copy_from_slice(section);
+                            at += section.len();
+                        }
+                        Ok(())
+                    })?
+                }
+            };
+            Some(bytes.into_any().unbind())
+        }
+        Body::Value(value) => Some(value_to_py(py, value)?.unbind()),
+        // One entry per `amqp-sequence` section, each of which is itself a
+        // list; flattening them would lose the section boundaries the sender
+        // chose.
+        Body::Sequence(sections) => {
+            let list = PyList::empty(py);
+            for section in sections {
+                list.append(value_to_py(py, section)?)?;
+            }
+            Some(list.into_any().unbind())
+        }
+    })
+}
+
+/// The cached dict as a new reference to the same object.
+fn dict_of<'py>(py: Python<'py>, dict: &Option<Py<PyDict>>) -> Option<Bound<'py, PyDict>> {
+    dict.as_ref().map(|dict| dict.bind(py).clone())
 }
 
 /// `weida_amqp.Outcome`: what the peer committed to.
@@ -221,6 +273,12 @@ pub struct PyOutcome {
 impl PyOutcome {
     pub fn of(inner: Outcome) -> PyOutcome {
         PyOutcome { inner }
+    }
+
+    /// The library's outcome, for a settle that was cancelled after it took
+    /// the outcome and must give it back to the link.
+    pub fn into_inner(self) -> Outcome {
+        self.inner
     }
 }
 
@@ -384,6 +442,32 @@ pub const fn receiver_mode_name(mode: ReceiverSettleMode) -> &'static str {
     match mode {
         ReceiverSettleMode::First => "first",
         ReceiverSettleMode::Second => "second",
+    }
+}
+
+/// A message body as the octets that get encoded: the string of a `text` send,
+/// or the caller's bytes, borrowed from the Python object for the encode.
+pub enum Octets {
+    Text(String),
+    Binary(PyBackedBytes),
+}
+
+impl Octets {
+    /// `text` sends the body as an `amqp-value` string. Anything else must be
+    /// bytes-like and goes out as a `data` section, without a copy.
+    pub fn of(body: &Bound<'_, PyAny>, text: bool) -> PyResult<Octets> {
+        Ok(if text {
+            Octets::Text(body.extract::<String>()?)
+        } else {
+            Octets::Binary(weida_py_core::payload(body)?)
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Octets::Text(text) => text.as_bytes(),
+            Octets::Binary(bytes) => bytes,
+        }
     }
 }
 

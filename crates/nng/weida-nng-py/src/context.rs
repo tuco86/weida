@@ -65,15 +65,11 @@ fn config(
     Ok(config)
 }
 
-/// A number of seconds as a duration, or `EINVAL` naming the value.
+/// A number of seconds as a duration, or `EINVAL` naming the value. The
+/// check is the shared one: `NaN`, an infinity, a negative number and a
+/// value past `MAX_SECONDS` are refused rather than panicking.
 pub(crate) fn seconds_to_duration(what: &str, seconds: f64) -> Result<Duration, Error> {
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(Error::EINVAL(
-            format!("{what} must be a finite, non-negative number of seconds, not {seconds}")
-                .into(),
-        ));
-    }
-    Ok(Duration::from_secs_f64(seconds))
+    weida_py_core::duration(what, seconds).map_err(|e| Error::EINVAL(e.to_string().into()))
 }
 
 #[pymethods]

@@ -45,6 +45,13 @@ use weida_nats::options::{Credentials, NonceSignature, Signer};
 use weida_nats::{ConnectionOptions, Error};
 
 use crate::errors::raise;
+use weida_py_core::duration;
+
+/// The largest queue length a binding passes to the library: `subscription_queue`,
+/// `outgoing_queue`, and `request_many`'s `max_replies`. Tokio's bounded channels
+/// panic above this capacity, so a larger count is refused as a configuration
+/// error rather than reaching a channel that cannot be built.
+pub const MAX_QUEUE: usize = usize::MAX >> 3;
 
 /// Every keyword this module accepts, for the message an unknown one gets.
 const KEYWORDS: &str = "name, token, user, password, jwt, signer, nkey_signer, verbose, \
@@ -94,9 +101,14 @@ pub fn from_kwargs(
                 "inbox_prefix" => options.inbox_prefix = value.extract()?,
                 "max_subscriptions" => options.max_subscriptions = value.extract()?,
                 "max_pending_requests" => options.max_pending_requests = value.extract()?,
-                "subscription_queue" => options.subscription_queue = value.extract()?,
+                "subscription_queue" => {
+                    options.subscription_queue =
+                        bounded(py, "subscription_queue", value.extract()?)?;
+                }
                 "max_queued_bytes" => options.max_queued_bytes = value.extract()?,
-                "outgoing_queue" => options.outgoing_queue = value.extract()?,
+                "outgoing_queue" => {
+                    options.outgoing_queue = bounded(py, "outgoing_queue", value.extract()?)?
+                }
                 "max_connect_urls" => options.max_connect_urls = value.extract()?,
                 "max_header_entries" => options.max_header_entries = value.extract()?,
                 "max_control_line" => options.max_control_line = value.extract()?,
@@ -228,31 +240,30 @@ fn signer_of(callable: &Bound<'_, PyAny>) -> PyResult<Signer> {
 
 /// A duration in seconds, refused rather than rounded where it is not one.
 pub fn seconds(py: Python<'_>, what: &str, value: &Bound<'_, PyAny>) -> PyResult<Duration> {
-    let value = value.extract::<f64>()?;
-    if !value.is_finite() || value < 0.0 {
-        return Err(configuration(
-            py,
-            format!("{what} is a finite, non-negative number of seconds, not {value}"),
-        ));
-    }
-    Ok(Duration::from_secs_f64(value))
+    window(py, what, value.extract::<f64>()?)
 }
 
 /// A duration argument that is already an `f64`, for the call sites where the
 /// window is a positional parameter rather than a keyword.
 pub fn window(py: Python<'_>, what: &str, value: f64) -> PyResult<Duration> {
-    if !value.is_finite() || value < 0.0 {
+    duration(what, value).map_err(|refused| configuration(py, refused.to_string()))
+}
+
+/// A queue length that must not exceed [`MAX_QUEUE`], returned unchanged when it
+/// does not.
+pub fn bounded(py: Python<'_>, what: &str, value: usize) -> PyResult<usize> {
+    if value > MAX_QUEUE {
         return Err(configuration(
             py,
-            format!("{what} is a finite, non-negative number of seconds, not {value}"),
+            format!("{what} is at most {MAX_QUEUE}, not {value}"),
         ));
     }
-    Ok(Duration::from_secs_f64(value))
+    Ok(value)
 }
 
 /// A configuration this binding refuses, in the library's own vocabulary so
 /// that `except weida_nats.Configuration` catches both its refusals and ours.
-fn configuration(py: Python<'_>, why: impl Into<String>) -> PyErr {
+pub(crate) fn configuration(py: Python<'_>, why: impl Into<String>) -> PyErr {
     crate::errors::to_py(
         py,
         &crate::errors::errno_of(Error::Configuration(why.into())),

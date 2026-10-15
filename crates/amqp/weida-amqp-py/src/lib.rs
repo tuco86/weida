@@ -89,7 +89,6 @@ use pyo3::prelude::*;
 
 mod connection;
 mod errors;
-mod lease;
 mod link;
 mod session;
 pub mod sync;

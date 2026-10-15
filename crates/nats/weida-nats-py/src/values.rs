@@ -22,18 +22,38 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use weida_nats::{Message, OwnedHeaders, RemoteInfo, State};
-use weida_py_core::py_bytes;
+use weida_py_core::LazyBytes;
 
 /// One delivered message.
+///
+/// `subject`, `reply_to` and `payload` become `bytes` on first access and the
+/// same object is returned after that, so `m.payload is m.payload` holds and
+/// reading a field twice costs one copy. `headers` is deliberately not cached:
+/// it is a list of pairs the caller may change, so each access returns a
+/// fresh one.
 #[pyclass(frozen, name = "Message", module = "weida_nats")]
 pub struct PyMessage {
     inner: Message,
+    subject_cell: LazyBytes,
+    reply_to_cell: LazyBytes,
+    payload_cell: LazyBytes,
 }
 
 impl PyMessage {
     /// Wraps a delivered message.
     pub fn of(message: Message) -> PyMessage {
-        PyMessage { inner: message }
+        PyMessage {
+            inner: message,
+            subject_cell: LazyBytes::new(),
+            reply_to_cell: LazyBytes::new(),
+            payload_cell: LazyBytes::new(),
+        }
+    }
+
+    /// The library's message back, for a receive that took one and was
+    /// cancelled before the caller got it.
+    pub fn into_inner(self) -> Message {
+        self.inner
     }
 }
 
@@ -43,7 +63,7 @@ impl PyMessage {
     /// the pattern that matched it.
     #[getter]
     fn subject<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        py_bytes(py, &self.inner.subject)
+        self.subject_cell.get(py, &self.inner.subject)
     }
 
     /// The subject as text, or `None` where it is not UTF-8.
@@ -67,14 +87,14 @@ impl PyMessage {
         self.inner
             .reply_to
             .as_deref()
-            .map(|reply_to| py_bytes(py, reply_to))
+            .map(|reply_to| self.reply_to_cell.get(py, reply_to))
     }
 
     /// The payload, exactly as long as the control line declared. May be
     /// empty, and may hold `CRLF`.
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        py_bytes(py, &self.inner.payload)
+        self.payload_cell.get(py, &self.inner.payload)
     }
 
     /// The header block as `[(name, value)]`, or `None` where the message

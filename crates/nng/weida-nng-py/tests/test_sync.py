@@ -12,6 +12,9 @@ conversion over `weida-nng`'s own blocking facade, which is `block_on`
 around the asynchronous sockets these tests' asyncio siblings use.
 """
 
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -214,3 +217,32 @@ def test_the_two_surfaces_talk_to_each_other():
     context.shutdown()
 
     assert result["body"] == b"one implementation"
+
+
+def test_ctrl_c_ends_a_receive_with_no_peer_and_no_deadline():
+    # A child process parks in `recv` on an idle PULL with no timeout; the
+    # parent interrupts it after the child reports it is waiting. The wait
+    # must end with KeyboardInterrupt rather than hold the process until a
+    # message arrives.
+    script = (
+        "from weida_nng import sync\n"
+        "sock = sync.PullSocket(sync.Context())\n"
+        "print('waiting', flush=True)\n"
+        "sock.recv()\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "waiting"
+        time.sleep(0.5)
+        child.send_signal(signal.SIGINT)
+        _, stderr = child.communicate(timeout=3)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+    assert "KeyboardInterrupt" in stderr

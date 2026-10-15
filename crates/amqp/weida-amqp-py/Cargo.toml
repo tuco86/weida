@@ -44,15 +44,6 @@ weida-amqp-codec.workspace = true
 # Python process able to open one at all: there is no ambient Tokio runtime in
 # `python main.py`.
 weida-runtime.workspace = true
-# Two things and no more: `tokio::sync::Notify`, which is what makes the lease
-# in `lease.rs` wake a waiting coroutine, and nothing else — the reactor is
-# `weida-runtime`'s and is reached through `Exec`.
-tokio.workspace = true
-# The synchronous surface drives the client's own futures on the calling
-# thread. Not the reactor's `block_on`: `weida-runtime`'s contract is that "the
-# caller may drive the returned futures on any executor", and this is that
-# sentence used — see `sync.rs`.
-futures.workspace = true
 
 [features]
 # Off by default, and enabled by maturin through `pyproject.toml`. With it on,

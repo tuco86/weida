@@ -26,20 +26,42 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use weida_amqp::link::LinkState;
-use weida_amqp::{Condition, Link};
-use weida_py_core::Bridge;
+use weida_amqp::{Condition, Delivery, Link};
+use weida_py_core::{Bridge, Lease, Slot};
 use weida_runtime::OwnedReactor;
 
 use crate::errors;
-use crate::lease::Slot;
 use crate::values::{
-    Outgoing, PyDelivery, PyOutcome, message_from, outcome_of, receiver_mode_name, sender_mode_name,
+    Octets, Outgoing, PyDelivery, PyOutcome, message_from, outcome_of, receiver_mode_name,
+    sender_mode_name,
 };
+
+/// What a receive or a settle takes out of the link, and what a cancelled one
+/// gives back.
+///
+/// Both kinds share one queue on the link's slot, so a restored value is found
+/// by the call that wants it: a cancelled `next_delivery` gives its delivery
+/// back to the next receive, and a cancelled `settled` gives its outcome back
+/// to the `settled` that asks for that delivery.
+pub enum Taken {
+    Delivery(Delivery),
+    Outcome(u32, weida_amqp::settlement::Outcome),
+}
+
+/// The next delivery: one a cancelled receive gave back if there is one,
+/// otherwise the link's own. Every receive goes through here, so a restored
+/// delivery is never overtaken by a newer one.
+pub(crate) async fn next_of(link: &mut Lease<Link, Taken>) -> Option<Delivery> {
+    match link.restored_where(|taken| matches!(taken, Taken::Delivery(_))) {
+        Some(Taken::Delivery(delivery)) => Some(delivery),
+        _ => link.next_delivery().await,
+    }
+}
 
 /// `weida_amqp.Link`.
 #[pyclass(frozen, name = "Link", module = "weida_amqp")]
 pub struct PyLink {
-    inner: Arc<Slot<Link>>,
+    inner: Arc<Slot<Link, Taken>>,
     bridge: Bridge,
     #[allow(
         dead_code,
@@ -208,18 +230,14 @@ impl PyLink {
         // Converted under the GIL, before the coroutine starts: the body must
         // outlive the call that made it, and a `&[u8]` borrowed from a Python
         // object does not.
-        let payload = if text {
-            body.extract::<String>()?.into_bytes()
-        } else {
-            weida_py_core::payload_of(body)?
-        };
+        let octets = Octets::of(body, text)?;
         // The message is encoded here rather than in the future, because
         // `Message` borrows its fields and a future must own what it carries.
         let encoded = {
             let message = message_from(
                 py,
                 &Outgoing {
-                    body: &payload,
+                    body: octets.as_slice(),
                     text,
                     subject: subject.as_deref(),
                     message_id: message_id.as_deref(),
@@ -265,16 +283,12 @@ impl PyLink {
         text: bool,
         durable: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let payload = if text {
-            body.extract::<String>()?.into_bytes()
-        } else {
-            weida_py_core::payload_of(body)?
-        };
+        let octets = Octets::of(body, text)?;
         let encoded = {
             let message = message_from(
                 py,
                 &Outgoing {
-                    body: &payload,
+                    body: octets.as_slice(),
                     text,
                     durable,
                     ..Outgoing::default()
@@ -302,28 +316,45 @@ impl PyLink {
     /// let a caller do.
     fn settled<'py>(&self, py: Python<'py>, delivery_id: u32) -> PyResult<Bound<'py, PyAny>> {
         let slot = Arc::clone(&self.inner);
-        self.bridge.awaitable(py, async move {
-            let outcome = slot
-                .acquire()
-                .await
-                .settled(delivery_id)
-                .await
-                .map_err(errors::errno_of)?;
-            Ok(PyOutcome::of(outcome))
-        })
+        let restore_to = Arc::clone(&self.inner);
+        // An outcome already taken for this delivery is returned first; one
+        // that a cancelled `settled` gave back is restored rather than lost.
+        self.bridge.awaitable_restoring(
+            py,
+            async move {
+                let mut link = slot.acquire().await;
+                let outcome = match link.restored_where(
+                    |taken| matches!(taken, Taken::Outcome(id, _) if *id == delivery_id),
+                ) {
+                    Some(Taken::Outcome(_, outcome)) => outcome,
+                    _ => link.settled(delivery_id).await.map_err(errors::errno_of)?,
+                };
+                Ok(PyOutcome::of(outcome))
+            },
+            move |outcome: PyOutcome| {
+                restore_to.restore(Taken::Outcome(delivery_id, outcome.into_inner()));
+            },
+        )
     }
 
     /// The next delivery, or `None` once the link has detached.
     fn next_delivery<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let slot = Arc::clone(&self.inner);
-        self.bridge.awaitable(py, async move {
-            Ok(slot
-                .acquire()
-                .await
-                .next_delivery()
-                .await
-                .map(PyDelivery::of))
-        })
+        let restore_to = Arc::clone(&self.inner);
+        // Restores the delivery if this task was cancelled after the receive
+        // took it, so a cancelled `wait_for` loses no message.
+        self.bridge.awaitable_restoring(
+            py,
+            async move {
+                let mut link = slot.acquire().await;
+                Ok(next_of(&mut link).await.map(PyDelivery::of))
+            },
+            move |delivery: Option<PyDelivery>| {
+                if let Some(delivery) = delivery {
+                    restore_to.restore(Taken::Delivery(delivery.into_inner()));
+                }
+            },
+        )
     }
 
     /// `async for delivery in link:`
@@ -334,14 +365,22 @@ impl PyLink {
     /// The next delivery, ending the iteration when the link detaches.
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let slot = Arc::clone(&self.inner);
-        self.bridge.awaitable(py, async move {
-            match slot.acquire().await.next_delivery().await {
-                Some(delivery) => Ok(PyDelivery::of(delivery)),
-                // A detached link delivers nothing further, which for an
-                // `async for` is the end rather than a failure.
-                None => Err(errors::end_of_stream("the link detached")),
-            }
-        })
+        let restore_to = Arc::clone(&self.inner);
+        self.bridge.awaitable_restoring(
+            py,
+            async move {
+                let mut link = slot.acquire().await;
+                match next_of(&mut link).await {
+                    Some(delivery) => Ok(PyDelivery::of(delivery)),
+                    // A detached link delivers nothing further, which for an
+                    // `async for` is the end rather than a failure.
+                    None => Err(errors::end_of_stream("the link detached")),
+                }
+            },
+            move |delivery: PyDelivery| {
+                restore_to.restore(Taken::Delivery(delivery.into_inner()));
+            },
+        )
     }
 
     /// A **receiver**: accepts a delivery.

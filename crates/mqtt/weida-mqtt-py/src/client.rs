@@ -20,13 +20,11 @@
 //! survives, which is what makes a reconnect a resumption rather than a loss.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use tokio::sync::Mutex;
 use weida_mqtt::{Client, Context, DisconnectReasonCode, Event, Events, Session};
-use weida_py_core::{Bridge, Errno};
+use weida_py_core::{Bridge, Errno, Slot, duration};
 
 use crate::errors::{self, STOP_ASYNC_ITERATION, errno_of};
 use crate::options::PyConnectOptions;
@@ -115,7 +113,7 @@ impl PyContext {
                     session: None,
                 },
                 events: PyEvents {
-                    inner: Arc::new(Mutex::new(events)),
+                    inner: Slot::new(events),
                     bridge,
                 },
             })
@@ -153,7 +151,7 @@ impl PyContext {
                     session: Some(session),
                 },
                 events: PyEvents {
-                    inner: Arc::new(Mutex::new(events)),
+                    inner: Slot::new(events),
                     bridge,
                 },
             })
@@ -409,15 +407,9 @@ impl PyClient {
                 "0x{reason_code:02X} is not a DISCONNECT reason code (3.14.2.1)"
             ))
         })?;
-        let expiry = match session_expiry {
-            Some(seconds) if seconds >= 0.0 => Some(Duration::from_secs_f64(seconds)),
-            Some(_) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "session_expiry must be a non-negative number of seconds",
-                ));
-            }
-            None => None,
-        };
+        let expiry = session_expiry
+            .map(|seconds| duration("session_expiry", seconds))
+            .transpose()?;
         let client = Arc::clone(&self.inner);
         self.bridge.awaitable(py, async move {
             client.disconnect_with(code, expiry).await.map_err(errno_of)
@@ -593,7 +585,7 @@ impl PyClient {
 /// messages uses the iterator, which is what most callers want.
 #[pyclass(frozen, name = "Events", module = "weida_mqtt")]
 pub struct PyEvents {
-    inner: Arc<Mutex<Events>>,
+    inner: Arc<Slot<Events, Stashed>>,
     bridge: Bridge,
 }
 
@@ -610,30 +602,37 @@ impl PyEvents {
     /// is the distinction 5.0 exists to make and 3.1.1 could not.
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let events = Arc::clone(&self.inner);
-        self.bridge.awaitable(py, async move {
-            let mut events = events.lock().await;
-            loop {
-                match events.next().await {
-                    Some(Event::Delivered(delivery)) => return Ok(PyDelivery::of(delivery)),
-                    // A resumed exchange completing, or a stored message given
-                    // up on, is not a delivery. Neither is dropped:
-                    // `next_event` yields them.
-                    Some(Event::Completed { .. } | Event::Abandoned { .. }) => continue,
-                    Some(Event::Disconnected(error)) => return Err(errno_of(error)),
-                    // `Event` is `#[non_exhaustive]`: a variant added to the
-                    // library must not silently become a delivery here, and a
-                    // skipped unknown event is the only safe reading of "this
-                    // iterator yields deliveries".
-                    Some(_) => continue,
-                    None => {
-                        return Err(Errno::new(
-                            STOP_ASYNC_ITERATION,
-                            "the connection task has finished and every event has been taken",
-                        ));
+        let restore_into = Arc::clone(&self.inner);
+        self.bridge.awaitable_restoring(
+            py,
+            async move {
+                let mut lease = events.acquire().await;
+                // A delivery or an end that a cancelled receive gave back is older than
+                // anything still in the stream, so it is returned first.
+                match lease.restored_where(|item| !matches!(item, Stashed::Other(_))) {
+                    Some(Stashed::Delivery(delivery)) => return Ok(Next::Delivery(delivery)),
+                    Some(Stashed::Ended(errno)) => return Ok(Next::Ended(errno)),
+                    Some(Stashed::Other(_)) | None => {}
+                }
+                loop {
+                    match lease.next().await.map(Stashed::of) {
+                        Some(Stashed::Delivery(delivery)) => return Ok(Next::Delivery(delivery)),
+                        Some(Stashed::Ended(errno)) => return Ok(Next::Ended(errno)),
+                        // A resumed exchange completing, or a stored message given up
+                        // on, is not a delivery. Neither is dropped: `next_event`
+                        // yields them.
+                        Some(Stashed::Other(_)) => continue,
+                        None => {
+                            return Err(Errno::new(
+                                STOP_ASYNC_ITERATION,
+                                "the connection task has finished and every event has been taken",
+                            ));
+                        }
                     }
                 }
-            }
-        })
+            },
+            move |taken: Next| restore_into.restore(taken.into()),
+        )
     }
 
     /// The next event of **any** kind, as a `(kind, value)` pair:
@@ -648,36 +647,26 @@ impl PyEvents {
     /// it.
     fn next_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let events = Arc::clone(&self.inner);
-        self.bridge.awaitable(py, async move {
-            let mut events = events.lock().await;
-            match events.next().await {
-                Some(Event::Delivered(delivery)) => Ok(Some(Reported::Delivered(delivery))),
-                Some(Event::Completed {
-                    packet_id,
-                    completion,
-                }) => Ok(Some(Reported::Completed {
-                    packet_id,
-                    completion,
-                })),
-                Some(Event::Abandoned { packet_id, error }) => Ok(Some(Reported::Abandoned {
-                    packet_id,
-                    cause: error.to_string(),
-                })),
-                Some(Event::Disconnected(error)) => Err(errno_of(error)),
-                // A variant the library added and this binding does not know.
-                // Reported as such rather than mapped onto one of the two
-                // above, because guessing which is what a caller would then
-                // have to un-guess.
-                Some(other) => Err(Errno::new(
-                    "Configuration",
-                    format!(
-                        "this binding does not know the event {other:?}; \
-                         weida-mqtt-py is older than weida-mqtt"
-                    ),
-                )),
-                None => Ok(None),
-            }
-        })
+        let restore_into = Arc::clone(&self.inner);
+        self.bridge.awaitable_restoring(
+            py,
+            async move {
+                let mut lease = events.acquire().await;
+                let taken = match lease.restored() {
+                    Some(taken) => taken,
+                    None => match lease.next().await {
+                        Some(event) => Stashed::of(event),
+                        None => return Ok(NextEvent::Done),
+                    },
+                };
+                Ok(NextEvent::Taken(taken))
+            },
+            move |taken: NextEvent| {
+                if let NextEvent::Taken(taken) = taken {
+                    restore_into.restore(taken);
+                }
+            },
+        )
     }
 
     fn __repr__(&self) -> String {
@@ -705,42 +694,108 @@ impl<'py> IntoPyObject<'py> for Codes {
     }
 }
 
-/// One event, as the `(kind, value)` pair `next_event` yields.
-enum Reported {
-    Delivered(weida_mqtt::Delivery),
-    Completed {
-        packet_id: u16,
-        completion: weida_mqtt::Completion,
-    },
-    Abandoned {
-        packet_id: u16,
-        cause: String,
-    },
+/// What a receive took off the stream and has not yet handed to Python. It is
+/// kept as the library gave it, so a receive that was cancelled before Python
+/// took the value can put it back exactly as it was.
+enum Stashed {
+    /// A delivery.
+    Delivery(weida_mqtt::Delivery),
+    /// The connection ended, with the failure that ended it.
+    Ended(Errno),
+    /// A completion or an abandonment, which only `next_event` yields.
+    Other(Event),
 }
 
-impl<'py> IntoPyObject<'py> for Reported {
+impl Stashed {
+    /// Takes an event off the stream. A disconnection is converted here, on the
+    /// reactor, where no Python object exists.
+    fn of(event: Event) -> Stashed {
+        match event {
+            Event::Delivered(delivery) => Stashed::Delivery(delivery),
+            Event::Disconnected(error) => Stashed::Ended(errno_of(error)),
+            other => Stashed::Other(other),
+        }
+    }
+}
+
+/// What `__anext__` yields: a delivery, or the failure that ended the
+/// connection, which is raised when Python takes it.
+enum Next {
+    Delivery(weida_mqtt::Delivery),
+    Ended(Errno),
+}
+
+impl From<Next> for Stashed {
+    fn from(next: Next) -> Stashed {
+        match next {
+            Next::Delivery(delivery) => Stashed::Delivery(delivery),
+            Next::Ended(errno) => Stashed::Ended(errno),
+        }
+    }
+}
+
+impl<'py> IntoPyObject<'py> for Next {
     type Target = PyAny;
     type Output = Bound<'py, PyAny>;
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         match self {
-            Reported::Delivered(delivery) => {
+            Next::Delivery(delivery) => Ok(Py::new(py, PyDelivery::of(delivery))?
+                .into_bound(py)
+                .into_any()),
+            Next::Ended(errno) => Err(errors::to_py(py, &errno)),
+        }
+    }
+}
+
+/// What `next_event` yields: an event of any kind, the failure that ended the
+/// connection, or the end of the stream.
+enum NextEvent {
+    Taken(Stashed),
+    Done,
+}
+
+impl<'py> IntoPyObject<'py> for NextEvent {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        match self {
+            NextEvent::Done => Ok(py.None().into_bound(py)),
+            NextEvent::Taken(Stashed::Ended(errno)) => Err(errors::to_py(py, &errno)),
+            NextEvent::Taken(Stashed::Delivery(delivery)) => {
                 let value = Py::new(py, PyDelivery::of(delivery))?;
                 Ok(("delivered", value).into_pyobject(py)?.into_any())
             }
-            Reported::Completed {
+            NextEvent::Taken(Stashed::Other(Event::Completed {
                 packet_id,
                 completion,
-            } => {
+            })) => {
                 let value = Py::new(py, PyCompletion::of(completion))?;
                 Ok(("completed", (packet_id, value))
                     .into_pyobject(py)?
                     .into_any())
             }
-            Reported::Abandoned { packet_id, cause } => Ok(("abandoned", (packet_id, cause))
-                .into_pyobject(py)?
-                .into_any()),
+            NextEvent::Taken(Stashed::Other(Event::Abandoned { packet_id, error })) => {
+                Ok(("abandoned", (packet_id, error.to_string()))
+                    .into_pyobject(py)?
+                    .into_any())
+            }
+            // A variant the library added and this binding does not know. It is
+            // reported as such rather than mapped onto one of the above, because
+            // guessing which is what a caller would then have to un-guess.
+            NextEvent::Taken(Stashed::Other(other)) => Err(errors::to_py(
+                py,
+                &Errno::new(
+                    "Configuration",
+                    format!(
+                        "this binding does not know the event {other:?}; \
+                         weida-mqtt-py is older than weida-mqtt"
+                    ),
+                ),
+            )),
         }
     }
 }

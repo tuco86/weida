@@ -17,12 +17,15 @@
 //! loop fails at the call rather than never completing.
 
 use std::ffi::CString;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use futures::StreamExt;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use weida_py_core::{Bridge, Errno, ErrorClasses};
+use weida_py_core::{Bridge, Errno, ErrorClasses, Slot};
 use weida_runtime::Exec;
 
 /// The module's exception classes, exactly as a real binding declares them.
@@ -55,6 +58,9 @@ impl Drop for DropFlag {
 #[pyclass]
 struct Demo {
     bridge: Bridge,
+    /// The queue `take` receives from, behind a slot as a binding's would be.
+    source: Arc<Slot<UnboundedReceiver<i64>, i64>>,
+    feed: UnboundedSender<i64>,
 }
 
 #[pymethods]
@@ -104,6 +110,32 @@ impl Demo {
         })
     }
 
+    /// Makes a value available to `take`.
+    fn feed(&self, value: i64) {
+        self.feed.unbounded_send(value).expect("the queue is open");
+    }
+
+    /// Takes the next value off the queue, giving it back if the task that
+    /// asked for it was cancelled before it could take it.
+    fn take<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let slot = Arc::clone(&self.source);
+        let back = Arc::clone(&self.source);
+        self.bridge.awaitable_restoring(
+            py,
+            async move {
+                let mut lease = slot.acquire().await;
+                if let Some(value) = lease.restored() {
+                    return Ok(value);
+                }
+                lease
+                    .next()
+                    .await
+                    .ok_or_else(|| Errno::new("EAGAIN", "the queue closed"))
+            },
+            move |value: i64| back.restore(value),
+        )
+    }
+
     /// How many parked futures have been dropped so far.
     fn dropped(&self) -> usize {
         DROPPED.load(Ordering::SeqCst)
@@ -113,6 +145,7 @@ impl Demo {
 /// Every assertion, in the language the binding is for.
 const SCRIPT: &str = r#"
 import asyncio
+import time
 
 # Nothing happens before the first await: the call outside a loop builds a
 # coroutine and starts no work, so the operation is never half-begun behind a
@@ -171,6 +204,44 @@ async def main():
     # The loop is still healthy afterwards.
     assert await demo.echo(b"after") == b"after"
 
+    # 4. A value whose task was cancelled is given back, in both moments the
+    # bridge documents. `take` parks on the Rust side until `feed` runs.
+    # (a) The completion reaches the loop and finds the future cancelled. The
+    # loop is blocked in `time.sleep`, which releases the GIL, so the reactor
+    # finishes the receive and the delivery thread queues the completion
+    # before the cancellation's abort callback can run.
+    task = asyncio.ensure_future(demo.take())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    demo.feed(7)
+    time.sleep(0.2)
+    await asyncio.sleep(0.05)
+    assert task.cancelled()
+    assert await asyncio.wait_for(demo.take(), 5) == 7, "the value was lost"
+
+    # (b) The completion is delivered and the task is cancelled before the
+    # coroutine resumes: `call_soon` queues the cancel behind the completion,
+    # which in turn queues the task's wakeup behind the cancel.
+    task = asyncio.ensure_future(demo.take())
+    await asyncio.sleep(0.05)
+    demo.feed(8)
+    time.sleep(0.2)
+    asyncio.get_running_loop().call_soon(task.cancel)
+    await asyncio.sleep(0.05)
+    assert task.cancelled()
+    assert await asyncio.wait_for(demo.take(), 5) == 8, "the value was lost"
+
+    # A value that was taken is not given back.
+    task = asyncio.ensure_future(demo.take())
+    await asyncio.sleep(0.05)
+    demo.feed(9)
+    assert await asyncio.wait_for(task, 5) == 9
+    try:
+        await asyncio.wait_for(demo.take(), 0.1)
+        raise AssertionError("nothing is left to take")
+    except asyncio.TimeoutError:
+        pass
+
 asyncio.run(main())
 "#;
 
@@ -184,10 +255,13 @@ fn a_binding_of_nothing_proves_the_foundation() {
         module.add_class::<Demo>()?;
         ERRORS.install(&module, "DemoError", &["EAGAIN", "ETERM"])?;
 
+        let (feed, receiver) = unbounded();
         let demo = Py::new(
             py,
             Demo {
                 bridge: Bridge::new(exec.clone(), to_py),
+                source: Slot::new(receiver),
+                feed,
             },
         )?;
         let globals = module.dict();

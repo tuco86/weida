@@ -107,6 +107,29 @@ def test_next_delivery_takes_a_timeout_and_returns_none_when_it_elapses():
     connection.close()
 
 
+def test_a_timeout_that_cannot_be_counted_is_refused_as_an_exception():
+    async def script(peer):
+        await peer.handshake()
+        await peer.answer_begin()
+        await peer.answer_attach(role_is_sender=True)
+        await peer.read_performative()  # the flow
+        await peer.expect_close()
+
+    port, _ = peer_thread(script)
+    connection = sync.connect("127.0.0.1", port, container_id="test")
+    session = connection.begin()
+    receiver = session.attach("invoices", "receiver", "/queues/invoices")
+    receiver.grant_credit(1)
+
+    with pytest.raises(Exception):
+        receiver.next_delivery(timeout=float("inf"))
+    with pytest.raises(Exception):
+        sync.connect("127.0.0.1", 9, container_id="test", handshake_timeout=float("nan"))
+
+    connection.close()
+
+
+
 def test_a_delivery_arrives_and_is_accepted_synchronously():
     async def script(peer):
         await peer.handshake()

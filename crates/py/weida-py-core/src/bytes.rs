@@ -44,6 +44,7 @@
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes};
 
 /// Borrows a Python payload without copying it.
@@ -77,6 +78,58 @@ pub fn payload_of(object: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 /// why zero is not on the menu.
 pub fn py_bytes<'py>(py: Python<'py>, payload: &[u8]) -> Bound<'py, PyBytes> {
     PyBytes::new(py, payload)
+}
+
+/// A `bytes` object made from Rust-owned octets the first time Python asks for
+/// it, and the same object every time after.
+///
+/// A getter that calls [`py_bytes`] copies the payload on **every access**, and
+/// `if m.payload: ... len(m.payload) ... use(m.payload)` is three copies of a
+/// body that already costs one. This is the cell a `#[pyclass]` keeps beside
+/// the field it converts instead: the first [`get`](LazyBytes::get) makes the
+/// object, and the rest are a reference-count increment. Identity holds too —
+/// `m.payload is m.payload` — which is also what a caller expects of an
+/// immutable value.
+///
+/// The Rust octets stay where they are. A message that arrived as `bytes` and
+/// is only ever forwarded never pays for the conversion, which is why the cell
+/// is lazy rather than filled at construction.
+pub struct LazyBytes {
+    cell: PyOnceLock<Py<PyBytes>>,
+}
+
+impl Default for LazyBytes {
+    fn default() -> LazyBytes {
+        LazyBytes::new()
+    }
+}
+
+impl LazyBytes {
+    /// An empty cell.
+    pub const fn new() -> LazyBytes {
+        LazyBytes {
+            cell: PyOnceLock::new(),
+        }
+    }
+
+    /// A cell already holding `object`, for a payload that arrived from Python
+    /// as `bytes`: handing the same object back is no copy at all.
+    pub fn seeded(object: Bound<'_, PyBytes>) -> LazyBytes {
+        let cell = PyOnceLock::new();
+        // A fresh cell cannot already be set.
+        let _ = cell.set(object.py(), object.unbind());
+        LazyBytes { cell }
+    }
+
+    /// The `bytes` object for `octets`, copied into it on the first call.
+    ///
+    /// `octets` must be the same on every call: only the first is read.
+    pub fn get<'py>(&self, py: Python<'py>, octets: &[u8]) -> Bound<'py, PyBytes> {
+        self.cell
+            .get_or_init(py, || py_bytes(py, octets).unbind())
+            .bind(py)
+            .clone()
+    }
 }
 
 /// The one error message this module has, so that both entry points refuse the

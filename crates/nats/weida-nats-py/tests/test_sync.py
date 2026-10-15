@@ -16,6 +16,9 @@ thread, which is the server and not the client.
 """
 
 import asyncio
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -297,3 +300,51 @@ def test_the_two_surfaces_agree(server):
         assert blocking_reply.status is awaited_reply.status is None
     finally:
         other.stop()
+
+# --------------------------------------------------------------------------
+# Bounds are configuration errors, and Ctrl-C ends a blocking wait
+
+
+@pytest.mark.parametrize("window", [1e30, -1.0, float("nan")])
+def test_a_bad_window_is_a_configuration_error(server, window):
+    nats = connected(server)
+    with pytest.raises(weida_nats.Configuration):
+        nats.request("service.echo", b"", window)
+    subscription = nats.subscribe("orders.created")
+    with pytest.raises(weida_nats.Configuration):
+        subscription.next_msg(window)
+    nats.close()
+
+
+def test_an_unbounded_queue_is_a_configuration_error(server):
+    with pytest.raises(weida_nats.Configuration):
+        connected(server, subscription_queue=2**62)
+    nats = connected(server)
+    with pytest.raises(weida_nats.Configuration):
+        nats.request_many("service.echo", b"", 0.1, 2**62)
+    nats.close()
+
+
+def test_ctrl_c_ends_a_blocking_next_msg(server):
+    script = (
+        "from weida_nats import sync\n"
+        f"nats = sync.connect('127.0.0.1', {server.port})\n"
+        "subscription = nats.subscribe('never.published')\n"
+        "print('ready', flush=True)\n"
+        "subscription.next_msg(60)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert child.stdout.readline().strip() == b"ready"
+        time.sleep(0.5)
+        child.send_signal(signal.SIGINT)
+        _, err = child.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        raise AssertionError("Ctrl-C did not end next_msg within 3 seconds")
+    assert b"KeyboardInterrupt" in err
+    assert child.returncode != 0

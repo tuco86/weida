@@ -9,8 +9,8 @@
 //! # The handle is leased
 //!
 //! `weida_amqp::Session` needs `&mut self` to read its events, so it lives in
-//! a [`Slot`](crate::lease::Slot) and each coroutine leases it for the length
-//! of one operation. A cancelled task gives it back; see `lease.rs`.
+//! a [`Slot`](weida_py_core::Slot) and each coroutine leases it for the length
+//! of one operation. A cancelled task gives it back: the lease's `Drop` does.
 
 use std::sync::Arc;
 
@@ -23,9 +23,9 @@ use weida_py_core::Bridge;
 use weida_runtime::OwnedReactor;
 
 use crate::errors;
-use crate::lease::Slot;
 use crate::link::PyLink;
 use crate::values::{receiver_settle_mode, sender_settle_mode};
+use weida_py_core::Slot;
 
 /// `weida_amqp.Session`.
 #[pyclass(frozen, name = "Session", module = "weida_amqp")]

@@ -28,7 +28,7 @@ use pyo3::types::{PyBytes, PyDict};
 use weida_mqtt::{
     Completion, Delivery, Message, PayloadFormat, QoS, RetainHandling, RetainedOrigin, Subscription,
 };
-use weida_py_core::{payload_of, py_bytes};
+use weida_py_core::{LazyBytes, duration, payload_of};
 
 /// Turns Python's QoS integer into the library's, refusing anything else at
 /// the call site rather than rounding it.
@@ -52,23 +52,20 @@ pub fn qos_byte(qos: QoS) -> u8 {
     }
 }
 
-/// Seconds as a float, refusing a negative one.
-fn seconds(name: &str, value: Option<f64>) -> PyResult<Option<Duration>> {
-    match value {
-        None => Ok(None),
-        Some(value) if value.is_finite() && value >= 0.0 => {
-            Ok(Some(Duration::from_secs_f64(value)))
-        }
-        Some(value) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "{name} must be a non-negative number of seconds; {value} is not"
-        ))),
-    }
+/// Seconds as a float, refusing a negative, non-finite or oversized one.
+pub(crate) fn seconds(name: &str, value: Option<f64>) -> PyResult<Option<Duration>> {
+    Ok(match value {
+        None => None,
+        Some(value) => Some(duration(name, value)?),
+    })
 }
 
 /// `weida_mqtt.Message`: one Application Message to publish.
 #[pyclass(frozen, name = "Message", module = "weida_mqtt")]
 pub struct PyMessage {
     pub(crate) inner: Message,
+    /// The payload as Python sees it, copied once on first access.
+    payload_cell: LazyBytes,
 }
 
 impl PyMessage {
@@ -112,9 +109,17 @@ impl PyMessage {
         payload_format_utf8: bool,
         user_properties: Option<Vec<(String, String)>>,
     ) -> PyResult<PyMessage> {
-        let payload = match payload {
-            Some(value) => payload_of(value)?,
-            None => Vec::new(),
+        let (payload, payload_cell) = match payload {
+            Some(value) => {
+                // A `bytes` argument is the object Python already holds, so it is
+                // the one handed back; anything else is copied once.
+                let cell = match value.cast::<PyBytes>() {
+                    Ok(bytes) => LazyBytes::seeded(bytes.clone()),
+                    Err(_) => LazyBytes::new(),
+                };
+                (payload_of(value)?, cell)
+            }
+            None => (Vec::new(), LazyBytes::new()),
         };
         let correlation_data = match correlation_data {
             Some(value) => Some(payload_of(value)?),
@@ -133,6 +138,7 @@ impl PyMessage {
                 correlation_data,
                 user_properties: user_properties.unwrap_or_default(),
             },
+            payload_cell,
         })
     }
 
@@ -153,6 +159,7 @@ impl PyMessage {
                 qos: qos_of(qos)?,
                 ..Message::delete_retained(topic)
             },
+            payload_cell: LazyBytes::new(),
         })
     }
 
@@ -165,7 +172,7 @@ impl PyMessage {
     /// The payload.
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        py_bytes(py, &self.inner.payload)
+        self.payload_cell.get(py, &self.inner.payload)
     }
 
     /// 0, 1 or 2.
@@ -196,12 +203,18 @@ impl PyMessage {
 #[pyclass(frozen, name = "Delivery", module = "weida_mqtt")]
 pub struct PyDelivery {
     inner: Delivery,
+    payload_cell: LazyBytes,
+    correlation_cell: LazyBytes,
 }
 
 impl PyDelivery {
     /// Wraps a delivery from the library.
     pub fn of(inner: Delivery) -> PyDelivery {
-        PyDelivery { inner }
+        PyDelivery {
+            inner,
+            payload_cell: LazyBytes::new(),
+            correlation_cell: LazyBytes::new(),
+        }
     }
 }
 
@@ -217,7 +230,7 @@ impl PyDelivery {
     /// The payload.
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        py_bytes(py, &self.inner.payload)
+        self.payload_cell.get(py, &self.inner.payload)
     }
 
     /// The QoS it was **delivered** at, which need not be the QoS it was
@@ -303,7 +316,7 @@ impl PyDelivery {
             properties
                 .correlation_data
                 .as_deref()
-                .map(|bytes| py_bytes(py, bytes)),
+                .map(|bytes| self.correlation_cell.get(py, bytes)),
         )?;
         // A list of pairs and not a dict: "the same name may appear more than
         // once" ([MQTT-3.3.2-17] preserves order and repeats), and a dict

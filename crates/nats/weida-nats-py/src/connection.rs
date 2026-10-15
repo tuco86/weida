@@ -374,6 +374,7 @@ impl PyConnection {
         let subject = subject_of(subject)?;
         let payload = payload_of(payload)?;
         let window = options::window(py, "timeout", timeout)?;
+        let max_replies = options::bounded(py, "max_replies", max_replies)?;
         let connection = self.inner.clone();
         self.bridge.awaitable(py, async move {
             connection

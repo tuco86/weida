@@ -16,6 +16,13 @@ use weida_nng::{Broadcast, Message};
 /// makes is into the `bytes` object Python owns.
 pub struct Body(pub Message);
 
+impl Body {
+    /// The library's message, for a receive that has to give it back.
+    pub fn into_inner(self) -> Message {
+        self.0
+    }
+}
+
 impl<'py> IntoPyObject<'py> for Body {
     type Target = PyBytes;
     type Output = Bound<'py, PyBytes>;

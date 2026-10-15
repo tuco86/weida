@@ -50,10 +50,6 @@ weida-nats.workspace = true
 # ambient Tokio runtime open a connection, and `OwnedReactor` is the value
 # that keeps that runtime alive for as long as the connection object.
 weida-runtime.workspace = true
-# One thing: `tokio::sync::Notify`, which is what makes a `Subscription` —
-# whose `next` takes `&mut self` — usable from two coroutines in turn without
-# ever being used by two at once. See `src/lease.rs`.
-tokio.workspace = true
 # `futures::executor::block_on`, and nothing else. It is the executor the
 # synchronous surface drives the library's futures on, on the *calling*
 # thread; see the module documentation of `src/sync.rs` for why it is not the
