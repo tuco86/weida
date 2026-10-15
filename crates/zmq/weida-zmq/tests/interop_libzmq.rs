@@ -885,6 +885,97 @@ async fn our_curve_client_reaches_a_libzmq_server() {
     assert_eq!(peer.await.expect("the peer"), b"ping");
 }
 
+/// Measured against libzmq 4.3.5: **a CURVE server asks a bound ZAP handler
+/// even when `ZMQ_ZAP_DOMAIN` is empty.** The 4.3.5 manual's sentence for
+/// that option, "when the ZAP domain is empty, which is the default, ZAP
+/// authentication is disabled", holds for NULL and not for CURVE, where the
+/// trigger is the handler being bound. Treating an empty domain as "do not
+/// authorize" would admit every client of a deployment that bound a handler
+/// to allow-list keys and never set a domain, so this library asks too (and
+/// stays closed, where libzmq opens, when a domain is set and nothing is
+/// bound).
+#[tokio::test]
+#[ignore = needs_libzmq!()]
+async fn libzmq_asks_a_bound_handler_for_curve_without_a_domain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let context = context();
+    let (server_public, server_secret) = keypair();
+    let (client_public, client_secret) = keypair();
+    let server_secret_bytes = secret_key_bytes(&server_secret);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+
+    let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::task::spawn_blocking(move || {
+        let ctx = zmq::Context::new();
+        let handler = ctx.socket(zmq::REP).expect("a REP socket");
+        handler
+            .bind("inproc://zeromq.zap.01")
+            .expect("bind the ZAP endpoint");
+        std::thread::spawn(move || {
+            while let Ok(request) = handler.recv_multipart(0) {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let reply: Vec<Vec<u8>> = vec![
+                    b"1.0".to_vec(),
+                    request[1].clone(),
+                    b"200".to_vec(),
+                    b"OK".to_vec(),
+                    b"interop".to_vec(),
+                    Vec::new(),
+                ];
+                if handler.send_multipart(reply, 0).is_err() {
+                    return;
+                }
+            }
+        });
+        let responder = libzmq_socket(&ctx, zmq::REP);
+        responder.set_curve_server(true).expect("curve server");
+        responder
+            .set_curve_secretkey(&server_secret_bytes)
+            .expect("secret key");
+        // No `set_zap_domain`: the default, empty.
+        responder.bind("tcp://127.0.0.1:0").expect("bind");
+        endpoint_tx
+            .send(
+                responder
+                    .get_last_endpoint()
+                    .expect("last endpoint")
+                    .expect("utf-8"),
+            )
+            .expect("the test is listening");
+        let request = responder.recv_bytes(0).expect("recv");
+        responder.send("pong", 0).expect("reply");
+        std::thread::sleep(Duration::from_millis(100));
+        request
+    });
+
+    let endpoint = within(endpoint_rx).await.expect("the endpoint");
+    let mut requester = ReqSocket::with_options(
+        &context,
+        SocketOptions {
+            curve_publickey: Some(client_public),
+            curve_secretkey: Some(client_secret),
+            curve_serverkey: Some(server_public),
+            ..SocketOptions::default()
+        },
+    )
+    .expect("req");
+    requester.connect(&endpoint).expect("connect");
+    within(requester.send(Multipart::single("ping")))
+        .await
+        .expect("our request");
+    let reply = within(requester.recv()).await.expect("our reply");
+    assert_eq!(text(&reply), "pong");
+    assert_eq!(peer.await.expect("the peer"), b"ping");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "libzmq asks a bound handler about a CURVE client whatever the domain"
+    );
+}
+
 // ---- ZAP: the refusal ------------------------------------------------
 
 /// A ZAP refusal closes the connection rather than rejecting a message: the

@@ -150,8 +150,15 @@ pub fn decode(
         len: header.len,
         max: usize::MAX as u64,
     })?;
-    let body = input.get(used..used + len).ok_or(FrameError::Incomplete)?;
-    Ok((header, body, used + len))
+    // `used` is 2 or 9 and `len` is already capped, so the sum cannot overflow
+    // on a 64-bit target. A 32-bit target can overflow it, and a body that
+    // large could not be held there anyway, so it is refused as too large.
+    let end = used.checked_add(len).ok_or(FrameError::BodyTooLarge {
+        len: header.len,
+        max: usize::MAX as u64,
+    })?;
+    let body = input.get(used..end).ok_or(FrameError::Incomplete)?;
+    Ok((header, body, end))
 }
 
 /// Appends a frame header for a body of `len` octets.

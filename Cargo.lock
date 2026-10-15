@@ -3618,6 +3618,7 @@ dependencies = [
 name = "weida-amqp"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
+ "bytes",
  "fe2o3-amqp",
  "rcgen",
  "tokio",
@@ -3663,6 +3664,7 @@ version = "0.1.0-alpha.7-dev"
 name = "weida-mqtt"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
+ "bytes",
  "futures",
  "rcgen",
  "tokio",
@@ -3691,7 +3693,9 @@ name = "weida-nats"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
  "async-nats",
+ "bytes",
  "futures-util",
+ "rand 0.9.5",
  "rcgen",
  "tokio",
  "tokio-rustls",
@@ -3721,10 +3725,12 @@ dependencies = [
 name = "weida-nng"
 version = "0.1.0-alpha.7-dev"
 dependencies = [
+ "bytes",
  "futures",
  "nng",
  "rcgen",
  "rustls-webpki",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3760,6 +3766,7 @@ dependencies = [
  "tracing",
  "webpki-roots 1.0.9",
  "weida",
+ "zeroize",
 ]
 
 [[package]]
@@ -3831,6 +3838,8 @@ version = "0.1.0-alpha.7-dev"
 dependencies = [
  "bytes",
  "crypto_box",
+ "crypto_secretbox",
+ "curve25519-dalek",
  "futures",
  "tokio",
  "tracing",
@@ -3838,6 +3847,7 @@ dependencies = [
  "weida-core",
  "weida-runtime",
  "weida-zmtp",
+ "zeroize",
  "zeromq",
  "zmq",
 ]

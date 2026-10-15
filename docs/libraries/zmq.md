@@ -80,7 +80,7 @@ is refused too, with "this library speaks tcp, ipc and inproc".
 | Transport | Verdict |
 | --- | --- |
 | `tcp://` | present — wildcard, IP literal and name forms kept apart; `ZMQ_LAST_ENDPOINT` readable after a wildcard bind; `DEFAULT_MAX_RESOLVED_ADDRESSES` = 8 caps what a name may expand to |
-| `ipc://` | present on Unix — `AF_UNIX` with unlink-then-bind, an explicit mode, a socket-type check before unlinking, the 113-octet Linux path budget (`MAX_IPC_ENDPOINT_BYTES`), and peer credentials available to authorization; the endpoint-stealing hazard is documented rather than papered over |
+| `ipc://` | present on Unix — `AF_UNIX` with an explicit mode, a socket-type check before anything is replaced, the 113-octet Linux path budget (`MAX_IPC_ENDPOINT_BYTES`), and peer credentials available to authorization. A node nobody listens on is replaced, and **a node somebody listens on is refused with `EADDRINUSE`**, where libzmq lets a second bind steal the endpoint |
 | `inproc://` | present — context-scoped namespace, libzmq's 256-character budget (`MAX_INPROC_NAME_BYTES`), connect-before-bind working as libzmq 4.0 fixed it, and two contexts in one process never meeting |
 | `pgm://`, `epgm://` | refused with a reason: reliable multicast is out of scope until a user asks. What is missing: the multicast family, the datagram-alignment offset field and subscriber-side filtering |
 | `udp://` | refused with a reason: the multicast/datagram family is out of scope. What is missing: RADIO/DISH, which is the only pattern libzmq allows on it |
@@ -97,8 +97,8 @@ One mechanism per socket, announced in the greeting and never negotiated, which 
 | --- | --- |
 | NULL (37/ZMTP) | present — greeting with the 3.0 downgrade, `READY` metadata with `Socket-Type` and `Identity`, `PING`/`PONG` gated on the negotiated version, `ERROR` sent and understood |
 | PLAIN (24/ZMTP-PLAIN) | present — `HELLO`/`WELCOME`/`INITIATE`/`READY` with username and password, either side, and the ZAP dialog behind it |
-| CURVE (25/ZMTP-CURVE, 26/CURVEZMQ) | present — the four keys; `HELLO` 200, `WELCOME` 168, `INITIATE` 257+, `READY` 30+ octets; the cookie discarded by a valid `INITIATE` or by `COOKIE_LIFETIME` (60 s); the nonce prefixes and short counters, which never repeat within a connection; session keys destroyed when the connection closes; the three security models; the peer's long-term key handed to the ZAP handler as the credential. One cryptographic dependency, `crypto_box` (RustCrypto's NaCl `crypto_box`: XSalsa20-Poly1305 over X25519), and `unsafe_code = "forbid"` |
-| ZAP (27/ZAP) | present — request and reply framing over `inproc://zeromq.zap.01`, one handler per context, status 200/300/400/500, the user-id field, `ZMQ_ZAP_DOMAIN` as the switch that turns authorization on, `ZMQ_ZAP_ENFORCE_DOMAIN` checked at configuration time; a 400 refuses the connection before any message flows, and the user id never becomes a weida identity |
+| CURVE (25/ZMTP-CURVE, 26/CURVEZMQ) | present — the four keys; `HELLO` 200, `WELCOME` 168, `INITIATE` 257+, `READY` 30+ octets; the cookie discarded by a valid `INITIATE` or by `COOKIE_LIFETIME` (60 s), sealed under a random per-connection key so it costs no key agreement; the nonce prefixes and short counters, which never repeat within a connection; session keys destroyed when the connection closes; the three security models; the peer's long-term key handed to the ZAP handler as the credential. The primitives are `curve25519-dalek`'s X25519 (RFC 7748 clamping, no reduction modulo the group order) and `crypto_secretbox`'s XSalsa20-Poly1305, composed as NaCl's `crypto_box`, which stays a test oracle only. A peer key that makes the shared secret all-zero (the small-order points) is refused with `EACCES`; every secret is a `Zeroizing` buffer; frames are sealed and opened in place in the connection's buffers; an unauthenticated `HELLO` costs the server one scalar multiplication and one base-point multiplication; and `unsafe_code = "forbid"` |
+| ZAP (27/ZAP) | present — request and reply framing over `inproc://zeromq.zap.01`, one handler per context, status 200/300/400/500, the user-id field, `ZMQ_ZAP_ENFORCE_DOMAIN` checked at configuration time; a 400 refuses the connection before any message flows, and the user id never becomes a weida identity. **When a handler is asked follows libzmq's rule, measured against libzmq 4.3.5:** always for PLAIN, with a `ZMQ_ZAP_DOMAIN` for NULL, and for a CURVE server when a domain is set **or a handler is bound**; a missing handler under that rule refuses. The request is read by position (the credential frames are counted by mechanism, and only the last extension frame is the kernel's `X-Local-Principal` statement), a PLAIN username that begins like that frame is refused before any handler is asked, and the dialog is a raw internal DEALER connection that takes no socket slot |
 | GSSAPI | **absent** — what is missing: the mechanism itself and a Kerberos stack under it. Its six options are refused by name (§5), because a mechanism this library cannot speak must not be announced in a greeting |
 | Private mechanisms | **absent** — 37/ZMTP permits them and this library has none; a peer announcing an unknown mechanism is refused at the greeting with `ENOCOMPATPROTO` |
 
@@ -344,9 +344,10 @@ no `split`: 28/REQREP alternates, so two independent halves would promise what t
 forbids. Each half is still one operation at a time, and a ROUTER's two halves share one
 routing table behind a lock that is never held across an `await`.
 
-**Seven bounds that are not libzmq options at all.** libzmq bounds a message count per queue and
+**Bounds that are not libzmq options at all.** libzmq bounds a message count per queue and
 nothing else; every number below exists because no remote input may cause unbounded allocation
-([INVARIANTS.md](../INVARIANTS.md)), and each is a named constant rather than a magic value:
+or unbounded waiting ([INVARIANTS.md](../INVARIANTS.md)), and each is a named constant rather
+than a magic value:
 
 | Bound | Default | What it bounds, and why libzmq has no option for it |
 | --- | --- | --- |
@@ -357,6 +358,13 @@ nothing else; every number below exists because no remote input may cause unboun
 | `MessageLimits::max_message_frames` | 1024 | frames in one message. ZMTP bounds a frame's size through `ZMQ_MAXMSGSIZE` and the frame *count* not at all, so a peer could send a million empty frames |
 | `MAX_ZAP_DOMAIN_BYTES` | 256 | the ZAP domain a caller may configure, which travels in every ZAP request |
 | `MONITOR_CAPACITY` | 1024 | events one monitor holds before the oldest are dropped, which is a drop and not a silence |
+| `HANDSHAKE_MAX_FRAME` | 64 KiB | one frame before the handshake ends. `ZMQ_MAXMSGSIZE` bounds data frames, and a `READY`, `INITIATE` or ZAP-sized command needs a few kilobytes; the header is judged first, so a frame declaring more is refused without being read, and a data frame during the handshake is refused at its header |
+| `weida_zmtp::MAX_PROPERTIES` | 64 | properties in one `READY` or `INITIATE` dictionary. The codec bounded a property's size and not their number, so a megabyte of five-octet properties was a hundred thousand entries |
+| `MESSAGE_IVL` and `MIN_MESSAGE_RATE` | 30 s, plus 1 s per 4 KiB that arrives | how long a started message may stay incomplete, with the heartbeat on or off. The deadline moves out only by octets that arrive, so declaring a large message earns nothing and a peer that trickles one ends the connection |
+| `OUT_HIGH_WATER` | 256 KiB | the output a connection builds before it stops taking messages from its pipe, so a peer that does not read holds this much plus one batch, and the heartbeat still ends the connection |
+| `PER_ADDRESS_DIVISOR`, `PER_ADDRESS_FLOOR` | `max_peers / 8`, at least 8 | the peers one remote IP address may hold (128 at the default `max_peers`); loopback, `ipc` and `inproc` are exempt, so a local multi-process deployment is not capped |
+| `HANDSHAKE_EVICT_AFTER` | 2 s | how long a handshake may stall in a full socket or address before a newcomer takes its place; a peer that completes a handshake is never evicted |
+| `ACCEPT_BACKOFF_MIN`, `ACCEPT_BACKOFF_MAX` | 10 ms, 1 s | the pause between accept attempts while they keep failing, so a descriptor ceiling slows a listener down instead of ending it or spinning on it; each failure is counted and published as `AcceptFailed`, logged at most once a second |
 
 `INPROC_BUFFER_BYTES` (64 KiB) and `DEFAULT_MAX_RESOLVED_ADDRESSES` (8) are the same kind of
 number for the `inproc` transport and the resolver.

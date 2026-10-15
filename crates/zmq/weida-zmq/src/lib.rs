@@ -100,8 +100,9 @@
 //!   connection, session keys destroyed when the connection closes, the
 //!   peer's long-term key handed to the ZAP handler as the CURVE credential,
 //!   and every frame after the `READY` inside a `MESSAGE` box. The layouts
-//!   are `weida-zmtp`'s; the one cryptographic dependency is `crypto_box`,
-//!   RustCrypto's NaCl `crypto_box` — see [`curve`].
+//!   are `weida-zmtp`'s; the primitives are `curve25519-dalek`'s X25519 and
+//!   `crypto_secretbox`'s XSalsa20-Poly1305, composed as NaCl's `crypto_box`
+//!   — see [`curve`].
 //!
 //! - [`optiontable`] — every `zmq_setsockopt` and `zmq_ctx_set` option by
 //!   name, honoured under the name this library gives it or refused with one

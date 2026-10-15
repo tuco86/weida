@@ -163,13 +163,25 @@ minicbor = { version = "2", features = ["alloc"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 ring = "0.17"
-# The one cryptographic dependency of `weida-zmq`, for CURVE. RustCrypto's
-# NaCl-compatible `crypto_box`: X25519 key agreement, HSalsa20 to derive the
-# shared key, XSalsa20-Poly1305 for the box - which is exactly the
+# RustCrypto's NaCl-compatible `crypto_box`: X25519 key agreement, HSalsa20 to
+# derive the shared key, XSalsa20-Poly1305 for the box - which is exactly the
 # construction 26/CURVEZMQ is specified in terms of, rather than a lookalike,
-# so a box this workspace seals opens in libsodium and libzmq. Pure Rust, so
+# so a box this workspace seals opens in libsodium and libzmq. `weida-zmq`
+# uses it only in its tests, as the independent implementation the library's
+# own composition (below) is checked against. Pure Rust, so
 # `unsafe_code = "forbid"` survives it.
 crypto_box = "0.9"
+# The primitives under CURVE, named directly. `crypto_box` keeps the raw bytes
+# of every `SecretKey` it is handed in a field its `Drop` does not wipe, so a
+# secret that passes through it outlives the connection in freed memory;
+# owning the Diffie-Hellman step (X25519, then HSalsa20, which is all
+# `crypto_box_beforenm` is) keeps every secret in a `Zeroizing` buffer.
+# `crypto_box` stays for the tests, as the independent implementation the
+# local one is checked against. All three are already in the graph through
+# `crypto_box` itself, so this adds edges and no crate.
+crypto_secretbox = { version = "0.1", default-features = false, features = ["alloc", "salsa20"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["precomputed-tables", "zeroize"] }
+zeroize = "1"
 # The Python bindings' one foreign dependency: CPython through PyO3.
 # `abi3-py39` is the limited API, so one wheel covers every CPython from 3.9
 # on, which is what the bindings' registry metadata promises. The bindings

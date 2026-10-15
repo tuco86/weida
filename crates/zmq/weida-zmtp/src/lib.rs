@@ -38,7 +38,8 @@
 //!
 //! Decoders borrow: a decoded frame body is a slice of the caller's buffer and
 //! a decoded [`Command`] points into that body, so the only allocation on the
-//! way in is the property list of a `READY`.
+//! way in is the property list of a `READY` or `INITIATE`: one allocation of at
+//! most [`MAX_PROPERTIES`] entries.
 //!
 //! # Reading a stream
 //!
@@ -72,7 +73,9 @@
 //! 2^63-1 octets per frame; libzmq's `ZMQ_MAXMSGSIZE` defaults to unlimited.
 //! Every decode entry point therefore takes the cap as an argument, and
 //! [`FrameError::BodyTooLarge`] is reported from the declared length alone.
-//! Nothing in this crate reserves memory on behalf of a peer.
+//! Nothing in this crate reserves memory on behalf of a peer except the
+//! property list of a metadata dictionary, which is capped at
+//! [`MAX_PROPERTIES`] entries.
 //!
 //! # Where this codec departs from the text
 //!
@@ -114,4 +117,4 @@ pub use curve::{CurveCommand, InitiatePlaintext};
 pub use error::{CommandError, CurveError, FrameError, GreetingError, Z85Error};
 pub use frame::{FrameHeader, FrameKind};
 pub use greeting::{GREETING_LEN, Greeting, Mechanism, VERSION, Version};
-pub use metadata::{Metadata, SocketType};
+pub use metadata::{MAX_PROPERTIES, Metadata, SocketType};

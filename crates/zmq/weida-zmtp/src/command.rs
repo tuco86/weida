@@ -15,8 +15,9 @@
 //! `\x05READY` on the wire, so the length form is what interoperates; the
 //! null-separator sentence is a leftover and is not implemented.
 //!
-//! Commands are borrowed from the frame body, so decoding one allocates
-//! nothing except the property list of a `READY`.
+//! Commands are borrowed from the frame body, so decoding one allocates at most
+//! the property list of a `READY` or `INITIATE`, capped at
+//! [`MAX_PROPERTIES`](crate::metadata::MAX_PROPERTIES) entries.
 
 use crate::error::CommandError;
 use crate::frame::{self, FrameKind};

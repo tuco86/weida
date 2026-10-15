@@ -29,14 +29,16 @@
 //! A server answers a `HELLO` with a `WELCOME` and then **keeps nothing**:
 //! "It's generated a keypair, sent that back to the client in a way only the
 //! client can read, and thrown it away." This implementation does exactly
-//! that. After [`CurveServer::welcome`] the only state left is the cookie
-//! key; `C'` and `s'` come back out of the cookie the client echoes in its
-//! `INITIATE`, and the cookie key is dropped the moment that `INITIATE`
-//! opens — or when the interval runs out, which 26/CURVEZMQ puts at "a short
-//! interval, for example 60 seconds" and this module at
-//! [`COOKIE_LIFETIME`]. An expired cookie is refused rather than tolerated:
-//! the cookie *is* the anti-DoS design, and a cookie key that never expired
-//! would be a long-term key nobody chose.
+//! that. The cookie is sealed with `crypto_secretbox` under 32 random octets
+//! that only this server holds, for one interval. After
+//! [`CurveServer::welcome`] the only state left is that cookie key; `C'` and
+//! `s'` come back out of the cookie the client echoes in its `INITIATE`, and
+//! the cookie key is dropped the moment that `INITIATE` opens — or when the
+//! interval runs out, which 26/CURVEZMQ puts at "a short interval, for
+//! example 60 seconds" and this module at [`COOKIE_LIFETIME`]. An expired
+//! cookie is refused rather than tolerated: the cookie *is* the anti-DoS
+//! design, and a cookie key that never expired would be a long-term key
+//! nobody chose.
 //!
 //! # The three security models
 //!
@@ -44,9 +46,11 @@
 //! options without any new knob:
 //!
 //! 1. **"Where the server does not check client keys at all."**
-//!    `ZMQ_CURVE_SERVER` with an empty `ZMQ_ZAP_DOMAIN`. Knowing `S` is the
-//!    whole of the authorization, which is what a public service with
-//!    confidentiality but no authentication wants.
+//!    `ZMQ_CURVE_SERVER` with an empty `ZMQ_ZAP_DOMAIN` **and no ZAP handler
+//!    bound**: a handler that is bound is asked about every client whatever
+//!    the domain, as libzmq asks it ([`crate::zap::asks_handler`]). Knowing
+//!    `S` is the whole of the authorization, which is what a public service
+//!    with confidentiality but no authentication wants.
 //! 2. **"Where all clients share the same public key, that the server
 //!    checks."** A `ZMQ_ZAP_DOMAIN` and a ZAP handler whose table has one
 //!    entry. The handler answers 200 or 400 on the key it is given.
@@ -76,34 +80,71 @@
 //! seen is refused: replay is one of the attacks 26/CURVEZMQ claims to
 //! defend against, and the counter is the only thing that can defend it.
 //!
-//! # The one cryptographic dependency
+//! # The primitives
 //!
-//! [`crypto_box`], from RustCrypto. 26/CURVEZMQ is specified in terms of
-//! NaCl's `crypto_box`: X25519 key agreement, HSalsa20 to derive the shared
-//! key, XSalsa20 for the stream and Poly1305 for the tag, boxes 16 octets
-//! larger than their plaintext. `crypto_box::SalsaBox` **is** that
-//! construction — not a lookalike — so a box this crate seals opens in
-//! libsodium and libzmq, and it is pure Rust, so `unsafe_code = "forbid"`
-//! survives it. It is the only cryptographic dependency this crate has, and
-//! `weida-zmtp` still has none at all.
+//! The Diffie-Hellman step is X25519 from [`curve25519_dalek`], with RFC 7748
+//! clamping and nothing else. RustCrypto's `crypto_box`, which the tests use as
+//! the reference, reduces the clamped scalar modulo the group order before it
+//! multiplies; libsodium, which libzmq uses, does not. For a point of prime
+//! order the reduction changes nothing, and every key a legitimate peer sends
+//! is such a point, so the two agree on those keys. On a point of small order
+//! the reduction is what leaks bits of the secret, so this module does not do
+//! it.
 //!
-//! One place where this implementation chooses its own construction is the
-//! cookie box. 26/CURVEZMQ seals it with `crypto_secretbox` under a random
-//! 32-octet cookie key; the cookie is opaque to every peer — only the server
-//! that made it ever opens it — so the choice is unobservable on the wire,
-//! and this module seals it with a `crypto_box` to a keypair generated for
-//! the interval. The 96 octets on the wire are the same 96 octets, which is
-//! the part that has to match.
+//! A box is then NaCl's layout: HSalsa20 over the shared secret with a zero
+//! nonce gives the key, XSalsa20-Poly1305 seals under it, and the 16-octet tag
+//! comes before the ciphertext, so a box is 16 octets longer than its
+//! plaintext. That is [`crypto_secretbox`]'s `XSalsa20Poly1305`, used through
+//! its HSalsa20 key derivation and its detached in-place API, which lets a
+//! frame be sealed and opened in the buffer it travels in. The tests check the
+//! bytes against `crypto_box`, RustCrypto's own NaCl implementation, which is
+//! a dev-dependency and not part of the library.
+//!
+//! # Box reuse
+//!
+//! A pair of keys makes one box, derived by the first stage that needs it and
+//! kept until the next stage replaces it. The `HELLO` signature box and the
+//! `WELCOME` box are the same pair, `(s, C')`. The `INITIATE` box, the `READY`
+//! box and the transport are the pair `(s', C')` on the server and `(c', S')`
+//! on the client. The vouch is the one box of a different pair, `(s', C)` on
+//! the server and `(c, S')` on the client, derived once `INITIATE` has named
+//! `C`. An unauthenticated `HELLO` therefore costs the server one shared
+//! secret, for opening the signature box, and one base-point multiplication,
+//! for the transient key pair; the cookie costs no key agreement at all.
+//!
+//! # Small-order keys
+//!
+//! A peer key of small order, the zero key among them, makes clamped X25519
+//! return an all-zero secret whatever the other key is, so the box it keys
+//! has a key anyone can compute. [`session_box`] refuses that output with
+//! `EACCES`, as libsodium's `crypto_scalarmult` does. Every key a peer sends
+//! goes through it: `C'` in the `HELLO`, `S'` in the `WELCOME` and `C` in the
+//! vouch.
+//!
+//! # Secrets in memory
+//!
+//! Every buffer that holds key material is a [`Zeroizing`] array, or is the
+//! key of a box, which is wiped when the box is dropped. The long-term secret
+//! exists once per [`CurveSecretKey`], shared by its clones; the transient
+//! secrets and the cookie key live only as long as the stage that needs them.
+//! Safe Rust cannot reach the stack: a secret passed by value, as the X25519
+//! scalar is, can leave a copy in a frame that nothing wipes. What is
+//! guaranteed is that no heap buffer or long-lived field holding a secret is
+//! freed without being wiped first.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crypto_box::aead::rand_core::RngCore;
-use crypto_box::aead::{Aead, OsRng};
-use crypto_box::{PublicKey, SalsaBox, SecretKey};
+use crypto_secretbox::aead::OsRng;
+use crypto_secretbox::aead::rand_core::RngCore;
+use crypto_secretbox::{AeadInPlace, Kdf, Key, KeyInit, Nonce, Tag, XSalsa20Poly1305};
+use curve25519_dalek::montgomery::MontgomeryPoint;
 use weida_zmtp::curve as layout;
 use weida_zmtp::{CurveCommand, FrameKind, InitiatePlaintext, Metadata, frame, z85};
+use zeroize::{Zeroize, Zeroizing};
 
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::options::{Security, SocketOptions};
 
@@ -128,6 +169,15 @@ pub const COOKIE_LIFETIME: Duration = Duration::from_secs(60);
 /// The `HELLO` signature box's plaintext: "Box \[64 * %x0\](C'->S)".
 const SIGNATURE_PLAINTEXT: [u8; 64] = [0u8; 64];
 
+/// The name block of a `MESSAGE` command: one length octet, then the name.
+/// The codec decodes it back, and [`CurveCommand::decode`] is what refuses a
+/// command that is not one.
+const MESSAGE_NAME_BLOCK: &[u8] = b"\x07MESSAGE";
+
+/// What precedes the box in a `MESSAGE` command: the name block and the short
+/// nonce that travels.
+const MESSAGE_HEAD_LEN: usize = MESSAGE_NAME_BLOCK.len() + layout::SHORT_NONCE_LEN;
+
 /// Which of 26/CURVEZMQ's security models a configuration selects, as far as
 /// this library can see it.
 ///
@@ -137,9 +187,9 @@ const SIGNATURE_PLAINTEXT: [u8; 64] = [0u8; 64];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecurityModel {
     /// Model 1: "the server does not check client keys at all". A CURVE
-    /// server with no `ZMQ_ZAP_DOMAIN`; every client that knows `S` is
-    /// admitted, and its key is still confidential and still authenticated
-    /// as *some* key.
+    /// server with no `ZMQ_ZAP_DOMAIN` and no ZAP handler bound in its
+    /// context; every client that knows `S` is admitted, and its key is still
+    /// confidential and still authenticated as *some* key.
     AnyClient,
     /// Models 2 and 3: the client's long-term key goes to a ZAP handler,
     /// which either holds one shared key or one key per client and may name
@@ -147,12 +197,17 @@ pub enum SecurityModel {
     CheckedByHandler,
 }
 
-/// What security model a socket's options select, or `None` where the socket
-/// is not a CURVE server and therefore checks nobody.
-pub fn security_model(options: &SocketOptions) -> Option<SecurityModel> {
+/// What security model a socket's options select in `context`, or `None`
+/// where the socket is not a CURVE server and therefore checks nobody.
+///
+/// Needs the context because a handler bound there is what turns a server
+/// without a domain from model 1 into a checked one.
+pub fn security_model(options: &SocketOptions, context: &Context) -> Option<SecurityModel> {
     match options.security() {
-        Security::CurveServer if options.zap_domain.is_empty() => Some(SecurityModel::AnyClient),
-        Security::CurveServer => Some(SecurityModel::CheckedByHandler),
+        Security::CurveServer if crate::zap::asks_handler(options, context) => {
+            Some(SecurityModel::CheckedByHandler)
+        }
+        Security::CurveServer => Some(SecurityModel::AnyClient),
         _ => None,
     }
 }
@@ -211,17 +266,25 @@ impl fmt::Display for CurvePublicKey {
 /// placeholder, because a secret key in a log is a secret key on a disk, and
 /// comparison is constant-time, because `SocketOptions` derives `PartialEq`
 /// and an early-exiting comparison there would be a timing oracle nobody
-/// asked for. `Drop` overwrites the octets — best effort, since only a
-/// volatile write is guaranteed to survive the optimizer, and the transient
-/// keys that matter for forward secrecy are [`crypto_box::SecretKey`]s,
-/// which zeroize on drop.
+/// asked for.
+///
+/// `Clone` shares the key instead of copying it: the octets exist once, in a
+/// buffer that is wiped when the last clone is dropped, and the options that
+/// every connection takes a copy of hold a reference. The public key is
+/// derived when the key is built, so asking for it costs nothing.
 #[derive(Clone)]
-pub struct CurveSecretKey([u8; KEY_LEN]);
+pub struct CurveSecretKey(Arc<Inner>);
+
+/// What the clones of a [`CurveSecretKey`] share.
+struct Inner {
+    secret: Zeroizing<[u8; KEY_LEN]>,
+    public: CurvePublicKey,
+}
 
 impl CurveSecretKey {
-    /// A key from its 32 octets.
-    pub const fn from_bytes(bytes: [u8; KEY_LEN]) -> CurveSecretKey {
-        CurveSecretKey(bytes)
+    /// A key from its 32 octets. The public key is derived here, once.
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> CurveSecretKey {
+        CurveSecretKey::from_secret(Zeroizing::new(bytes))
     }
 
     /// A key as `zmq_setsockopt` takes one: 32 binary octets or 40
@@ -231,7 +294,12 @@ impl CurveSecretKey {
     ///
     /// `EINVAL`, as [`CurvePublicKey::parse`].
     pub fn parse(option: &[u8]) -> Result<CurveSecretKey> {
-        parse_key(option).map(CurveSecretKey)
+        parse_key(option).map(CurveSecretKey::from_bytes)
+    }
+
+    fn from_secret(secret: Zeroizing<[u8; KEY_LEN]>) -> CurveSecretKey {
+        let public = CurvePublicKey(public_key_of(&secret));
+        CurveSecretKey(Arc::new(Inner { secret, public }))
     }
 
     /// The public key this secret key belongs to.
@@ -240,17 +308,24 @@ impl CurveSecretKey {
     /// manual says a server "does not need to know its own public key", and
     /// that is because X25519 derives it.
     pub fn public_key(&self) -> CurvePublicKey {
-        CurvePublicKey(*SecretKey::from(self.0).public_key().as_bytes())
+        self.0.public
     }
 
     /// The 40-character Z85 form. Named so that writing a secret key down is
-    /// a deliberate call and never a `Display`.
+    /// a deliberate call and never a `Display`. The text is a copy this crate
+    /// does not wipe: it belongs to the caller from the moment it returns.
     pub fn to_z85(&self) -> String {
-        z85::encode_key(&self.0)
+        z85::encode_key(&self.0.secret)
     }
 
-    fn secret(&self) -> SecretKey {
-        SecretKey::from(self.0)
+    fn secret_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0.secret
+    }
+
+    /// Whether two keys are one allocation, which is what a clone is.
+    #[cfg(test)]
+    fn shares_allocation_with(&self, other: &CurveSecretKey) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -263,7 +338,7 @@ impl fmt::Debug for CurveSecretKey {
 impl PartialEq for CurveSecretKey {
     fn eq(&self, other: &CurveSecretKey) -> bool {
         let mut difference = 0u8;
-        for (ours, theirs) in self.0.iter().zip(other.0.iter()) {
+        for (ours, theirs) in self.0.secret.iter().zip(other.0.secret.iter()) {
             difference |= ours ^ theirs;
         }
         difference == 0
@@ -272,19 +347,10 @@ impl PartialEq for CurveSecretKey {
 
 impl Eq for CurveSecretKey {}
 
-impl Drop for CurveSecretKey {
-    fn drop(&mut self) {
-        self.0.fill(0);
-    }
-}
-
 /// A fresh CURVE key pair, as `zmq_curve_keypair` returns one.
 pub fn keypair() -> (CurvePublicKey, CurveSecretKey) {
-    let secret = SecretKey::generate(&mut OsRng);
-    (
-        CurvePublicKey(*secret.public_key().as_bytes()),
-        CurveSecretKey(secret.to_bytes()),
-    )
+    let secret = CurveSecretKey::from_secret(random_key());
+    (secret.public_key(), secret)
 }
 
 /// 32 binary octets or 40 characters of Z85, and nothing else.
@@ -336,14 +402,67 @@ impl Counter {
     }
 }
 
+/// The box of one pair of keys: `crypto_box`'s construction after its key
+/// agreement, an XSalsa20-Poly1305 keyed by HSalsa20 of the shared secret. It
+/// wipes its key when it is dropped.
+type SessionBox = XSalsa20Poly1305;
+
+/// 32 octets from the operating system, in a buffer that is wiped on drop.
+fn random_key() -> Zeroizing<[u8; KEY_LEN]> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    OsRng.fill_bytes(&mut *key);
+    key
+}
+
+/// The X25519 shared secret of `secret` and `peer`, with RFC 7748 clamping.
+///
+/// The result is not checked here: [`session_box`] is the caller that keys a
+/// box from it, and it checks first.
+fn x25519(secret: &[u8; KEY_LEN], peer: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
+    Zeroizing::new(MontgomeryPoint(*peer).mul_clamped(*secret).to_bytes())
+}
+
+/// The public key of `secret`: X25519 of the base point.
+fn public_key_of(secret: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    MontgomeryPoint::mul_base_clamped(*secret).to_bytes()
+}
+
+/// The box of `secret` and `peer`: NaCl's `crypto_box` construction, with the
+/// shared secret and the key derived from it wiped on every path.
+///
+/// # Errors
+///
+/// `EACCES` if the shared secret is all zero, which clamped X25519 produces
+/// for a small-order peer key whatever the secret is: the box would then be
+/// keyed by a constant anyone can compute. libsodium's `crypto_scalarmult`
+/// refuses the same output.
+fn session_box(secret: &[u8; KEY_LEN], peer: &[u8; KEY_LEN]) -> Result<SessionBox> {
+    let shared = x25519(secret, peer);
+    // Every octet is folded in before the test, so the time taken does not
+    // depend on where the first non-zero octet is.
+    let nonzero = shared.iter().fold(0u8, |acc, octet| acc | octet);
+    if nonzero == 0 {
+        return Err(Error::EACCES(
+            "the peer's public key is a small-order public key: its X25519 shared secret is \
+             all zero, which every such key produces"
+                .into(),
+        ));
+    }
+    // HSalsa20 of the shared secret under a zero nonce: the key `crypto_box`
+    // derives from the shared secret, which is not uniform by itself.
+    let mut key = <SessionBox as Kdf>::kdf(Key::from_slice(&shared[..]), &Default::default());
+    let boxed = SessionBox::new(&key);
+    key.as_mut_slice().zeroize();
+    Ok(boxed)
+}
+
 /// The cookie key a server holds between its `WELCOME` and one `INITIATE`.
 ///
-/// A keypair rather than a symmetric key, for the reason the module
-/// documentation gives: the cookie is opaque to every peer, so the
-/// construction is the server's own and the octet count is what matters.
+/// One random key per connection, which is what 26/CURVEZMQ asks for: the
+/// cookie is opaque to every peer, so the server needs nothing but a secret
+/// of its own to seal it with.
 struct CookieKey {
-    public: PublicKey,
-    secret: SecretKey,
+    key: XSalsa20Poly1305,
     /// When this key stops being accepted. The other half of "or as soon as
     /// the client sends a valid INITIATE".
     expires: Instant,
@@ -351,16 +470,11 @@ struct CookieKey {
 
 impl CookieKey {
     fn new(lifetime: Duration) -> CookieKey {
-        let secret = SecretKey::generate(&mut OsRng);
+        let key = random_key();
         CookieKey {
-            public: secret.public_key(),
-            secret,
+            key: XSalsa20Poly1305::new(Key::from_slice(&key[..])),
             expires: Instant::now() + lifetime,
         }
-    }
-
-    fn boxed(&self) -> SalsaBox {
-        SalsaBox::new(&self.public, &self.secret)
     }
 }
 
@@ -370,14 +484,19 @@ impl CookieKey {
 pub struct CurveClient {
     /// `C` and `c`: the identity a ZAP handler will be told about.
     long_public: CurvePublicKey,
-    long_secret: SecretKey,
+    long_secret: CurveSecretKey,
     /// `S`: the server this client will talk to, and nobody else.
-    server_key: PublicKey,
+    server_key: [u8; KEY_LEN],
     /// `C'` and `c'`.
-    transient_public: PublicKey,
-    transient_secret: SecretKey,
+    transient_public: [u8; KEY_LEN],
+    transient_secret: Zeroizing<[u8; KEY_LEN]>,
+    /// `(c', S)`, derived by the `HELLO` and kept until the `WELCOME` opens.
+    hello_box: Option<SessionBox>,
     /// `S'`, learned from the `WELCOME` box.
-    server_transient: Option<PublicKey>,
+    server_transient: Option<[u8; KEY_LEN]>,
+    /// `(c', S')`: the box the `INITIATE`, the `READY` and the transport run
+    /// on, derived when the `WELCOME` is read.
+    session: Option<SessionBox>,
     /// The cookie, held only between `WELCOME` and `INITIATE`.
     cookie: Option<[u8; layout::COOKIE_LEN]>,
     counter: Counter,
@@ -390,14 +509,17 @@ impl CurveClient {
         long_secret: &CurveSecretKey,
         server_key: CurvePublicKey,
     ) -> CurveClient {
-        let transient_secret = SecretKey::generate(&mut OsRng);
+        let transient_secret = random_key();
+        let transient_public = public_key_of(&transient_secret);
         CurveClient {
             long_public,
-            long_secret: long_secret.secret(),
-            server_key: PublicKey::from(*server_key.as_bytes()),
-            transient_public: transient_secret.public_key(),
+            long_secret: long_secret.clone(),
+            server_key: *server_key.as_bytes(),
+            transient_public,
             transient_secret,
+            hello_box: None,
             server_transient: None,
+            session: None,
             cookie: None,
             counter: Counter::new(),
         }
@@ -409,18 +531,23 @@ impl CurveClient {
     ///
     /// # Errors
     ///
-    /// `ENOCOMPATPROTO` if the nonce counter is exhausted; `EIO` if the box
-    /// cannot be sealed, which needs a broken cryptography library.
+    /// `EACCES` if the server key is of small order; `ENOCOMPATPROTO` if the
+    /// nonce counter is exhausted; `EIO` if the box cannot be sealed, which
+    /// needs a broken cryptography library.
     pub fn hello(&mut self) -> Result<Vec<u8>> {
         let nonce = self.counter.take()?;
-        let sealed = seal(
-            &SalsaBox::new(&self.server_key, &self.transient_secret),
+        let hello_box = session_box(&self.transient_secret, &self.server_key)?;
+        let signature_box = seal(
+            &hello_box,
             &layout::short_nonce(layout::PREFIX_HELLO, nonce),
             &SIGNATURE_PLAINTEXT,
         )?;
-        let signature_box = sized::<{ layout::SIGNATURE_BOX_LEN }>(&sealed, "HELLO signature")?;
+        let signature_box =
+            sized::<{ layout::SIGNATURE_BOX_LEN }>(&signature_box, "HELLO signature")?;
+        // The WELCOME opens under this box, so it is kept until then.
+        self.hello_box = Some(hello_box);
         CurveCommand::Hello {
-            client_key: self.transient_public.as_bytes(),
+            client_key: &self.transient_public,
             nonce,
             signature_box: &signature_box,
         }
@@ -428,13 +555,14 @@ impl CurveClient {
         .map_err(curve_error)
     }
 
-    /// Reads a `WELCOME`: opens the box with `c'` and `S`, keeping `S'` and
-    /// the cookie.
+    /// Reads a `WELCOME`: opens the box with `c'` and `S`, and keeps `S'`, the
+    /// cookie and the box of `(c', S')`.
     ///
     /// # Errors
     ///
-    /// `EACCES` if the box does not open — which means the peer does not hold
-    /// `s`, so it is not the server this client was configured for.
+    /// `EFSM` if no `HELLO` has been sent. `EACCES` if the box does not open —
+    /// which means the peer does not hold `s`, so it is not the server this
+    /// client was configured for — or if `S'` is of small order.
     /// `ENOCOMPATPROTO` for a malformed command.
     pub fn read_welcome(&mut self, body: &[u8]) -> Result<()> {
         let CurveCommand::Welcome { nonce, welcome_box } =
@@ -442,16 +570,27 @@ impl CurveClient {
         else {
             return Err(unexpected("WELCOME", body));
         };
-        let plaintext = open(
-            &SalsaBox::new(&self.server_key, &self.transient_secret),
-            &layout::long_nonce(layout::PREFIX_WELCOME, nonce),
-            welcome_box,
+        let Some(hello_box) = &self.hello_box else {
+            return Err(Error::EFSM(
+                "a WELCOME is opened with the box a HELLO derives, and no HELLO has been sent"
+                    .into(),
+            ));
+        };
+        let plaintext = sized::<{ layout::KEY_LEN + layout::COOKIE_LEN }>(
+            &open(
+                hello_box,
+                &layout::long_nonce(layout::PREFIX_WELCOME, nonce),
+                welcome_box,
+                "WELCOME",
+            )?,
             "WELCOME",
         )?;
-        let plaintext = sized::<{ layout::KEY_LEN + layout::COOKIE_LEN }>(&plaintext, "WELCOME")?;
         let (server_transient, cookie) = layout::split_welcome_plaintext(&plaintext);
-        self.server_transient = Some(PublicKey::from(*server_transient));
+        let session = session_box(&self.transient_secret, server_transient)?;
+        self.server_transient = Some(*server_transient);
         self.cookie = Some(*cookie);
+        self.session = Some(session);
+        self.hello_box = None;
         Ok(())
     }
 
@@ -460,9 +599,12 @@ impl CurveClient {
     ///
     /// # Errors
     ///
-    /// `EFSM` if no `WELCOME` has been read; otherwise as [`Self::hello`].
+    /// `EFSM` if no `WELCOME` has been read; `EACCES` if the vouch key is of
+    /// small order; otherwise as [`Self::hello`].
     pub fn initiate(&mut self, metadata: &Metadata<'_>) -> Result<Vec<u8>> {
-        let (Some(server_transient), Some(cookie)) = (&self.server_transient, self.cookie) else {
+        let (Some(server_transient), Some(cookie), Some(session)) =
+            (self.server_transient, self.cookie, self.session.as_ref())
+        else {
             return Err(Error::EFSM(
                 "an INITIATE needs the S' and the cookie that a WELCOME carries".into(),
             ));
@@ -470,12 +612,13 @@ impl CurveClient {
         // `vouch = vouch-nonce vouch-box`, `Box [C',S](C->S')`: the client's
         // long-term key signs the pair, so a vouch collected by one server
         // cannot be replayed at another.
+        let vouch_key = session_box(self.long_secret.secret_bytes(), &server_transient)?;
         let mut vouch_nonce = [0u8; layout::LONG_NONCE_LEN];
         OsRng.fill_bytes(&mut vouch_nonce);
         let vouch_box = seal(
-            &SalsaBox::new(server_transient, &self.long_secret),
+            &vouch_key,
             &layout::long_nonce(layout::PREFIX_VOUCH, &vouch_nonce),
-            &layout::join_key_pair(self.transient_public.as_bytes(), self.server_key.as_bytes()),
+            &layout::join_key_pair(&self.transient_public, &self.server_key),
         )?;
         let vouch = layout::join_nonce_box(
             &vouch_nonce,
@@ -493,7 +636,7 @@ impl CurveClient {
 
         let nonce = self.counter.take()?;
         let initiate_box = seal(
-            &SalsaBox::new(server_transient, &self.transient_secret),
+            session,
             &layout::short_nonce(layout::PREFIX_INITIATE, nonce),
             &plaintext,
         )?;
@@ -516,7 +659,7 @@ impl CurveClient {
     /// `EACCES` if the box does not open, `ENOCOMPATPROTO` for a malformed
     /// command or a `READY` before the `WELCOME`.
     pub fn read_ready(&mut self, body: &[u8]) -> Result<Vec<u8>> {
-        let Some(server_transient) = &self.server_transient else {
+        let Some(session) = &self.session else {
             return Err(unexpected("WELCOME", body));
         };
         let CurveCommand::Ready { nonce, ready_box } =
@@ -524,12 +667,15 @@ impl CurveClient {
         else {
             return Err(unexpected("READY", body));
         };
-        open(
-            &SalsaBox::new(server_transient, &self.transient_secret),
+        let mut metadata = open(
+            session,
             &layout::short_nonce(layout::PREFIX_READY, nonce),
             ready_box,
             "READY",
-        )
+        )?;
+        // The metadata dictionary is not key material, so its buffer leaves
+        // the wipe policy here, as the caller's own bytes.
+        Ok(std::mem::take(&mut *metadata))
     }
 
     /// The message transport this handshake agreed: `C'` and `S'`, with the
@@ -539,18 +685,17 @@ impl CurveClient {
     ///
     /// `EFSM` if the handshake did not get as far as a `WELCOME`.
     pub fn into_transport(self) -> Result<CurveTransport> {
-        let Some(server_transient) = &self.server_transient else {
+        let Some(session) = self.session else {
             return Err(Error::EFSM(
                 "a CURVE transport needs the S' a WELCOME carries".into(),
             ));
         };
         Ok(CurveTransport {
-            boxed: SalsaBox::new(server_transient, &self.transient_secret),
+            boxed: Some(session),
             send_prefix: layout::PREFIX_MESSAGE_CLIENT,
             recv_prefix: layout::PREFIX_MESSAGE_SERVER,
             send: Counter(self.counter.0),
             highest_seen: 0,
-            alive: true,
         })
     }
 }
@@ -560,8 +705,9 @@ pub struct OpenedInitiate {
     /// The client's long-term public key `C` — the ZAP credential, and the
     /// only thing an authorization decision can be made on.
     pub client_key: CurvePublicKey,
-    /// The opened box, whose metadata section is [`Self::metadata`].
-    plaintext: Vec<u8>,
+    /// The opened box, whose metadata section is [`Self::metadata`]. It was
+    /// opened under session keys, so it is wiped when it is dropped.
+    plaintext: Zeroizing<Vec<u8>>,
 }
 
 impl OpenedInitiate {
@@ -594,34 +740,40 @@ impl fmt::Debug for OpenedInitiate {
     }
 }
 
+/// What `read_hello` keeps for `welcome`: the client's transient key and the
+/// box of `(s, C')`, which opened the `HELLO` and seals the `WELCOME`.
+struct HelloState {
+    client_transient: [u8; KEY_LEN],
+    boxed: SessionBox,
+}
+
 /// The server half of a CURVE handshake.
 pub struct CurveServer {
-    /// `s`, and `S` derived from it: "a server does not need to know its own
-    /// public key".
-    long_secret: SecretKey,
-    long_public: PublicKey,
+    /// `s`. The public key `S` is derived from it once, when the key was
+    /// built: "a server does not need to know its own public key".
+    long_secret: CurveSecretKey,
     /// How long a cookie key lives once it is made. A parameter rather than
     /// a constant so that the expiry can be tested without waiting a minute.
     cookie_lifetime: Duration,
-    /// `C'`, held only between the `HELLO` and the `WELCOME`.
-    client_transient: Option<PublicKey>,
+    /// `C'` and the box of `(s, C')`, held only between the `HELLO` and the
+    /// `WELCOME`.
+    hello: Option<HelloState>,
     /// The cookie key, held only between the `WELCOME` and a valid
     /// `INITIATE`.
     cookie: Option<CookieKey>,
-    /// `C'` and `s'`, recovered from the cookie by a valid `INITIATE`.
-    session: Option<(PublicKey, SecretKey)>,
+    /// The box of `(s', C')`, recovered from the cookie by a valid
+    /// `INITIATE`: what the `READY` and the transport run on.
+    session: Option<SessionBox>,
     counter: Counter,
 }
 
 impl CurveServer {
     /// A server holding its long-term secret key.
     pub fn new(long_secret: &CurveSecretKey, cookie_lifetime: Duration) -> CurveServer {
-        let long_secret = long_secret.secret();
         CurveServer {
-            long_public: long_secret.public_key(),
-            long_secret,
+            long_secret: long_secret.clone(),
             cookie_lifetime,
-            client_transient: None,
+            hello: None,
             cookie: None,
             session: None,
             counter: Counter::new(),
@@ -629,15 +781,16 @@ impl CurveServer {
     }
 
     /// Reads a `HELLO`: opens the signature box with `s`, which proves the
-    /// client knows `S`, and keeps `C'`.
+    /// client knows `S`, and keeps `C'` and the box that opened it for the
+    /// `WELCOME`.
     ///
     /// # Errors
     ///
-    /// `EACCES` if the signature box does not open or does not hold the 64
-    /// zero octets: the peer does not know this server's public key.
-    /// `ENOCOMPATPROTO` for a malformed or mis-sized command — including the
-    /// 198-octet `HELLO` that 26/CURVEZMQ's prose describes and its own
-    /// grammar contradicts.
+    /// `EACCES` if the client key is of small order, if the signature box does
+    /// not open, or if it does not hold the 64 zero octets: the peer does not
+    /// know this server's public key. `ENOCOMPATPROTO` for a malformed or
+    /// mis-sized command — including the 198-octet `HELLO` that 26/CURVEZMQ's
+    /// prose describes and its own grammar contradicts.
     pub fn read_hello(&mut self, body: &[u8]) -> Result<()> {
         let CurveCommand::Hello {
             client_key,
@@ -647,21 +800,24 @@ impl CurveServer {
         else {
             return Err(unexpected("HELLO", body));
         };
-        let client_transient = PublicKey::from(*client_key);
+        let boxed = session_box(self.long_secret.secret_bytes(), client_key)?;
         let signature = open(
-            &SalsaBox::new(&client_transient, &self.long_secret),
+            &boxed,
             &layout::short_nonce(layout::PREFIX_HELLO, nonce),
             signature_box,
             "HELLO",
         )?;
-        if signature != SIGNATURE_PLAINTEXT {
+        if signature.as_slice() != &SIGNATURE_PLAINTEXT[..] {
             return Err(Error::EACCES(
                 "the HELLO signature box does not hold the 64 zero octets 26/CURVEZMQ \
                  specifies"
                     .into(),
             ));
         }
-        self.client_transient = Some(client_transient);
+        self.hello = Some(HelloState {
+            client_transient: *client_key,
+            boxed,
+        });
         Ok(())
     }
 
@@ -673,23 +829,27 @@ impl CurveServer {
     ///
     /// `EFSM` if no `HELLO` has been read.
     pub fn welcome(&mut self) -> Result<Vec<u8>> {
-        let Some(client_transient) = self.client_transient.take() else {
+        let Some(hello) = self.hello.take() else {
             return Err(Error::EFSM(
                 "a WELCOME needs the C' that a HELLO carries".into(),
             ));
         };
-        let transient_secret = SecretKey::generate(&mut OsRng);
-        let transient_public = transient_secret.public_key();
+        let transient_secret = random_key();
+        let transient_public = public_key_of(&transient_secret);
 
         // `cookie = cookie-nonce cookie-box`, holding C' and s' so that the
         // server can keep neither.
         let cookie_key = CookieKey::new(self.cookie_lifetime);
         let mut cookie_nonce = [0u8; layout::LONG_NONCE_LEN];
         OsRng.fill_bytes(&mut cookie_nonce);
+        let cookie_plaintext = Zeroizing::new(layout::join_key_pair(
+            &hello.client_transient,
+            &transient_secret,
+        ));
         let cookie_box = seal(
-            &cookie_key.boxed(),
+            &cookie_key.key,
             &layout::long_nonce(layout::PREFIX_COOKIE, &cookie_nonce),
-            &layout::join_key_pair(client_transient.as_bytes(), &transient_secret.to_bytes()),
+            &cookie_plaintext[..],
         )?;
         let cookie = layout::join_nonce_box(
             &cookie_nonce,
@@ -697,12 +857,13 @@ impl CurveServer {
         );
         self.cookie = Some(cookie_key);
 
+        // `Box [S' + cookie](S->C')`, under the box the HELLO derived.
         let mut welcome_nonce = [0u8; layout::LONG_NONCE_LEN];
         OsRng.fill_bytes(&mut welcome_nonce);
         let welcome_box = seal(
-            &SalsaBox::new(&client_transient, &self.long_secret),
+            &hello.boxed,
             &layout::long_nonce(layout::PREFIX_WELCOME, &welcome_nonce),
-            &layout::join_welcome_plaintext(transient_public.as_bytes(), &cookie),
+            &layout::join_welcome_plaintext(&transient_public, &cookie),
         )?;
         let welcome_box = sized::<{ layout::WELCOME_BOX_LEN }>(&welcome_box, "WELCOME")?;
         CurveCommand::Welcome {
@@ -718,10 +879,11 @@ impl CurveServer {
     ///
     /// # Errors
     ///
-    /// `EACCES` for a cookie that has expired, a box that does not open, or a
-    /// vouch that does not name this connection's `C'` and this server's `S`
-    /// — the last one being the replay a vouch exists to prevent.
-    /// `ENOCOMPATPROTO` for a malformed command.
+    /// `EACCES` for a cookie that has expired, a cookie this server did not
+    /// seal, a box that does not open, a client key of small order, or a vouch
+    /// that does not name this connection's `C'` and this server's `S` — the
+    /// last one being the replay a vouch exists to prevent. `ENOCOMPATPROTO`
+    /// for a malformed command.
     pub fn read_initiate(&mut self, body: &[u8]) -> Result<OpenedInitiate> {
         let CurveCommand::Initiate {
             cookie,
@@ -751,39 +913,43 @@ impl CurveServer {
             ));
         }
         let (cookie_nonce, cookie_box) = layout::split_nonce_box(cookie);
-        let opened = open(
-            &cookie_key.boxed(),
-            &layout::long_nonce(layout::PREFIX_COOKIE, cookie_nonce),
-            cookie_box,
+        let cookie_plaintext = Zeroizing::new(sized::<{ 2 * layout::KEY_LEN }>(
+            &open(
+                &cookie_key.key,
+                &layout::long_nonce(layout::PREFIX_COOKIE, cookie_nonce),
+                cookie_box,
+                "cookie",
+            )?,
             "cookie",
-        )?;
-        let opened = sized::<{ 2 * layout::KEY_LEN }>(&opened, "cookie")?;
-        let (client_transient, transient_secret) = layout::split_key_pair(&opened);
-        let client_transient = PublicKey::from(*client_transient);
-        let transient_secret = SecretKey::from(*transient_secret);
+        )?);
+        let (client_transient, transient_secret) = layout::split_key_pair(&cookie_plaintext);
+        let session = session_box(transient_secret, client_transient)?;
 
         let plaintext = open(
-            &SalsaBox::new(&client_transient, &transient_secret),
+            &session,
             &layout::short_nonce(layout::PREFIX_INITIATE, nonce),
             initiate_box,
             "INITIATE",
         )?;
         let initiate = InitiatePlaintext::decode(&plaintext).map_err(curve_error)?;
-        let client_key = PublicKey::from(*initiate.client_key);
+        let client_key = *initiate.client_key;
 
         // `Box [C',S](C->S')`: opened with `s'` and `C`, and its plaintext
         // must name this connection's C' and this server's S.
+        let vouch_session = session_box(transient_secret, &client_key)?;
         let (vouch_nonce, vouch_box) = layout::split_nonce_box(initiate.vouch);
-        let vouch = open(
-            &SalsaBox::new(&client_key, &transient_secret),
-            &layout::long_nonce(layout::PREFIX_VOUCH, vouch_nonce),
-            vouch_box,
+        let vouch = sized::<{ 2 * layout::KEY_LEN }>(
+            &open(
+                &vouch_session,
+                &layout::long_nonce(layout::PREFIX_VOUCH, vouch_nonce),
+                vouch_box,
+                "vouch",
+            )?,
             "vouch",
         )?;
-        let vouch = sized::<{ 2 * layout::KEY_LEN }>(&vouch, "vouch")?;
         let (vouched_transient, vouched_server) = layout::split_key_pair(&vouch);
-        if vouched_transient != client_transient.as_bytes()
-            || vouched_server != self.long_public.as_bytes()
+        if vouched_transient != client_transient
+            || vouched_server != self.long_secret.public_key().as_bytes()
         {
             return Err(Error::EACCES(
                 "the vouch box names another connection's transient key or another server, \
@@ -795,9 +961,9 @@ impl CurveServer {
         // "or as soon as the client sends a valid INITIATE": the cookie key
         // has done its work and must not open a second one.
         self.cookie = None;
-        self.session = Some((client_transient, transient_secret));
+        self.session = Some(session);
         Ok(OpenedInitiate {
-            client_key: CurvePublicKey(*client_key.as_bytes()),
+            client_key: CurvePublicKey(client_key),
             plaintext,
         })
     }
@@ -808,7 +974,7 @@ impl CurveServer {
     ///
     /// `EFSM` if no valid `INITIATE` has been read.
     pub fn ready(&mut self, metadata: &Metadata<'_>) -> Result<Vec<u8>> {
-        let Some((client_transient, transient_secret)) = &self.session else {
+        let Some(session) = &self.session else {
             return Err(Error::EFSM(
                 "a READY needs the session keys a valid INITIATE recovers".into(),
             ));
@@ -817,7 +983,7 @@ impl CurveServer {
         metadata.encode(&mut plaintext).map_err(metadata_error)?;
         let nonce = self.counter.take()?;
         let ready_box = seal(
-            &SalsaBox::new(client_transient, transient_secret),
+            session,
             &layout::short_nonce(layout::PREFIX_READY, nonce),
             &plaintext,
         )?;
@@ -835,18 +1001,17 @@ impl CurveServer {
     ///
     /// `EFSM` if no valid `INITIATE` has been read.
     pub fn into_transport(self) -> Result<CurveTransport> {
-        let Some((client_transient, transient_secret)) = &self.session else {
+        let Some(session) = self.session else {
             return Err(Error::EFSM(
                 "a CURVE transport needs the session keys a valid INITIATE recovers".into(),
             ));
         };
         Ok(CurveTransport {
-            boxed: SalsaBox::new(client_transient, transient_secret),
+            boxed: Some(session),
             send_prefix: layout::PREFIX_MESSAGE_SERVER,
             recv_prefix: layout::PREFIX_MESSAGE_CLIENT,
             send: Counter(self.counter.0),
             highest_seen: 0,
-            alive: true,
         })
     }
 
@@ -865,20 +1030,21 @@ impl CurveServer {
 /// commands between them alike, because a CURVE connection has no plaintext
 /// after its `READY`.
 pub struct CurveTransport {
-    boxed: SalsaBox,
+    /// The box of this connection's session keys. `None` once destroyed,
+    /// which drops the box and wipes its key.
+    boxed: Option<SessionBox>,
     send_prefix: &'static [u8; layout::SHORT_NONCE_PREFIX_LEN],
     recv_prefix: &'static [u8; layout::SHORT_NONCE_PREFIX_LEN],
     send: Counter,
     /// The highest counter seen from the peer. A `MESSAGE` that does not
     /// exceed it is a replay.
     highest_seen: u64,
-    alive: bool,
 }
 
 impl fmt::Debug for CurveTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CurveTransport")
-            .field("alive", &self.alive)
+            .field("alive", &self.boxed.is_some())
             .field("sent", &self.send.0)
             .field("highest_seen", &self.highest_seen)
             .finish_non_exhaustive()
@@ -886,8 +1052,25 @@ impl fmt::Debug for CurveTransport {
 }
 
 impl CurveTransport {
-    /// Seals one frame: the flags octet and the body, as one `MESSAGE`
-    /// ready for the wire.
+    /// Seals one frame: the flags octet and the body, as one `MESSAGE` ready
+    /// for the wire, in a buffer of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::seal_frame_into`].
+    pub fn seal_frame(&mut self, flags: u8, body: &[u8]) -> Result<Vec<u8>> {
+        let mut frame = Vec::new();
+        self.seal_frame_into(flags, body, &mut frame)?;
+        Ok(frame)
+    }
+
+    /// Appends one complete wire frame to `out`: a message-frame header, then
+    /// the `MESSAGE` command — `\x07MESSAGE`, the nonce counter, the 16-octet
+    /// tag and the ciphertext of `flags || body`.
+    ///
+    /// The frame takes one reservation of exactly its size, the body is copied
+    /// once, and the box is encrypted where it lies, with the tag written into
+    /// its slot.
     ///
     /// **In a message frame, not a command frame.** 26/CURVEZMQ calls
     /// `MESSAGE` a command and the body is a command body — the name, the
@@ -897,52 +1080,97 @@ impl CurveTransport {
     /// CURVE handshake with libzmq succeeds and the first command-framed
     /// `MESSAGE` closes the connection. The outer MORE flag stays zero
     /// because the real one is the flags octet inside the box. Reading
-    /// accepts either kind ([`Self::open_message`] takes a body).
+    /// accepts either kind ([`Self::open_message_in_place`] takes a body).
+    ///
+    /// The nonce counter is taken before anything is written. A failure after
+    /// that point leaves a gap in the counter, which the peer accepts because
+    /// it requires only that counters increase, and never a reused nonce. On
+    /// error `out` is truncated back to the length it had.
     ///
     /// # Errors
     ///
     /// `ENOTSOCK` after [`Self::destroy`], `ENOCOMPATPROTO` at the counter
-    /// ceiling.
-    pub fn seal_frame(&mut self, flags: u8, body: &[u8]) -> Result<Vec<u8>> {
-        self.check_alive()?;
-        let mut plaintext = Vec::with_capacity(1 + body.len());
-        plaintext.push(flags);
-        plaintext.extend_from_slice(body);
+    /// ceiling, `EIO` if the box cannot be sealed.
+    pub fn seal_frame_into(&mut self, flags: u8, body: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        let boxed = live(&self.boxed)?;
         let nonce = self.send.take()?;
-        let message_box = seal(
-            &self.boxed,
-            &layout::short_nonce(self.send_prefix, nonce),
-            &plaintext,
-        )?;
-        let mut framed = Vec::new();
-        CurveCommand::Message {
-            nonce,
-            message_box: &message_box,
+        let command_len = MESSAGE_HEAD_LEN + layout::BOX_OVERHEAD + 1 + body.len();
+        let header_len = if command_len as u64 > frame::MAX_SHORT_BODY {
+            9
+        } else {
+            2
+        };
+        let start = out.len();
+        out.reserve_exact(header_len + command_len);
+        frame::encode_header(FrameKind::Message { more: false }, command_len as u64, out);
+        out.extend_from_slice(MESSAGE_NAME_BLOCK);
+        out.extend_from_slice(&nonce.to_be_bytes());
+        let tag_at = out.len();
+        out.resize(tag_at + layout::BOX_OVERHEAD, 0);
+        out.push(flags);
+        out.extend_from_slice(body);
+
+        let nonce_bytes = layout::short_nonce(self.send_prefix, nonce);
+        let ciphertext_at = tag_at + layout::BOX_OVERHEAD;
+        match boxed.encrypt_in_place_detached(
+            Nonce::from_slice(&nonce_bytes),
+            &[],
+            &mut out[ciphertext_at..],
+        ) {
+            Ok(tag) => {
+                out[tag_at..ciphertext_at].copy_from_slice(tag.as_slice());
+                Ok(())
+            }
+            Err(_) => {
+                out.truncate(start);
+                Err(seal_error())
+            }
         }
-        .encode_body(&mut framed)
-        .map_err(curve_error)?;
-        Ok(frame::encode(FrameKind::Message { more: false }, &framed))
     }
 
     /// Opens one `MESSAGE` command body, returning the flags octet and the
     /// frame body it held.
     ///
+    /// This is [`Self::open_message_in_place`] on a copy of `body`, with the
+    /// header of the box dropped from the copy.
+    ///
     /// # Errors
     ///
-    /// `ENOCOMPATPROTO` for a command that is not a `MESSAGE` or whose
-    /// counter does not exceed the highest seen — a repeated nonce is a
-    /// replay, and 26/CURVEZMQ names replay among the attacks it defends
-    /// against. `EACCES` if the box does not open.
+    /// As [`Self::open_message_in_place`].
     pub fn open_message(&mut self, body: &[u8]) -> Result<(u8, Vec<u8>)> {
-        self.check_alive()?;
-        let CurveCommand::Message { nonce, message_box } =
-            CurveCommand::decode(body).map_err(curve_error)?
-        else {
-            return Err(Error::ENOCOMPATPROTO(
-                "a CURVE connection carries MESSAGE commands after its READY, and this is \
-                 something else"
-                    .into(),
-            ));
+        let mut command_body = body.to_vec();
+        let (flags, start) = self.open_message_in_place(&mut command_body)?;
+        command_body.drain(..start);
+        Ok((flags, command_body))
+    }
+
+    /// Opens a `MESSAGE` command in place. `command_body` is the command body
+    /// as it came off the wire, and it is decrypted where it lies. Returns the
+    /// flags octet and the offset at which the frame body starts; the frame
+    /// body runs to the end of `command_body`.
+    ///
+    /// The counter is checked before any decryption, and `highest_seen`
+    /// advances only once the box has opened. The tag is checked before the
+    /// keystream is applied, so a box that does not open is left as it came
+    /// in, and the counter is not moved by it.
+    ///
+    /// # Errors
+    ///
+    /// `ENOTSOCK` after [`Self::destroy`]. `ENOCOMPATPROTO` for a command that
+    /// is not a `MESSAGE` or whose counter does not exceed the highest seen: a
+    /// repeated nonce is a replay, and 26/CURVEZMQ names replay among the
+    /// attacks it defends against. `EACCES` if the box does not open.
+    pub fn open_message_in_place(&mut self, command_body: &mut [u8]) -> Result<(u8, usize)> {
+        let boxed = live(&self.boxed)?;
+        let nonce = match CurveCommand::decode(command_body).map_err(curve_error)? {
+            CurveCommand::Message { nonce, .. } => nonce,
+            _ => {
+                return Err(Error::ENOCOMPATPROTO(
+                    "a CURVE connection carries MESSAGE commands after its READY, and this is \
+                     something else"
+                        .into(),
+                ));
+            }
         };
         if nonce <= self.highest_seen {
             return Err(Error::ENOCOMPATPROTO(
@@ -954,27 +1182,35 @@ impl CurveTransport {
                 .into(),
             ));
         }
-        let plaintext = open(
-            &self.boxed,
-            &layout::short_nonce(self.recv_prefix, nonce),
-            message_box,
-            "MESSAGE",
-        )?;
+        let (_, sealed) = command_body
+            .split_at_mut_checked(MESSAGE_HEAD_LEN)
+            .ok_or_else(short_message)?;
+        let (tag, ciphertext) = sealed
+            .split_at_mut_checked(layout::BOX_OVERHEAD)
+            .ok_or_else(short_message)?;
+        let nonce_bytes = layout::short_nonce(self.recv_prefix, nonce);
+        boxed
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                &[],
+                ciphertext,
+                Tag::from_slice(tag),
+            )
+            .map_err(|_| open_error("MESSAGE"))?;
         self.highest_seen = nonce;
-        let (&flags, body) = plaintext
-            .split_first()
-            .ok_or_else(|| Error::ENOCOMPATPROTO("a MESSAGE box has no flags octet".into()))?;
-        Ok((flags, body.to_vec()))
+        let flags = *ciphertext.first().ok_or_else(short_message)?;
+        Ok((flags, MESSAGE_HEAD_LEN + layout::BOX_OVERHEAD + 1))
     }
 
     /// Destroys the session keys: "Session keys are held in memory and
     /// destroyed when the connection is closed."
     ///
-    /// Called when the connection ends. Afterwards nothing can be sealed or
-    /// opened on this transport, which is what makes the destruction
-    /// observable rather than a claim about memory.
+    /// Called when the connection ends. The box is dropped, which wipes its
+    /// key, and afterwards nothing can be sealed or opened on this transport,
+    /// which is what makes the destruction observable rather than a claim
+    /// about memory.
     pub fn destroy(&mut self) {
-        self.alive = false;
+        self.boxed = None;
         self.send = Counter(0);
         self.highest_seen = 0;
     }
@@ -983,44 +1219,72 @@ impl CurveTransport {
     pub const fn sent(&self) -> u64 {
         self.send.0
     }
-
-    fn check_alive(&self) -> Result<()> {
-        if self.alive {
-            Ok(())
-        } else {
-            Err(Error::ENOTSOCK(
-                "this connection's CURVE session keys have been destroyed".into(),
-            ))
-        }
-    }
 }
 
-/// A box, sealed.
-fn seal(boxed: &SalsaBox, nonce: &[u8; layout::NONCE_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
-    boxed
-        .encrypt(crypto_box::Nonce::from_slice(nonce), plaintext)
-        .map_err(|_| Error::EIO("the cryptography library refused to seal a CURVE box".into()))
+/// The box of a transport that has not been destroyed.
+fn live(boxed: &Option<SessionBox>) -> Result<&SessionBox> {
+    boxed.as_ref().ok_or_else(|| {
+        Error::ENOTSOCK("this connection's CURVE session keys have been destroyed".into())
+    })
+}
+
+/// A box, sealed: the 16-octet tag, then the ciphertext, which is NaCl's
+/// layout.
+fn seal(boxed: &SessionBox, nonce: &[u8; layout::NONCE_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let mut sealed = Vec::with_capacity(layout::BOX_OVERHEAD + plaintext.len());
+    sealed.resize(layout::BOX_OVERHEAD, 0);
+    sealed.extend_from_slice(plaintext);
+    let tag = boxed
+        .encrypt_in_place_detached(
+            Nonce::from_slice(nonce),
+            &[],
+            &mut sealed[layout::BOX_OVERHEAD..],
+        )
+        .map_err(|_| seal_error())?;
+    sealed[..layout::BOX_OVERHEAD].copy_from_slice(tag.as_slice());
+    Ok(sealed)
 }
 
 /// A box, opened — or `EACCES`, because a box that does not open is a peer
-/// that does not hold the key it claimed.
+/// that does not hold the key it claimed. The plaintext is returned in a
+/// buffer that is wiped when it is dropped.
 fn open(
-    boxed: &SalsaBox,
+    boxed: &SessionBox,
     nonce: &[u8; layout::NONCE_LEN],
     sealed: &[u8],
     what: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
+    let (tag, ciphertext) = sealed
+        .split_at_checked(layout::BOX_OVERHEAD)
+        .ok_or_else(|| open_error(what))?;
+    let mut plaintext = Zeroizing::new(ciphertext.to_vec());
     boxed
-        .decrypt(crypto_box::Nonce::from_slice(nonce), sealed)
-        .map_err(|_| {
-            Error::EACCES(
-                format!(
-                    "the {what} box does not open: the peer does not hold the key it would \
-                     need, or the octets were altered"
-                )
-                .into(),
-            )
-        })
+        .decrypt_in_place_detached(
+            Nonce::from_slice(nonce),
+            &[],
+            &mut plaintext,
+            Tag::from_slice(tag),
+        )
+        .map_err(|_| open_error(what))?;
+    Ok(plaintext)
+}
+
+fn seal_error() -> Error {
+    Error::EIO("the cryptography library refused to seal a CURVE box".into())
+}
+
+fn open_error(what: &str) -> Error {
+    Error::EACCES(
+        format!(
+            "the {what} box does not open: the peer does not hold the key it would need, or \
+             the octets were altered"
+        )
+        .into(),
+    )
+}
+
+fn short_message() -> Error {
+    Error::ENOCOMPATPROTO("a MESSAGE command is shorter than its box".into())
 }
 
 /// A box or plaintext of exactly the length its layout states.
@@ -1094,6 +1358,51 @@ mod tests {
         let (_, body, used) = weida_zmtp::frame::decode(frame_bytes, 1 << 20).expect("a frame");
         assert_eq!(used, frame_bytes.len());
         body.to_vec()
+    }
+
+    /// The octets of 64 hex digits.
+    fn hex32(text: &str) -> [u8; KEY_LEN] {
+        assert_eq!(text.len(), 2 * KEY_LEN, "64 hex digits");
+        let mut octets = [0u8; KEY_LEN];
+        for (i, octet) in octets.iter_mut().enumerate() {
+            *octet = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).expect("hex digits");
+        }
+        octets
+    }
+
+    /// An encoding of a field element: `first` and then 0xff, with the top
+    /// bit clear, which is how the non-canonical forms of p-1, p and p+1 are
+    /// written.
+    fn field_encoding(first: u8) -> [u8; KEY_LEN] {
+        let mut octets = [0xffu8; KEY_LEN];
+        octets[0] = first;
+        octets[KEY_LEN - 1] = 0x7f;
+        octets
+    }
+
+    /// The small-order encodings of Curve25519 a peer could send: the zero
+    /// key, u = 1, the two points of order eight, and the non-canonical
+    /// encodings of p-1, p and p+1 (the field elements -1, 0 and 1).
+    fn small_order_keys() -> [[u8; KEY_LEN]; 7] {
+        let mut one = [0u8; KEY_LEN];
+        one[0] = 1;
+        [
+            [0u8; KEY_LEN],
+            one,
+            hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+            hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+            field_encoding(0xec),
+            field_encoding(0xed),
+            field_encoding(0xee),
+        ]
+    }
+
+    /// The box a naive implementation keys from an all-zero shared secret:
+    /// HSalsa20 of zero, built with `crypto_secretbox` directly.
+    fn box_keyed_by_zero_secret() -> SessionBox {
+        let zero = [0u8; KEY_LEN];
+        let key = <SessionBox as Kdf>::kdf(Key::from_slice(&zero), &Default::default());
+        SessionBox::new(&key)
     }
 
     /// Claim: a whole handshake runs, both sides derive the same session
@@ -1248,6 +1557,33 @@ mod tests {
         assert!(!server.holds_cookie(), "and the stale key is gone");
     }
 
+    /// Claim: a cookie sealed for one connection does not open under the key
+    /// of another, so the cookie is bound to the server that made it.
+    #[test]
+    fn a_cookie_does_not_open_under_another_connections_key() {
+        let (server_public, server_secret) = keypair();
+        let (client_public, client_secret) = keypair();
+        let mut client = CurveClient::new(client_public, &client_secret, server_public);
+        let hello = body(&client.hello().expect("HELLO"));
+
+        let mut first = CurveServer::new(&server_secret, COOKIE_LIFETIME);
+        let mut second = CurveServer::new(&server_secret, COOKIE_LIFETIME);
+        first.read_hello(&hello).expect("read HELLO");
+        second.read_hello(&hello).expect("read HELLO");
+        let welcome = body(&first.welcome().expect("WELCOME"));
+        second.welcome().expect("the second WELCOME");
+        client.read_welcome(&welcome).expect("read WELCOME");
+        let initiate = body(&client.initiate(&Metadata::new()).expect("INITIATE"));
+
+        // The cookie in this INITIATE is the first server's, so the second
+        // server's key must not open it.
+        let err = second.read_initiate(&initiate).unwrap_err();
+        assert_eq!(err.errno(), "EACCES", "{err}");
+        first
+            .read_initiate(&initiate)
+            .expect("the server that sealed the cookie opens it");
+    }
+
     /// Claim: a client that does not know `S` cannot get past `HELLO`, which
     /// is what the signature box is for.
     #[test]
@@ -1281,12 +1617,159 @@ mod tests {
         let welcome = body(&server.welcome().expect("WELCOME"));
         client.read_welcome(&welcome).expect("read WELCOME");
         let (elsewhere, _) = keypair();
-        client.server_key = PublicKey::from(*elsewhere.as_bytes());
+        client.server_key = *elsewhere.as_bytes();
         let initiate = body(&client.initiate(&Metadata::new()).expect("INITIATE"));
 
         let err = server.read_initiate(&initiate).unwrap_err();
         assert_eq!(err.errno(), "EACCES", "{err}");
         assert!(err.cause().contains("vouch"), "{err}");
+    }
+
+    /// Claim: a `HELLO` whose transient key is of small order is refused, even
+    /// with a signature box that a naive implementation would open, because
+    /// that box is keyed by the all-zero shared secret every such key yields.
+    #[test]
+    fn a_hello_with_a_small_order_key_is_refused() {
+        let (server_public, server_secret) = keypair();
+        let (client_public, client_secret) = keypair();
+        for key in small_order_keys() {
+            let zero_box = box_keyed_by_zero_secret();
+            let nonce = layout::short_nonce(layout::PREFIX_HELLO, 1);
+            let signature = sized::<{ layout::SIGNATURE_BOX_LEN }>(
+                &seal(&zero_box, &nonce, &SIGNATURE_PLAINTEXT).expect("seal"),
+                "HELLO signature",
+            )
+            .expect("80 octets");
+            // The premise of the refusal: the box does open under the zero key.
+            open(&zero_box, &nonce, &signature, "HELLO")
+                .expect("the zero-keyed box opens, so only the small-order rule refuses it");
+
+            let mut hello = Vec::new();
+            CurveCommand::Hello {
+                client_key: &key,
+                nonce: 1,
+                signature_box: &signature,
+            }
+            .encode_body(&mut hello)
+            .expect("a HELLO");
+            let mut server = CurveServer::new(&server_secret, COOKIE_LIFETIME);
+            let err = server.read_hello(&hello).unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+        }
+
+        let mut client = CurveClient::new(client_public, &client_secret, server_public);
+        let hello = body(&client.hello().expect("HELLO"));
+        let mut server = CurveServer::new(&server_secret, COOKIE_LIFETIME);
+        server
+            .read_hello(&hello)
+            .expect("a HELLO from a real key is accepted");
+    }
+
+    /// Claim: a `WELCOME` whose transient server key `S'` is of small order is
+    /// refused by the client, so no box is keyed from a constant.
+    #[test]
+    fn a_welcome_with_a_small_order_server_key_is_refused() {
+        for key in small_order_keys() {
+            let (server_public, server_secret) = keypair();
+            let (client_public, client_secret) = keypair();
+            let mut client = CurveClient::new(client_public, &client_secret, server_public);
+            client.hello().expect("HELLO");
+
+            // The WELCOME a server holding `s` sends to this client, with the
+            // small-order key inside. Its box is `(s, C')`, which the client
+            // derives too, from its own side of the same pair.
+            let boxed = session_box(server_secret.secret_bytes(), &client.transient_public)
+                .expect("the box of (s, C')");
+            let nonce = [0x5a; layout::LONG_NONCE_LEN];
+            let welcome_box = sized::<{ layout::WELCOME_BOX_LEN }>(
+                &seal(
+                    &boxed,
+                    &layout::long_nonce(layout::PREFIX_WELCOME, &nonce),
+                    &layout::join_welcome_plaintext(&key, &[0u8; layout::COOKIE_LEN]),
+                )
+                .expect("seal"),
+                "WELCOME",
+            )
+            .expect("144 octets");
+            let mut welcome = Vec::new();
+            CurveCommand::Welcome {
+                nonce: &nonce,
+                welcome_box: &welcome_box,
+            }
+            .encode_body(&mut welcome)
+            .expect("a WELCOME");
+
+            let err = client.read_welcome(&welcome).unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+        }
+    }
+
+    /// Claim: an `INITIATE` whose client key `C` is of small order is refused
+    /// by the server at the vouch, so the server never trusts a constant key.
+    #[test]
+    fn a_vouch_with_a_small_order_client_key_is_refused() {
+        for key in small_order_keys() {
+            let (server_public, server_secret) = keypair();
+            let (client_public, client_secret) = keypair();
+            let mut client = CurveClient::new(client_public, &client_secret, server_public);
+            let mut server = CurveServer::new(&server_secret, COOKIE_LIFETIME);
+            let hello = body(&client.hello().expect("HELLO"));
+            server.read_hello(&hello).expect("read HELLO");
+            let welcome = body(&server.welcome().expect("WELCOME"));
+            client.read_welcome(&welcome).expect("read WELCOME");
+
+            // An INITIATE a naive implementation would accept in full: the vouch
+            // is sealed under the box keyed by the all-zero secret and names this
+            // connection's C' and the server's S. Only the small-order `C` is
+            // wrong, so the refusal has to come from the key check.
+            let server_transient = client.server_transient.expect("S'");
+            let session = session_box(&client.transient_secret, &server_transient)
+                .expect("the box of (c', S')");
+            let vouch_nonce = [0x33u8; layout::LONG_NONCE_LEN];
+            let vouch_box = seal(
+                &box_keyed_by_zero_secret(),
+                &layout::long_nonce(layout::PREFIX_VOUCH, &vouch_nonce),
+                &layout::join_key_pair(&client.transient_public, server_public.as_bytes()),
+            )
+            .expect("seal");
+            open(
+                &box_keyed_by_zero_secret(),
+                &layout::long_nonce(layout::PREFIX_VOUCH, &vouch_nonce),
+                &vouch_box,
+                "vouch",
+            )
+            .expect("the premise: a naive implementation would open this vouch");
+            let vouch = layout::join_nonce_box(
+                &vouch_nonce,
+                &sized::<{ layout::NONCE_BOX_LEN }>(&vouch_box, "vouch").expect("80 octets"),
+            );
+            let mut plaintext = Vec::new();
+            InitiatePlaintext {
+                client_key: &key,
+                vouch: &vouch,
+                metadata: Metadata::new(),
+            }
+            .encode(&mut plaintext)
+            .expect("an INITIATE plaintext");
+            let initiate_box = seal(
+                &session,
+                &layout::short_nonce(layout::PREFIX_INITIATE, 2),
+                &plaintext,
+            )
+            .expect("seal");
+            let cookie = client.cookie.expect("the cookie");
+            let mut initiate = Vec::new();
+            CurveCommand::Initiate {
+                cookie: &cookie,
+                nonce: 2,
+                initiate_box: &initiate_box,
+            }
+            .encode_body(&mut initiate)
+            .expect("an INITIATE");
+
+            let err = server.read_initiate(&initiate).unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+        }
     }
 
     /// Claim: destroyed session keys seal and open nothing.
@@ -1302,6 +1785,165 @@ mod tests {
         server.destroy();
         let err = server.open_message(&sealed).unwrap_err();
         assert_eq!(err.errno(), "ENOTSOCK", "{err}");
+    }
+
+    /// Claim: a transport seals into a buffer and opens in place. The body
+    /// sits where the returned offset says, a forged box neither opens nor
+    /// moves the replay counter, and a replayed box is refused.
+    #[test]
+    fn a_transport_seals_and_opens_in_place() {
+        let (mut client, mut server) = handshake();
+
+        // Two frames appended to one buffer. The second is long enough for the
+        // long size field, so both header forms are exercised.
+        let mut wire = Vec::new();
+        client
+            .seal_frame_into(layout::MESSAGE_FLAG_MORE, b"in place", &mut wire)
+            .expect("seal");
+        let first_end = wire.len();
+        let long = vec![0xa5u8; 1000];
+        client.seal_frame_into(0, &long, &mut wire).expect("seal");
+
+        let (_, command, used) =
+            weida_zmtp::frame::decode(&wire[..first_end], 1 << 20).expect("the first frame");
+        assert_eq!(used, first_end);
+        let mut first = command.to_vec();
+        let (flags, at) = server
+            .open_message_in_place(&mut first)
+            .expect("open the first frame");
+        assert_eq!(
+            flags,
+            layout::MESSAGE_FLAG_MORE,
+            "the MORE flag travels inside the box"
+        );
+        assert_eq!(&first[at..], b"in place");
+
+        let (_, command, used) =
+            weida_zmtp::frame::decode(&wire[first_end..], 1 << 20).expect("the second frame");
+        assert_eq!(used, wire.len() - first_end);
+        let mut second = command.to_vec();
+        let (flags, at) = server
+            .open_message_in_place(&mut second)
+            .expect("open the second frame");
+        assert_eq!(flags, 0);
+        assert_eq!(&second[at..], &long[..]);
+
+        // A frame whose ciphertext has one flipped bit: refused, and the
+        // genuine box still opens afterwards because the counter did not move.
+        let mut wire = Vec::new();
+        client
+            .seal_frame_into(0, b"after a forgery", &mut wire)
+            .expect("seal");
+        let (_, command, _) = weida_zmtp::frame::decode(&wire, 1 << 20).expect("a frame");
+        let genuine = command.to_vec();
+        let mut forged = genuine.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        let err = server.open_message_in_place(&mut forged).unwrap_err();
+        assert_eq!(err.errno(), "EACCES", "{err}");
+
+        let mut opened = genuine.clone();
+        let (_, at) = server
+            .open_message_in_place(&mut opened)
+            .expect("the genuine box opens after a forgery");
+        assert_eq!(&opened[at..], b"after a forgery");
+
+        // The same octets again are a replay, refused before any decryption.
+        let err = server
+            .open_message_in_place(&mut genuine.clone())
+            .unwrap_err();
+        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+    }
+
+    /// Claim: a `CurveSecretKey` clone shares the key's allocation instead of
+    /// copying the secret.
+    #[test]
+    fn a_secret_key_clone_shares_its_allocation() {
+        let (_, secret) = keypair();
+        let copy = secret.clone();
+        assert!(
+            copy.shares_allocation_with(&secret),
+            "a clone shares the key"
+        );
+        let (_, other) = keypair();
+        assert!(!other.shares_allocation_with(&secret));
+    }
+
+    /// Claim: X25519 is RFC 7748 — the two vectors of section 5.2, and the
+    /// public keys and shared secret of section 6.1 — so the Diffie-Hellman
+    /// step agrees with every other implementation of the function.
+    #[test]
+    fn x25519_matches_rfc_7748() {
+        assert_eq!(
+            *x25519(
+                &hex32("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+                &hex32("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"),
+            ),
+            hex32("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"),
+        );
+        assert_eq!(
+            *x25519(
+                &hex32("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+                &hex32("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"),
+            ),
+            hex32("95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"),
+        );
+
+        let alice = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let bob = hex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+        assert_eq!(
+            public_key_of(&alice),
+            hex32("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"),
+        );
+        assert_eq!(
+            public_key_of(&bob),
+            hex32("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"),
+        );
+        let shared = hex32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+        assert_eq!(*x25519(&alice, &public_key_of(&bob)), shared);
+        assert_eq!(*x25519(&bob, &public_key_of(&alice)), shared);
+    }
+
+    /// Claim: the local box is `crypto_box`'s box byte for byte, so a box
+    /// sealed here opens in the reference implementation and the reverse.
+    #[test]
+    fn the_local_box_is_nacls_crypto_box() {
+        use crypto_box::aead::Aead;
+
+        for _ in 0..8 {
+            let (public_a, secret_a) = keypair();
+            let (public_b, secret_b) = keypair();
+            let nonce = [0x42u8; layout::NONCE_LEN];
+            let message = b"a message both implementations seal and open";
+
+            let reference_ab = crypto_box::SalsaBox::new(
+                &crypto_box::PublicKey::from(*public_b.as_bytes()),
+                &crypto_box::SecretKey::from(*secret_a.secret_bytes()),
+            );
+            let local_ab =
+                session_box(secret_a.secret_bytes(), public_b.as_bytes()).expect("a box");
+            let sealed = seal(&local_ab, &nonce, message).expect("seal");
+            assert_eq!(
+                sealed,
+                reference_ab
+                    .encrypt(crypto_box::Nonce::from_slice(&nonce), &message[..])
+                    .expect("crypto_box seals"),
+                "the same octets, tag first"
+            );
+
+            let reference_ba = crypto_box::SalsaBox::new(
+                &crypto_box::PublicKey::from(*public_a.as_bytes()),
+                &crypto_box::SecretKey::from(*secret_b.secret_bytes()),
+            );
+            let sealed_by_reference = reference_ba
+                .encrypt(crypto_box::Nonce::from_slice(&nonce), &message[..])
+                .expect("crypto_box seals");
+            let local_ba =
+                session_box(secret_b.secret_bytes(), public_a.as_bytes()).expect("a box");
+            let opened = open(&local_ba, &nonce, &sealed_by_reference, "crypto_box")
+                .expect("the local box opens the reference box");
+            assert_eq!(opened.as_slice(), &message[..]);
+        }
     }
 
     /// Claim: a key is 32 binary octets or 40 characters of Z85, and

@@ -28,34 +28,112 @@
 //! pure-Rust `zeromq` crate in both roles, including the downgrade and
 //! heartbeat cases above.
 
+use std::future::poll_fn;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use weida_runtime::Exec;
 use weida_zmtp::{
-    Command, CommandError, FrameKind, Greeting, GreetingError, Metadata, SocketType, Version,
-    curve as curve_layout, frame, greeting,
+    Command, CommandError, FrameError, FrameKind, Greeting, GreetingError, Metadata, SocketType,
+    Version, curve as curve_layout, frame, greeting,
 };
+use zeroize::Zeroize;
 
 use crate::context::Context;
 use crate::curve::{
     COOKIE_LIFETIME, CurveClient, CurvePublicKey, CurveSecretKey, CurveServer, CurveTransport,
 };
-use crate::engine::{Connection, Role, Session, SessionFuture};
+use crate::engine::{Connection, LogGate, Role, Session, SessionFuture};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
-use crate::message::{Decoded, Message, MessageLimits, Multipart};
+use crate::message::{
+    Assembly, Message, MessageLimits, Multipart, command_in_multipart, frame_error, header_octets,
+};
 use crate::options::{Security, SocketOptions};
 use crate::pipe::{Queue, Sent};
 use crate::subscriptions::{self, SubscriptionForm, Subscriptions};
 use crate::zap::{self, ZapRequest, ZapUserId};
 
-/// Read buffer growth step. A frame header is at most nine octets and a
-/// command body a few hundred, so the interesting case is a payload, which is
-/// read straight into this buffer.
-const CHUNK: usize = 16 * 1024;
+/// What the receive buffer grows by when a read would be offered less than
+/// [`MIN_READ_SPARE`]. A frame header is at most nine octets and a command
+/// body a few hundred, so the interesting case is a payload, which is read
+/// straight into this buffer and handed on as a slice of it.
+const READ_CHUNK: usize = 16 * 1024;
+
+/// Spare room below which the receive buffer is grown before the next read,
+/// so that a read is never offered a handful of octets.
+const MIN_READ_SPARE: usize = 4 * 1024;
+
+/// The largest frame the greeting and the security handshake accept, header
+/// included, and the most a peer can make this side buffer before it has
+/// authenticated.
+///
+/// The largest legitimate handshake command is a few hundred octets — a
+/// CURVE `HELLO` is 200, a PLAIN `HELLO` at most 520, a `WELCOME` 168, and
+/// `READY`/`INITIATE` carry a `Socket-Type`, an `Identity` of at most 255
+/// octets and a handful of properties — so this is far above anything an
+/// honest peer sends and far below `ZMQ_MAXMSGSIZE`, which an operator may
+/// have raised for bulk traffic. A frame that is not a command, or declares
+/// more than this, is refused at its header, before a body octet is read.
+pub const HANDSHAKE_MAX_FRAME: u64 = 64 * 1024;
+
+/// How long a peer may take over a message it has started before the octets
+/// it has sent buy it more time ([`MIN_MESSAGE_RATE`]). Without it a peer
+/// could announce a message and send a byte a minute, holding the connection
+/// and its buffers for ever whenever the heartbeat is off, which is the
+/// default.
+pub const MESSAGE_IVL: Duration = Duration::from_secs(30);
+
+/// The slowest rate, in octets per second, at which a message is expected to
+/// keep arriving: every this many octets received extend the time a peer has
+/// for the message by a second. A message that keeps up is never overdue,
+/// however large, and one that crawls in more slowly — or that was announced
+/// and not sent — ends the connection once [`MESSAGE_IVL`] and what it has
+/// earned are spent. A modem's pace keeps up.
+pub const MIN_MESSAGE_RATE: u64 = 4 * 1024;
+
+/// Output waiting for a peer that is not draining it, above which no more is
+/// taken from the pipe: the pipe's high-water marks are the bound, and a
+/// second, unbounded buffer behind them would defeat it.
+const OUT_HIGH_WATER: usize = 256 * 1024;
+
+/// Messages written with one `write`, at most: what the pipe already holds is
+/// gathered into the connection's output before it is written, as libzmq
+/// batches. One syscall per message is a ceiling on small-message throughput.
+const BATCH_MESSAGES: usize = 64;
+
+/// Output at which a batch stops growing.
+const BATCH_BYTES: usize = 64 * 1024;
+
+/// Frames shorter than this are copied out of the receive buffer rather than
+/// sliced off it: the copy is cheaper than the shared bookkeeping, and the
+/// frame does not pin the buffer it arrived in.
+const SLICE_MIN: usize = 512;
+
+/// A larger frame is sliced off the receive buffer only when it is at least
+/// one `SLICE_SHARE`th of the buffer's allocation, so that a queued frame
+/// pins at most that many times its own size and a peer cannot turn a small
+/// accounted message into a large resident one.
+const SLICE_SHARE: usize = 4;
+
+/// The receive and send buffers keep at most this much capacity while they
+/// are empty; a connection that once carried a large message does not hold
+/// its high-water mark for the rest of its life.
+const RETAINED_BUFFER: usize = 64 * 1024;
+
+/// The floor under `ZMQ_HEARTBEAT_IVL`, so that a zero interval is a fast
+/// heartbeat rather than a spin.
+const MIN_HEARTBEAT_IVL: Duration = Duration::from_millis(1);
+
+/// How often a refused subscription is logged, per connection. A subscriber
+/// at its table ceiling can send a `SUBSCRIBE` per eleven octets, and a log
+/// line per refusal would turn each of them into a hundred octets of log.
+const REFUSAL_LOG_PERIOD: Duration = Duration::from_secs(1);
 
 /// The context this library puts in its `PING`s. Opaque by specification —
 /// the `PONG` echoes it and nothing interprets it.
@@ -229,12 +307,13 @@ async fn drive(
         }
         for (prefix, count) in mine.counted() {
             for _ in 0..count {
-                write_subscription(&mut wire, options.subscription_form, true, &prefix).await?;
+                queue_subscription(&mut wire, options.subscription_form, true, &prefix)?;
             }
         }
         for message in carried {
-            wire.write_message(&message).await?;
+            wire.queue_message(&message)?;
         }
+        wire.flush().await?;
     }
 
     if ours == SocketType::XPub
@@ -322,7 +401,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
         as_server: security.as_server(),
         ..Greeting::null()
     };
-    wire.write_all(&greeting.encode()).await?;
+    wire.write_raw(&greeting.encode()).await?;
 
     let mut theirs = [0u8; greeting::GREETING_LEN];
     wire.read_exactly(&mut theirs).await?;
@@ -360,7 +439,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
     let peer_metadata = match security {
         Security::Null => {
             wire.write_command(&Command::Ready(ours_metadata)).await?;
-            PeerMetadata::Command(expect_command(wire, "READY").await?)
+            PeerMetadata::Command(wire.read_command("READY").await?)
         }
         Security::PlainClient => {
             // `C:HELLO(user,pass) -> S:WELCOME|S:ERROR`, then
@@ -370,7 +449,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
                 password: options.plain_password.as_deref().unwrap_or("").as_bytes(),
             })
             .await?;
-            let body = expect_command(wire, "WELCOME").await?;
+            let body = wire.read_command("WELCOME").await?;
             match Command::decode(&body).map_err(command_error)? {
                 Command::Welcome => {}
                 other => {
@@ -381,10 +460,10 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
             }
             wire.write_command(&Command::Initiate(ours_metadata))
                 .await?;
-            PeerMetadata::Command(expect_command(wire, "READY").await?)
+            PeerMetadata::Command(wire.read_command("READY").await?)
         }
         Security::PlainServer => {
-            let body = expect_command(wire, "HELLO").await?;
+            let body = wire.read_command("HELLO").await?;
             let (username, password) = match Command::decode(&body).map_err(command_error)? {
                 Command::Hello { username, password } => (username.to_vec(), password.to_vec()),
                 other => {
@@ -406,7 +485,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .await?;
             wire.write_command(&Command::Welcome).await?;
-            let peer_metadata = expect_command(wire, "INITIATE").await?;
+            let peer_metadata = wire.read_command("INITIATE").await?;
             wire.write_command(&Command::Ready(ours_metadata)).await?;
             PeerMetadata::Command(peer_metadata)
         }
@@ -420,12 +499,12 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
             );
             let hello = client.hello()?;
             wire.write_handshake(&hello).await?;
-            let body = expect_command(wire, "WELCOME").await?;
+            let body = wire.read_command("WELCOME").await?;
             refused(&body)?;
             client.read_welcome(&body)?;
             let initiate = client.initiate(&ours_metadata)?;
             wire.write_handshake(&initiate).await?;
-            let body = expect_command(wire, "READY").await?;
+            let body = wire.read_command("READY").await?;
             refused(&body)?;
             let metadata = client.read_ready(&body)?;
             // Everything after this point is a MESSAGE box.
@@ -434,7 +513,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
         }
         Security::CurveServer => {
             let mut server = CurveServer::new(curve_secret(options)?, COOKIE_LIFETIME);
-            let body = expect_command(wire, "HELLO").await?;
+            let body = wire.read_command("HELLO").await?;
             refused(&body)?;
             if let Err(e) = server.read_hello(&body) {
                 // A HELLO that does not open is a peer that does not know
@@ -446,7 +525,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let welcome = server.welcome()?;
             wire.write_handshake(&welcome).await?;
-            let body = expect_command(wire, "INITIATE").await?;
+            let body = wire.read_command("INITIATE").await?;
             refused(&body)?;
             let opened = match server.read_initiate(&body) {
                 Ok(opened) => opened,
@@ -455,14 +534,16 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
                     return Err(e);
                 }
             };
-            // The domain is the switch between 26/CURVEZMQ's security
-            // models: without one, "the server does not check client keys at
-            // all" and knowing `S` was the authorization. With one, the
+            // Whether the client's key goes to a handler: always when one is
+            // bound, and under a domain even when none is, because then the
+            // refusal is the answer. Without either, "the server does not
+            // check client keys at all" and knowing `S` was the
+            // authorization (26/CURVEZMQ's first model). With one, the
             // credential is `C` — "a 32-byte long-term public key of the peer
             // being authenticated", the key that never travelled in clear
             // text — and the identity frame is the peer's own `Identity`
             // property, out of the same box.
-            if options.authorizes() {
+            if zap::asks_handler(options, &facts.context) {
                 let identity = opened
                     .metadata()?
                     .get("Identity")
@@ -577,7 +658,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
 /// [`Metadata`] borrowed from them outlives the handshake.
 enum PeerMetadata {
     /// A `READY` or `INITIATE` command body.
-    Command(Vec<u8>),
+    Command(Bytes),
     /// The property dictionary out of an `INITIATE` or `READY` box.
     Dictionary(Vec<u8>),
 }
@@ -588,12 +669,25 @@ enum PeerMetadata {
 /// 37/ZMTP calls an incoming one fatal. A CURVE command can never be
 /// mistaken for one, because no CURVE command is named `ERROR`.
 fn refused(body: &[u8]) -> Result<()> {
+    // Only an `ERROR` is looked at: a handshake body is decoded as the
+    // command it is in the one place that acts on it, and a CURVE body that
+    // is not an `ERROR` is not a NULL-style command to be parsed here.
+    if command_name(body) != Some(b"ERROR") {
+        return Ok(());
+    }
     match Command::decode(body) {
         Ok(Command::Error(reason)) => Err(Error::ENOCOMPATPROTO(
             format!("the peer refused the handshake: {}", sanitize(reason)).into(),
         )),
         _ => Ok(()),
     }
+}
+
+/// The name a command body announces: its length-prefixed name, or `None`
+/// when the body does not hold one. Nothing past the name is looked at.
+fn command_name(body: &[u8]) -> Option<&[u8]> {
+    let len = usize::from(*body.first()?);
+    body.get(1..1 + len)
 }
 
 /// A CURVE key an option must carry, or `EINVAL` naming the option.
@@ -629,20 +723,6 @@ fn handshake_metadata(ours: SocketType, options: &SocketOptions) -> Metadata<'_>
     metadata
 }
 
-/// Reads the next command body, refusing a message: nothing may precede a
-/// handshake command, so early data is a protocol violation.
-async fn expect_command<S: AsyncRead + AsyncWrite + Unpin>(
-    wire: &mut Wire<S>,
-    what: &str,
-) -> Result<Vec<u8>> {
-    match wire.read_next().await? {
-        Incoming::Command(body) => Ok(body),
-        Incoming::Message(_) => Err(Error::ENOCOMPATPROTO(
-            format!("the peer sent a message before its {what}").into(),
-        )),
-    }
-}
-
 /// Asks the ZAP handler about this connection, and refuses the connection
 /// with an `ERROR` when the answer is not 200.
 ///
@@ -656,6 +736,25 @@ async fn authorize<S: AsyncRead + AsyncWrite + Unpin>(
     credentials: Vec<Vec<u8>>,
     identity: Vec<u8>,
 ) -> Result<Option<ZapUserId>> {
+    if credentials
+        .iter()
+        .any(|credential| zap::imitates_local_principal(credential))
+    {
+        // A PLAIN username and password are whatever octets the peer chose,
+        // and a handler written against the extension frame's convention
+        // would read one that starts like it as the kernel's statement about
+        // a local peer. No honest peer has such a credential, so nobody is
+        // asked: the connection is refused here.
+        wire.refuse("400 a credential imitates the local principal extension")
+            .await;
+        return Err(Error::EACCES(
+            format!(
+                "a {mechanism} credential begins like the X-Local-Principal extension frame, \
+                 which only this library may send; the connection is refused"
+            )
+            .into(),
+        ));
+    }
     let request = ZapRequest {
         request_id: next_request_id(),
         domain: options.zap_domain.clone(),
@@ -706,10 +805,18 @@ fn next_request_id() -> Vec<u8> {
 
 /// Moves messages both ways until the connection or the pipe ends.
 ///
-/// Three things happen in one loop, and they are one loop on purpose: reading
-/// the wire, draining this peer's outgoing queue onto it, and beating the
-/// heartbeat. A separate reader and writer task would need a lock over the
-/// same socket and would not make either direction faster.
+/// Four things happen in one loop, and they are one loop on purpose: the wire
+/// (reading, and writing what has been queued for it), draining this peer's
+/// outgoing queue into that output, the `ERROR`s the application asks this
+/// connection to carry, and the timers. A separate reader and writer task
+/// would need a lock over the same socket and would not make either
+/// direction faster.
+///
+/// **Nothing waits on the peer while the rest stands still.** A write is an
+/// arm of this loop, not an await inside another arm's body, so a peer that
+/// stops reading cannot stop the timers or this side's reading: with the
+/// heartbeat on, the connection ends by `ETIMEDOUT` instead of hanging on a
+/// full socket buffer for good.
 ///
 /// **Backpressure is the receive queue not being drained.** When this peer's
 /// incoming queue is full and its socket type blocks, the `send` below waits,
@@ -725,52 +832,55 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
     exec: &Exec,
     version: Version,
 ) -> Result<()> {
-    let outgoing: std::sync::Arc<Queue> = pipe.outgoing();
-    let incoming: std::sync::Arc<Queue> = pipe.incoming();
-    let mut liveness = Liveness::new(options, version);
+    let outgoing: Arc<Queue> = pipe.outgoing();
+    let incoming: Arc<Queue> = pipe.incoming();
+    let refusals = LogGate::new(REFUSAL_LOG_PERIOD);
+    let mut liveness = Liveness::new(options, version, exec, wire);
 
     loop {
+        // Not while the peer is sitting on what is already queued.
+        let room = wire.pending() < OUT_HIGH_WATER;
         tokio::select! {
-            arrived = wire.read_next() => {
-                liveness.saw_traffic();
-                match arrived? {
-                    Incoming::Message(message) => {
-                        if publishes(ours) {
-                            // A publisher never hands an inbound message to
-                            // its application: "PUB SHALL silently discard
-                            // any messages that subscribers send it". The one
-                            // thing such a message may be is a subscription
-                            // in ZMTP 2.0's form, which is how a 3.0 peer
-                            // asks.
-                            apply_message_form(ours, subscriptions, &incoming, options, &message)
-                                .await?;
-                        } else if incoming.send(message).await? == Sent::Dropped {
-                            tracing::trace!(
-                                "dropped an inbound message: the queue is at its high-water mark"
-                            );
-                        }
-                    }
-                    Incoming::Command(body) => {
-                        answer(wire, ours, subscriptions, &incoming, options, &body).await?;
+            event = wire.next_event() => match event? {
+                Event::Received(Incoming::Message(message)) => {
+                    if publishes(ours) {
+                        // A publisher never hands an inbound message to
+                        // its application: "PUB SHALL silently discard
+                        // any messages that subscribers send it". The one
+                        // thing such a message may be is a subscription
+                        // in ZMTP 2.0's form, which is how a 3.0 peer
+                        // asks.
+                        apply_message_form(
+                            ours,
+                            subscriptions,
+                            &incoming,
+                            options,
+                            &refusals,
+                            message,
+                        )
+                        .await?;
+                    } else if incoming.send(message).await? == Sent::Dropped {
+                        tracing::trace!(
+                            "dropped an inbound message: the queue is at its high-water mark"
+                        );
                     }
                 }
-            }
-            queued = outgoing.recv() => match queued {
+                Event::Received(Incoming::Command(body)) => {
+                    answer(wire, ours, subscriptions, &incoming, options, &refusals, &body)
+                        .await?;
+                }
+                Event::Wrote => {}
+            },
+            queued = outgoing.recv(), if room => match queued {
                 Ok(message) => {
-                    // A subscribing socket's outgoing messages *are* its
-                    // subscriptions, in the `%x01`/`%x00` form the API uses;
-                    // which form goes on the wire is this socket's choice.
-                    match subscribing_form(ours, &message) {
-                        Some((subscribe, prefix)) => {
-                            write_subscription(
-                                wire,
-                                options.subscription_form,
-                                subscribe,
-                                &prefix,
-                            )
-                            .await?;
-                        }
-                        None => wire.write_message(&message).await?,
+                    dispatch(wire, ours, options, &message)?;
+                    // What the pipe already holds goes out in the same
+                    // write.
+                    let mut taken = 1;
+                    while taken < BATCH_MESSAGES && wire.pending() < BATCH_BYTES {
+                        let Ok(next) = outgoing.try_recv() else { break };
+                        dispatch(wire, ours, options, &next)?;
+                        taken += 1;
                     }
                 }
                 // The pipe was destroyed: the socket closed or disconnected
@@ -784,10 +894,30 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
             // incoming ERROR command as fatal" is the *peer's* rule, and
             // whether it closes is its choice.
             reason = pipe.refusal() => {
-                wire.write_command(&Command::Error(&reason)).await?;
+                wire.queue_command(&Command::Error(&reason))?;
             }
-            () = liveness.tick(exec) => liveness.beat(wire).await?,
+            () = liveness.expired() => liveness.fire(wire)?,
         }
+    }
+}
+
+/// Puts one message from the pipe into the connection's output: a
+/// subscribing socket's own subscriptions in the form this socket sends
+/// them, anything else as the message it is.
+fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    ours: SocketType,
+    options: &SocketOptions,
+    message: &Multipart,
+) -> Result<()> {
+    // A subscribing socket's outgoing messages *are* its subscriptions, in
+    // the `%x01`/`%x00` form the API uses; which form goes on the wire is
+    // this socket's choice.
+    match subscribing_form(ours, message) {
+        Some((subscribe, prefix)) => {
+            queue_subscription(wire, options.subscription_form, subscribe, &prefix)
+        }
+        None => wire.queue_message(message),
     }
 }
 
@@ -799,25 +929,53 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
 /// subscription on a REQ or a PUSH is not a loss, it is the only correct
 /// answer. Anything else is noted and ignored, which is what a peer must do
 /// with a command it has no use for.
+///
+/// `READY` and `INITIATE` are the handshake's, and once it is over nothing
+/// uses them, so they are dropped **without being parsed**: parsing a
+/// property dictionary only to ignore it is work a peer could ask for as
+/// often as it likes.
 async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     ours: SocketType,
     subscriptions: &Arc<Subscriptions>,
     incoming: &Arc<Queue>,
     options: &SocketOptions,
+    refusals: &LogGate,
     body: &[u8],
 ) -> Result<()> {
+    if matches!(command_name(body), Some(b"READY" | b"INITIATE")) {
+        tracing::debug!("ignoring a handshake command that arrived after the handshake");
+        return Ok(());
+    }
     match Command::decode(body).map_err(command_error)? {
         Command::Subscribe(prefix) if publishes(ours) => {
-            apply_subscription(ours, subscriptions, incoming, options, true, prefix).await
+            apply_subscription(
+                ours,
+                subscriptions,
+                incoming,
+                options,
+                refusals,
+                true,
+                prefix,
+            )
+            .await
         }
         Command::Cancel(prefix) if publishes(ours) => {
-            apply_subscription(ours, subscriptions, incoming, options, false, prefix).await
+            apply_subscription(
+                ours,
+                subscriptions,
+                incoming,
+                options,
+                refusals,
+                false,
+                prefix,
+            )
+            .await
         }
         Command::Ping { context, .. } => {
             // "When a peer receives a PING command it SHALL respond with a
             // PONG command that echoes the ping-context."
-            wire.write_command(&Command::Pong { context }).await
+            wire.queue_command(&Command::Pong { context })
         }
         Command::Error(reason) => Err(Error::ENOCOMPATPROTO(
             format!("the peer sent ERROR: {}", sanitize(reason)).into(),
@@ -853,8 +1011,8 @@ fn subscribing_form(ours: SocketType, message: &Multipart) -> Option<(bool, Vec<
     Some((subscribe, prefix.to_vec()))
 }
 
-/// Writes one subscription in the configured form.
-async fn write_subscription<S: AsyncRead + AsyncWrite + Unpin>(
+/// Queues one subscription in the configured form.
+fn queue_subscription<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     form: SubscriptionForm,
     subscribe: bool,
@@ -867,11 +1025,11 @@ async fn write_subscription<S: AsyncRead + AsyncWrite + Unpin>(
             } else {
                 Command::Cancel(prefix)
             };
-            wire.write_command(&command).await
+            wire.queue_command(&command)
         }
         SubscriptionForm::LegacyMessage => {
             let frame = subscriptions::write_message_form(subscribe, prefix);
-            wire.write_message(&Multipart::single(frame)).await
+            wire.queue_message(&Multipart::single(frame))
         }
     }
 }
@@ -883,6 +1041,7 @@ async fn apply_subscription(
     subscriptions: &Arc<Subscriptions>,
     incoming: &Arc<Queue>,
     options: &SocketOptions,
+    refusals: &LogGate,
     subscribe: bool,
     prefix: &[u8],
 ) -> Result<()> {
@@ -896,10 +1055,13 @@ async fn apply_subscription(
         match subscriptions.subscribe(prefix) {
             Some(first) => first,
             None => {
-                tracing::warn!(
-                    held = subscriptions.len(),
-                    "refused a subscription: this peer is at its table ceiling"
-                );
+                if let Some(suppressed) = refusals.permit() {
+                    tracing::warn!(
+                        held = subscriptions.len(),
+                        suppressed,
+                        "refused a subscription: this peer is at its table ceiling"
+                    );
+                }
                 return Ok(());
             }
         }
@@ -921,11 +1083,24 @@ async fn apply_subscription(
             changed
         };
         if deliver {
+            // Waits for room rather than dropping: a notification is how a
+            // proxy learns what to forward upstream, so a lost one is a topic
+            // its subscribers never receive. The wait is this connection's
+            // own — its reads stop until the application drains, which is the
+            // back-pressure a full queue is everywhere else — and it ends
+            // with `EHOSTUNREACH` when the pipe is destroyed, or is dropped
+            // with the session.
             let frame = subscriptions::write_message_form(subscribe, prefix);
-            if incoming.try_send(Multipart::single(frame)).is_err() {
-                tracing::debug!(
-                    "dropped a subscription notification: the application is not reading"
-                );
+            match incoming.send(Multipart::single(frame)).await {
+                Ok(Sent::Queued) => {}
+                // Only a receive queue configured to drop or to refuse at
+                // its mark gets here; `XPubSocket` leaves it blocking.
+                Ok(Sent::Dropped) | Err(Error::EAGAIN(_)) => {
+                    tracing::debug!(
+                        "dropped a subscription notification: the receive queue is set not to wait"
+                    );
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -939,20 +1114,30 @@ async fn apply_message_form(
     subscriptions: &Arc<Subscriptions>,
     incoming: &Arc<Queue>,
     options: &SocketOptions,
-    message: &Multipart,
+    refusals: &LogGate,
+    message: Multipart,
 ) -> Result<()> {
     if message.len() == 1
         && let Some((subscribe, prefix)) =
             subscriptions::read_message_form(message.frames()[0].as_slice())
     {
-        return apply_subscription(ours, subscriptions, incoming, options, subscribe, prefix).await;
+        return apply_subscription(
+            ours,
+            subscriptions,
+            incoming,
+            options,
+            refusals,
+            subscribe,
+            prefix,
+        )
+        .await;
     }
     if ours == SocketType::XPub {
         // "XPUB: as PUB plus … inbound messages fair-queued to the
         // application", and "messages without a sub/unsub prefix are also
         // received, but have no effect on subscription status" — which is how
         // an XSUB sends upstream through a proxy.
-        if incoming.send(message.clone()).await? == Sent::Dropped {
+        if incoming.send(message).await? == Sent::Dropped {
             tracing::trace!("dropped an inbound message: the queue is at its high-water mark");
         }
         return Ok(());
@@ -965,7 +1150,23 @@ async fn apply_message_form(
     Ok(())
 }
 
-/// The heartbeat: `PING` on a timer, and silence declared fatal.
+/// The connection's timers: the heartbeat, and the watch on a message that
+/// has been started and not finished.
+///
+/// **One timer, kept across iterations.** It is armed for the nearest of the
+/// moments something must be looked at and re-armed only when it fires, so
+/// neither this side's own traffic nor the peer's can keep pushing it out:
+/// a timer rebuilt on every pass of the loop never fires on a connection
+/// that is busy in either direction, which is exactly the connection whose
+/// peer may have vanished.
+///
+/// **The heartbeat is libzmq's.** A `PING` every `ZMQ_HEARTBEAT_IVL`
+/// whatever else is going on, and a connection is dead when nothing at all
+/// has arrived for `ZMQ_HEARTBEAT_TIMEOUT` after a `PING` that was not
+/// answered. "A peer SHOULD treat any incoming traffic (not just a PONG
+/// reply) as a sign of life", and traffic is **octets**: a message that
+/// takes longer than the timeout to arrive over a slow link is alive, not
+/// silent.
 ///
 /// `PING`/`PONG` are 3.1 commands, so a connection that negotiated 3.0 gets
 /// no heartbeat at all whatever `ZMQ_HEARTBEAT_IVL` says. That is not
@@ -975,13 +1176,23 @@ struct Liveness {
     interval: Option<Duration>,
     timeout: Duration,
     ttl_deciseconds: u16,
-    last: Instant,
+    message_ivl: Duration,
+    next_ping: Instant,
+    /// When the oldest `PING` that nothing has answered was queued.
+    ping_sent: Option<Instant>,
+    exec: Exec,
+    sleep: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 impl Liveness {
-    fn new(options: &SocketOptions, version: Version) -> Liveness {
+    fn new<S: AsyncRead + AsyncWrite + Unpin>(
+        options: &SocketOptions,
+        version: Version,
+        exec: &Exec,
+        wire: &Wire<S>,
+    ) -> Liveness {
         let interval = match options.heartbeat_ivl {
-            Some(interval) if version >= greeting::VERSION => Some(interval),
+            Some(interval) if version >= greeting::VERSION => Some(interval.max(MIN_HEARTBEAT_IVL)),
             Some(_) => {
                 tracing::info!(
                     %version,
@@ -1001,50 +1212,94 @@ impl Liveness {
             .heartbeat_ttl
             .map(|ttl| u16::try_from(ttl.as_millis() / 100).unwrap_or(u16::MAX))
             .unwrap_or(0);
-        Liveness {
+        let now = Instant::now();
+        let mut liveness = Liveness {
             interval,
             timeout,
             ttl_deciseconds,
-            last: Instant::now(),
-        }
+            message_ivl: wire.message_ivl(),
+            next_ping: now + interval.unwrap_or_default(),
+            ping_sent: None,
+            exec: exec.clone(),
+            sleep: Box::pin(std::future::ready(())),
+        };
+        liveness.arm(now);
+        liveness
     }
 
-    /// "A peer SHOULD treat any incoming traffic (not just a PONG reply) as a
-    /// sign of life."
-    fn saw_traffic(&mut self) {
-        self.last = Instant::now();
+    /// Arms the timer for the nearest of: the next `PING`, the end of the
+    /// silence a `PING` is waiting out, and — always — half a
+    /// [`MESSAGE_IVL`] from now, which is how often a stalled message is
+    /// looked for (a stall is found within one and a half intervals).
+    fn arm(&mut self, now: Instant) {
+        let mut due = now + self.message_ivl / 2;
+        if self.interval.is_some() {
+            due = due.min(self.next_ping);
+        }
+        if let Some(sent) = self.ping_sent
+            && !self.timeout.is_zero()
+        {
+            due = due.min(sent + self.timeout);
+        }
+        self.sleep = Box::pin(self.exec.sleep(due.saturating_duration_since(now)));
     }
 
-    /// Sleeps until the next beat is due, or forever when the heartbeat is
-    /// off. Cancel-safe, because it holds no state: the deadline is
-    /// recomputed each time.
-    async fn tick(&self, exec: &Exec) {
-        match self.interval {
-            Some(interval) => exec.sleep(interval).await,
-            None => std::future::pending().await,
-        }
+    /// Completes when the timer is due. Cancel-safe: the timer is state of
+    /// this value, not of the future.
+    async fn expired(&mut self) {
+        (&mut self.sleep).await;
     }
 
-    /// Sends one `PING`, and reports the peer dead when it has been silent
-    /// past `ZMQ_HEARTBEAT_TIMEOUT`.
-    async fn beat<S: AsyncRead + AsyncWrite + Unpin>(&mut self, wire: &mut Wire<S>) -> Result<()> {
-        if self.interval.is_none() {
-            return Ok(());
+    /// Looks at everything that was waiting for the timer: ends the
+    /// connection for a peer that has gone quiet or a message that has
+    /// stalled, queues the next `PING`, and arms the timer again.
+    fn fire<S: AsyncRead + AsyncWrite + Unpin>(&mut self, wire: &mut Wire<S>) -> Result<()> {
+        let now = Instant::now();
+        // Anything that arrived since the `PING` was queued answers it.
+        if let Some(sent) = self.ping_sent
+            && wire.last_read() > sent
+        {
+            self.ping_sent = None;
         }
-        if !self.timeout.is_zero() && self.last.elapsed() >= self.timeout {
+        if let Some(sent) = self.ping_sent
+            && !self.timeout.is_zero()
+            && now.saturating_duration_since(sent) >= self.timeout
+        {
             return Err(Error::ETIMEDOUT(
                 format!(
-                    "the peer has been silent for {:?} (ZMQ_HEARTBEAT_TIMEOUT)",
-                    self.last.elapsed()
+                    "nothing has arrived for {:?} since a PING went unanswered \
+                     (ZMQ_HEARTBEAT_TIMEOUT)",
+                    now.saturating_duration_since(sent)
                 )
                 .into(),
             ));
         }
-        wire.write_command(&Command::Ping {
-            ttl: self.ttl_deciseconds,
-            context: PING_CONTEXT,
-        })
-        .await
+        if let Some(interval) = self.interval
+            && now >= self.next_ping
+        {
+            wire.queue_command(&Command::Ping {
+                ttl: self.ttl_deciseconds,
+                context: PING_CONTEXT,
+            })?;
+            self.next_ping = now + interval;
+            if self.ping_sent.is_none() {
+                self.ping_sent = Some(now);
+            }
+        }
+        if let Some(overdue) = wire.message_deadline()
+            && now >= overdue
+        {
+            return Err(Error::ETIMEDOUT(
+                format!(
+                    "the peer started a message and has not finished it within {:?} plus a \
+                     second for every {MIN_MESSAGE_RATE} octets that arrived",
+                    self.message_ivl
+                )
+                .into(),
+            ));
+        }
+        self.arm(now);
+        Ok(())
     }
 }
 
@@ -1055,39 +1310,75 @@ pub enum Incoming {
     Message(Multipart),
     /// A command frame's body, still encoded: `READY`, `PING`, `SUBSCRIBE`
     /// and the rest. "Commands always consist of one frame."
-    Command(Vec<u8>),
+    Command(Bytes),
+}
+
+/// What [`Wire::next_event`] woke for.
+enum Event {
+    /// A whole message or command arrived.
+    Received(Incoming),
+    /// Queued output was written, or flushed.
+    Wrote,
+}
+
+/// One frame taken off the receive buffer.
+struct Frame {
+    kind: FrameKind,
+    body: Bytes,
+    /// What the frame spends of its message's budget: its header and body.
+    cost: u64,
 }
 
 /// ZMTP over a byte stream: the I/O the codec deliberately does not do.
 ///
 /// Public because the socket types drive it, and because it is what makes the
 /// session testable against a raw stream.
+///
+/// **Each octet is looked at once.** Frames are parsed off the front of one
+/// receive buffer as they complete and moved into the message being
+/// assembled; a frame that has not fully arrived costs one header parse per
+/// read, never a re-walk of what came before it, so receiving is linear in
+/// the octets received however slowly a peer sends them. A large frame is a
+/// slice of the buffer it was read into, copied by nobody.
 #[derive(Debug)]
 pub struct Wire<S> {
     io: S,
-    /// Unparsed inbound bytes. Persisting across calls is half of what makes
-    /// reading cancel-safe; the other half is that bytes are appended only
-    /// once a read has **completed** — see [`Wire::fill`].
-    buf: Vec<u8>,
-    /// Where a read lands before it is appended. Reused, so a read costs no
-    /// allocation, and separate from `buf` so that a cancelled read cannot
-    /// change what is parsed.
+    /// Received octets not yet parsed. Persisting across calls is half of
+    /// what makes reading cancel-safe; the other half is that octets are
+    /// appended only once a read has **completed** — see [`Wire::fill`].
+    inbound: BytesMut,
+    /// Output not yet written: whole frames, appended by the `queue_*`
+    /// methods and written by [`Wire::write_some`], so that everything queued
+    /// between two writes goes out in one.
+    outbound: Vec<u8>,
+    /// How much of `outbound` has been written.
+    written: usize,
+    /// Whether written octets have not been flushed yet.
+    flush_due: bool,
+    /// A command body being encoded, reused so that a `PING` costs no
+    /// allocation.
     scratch: Vec<u8>,
     limits: MessageLimits,
+    /// The frames of the message now arriving, held until its last one.
+    assembly: Assembly,
     /// The CURVE session keys, once a handshake has agreed them. `None` is
     /// NULL and PLAIN, where the wire is what it says it is.
     curve: Option<CurveTransport>,
-    /// Opened frames waiting to be assembled into a message, under CURVE.
-    ///
-    /// Re-framed rather than re-implemented: each opened box holds one
-    /// frame's flags and body, which are written back as ZMTP frame octets so
-    /// that [`Multipart::decode`] does the assembly and applies
-    /// `ZMQ_MAXMSGSIZE` and the frame ceiling — the same code, and therefore
-    /// the same limits, as an unencrypted connection. It is bounded by those
-    /// limits: the assembly is attempted after every opened frame, so a peer
-    /// that sends MORE forever is refused with `EMSGSIZE` one frame past the
-    /// cap rather than growing this buffer.
-    plain: Vec<u8>,
+    /// Which of reading and writing goes first the next time both are ready.
+    write_first: bool,
+    /// When the last read completed: "any incoming traffic" for the
+    /// heartbeat, measured in octets arriving rather than in messages
+    /// finishing.
+    last_read: Instant,
+    /// When the first octet of the message now arriving was read, or `None`
+    /// while nothing is half received.
+    started: Option<Instant>,
+    /// Octets read from the stream so far.
+    received: u64,
+    /// What `received` was when the message now arriving began, so that the
+    /// octets it has brought are known.
+    message_origin: u64,
+    message_ivl: Duration,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
@@ -1097,12 +1388,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     pub fn new(io: S, limits: MessageLimits) -> Wire<S> {
         Wire {
             io,
-            buf: Vec::new(),
-            scratch: vec![0u8; CHUNK],
+            inbound: BytesMut::new(),
+            outbound: Vec::new(),
+            written: 0,
+            flush_due: false,
+            scratch: Vec::new(),
             limits,
+            assembly: Assembly::default(),
             curve: None,
-            plain: Vec::new(),
+            write_first: false,
+            last_read: Instant::now(),
+            started: None,
+            received: 0,
+            message_origin: 0,
+            message_ivl: MESSAGE_IVL,
         }
+    }
+
+    /// Overrides [`MESSAGE_IVL`], so that a test need not wait half a minute.
+    #[cfg(test)]
+    pub(crate) fn with_message_ivl(mut self, message_ivl: Duration) -> Wire<S> {
+        self.message_ivl = message_ivl;
+        self
+    }
+
+    /// Octets received and not yet parsed.
+    #[cfg(test)]
+    pub(crate) fn buffered(&self) -> usize {
+        self.inbound.len()
+    }
+
+    /// The receive buffer's capacity.
+    #[cfg(test)]
+    pub(crate) fn receive_capacity(&self) -> usize {
+        self.inbound.capacity()
     }
 
     /// Installs the CURVE session keys a handshake agreed, after which every
@@ -1114,114 +1433,271 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// Destroys the session keys: "Session keys are held in memory and
     /// destroyed when the connection is closed."
     ///
-    /// The decrypted staging buffer is overwritten as well, for the same
-    /// reason and with the same honesty about it: without a volatile write
-    /// neither erasure is guaranteed to survive the optimizer, and what is
-    /// guaranteed is that nothing can be sealed or opened afterwards.
+    /// What was opened in place in the receive buffer is plaintext and is
+    /// overwritten too, with a write the optimizer may not remove. Frames
+    /// already handed to the application are the application's.
     pub fn destroy_session_keys(&mut self) {
         if let Some(curve) = &mut self.curve {
             curve.destroy();
         }
         self.curve = None;
-        self.plain.fill(0);
-        self.plain.clear();
+        self.inbound[..].zeroize();
+        self.inbound.clear();
+    }
+
+    /// When the last octet was read.
+    fn last_read(&self) -> Instant {
+        self.last_read
+    }
+
+    /// How long a peer may take over a message before the octets it has sent
+    /// buy it more time: [`MESSAGE_IVL`].
+    fn message_ivl(&self) -> Duration {
+        self.message_ivl
+    }
+
+    /// The moment after which the message now arriving is overdue, or `None`
+    /// when none is half received.
+    ///
+    /// [`MESSAGE_IVL`] after its first octet, and one second more for every
+    /// [`MIN_MESSAGE_RATE`] octets it has brought: a message that keeps
+    /// arriving at that pace is never overdue, however large, and a peer that
+    /// announces a message and sends it too slowly — or not at all — is, and
+    /// gains nothing by announcing a large one, because the time it is
+    /// allowed is bought with octets that arrived and not with octets it
+    /// declared.
+    fn message_deadline(&self) -> Option<Instant> {
+        let started = self.started?;
+        let arrived = self.received - self.message_origin;
+        started.checked_add(self.message_ivl + Duration::from_secs(arrived / MIN_MESSAGE_RATE))
+    }
+
+    /// Output queued and not yet written.
+    fn pending(&self) -> usize {
+        self.outbound.len() - self.written
+    }
+
+    fn has_pending(&self) -> bool {
+        self.written < self.outbound.len() || self.flush_due
     }
 
     /// Reads the next whole message or command.
     ///
-    /// Cancel-safe: the buffer survives, so a dropped call loses nothing but
-    /// the in-flight `read` — which the session's own `select!` relies on,
-    /// because it drops this future on every message it writes.
+    /// Cancel-safe: the buffer and the frames of a half-received message
+    /// survive, so a dropped call loses nothing but the in-flight `read`.
     ///
-    /// The parsing is [`Multipart::decode`]'s, so `ZMQ_MAXMSGSIZE` is judged
-    /// from declared lengths and a multipart message is delivered only once
-    /// its last frame has arrived.
+    /// The limits are [`MessageLimits`]': `ZMQ_MAXMSGSIZE` is judged from
+    /// declared lengths, at the header of the frame that crosses it, and a
+    /// multipart message is delivered only once its last frame has arrived.
     pub async fn read_next(&mut self) -> Result<Incoming> {
-        if self.curve.is_some() {
-            return self.read_next_sealed().await;
-        }
         loop {
-            match Multipart::decode(&self.buf, self.limits)? {
-                Decoded::Message { message, consumed } => {
-                    self.buf.drain(..consumed);
-                    return Ok(Incoming::Message(message));
-                }
-                Decoded::Command { body, consumed } => {
-                    let body = body.to_vec();
-                    self.buf.drain(..consumed);
-                    return Ok(Incoming::Command(body));
-                }
-                Decoded::Incomplete => self.fill().await?,
+            if let Some(incoming) = self.next_buffered()? {
+                return Ok(incoming);
             }
+            self.fill().await?;
         }
     }
 
-    /// [`Self::read_next`] for a CURVE connection: the same assembly over
-    /// the frames that came out of the boxes.
-    ///
-    /// Cancel-safe for the same two reasons and one more: an opened frame is
-    /// appended to `plain` before anything is returned, so a dropped future
-    /// loses neither the octets nor the plaintext — and never re-opens a box,
-    /// which would fail the nonce check.
-    async fn read_next_sealed(&mut self) -> Result<Incoming> {
+    /// Reads the next command body of a handshake, and refuses everything
+    /// else **at its header**: nothing may precede a handshake command, so a
+    /// message frame is a protocol violation, and nothing is buffered on its
+    /// behalf. A command declaring more than [`HANDSHAKE_MAX_FRAME`] is
+    /// refused the same way, which is what keeps a peer that has not
+    /// authenticated from making this side buffer `ZMQ_MAXMSGSIZE`.
+    pub(crate) async fn read_command(&mut self, what: &str) -> Result<Bytes> {
+        let cap = HANDSHAKE_MAX_FRAME.min(self.limits.max_bytes);
         loop {
-            match Multipart::decode(&self.plain, self.limits)? {
-                Decoded::Message { message, consumed } => {
-                    self.plain.drain(..consumed);
-                    return Ok(Incoming::Message(message));
-                }
-                Decoded::Command { body, consumed } => {
-                    let body = body.to_vec();
-                    self.plain.drain(..consumed);
-                    return Ok(Incoming::Command(body));
-                }
-                Decoded::Incomplete => self.open_next_box().await?,
-            }
-        }
-    }
-
-    /// Reads one `MESSAGE` command, opens its box and appends the frame it
-    /// held to the plaintext buffer.
-    async fn open_next_box(&mut self) -> Result<()> {
-        let body = loop {
-            match frame::decode(&self.buf, self.limits.max_bytes) {
-                Ok((_header, body, used)) => {
-                    let body = body.to_vec();
-                    self.buf.drain(..used);
-                    // **The frame kind is not the test; the box is.**
-                    // 26/CURVEZMQ calls `MESSAGE` a command, and libzmq
-                    // 4.3.5 sends it in a **message** frame — flags without
-                    // the COMMAND bit, body `\x07MESSAGE` — measured in
-                    // `tests/interop_libzmq.rs`. So both kinds are read, the
-                    // body decides what arrived, and the outer MORE flag is
-                    // ignored because the real one is inside the box. A
-                    // frame that is neither a `MESSAGE` nor an `ERROR` is
-                    // refused below, and a `MESSAGE` whose box does not open
-                    // is refused after that, which is the check that matters.
-                    break body;
-                }
-                Err(e) if !e.is_violation() => self.fill().await?,
-                Err(e) => {
+            if let Some((header, used)) = self.buffered_header(cap)? {
+                if header.kind != FrameKind::Command {
                     return Err(Error::ENOCOMPATPROTO(
-                        format!("malformed frame: {e}").into(),
+                        format!("the peer sent a message before its {what}").into(),
                     ));
                 }
+                let (len, end) = frame_end(used, header.len)?;
+                if self.inbound.len() >= end {
+                    self.inbound.advance(used);
+                    let body = self.take_body(len);
+                    self.after_delivery();
+                    return Ok(body);
+                }
+                self.make_room(end);
             }
+            self.fill().await?;
+        }
+    }
+
+    /// Waits for the next thing that needs doing on the wire: a message or
+    /// command to hand on, or queued output that was written.
+    ///
+    /// Reading and writing are polled by **one** future, which is what lets a
+    /// loop wait for both at once while the rest of it borrows the wire for
+    /// nothing else. Cancel-safe: state moves only when an octet has really
+    /// been read or written.
+    async fn next_event(&mut self) -> Result<Event> {
+        poll_fn(|cx| self.poll_event(cx)).await
+    }
+
+    fn poll_event(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<Event>> {
+        // Reading and writing take turns at going first, so a peer that
+        // keeps one of them ready for ever cannot starve the other.
+        self.write_first = !self.write_first;
+        for write in [self.write_first, !self.write_first] {
+            if write {
+                if self.has_pending() {
+                    let mut step = pin!(self.write_some());
+                    if let Poll::Ready(outcome) = step.as_mut().poll(cx) {
+                        return Poll::Ready(outcome.map(|()| Event::Wrote));
+                    }
+                }
+            } else if let Poll::Ready(outcome) = self.poll_receive(cx) {
+                return Poll::Ready(outcome.map(Event::Received));
+            }
+        }
+        Poll::Pending
+    }
+
+    fn poll_receive(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<Incoming>> {
+        loop {
+            match self.next_buffered() {
+                Ok(Some(incoming)) => return Poll::Ready(Ok(incoming)),
+                Ok(None) => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+            let mut step = pin!(self.fill());
+            match step.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    /// The next whole message or command already in the buffer, assembling
+    /// frames until one completes. `None` when more octets are needed.
+    fn next_buffered(&mut self) -> Result<Option<Incoming>> {
+        loop {
+            let frame = if self.curve.is_some() {
+                self.next_sealed_frame()?
+            } else {
+                self.next_plain_frame()?
+            };
+            let Some(Frame { kind, body, cost }) = frame else {
+                return Ok(None);
+            };
+            match kind {
+                FrameKind::Command => {
+                    if !self.assembly.is_empty() {
+                        return Err(command_in_multipart());
+                    }
+                    self.after_delivery();
+                    return Ok(Some(Incoming::Command(body)));
+                }
+                FrameKind::Message { more } => {
+                    if let Some(message) = self.assembly.push(Message::from(body), cost, more) {
+                        self.after_delivery();
+                        return Ok(Some(Incoming::Message(message)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The frame header at the front of the buffer, checked against `cap`,
+    /// or `None` while it has not fully arrived.
+    fn buffered_header(&self, cap: u64) -> Result<Option<(frame::FrameHeader, usize)>> {
+        match frame::decode_header(&self.inbound, cap) {
+            Ok(decoded) => Ok(Some(decoded)),
+            Err(FrameError::Incomplete) => Ok(None),
+            Err(e) => Err(frame_error(e, self.limits.max_bytes)),
+        }
+    }
+
+    /// The next frame of an unencrypted connection, if it is all there. Its
+    /// header is judged against what the message may still spend **before
+    /// its body is awaited**, and the body is room reserved once.
+    fn next_plain_frame(&mut self) -> Result<Option<Frame>> {
+        let remaining = self.assembly.budget().remaining(&self.limits);
+        let Some((header, used)) = self.buffered_header(remaining)? else {
+            return Ok(None);
         };
+        let cost = self.assembly.budget().check(used, header, &self.limits)?;
+        let (len, end) = frame_end(used, header.len)?;
+        if self.inbound.len() < end {
+            self.make_room(end);
+            return Ok(None);
+        }
+        self.inbound.advance(used);
+        let body = self.take_body(len);
+        Ok(Some(Frame {
+            kind: header.kind,
+            body,
+            cost,
+        }))
+    }
+
+    /// The next frame of a CURVE connection: one `MESSAGE` box, opened, or an
+    /// `ERROR` in clear text.
+    ///
+    /// Nothing is opened until the box is whole, and a box that holds more
+    /// than the message may still spend is refused from its header, before it
+    /// is received and before any cryptographic work is spent on it. Opening
+    /// and handing the frame on have no await between them, so a dropped
+    /// future never loses an opened box — and never re-opens one, which would
+    /// fail the nonce check.
+    fn next_sealed_frame(&mut self) -> Result<Option<Frame>> {
+        let remaining = self.assembly.budget().remaining(&self.limits);
+        // The box and its framing cost `MESSAGE_MIN_LEN` octets beyond the
+        // frame body inside, which is what the plaintext header adds to the
+        // largest frame that fits.
+        let cap = remaining.saturating_add(curve_layout::MESSAGE_MIN_LEN as u64 + 9);
+        let Some((header, used)) = self.buffered_header(cap)? else {
+            return Ok(None);
+        };
+        let (len, end) = frame_end(used, header.len)?;
+        if len >= curve_layout::MESSAGE_MIN_LEN {
+            let plain = (len - curve_layout::MESSAGE_MIN_LEN) as u64;
+            self.assembly.budget().check(
+                header_octets(plain),
+                frame::FrameHeader {
+                    kind: FrameKind::Command,
+                    len: plain,
+                },
+                &self.limits,
+            )?;
+        }
+        if self.inbound.len() < end {
+            self.make_room(end);
+            return Ok(None);
+        }
+
         // An `ERROR` is the one command that still arrives in clear text:
         // 37/ZMTP calls it fatal and a peer sending it is giving up, so
         // reading it turns a clean refusal into a reason instead of a
         // timeout. Nothing else is accepted outside a box.
-        if let Ok(Command::Error(reason)) = Command::decode(&body) {
+        if self.inbound[used..end].starts_with(b"\x05ERROR")
+            && let Ok(Command::Error(reason)) = Command::decode(&self.inbound[used..end])
+        {
             return Err(Error::ENOCOMPATPROTO(
                 format!("the peer refused the connection: {}", sanitize(reason)).into(),
             ));
         }
+        // **The frame kind is not the test; the box is.** 26/CURVEZMQ calls
+        // `MESSAGE` a command, and libzmq 4.3.5 sends it in a **message**
+        // frame — flags without the COMMAND bit, body `\x07MESSAGE` —
+        // measured in `tests/interop_libzmq.rs`. So both kinds are read, the
+        // body decides what arrived, and the outer MORE flag is ignored
+        // because the real one is inside the box. A body that is not a
+        // `MESSAGE` is refused by the opening, and a `MESSAGE` whose box
+        // does not open is refused after that, which is the check that
+        // matters.
         let curve = self
             .curve
             .as_mut()
             .ok_or_else(|| Error::ENOTSOCK("this connection has no CURVE session".into()))?;
-        let (flags, frame_body) = curve.open_message(&body)?;
+        // The box is opened where it lies: the plaintext stays in the receive
+        // buffer and leaves it like a clear frame's body, so a sealed frame
+        // costs its decryption and no copy of its own.
+        let (flags, offset) = curve.open_message_in_place(&mut self.inbound[used..end])?;
         let kind = if flags & curve_layout::MESSAGE_FLAG_COMMAND != 0 {
             FrameKind::Command
         } else {
@@ -1229,61 +1705,202 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 more: flags & curve_layout::MESSAGE_FLAG_MORE != 0,
             }
         };
-        self.plain
-            .extend_from_slice(&frame::encode(kind, &frame_body));
-        Ok(())
+        let body_at = used + offset;
+        let plain_len = (end - body_at) as u64;
+        let cost = self.assembly.budget().check(
+            header_octets(plain_len),
+            frame::FrameHeader {
+                kind,
+                len: plain_len,
+            },
+            &self.limits,
+        )?;
+        self.inbound.advance(body_at);
+        let body = self.take_body(end - body_at);
+        Ok(Some(Frame { kind, body, cost }))
     }
 
-    /// Writes one whole message: every frame in one buffer, MORE on all but
-    /// the last.
+    /// Takes `len` octets off the front of the buffer as a frame's body.
     ///
-    /// One write, because "on sending, the peer SHALL queue all frames of a
-    /// message in memory until the final frame is sent" — a peer must never
-    /// see half a message. Under CURVE each frame is sealed on its own, with
-    /// its MORE flag inside the box, and the boxes go out in that one write.
-    pub async fn write_message(&mut self, message: &Multipart) -> Result<()> {
-        let bytes = match self.curve.as_mut() {
-            None => message.encode(),
+    /// A large frame is a slice of the buffer it was read into, so the
+    /// payload is copied by nobody after the kernel's read; a small one is
+    /// copied out, because a slice keeps the whole allocation alive for as
+    /// long as it is queued and a few octets must not pin a read buffer.
+    fn take_body(&mut self, len: usize) -> Bytes {
+        if len == 0 {
+            return Bytes::new();
+        }
+        if len >= SLICE_MIN && len.saturating_mul(SLICE_SHARE) >= self.inbound.capacity() {
+            return self.inbound.split_to(len).freeze();
+        }
+        let body = Message::copy_of(&self.inbound[..len]).into_inner();
+        self.inbound.advance(len);
+        body
+    }
+
+    /// Reserves room for a frame whose header has been read and whose body
+    /// has not arrived, in one step: its declared length is already within
+    /// its budget, so asking for all of it now avoids growing the buffer
+    /// (and copying what is in it) once per doubling.
+    fn make_room(&mut self, end: usize) {
+        // The slack is what keeps the last read of a large frame from finding
+        // less than [`MIN_READ_SPARE`] and growing — which would copy the
+        // whole frame to make room for a few octets.
+        self.inbound
+            .reserve(end - self.inbound.len() + MIN_READ_SPARE);
+    }
+
+    /// Bookkeeping after a message or command has been handed on.
+    fn after_delivery(&mut self) {
+        // What is left in the buffer is the start of the next message, which
+        // arrived with the last read.
+        self.started = if self.inbound.is_empty() {
+            None
+        } else {
+            Some(self.last_read)
+        };
+        self.message_origin = self.received - self.inbound.len() as u64;
+        // A connection that once received a large message does not keep its
+        // buffer for the rest of its life.
+        if self.inbound.is_empty() && self.inbound.capacity() > RETAINED_BUFFER {
+            self.inbound = BytesMut::new();
+        }
+    }
+
+    /// Queues one whole message: every frame, MORE on all but the last.
+    ///
+    /// Nothing is written: the frames go into the connection's output, and a
+    /// message is never split because the output is only ever written from
+    /// its front. A peer must never see half a message — "on sending, the
+    /// peer SHALL queue all frames of a message in memory until the final
+    /// frame is sent" — and a batch of messages shares one write. Under CURVE
+    /// each frame is sealed on its own, with its MORE flag inside the box.
+    pub(crate) fn queue_message(&mut self, message: &Multipart) -> Result<()> {
+        match self.curve.as_mut() {
+            None => message.encode_into(&mut self.outbound),
             Some(curve) => {
+                // One reservation for the whole message, so that sealing a
+                // frame appends into room that is already there.
+                self.outbound.reserve(
+                    message
+                        .frames()
+                        .iter()
+                        .map(|frame| sealed_frame_len(frame.len()))
+                        .sum(),
+                );
                 let last = message.len() - 1;
-                let mut out = Vec::new();
                 for (index, frame) in message.frames().iter().enumerate() {
                     let flags = if index == last {
                         0
                     } else {
                         curve_layout::MESSAGE_FLAG_MORE
                     };
-                    out.extend_from_slice(&curve.seal_frame(flags, frame.as_slice())?);
+                    curve.seal_frame_into(flags, frame.as_slice(), &mut self.outbound)?;
                 }
-                out
             }
-        };
-        self.write_all(&bytes).await
+        }
+        Ok(())
     }
 
-    /// Writes one command frame — sealed, on a CURVE connection.
+    /// Queues one command frame — sealed, on a CURVE connection.
+    pub(crate) fn queue_command(&mut self, command: &Command<'_>) -> Result<()> {
+        self.scratch.clear();
+        command
+            .encode_body(&mut self.scratch)
+            .map_err(command_error)?;
+        match self.curve.as_mut() {
+            None => {
+                frame::encode_header(
+                    FrameKind::Command,
+                    self.scratch.len() as u64,
+                    &mut self.outbound,
+                );
+                self.outbound.extend_from_slice(&self.scratch);
+            }
+            Some(curve) => {
+                self.outbound.reserve(sealed_frame_len(self.scratch.len()));
+                curve.seal_frame_into(
+                    curve_layout::MESSAGE_FLAG_COMMAND,
+                    &self.scratch,
+                    &mut self.outbound,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes one whole message and waits until it has been written.
+    pub async fn write_message(&mut self, message: &Multipart) -> Result<()> {
+        self.queue_message(message)?;
+        self.flush().await
+    }
+
+    /// Writes one command frame — sealed, on a CURVE connection — and waits
+    /// until it has been written.
     pub async fn write_command(&mut self, command: &Command<'_>) -> Result<()> {
-        let bytes = self.command_bytes(command)?;
-        self.write_all(&bytes).await
+        self.queue_command(command)?;
+        self.flush().await
+    }
+
+    /// Writes octets as they are — the greeting — and waits until they have
+    /// been written.
+    pub(crate) async fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        self.outbound.extend_from_slice(bytes);
+        self.flush().await
     }
 
     /// Writes one CURVE handshake frame, which is already complete octets:
     /// the handshake is what agrees the session keys, so it is never sealed
     /// by them.
-    async fn write_handshake(&mut self, frame_bytes: &[u8]) -> Result<()> {
-        self.write_all(frame_bytes).await
+    pub(crate) async fn write_handshake(&mut self, frame_bytes: &[u8]) -> Result<()> {
+        self.write_raw(frame_bytes).await
     }
 
-    /// One command's frame octets, sealed or not.
-    fn command_bytes(&mut self, command: &Command<'_>) -> Result<Vec<u8>> {
-        match self.curve.as_mut() {
-            None => command.encode().map_err(command_error),
-            Some(curve) => {
-                let mut body = Vec::new();
-                command.encode_body(&mut body).map_err(command_error)?;
-                curve.seal_frame(curve_layout::MESSAGE_FLAG_COMMAND, &body)
+    /// Writes everything queued.
+    pub(crate) async fn flush(&mut self) -> Result<()> {
+        while self.has_pending() {
+            self.write_some().await?;
+        }
+        Ok(())
+    }
+
+    /// One step of getting queued output onto the wire: a `write`, and the
+    /// flush that follows once the output is empty.
+    ///
+    /// Cancel-safe: `AsyncWriteExt::write` writes nothing when it is
+    /// dropped, and the position is advanced only for octets it reported.
+    async fn write_some(&mut self) -> Result<()> {
+        if self.written < self.outbound.len() {
+            let wrote = self.io.write(&self.outbound[self.written..]).await?;
+            if wrote == 0 {
+                return Err(Error::EHOSTUNREACH("the peer closed the connection".into()));
+            }
+            self.written += wrote;
+            self.flush_due = true;
+            if self.written < self.outbound.len() {
+                return Ok(());
+            }
+            self.outbound.clear();
+            self.written = 0;
+            if self.outbound.capacity() > RETAINED_BUFFER {
+                self.outbound = Vec::new();
             }
         }
+        self.io.flush().await?;
+        self.flush_due = false;
+        Ok(())
+    }
+
+    /// Reads exactly `out.len()` octets — a peer's greeting — using whatever
+    /// is already buffered.
+    async fn read_exactly(&mut self, out: &mut [u8]) -> Result<()> {
+        while self.inbound.len() < out.len() {
+            self.fill().await?;
+        }
+        out.copy_from_slice(&self.inbound[..out.len()]);
+        self.inbound.advance(out.len());
+        self.after_delivery();
+        Ok(())
     }
 
     /// Reads exactly `out.len()` octets — a peer's greeting, in a test that
@@ -1296,7 +1913,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// Writes bytes with no framing — a greeting, in the same tests.
     #[cfg(test)]
     pub(crate) async fn write_raw_for_test(&mut self, bytes: &[u8]) {
-        self.write_all(bytes).await.expect("write");
+        self.write_raw(bytes).await.expect("write");
     }
 
     /// Writes an `ERROR` and gives up on the connection.
@@ -1304,44 +1921,54 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// Best effort by construction: the peer is being closed on, so a write
     /// that fails changes nothing — including one that cannot be sealed.
     async fn refuse(&mut self, reason: &str) {
-        if let Ok(bytes) = self.command_bytes(&Command::Error(reason)) {
-            let _ = self.io.write_all(&bytes).await;
-            let _ = self.io.flush().await;
+        if self.queue_command(&Command::Error(reason)).is_ok() {
+            let _ = self.flush().await;
         }
     }
 
-    async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        self.io.write_all(bytes).await?;
-        self.io.flush().await?;
-        Ok(())
-    }
-
-    /// Reads exactly `out.len()` octets, using whatever is already buffered.
-    async fn read_exactly(&mut self, out: &mut [u8]) -> Result<()> {
-        while self.buf.len() < out.len() {
-            self.fill().await?;
-        }
-        out.copy_from_slice(&self.buf[..out.len()]);
-        self.buf.drain(..out.len());
-        Ok(())
-    }
-
-    /// Reads more bytes, or reports the peer's close.
+    /// Reads more octets, or reports the peer's close.
     ///
-    /// Reading into `scratch` and appending afterwards is what makes this
-    /// cancel-safe: `AsyncReadExt::read` is cancel-safe, so a dropped call
-    /// reads nothing and leaves `buf` exactly as it was. Growing `buf` first
-    /// and truncating after the await is the version that looks equivalent
-    /// and is not — a cancelled read leaves the slack behind, and a
-    /// zero-filled buffer decodes as a stream of empty message frames.
+    /// Cancel-safe: `AsyncReadExt::read_buf` appends nothing when it is
+    /// dropped, so a cancelled call leaves the buffer exactly as it was. The
+    /// version that grows the buffer first and truncates after the await
+    /// looks equivalent and is not — a cancelled read leaves the slack
+    /// behind, and a zero-filled buffer decodes as a stream of empty message
+    /// frames.
     async fn fill(&mut self) -> Result<()> {
-        let read = self.io.read(&mut self.scratch).await?;
+        if self.inbound.capacity() - self.inbound.len() < MIN_READ_SPARE {
+            self.inbound.reserve(READ_CHUNK);
+        }
+        let before = self.received;
+        let read = self.io.read_buf(&mut self.inbound).await?;
         if read == 0 {
             return Err(Error::EHOSTUNREACH("the peer closed the connection".into()));
         }
-        self.buf.extend_from_slice(&self.scratch[..read]);
+        self.received += read as u64;
+        self.last_read = Instant::now();
+        if self.started.is_none() {
+            self.started = Some(self.last_read);
+            self.message_origin = before;
+        }
         Ok(())
     }
+}
+
+/// A declared body length and where its frame ends, for a header of `used`
+/// octets. The cap has already bounded the length, so this can only fail on
+/// a target whose address space is smaller than the cap.
+fn frame_end(used: usize, len: u64) -> Result<(usize, usize)> {
+    let unaddressable =
+        || Error::EMSGSIZE(format!("a frame declaring {len} bytes cannot be addressed").into());
+    let body = usize::try_from(len).map_err(|_| unaddressable())?;
+    let end = used.checked_add(body).ok_or_else(unaddressable)?;
+    Ok((body, end))
+}
+
+/// The octets one sealed frame with a body of `body_len` octets takes on the
+/// wire: the frame header and the `MESSAGE` command around its box.
+fn sealed_frame_len(body_len: usize) -> usize {
+    let command = curve_layout::MESSAGE_MIN_LEN + body_len;
+    header_octets(command as u64) + command
 }
 
 /// Makes a reason printable, since `ERROR` carries printable ASCII only and
@@ -1384,13 +2011,13 @@ mod tests {
 
     /// A peer driven directly by the codec: the only honest way to check a
     /// protocol implementation is against the specification's own bytes.
-    struct CodecPeer {
-        io: TcpStream,
+    struct CodecPeer<S = TcpStream> {
+        io: S,
         buf: Vec<u8>,
     }
 
-    impl CodecPeer {
-        fn new(io: TcpStream) -> CodecPeer {
+    impl<S: AsyncRead + AsyncWrite + Unpin> CodecPeer<S> {
+        fn new(io: S) -> CodecPeer<S> {
             CodecPeer {
                 io,
                 buf: Vec::new(),
@@ -1481,6 +2108,10 @@ mod tests {
         }
     }
 
+    fn context() -> Context {
+        Context::new(ContextConfig::default()).expect("context")
+    }
+
     /// Runs a session over one end of a connected pair, with no engine, and
     /// hands back the pipe so a test can see both directions.
     ///
@@ -1488,12 +2119,20 @@ mod tests {
     /// security handshake reads: under NULL it decides which side
     /// authorizes, so a test of a server's ZAP dialog binds rather than
     /// dials.
-    fn context() -> Context {
-        Context::new(ContextConfig::default()).expect("context")
-    }
-
     fn drive_session(
         stream: TcpStream,
+        ours: SocketType,
+        options: SocketOptions,
+        role: Role,
+        context: &Context,
+    ) -> (Pipe, AuthenticatedUser, tokio::task::JoinHandle<Result<()>>) {
+        drive_stream(Stream::tcp(stream), ours, options, role, context)
+    }
+
+    /// [`drive_session`] over any stream: an in-memory one when a test wants a
+    /// peer that can be made to stop reading.
+    fn drive_stream(
+        stream: Stream,
         ours: SocketType,
         options: SocketOptions,
         role: Role,
@@ -1502,7 +2141,7 @@ mod tests {
         let pipe = Pipe::new(options.pipe);
         let user = AuthenticatedUser::default();
         let connection = Connection {
-            stream: Stream::tcp(stream),
+            stream,
             pipe: pipe.clone(),
             peer: PeerId::detached(),
             role,
@@ -2498,7 +3137,7 @@ mod tests {
             );
         }
         assert_eq!(
-            crate::curve::security_model(&server_options),
+            crate::curve::security_model(&server_options, &context),
             Some(crate::curve::SecurityModel::CheckedByHandler)
         );
         drop(peer);
@@ -2586,5 +3225,914 @@ mod tests {
             .expect("the task");
         let err = outcome.unwrap_err();
         assert_eq!(err.errno(), "EACCES", "{err}");
+    }
+
+    // ---- hostile peers: what a stranger can make this side hold or wait for ----
+
+    /// A bound for every await in these tests.
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("the operation finished within ten seconds")
+    }
+
+    /// A stream that yields what it holds a few octets per read — the way a
+    /// peer that sends one octet per packet does — and swallows what is
+    /// written to it.
+    struct Drip {
+        data: Vec<u8>,
+        at: usize,
+        chunk: usize,
+    }
+
+    impl AsyncRead for Drip {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let take = self
+                .chunk
+                .min(self.data.len() - self.at)
+                .min(buf.remaining());
+            let (from, to) = (self.at, self.at + take);
+            buf.put_slice(&self.data[from..to]);
+            self.at = to;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Drip {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A session over an in-memory stream, handshaken as a NULL `PUSH` that
+    /// dialled a `PULL`, with the peer's end of the stream handed back.
+    async fn handshaken_over_a_duplex(
+        options: SocketOptions,
+        window: usize,
+    ) -> (
+        Pipe,
+        tokio::task::JoinHandle<Result<()>>,
+        CodecPeer<tokio::io::DuplexStream>,
+    ) {
+        let (ours, theirs) = tokio::io::duplex(window);
+        let mut peer = CodecPeer::new(theirs);
+        let (pipe, _user, task) = drive_stream(
+            Stream::inproc(ours),
+            SocketType::Push,
+            options,
+            Role::Connecter,
+            &context(),
+        );
+        peer.read_greeting().await;
+        peer.greet(greeting::VERSION).await;
+        peer.read_frame().await;
+        peer.ready(SocketType::Pull).await;
+        (pipe, task, peer)
+    }
+
+    /// Claim: **before a peer has authenticated, this side buffers what a
+    /// handshake needs and no more.** A frame that cannot be a handshake
+    /// command is refused at its header — the body is neither awaited nor
+    /// buffered — even when `ZMQ_MAXMSGSIZE` has been raised to a gigabyte
+    /// for bulk traffic.
+    #[tokio::test]
+    async fn a_handshake_refuses_at_the_header_what_it_cannot_need() {
+        let limits = MessageLimits::new(1 << 30, crate::message::DEFAULT_MAX_MESSAGE_FRAMES);
+
+        // A message frame declaring 900 KiB where READY belongs, followed by
+        // a few KiB of it: refused on the header alone.
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let mut wire = Wire::new(ours, limits);
+        let mut header = vec![0x02u8];
+        header.extend_from_slice(&(900u64 * 1024).to_be_bytes());
+        theirs.write_all(&header).await.expect("write");
+        theirs.write_all(&[0u8; 4096]).await.expect("write");
+        let err = within(wire.read_command("READY")).await.unwrap_err();
+        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+        assert!(
+            wire.buffered() < 8 * 1024,
+            "{} octets were buffered for a frame no handshake sends",
+            wire.buffered()
+        );
+
+        // A *command* just past what any handshake command needs.
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let mut wire = Wire::new(ours, limits);
+        let mut header = vec![0x06u8];
+        header.extend_from_slice(&(HANDSHAKE_MAX_FRAME + 1).to_be_bytes());
+        theirs.write_all(&header).await.expect("write");
+        let err = within(wire.read_command("READY")).await.unwrap_err();
+        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+
+        // A message frame inside the cap, whose body never arrives: the
+        // refusal does not wait for it.
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let mut wire = Wire::new(ours, limits);
+        theirs.write_all(&[0x00, 100]).await.expect("write");
+        let err = within(wire.read_command("READY")).await.unwrap_err();
+        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+        assert!(err.cause().contains("before its READY"), "{err}");
+
+        // And a legitimate command still goes through.
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let mut wire = Wire::new(ours, limits);
+        theirs
+            .write_all(&Command::Ready(Metadata::new()).encode().expect("READY"))
+            .await
+            .expect("write");
+        let body = within(wire.read_command("READY")).await.expect("READY");
+        assert_eq!(&body[..], b"\x05READY");
+    }
+
+    /// Claim: **receiving is linear in the octets received.** A message
+    /// whose first frame is half a mebibyte and whose second arrives a few
+    /// octets at a time — about ten thousand reads — costs a copy of each
+    /// frame at most once, not a copy of the first frame per read.
+    #[tokio::test]
+    async fn a_message_dripped_octet_by_octet_is_not_copied_per_read() {
+        let message = Multipart::new(vec![
+            Message::from(vec![1u8; 512 * 1024]),
+            Message::from(vec![2u8; 400 * 1024]),
+        ])
+        .expect("frames");
+        let total = message.total_bytes();
+        let drip = Drip {
+            data: message.encode(),
+            at: 0,
+            chunk: 97,
+        };
+        let mut wire = Wire::new(drip, MessageLimits::new(2 * 1024 * 1024, 16));
+
+        let before = crate::message::copied_bytes();
+        let Incoming::Message(arrived) = within(wire.read_next()).await.expect("the message")
+        else {
+            panic!("expected a message");
+        };
+        assert_eq!(arrived, message);
+        let copied = crate::message::copied_bytes() - before;
+        assert!(
+            copied <= total,
+            "{copied} octets were copied to receive a {total}-octet message"
+        );
+    }
+
+    /// Claim: a connection does not keep the capacity of one large message
+    /// for the rest of its life — and the frame it handed on is what it was
+    /// read into, not a second copy.
+    #[tokio::test]
+    async fn a_connection_does_not_keep_the_capacity_of_one_large_message() {
+        let (ours, mut theirs) = tokio::io::duplex(4 << 20);
+        let mut wire = Wire::new(ours, MessageLimits::new(2 * 1024 * 1024, 16));
+        let big = Multipart::single(vec![1u8; 1_000_000]).encode();
+        theirs.write_all(&big).await.expect("write");
+
+        let before = crate::message::copied_bytes();
+        let Incoming::Message(message) = within(wire.read_next()).await.expect("the message")
+        else {
+            panic!("expected a message");
+        };
+        assert_eq!(message.total_bytes(), 1_000_000);
+        assert_eq!(
+            crate::message::copied_bytes(),
+            before,
+            "a large frame is a slice of the receive buffer"
+        );
+        assert!(
+            wire.receive_capacity() <= RETAINED_BUFFER,
+            "the empty buffer kept {} octets",
+            wire.receive_capacity()
+        );
+    }
+
+    /// Claim: **a message that is started and not finished does not hold the
+    /// connection for ever**, whether the heartbeat is on or not (it is off
+    /// here, which is the default): a peer that announces a large message
+    /// and sends a few kilobytes of it ends the connection.
+    #[tokio::test]
+    async fn a_message_that_stops_arriving_ends_the_connection() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let mut wire =
+            Wire::new(ours, MessageLimits::default()).with_message_ivl(Duration::from_millis(200));
+        let options = options();
+        let pipe = Pipe::new(options.pipe);
+        let subscriptions = Arc::new(Subscriptions::new(
+            crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
+            crate::subscriptions::DEFAULT_MAX_SUBSCRIPTION_BYTES,
+        ));
+        let exec = Exec::current().expect("ambient reactor");
+
+        let mut head = vec![0x02u8];
+        head.extend_from_slice(&(900u64 * 1024).to_be_bytes());
+        head.extend_from_slice(&[0u8; 2048]);
+        theirs.write_all(&head).await.expect("write");
+
+        let started = std::time::Instant::now();
+        let outcome = within(pump(
+            &mut wire,
+            SocketType::Pull,
+            &subscriptions,
+            &pipe,
+            &options,
+            &exec,
+            greeting::VERSION,
+        ))
+        .await;
+        let err = outcome.unwrap_err();
+        assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Claim: the allowance is bought by octets that arrive, so a message
+    /// that keeps arriving — slowly, but steadily — is never overdue.
+    #[tokio::test]
+    async fn a_message_that_keeps_arriving_is_never_overdue() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let mut wire =
+            Wire::new(ours, MessageLimits::default()).with_message_ivl(Duration::from_millis(200));
+        let options = options();
+        let pipe = Pipe::new(options.pipe);
+        let subscriptions = Arc::new(Subscriptions::new(
+            crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
+            crate::subscriptions::DEFAULT_MAX_SUBSCRIPTION_BYTES,
+        ));
+        let exec = Exec::current().expect("ambient reactor");
+
+        // 40 KiB in four pieces, 150 ms apart: more than a message interval
+        // in all, at a pace far above the minimum rate.
+        let frame = Multipart::single(vec![5u8; 40 * 1024]).encode();
+        let sender = tokio::spawn(async move {
+            for piece in frame.chunks(10 * 1024) {
+                theirs.write_all(piece).await.expect("write");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            theirs
+        });
+        let incoming = pipe.incoming();
+        tokio::select! {
+            outcome = pump(
+                &mut wire,
+                SocketType::Pull,
+                &subscriptions,
+                &pipe,
+                &options,
+                &exec,
+                greeting::VERSION,
+            ) => panic!("the pump ended while a message was arriving: {outcome:?}"),
+            arrived = within(incoming.recv()) => {
+                assert_eq!(arrived.expect("a message").frames()[0].len(), 40 * 1024);
+            }
+        }
+        let _ = sender.await;
+    }
+
+    /// Claim: **a peer that stops reading cannot hold a session** with the
+    /// heartbeat on. The write that the peer's full window blocks is an arm
+    /// of the session's loop rather than an await that stops everything, so
+    /// the heartbeat still runs and ends the connection by `ETIMEDOUT`.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_cannot_hold_the_session() {
+        let (pipe, task, _peer) = handshaken_over_a_duplex(
+            SocketOptions {
+                heartbeat_ivl: Some(Duration::from_millis(50)),
+                heartbeat_timeout: Some(Duration::from_millis(200)),
+                ..options()
+            },
+            64 * 1024,
+        )
+        .await;
+
+        // Far more than the stream's window: the writer blocks for good.
+        for _ in 0..16 {
+            pipe.outgoing()
+                .send(Multipart::single(vec![7u8; 64 * 1024]))
+                .await
+                .expect("queued");
+        }
+        let err = within(task).await.expect("the task").unwrap_err();
+        assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
+    }
+
+    /// Claim: **our own traffic does not keep a vanished peer alive.** The
+    /// heartbeat timer is not rebuilt on every message, so an application
+    /// that publishes every few milliseconds to a peer that has gone quiet
+    /// still finds the connection ended.
+    #[tokio::test]
+    async fn a_busy_session_still_times_out_a_silent_peer() {
+        let (pipe, task, _peer) = handshaken_over_a_duplex(
+            SocketOptions {
+                heartbeat_ivl: Some(Duration::from_millis(100)),
+                heartbeat_timeout: Some(Duration::from_millis(500)),
+                ..options()
+            },
+            1 << 20,
+        )
+        .await;
+
+        let outgoing = pipe.outgoing();
+        let sender = tokio::spawn(async move {
+            while outgoing.send(Multipart::single("tick")).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let err = within(task).await.expect("the task").unwrap_err();
+        assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
+        sender.abort();
+    }
+
+    /// Claim: **a message that takes longer than the heartbeat timeout to
+    /// arrive is traffic, not silence.** The octets of a slow transfer count
+    /// as a sign of life as they arrive, and not when the message is done.
+    #[tokio::test]
+    async fn a_slowly_arriving_message_is_not_silence() {
+        let (pipe, task, mut peer) = handshaken_over_a_duplex(
+            SocketOptions {
+                heartbeat_ivl: Some(Duration::from_millis(100)),
+                heartbeat_timeout: Some(Duration::from_millis(300)),
+                ..options()
+            },
+            1 << 20,
+        )
+        .await;
+
+        // 100 KiB over about a second: ten pieces, a tenth of a second
+        // apart, each inside the timeout.
+        let frame = Multipart::single(vec![9u8; 100 * 1024]).encode();
+        for piece in frame.chunks(10 * 1024) {
+            peer.send(piece).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let arrived = within(pipe.incoming().recv()).await.expect("a message");
+        assert_eq!(arrived.frames()[0].len(), 100 * 1024);
+        assert!(
+            !task.is_finished(),
+            "the session survived its own heartbeat"
+        );
+    }
+
+    /// Claim: **a stray `READY` after the handshake is ignored without being
+    /// parsed**, so a malformed one — which a parse would refuse by ending
+    /// the connection — changes nothing, and the connection still answers.
+    #[tokio::test]
+    async fn a_stray_ready_after_the_handshake_is_not_parsed() {
+        let (_pipe, task, mut peer) = handshaken_over_a_duplex(options(), 1 << 20).await;
+
+        // A property whose value claims nine octets and holds two.
+        peer.send(&frame::encode(
+            FrameKind::Command,
+            b"\x05READY\x01A\x00\x00\x00\x09ab",
+        ))
+        .await;
+        peer.send(
+            &Command::Ping {
+                ttl: 0,
+                context: b"still here",
+            }
+            .encode()
+            .expect("PING"),
+        )
+        .await;
+        let (name, body) = within(peer.read_command_name()).await;
+        assert_eq!(
+            name, "PONG",
+            "the connection answered after the stray READY"
+        );
+        assert!(matches!(
+            Command::decode(&body).expect("PONG"),
+            Command::Pong { context } if context == b"still here"
+        ));
+        assert!(!task.is_finished());
+    }
+
+    /// Claim: a `READY` with more properties than any peer has is refused in
+    /// the handshake, from the codec's own cap, instead of being parsed into
+    /// a list a peer sized.
+    #[tokio::test]
+    async fn a_ready_with_too_many_properties_is_refused() {
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Pull,
+            options(),
+            Role::Connecter,
+            &context(),
+        );
+
+        peer.read_greeting().await;
+        peer.greet(greeting::VERSION).await;
+        peer.read_frame().await;
+        let mut body = b"\x05READY".to_vec();
+        for _ in 0..(weida_zmtp::MAX_PROPERTIES + 1) {
+            body.extend_from_slice(b"\x01a\x00\x00\x00\x00");
+        }
+        peer.send(&frame::encode(FrameKind::Command, &body)).await;
+
+        let err = within(task).await.expect("the task").unwrap_err();
+        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+        assert!(err.cause().contains("properties"), "{err}");
+    }
+
+    /// Claim: **a CURVE server asks a bound ZAP handler about a client even
+    /// when no `ZMQ_ZAP_DOMAIN` is set**, which is libzmq's rule (measured in
+    /// `tests/interop_libzmq.rs`). A deployment that bound a handler to
+    /// allow-list client keys and never set a domain is not silently open: the
+    /// handler's 400 refuses the client, and it was asked once.
+    #[tokio::test]
+    async fn a_curve_server_asks_a_bound_handler_without_a_domain() {
+        let context = context();
+        let (server_options, server_key) = curve_server_options("");
+        let (asked, handler) = zap_handler(&context, |request| {
+            ZapReply::refused(
+                request.request_id,
+                ZapStatus::AuthenticationFailure,
+                "not on the list",
+            )
+        })
+        .await;
+
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (pipe, user, task) = drive_session(
+            ours,
+            SocketType::Pair,
+            server_options.clone(),
+            Role::Binder,
+            &context,
+        );
+        let (public, secret) = crate::curve::keypair();
+        peer.read_greeting().await;
+        peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
+        let mut client = CurveClient::new(public, &secret, server_key);
+        peer.send(&client.hello().expect("HELLO")).await;
+        let (_, body) = peer.read_frame().await;
+        client.read_welcome(&body).expect("read WELCOME");
+        peer.send(&client.initiate(&Metadata::new()).expect("INITIATE"))
+            .await;
+
+        let (kind, body) = peer.read_frame().await;
+        assert_eq!(kind, FrameKind::Command);
+        let Command::Error(reason) = Command::decode(&body).expect("a command") else {
+            panic!("expected an ERROR, not a READY: the handler was not asked");
+        };
+        assert!(reason.contains("not on the list"), "{reason}");
+        let err = within(task).await.expect("the task").unwrap_err();
+        assert_eq!(err.errno(), "EACCES", "{err}");
+        assert_eq!(user.get(), None);
+        assert!(pipe.incoming().try_recv().is_err());
+        assert_eq!(asked.lock().expect("asked").len(), 1, "asked exactly once");
+        assert_eq!(
+            crate::curve::security_model(&server_options, &context),
+            Some(crate::curve::SecurityModel::CheckedByHandler),
+            "a bound handler makes the server a checked one"
+        );
+        assert_eq!(
+            crate::curve::security_model(&server_options, &self::context()),
+            Some(crate::curve::SecurityModel::AnyClient),
+            "no handler and no domain is model 1"
+        );
+        handler.abort();
+    }
+
+    /// Claim: **a PLAIN credential cannot pose as the kernel's statement.** A
+    /// username that begins like the `X-Local-Principal` extension frame is
+    /// refused before any handler is asked, so a handler that scans for the
+    /// prefix instead of counting frames cannot be made to read a peer's bytes
+    /// as a local principal.
+    #[tokio::test]
+    async fn a_username_that_imitates_the_local_principal_is_refused() {
+        let context = context();
+        let (asked, handler) = zap_handler(&context, |request| {
+            ZapReply::allowed(request.request_id, "root")
+        })
+        .await;
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, user, task) = drive_session(
+            ours,
+            SocketType::Rep,
+            SocketOptions {
+                plain_server: true,
+                zap_domain: "test".to_owned(),
+                ..options()
+            },
+            Role::Binder,
+            &context,
+        );
+
+        peer.read_greeting().await;
+        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+        peer.command(Command::Hello {
+            username: b"X-Local-Principal: uid=0, gid=0",
+            password: b"pw",
+        })
+        .await;
+
+        let (name, _) = within(peer.read_command_name()).await;
+        assert_eq!(name, "ERROR");
+        let err = within(task).await.expect("the task").unwrap_err();
+        assert_eq!(err.errno(), "EACCES", "{err}");
+        assert_eq!(user.get(), None);
+        assert!(
+            asked.lock().expect("asked").is_empty(),
+            "the handler was asked about a forged principal"
+        );
+        handler.abort();
+    }
+
+    /// Claim: **pending authorizations do not use up the context's sockets.**
+    /// Each ZAP dialog used to build a socket and take one of the context's
+    /// `ZMQ_MAX_SOCKETS`, so a handler slower than the connections arriving
+    /// left every other `zmq_socket()` in the application failing. Here six
+    /// connections wait on a handler that has not answered, a context with
+    /// room for two sockets still has its second free, and all six are
+    /// authorized once the handler answers.
+    #[tokio::test]
+    async fn pending_authorizations_take_no_socket_slots() {
+        let context = Context::new(ContextConfig {
+            max_sockets: 2,
+            ..ContextConfig::default()
+        })
+        .expect("context");
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handler = crate::RepSocket::new(&context).expect("rep");
+        handler
+            .bind(crate::zap::ZAP_ENDPOINT)
+            .await
+            .expect("bind the ZAP endpoint");
+        let answering = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            let asked = Arc::clone(&asked);
+            async move {
+                while let Ok(message) = handler.recv().await {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    let request = crate::zap::ZapRequest::decode(&message).expect("a request");
+                    gate.acquire().await.expect("the gate").forget();
+                    if handler
+                        .send(ZapReply::allowed(request.request_id, "operator").encode())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let mut peers = Vec::new();
+        let mut users = Vec::new();
+        for _ in 0..6 {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, user, _task) = drive_session(
+                ours,
+                SocketType::Rep,
+                SocketOptions {
+                    zap_domain: "global".to_owned(),
+                    ..options()
+                },
+                Role::Binder,
+                &context,
+            );
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            peer.ready(SocketType::Req).await;
+            peers.push(peer);
+            users.push(user);
+        }
+
+        // The handler holds the first request; the other five dialogs wait
+        // behind it. Margin: five connections need microseconds to dial; the
+        // phenomenon is the absence of a free slot, which a dialog that took
+        // one would show at once.
+        within(async {
+            while asked.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let slot = context
+            .open_socket()
+            .expect("a socket slot is free while authorizations are pending");
+        drop(slot);
+
+        gate.add_permits(6);
+        within(async {
+            while users.iter().any(|user| user.get().is_none()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert_eq!(asked.load(Ordering::SeqCst), 6);
+        answering.abort();
+    }
+
+    // ---- the Wire against arbitrary streams ----
+
+    /// Deterministic xorshift64*, as the codec's smoke tests use: reproducible
+    /// failures and no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// A random multipart message whose frames straddle every size class of
+    /// the frame header: empty, one octet, the short form's edge, the long
+    /// form's start, and a few kilobytes.
+    fn random_message(rng: &mut Rng) -> Multipart {
+        const SIZES: [usize; 8] = [0, 1, 40, 254, 255, 256, 700, 5000];
+        let frames = (0..1 + rng.below(5))
+            .map(|_| {
+                let len = SIZES[rng.below(SIZES.len())];
+                Message::from(rng.bytes(len))
+            })
+            .collect();
+        Multipart::new(frames).expect("frames")
+    }
+
+    /// A matched pair of CURVE transports, from a whole handshake.
+    fn curve_transports() -> (CurveTransport, CurveTransport) {
+        let body = |frame_bytes: &[u8]| {
+            frame::decode(frame_bytes, 1 << 20)
+                .expect("a frame")
+                .1
+                .to_vec()
+        };
+        let (server_public, server_secret) = crate::curve::keypair();
+        let (client_public, client_secret) = crate::curve::keypair();
+        let mut client = CurveClient::new(client_public, &client_secret, server_public);
+        let mut server = CurveServer::new(&server_secret, COOKIE_LIFETIME);
+        server
+            .read_hello(&body(&client.hello().expect("HELLO")))
+            .expect("read HELLO");
+        client
+            .read_welcome(&body(&server.welcome().expect("WELCOME")))
+            .expect("read WELCOME");
+        server
+            .read_initiate(&body(&client.initiate(&Metadata::new()).expect("INITIATE")))
+            .expect("read INITIATE");
+        client
+            .read_ready(&body(&server.ready(&Metadata::new()).expect("READY")))
+            .expect("read READY");
+        (
+            client.into_transport().expect("client transport"),
+            server.into_transport().expect("server transport"),
+        )
+    }
+
+    /// Claim: **however a valid stream is cut into reads, the same messages
+    /// and commands come out, in order** — one octet at a time, a few hundred
+    /// at a time, and whether or not the stream is sealed. Frames are taken
+    /// off one buffer as they complete, so this is where an off-by-one in
+    /// that bookkeeping would show.
+    #[tokio::test]
+    async fn any_chunking_of_a_valid_stream_delivers_the_same_messages() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for round in 0..150 {
+            let sealed = round % 2 == 1;
+            let (mut sender, receiver) = if sealed {
+                let (client, server) = curve_transports();
+                (Some(client), Some(server))
+            } else {
+                (None, None)
+            };
+
+            let mut expected: Vec<Incoming> = Vec::new();
+            let mut stream = Vec::new();
+            for _ in 0..1 + rng.below(6) {
+                if rng.below(4) == 0 {
+                    let ping = Command::Ping {
+                        ttl: rng.below(100) as u16,
+                        context: b"ctx",
+                    };
+                    let mut body = Vec::new();
+                    ping.encode_body(&mut body).expect("PING body");
+                    match sender.as_mut() {
+                        None => stream.extend_from_slice(&frame::encode(FrameKind::Command, &body)),
+                        Some(transport) => stream.extend_from_slice(
+                            &transport
+                                .seal_frame(curve_layout::MESSAGE_FLAG_COMMAND, &body)
+                                .expect("seal"),
+                        ),
+                    }
+                    expected.push(Incoming::Command(Bytes::from(body)));
+                } else {
+                    let message = random_message(&mut rng);
+                    match sender.as_mut() {
+                        None => message.encode_into(&mut stream),
+                        Some(transport) => {
+                            let last = message.len() - 1;
+                            for (index, frame) in message.frames().iter().enumerate() {
+                                let flags = if index == last {
+                                    0
+                                } else {
+                                    curve_layout::MESSAGE_FLAG_MORE
+                                };
+                                stream.extend_from_slice(
+                                    &transport.seal_frame(flags, frame.as_slice()).expect("seal"),
+                                );
+                            }
+                        }
+                    }
+                    expected.push(Incoming::Message(message));
+                }
+            }
+
+            let drip = Drip {
+                data: stream,
+                at: 0,
+                chunk: 1 + rng.below(300),
+            };
+            let mut wire = Wire::new(drip, MessageLimits::new(1 << 20, 16));
+            if let Some(transport) = receiver {
+                wire.encrypt_with(transport);
+            }
+            for want in expected {
+                let got = within(wire.read_next()).await.expect("the next item");
+                assert_eq!(got, want, "round {round}, sealed: {sealed}");
+            }
+            let end = within(wire.read_next()).await.unwrap_err();
+            assert_eq!(end.errno(), "EHOSTUNREACH", "{end}");
+        }
+    }
+
+    /// Claim: **arbitrary octets never panic the reader** — they are a
+    /// message, a command or an error, and the stream ends — in the clear and
+    /// under a CURVE session, where every frame has to open as a box.
+    #[tokio::test]
+    async fn arbitrary_octets_are_never_a_panic() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for round in 0..3000 {
+            let len = rng.below(700);
+            let mut data = rng.bytes(len);
+            // Bias a share of the streams towards plausible frame headers, so
+            // that the parser is exercised beyond its first refusal.
+            if round % 3 == 0 {
+                for at in (0..data.len()).step_by(1 + rng.below(40)) {
+                    data[at] = [0x00, 0x01, 0x02, 0x04, 0x06][rng.below(5)];
+                }
+            }
+            let sealed = round % 2 == 0;
+            let drip = Drip {
+                data,
+                at: 0,
+                chunk: 1 + rng.below(64),
+            };
+            let mut wire = Wire::new(drip, MessageLimits::new(4096, 8));
+            if sealed {
+                wire.encrypt_with(curve_transports().1);
+            }
+            // Every item consumes at least two octets, so this ends.
+            for _ in 0..=len {
+                if within(wire.read_next()).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Claim: **batching never reorders or splits anything.** Two thousand
+    /// two-frame messages — one in ten spanning many windows — go through a
+    /// stream whose window is a kilobyte, with a peer that reads as it can:
+    /// every message arrives whole, in order, frame by frame, whatever share
+    /// of them were gathered into one write.
+    #[tokio::test]
+    async fn a_burst_through_a_tiny_window_arrives_complete_and_in_order() {
+        let (pipe, task, mut peer) = handshaken_over_a_duplex(options(), 1024).await;
+        let outgoing = pipe.outgoing();
+        let producer = tokio::spawn(async move {
+            for n in 0u32..2000 {
+                let body = if n % 10 == 0 {
+                    vec![(n % 251) as u8; 5000]
+                } else {
+                    n.to_be_bytes().to_vec()
+                };
+                let message = Multipart::new(vec![
+                    Message::from(n.to_be_bytes().to_vec()),
+                    Message::from(body),
+                ])
+                .expect("frames");
+                outgoing.send(message).await.expect("queued");
+            }
+        });
+        for n in 0u32..2000 {
+            let (kind, first) = within(peer.read_frame()).await;
+            assert_eq!(kind, FrameKind::Message { more: true }, "message {n}");
+            assert_eq!(first, n.to_be_bytes(), "message {n}");
+            let (kind, body) = within(peer.read_frame()).await;
+            assert_eq!(kind, FrameKind::Message { more: false }, "message {n}");
+            if n % 10 == 0 {
+                assert_eq!(body, vec![(n % 251) as u8; 5000], "message {n}");
+            } else {
+                assert_eq!(body, n.to_be_bytes(), "message {n}");
+            }
+        }
+        within(producer).await.expect("the producer");
+        assert!(!task.is_finished());
+    }
+
+    /// Claim: **a subscription notification is never dropped because the
+    /// application is slow.** An XPUB whose receive queue holds four messages
+    /// is sent twenty distinct subscriptions by one peer before the
+    /// application reads anything: the session waits for room, which pauses
+    /// that peer's reads and nobody else's, and the application then receives
+    /// every `\x01` notification, in order. A proxy forwarding them upstream
+    /// would otherwise never learn some of its subscribers' topics.
+    #[tokio::test]
+    async fn an_xpub_notification_waits_for_the_application_instead_of_being_dropped() {
+        let mut xpub_options = options();
+        xpub_options.pipe.incoming.hwm = 4;
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let mut peer = CodecPeer::new(theirs);
+        let (pipe, _user, task) = drive_stream(
+            Stream::inproc(ours),
+            SocketType::XPub,
+            xpub_options,
+            Role::Binder,
+            &context(),
+        );
+        peer.read_greeting().await;
+        peer.greet(greeting::VERSION).await;
+        peer.read_frame().await;
+        peer.ready(SocketType::Sub).await;
+
+        let mut burst = Vec::new();
+        for n in 0..20 {
+            let prefix = format!("topic-{n:02}");
+            burst.extend_from_slice(
+                &Command::Subscribe(prefix.as_bytes())
+                    .encode()
+                    .expect("SUBSCRIBE"),
+            );
+        }
+        peer.send(&burst).await;
+
+        // The queue fills to its mark and the rest waits in the session.
+        within(async {
+            while pipe.incoming().len() < 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(pipe.incoming().len(), 4);
+        assert_eq!(pipe.incoming().dropped(), 0);
+
+        for n in 0..20 {
+            let notice = within(pipe.incoming().recv())
+                .await
+                .expect("a notification");
+            let mut want = vec![0x01];
+            want.extend_from_slice(format!("topic-{n:02}").as_bytes());
+            assert_eq!(
+                notice.frames()[0].as_slice(),
+                want.as_slice(),
+                "notification {n}"
+            );
+        }
+        assert!(!task.is_finished());
     }
 }

@@ -18,6 +18,10 @@
 //! remaining budget down and translates the refusal into
 //! [`Error::EMSGSIZE`]; it does not repeat the arithmetic.
 
+#[cfg(test)]
+use std::cell::Cell;
+
+use bytes::Bytes;
 use weida_zmtp::{FrameError, FrameKind, frame};
 
 use crate::error::{Error, Result};
@@ -56,15 +60,14 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 /// item 5).
 ///
 /// It is chosen against two products. A frame costs at least two octets on
-/// the wire and a `Message` costs a `Vec` header plus its bytes, so 1024
-/// frames of nothing are kilobytes rather than the eight megabytes an
-/// unbounded count allowed. And the count bounds *work*, not only memory:
-/// an incomplete message is re-parsed from the front on every read, so the
-/// re-parse is 1024 headers at worst instead of the whole buffer. Every
-/// envelope any ZeroMQ pattern defines is a handful of frames — the reply
-/// envelope is one delimiter plus addresses, a RADIO message is two — so a
-/// legitimate message is orders of magnitude below this, and an application
-/// whose own framing is not may raise it.
+/// the wire and a `Message` costs a handle plus its bytes, so 1024 frames of
+/// nothing are tens of kilobytes rather than the eight megabytes an
+/// unbounded count allowed. And the count bounds the *per-message work*: a
+/// whole-buffer [`Multipart::decode`] walks at most this many headers per
+/// call. Every envelope any ZeroMQ pattern defines is a handful of frames —
+/// the reply envelope is one delimiter plus addresses, a RADIO message is
+/// two — so a legitimate message is orders of magnitude below this, and an
+/// application whose own framing is not may raise it.
 pub const DEFAULT_MAX_MESSAGE_FRAMES: usize = 1024;
 
 /// What bounds one inbound message.
@@ -103,20 +106,61 @@ impl Default for MessageLimits {
 /// serialization (`docs/research/zeromq.md` §3). An empty frame is a legal
 /// frame and a load-bearing one: it is the envelope delimiter REQ prepends
 /// and REP strips.
+///
+/// **Cloning is a reference-count bump**, not a copy: the bytes are shared
+/// and immutable, so a publisher hands one frame to every subscriber, a
+/// proxy copies a message to its capture socket, and a received frame can be
+/// a slice of the buffer it was read into, all without moving a payload
+/// byte.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Message {
-    bytes: Vec<u8>,
+    bytes: Bytes,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Payload bytes copied into a frame on this thread, so that a test can
+    /// tell a decoder that copies once from one that copies on every read.
+    static COPIED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Payload bytes copied into frames on this thread so far.
+#[cfg(test)]
+pub(crate) fn copied_bytes() -> u64 {
+    COPIED.with(Cell::get)
 }
 
 impl Message {
     /// An empty frame — the envelope delimiter, and a legal message of size
     /// zero.
     pub const fn empty() -> Message {
-        Message { bytes: Vec::new() }
+        Message {
+            bytes: Bytes::new(),
+        }
+    }
+
+    /// A frame holding a copy of `bytes`.
+    ///
+    /// The one place a received payload is copied into a frame of its own;
+    /// small frames are copied rather than sliced off the receive buffer so
+    /// that a queued frame of a few octets never pins the allocation it was
+    /// read into.
+    pub(crate) fn copy_of(bytes: &[u8]) -> Message {
+        #[cfg(test)]
+        COPIED.with(|copied| copied.set(copied.get() + bytes.len() as u64));
+        Message {
+            bytes: Bytes::copy_from_slice(bytes),
+        }
     }
 
     /// The frame's bytes.
     pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The frame's shared bytes, for a caller that wants to keep a handle on
+    /// them without copying.
+    pub const fn as_bytes(&self) -> &Bytes {
         &self.bytes
     }
 
@@ -130,47 +174,63 @@ impl Message {
         self.bytes.is_empty()
     }
 
-    /// Takes the bytes, consuming the frame.
+    /// Takes the bytes as a `Vec`, consuming the frame. Free when this was
+    /// the only handle on a frame built from a `Vec`; a copy otherwise.
     pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes.into()
+    }
+
+    /// Takes the shared bytes, consuming the frame.
+    pub fn into_inner(self) -> Bytes {
         self.bytes
     }
 }
 
-impl From<Vec<u8>> for Message {
-    fn from(bytes: Vec<u8>) -> Message {
+impl From<Bytes> for Message {
+    fn from(bytes: Bytes) -> Message {
         Message { bytes }
+    }
+}
+
+impl From<Message> for Bytes {
+    fn from(message: Message) -> Bytes {
+        message.bytes
+    }
+}
+
+impl From<Vec<u8>> for Message {
+    /// Takes the `Vec` over without copying it.
+    fn from(bytes: Vec<u8>) -> Message {
+        Message {
+            bytes: Bytes::from(bytes),
+        }
     }
 }
 
 impl From<&[u8]> for Message {
     fn from(bytes: &[u8]) -> Message {
-        Message {
-            bytes: bytes.to_vec(),
-        }
+        Message::copy_of(bytes)
     }
 }
 
 impl<const N: usize> From<&[u8; N]> for Message {
     fn from(bytes: &[u8; N]) -> Message {
-        Message {
-            bytes: bytes.to_vec(),
-        }
+        Message::copy_of(bytes)
     }
 }
 
 impl From<String> for Message {
+    /// Takes the `String`'s buffer over without copying it.
     fn from(text: String) -> Message {
         Message {
-            bytes: text.into_bytes(),
+            bytes: Bytes::from(text),
         }
     }
 }
 
 impl From<&str> for Message {
     fn from(text: &str) -> Message {
-        Message {
-            bytes: text.as_bytes().to_vec(),
-        }
+        Message::copy_of(text.as_bytes())
     }
 }
 
@@ -264,6 +324,15 @@ impl Multipart {
         self.frames
     }
 
+    /// The octets [`Self::encode`] writes: every frame's header — two octets
+    /// up to 255 bytes of body, nine beyond — and its body.
+    pub fn encoded_len(&self) -> usize {
+        self.frames
+            .iter()
+            .map(|frame| header_octets(frame.len() as u64) + frame.len())
+            .sum()
+    }
+
     /// Encodes the whole message: MORE set on every frame but the last.
     ///
     /// One buffer for the whole message, because that is what atomicity means
@@ -271,7 +340,17 @@ impl Multipart {
     /// memory until the final frame is sent" (§3). A caller cannot hand half
     /// of this to a socket.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.total_bytes() as usize + 2 * self.frames.len());
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// [`Self::encode`], appended to `out`: one reservation of exactly
+    /// [`Self::encoded_len`] octets, so a connection that batches many
+    /// messages into one write copies each frame once and reallocates for
+    /// none of them.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
         let last = self.frames.len() - 1;
         for (index, frame) in self.frames.iter().enumerate() {
             frame::encode_header(
@@ -279,11 +358,10 @@ impl Multipart {
                     more: index != last,
                 },
                 frame.len() as u64,
-                &mut out,
+                out,
             );
             out.extend_from_slice(frame.as_slice());
         }
-        out
     }
 
     /// Decodes whatever is at the front of `input`, under `limits`.
@@ -301,39 +379,33 @@ impl Multipart {
     /// alone is enough to refuse it, before the body has arrived and before
     /// anything is reserved for it.
     ///
-    /// **Both bounds are load-bearing, and the second one was a hole.**
-    /// Counting declared bodies alone bounds nothing: an empty frame declares
-    /// no body, so a peer sending `01 00` — one empty frame, MORE set —
-    /// forever grew a reader's buffer by two octets per frame with
-    /// `ZMQ_MAXMSGSIZE` untouched (measured: four million of them are eight
-    /// megabytes held against a one-mebibyte ceiling, and still
-    /// `Incomplete`). So a frame costs its **header plus its declared body**
-    /// against [`MessageLimits::max_bytes`], and the frame count has a
-    /// ceiling of its own.
+    /// **Both bounds are load-bearing.** Counting declared bodies alone
+    /// bounds nothing: an empty frame declares no body, so a peer sending
+    /// `01 00` — one empty frame, MORE set — forever would grow a reader's
+    /// buffer by two octets per frame with `ZMQ_MAXMSGSIZE` untouched. So a
+    /// frame costs its **header plus its declared body** against
+    /// [`MessageLimits::max_bytes`], and the frame count has a ceiling of
+    /// its own.
+    ///
+    /// **A call costs headers, not payload, until the message is whole.** The
+    /// first pass walks the frame headers and allocates nothing; only a
+    /// message that is complete is copied, once. A caller that re-decodes a
+    /// growing buffer on every read — which is what a hostile peer dripping
+    /// a large message one octet at a time makes it do — therefore pays at
+    /// most [`MessageLimits::max_frames`] header parses per read and never a
+    /// copy of a frame it has already seen. A connection does not re-decode
+    /// at all: the session assembles frames as they complete.
     pub fn decode(input: &[u8], limits: MessageLimits) -> Result<Decoded<'_>> {
-        let mut frames: Vec<Message> = Vec::new();
-        let mut held: u64 = 0;
+        let mut budget = Budget::default();
         let mut at = 0usize;
         loop {
-            let remaining = limits.max_bytes.saturating_sub(held);
+            let remaining = budget.remaining(&limits);
             let (header, used) = match frame::decode_header(&input[at..], remaining) {
                 Ok(decoded) => decoded,
                 Err(FrameError::Incomplete) => return Ok(Decoded::Incomplete),
                 Err(e) => return Err(frame_error(e, limits.max_bytes)),
             };
-            // The header's own octets count too: this is the check that makes
-            // a stream of empty frames finite.
-            let cost = used as u64 + header.len;
-            if cost > remaining {
-                return Err(Error::EMSGSIZE(
-                    format!(
-                        "this message has reached its {}-byte budget (ZMQ_MAXMSGSIZE), \
-                         counting frame headers; the next frame needs {cost} more",
-                        limits.max_bytes
-                    )
-                    .into(),
-                ));
-            }
+            let cost = budget.check(used, header, &limits)?;
             let body_at = at + used;
             let Some(end) = body_at.checked_add(header.len as usize) else {
                 return Err(Error::EMSGSIZE(
@@ -347,12 +419,8 @@ impl Multipart {
             }
             match header.kind {
                 FrameKind::Command => {
-                    if !frames.is_empty() {
-                        return Err(Error::EINVAL(
-                            "a command frame appeared inside a multipart message; MORE is zero \
-                             on commands, so a command is never part of one"
-                                .into(),
-                        ));
+                    if budget.frames > 0 {
+                        return Err(command_in_multipart());
                     }
                     return Ok(Decoded::Command {
                         body: &input[body_at..end],
@@ -360,22 +428,11 @@ impl Multipart {
                     });
                 }
                 FrameKind::Message { more } => {
-                    if frames.len() >= limits.max_frames {
-                        return Err(Error::EMSGSIZE(
-                            format!(
-                                "this message already has its ceiling of {} frames; \
-                                 37/ZMTP sets no limit, so this one is ours",
-                                limits.max_frames
-                            )
-                            .into(),
-                        ));
-                    }
-                    held += cost;
-                    frames.push(Message::from(&input[body_at..end]));
+                    budget.commit(cost, true);
                     at = end;
                     if !more {
                         return Ok(Decoded::Message {
-                            message: Multipart { frames },
+                            message: copy_frames(&input[..at], budget.frames),
                             consumed: at,
                         });
                     }
@@ -385,8 +442,151 @@ impl Multipart {
     }
 }
 
+/// The second pass of [`Multipart::decode`]: `input` is exactly the frames of
+/// one whole message, already validated by the first, so this only copies.
+fn copy_frames(input: &[u8], frames: usize) -> Multipart {
+    let mut out = Vec::with_capacity(frames);
+    let mut at = 0usize;
+    while at < input.len() {
+        // The first pass parsed these same octets under a tighter cap.
+        let Ok((header, used)) = frame::decode_header(&input[at..], frame::MAX_BODY) else {
+            break;
+        };
+        let body_at = at + used;
+        let end = body_at + header.len as usize;
+        out.push(Message::copy_of(&input[body_at..end]));
+        at = end;
+    }
+    Multipart { frames: out }
+}
+
+/// The octets a frame header takes for a body of `len`: the shortest form,
+/// which is the one this library writes.
+pub(crate) const fn header_octets(len: u64) -> usize {
+    if len > frame::MAX_SHORT_BODY { 9 } else { 2 }
+}
+
+pub(crate) fn command_in_multipart() -> Error {
+    Error::EINVAL(
+        "a command frame appeared inside a multipart message; MORE is zero on commands, so a \
+         command is never part of one"
+            .into(),
+    )
+}
+
+/// What one inbound message has spent of [`MessageLimits`] so far.
+///
+/// Shared by the whole-buffer [`Multipart::decode`] and by a connection that
+/// assembles frames as they complete, so both refuse the same messages at the
+/// same header.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Budget {
+    /// Octets charged: every message frame's header plus its declared body.
+    held: u64,
+    /// Message frames charged.
+    frames: usize,
+}
+
+impl Budget {
+    /// Octets the message may still add.
+    pub(crate) fn remaining(&self, limits: &MessageLimits) -> u64 {
+        limits.max_bytes.saturating_sub(self.held)
+    }
+
+    /// Whether `header`, which took `header_octets` on the wire, still fits:
+    /// the cost of the frame, or `EMSGSIZE`. Pure, so a frame whose body has
+    /// not arrived can be checked again on the next read at no charge.
+    ///
+    /// The header's own octets count too: this is the check that makes a
+    /// stream of empty frames finite.
+    pub(crate) fn check(
+        &self,
+        header_octets: usize,
+        header: frame::FrameHeader,
+        limits: &MessageLimits,
+    ) -> Result<u64> {
+        let remaining = self.remaining(limits);
+        let cost = header_octets as u64 + header.len;
+        if cost > remaining {
+            return Err(Error::EMSGSIZE(
+                format!(
+                    "this message has reached its {}-byte budget (ZMQ_MAXMSGSIZE), counting \
+                     frame headers; the next frame needs {cost} more",
+                    limits.max_bytes
+                )
+                .into(),
+            ));
+        }
+        if matches!(header.kind, FrameKind::Message { .. }) && self.frames >= limits.max_frames {
+            return Err(Error::EMSGSIZE(
+                format!(
+                    "this message already has its ceiling of {} frames; 37/ZMTP sets no limit, \
+                     so this one is ours",
+                    limits.max_frames
+                )
+                .into(),
+            ));
+        }
+        Ok(cost)
+    }
+
+    /// Charges a frame that [`Self::check`] accepted.
+    pub(crate) fn commit(&mut self, cost: u64, message_frame: bool) {
+        if message_frame {
+            self.held += cost;
+            self.frames += 1;
+        }
+    }
+}
+
+/// The frames of one inbound message that have arrived, held until its last
+/// one has.
+///
+/// This is "all frames or none" for a connection that reads a stream: each
+/// frame is moved in as it completes and never looked at again, which is
+/// what makes receiving linear in the octets received, and a partial message
+/// is bounded by the same [`Budget`] a whole one is.
+#[derive(Debug, Default)]
+pub(crate) struct Assembly {
+    budget: Budget,
+    frames: Vec<Message>,
+}
+
+impl Assembly {
+    /// What the message has spent so far.
+    pub(crate) const fn budget(&self) -> &Budget {
+        &self.budget
+    }
+
+    /// Whether no frame of an unfinished message is held, which is the only
+    /// state a command may arrive in.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Adds a frame that [`Budget::check`] accepted at `cost`. Returns the
+    /// message when this was its last frame, leaving the assembly empty for
+    /// the next one.
+    pub(crate) fn push(&mut self, frame: Message, cost: u64, more: bool) -> Option<Multipart> {
+        if !more && self.frames.is_empty() {
+            // The common case, and one allocation of exactly one handle.
+            self.budget = Budget::default();
+            return Some(Multipart::single(frame));
+        }
+        self.budget.commit(cost, true);
+        self.frames.push(frame);
+        if more {
+            return None;
+        }
+        self.budget = Budget::default();
+        Some(Multipart {
+            frames: std::mem::take(&mut self.frames),
+        })
+    }
+}
+
 /// Translates the codec's refusal into this crate's vocabulary.
-fn frame_error(error: FrameError, max_message_bytes: u64) -> Error {
+pub(crate) fn frame_error(error: FrameError, max_message_bytes: u64) -> Error {
     match error {
         FrameError::BodyTooLarge { len, max } => Error::EMSGSIZE(
             format!(
@@ -720,5 +920,154 @@ mod tests {
         let over = Multipart::new(frames).expect("frames").encode();
         let err = Multipart::decode(&over, limits).unwrap_err();
         assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+    }
+
+    /// Claim: **a peer cannot make a reader copy a frame again by sending the
+    /// rest of its message slowly.** A decode of a buffer that does not yet
+    /// hold the whole message reads headers only, so re-decoding a growing
+    /// prefix on every read — which is what dripping one octet at a time makes
+    /// a reader do — copies nothing until the last octet arrives, and the
+    /// whole message is then copied once.
+    #[test]
+    fn a_partial_message_is_never_copied() {
+        let limits = MessageLimits::new(2 * 1024 * 1024, DEFAULT_MAX_MESSAGE_FRAMES);
+        let first = vec![1u8; 512 * 1024];
+        let second = vec![2u8; 400 * 1024];
+        let encoded = Multipart::new(vec![
+            Message::from(first.clone()),
+            Message::from(second.clone()),
+        ])
+        .expect("frames")
+        .encode();
+
+        let baseline = copied_bytes();
+        // From the moment the first frame is whole, every prefix is one more
+        // read of the second.
+        let drip_from = 9 + first.len();
+        for cut in (drip_from..encoded.len()).step_by(97) {
+            assert_eq!(
+                Multipart::decode(&encoded[..cut], limits).expect("decode"),
+                Decoded::Incomplete,
+                "a {cut}-byte prefix must deliver nothing"
+            );
+        }
+        assert_eq!(
+            copied_bytes(),
+            baseline,
+            "decoding a partial message copied payload"
+        );
+
+        match Multipart::decode(&encoded, limits).expect("decode") {
+            Decoded::Message { message, consumed } => {
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(message.total_bytes(), (first.len() + second.len()) as u64);
+            }
+            other => panic!("expected a message, got {other:?}"),
+        }
+        assert_eq!(
+            copied_bytes() - baseline,
+            (first.len() + second.len()) as u64,
+            "a whole message is copied exactly once"
+        );
+    }
+
+    /// Claim: a clone shares the payload rather than copying it, which is what
+    /// lets a publisher hand one message to every subscriber, and a `Vec` or a
+    /// `String` becomes a frame without being copied at all.
+    #[test]
+    fn cloning_a_message_copies_no_payload() {
+        let message = Multipart::new(vec![Message::from(vec![7u8; 4096]), Message::from("tail")])
+            .expect("frames");
+        let copy = message.clone();
+        for (original, cloned) in message.frames().iter().zip(copy.frames()) {
+            assert_eq!(
+                original.as_slice().as_ptr(),
+                cloned.as_slice().as_ptr(),
+                "a clone must share the bytes"
+            );
+        }
+        assert_eq!(copy, message);
+
+        let bytes = vec![3u8; 1000];
+        let at = bytes.as_ptr();
+        let frame = Message::from(bytes);
+        assert_eq!(
+            frame.as_slice().as_ptr(),
+            at,
+            "a Vec is taken over, not copied"
+        );
+        assert_eq!(frame.into_bytes().len(), 1000);
+    }
+
+    /// Claim: `encoded_len` is what `encode` writes — two octets of header up
+    /// to 255 bytes of body and nine beyond — and `encode_into` appends.
+    #[test]
+    fn encoded_len_is_what_encode_writes() {
+        for frames in [vec![0usize], vec![255], vec![256], vec![0, 300, 1, 70_000]] {
+            let message = Multipart::new(
+                frames
+                    .iter()
+                    .map(|len| Message::from(vec![5u8; *len]))
+                    .collect(),
+            )
+            .expect("frames");
+            assert_eq!(message.encoded_len(), message.encode().len(), "{frames:?}");
+        }
+
+        let message = parts(&[b"abc", b"de"]);
+        let mut out = b"prefix".to_vec();
+        message.encode_into(&mut out);
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(&out[6..], message.encode().as_slice());
+    }
+
+    /// Claim: a connection that assembles frames as they arrive holds them
+    /// until the last one — all or none — refuses the frame that crosses the
+    /// budget from its header alone, and starts over for the next message.
+    #[test]
+    fn an_assembly_delivers_all_frames_or_none() {
+        let limits = MessageLimits::new(250, DEFAULT_MAX_MESSAGE_FRAMES);
+        let mut assembly = Assembly::default();
+        let message_header = |more, len| frame::FrameHeader {
+            kind: FrameKind::Message { more },
+            len,
+        };
+
+        let cost = assembly
+            .budget()
+            .check(2, message_header(true, 100), &limits)
+            .expect("fits");
+        assert!(assembly.push(Message::from("one"), cost, true).is_none());
+        assert!(!assembly.is_empty());
+
+        // 102 octets are spent; the next 148 fit and 149 do not.
+        assert!(
+            assembly
+                .budget()
+                .check(2, message_header(true, 146), &limits)
+                .is_ok()
+        );
+        let err = assembly
+            .budget()
+            .check(2, message_header(true, 147), &limits)
+            .unwrap_err();
+        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+
+        let cost = assembly
+            .budget()
+            .check(2, message_header(false, 10), &limits)
+            .expect("fits");
+        let done = assembly
+            .push(Message::from("two"), cost, false)
+            .expect("the last frame completes the message");
+        assert_eq!(done.len(), 2);
+        assert!(assembly.is_empty());
+        assert_eq!(assembly.budget().remaining(&limits), 250, "a fresh budget");
+
+        // One frame, which is most of what a socket receives.
+        let single = assembly
+            .push(Message::from("solo"), 6, false)
+            .expect("a lone frame is a message");
+        assert_eq!(single.frames()[0].as_slice(), b"solo");
     }
 }

@@ -29,14 +29,22 @@
 //! behind unknown intermediaries MUST accept an address envelope consisting
 //! of N routing ID frames followed by an empty address delimiter frame… and
 //! MUST send the same envelope back with the reply. This is what a REP socket
-//! does." This library dials with a DEALER socket — 27/ZAP allows "REQ or
-//! DEALER" — and writes that envelope itself, so the frames above are exactly
-//! what goes on the wire and nothing is added behind the caller's back.
+//! does." This library dials as a DEALER — 27/ZAP allows "REQ or DEALER" —
+//! and writes that envelope itself, so the frames above are exactly what goes
+//! on the wire and nothing is added behind the caller's back.
+//!
+//! **The dialog is a connection, not a socket.** It speaks a DEALER's ZMTP
+//! over an in-memory stream to the handler's binding and takes no
+//! `ZMQ_MAX_SOCKETS` slot: how many dialogs are in flight is decided by
+//! whoever opens connections to a server, and a slot per dialog let a stranger
+//! exhaust every other socket in the context.
 //!
 //! **Credentials per mechanism**: NULL has none, and the dialog then exists
 //! so that a server can "filter bogus clients on the basis of IP address";
-//! PLAIN has two frames, username and password. CURVE's public-key frame
-//! belongs to the mechanism that is not implemented here.
+//! PLAIN has two frames, username and password; CURVE has one, the client's
+//! 32-octet long-term public key. The count is fixed by the mechanism, and a
+//! request is read **by position**: whatever follows those frames is an
+//! extension and never a credential.
 //!
 //! # What this library adds, and names
 //!
@@ -53,6 +61,13 @@
 //!   ([0010](../../../docs/decisions/0010-local-transport.md) §4.4): the
 //!   handler decides, the peer only reports, and nothing here turns it into a
 //!   credential.
+//! - It is **read by position**, as the last frame after a mechanism's
+//!   credentials, never recognised by what it says: a PLAIN username is
+//!   whatever octets the peer chose, and one that begins `X-Local-Principal: `
+//!   must not be taken for the kernel's statement. A server also refuses a
+//!   credential that begins that way before any handler is asked, so a
+//!   handler that scans for the prefix instead of counting frames is safe
+//!   too.
 //!
 //! # The user id is not an identity either
 //!
@@ -69,6 +84,19 @@
 //! - It is a **per-connection** fact held by the server, not a per-message
 //!   label (`docs/research/zeromq.md` §12/P14). It is readable on the peer,
 //!   as [`crate::Peer::user_id`], and it never touches the routing id.
+//!
+//! # When a handler is asked
+//!
+//! libzmq's rule, measured against 4.3.5
+//! (`tests/interop_libzmq.rs::libzmq_asks_a_bound_handler_for_curve_without_a_domain`):
+//! NULL asks only when a domain is set; PLAIN and CURVE ask whenever a handler
+//! is bound, **with any domain, empty included**. A deployment that binds a
+//! handler to allow-list client keys and never sets a domain is therefore not
+//! silently unauthenticated. [`asks_handler`] is that rule, and this library
+//! is stricter in one place: a server that must ask and finds no handler
+//! refuses the connection where libzmq admits it (PLAIN always, CURVE and NULL
+//! under a domain). CURVE with no domain and no handler is 26/CURVEZMQ's first
+//! model, "the server does not check client keys at all".
 //!
 //! # One handler per context
 //!
@@ -89,15 +117,19 @@
 //! that a server which must authorize and finds no handler refuses the
 //! connection instead of admitting it.
 
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use weida_core::LocalPrincipal;
+use weida_zmtp::{Command, SocketType};
 
 use crate::context::Context;
-use crate::dealerrouter::DealerSocket;
+use crate::engine::Role;
 use crate::error::{Error, Result};
-use crate::message::{Message, Multipart};
+use crate::message::{Message, MessageLimits, Multipart};
 use crate::options::{Security, SocketOptions};
+use crate::session::{Incoming, PeerFacts, Wire, handshake_on};
+use crate::transport::Stream;
 
 /// The endpoint a ZAP handler binds, fixed by 27/ZAP.
 pub const ZAP_ENDPOINT: &str = "inproc://zeromq.zap.01";
@@ -274,6 +306,15 @@ impl ZapRequest {
     /// Accepts the address envelope 27/ZAP describes: any number of routing
     /// frames before the empty delimiter, which a REP socket has already
     /// stripped and a ROUTER socket has not.
+    ///
+    /// **The frames after the mechanism are read by position.** The
+    /// mechanism fixes how many are credentials (NULL none, PLAIN two, CURVE
+    /// one); of what follows, only the last frame is looked at, and only to
+    /// read the kernel's statement out of it. A credential is never
+    /// reclassified by its content, so a PLAIN username that imitates the
+    /// extension frame stays a credential. A mechanism this library never
+    /// sends has no known count: all of its frames are credentials and none
+    /// is an extension.
     pub fn decode(message: &Multipart) -> Result<ZapRequest> {
         let frames: Vec<&[u8]> = message.frames().iter().map(Message::as_slice).collect();
         let body = strip_envelope(&frames);
@@ -292,24 +333,24 @@ impl ZapRequest {
                 .into(),
             ));
         }
-        let mut credentials = Vec::new();
-        let mut local_principal = None;
-        for frame in body.iter().skip(6) {
-            match std::str::from_utf8(frame)
-                .ok()
-                .and_then(|text| text.strip_prefix(LOCAL_PRINCIPAL_PREFIX))
-            {
-                Some(text) => local_principal = parse_local_principal(text),
-                None => credentials.push(frame.to_vec()),
-            }
-        }
+        let request_id = field(1, "request id")?.to_vec();
+        let domain = text_of(field(2, "domain")?);
+        let address = text_of(field(3, "address")?);
+        let identity = field(4, "identity")?.to_vec();
+        let mechanism = text_of(field(5, "mechanism")?);
+        let after = body.get(6..).unwrap_or_default();
+        let (credentials, extensions) = match credential_frames(&mechanism) {
+            Some(count) => after.split_at(count.min(after.len())),
+            None => (after, &[][..]),
+        };
+        let local_principal = extensions.last().and_then(|frame| principal_of(frame));
         Ok(ZapRequest {
-            request_id: field(1, "request id")?.to_vec(),
-            domain: text_of(field(2, "domain")?),
-            address: text_of(field(3, "address")?),
-            identity: field(4, "identity")?.to_vec(),
-            mechanism: text_of(field(5, "mechanism")?),
-            credentials,
+            request_id,
+            domain,
+            address,
+            identity,
+            mechanism,
+            credentials: credentials.iter().map(|frame| frame.to_vec()).collect(),
             local_principal,
         })
     }
@@ -434,16 +475,46 @@ impl ZapReply {
     }
 }
 
+/// Whether a server puts a connection to the context's ZAP handler.
+///
+/// libzmq's rule (see the module documentation): NULL when a domain is set,
+/// PLAIN always, CURVE whenever a handler is bound **or** a domain is set —
+/// with a domain and no handler the answer is still yes, because then the
+/// refusal is the answer. A client never asks.
+pub fn asks_handler(options: &SocketOptions, context: &Context) -> bool {
+    match options.security() {
+        Security::PlainServer => true,
+        Security::PlainClient | Security::CurveClient => false,
+        Security::Null => !options.zap_domain.is_empty(),
+        Security::CurveServer => {
+            !options.zap_domain.is_empty() || context.inproc().is_bound(ZAP_NAME)
+        }
+    }
+}
+
 /// Asks the context's handler about one connection.
 ///
-/// One DEALER socket per question, which is a socket slot for the duration of
-/// the handshake — libzmq spends one too, per session. The socket is closed
-/// before this returns.
+/// The question is a connection of its own to the handler's binding — a
+/// DEALER's ZMTP over an in-memory stream — and not a socket, so it takes no
+/// socket slot and a flood of connections cannot use up the context's
+/// `ZMQ_MAX_SOCKETS`. It lasts as long as the handler takes to answer, which
+/// is bounded by the handshake interval the engine applies to the whole
+/// session, and it is closed before this returns.
 ///
 /// Fails with `ENOTSOCK` when no handler is bound: "The handler SHALL start
 /// before any server starts", and a server that cannot ask must not admit.
-pub async fn authorize(context: &Context, request: &ZapRequest) -> Result<ZapReply> {
-    if !context.inproc().is_bound(ZAP_NAME) {
+///
+/// Boxed because the dialog runs the session's own handshake, which is what
+/// calls this: the box is where that cycle ends.
+pub fn authorize<'a>(
+    context: &'a Context,
+    request: &'a ZapRequest,
+) -> Pin<Box<dyn Future<Output = Result<ZapReply>> + Send + 'a>> {
+    Box::pin(dialog(context, request))
+}
+
+async fn dialog(context: &Context, request: &ZapRequest) -> Result<ZapReply> {
+    let Some(stream) = context.inproc().dial_zap(ZAP_NAME) else {
         return Err(Error::ENOTSOCK(
             format!(
                 "no ZAP handler is bound at {ZAP_ENDPOINT} in this context, so this connection \
@@ -451,23 +522,32 @@ pub async fn authorize(context: &Context, request: &ZapRequest) -> Result<ZapRep
             )
             .into(),
         ));
-    }
-    let mut dialog = DealerSocket::with_options(
-        context,
-        SocketOptions {
-            // The handshake's own bound is ZMQ_HANDSHAKE_IVL, applied by the
-            // engine to the whole session; this socket must not add a second
-            // clock that could expire mid-dialog.
-            send_timeout: None,
-            recv_timeout: None,
-            ..SocketOptions::default()
-        },
-    )?;
-    dialog.connect(ZAP_ENDPOINT)?;
-    dialog.send(request.encode()).await?;
-    let reply = ZapReply::decode(&dialog.recv().await?);
-    dialog.close();
-    let reply = reply?;
+    };
+    let mut wire = Wire::new(stream, MessageLimits::default());
+    // The dialog itself is unauthenticated NULL, as the dialling side: there
+    // is nobody on it to authorize, and a domain here would ask the handler
+    // about the question it is being asked.
+    let facts = PeerFacts {
+        role: Role::Connecter,
+        address: String::new(),
+        credentials: None,
+        context: context.clone(),
+    };
+    handshake_on(
+        &mut wire,
+        SocketType::Dealer,
+        &SocketOptions::default(),
+        &facts,
+    )
+    .await?;
+    wire.write_message(&request.encode()).await?;
+    let answer = loop {
+        match wire.read_next().await? {
+            Incoming::Message(message) => break message,
+            Incoming::Command(body) => dialog_command(&mut wire, &body).await?,
+        }
+    };
+    let reply = ZapReply::decode(&answer)?;
     if reply.request_id != request.request_id {
         return Err(Error::ENOCOMPATPROTO(
             "a ZAP handler echoed a different request id, so its reply answers another question"
@@ -475,6 +555,19 @@ pub async fn authorize(context: &Context, request: &ZapRequest) -> Result<ZapRep
         ));
     }
     Ok(reply)
+}
+
+/// What a command from the handler's end of the dialog gets: a `PING` its
+/// socket was configured to send is answered, its `ERROR` ends the dialog,
+/// and anything else is not the dialog's business.
+async fn dialog_command(wire: &mut Wire<Stream>, body: &[u8]) -> Result<()> {
+    match Command::decode(body) {
+        Ok(Command::Ping { context, .. }) => wire.write_command(&Command::Pong { context }).await,
+        Ok(Command::Error(reason)) => Err(Error::ENOCOMPATPROTO(
+            format!("the ZAP handler's socket refused the dialog: {reason}").into(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The mechanism name and credential frames a security choice sends.
@@ -523,6 +616,34 @@ fn strip_envelope<'a>(frames: &'a [&'a [u8]]) -> &'a [&'a [u8]] {
         Some(delimiter) => &frames[delimiter + 1..],
         None => frames,
     }
+}
+
+/// How many credential frames a mechanism's request carries, or `None` for a
+/// mechanism this library does not send.
+fn credential_frames(mechanism: &str) -> Option<usize> {
+    match mechanism {
+        "NULL" => Some(0),
+        "PLAIN" => Some(2),
+        "CURVE" => Some(1),
+        _ => None,
+    }
+}
+
+/// The kernel's statement, read out of an extension frame, if that is what
+/// the frame holds.
+fn principal_of(frame: &[u8]) -> Option<LocalPrincipal> {
+    std::str::from_utf8(frame)
+        .ok()?
+        .strip_prefix(LOCAL_PRINCIPAL_PREFIX)
+        .and_then(parse_local_principal)
+}
+
+/// Whether a credential begins like the extension frame this library appends
+/// for a local peer. No honest peer has such a username, a password or a key;
+/// a server that sees one refuses the connection instead of asking a handler
+/// that might scan for the prefix.
+pub(crate) fn imitates_local_principal(credential: &[u8]) -> bool {
+    credential.starts_with(LOCAL_PRINCIPAL_PREFIX.as_bytes())
 }
 
 fn text_of(frame: &[u8]) -> String {
@@ -739,5 +860,106 @@ mod tests {
         assert_eq!(slot.get(), None);
         slot.set(Some(id.clone()));
         assert_eq!(slot.get(), Some(id));
+    }
+
+    /// Claim: **a peer's credential cannot pose as the kernel's statement.**
+    /// A PLAIN username is whatever octets the peer chose; one that reads like
+    /// the extension frame stays a credential, and no principal appears for a
+    /// TCP peer, which has none.
+    #[test]
+    fn a_credential_cannot_pose_as_the_local_principal() {
+        let forged = ZapRequest {
+            credentials: vec![
+                b"X-Local-Principal: uid=0, gid=0, pid=1".to_vec(),
+                b"pw".to_vec(),
+            ],
+            local_principal: None,
+            ..request()
+        };
+        let read = ZapRequest::decode(&forged.encode()).expect("decode");
+        assert_eq!(
+            read.local_principal, None,
+            "a credential is not a principal"
+        );
+        let (username, password) = read.plain_credentials().expect("two credentials");
+        assert_eq!(username, b"X-Local-Principal: uid=0, gid=0, pid=1");
+        assert_eq!(password, b"pw");
+
+        // And beside a genuine statement the genuine one — the last frame
+        // after the credentials — is what is read, whatever the credentials
+        // say.
+        let both = ZapRequest {
+            local_principal: Some(LocalPrincipal {
+                uid: 1000,
+                gid: 100,
+                pid: Some(4242),
+            }),
+            ..forged
+        };
+        let read = ZapRequest::decode(&both.encode()).expect("decode");
+        assert_eq!(read.local_principal, both.local_principal);
+        assert_eq!(read.credentials, both.credentials);
+    }
+
+    /// Claim: a mechanism this library never sends has no count to split by,
+    /// so every frame after it is a credential and none is an extension.
+    #[test]
+    fn an_unknown_mechanism_has_no_extension_frame() {
+        let mut frames: Vec<Message> = ZapRequest {
+            mechanism: "GSSAPI".to_owned(),
+            credentials: Vec::new(),
+            ..request()
+        }
+        .encode()
+        .into_frames();
+        frames.push(Message::from("principal@REALM"));
+        frames.push(Message::from("X-Local-Principal: uid=0, gid=0"));
+        let read = ZapRequest::decode(&Multipart::new(frames).expect("frames")).expect("decode");
+        assert_eq!(read.credentials.len(), 2);
+        assert_eq!(read.local_principal, None);
+    }
+
+    /// Claim: libzmq's rule for when a handler is asked — NULL with a domain,
+    /// PLAIN always, CURVE with a domain **or** a bound handler — and a
+    /// client never asks.
+    #[tokio::test]
+    async fn the_handler_is_asked_by_libzmqs_rule() {
+        use crate::context::ContextConfig;
+        use crate::curve::keypair;
+
+        let context = Context::new(ContextConfig::default()).expect("context");
+        let (_, secret) = keypair();
+        let null = SocketOptions::default();
+        let null_domain = SocketOptions {
+            zap_domain: "d".to_owned(),
+            ..SocketOptions::default()
+        };
+        let plain = SocketOptions {
+            plain_server: true,
+            ..SocketOptions::default()
+        };
+        let curve = SocketOptions {
+            curve_server: true,
+            curve_secretkey: Some(secret),
+            ..SocketOptions::default()
+        };
+        let curve_domain = SocketOptions {
+            zap_domain: "d".to_owned(),
+            ..curve.clone()
+        };
+
+        // No handler bound.
+        assert!(!asks_handler(&null, &context));
+        assert!(asks_handler(&null_domain, &context));
+        assert!(asks_handler(&plain, &context));
+        assert!(!asks_handler(&curve, &context), "model one");
+        assert!(asks_handler(&curve_domain, &context));
+
+        // A handler bound: a CURVE server asks with an empty domain too;
+        // NULL still needs its domain.
+        let _handler = context.inproc().bind(ZAP_NAME).expect("bind");
+        assert!(!asks_handler(&null, &context));
+        assert!(asks_handler(&curve, &context));
+        assert!(asks_handler(&curve_domain, &context));
     }
 }

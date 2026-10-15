@@ -55,3 +55,17 @@ path = "fuzz_targets/greeting.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "curve_command"
+path = "fuzz_targets/curve_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "initiate_plaintext"
+path = "fuzz_targets/initiate_plaintext.rs"
+test = false
+doc = false
+bench = false

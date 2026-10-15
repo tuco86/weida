@@ -27,12 +27,19 @@ weida-zmtp.workspace = true
 # Connection lifecycle logging: a reconnect loop that says nothing is a
 # reconnect loop nobody can debug.
 tracing.workspace = true
-# CURVE's cryptography, and the only cryptographic dependency this crate has:
-# `crypto_box` **is** NaCl's `crypto_box`, which is the construction
-# 26/CURVEZMQ is written in terms of. The layouts stay in `weida-zmtp`, whose
-# own manifest is empty, and `unsafe_code = "forbid"` survives this because
-# the crate is pure Rust.
-crypto_box.workspace = true
+# CURVE's primitives, named directly so that every secret lives in a buffer
+# this crate wipes: X25519 from `curve25519-dalek`, the box from
+# `crypto_secretbox` (HSalsa20 for the key, XSalsa20-Poly1305 for the
+# seal), and `zeroize` for what holds them. `getrandom` is the operating
+# system's randomness: every CURVE key, nonce and cookie key is drawn from
+# it, and this crate has no other source of randomness.
+curve25519-dalek.workspace = true
+crypto_secretbox = { workspace = true, features = ["getrandom"] }
+zeroize.workspace = true
+# A frame is a refcounted slice of the receive buffer, so that handing it to
+# a queue, to every subscriber of a publisher and to the application copies
+# no payload.
+bytes.workspace = true
 # The executor the blocking facade drives its futures on, and only that: the
 # reactor's own threads are busy driving the connections, so a blocking caller
 # polls the socket's future on the thread that asked. `weida-runtime`'s Exec
@@ -70,8 +77,10 @@ trybuild.workspace = true
 # disagreement is an interoperability bug rather than a tautology. Tests
 # only, and no supervised process - `cargo test` is the whole apparatus.
 zeromq.workspace = true
-# Frames for the peer's own message type, which takes `Bytes`.
-bytes.workspace = true
+# RustCrypto's `crypto_box`, NaCl's construction from another implementation.
+# The local CURVE box is checked against it byte for byte in the tests; the
+# library builds its boxes from the primitives above and does not depend on it.
+crypto_box.workspace = true
 
 [features]
 # The synchronous facade, off by default: `weida_zmq::blocking`. Not default

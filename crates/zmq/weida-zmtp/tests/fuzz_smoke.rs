@@ -15,9 +15,10 @@
 //! a decoder that reserved the declared length would abort the test process
 //! rather than fail it.
 
-use weida_zmtp::error::{FrameError, GreetingError};
+use weida_zmtp::error::{CommandError, FrameError, GreetingError};
 use weida_zmtp::{
-    Command, CurveCommand, Greeting, Mechanism, Metadata, SocketType, curve, frame, greeting, z85,
+    Command, CurveCommand, Greeting, InitiatePlaintext, MAX_PROPERTIES, Mechanism, Metadata,
+    SocketType, curve, frame, greeting, z85,
 };
 
 const ITERATIONS: usize = 100_000;
@@ -224,6 +225,30 @@ fn fuzz_smoke_curve_command_bodies() {
 }
 
 #[test]
+fn fuzz_smoke_initiate_plaintext() {
+    // The plaintext of an INITIATE box: two keys, a vouch and a dictionary.
+    // Lengths are drawn up to a little past the minimum, so the accepted path
+    // is reached as well as the refusals.
+    let mut rng = Rng::new(0x1A17);
+    for _ in 0..ITERATIONS {
+        let input = rng.bytes(curve::INITIATE_PLAINTEXT_MIN_LEN + 40);
+        match InitiatePlaintext::decode(&input) {
+            Ok(value) => {
+                assert!(input.len() >= curve::INITIATE_PLAINTEXT_MIN_LEN);
+                assert!(value.metadata.properties().len() <= MAX_PROPERTIES);
+                let mut re = Vec::new();
+                value
+                    .encode(&mut re)
+                    .expect("an accepted INITIATE plaintext re-encodes");
+                assert_eq!(re, input);
+                assert_eq!(InitiatePlaintext::decode(&re).expect("re-decode"), value);
+            }
+            Err(e) => assert!(e.is_violation()),
+        }
+    }
+}
+
+#[test]
 fn fuzz_smoke_z85() {
     // Z85 is where text a human typed becomes a key, so the property is that
     // no input panics and every accepted one round-trips: five legal
@@ -256,6 +281,10 @@ fn fuzz_smoke_metadata() {
         let input = rng.bytes(32);
         match Metadata::decode(&input) {
             Ok(md) => {
+                assert!(
+                    md.properties().len() <= MAX_PROPERTIES,
+                    "an accepted dictionary is within the cap"
+                );
                 for (name, value) in md.properties() {
                     assert!(!name.is_empty() && name.len() <= 255);
                     assert!(value.len() <= i32::MAX as usize);
@@ -270,6 +299,35 @@ fn fuzz_smoke_metadata() {
                 let _ = md.socket_type();
             }
             Err(e) => assert!(e.is_violation()),
+        }
+    }
+}
+
+#[test]
+fn fuzz_smoke_metadata_property_counts() {
+    // Dictionaries of one to two caps' worth of minimal properties: the count
+    // alone decides the outcome, and a refusal names the cap instead of
+    // panicking or building the list.
+    let mut rng = Rng::new(0x6E7A);
+    for _ in 0..ITERATIONS / 10 {
+        let count = rng.below(2 * MAX_PROPERTIES + 1);
+        let mut input = Vec::new();
+        for _ in 0..count {
+            input.push(1);
+            input.push(b'a' + rng.below(3) as u8);
+            let value = rng.bytes(3);
+            input.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            input.extend_from_slice(&value);
+        }
+        match Metadata::decode(&input) {
+            Ok(md) => {
+                assert!(count <= MAX_PROPERTIES);
+                assert_eq!(md.properties().len(), count);
+            }
+            Err(e) => {
+                assert!(count > MAX_PROPERTIES, "{count} properties refused");
+                assert_eq!(e, CommandError::TooManyProperties(MAX_PROPERTIES + 1));
+            }
         }
     }
 }
@@ -334,6 +392,13 @@ fn fuzz_smoke_greeting_from_valid_ones() {
 
 /// Every documented bound an accepted command must respect.
 fn check_command(command: &Command<'_>) {
+    if let Command::Ready(md) | Command::Initiate(md) = command {
+        assert!(
+            md.properties().len() <= MAX_PROPERTIES,
+            "{} carries more properties than the cap",
+            command.name()
+        );
+    }
     match command {
         Command::Ready(md) => {
             for (name, _) in md.properties() {

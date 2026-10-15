@@ -180,6 +180,11 @@ pub enum CommandError {
     /// A PLAIN `HELLO` username or password exceeds 255 octets, which its
     /// own one-octet length field cannot describe.
     FieldTooLong(usize),
+    /// A metadata dictionary holds more properties than
+    /// [`MAX_PROPERTIES`](crate::metadata::MAX_PROPERTIES). Decoding refuses
+    /// at the first property past the cap, so the count is the one reached
+    /// at refusal (`MAX_PROPERTIES + 1`), not the total of a peer's dictionary.
+    TooManyProperties(usize),
 }
 
 impl CommandError {
@@ -209,6 +214,13 @@ impl fmt::Display for CommandError {
             }
             CommandError::FieldTooLong(n) => {
                 write!(f, "PLAIN field of {n} octets exceeds 255")
+            }
+            CommandError::TooManyProperties(n) => {
+                write!(
+                    f,
+                    "metadata of {n} properties exceeds {}",
+                    crate::metadata::MAX_PROPERTIES
+                )
             }
         }
     }

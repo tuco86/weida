@@ -46,14 +46,41 @@ use crate::transport::Stream;
 /// enough that a stalled reader cannot hold a megabyte per connection.
 pub const INPROC_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Who dialled an `inproc://` name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialler {
+    /// A socket, by its id in the context.
+    Socket(SocketId),
+    /// The library's own ZAP dialog, which is a connection and not a socket:
+    /// it takes no socket slot under `ZMQ_MAX_SOCKETS`, because a stranger
+    /// decides how many of them are in flight.
+    ZapDialog,
+}
+
+impl std::fmt::Display for Dialler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Dialler::Socket(id) => write!(f, "{id}"),
+            Dialler::ZapDialog => f.write_str("the ZAP dialog"),
+        }
+    }
+}
+
+impl PartialEq<SocketId> for Dialler {
+    /// Whether this is that socket dialling.
+    fn eq(&self, other: &SocketId) -> bool {
+        *self == Dialler::Socket(*other)
+    }
+}
+
 /// A dial to an `inproc://` name, handed to whoever bound it.
 ///
-/// The binder's half of the connection plus the id of the socket that
-/// dialled, which is what a log line needs to say who arrived.
+/// The binder's half of the connection plus who dialled, which is what a log
+/// line needs to say who arrived.
 #[derive(Debug)]
 pub struct InprocDial {
-    /// The socket that dialled.
-    pub from: SocketId,
+    /// Who dialled.
+    pub from: Dialler,
     /// The accepting side's half of the connection.
     pub stream: Stream,
 }
@@ -118,6 +145,16 @@ impl Inproc {
     /// a failure or something to wait for, and for `inproc` it is something
     /// to wait for ([`Inproc::wait_until_bound`]).
     pub fn dial(&self, name: &str, from: SocketId) -> Option<Stream> {
+        self.connect(name, Dialler::Socket(from))
+    }
+
+    /// [`Inproc::dial`] for the library's own ZAP dialog, which is a
+    /// connection and not a socket: no socket slot is taken.
+    pub(crate) fn dial_zap(&self, name: &str) -> Option<Stream> {
+        self.connect(name, Dialler::ZapDialog)
+    }
+
+    fn connect(&self, name: &str, from: Dialler) -> Option<Stream> {
         let owner = self.names.lookup(name)?;
         let (theirs, ours) = tokio::io::duplex(INPROC_BUFFER_BYTES);
         owner
@@ -210,7 +247,7 @@ mod tests {
         let from = dialler();
         let mut ours = inproc.dial("orders", from).expect("dialled");
         let mut dial = binding.accept().await.expect("accepted");
-        assert_eq!(dial.from, from);
+        assert_eq!(dial.from, Dialler::Socket(from));
 
         ours.write_all(b"ping").await.expect("write");
         let mut got = [0u8; 4];

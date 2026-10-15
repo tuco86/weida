@@ -33,43 +33,38 @@
 //! would have accepted" and "will the kernel store this path without
 //! truncating it".
 //!
-//! # The endpoint-stealing hazard, stated rather than papered over
+//! # An endpoint is not stolen, which libzmq's is
 //!
 //! `zmq_ipc(7)`: "if a second process binds to an endpoint already bound by a
 //! process, this will succeed and the first process will lose its binding. In
 //! this behaviour, the `ipc` transport is not consistent with the `tcp` or
-//! `inproc` transports" (`docs/research/zeromq.md` §8). This library has the
-//! same behaviour, for the same reason: the stale-node problem has no answer
-//! other than unlink-then-bind — a socket file outlives the process that
-//! created it, so a crash would otherwise make the endpoint permanently
-//! unbindable — and an unlink cannot distinguish a stale node from a live
-//! one.
+//! `inproc` transports" (`docs/research/zeromq.md` §8). **This library does
+//! not reproduce that.** A socket file outlives the process that created it,
+//! so a bind has to replace a stale node or the endpoint would be unbindable
+//! for good after a crash; but a node that something answers on is a live
+//! binding, and `weida-runtime` tells the two apart by connecting to it. A
+//! live node is refused with `EADDRINUSE`, as `tcp` and `inproc` refuse a
+//! second bind, and only a node nobody listens on is replaced. A program
+//! ported from libzmq that takes an endpoint over by binding it again gets
+//! an error instead, which is the one deliberate difference.
 //!
-//! What is done about it, and what is not:
+//! What else is done, and what is not:
 //!
-//! - **Only a socket is unlinked.** Anything else at the path is refused
+//! - **Only a socket is replaced.** Anything else at the path is refused
 //!   (`EADDRINUSE`), because a bind that deletes a caller's file is worse
 //!   than a bind that fails.
 //! - **The mode is `0600`, set after bind**, never inherited from `umask`.
 //! - **The node is removed on drop**, so the common case never meets the
 //!   stale node at all.
 //! - **The directory is load-bearing and this library cannot fix it.** The
-//!   substitution race between unlink and bind is closed only "unless
-//!   directory ownership and permissions prevent endpoint substitution"
-//!   (`docs/research/ipc.md` §1.2, §7). A caller putting a socket in a
-//!   world-writable directory — `/tmp` — can have its endpoint stolen or
+//!   probe and the replacement cannot stop a process that may write the
+//!   directory from removing the node and binding its own, which closes only
+//!   "unless directory ownership and permissions prevent endpoint
+//!   substitution" (`docs/research/ipc.md` §1.2, §7). A caller putting a
+//!   socket in a world-writable directory — `/tmp` — can have its endpoint
 //!   substituted by any local user, and no check inside the process can
 //!   prevent it. Put the socket in a directory you own and nobody else may
 //!   write.
-//! - **A stolen endpoint is a broken endpoint for both.** After a steal the
-//!   node belongs to the thief, and whichever binding is dropped first
-//!   removes it — the loser's unlink takes the winner's socket file with it.
-//!   libzmq unlinks on unbind too and has the same consequence; it is stated
-//!   here because it is the part a reader would not guess from "the first
-//!   process will lose its binding". What the loser keeps is its accepted
-//!   connections, which are sockets and not names.
-//! - **`inproc://` is the transport without this hazard**, which is exactly
-//!   what §8's "not consistent with the `tcp` or `inproc` transports" says.
 //!
 //! # Credentials, not identity
 //!
@@ -225,18 +220,17 @@ mod tests {
         std::fs::remove_file(&path).expect("clean up");
     }
 
-    /// Claim: a stale socket file — the node a crash leaves behind — is
-    /// unlinked and re-bound, because otherwise the endpoint would be
-    /// permanently unbindable. This is also the stealing hazard, and it is
-    /// the same code path: an unlink cannot tell a stale node from a live
-    /// one.
+    /// Claim: a stale socket file — the node a crash leaves behind, with
+    /// nobody listening — is replaced, because otherwise the endpoint would
+    /// be permanently unbindable. A node somebody *is* listening on is not a
+    /// stale one and is refused (`tests/ipc.rs`).
     #[tokio::test]
     async fn a_stale_node_is_replaced() {
         let exec = exec();
         let path = scratch_path("stale");
-        let first = IpcBinding::bind(&exec, &path).expect("bind");
-        // Forget it without unlinking, which is what a crash does.
-        std::mem::forget(first);
+        // A listener that is closed and not unlinked leaves exactly what a
+        // crash leaves: a socket node that nothing answers on.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
         assert!(path.exists());
 
         let second = IpcBinding::bind(&exec, &path).expect("rebind over the stale node");

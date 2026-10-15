@@ -138,42 +138,34 @@ async fn the_endpoint_budget_is_libzmqs() {
     assert_eq!(err.errno(), "EINVAL", "{err}");
 }
 
-/// Claim: a second bind of the same path **steals** the endpoint, which is
-/// libzmq's documented behaviour — "this will succeed and the first process
-/// will lose its binding. In this behaviour, the `ipc` transport is not
-/// consistent with the `tcp` or `inproc` transports." A new connection
-/// reaches the thief, not the incumbent.
-///
-/// This is a hazard rather than a feature, and it is asserted so that it
-/// cannot change by accident: the alternative — refusing the bind — would
-/// make an endpoint permanently unbindable after a crash, because a socket
-/// file outlives the process that made it.
+/// Claim: a second bind of a path somebody is listening on is **refused**
+/// with `EADDRINUSE`, as `tcp` and `inproc` refuse it, and the incumbent keeps
+/// its endpoint. libzmq's `ipc` instead lets the second bind take the name
+/// over ("this will succeed and the first process will lose its binding"),
+/// which lets any process that can write the directory silence a service by
+/// binding its path. A *stale* node — a socket file nobody listens on, which
+/// is what a crash leaves — is still replaced, so the endpoint does not
+/// become unbindable.
 #[tokio::test]
-async fn a_second_bind_steals_the_endpoint() {
+async fn a_second_bind_does_not_steal_a_live_endpoint() {
     let ctx = context();
     let path = socket_path("stealing");
     let mut incumbent = PullSocket::new(&ctx).expect("pull");
     incumbent.bind(&endpoint(&path)).await.expect("bind");
 
-    let mut thief = PullSocket::new(&ctx).expect("pull");
-    thief
+    let thief = PullSocket::new(&ctx).expect("pull");
+    let err = thief
         .bind(&endpoint(&path))
         .await
-        .expect("a second bind succeeds, which is the hazard");
+        .expect_err("a live endpoint is not taken over");
+    assert_eq!(err.errno(), "EADDRINUSE", "{err}");
 
     let mut pusher = PushSocket::new(&ctx).expect("push");
     pusher.connect(&endpoint(&path)).expect("connect");
-    pusher
-        .send("for whoever holds the name")
+    pusher.send("for the incumbent").await.expect("send");
+    let received = tokio::time::timeout(std::time::Duration::from_secs(10), incumbent.recv())
         .await
-        .expect("send");
-
-    assert_eq!(
-        text(&thief.recv().await.expect("the thief receives")),
-        b"for whoever holds the name"
-    );
-    assert!(
-        incumbent.try_recv().is_err(),
-        "the incumbent lost its binding and receives nothing new"
-    );
+        .expect("the incumbent receives in time")
+        .expect("a message");
+    assert_eq!(text(&received), b"for the incumbent");
 }

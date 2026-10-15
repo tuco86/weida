@@ -14,8 +14,8 @@
 //!
 //! Properties are borrowed, not copied: a decoded [`Metadata`] points into the
 //! frame body it came from. Only the property list itself is owned, so
-//! decoding a `READY` costs one allocation regardless of how much metadata it
-//! carries.
+//! decoding a `READY` costs one allocation of at most [`MAX_PROPERTIES`]
+//! entries, however much metadata the peer sends.
 
 use crate::error::CommandError;
 
@@ -23,6 +23,13 @@ use crate::error::CommandError;
 /// 2^32-1. "The value SHALL be 0 to 2,147,483,647 (2^31-1 or INT32_MAX in
 /// C/C++) octets of opaque binary data."
 pub const MAX_VALUE_LEN: usize = i32::MAX as usize;
+
+/// Most properties one dictionary may carry. A peer chooses the count, and a
+/// property costs six octets on the wire but a 32-octet entry here, so without
+/// this cap a 1 MiB `READY` of minimal properties would allocate ~5.6 MB before
+/// anything is decided. Real `READY` and `INITIATE` metadata is `Socket-Type`,
+/// `Identity` and a handful of `X-` properties.
+pub const MAX_PROPERTIES: usize = 64;
 
 /// A ZeroMQ socket type, as announced by the `Socket-Type` property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -182,8 +189,13 @@ impl<'a> Metadata<'a> {
         &self.0
     }
 
-    /// Appends the encoded dictionary to `out`.
+    /// Appends the encoded dictionary to `out`. A dictionary over
+    /// [`MAX_PROPERTIES`] is refused before anything is written, because the
+    /// decoder would refuse it too.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), CommandError> {
+        if self.0.len() > MAX_PROPERTIES {
+            return Err(CommandError::TooManyProperties(self.0.len()));
+        }
         for (name, value) in &self.0 {
             let name = name.as_bytes();
             if name.is_empty() || name.len() > 255 || !name.iter().all(|b| is_name_char(*b)) {
@@ -205,11 +217,16 @@ impl<'a> Metadata<'a> {
     /// `input` is the remainder of a command body, so it is already bounded by
     /// the frame cap: a declared value length reaching past the end is a
     /// violation rather than a request for more bytes, and cannot make this
-    /// side allocate.
+    /// side allocate. A dictionary over [`MAX_PROPERTIES`] is refused at the
+    /// first property past the cap, so the parse never walks a hostile body
+    /// to its end.
     pub fn decode(input: &'a [u8]) -> Result<Self, CommandError> {
         let mut rest = input;
         let mut properties = Vec::new();
         while !rest.is_empty() {
+            if properties.len() == MAX_PROPERTIES {
+                return Err(CommandError::TooManyProperties(MAX_PROPERTIES + 1));
+            }
             let name_len = usize::from(rest[0]);
             if name_len == 0 {
                 return Err(CommandError::BadPropertyName);
@@ -394,5 +411,46 @@ mod tests {
         assert_eq!(SocketType::parse(b"req"), None);
         assert_eq!(SocketType::parse(b""), None);
         assert_eq!(SocketType::parse(b"XREQ"), None);
+    }
+
+    #[test]
+    fn a_mebibyte_of_minimal_properties_is_refused_at_the_cap() {
+        // 174762 six-octet properties fill a 1 MiB body. The refusal must come
+        // at the first property past the cap, so the parse stops after 65 of
+        // them instead of building a list of all of them.
+        let body = b"\x01a\x00\x00\x00\x00".repeat(174_762);
+        assert_eq!(
+            Metadata::decode(&body),
+            Err(CommandError::TooManyProperties(MAX_PROPERTIES + 1))
+        );
+    }
+
+    #[test]
+    fn exactly_max_properties_decode_and_round_trip() {
+        let names: Vec<String> = (0..MAX_PROPERTIES).map(|i| format!("X-{i}")).collect();
+        let mut md = Metadata::new();
+        for name in &names {
+            md = md.with(name, b"v");
+        }
+        let mut bytes = Vec::new();
+        md.encode(&mut bytes).expect("the cap itself encodes");
+        let back = Metadata::decode(&bytes).expect("the cap itself decodes");
+        assert_eq!(back.properties().len(), MAX_PROPERTIES);
+        assert_eq!(back, md);
+    }
+
+    #[test]
+    fn one_property_past_the_cap_is_refused_by_encode_before_any_output() {
+        let names: Vec<String> = (0..=MAX_PROPERTIES).map(|i| format!("X-{i}")).collect();
+        let mut md = Metadata::new();
+        for name in &names {
+            md = md.with(name, b"v");
+        }
+        let mut out = Vec::new();
+        assert_eq!(
+            md.encode(&mut out),
+            Err(CommandError::TooManyProperties(MAX_PROPERTIES + 1))
+        );
+        assert!(out.is_empty(), "a refused dictionary writes nothing");
     }
 }
