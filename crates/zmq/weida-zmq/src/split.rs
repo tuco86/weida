@@ -24,7 +24,7 @@
 //! plus the routing table of a ROUTER, which is behind a lock that is never
 //! held across an await.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,6 +36,7 @@ use crate::pipe::{MuteAction, Sent, Weighed};
 use crate::pubsub::Published;
 use crate::socket::{Shared, SocketCore};
 use crate::subscriptions::{self, Subscriptions};
+use crate::upstream::{UpstreamTable, Verdict};
 
 // --- the bodies the socket types and their halves share ---------------------
 
@@ -395,6 +396,11 @@ impl XPubRecv {
         self.events.recv_within(&self.core, limit).await
     }
 
+    /// As [`XPubSocket::recv_forwarded`][crate::XPubSocket::recv_forwarded].
+    pub async fn recv_forwarded(&mut self) -> Result<Multipart> {
+        self.events.recv_forwarded(&self.core).await
+    }
+
     /// As [`XPubSocket::subscribe`][crate::XPubSocket::subscribe].
     pub fn subscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
         self.events.subscribe(&self.core, prefix.as_ref())
@@ -442,6 +448,14 @@ impl XPubRecv {
 /// subscription is handed over while a departed peer is still owed, so the
 /// records of the departed and of the live together never outnumber the peers
 /// that were live.
+///
+/// **Read as a forwarding device's end** ([`XPubEvents::recv_forwarded`]), the
+/// same record answers a second question: how many distinct prefixes each
+/// subscriber has had forwarded. That is its share of the table upstream
+/// ([`crate::upstream`]), and a subscribe that would take a subscriber over it
+/// is not handed over: the subscriber is told so with an `ERROR`, once. A
+/// prefix is handed over for the first subscriber that holds it, and its
+/// unsubscribe for the last.
 #[derive(Debug, Default)]
 pub(crate) struct XPubEvents {
     /// What the application believes each peer holds: for each prefix, the
@@ -463,6 +477,14 @@ pub(crate) struct XPubEvents {
     /// `ZMQ_XPUB_MANUAL`'s `subscribe` applies to — libzmq applies it to the
     /// last pipe too.
     last_subscriber: Option<PeerId>,
+    /// The prefixes a forwarding device's subscribers hold upstream, once the
+    /// socket is read as that device's end. `None` for a socket that is not.
+    upstream: Option<UpstreamTable>,
+    /// The subscribers refused something upstream and told so, once. A
+    /// subscriber that ignores the `ERROR` and goes on asking is not told
+    /// again, because every telling is a message queued on its connection for as
+    /// long as it does not read. Only live peers are kept.
+    told: HashSet<PeerId>,
 }
 
 impl XPubEvents {
@@ -497,6 +519,34 @@ impl XPubEvents {
                 format!("nothing arrived within {limit:?}").into(),
             )),
         }
+    }
+
+    /// As [`XPubEvents::recv`], for a socket that is a forwarding device's end:
+    /// each prefix is reported once however many subscribers hold it, and no
+    /// subscriber has more of the table upstream than its share.
+    pub(crate) async fn recv_forwarded(&mut self, core: &Shared) -> Result<Multipart> {
+        self.share_upstream(core);
+        self.recv(core).await
+    }
+
+    /// Makes this socket a forwarding device's end, once.
+    ///
+    /// A `ZMQ_XPUB_MANUAL` socket stays what it was: what it reports is a
+    /// request the application grants with [`XPubEvents::subscribe`], not
+    /// something a subscriber holds, so there is nothing to count. Whatever
+    /// the record held before is counted, so that its departures are not
+    /// lost.
+    fn share_upstream(&mut self, core: &Shared) {
+        if self.upstream.is_some() || core.options().xpub_manual {
+            return;
+        }
+        let mut table = UpstreamTable::new(core.options().max_subscriptions);
+        for prefixes in self.held.values() {
+            for prefix in prefixes.keys() {
+                table.adopt(prefix);
+            }
+        }
+        self.upstream = Some(table);
     }
 
     pub(crate) fn subscribe(&mut self, core: &Shared, prefix: &[u8]) -> Result<()> {
@@ -607,6 +657,13 @@ impl XPubEvents {
         if core.options().xpub_manual {
             return true;
         }
+        if self.upstream.is_some() {
+            return if subscribe {
+                self.hold_upstream(core, peer, prefix)
+            } else {
+                self.release_upstream(core, peer, prefix)
+            };
+        }
         if !subscribe {
             self.release(peer, prefix);
             return true;
@@ -622,6 +679,92 @@ impl XPubEvents {
             held.insert(prefix.to_vec(), 1);
         }
         true
+    }
+
+    /// A subscribe from `peer` for a socket that is a forwarding device's end:
+    /// whether it is handed over, which is when `peer` is the first to hold the
+    /// prefix. A prefix the peer holds already is a repeat — `ZMQ_XPUB_VERBOSE`
+    /// hands those over — and is no second holder; one that would take the peer
+    /// over its share, or fill the table, is refused to it.
+    fn hold_upstream(&mut self, core: &Shared, peer: PeerId, prefix: &[u8]) -> bool {
+        let Some(table) = self.upstream.as_mut() else {
+            return true;
+        };
+        let held = self.held.entry(peer).or_default();
+        if let Some(count) = held.get_mut(prefix) {
+            *count += 1;
+            return false;
+        }
+        let verdict = table.hold(held.len(), prefix);
+        match verdict {
+            Verdict::Forward | Verdict::Absorb => {
+                held.insert(prefix.to_vec(), 1);
+                verdict == Verdict::Forward
+            }
+            Verdict::OverShare | Verdict::TableFull => {
+                if held.is_empty() {
+                    self.held.remove(&peer);
+                }
+                self.refuse_upstream(core, peer, verdict);
+                false
+            }
+        }
+    }
+
+    /// An unsubscribe from `peer` for a socket that is a forwarding device's
+    /// end: whether it is handed over, which is when `peer` was the last to
+    /// hold the prefix.
+    ///
+    /// The cancel that is handed over is the one that emptied the peer's own
+    /// table, so it ends the peer's holding whatever count the record has —
+    /// except under `ZMQ_XPUB_VERBOSER`, which hands over every cancel and so
+    /// counts them off. A cancel for something the peer was never forwarded
+    /// for, a refused subscription included, is nobody's to pass on.
+    fn release_upstream(&mut self, core: &Shared, peer: PeerId, prefix: &[u8]) -> bool {
+        let verboser = core.options().xpub_verboser;
+        let Some(held) = self.held.get_mut(&peer) else {
+            return false;
+        };
+        let gone = match held.get_mut(prefix) {
+            None => return false,
+            Some(count) if verboser && *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => {
+                held.remove(prefix);
+                true
+            }
+        };
+        if held.is_empty() {
+            self.held.remove(&peer);
+        }
+        gone && self
+            .upstream
+            .as_mut()
+            .is_some_and(|table| table.release(prefix))
+    }
+
+    /// Tells `peer`, once, why a subscription of its was not forwarded: the
+    /// `ERROR` [`XPubEvents::refuse`] sends. 37/ZMTP has the peer treat it as
+    /// fatal, so a subscriber that heeds it ends its own connection, and its
+    /// holdings go upstream as cancels when it does.
+    fn refuse_upstream(&mut self, core: &Shared, peer: PeerId, verdict: Verdict) {
+        tracing::debug!(%peer, ?verdict, "did not forward a subscription");
+        if !self.told.insert(peer) {
+            return;
+        }
+        let reason = match (verdict, self.upstream.as_ref()) {
+            (Verdict::OverShare, Some(table)) => format!(
+                "this subscriber already holds its share of the proxy's upstream \
+                 subscriptions, {} prefixes",
+                table.share()
+            ),
+            _ => "the proxy's upstream subscriptions are full".to_owned(),
+        };
+        if let Some(pipe) = core.pipe_of(peer) {
+            pipe.refuse(&reason);
+        }
     }
 
     /// Takes one off what the application holds of `prefix` for `peer`: the
@@ -673,6 +816,9 @@ impl XPubEvents {
         if self.last_subscriber.is_some_and(|id| !is_live(&id)) {
             self.last_subscriber = None;
         }
+        // A peer refused everything holds nothing, so the pass over `held`
+        // does not find it.
+        self.told.retain(is_live);
         self.seen = Some(generation);
     }
 
@@ -681,6 +827,9 @@ impl XPubEvents {
     /// which held a thousand prefixes does not become a thousand messages in
     /// memory at once.
     fn next_departure(&mut self) -> Option<Multipart> {
+        if self.upstream.is_some() {
+            return self.next_cancel_upstream();
+        }
         let owed = self.departed.front_mut()?;
         let (prefix, count) = owed.last_mut()?;
         let notice = Multipart::single(Message::from(subscriptions::write_message_form(
@@ -696,11 +845,34 @@ impl XPubEvents {
         }
         Some(notice)
     }
+
+    /// The next cancel a forwarding device's end owes upstream for a peer that
+    /// left. The peer held each prefix once as far as the table is concerned,
+    /// however often it subscribed, and a prefix another subscriber holds is
+    /// not cancelled: the cancels are the ones the table says were the last.
+    fn next_cancel_upstream(&mut self) -> Option<Multipart> {
+        let table = self.upstream.as_mut()?;
+        while let Some(owed) = self.departed.front_mut() {
+            let Some((prefix, _)) = owed.pop() else {
+                self.departed.pop_front();
+                continue;
+            };
+            if owed.is_empty() {
+                self.departed.pop_front();
+            }
+            if table.release(&prefix) {
+                return Some(Multipart::single(Message::from(
+                    subscriptions::write_message_form(false, &prefix),
+                )));
+            }
+        }
+        None
+    }
 }
 
 /// A one-frame message in the subscription form, read: `true` for a
 /// subscribe, and the prefix.
-fn subscription_of(message: &Multipart) -> Option<(bool, &[u8])> {
+pub(crate) fn subscription_of(message: &Multipart) -> Option<(bool, &[u8])> {
     if message.len() != 1 {
         return None;
     }
@@ -1284,6 +1456,259 @@ mod tests {
             .expect("the subscribe no unsubscribe has answered");
         assert_eq!(owed.frames()[0].as_slice(), b"\x00a");
         assert!(events.next_departure().is_none());
+    }
+
+    /// A dialled peer that never connects, which has an id the engine knows
+    /// until it is disconnected, and the endpoint that disconnects it.
+    fn a_peer(core: &SocketCore, port: u16) -> (PeerId, crate::endpoint::Endpoint) {
+        let endpoint =
+            crate::endpoint::Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
+        let id = core.engine().connect(&endpoint).expect("connect");
+        (id, endpoint)
+    }
+
+    /// An XPUB read as a forwarding device's end, without ever connecting
+    /// anybody: the peers are the engine's own dialled ones.
+    fn a_device_end(options: SocketOptions) -> (SocketCore, XPubEvents) {
+        let core = xpub(SocketOptions {
+            reconnect_ivl: None,
+            ..options
+        });
+        let mut events = XPubEvents::default();
+        events.share_upstream(&core);
+        assert!(events.upstream.is_some());
+        (core, events)
+    }
+
+    /// Everything a departed peer is owed, as the bytes the application reads.
+    fn departures(events: &mut XPubEvents) -> Vec<Vec<u8>> {
+        let mut owed = Vec::new();
+        while let Some(message) = events.next_departure() {
+            owed.push(message.frames()[0].as_slice().to_vec());
+        }
+        owed.sort();
+        owed
+    }
+
+    /// Claim: **a prefix is handed to a forwarding device for its first
+    /// holder and its cancel for its last**, however many subscribers hold it
+    /// in between. What the device forwards is then one subscription for the
+    /// prefix, which is what an upstream that keeps a set of connections per
+    /// prefix can hold, and the first subscriber to leave does not cancel it
+    /// for the rest.
+    #[tokio::test]
+    async fn a_prefix_is_handed_over_for_its_first_holder_and_cancelled_with_its_last() {
+        let (core, mut events) = a_device_end(SocketOptions::default());
+        let (first, _) = a_peer(&core, 9);
+        let (second, _) = a_peer(&core, 19);
+
+        assert!(events.admit(&core, first, &subscribe(b"news")));
+        assert!(
+            !events.admit(&core, second, &subscribe(b"news")),
+            "the second holder of a prefix adds nothing to forward"
+        );
+        assert!(
+            !events.admit(&core, first, &cancel(b"news")),
+            "one of two holders letting go cancels nothing"
+        );
+        assert!(
+            events.admit(&core, second, &cancel(b"news")),
+            "the last holder letting go cancels it"
+        );
+        assert!(
+            !events.admit(&core, second, &cancel(b"news")),
+            "a cancel for a prefix nobody holds is not passed on"
+        );
+        assert!(
+            events.admit(&core, second, &Multipart::single("hello")),
+            "a message that is no subscription passes untouched"
+        );
+        assert!(events.held.is_empty(), "nobody holds anything any more");
+    }
+
+    /// Claim: **a subscriber that leaves cancels only what nobody else holds.**
+    /// A prefix it shared stays forwarded for the one that is left, and is
+    /// cancelled when that one goes too.
+    #[tokio::test]
+    async fn a_departed_subscriber_cancels_only_what_nobody_else_holds() {
+        let (core, mut events) = a_device_end(SocketOptions::default());
+        let (first, first_at) = a_peer(&core, 9);
+        let (second, second_at) = a_peer(&core, 19);
+        assert!(events.admit(&core, first, &subscribe(b"a")));
+        assert!(events.admit(&core, first, &subscribe(b"shared")));
+        assert!(!events.admit(&core, second, &subscribe(b"shared")));
+        assert!(events.admit(&core, second, &subscribe(b"b")));
+
+        core.engine().disconnect(&first_at).expect("disconnect");
+        events.reconcile(&core);
+        assert_eq!(
+            departures(&mut events),
+            [b"\x00a".to_vec()],
+            "the prefix only the first held"
+        );
+
+        core.engine().disconnect(&second_at).expect("disconnect");
+        events.reconcile(&core);
+        assert_eq!(
+            departures(&mut events),
+            [b"\x00b".to_vec(), b"\x00shared".to_vec()],
+            "and the second one's, shared prefix included now that it is the last"
+        );
+        assert!(events.departed.is_empty() && events.held.is_empty());
+    }
+
+    /// Claim: **no subscriber has more than its share of the table
+    /// forwarded**: the prefixes past it are not handed over, the subscriber
+    /// is told why with an `ERROR`, once however much more it asks for, and a
+    /// cancel for what was refused is not passed on. Another subscriber is
+    /// not held to what the first one asked for.
+    #[tokio::test]
+    async fn a_subscriber_over_its_share_is_told_once_and_not_forwarded() {
+        let (core, mut events) = a_device_end(SocketOptions {
+            max_subscriptions: 64,
+            ..SocketOptions::default()
+        });
+        let share = crate::upstream::upstream_share(64);
+        let (greedy, greedy_at) = a_peer(&core, 9);
+        let (honest, _) = a_peer(&core, 19);
+
+        for index in 0..share {
+            let prefix = format!("junk-{index}");
+            assert!(
+                events.admit(&core, greedy, &subscribe(prefix.as_bytes())),
+                "{prefix} is within the share"
+            );
+        }
+        for extra in ["one-too-many", "and-another", "and-a-third"] {
+            assert!(
+                !events.admit(&core, greedy, &subscribe(extra.as_bytes())),
+                "{extra} is past the share"
+            );
+        }
+        assert!(
+            !events.admit(&core, greedy, &cancel(b"one-too-many")),
+            "nothing was forwarded for it, so there is nothing to cancel"
+        );
+        assert_eq!(
+            events.held[&greedy].len(),
+            share,
+            "the refused are not kept"
+        );
+
+        let pipe = core.pipe_of(greedy).expect("the subscriber's pipe");
+        let reason = tokio::time::timeout(Duration::from_secs(10), pipe.refusal())
+            .await
+            .expect("the subscriber was told");
+        assert!(reason.contains("share"), "{reason}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), pipe.refusal())
+                .await
+                .is_err(),
+            "and told once, not for every subscription it went on to send"
+        );
+
+        assert!(
+            events.admit(&core, honest, &subscribe(b"news")),
+            "another subscriber has its own share"
+        );
+
+        core.engine().disconnect(&greedy_at).expect("disconnect");
+        events.reconcile(&core);
+        assert!(
+            events.told.is_empty(),
+            "a subscriber that left is forgotten"
+        );
+        assert_eq!(departures(&mut events).len(), share);
+    }
+
+    /// Claim: **the table upstream is not overfilled by many subscribers each
+    /// within its share.** A prefix that would be new there is refused to
+    /// whoever asks once it is full, and one that is in it already is still
+    /// welcome, because it takes no room.
+    #[tokio::test]
+    async fn a_full_upstream_table_refuses_a_new_prefix_and_not_a_held_one() {
+        // A table of 16 gives each subscriber 8.
+        let (core, mut events) = a_device_end(SocketOptions {
+            max_subscriptions: 16,
+            ..SocketOptions::default()
+        });
+        let [(first, _), (second, _), (third, _)] =
+            [a_peer(&core, 9), a_peer(&core, 19), a_peer(&core, 29)];
+        for (peer, name) in [(first, "a"), (second, "b")] {
+            for index in 0..8 {
+                let prefix = format!("{name}-{index}");
+                assert!(events.admit(&core, peer, &subscribe(prefix.as_bytes())));
+            }
+        }
+
+        assert!(
+            !events.admit(&core, third, &subscribe(b"new")),
+            "the table is full of other prefixes"
+        );
+        assert!(
+            !events.admit(&core, third, &subscribe(b"a-0")),
+            "a held prefix is nothing to forward, but it is the third holder's now"
+        );
+        assert_eq!(events.held[&third].len(), 1);
+        assert!(
+            events.admit(&core, first, &cancel(b"a-1")),
+            "a prefix cancelled makes room again"
+        );
+        assert!(events.admit(&core, third, &subscribe(b"new")));
+    }
+
+    /// Claim: **a repeat is no second holder, and the cancel that follows ends
+    /// the holding**, under `ZMQ_XPUB_VERBOSE`, which hands over every
+    /// subscribe and only the cancel that emptied the peer's own table. A
+    /// record that counted the repeats would owe the upstream a cancel for a
+    /// prefix the peer has already let go of.
+    #[tokio::test]
+    async fn under_verbose_a_repeat_is_no_second_holder() {
+        let (core, mut events) = a_device_end(SocketOptions {
+            xpub_verbose: true,
+            ..SocketOptions::default()
+        });
+        let (peer, _) = a_peer(&core, 9);
+        assert!(events.admit(&core, peer, &subscribe(b"a")));
+        assert!(!events.admit(&core, peer, &subscribe(b"a")), "a repeat");
+        assert!(
+            events.admit(&core, peer, &cancel(b"a")),
+            "the cancel that emptied the peer's table ends its holding"
+        );
+        assert!(events.held.is_empty());
+    }
+
+    /// Claim: **under `ZMQ_XPUB_VERBOSER`, which hands over every cancel, each
+    /// one takes one off the count**, and a cancel for a prefix the peer never
+    /// held is not passed on, so it cannot cancel what another subscriber
+    /// holds.
+    #[tokio::test]
+    async fn under_verboser_every_cancel_takes_one_off() {
+        let (core, mut events) = a_device_end(SocketOptions {
+            xpub_verboser: true,
+            ..SocketOptions::default()
+        });
+        let (peer, _) = a_peer(&core, 9);
+        let (other, _) = a_peer(&core, 19);
+        assert!(events.admit(&core, peer, &subscribe(b"a")));
+        assert!(!events.admit(&core, peer, &subscribe(b"a")));
+        assert!(!events.admit(&core, other, &cancel(b"a")), "never held it");
+        assert!(!events.admit(&core, peer, &cancel(b"a")), "one is left");
+        assert!(events.admit(&core, peer, &cancel(b"a")), "and now none");
+    }
+
+    /// Claim: a `ZMQ_XPUB_MANUAL` socket is not made a forwarding device's end:
+    /// what it reports are requests for the application to grant, and a
+    /// request refused for a share would be one the application never saw.
+    #[tokio::test]
+    async fn a_manual_socket_is_left_as_it_was() {
+        let core = xpub(SocketOptions {
+            xpub_manual: true,
+            ..SocketOptions::default()
+        });
+        let mut events = XPubEvents::default();
+        events.share_upstream(&core);
+        assert!(events.upstream.is_none());
     }
 
     /// A change to the peer set: a dialled peer that never connects arrives.

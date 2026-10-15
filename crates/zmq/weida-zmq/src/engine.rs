@@ -38,7 +38,7 @@
 //! would be a ZeroMQ implementation that speaks nothing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -478,42 +478,12 @@ const LOG_PERIOD: Duration = Duration::from_secs(1);
 /// How many accepted peers one host may hold: its `1 / PER_ADDRESS_DIVISOR`
 /// share of `max_peers`, never fewer than [`PER_ADDRESS_FLOOR`] and never more
 /// than `max_peers`. A default socket admits 128 peers from one host, and a PAIR
-/// with a `max_peers` of 1 admits one.
+/// with a `max_peers` of 1 admits one. A host is what [`weida_core::host_key`]
+/// says it is, the key `weida-nng` counts its peers under too.
 fn per_address_cap(max_peers: usize) -> usize {
     (max_peers / PER_ADDRESS_DIVISOR)
         .max(PER_ADDRESS_FLOOR)
         .min(max_peers)
-}
-
-/// What the per-address cap counts a peer at `ip` under, or `None` for a peer
-/// it does not count.
-///
-/// An IPv4 peer is counted by its address and an IPv6 peer by its `/64`. An
-/// IPv6 host is routed a whole `/64`, so a count per address would be a count
-/// per suffix the host chooses: one host could hold every slot of the table
-/// while staying under the cap of each address it connects from. An
-/// IPv4-mapped IPv6 address — what an IPv4 client looks like to a dual-stack
-/// listener, `tcp://[::]:port` — is counted as the IPv4 address it carries, so
-/// one host is one key however it reaches the listener. This is the key
-/// `weida-nng` counts its peers under (`PeerKey::host`), so that the two
-/// libraries bound the same threat the same way.
-///
-/// Loopback is this host's own processes, which a test or a sidecar
-/// legitimately opens by the thousand, so it is not counted. It is judged on
-/// the canonical address, which is why `::ffff:127.0.0.1` is exempt like
-/// `127.0.0.1`.
-fn counted_address(ip: IpAddr) -> Option<IpAddr> {
-    let ip = ip.to_canonical();
-    if ip.is_loopback() {
-        return None;
-    }
-    Some(match ip {
-        IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => {
-            let [a, b, c, d, ..] = v6.segments();
-            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
-        }
-    })
 }
 
 /// One accepted peer whose handshake has not completed.
@@ -536,7 +506,7 @@ struct Admission {
     /// is admission order.
     handshaking: BTreeMap<PeerId, Handshaking>,
     /// The key of each accepted peer that counts against the per-address cap,
-    /// as [`counted_address`] makes it. Loopback peers have no entry.
+    /// as [`weida_core::host_key`] makes it. Loopback peers have no entry.
     addresses: HashMap<PeerId, IpAddr>,
     /// How many accepted peers each key holds.
     per_address: HashMap<IpAddr, usize>,
@@ -1333,7 +1303,7 @@ impl EngineInner {
     /// unbounded count multiplies that product by a number a stranger picks.
     ///
     /// One host may hold only [`per_address_cap`] of the table, so it cannot
-    /// take every slot; a host is what [`counted_address`] says it is. A full
+    /// take every slot; a host is what [`weida_core::host_key`] says it is. A full
     /// table or a full host makes room only by evicting a handshake that has
     /// stalled for [`HANDSHAKE_EVICT_AFTER`] as of `now`: a silent peer gives
     /// way to a newcomer, and a live one never does.
@@ -1350,8 +1320,12 @@ impl EngineInner {
         }
         let mut admission = lock_unpoisoned(&self.admission);
         // `ipc` and `inproc` peers have no address at all, and loopback is not
-        // counted: see [`counted_address`].
-        let counted = address.and_then(counted_address);
+        // counted: it is this host's own processes, which a test or a sidecar
+        // legitimately opens by the thousand.
+        let counted = address
+            .map(weida_core::host_key)
+            .filter(|host| !host.loopback)
+            .map(|host| host.key);
         let cap = per_address_cap(self.options.max_peers);
         let address_full = counted.is_some_and(|address| {
             admission
@@ -1543,7 +1517,7 @@ struct Accepted {
     /// empty for a local transport, which has no address to report.
     address: String,
     /// The peer's IP as the kernel reported it, from which the per-address cap
-    /// derives its key ([`counted_address`]). `None` for a local transport.
+    /// derives its key ([`weida_core::host_key`]). `None` for a local transport.
     ip: Option<IpAddr>,
     /// The kernel's statement about a local peer, where the transport has one.
     credentials: Option<weida_core::LocalPrincipal>,
@@ -1566,9 +1540,6 @@ impl Acceptor for TcpListener {
     async fn accept(&mut self) -> Result<Option<Accepted>> {
         let (stream, from) = TcpListener::accept(self).await?;
         let stream = Stream::tcp(stream);
-        // Every accepted peer gets the setting every dialled peer gets, so a
-        // request-reply exchange on loopback does not wait on Nagle's algorithm.
-        let _ = stream.set_nodelay(true);
         Ok(Some(Accepted {
             stream,
             // 27/ZAP wants the client address and not the port: authorization
@@ -1702,6 +1673,9 @@ fn serve_accepted(ctx: &TaskCtx, accepted: Accepted, endpoint: &Endpoint) -> boo
         }
     };
     drop(engine);
+    // Tuned once the connection is admitted, so that one about to be refused
+    // costs this side no more than the accept.
+    tune(&stream, &ctx.options);
 
     let peer = slots.peer;
     let guard = AcceptedGuard {
@@ -1940,13 +1914,28 @@ async fn dial(ctx: &TaskCtx, endpoint: &Endpoint) -> Result<Stream> {
         match outcome {
             Ok(stream) => {
                 let stream = Stream::tcp(stream);
-                let _ = stream.set_nodelay(true);
+                tune(&stream, &ctx.options);
                 return Ok(stream);
             }
             Err(e) => last = e,
         }
     }
     Err(last)
+}
+
+/// What every TCP connection of this socket is set up with, whether it dialled
+/// the connection or accepted it: Nagle's algorithm off, so that a
+/// request-reply exchange on loopback does not wait on it, and the keepalive
+/// that `ZMQ_TCP_KEEPALIVE` and its three tuning options ask for. A failure to
+/// set either is not fatal — the connection works, with less — so it is logged
+/// and not raised. An `ipc` or `inproc` stream has neither to set.
+fn tune(stream: &Stream, options: &SocketOptions) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "could not disable Nagle on a TCP connection");
+    }
+    if let Err(error) = stream.set_keepalive(options) {
+        tracing::debug!(%error, "could not set the TCP keepalive on a connection");
+    }
 }
 
 /// The address to report to a ZAP handler for an endpoint this socket
@@ -3386,5 +3375,93 @@ mod tests {
             (true, true),
             "a peer went"
         );
+    }
+
+    /// What the kernel has for one TCP connection: `SO_KEEPALIVE` and the three
+    /// probe parameters, with the role the connection was made in.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct KeepaliveState {
+        role: Role,
+        enabled: bool,
+        idle: Duration,
+        interval: Duration,
+        count: u32,
+    }
+
+    /// A session that records the [`KeepaliveState`] of each TCP connection it
+    /// is handed and then holds the connection until the peer closes it.
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct KeepaliveProbe {
+        seen: Mutex<Vec<KeepaliveState>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl KeepaliveProbe {
+        fn seen(&self) -> Vec<KeepaliveState> {
+            self.seen.lock().expect("probe").clone()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Session for KeepaliveProbe {
+        fn run(&self, mut connection: Connection) -> SessionFuture {
+            let socket =
+                socket2::SockRef::from(connection.stream.as_tcp().expect("a TCP connection"));
+            self.seen.lock().expect("probe").push(KeepaliveState {
+                role: connection.role,
+                enabled: socket.keepalive().expect("SO_KEEPALIVE"),
+                idle: socket.tcp_keepalive_time().expect("idle time"),
+                interval: socket.tcp_keepalive_interval().expect("probe interval"),
+                count: socket.tcp_keepalive_retries().expect("probe count"),
+            });
+            Box::pin(async move {
+                connection.handshake.complete();
+                let mut byte = [0u8; 1];
+                let _ = connection.stream.read(&mut byte).await;
+                Ok(())
+            })
+        }
+    }
+
+    /// Claim: **`ZMQ_TCP_KEEPALIVE` and its tuning options reach both kinds of
+    /// TCP connection**, the one a listener accepts and the one a connecter
+    /// dials, each from its own socket's options. A half-open connection is
+    /// found by the kernel's probes or not at all while the heartbeat is off,
+    /// and the probes are configured on the connection, not on the socket
+    /// that listens or dials.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn keepalive_is_set_on_accepted_and_dialled_connections() {
+        let keepalive = |idle: u64, intvl: u64, cnt: u32| SocketOptions {
+            tcp_keepalive: Some(true),
+            tcp_keepalive_idle: Some(Duration::from_secs(idle)),
+            tcp_keepalive_intvl: Some(Duration::from_secs(intvl)),
+            tcp_keepalive_cnt: Some(cnt),
+            ..options()
+        };
+        let ctx = context();
+        let accepting = Arc::new(KeepaliveProbe::default());
+        let server = Engine::new(&ctx, keepalive(31, 7, 4), accepting.clone()).expect("server");
+        let endpoint = server
+            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+            .await
+            .expect("bind");
+
+        let dialling = Arc::new(KeepaliveProbe::default());
+        let client = Engine::new(&ctx, keepalive(43, 9, 6), dialling.clone()).expect("client");
+        client.connect(&endpoint).expect("connect");
+        wait_for(|| !accepting.seen().is_empty() && !dialling.seen().is_empty()).await;
+
+        let state = |role, idle, interval, count| KeepaliveState {
+            role,
+            enabled: true,
+            idle: Duration::from_secs(idle),
+            interval: Duration::from_secs(interval),
+            count,
+        };
+        assert_eq!(accepting.seen(), [state(Role::Binder, 31, 7, 4)]);
+        assert_eq!(dialling.seen(), [state(Role::Connecter, 43, 9, 6)]);
     }
 }

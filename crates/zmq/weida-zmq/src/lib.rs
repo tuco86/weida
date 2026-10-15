@@ -34,8 +34,9 @@
 //! - [`Engine`] and [`SocketOptions`] — one socket's binds, connects and
 //!   reconnects, with `ZMQ_RECONNECT_IVL`/`_IVL_MAX` backoff,
 //!   `ZMQ_HANDSHAKE_IVL`, `ZMQ_CONNECT_TIMEOUT`, `ZMQ_IMMEDIATE`,
-//!   `ZMQ_BACKLOG` and `ZMQ_LAST_ENDPOINT`, handing each established
-//!   connection to a [`Session`].
+//!   `ZMQ_BACKLOG`, `ZMQ_TCP_KEEPALIVE` with its three tuning options and
+//!   `ZMQ_LAST_ENDPOINT`, handing each established connection to a
+//!   [`Session`].
 //! - [`ZmtpSession`] and [`Wire`] — the protocol itself over one connection:
 //!   the greeting with its 3.0 downgrade, the NULL handshake, `READY` with
 //!   `Socket-Type` and `Identity`, MORE/COMMAND framing, `PING`/`PONG` gated
@@ -69,7 +70,10 @@
 //!   built from: subscriptions delivered to the application in the `1`/`0`
 //!   form with `ZMQ_XPUB_VERBOSE`, `_VERBOSER`, `_MANUAL` and
 //!   `_WELCOME_MSG`, an unsubscribe synthesized when a subscriber vanishes,
-//!   and messages and subscriptions sent upstream.
+//!   and messages and subscriptions sent upstream. The receive a device uses,
+//!   [`XPubSocket::recv_forwarded`], reports a prefix once however many
+//!   subscribers hold it and holds each of them to its [`upstream_share`] of
+//!   the table behind the proxy.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //! - `IpcBinding` (unix only) — the `ipc` transport on `AF_UNIX`, with
@@ -198,6 +202,7 @@ pub mod socket;
 pub mod split;
 pub mod subscriptions;
 pub mod transport;
+pub mod upstream;
 pub mod xpubxsub;
 pub mod zap;
 
@@ -229,7 +234,7 @@ pub use monitor::{
 };
 pub use options::{
     DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,
-    MAX_ZAP_DOMAIN_BYTES, Security, SocketOptions,
+    MAX_TCP_KEEPALIVE_CNT, MAX_TCP_KEEPALIVE_SECS, MAX_ZAP_DOMAIN_BYTES, Security, SocketOptions,
 };
 pub use optiontable::{OPTIONS, Refusal, Scope, Verdict, ZmqOption};
 pub use pair::PairSocket;
@@ -254,6 +259,7 @@ pub use subscriptions::{
     DEFAULT_MAX_SUBSCRIPTION_BYTES, DEFAULT_MAX_SUBSCRIPTIONS, SubscriptionForm, Subscriptions,
 };
 pub use transport::Stream;
+pub use upstream::{UPSTREAM_SHARE_DIVISOR, UPSTREAM_SHARE_FLOOR, upstream_share};
 pub use xpubxsub::{XPubSocket, XSubSocket};
 pub use zap::{
     AuthenticatedUser, ZAP_ENDPOINT, ZAP_NAME, ZapReply, ZapRequest, ZapStatus, ZapUserId,

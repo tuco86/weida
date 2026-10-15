@@ -206,7 +206,14 @@ with a count apiece: one unsubscribe is owed for every subscribe handed over tha
 unsubscribe handed over has answered, repeats included, which is what an upstream XSUB that
 counts each forwarded subscribe needs back. A departed peer is expanded into unsubscribes one
 at a time, ahead of any new event, so the records of the departed and of the live together
-never outnumber the peers that were live (`weida-zmq`'s `split::XPubEvents`).
+never outnumber the peers that were live (`weida-zmq`'s `split::XPubEvents`). Read as a forwarding
+device's end (`XPubSocket::recv_forwarded`, which a pub/sub proxy does), the same record holds at
+most `upstream_share(max_subscriptions)` prefixes for a peer — an eighth of the table, at least
+eight — and the device's table of what it forwarded holds at most `max_subscriptions` distinct
+prefixes however many peers stand behind it, a prefix counted once for its first holder and
+cancelled for its last. A subscribe past the share or into a full table is not forwarded, and
+its peer is sent one `ERROR` and no more; the peers told are kept only while they are live, so a
+subscriber that reconnects without end grows nothing.
 
 **A message count is not a memory bound**, and that is the one place a standalone library
 adds a name of its own rather than the foreign protocol's. `ZMQ_SNDHWM` and `ZMQ_RCVHWM`
@@ -246,9 +253,12 @@ message cannot keep a large packet's buffer alive behind the budget's back
 message that has started must keep arriving (`MESSAGE_IVL` 30 s, extended by the octets that
 arrive at `MIN_MESSAGE_RATE`); a connection stops taking messages from its pipe at
 `OUT_HIGH_WATER` of unwritten output; one remote host holds at most `max_peers / 8` peers
-(at least 8; a host is an IPv4 address or an IPv6 `/64`, an IPv4-mapped address counts as the
-IPv4 one, and loopback in any form, `ipc` and `inproc` are exempt) and a handshake that stalls for
-`HANDSHAKE_EVICT_AFTER` gives its slot to a newcomer; and an accept that fails backs off from
+(at least 8; a host is what `weida_core::host_key` says, an IPv4 address or an IPv6 `/64`, an
+IPv4-mapped address counts as the IPv4 one, and loopback in any form, `ipc` and `inproc` are
+exempt) and a handshake that stalls for `HANDSHAKE_EVICT_AFTER` gives its slot to a newcomer; a
+half-open TCP connection is found by the kernel's probes once `ZMQ_TCP_KEEPALIVE` is 1 (the
+default leaves it to the operating system, as libzmq's does, and the heartbeat is the liveness
+then); and an accept that fails backs off from
 10 ms to 1 s instead of ending the listener. A received frame is a slice of its read buffer
 only when it is at least a quarter of the allocation it was read into; any other is copied out,
 so a few octets never pin a read buffer, and a connection that went quiet after one large

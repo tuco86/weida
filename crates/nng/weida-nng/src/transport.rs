@@ -45,25 +45,17 @@ pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// What a listener counts a connection against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PeerKey {
-    /// A remote host: its IPv4 address, or the `/64` an IPv6 address
-    /// belongs to, because an IPv6 host is given a whole `/64` and a count
-    /// per address would be a count per attacker-chosen suffix.
+    /// A remote host, under the key [`weida_core::host_key`] gives it: its IPv4
+    /// address, or the `/64` an IPv6 address belongs to, because an IPv6 host
+    /// is given a whole `/64` and a count per address would be a count per
+    /// attacker-chosen suffix. `weida-zmq` counts a host the same way.
+    ///
+    /// Loopback is counted like any other host, as an `ipc://` peer is
+    /// counted under its uid: a local process holds pipes against
+    /// `max_pipes_per_peer` too. `weida-zmq` exempts it.
     Host(IpAddr),
     /// The user id the kernel attributed to an `ipc://` peer.
     User(u32),
-}
-
-impl PeerKey {
-    /// The key of a peer at `ip`.
-    pub fn host(ip: IpAddr) -> PeerKey {
-        match ip.to_canonical() {
-            IpAddr::V4(v4) => PeerKey::Host(IpAddr::V4(v4)),
-            IpAddr::V6(v6) => {
-                let [a, b, c, d, ..] = v6.segments();
-                PeerKey::Host(IpAddr::V6(std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0)))
-            }
-        }
-    }
 }
 
 /// What every TCP connection of this crate is set up with, however it was
@@ -237,13 +229,16 @@ impl Stream {
     /// own.
     pub fn peer_key(&self) -> Option<PeerKey> {
         match &self.0 {
-            Inner::Tcp(stream) => stream.peer_addr().ok().map(|a| PeerKey::host(a.ip())),
+            Inner::Tcp(stream) => stream
+                .peer_addr()
+                .ok()
+                .map(|a| PeerKey::Host(weida_core::host_key(a.ip()).key)),
             Inner::Tls { stream, .. } => stream
                 .get_ref()
                 .0
                 .peer_addr()
                 .ok()
-                .map(|a| PeerKey::host(a.ip())),
+                .map(|a| PeerKey::Host(weida_core::host_key(a.ip()).key)),
             Inner::Inproc(_) => None,
             #[cfg(unix)]
             Inner::Unix { principal, .. } => Some(PeerKey::User(principal.uid)),

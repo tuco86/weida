@@ -3841,6 +3841,7 @@ dependencies = [
  "crypto_secretbox",
  "curve25519-dalek",
  "futures",
+ "socket2",
  "tokio",
  "tracing",
  "trybuild",

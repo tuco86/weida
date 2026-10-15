@@ -52,7 +52,7 @@ is enforced at the handshake by `SocketType::accepts` in the codec, called from
 | `ZMQ_ROUTER` | present | `RouterSocket` (`dealerrouter.rs`) | outgoing **drop**, incoming block; routing-id frame prepended and stripped, peer-chosen `Identity` honoured; `ZMQ_ROUTER_MANDATORY` turns the drop into `EHOSTUNREACH`, `ZMQ_ROUTER_HANDOVER` evicts an incumbent, `ZMQ_PROBE_ROUTER` sends the empty message; `router_bind_identity_to_user` (not a libzmq option, off by default) accepts only the ZAP user's own id as a routing id |
 | `ZMQ_PUB` | present | `PubSocket` (`pubsub.rs`) | outgoing **drop**; send only; publisher-side binary prefix match on the first frame; fan out |
 | `ZMQ_SUB` | present | `SubSocket` (`pubsub.rs`) | incoming **drop** — 29/PUBSUB's receiving-side rule, which the manual's table omits for SUB; receive only, fair-queued; subscriptions additive and non-idempotent; both wire forms accepted, the sent one configurable |
-| `ZMQ_XPUB` | present | `XPubSocket` (`xpubxsub.rs`) | outgoing **drop**; subscriptions delivered to the application in the `%x01`/`%x00` form, a departure synthesized as one unsubscribe for each subscription the application was handed and has seen no unsubscribe for; `ZMQ_XPUB_VERBOSE`, `_VERBOSER`, `_MANUAL`, `_WELCOME_MSG` |
+| `ZMQ_XPUB` | present | `XPubSocket` (`xpubxsub.rs`) | outgoing **drop**; subscriptions delivered to the application in the `%x01`/`%x00` form, a departure synthesized as one unsubscribe for each subscription the application was handed and has seen no unsubscribe for; `ZMQ_XPUB_VERBOSE`, `_VERBOSER`, `_MANUAL`, `_WELCOME_MSG`. `recv()` reports **per subscriber**, which is what an application that counts them wants; `recv_forwarded()`, which a proxy uses on its XPUB end, reports a prefix once however many subscribers hold it and holds each to its share of the table behind the proxy (§9) |
 | `ZMQ_XSUB` | present | `XSubSocket` (`xpubxsub.rs`) | drop both ways; subscriptions forwarded upstream and re-sent at every handshake, with their counts |
 | `ZMQ_PUSH` | present | `PushSocket` (`pipeline.rs`) | outgoing block; send only; round-robin over peers whose queue has room; never discards |
 | `ZMQ_PULL` | present | `PullSocket` (`pipeline.rs`) | incoming block; receive only, fair-queued |
@@ -106,7 +106,7 @@ One mechanism per socket, announced in the greeting and never negotiated, which 
 
 Every `zmq_setsockopt` and `zmq_ctx_set` option of the sheet's inventory, from
 `weida-zmq`'s `optiontable.rs`, which is the code this table is generated from and which a
-test walks in full: **98 rows — 38 honoured, 60 refused** (24 absent with what is missing
+test walks in full: **98 rows — 42 honoured, 56 refused** (20 absent with what is missing
 named, 14 for a transport this library does not implement, 9 replaced by a `weida-runtime`
 construct, 9 libzmq DRAFT options, 4 deprecated by libzmq itself in favour of ZAP). Eleven are
 `zmq_ctx_set`, 87 `zmq_setsockopt`.
@@ -150,10 +150,10 @@ is a future rather than a descriptor.
 | `ZMQ_HEARTBEAT_IVL` | `zmq_setsockopt` | **honoured** as `SocketOptions::heartbeat_ivl` |
 | `ZMQ_HEARTBEAT_TIMEOUT` | `zmq_setsockopt` | **honoured** as `SocketOptions::heartbeat_timeout` |
 | `ZMQ_HEARTBEAT_TTL` | `zmq_setsockopt` | **honoured** as `SocketOptions::heartbeat_ttl` — deciseconds on the wire |
-| `ZMQ_TCP_KEEPALIVE` | `zmq_setsockopt` | **refused** — absent: no TCP keepalive is configured; ZMQ_HEARTBEAT_IVL is the liveness this library offers, and it works on every transport rather than on TCP alone |
-| `ZMQ_TCP_KEEPALIVE_IDLE` | `zmq_setsockopt` | **refused** — absent: no TCP keepalive is configured; see ZMQ_TCP_KEEPALIVE |
-| `ZMQ_TCP_KEEPALIVE_CNT` | `zmq_setsockopt` | **refused** — absent: no TCP keepalive is configured; see ZMQ_TCP_KEEPALIVE |
-| `ZMQ_TCP_KEEPALIVE_INTVL` | `zmq_setsockopt` | **refused** — absent: no TCP keepalive is configured; see ZMQ_TCP_KEEPALIVE |
+| `ZMQ_TCP_KEEPALIVE` | `zmq_setsockopt` | **honoured** as `SocketOptions::tcp_keepalive` — None for libzmq's -1: SO_KEEPALIVE is left as the operating system has it, which is the default |
+| `ZMQ_TCP_KEEPALIVE_IDLE` | `zmq_setsockopt` | **honoured** as `SocketOptions::tcp_keepalive_idle` — whole seconds, None for libzmq's -1; refused unless ZMQ_TCP_KEEPALIVE is 1, where libzmq ignores it |
+| `ZMQ_TCP_KEEPALIVE_CNT` | `zmq_setsockopt` | **honoured** as `SocketOptions::tcp_keepalive_cnt` — None for libzmq's -1; refused unless ZMQ_TCP_KEEPALIVE is 1, where libzmq ignores it |
+| `ZMQ_TCP_KEEPALIVE_INTVL` | `zmq_setsockopt` | **honoured** as `SocketOptions::tcp_keepalive_intvl` — whole seconds, None for libzmq's -1; refused unless ZMQ_TCP_KEEPALIVE is 1, where libzmq ignores it |
 | `ZMQ_TCP_MAXRT` | `zmq_setsockopt` | **refused** — absent: TCP_USER_TIMEOUT is not set; ZMQ_HANDSHAKE_IVL bounds a handshake and ZMQ_HEARTBEAT_IVL bounds a silence |
 | `ZMQ_TOS` | `zmq_setsockopt` | **refused** — absent: no IP type-of-service is set; the OS default applies |
 | `ZMQ_BINDTODEVICE` | `zmq_setsockopt` | **refused** — absent: SO_BINDTODEVICE is not set; an endpoint's interface is chosen by the address it names |
@@ -268,7 +268,7 @@ have (§9).
 | --- | --- |
 | `zmq_proxy(frontend, backend, capture)` | present — `proxy()`, over the typed socket surfaces behind the `Device` trait (PAIR, DEALER, ROUTER, XSUB, XPUB, PUB, SUB, PUSH, PULL). Both directions, one message held at a time, and a copy of every message to the capture socket including the subscription control frames. Returns the counters it reached rather than only an error code. A message a socket refuses with `EINVAL`, `EHOSTUNREACH` or `EAGAIN` is counted in `refused` and dropped, and the device goes on; any other socket error ends it |
 | `zmq_proxy_steerable(frontend, backend, capture, control)` | present — `proxy_steerable()`, with `PAUSE`, `RESUME`, `TERMINATE` and `STATISTICS`; `STATISTICS` replies with libzmq's eight `u64` counters, and `PAUSE` stops reading both data sockets so their queues fill and their peers feel it. `refused` is not one of the eight; an unknown control command is counted in it and skipped |
-| The three canonical configurations — shared queue (ROUTER/DEALER), forwarder (XSUB/XPUB), streamer (PULL/PUSH) | present — as socket-type pairings of `proxy()`, not as separate functions; libzmq ships them the same way |
+| The three canonical configurations — shared queue (ROUTER/DEALER), forwarder (XSUB/XPUB), streamer (PULL/PUSH) | present — as socket-type pairings of `proxy()`, not as separate functions; libzmq ships them the same way. **The forwarder differs from a verbatim one in what it does with subscriptions**: its XPUB end reports a prefix once however many subscribers hold it and its cancel when the last one lets go or leaves, and holds each subscriber to its share of the table behind the proxy (`UPSTREAM_SHARE_DIVISOR`, §9) — one that asks for more is sent an `ERROR` naming why, once, and what it asked for is not forwarded, so one subscriber with a thousand junk prefixes cannot fill the publishers' table and starve every topic another asks for. Its XSUB end makes what it forwards through its own table, so a publisher that restarts is told again at its handshake. A capture socket gets a copy of every subscription the forwarder forwards |
 | `zmq_device(3)` | **absent** — removed from libzmq itself in favour of `zmq_proxy`. What is missing: nothing a 4.x caller can reach |
 | `zmq_poll`, `zmq_poller` | **absent by construction** — what is missing: a descriptor-set poller. Readiness here is a future, and `tokio::select!` over socket futures is what a `zmq_poll` loop becomes; every zguide recipe in `examples/` is such a loop, which is the evidence that the shape survives the translation |
 
@@ -362,12 +362,26 @@ than a magic value:
 | `weida_zmtp::MAX_PROPERTIES` | 64 | properties in one `READY` or `INITIATE` dictionary. The codec bounded a property's size and not their number, so a megabyte of five-octet properties was a hundred thousand entries |
 | `MESSAGE_IVL` and `MIN_MESSAGE_RATE` | 30 s, plus 1 s per 4 KiB that arrives | how long a started message may stay incomplete, with the heartbeat on or off. The deadline moves out only by octets that arrive, so declaring a large message earns nothing and a peer that trickles one ends the connection |
 | `OUT_HIGH_WATER` | 256 KiB | the output a connection builds before it stops taking messages from its pipe, so a peer that does not read holds this much plus one batch, and the heartbeat still ends the connection |
-| `PER_ADDRESS_DIVISOR`, `PER_ADDRESS_FLOOR` | `max_peers / 8`, at least 8 | the peers one remote host may hold (128 at the default `max_peers`). A host is an IPv4 address or an IPv6 `/64` — an IPv6 host is routed a whole `/64`, and a count per address would be a count per suffix it picks — and an IPv4-mapped address, which is what an IPv4 client looks like to a dual-stack listener, counts as the IPv4 address it carries; this is the key `weida-nng` counts under. Loopback in any form, `ipc` and `inproc` are exempt, so a local multi-process deployment is not capped |
+| `PER_ADDRESS_DIVISOR`, `PER_ADDRESS_FLOOR` | `max_peers / 8`, at least 8 | the peers one remote host may hold (128 at the default `max_peers`). A host is an IPv4 address or an IPv6 `/64` — an IPv6 host is routed a whole `/64`, and a count per address would be a count per suffix it picks — and an IPv4-mapped address, which is what an IPv4 client looks like to a dual-stack listener, counts as the IPv4 address it carries. That rule is `weida_core::host_key`, the one function this library and `weida-nng` count a peer's host with. Loopback in any form, `ipc` and `inproc` are exempt, so a local multi-process deployment is not capped |
 | `HANDSHAKE_EVICT_AFTER` | 2 s | how long a handshake may stall in a full socket or address before a newcomer takes its place; a peer that completes a handshake is never evicted |
 | `ACCEPT_BACKOFF_MIN`, `ACCEPT_BACKOFF_MAX` | 10 ms, 1 s | the pause between accept attempts while they keep failing, so a descriptor ceiling slows a listener down instead of ending it or spinning on it; each failure is counted and published as `AcceptFailed`, logged at most once a second |
+| `UPSTREAM_SHARE_DIVISOR`, `UPSTREAM_SHARE_FLOOR` | `max_subscriptions / 8`, at least 8 | the prefixes one subscriber behind a forwarding device may have forwarded upstream (128 at the default `max_subscriptions`; `upstream_share()` computes it). A proxy's subscribers share one table upstream — its XSUB's, and each publisher's for the proxy's connection — and `max_subscriptions` bounds that table, not anybody's part of it, so without a share one subscriber with 1024 junk prefixes fills it and every topic another asks for afterwards is refused there in silence. A subscribe past the share, or that would add a prefix to a full table, is not forwarded and its subscriber is sent an `ERROR` naming why, once; the table is at most `max_subscriptions` prefixes, so the device's own memory for it is bounded by the table and not by its subscribers. Give the XPUB and XSUB the same `max_subscriptions` |
 
 `INPROC_BUFFER_BYTES` (64 KiB) and `DEFAULT_MAX_RESOLVED_ADDRESSES` (8) are the same kind of
 number for the `inproc` transport and the resolver.
+
+**TCP keepalive is honoured, and one libzmq silence is refused.** `ZMQ_TCP_KEEPALIVE` and
+its three tuning options (§5) are applied to every TCP connection a socket accepts or dials,
+through `socket2`, with libzmq's semantics and defaults: `-1` leaves `SO_KEEPALIVE` to the
+operating system, which is off on most, so the default is libzmq's and an idle half-open peer
+still holds its slot until the heartbeat or the OS notices — a deployment that wants the kernel
+to find it sets `ZMQ_TCP_KEEPALIVE` to 1. libzmq applies `_IDLE`, `_INTVL` and `_CNT` only when
+`ZMQ_TCP_KEEPALIVE` is 0 or 1 and ignores them in silence under `-1`; here that is `EINVAL`,
+like every option this library would otherwise ignore. The two times are whole seconds from 1 to
+`MAX_TCP_KEEPALIVE_SECS` (32767) and the count from 1 to `MAX_TCP_KEEPALIVE_CNT` (127): Linux's
+own ceilings, kept on every platform so that a configuration means the same everywhere and a
+value the kernel would refuse fails where it is set. Where a platform has no such knob the
+operating system's value stays, as in libzmq's "where supported by OS".
 
 **One option libzmq does not have, off by default.** `SocketOptions::router_bind_identity_to_user`
 binds a ROUTER's routing ids to the user the ZAP handler authenticated: an announced id is

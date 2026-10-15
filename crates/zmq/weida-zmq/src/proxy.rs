@@ -55,6 +55,31 @@
 //! statistics count what was handed over rather than what arrived. A message
 //! a socket refused counts in [`ProxyStatistics::refused`] and in neither
 //! `_out` counter.
+//!
+//! # Subscriptions through a pub-sub proxy
+//!
+//! A forwarder has an XSUB toward its publishers and an XPUB toward its
+//! subscribers, and the subscriptions its XPUB reads are what it hands the XSUB
+//! to send upstream. Forwarded as they come they would let one subscriber with
+//! a thousand junk prefixes fill the table the publishers keep for the proxy,
+//! after which every topic an honest subscriber asks for is refused upstream in
+//! silence; and they would put one subscription upstream for every subscriber
+//! of a prefix, so that the first of them to leave cancelled it for the rest.
+//!
+//! So an XPUB end is read with [`XPubSocket::recv_forwarded`]: a prefix goes
+//! upstream when its first subscriber takes it and is cancelled when its last
+//! lets go or leaves, and each subscriber gets
+//! [`upstream_share`](crate::upstream_share) of the table — an eighth of
+//! `max_subscriptions`, and at least eight prefixes. A subscriber that asks for
+//! more is sent an `ERROR` naming why, once, and what it asked for is not
+//! forwarded. The XSUB end makes what it forwards through its own table
+//! instead of queueing it as a message, so a publisher that restarts or
+//! connects later is told again at its handshake.
+//!
+//! Give the two sockets the same `max_subscriptions`: the share is a fraction
+//! of the XPUB's, and a table that is smaller upstream refuses in silence what
+//! the share allowed. A capture socket gets a copy of every subscription the
+//! device forwards, which are the ones it handled.
 
 use std::fmt;
 
@@ -64,6 +89,7 @@ use crate::message::Multipart;
 use crate::pair::PairSocket;
 use crate::pipeline::{PullSocket, PushSocket};
 use crate::pubsub::{PubSocket, SubSocket};
+use crate::split;
 use crate::xpubxsub::{XPubSocket, XSubSocket};
 
 /// `PAUSE`: stop reading either side until `RESUME`.
@@ -195,15 +221,35 @@ impl Device for XSubSocket {
 
     /// An XSUB sends subscriptions upstream, and a pub-sub proxy's XSUB is
     /// where the subscriptions its XPUB read are forwarded.
+    ///
+    /// A subscription is made through the socket's own table and not queued as
+    /// a bare message, so that a publisher this socket connects to later, or
+    /// reconnects to after it restarted, is told what the proxy holds at its
+    /// handshake. A device that forwarded subscriptions without keeping them
+    /// would go deaf upstream when the publisher did. The table refuses with
+    /// `EINVAL` what a table refuses — a prefix it is full of, an
+    /// unsubscribe for a prefix it does not hold — and a device counts that
+    /// as the refusal it is and goes on.
     fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
-        XSubSocket::send(self, message);
-        std::future::ready(Ok(()))
+        let outcome = match split::subscription_of(&message) {
+            Some((true, prefix)) => XSubSocket::subscribe(self, prefix),
+            Some((false, prefix)) => XSubSocket::unsubscribe(self, prefix),
+            None => {
+                XSubSocket::send(self, message);
+                Ok(())
+            }
+        };
+        std::future::ready(outcome)
     }
 }
 
 impl Device for XPubSocket {
+    /// An XPUB end reports the subscriptions behind it the way a device needs
+    /// them ([`XPubSocket::recv_forwarded`]): each prefix once however many
+    /// subscribers hold it, and none for a subscriber over its share of the
+    /// table the XSUB end forwards them into.
     fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
-        XPubSocket::recv(self)
+        XPubSocket::recv_forwarded(self)
     }
 
     fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
@@ -621,6 +667,9 @@ mod tests {
     use crate::context::{Context, ContextConfig};
     use crate::message::Message;
     use crate::options::SocketOptions;
+    use crate::subscriptions::{self, DEFAULT_MAX_SUBSCRIPTIONS};
+    use crate::upstream::upstream_share;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::task::JoinHandle;
 
@@ -1298,5 +1347,311 @@ mod tests {
             .expect("the task")
             .expect("the counters");
         assert_eq!(statistics.refused, 1, "STOP was counted");
+    }
+
+    fn bytes_of(message: &Multipart) -> Vec<u8> {
+        message.frames()[0].as_slice().to_vec()
+    }
+
+    async fn wait_for(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "condition never held");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A pub-sub forwarder, running: an XSUB facing `upstream` and an XPUB
+    /// facing subscribers, with the XPUB as the device's frontend or as its
+    /// backend. Returns where subscribers connect, and the device.
+    async fn forwarder(
+        context: &Context,
+        upstream: &str,
+        xpub_is_frontend: bool,
+    ) -> (String, JoinHandle<Result<ProxyStatistics>>) {
+        let mut xsub = XSubSocket::new(context).expect("xsub");
+        xsub.connect(upstream).expect("connect upstream");
+        let mut xpub = XPubSocket::new(context).expect("xpub");
+        let bound = bounded("bind the XPUB", xpub.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let device = if xpub_is_frontend {
+            tokio::spawn(async move { proxy::<_, _, PairSocket>(&mut xpub, &mut xsub, None).await })
+        } else {
+            tokio::spawn(async move { proxy::<_, _, PairSocket>(&mut xsub, &mut xpub, None).await })
+        };
+        (bound.to_string(), device)
+    }
+
+    fn subscriber_of(context: &Context, at: &str) -> SubSocket {
+        let subscriber = SubSocket::new(context).expect("sub");
+        subscriber.connect(at).expect("connect");
+        subscriber
+    }
+
+    /// Publishes `topic` on `upstream` until `subscriber` receives one: the
+    /// publisher drops what nobody wants, so a subscription in effect is
+    /// what the first receipt shows.
+    async fn published_until_received(
+        upstream: &mut impl FnMut(Multipart),
+        subscriber: &mut SubSocket,
+        topic: &str,
+    ) {
+        bounded("the subscriber receives", async {
+            loop {
+                upstream(Multipart::single(topic.to_owned()));
+                if subscriber.try_recv().is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+    }
+
+    /// Every event `upstream` reports before `window` passes with none.
+    async fn events_within(upstream: &mut XPubSocket, window: Duration) -> Vec<Vec<u8>> {
+        let mut events = Vec::new();
+        while let Ok(event) = upstream.recv_timeout(window).await {
+            events.push(bytes_of(&event));
+        }
+        events
+    }
+
+    /// Claim: **a prefix two subscribers hold goes upstream once, and its
+    /// cancel goes when the last of them lets go.** Upstream is an XPUB that
+    /// reports every subscribe it is sent, repeats included, so a prefix
+    /// forwarded for each subscriber shows as two. The first subscriber to
+    /// leave must not cancel it for the other, which a publisher that keeps a
+    /// set of connections per prefix — libzmq's — would otherwise do.
+    #[tokio::test]
+    async fn a_prefix_two_subscribers_hold_goes_upstream_once_and_is_cancelled_with_the_last() {
+        two_subscribers_hold_a_prefix(false).await;
+    }
+
+    /// Claim: the same holds with the XPUB as the device's **frontend** and the
+    /// XSUB as its backend: a device is symmetric, and which end faces the
+    /// subscribers is the caller's choice.
+    #[tokio::test]
+    async fn the_same_holds_with_the_xpub_as_the_frontend() {
+        two_subscribers_hold_a_prefix(true).await;
+    }
+
+    async fn two_subscribers_hold_a_prefix(xpub_is_frontend: bool) {
+        let context = context();
+        let mut upstream = XPubSocket::with_options(
+            &context,
+            SocketOptions {
+                xpub_verbose: true,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xpub");
+        let upstream_at = bounded("bind upstream", upstream.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind")
+            .to_string();
+        let (downstream, _device) = forwarder(&context, &upstream_at, xpub_is_frontend).await;
+
+        let mut first = subscriber_of(&context, &downstream);
+        let mut second = subscriber_of(&context, &downstream);
+        first.subscribe("news").expect("subscribe");
+        second.subscribe("news").expect("subscribe");
+
+        // A message reaching a subscriber is its subscription in effect, here
+        // and upstream, so both are in by the time both have one.
+        let mut publish = |message| {
+            upstream.publish(message);
+        };
+        published_until_received(&mut publish, &mut first, "news 1").await;
+        published_until_received(&mut publish, &mut second, "news 1").await;
+
+        let announced = events_within(&mut upstream, Duration::from_millis(300)).await;
+        assert_eq!(
+            announced,
+            [b"\x01news".to_vec()],
+            "one subscription upstream for two subscribers"
+        );
+
+        first.unsubscribe("news").expect("unsubscribe");
+        assert!(
+            events_within(&mut upstream, Duration::from_millis(300))
+                .await
+                .is_empty(),
+            "the second subscriber still holds the prefix, so nothing is cancelled"
+        );
+        let mut publish = |message| {
+            upstream.publish(message);
+        };
+        published_until_received(&mut publish, &mut second, "news 2").await;
+
+        second.unsubscribe("news").expect("unsubscribe");
+        let cancelled = bounded("the last cancel", upstream.recv())
+            .await
+            .expect("an event");
+        assert_eq!(bytes_of(&cancelled), b"\x00news");
+    }
+
+    /// The junk subscriber's prefixes: as many as a table takes, all different.
+    fn junk(index: usize) -> String {
+        format!("junk-{index:04}")
+    }
+
+    /// Claim: **one subscriber with 1024 junk prefixes cannot stop an honest
+    /// one from receiving a new topic.** The subscribers behind a proxy share
+    /// one table upstream; a subscriber that filled it would have every topic
+    /// asked for afterwards refused there in silence. It is held to its share
+    /// instead: the prefixes past it are not forwarded, it is told with an
+    /// `ERROR` — which this library's own subscriber answers by ending its
+    /// connection — and what it did hold is cancelled upstream as it goes.
+    #[tokio::test]
+    async fn one_subscriber_with_junk_prefixes_cannot_stop_an_honest_one() {
+        let context = context();
+        let upstream = XPubSocket::new(&context).expect("xpub");
+        let upstream_at = bounded("bind upstream", upstream.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind")
+            .to_string();
+        let (mut publish, mut reports) = upstream.split();
+        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let collecting = {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                while let Ok(event) = reports.recv().await {
+                    seen.lock().expect("seen").push(bytes_of(&event));
+                }
+            })
+        };
+        let (downstream, _device) = forwarder(&context, &upstream_at, false).await;
+
+        // The junk subscriber holds as many prefixes as a table takes, and says
+        // so all at once at its handshake. It does not reconnect after the
+        // `ERROR`, so that what upstream sees is one try.
+        let mut junk_subscriber = SubSocket::with_options(
+            &context,
+            SocketOptions {
+                reconnect_ivl: None,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("sub");
+        for index in 0..DEFAULT_MAX_SUBSCRIPTIONS {
+            junk_subscriber
+                .subscribe(junk(index))
+                .expect("a prefix the subscriber's own table takes");
+        }
+        junk_subscriber.connect(&downstream).expect("connect");
+
+        let share = upstream_share(DEFAULT_MAX_SUBSCRIPTIONS);
+        let upstream_saw = |kind: &[u8]| {
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .filter(|event| event.starts_with(kind) && event[1..].starts_with(b"junk-"))
+                .count()
+        };
+        let junk_subscriber_is_gone =
+            |subscriber: &SubSocket| subscriber.connections().iter().all(|peer| !peer.connected);
+
+        // The honest subscriber asks for its topic once the junk has been taken
+        // in: all of it is upstream, or its subscriber was refused and let go
+        // after the share. Asking sooner would let the topic in ahead of the
+        // flood whatever the proxy does about it.
+        let mut honest = subscriber_of(&context, &downstream);
+        wait_for(|| {
+            upstream_saw(b"\x01") == DEFAULT_MAX_SUBSCRIPTIONS
+                || (upstream_saw(b"\x01") >= share && junk_subscriber_is_gone(&junk_subscriber))
+        })
+        .await;
+        honest.subscribe("news").expect("subscribe");
+        let mut publishing = |message: Multipart| {
+            publish.publish(message);
+        };
+        published_until_received(&mut publishing, &mut honest, "news 1").await;
+
+        // The junk subscriber was refused, in the way this library has of
+        // refusing a subscriber, and its connection ended on it.
+        wait_for(|| junk_subscriber_is_gone(&junk_subscriber)).await;
+
+        // Upstream was asked for no more of the junk than the share, and was
+        // told to cancel all of it once its subscriber was gone.
+        wait_for(|| upstream_saw(b"\x00") == share).await;
+        assert_eq!(
+            upstream_saw(b"\x01"),
+            share,
+            "no more than its share was forwarded"
+        );
+        assert!(
+            seen.lock().expect("seen").contains(&b"\x01news".to_vec()),
+            "the honest subscriber's topic was forwarded"
+        );
+        collecting.abort();
+    }
+
+    /// Claim: **an XSUB device end keeps what it forwards in its own table**,
+    /// so that it is what a publisher is told at a handshake, and refuses what a
+    /// table refuses: a cancel for a prefix it does not hold. Data passes as
+    /// before.
+    #[tokio::test]
+    async fn an_xsub_device_end_keeps_the_subscriptions_it_forwards() {
+        let context = context();
+        let mut xsub = XSubSocket::new(&context).expect("xsub");
+        let form =
+            |subscribe| Multipart::single(subscriptions::write_message_form(subscribe, b"news"));
+
+        Device::send(&mut xsub, form(true))
+            .await
+            .expect("a subscription");
+        assert_eq!(xsub.subscriptions(), [b"news".to_vec()]);
+        Device::send(&mut xsub, Multipart::single("data"))
+            .await
+            .expect("data passes");
+        assert_eq!(xsub.subscriptions().len(), 1, "data is no subscription");
+
+        Device::send(&mut xsub, form(false))
+            .await
+            .expect("a cancel");
+        assert!(xsub.subscriptions().is_empty());
+        let err = Device::send(&mut xsub, form(false))
+            .await
+            .expect_err("a second cancel is for nothing");
+        assert_eq!(err.errno(), "EINVAL", "{err}");
+    }
+
+    /// Claim: **a forwarder tells a publisher that restarted what it holds**,
+    /// because the subscription it forwarded is in its XSUB's table and goes
+    /// out again at every handshake. A forwarder that counts a prefix once
+    /// and forwards it once would otherwise go deaf upstream the first time its
+    /// publisher did, for every subscriber that already held the prefix.
+    #[tokio::test]
+    async fn a_forwarder_tells_a_restarted_publisher_what_it_holds() {
+        let context = context();
+        let mut upstream = XPubSocket::new(&context).expect("xpub");
+        let upstream_at = bounded("bind upstream", upstream.bind("tcp://127.0.0.1:0"))
+            .await
+            .expect("bind")
+            .to_string();
+        let (downstream, _device) = forwarder(&context, &upstream_at, false).await;
+        let mut subscriber = subscriber_of(&context, &downstream);
+        subscriber.subscribe("news").expect("subscribe");
+        let first = bounded("the subscription", upstream.recv())
+            .await
+            .expect("an event");
+        assert_eq!(bytes_of(&first), b"\x01news");
+
+        // The publisher goes, and a new one binds where it was.
+        upstream.close();
+        drop(upstream);
+        let mut restarted = XPubSocket::new(&context).expect("xpub");
+        bounded("the new publisher binds", async {
+            while restarted.bind(&upstream_at).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let again = bounded("the subscription again", restarted.recv())
+            .await
+            .expect("an event");
+        assert_eq!(bytes_of(&again), b"\x01news");
     }
 }

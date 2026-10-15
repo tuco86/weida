@@ -65,6 +65,21 @@ pub const DEFAULT_MAX_PEERS: usize = 1024;
 /// deciseconds in a `u16`, so 6553.5 s (`docs/research/zeromq.md` §11).
 pub const MAX_HEARTBEAT_TTL: Duration = Duration::from_millis(6_553_500);
 
+/// The largest `ZMQ_TCP_KEEPALIVE_IDLE` and `ZMQ_TCP_KEEPALIVE_INTVL` this
+/// library takes, in seconds.
+///
+/// Linux's own ceiling for `TCP_KEEPIDLE` and `TCP_KEEPINTVL`, which it
+/// refuses above with `EINVAL`. Other kernels take more, and the number is kept
+/// everywhere so that a configuration means the same on every platform and a
+/// value the kernel would reject fails where it is set, instead of quietly
+/// leaving every connection without the keepalive that was asked for.
+pub const MAX_TCP_KEEPALIVE_SECS: u64 = 32_767;
+
+/// The largest `ZMQ_TCP_KEEPALIVE_CNT` this library takes: Linux's ceiling for
+/// `TCP_KEEPCNT`, kept everywhere for the reason [`MAX_TCP_KEEPALIVE_SECS`]
+/// gives.
+pub const MAX_TCP_KEEPALIVE_CNT: u32 = 127;
+
 /// Longest `ZMQ_ZAP_DOMAIN`, in bytes.
 ///
 /// **Not a libzmq limit**: 27/ZAP requires the domain frame to be non-empty
@@ -172,6 +187,42 @@ pub struct SocketOptions {
     /// hint. The wire field is deciseconds in a `u16`, so the maximum is
     /// 6553.5 s and finer granularity is rounded down.
     pub heartbeat_ttl: Option<Duration>,
+    /// `ZMQ_TCP_KEEPALIVE`: whether the kernel probes a TCP connection that has
+    /// gone quiet, to find out that its peer has gone. `None` is libzmq's `-1`
+    /// and its default: leave `SO_KEEPALIVE` as the operating system has it,
+    /// which is off on most. `Some(false)` is `0` and `Some(true)` is `1`.
+    ///
+    /// This is the one liveness a TCP connection has while `ZMQ_HEARTBEAT_IVL`
+    /// is off, which is its default, and the heartbeat needs ZMTP 3.1 besides.
+    /// A peer that vanished without a `FIN` or an `RST` — a crash, a pulled
+    /// cable, a dropped NAT mapping — otherwise holds its slot, and on an
+    /// accepted connection one of [`SocketOptions::max_peers`], for as long as
+    /// the operating system keeps the connection.
+    ///
+    /// Applied to every TCP connection this socket accepts or dials, once it
+    /// is made, and not to `ipc://` or `inproc://`, which have no such
+    /// probe. The three options below tune the probes and apply only when this
+    /// is `Some(true)`: libzmq skips them in silence under `-1` and `0`, and
+    /// this library refuses the combination instead.
+    pub tcp_keepalive: Option<bool>,
+    /// `ZMQ_TCP_KEEPALIVE_IDLE`: how long a connection may carry nothing before
+    /// the first probe, in whole seconds from 1 to [`MAX_TCP_KEEPALIVE_SECS`].
+    /// `None` is libzmq's `-1`: the operating system's own, which on Linux is
+    /// two hours.
+    ///
+    /// Where the platform has no such knob the operating system's value stays,
+    /// as in libzmq, whose manual says "where supported by OS".
+    pub tcp_keepalive_idle: Option<Duration>,
+    /// `ZMQ_TCP_KEEPALIVE_INTVL`: the gap between probes, in whole seconds from
+    /// 1 to [`MAX_TCP_KEEPALIVE_SECS`]. `None` is libzmq's `-1`: the operating
+    /// system's own, which on Linux is 75 seconds. Where the platform has no
+    /// such knob the operating system's value stays.
+    pub tcp_keepalive_intvl: Option<Duration>,
+    /// `ZMQ_TCP_KEEPALIVE_CNT`: how many unanswered probes end the connection,
+    /// from 1 to [`MAX_TCP_KEEPALIVE_CNT`]. `None` is libzmq's `-1`: the
+    /// operating system's own, which on Linux is nine. Where the platform has
+    /// no such knob the operating system's value stays.
+    pub tcp_keepalive_cnt: Option<u32>,
     /// `ZMQ_SNDTIMEO`: how long a blocking send may wait before reporting
     /// `EAGAIN`. `None` is libzmq's `-1`: wait forever.
     pub send_timeout: Option<Duration>,
@@ -397,6 +448,10 @@ impl std::fmt::Debug for SocketOptions {
             heartbeat_ivl,
             heartbeat_timeout,
             heartbeat_ttl,
+            tcp_keepalive,
+            tcp_keepalive_idle,
+            tcp_keepalive_intvl,
+            tcp_keepalive_cnt,
             send_timeout,
             recv_timeout,
             req_correlate,
@@ -438,6 +493,10 @@ impl std::fmt::Debug for SocketOptions {
             .field("heartbeat_ivl", heartbeat_ivl)
             .field("heartbeat_timeout", heartbeat_timeout)
             .field("heartbeat_ttl", heartbeat_ttl)
+            .field("tcp_keepalive", tcp_keepalive)
+            .field("tcp_keepalive_idle", tcp_keepalive_idle)
+            .field("tcp_keepalive_intvl", tcp_keepalive_intvl)
+            .field("tcp_keepalive_cnt", tcp_keepalive_cnt)
             .field("send_timeout", send_timeout)
             .field("recv_timeout", recv_timeout)
             .field("req_correlate", req_correlate)
@@ -496,6 +555,10 @@ impl Default for SocketOptions {
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
+            tcp_keepalive: None,
+            tcp_keepalive_idle: None,
+            tcp_keepalive_intvl: None,
+            tcp_keepalive_cnt: None,
             send_timeout: None,
             recv_timeout: None,
             req_correlate: false,
@@ -718,6 +781,52 @@ impl SocketOptions {
                 "ZMQ_HEARTBEAT_TIMEOUT is set while the heartbeat is off \
                  (ZMQ_HEARTBEAT_IVL = 0), so nothing would ever measure the silence"
                     .into(),
+            ));
+        }
+        self.validate_keepalive()?;
+        Ok(())
+    }
+
+    /// Refuses a keepalive configuration that nothing would apply, or that the
+    /// kernel would refuse on every connection.
+    fn validate_keepalive(&self) -> Result<()> {
+        let tuned = self.tcp_keepalive_idle.is_some()
+            || self.tcp_keepalive_intvl.is_some()
+            || self.tcp_keepalive_cnt.is_some();
+        if tuned && self.tcp_keepalive != Some(true) {
+            return Err(Error::EINVAL(
+                "ZMQ_TCP_KEEPALIVE_IDLE, _INTVL and _CNT tune the probes that ZMQ_TCP_KEEPALIVE = 1 \
+                 switches on, and libzmq applies none of them while it is -1 or 0; this library \
+                 refuses what would be ignored"
+                    .into(),
+            ));
+        }
+        for (option, value) in [
+            ("ZMQ_TCP_KEEPALIVE_IDLE", self.tcp_keepalive_idle),
+            ("ZMQ_TCP_KEEPALIVE_INTVL", self.tcp_keepalive_intvl),
+        ] {
+            if let Some(value) = value
+                && (value.subsec_nanos() != 0
+                    || !(1..=MAX_TCP_KEEPALIVE_SECS).contains(&value.as_secs()))
+            {
+                return Err(Error::EINVAL(
+                    format!(
+                        "{option} is a whole number of seconds from 1 to \
+                         {MAX_TCP_KEEPALIVE_SECS}; this one is {value:?}"
+                    )
+                    .into(),
+                ));
+            }
+        }
+        if let Some(count) = self.tcp_keepalive_cnt
+            && !(1..=MAX_TCP_KEEPALIVE_CNT).contains(&count)
+        {
+            return Err(Error::EINVAL(
+                format!(
+                    "ZMQ_TCP_KEEPALIVE_CNT is a number of probes from 1 to \
+                     {MAX_TCP_KEEPALIVE_CNT}; this one is {count}"
+                )
+                .into(),
             ));
         }
         Ok(())
@@ -955,6 +1064,85 @@ mod tests {
             let err = broken.validate().unwrap_err();
             assert_eq!(err.errno(), "EINVAL", "{err}");
             assert!(!err.cause().is_empty());
+        }
+    }
+
+    /// Claim: **the TCP keepalive options are honoured or refused, never
+    /// ignored.** Off and on, with or without tuning, is a configuration; a
+    /// tuning value with the keepalive not switched on is the one libzmq
+    /// ignores in silence, and a value the kernel would reject — zero, a
+    /// fraction of a second, one above the ceiling — fails where it is set
+    /// instead of leaving every connection without the probes that were asked
+    /// for.
+    #[test]
+    fn the_tcp_keepalive_options_are_honoured_or_refused() {
+        let tuned = SocketOptions {
+            tcp_keepalive: Some(true),
+            tcp_keepalive_idle: Some(Duration::from_secs(60)),
+            tcp_keepalive_intvl: Some(Duration::from_secs(10)),
+            tcp_keepalive_cnt: Some(4),
+            ..SocketOptions::default()
+        };
+        for usable in [
+            SocketOptions {
+                tcp_keepalive: Some(true),
+                ..SocketOptions::default()
+            },
+            SocketOptions {
+                tcp_keepalive: Some(false),
+                ..SocketOptions::default()
+            },
+            tuned.clone(),
+            SocketOptions {
+                tcp_keepalive_idle: Some(Duration::from_secs(MAX_TCP_KEEPALIVE_SECS)),
+                tcp_keepalive_intvl: Some(Duration::from_secs(1)),
+                tcp_keepalive_cnt: Some(MAX_TCP_KEEPALIVE_CNT),
+                ..tuned.clone()
+            },
+        ] {
+            usable.validate().expect("a keepalive this library can set");
+        }
+
+        for broken in [
+            // Tuning without the keepalive, which libzmq ignores in silence.
+            SocketOptions {
+                tcp_keepalive_idle: Some(Duration::from_secs(60)),
+                ..SocketOptions::default()
+            },
+            SocketOptions {
+                tcp_keepalive: Some(false),
+                tcp_keepalive_cnt: Some(3),
+                ..SocketOptions::default()
+            },
+            // Values the kernel would reject.
+            SocketOptions {
+                tcp_keepalive_idle: Some(Duration::ZERO),
+                ..tuned.clone()
+            },
+            SocketOptions {
+                tcp_keepalive_idle: Some(Duration::from_millis(1500)),
+                ..tuned.clone()
+            },
+            SocketOptions {
+                tcp_keepalive_idle: Some(Duration::from_secs(MAX_TCP_KEEPALIVE_SECS + 1)),
+                ..tuned.clone()
+            },
+            SocketOptions {
+                tcp_keepalive_intvl: Some(Duration::ZERO),
+                ..tuned.clone()
+            },
+            SocketOptions {
+                tcp_keepalive_cnt: Some(0),
+                ..tuned.clone()
+            },
+            SocketOptions {
+                tcp_keepalive_cnt: Some(MAX_TCP_KEEPALIVE_CNT + 1),
+                ..tuned.clone()
+            },
+        ] {
+            let err = broken.validate().unwrap_err();
+            assert_eq!(err.errno(), "EINVAL", "{err}");
+            assert!(err.cause().contains("ZMQ_TCP_KEEPALIVE"), "{err}");
         }
     }
 

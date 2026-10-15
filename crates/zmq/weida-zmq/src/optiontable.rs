@@ -373,31 +373,34 @@ pub const OPTIONS: &[ZmqOption] = &[
     ZmqOption {
         name: "ZMQ_TCP_KEEPALIVE",
         scope: Sock,
-        verdict: Refused(Absent(
-            "no TCP keepalive is configured; ZMQ_HEARTBEAT_IVL is the liveness this library \
-             offers, and it works on every transport rather than on TCP alone",
-        )),
+        verdict: Honoured(
+            "SocketOptions::tcp_keepalive, None for libzmq's -1: SO_KEEPALIVE is left as the \
+             operating system has it, which is the default",
+        ),
     },
     ZmqOption {
         name: "ZMQ_TCP_KEEPALIVE_IDLE",
         scope: Sock,
-        verdict: Refused(Absent(
-            "no TCP keepalive is configured; see ZMQ_TCP_KEEPALIVE",
-        )),
+        verdict: Honoured(
+            "SocketOptions::tcp_keepalive_idle, whole seconds, None for libzmq's -1; refused \
+             unless ZMQ_TCP_KEEPALIVE is 1, where libzmq ignores it",
+        ),
     },
     ZmqOption {
         name: "ZMQ_TCP_KEEPALIVE_CNT",
         scope: Sock,
-        verdict: Refused(Absent(
-            "no TCP keepalive is configured; see ZMQ_TCP_KEEPALIVE",
-        )),
+        verdict: Honoured(
+            "SocketOptions::tcp_keepalive_cnt, None for libzmq's -1; refused unless \
+             ZMQ_TCP_KEEPALIVE is 1, where libzmq ignores it",
+        ),
     },
     ZmqOption {
         name: "ZMQ_TCP_KEEPALIVE_INTVL",
         scope: Sock,
-        verdict: Refused(Absent(
-            "no TCP keepalive is configured; see ZMQ_TCP_KEEPALIVE",
-        )),
+        verdict: Honoured(
+            "SocketOptions::tcp_keepalive_intvl, whole seconds, None for libzmq's -1; refused \
+             unless ZMQ_TCP_KEEPALIVE is 1, where libzmq ignores it",
+        ),
     },
     ZmqOption {
         name: "ZMQ_TCP_MAXRT",
@@ -923,6 +926,10 @@ mod tests {
             "ZMQ_HEARTBEAT_IVL",
             "ZMQ_HEARTBEAT_TIMEOUT",
             "ZMQ_HEARTBEAT_TTL",
+            "ZMQ_TCP_KEEPALIVE",
+            "ZMQ_TCP_KEEPALIVE_IDLE",
+            "ZMQ_TCP_KEEPALIVE_CNT",
+            "ZMQ_TCP_KEEPALIVE_INTVL",
             "ZMQ_ROUTING_ID",
             "ZMQ_IDENTITY",
             "ZMQ_ROUTER_MANDATORY",

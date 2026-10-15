@@ -1299,7 +1299,7 @@ impl Raw {
                     remote_addr: peer.map(|addr| addr.to_string()),
                     credentials: None,
                     tls: None,
-                    source: peer.map(|addr| PeerKey::host(addr.ip())),
+                    source: peer.map(|addr| PeerKey::Host(weida_core::host_key(addr.ip()).key)),
                 }
             }
         }

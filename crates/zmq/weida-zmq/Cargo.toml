@@ -41,6 +41,11 @@ zeroize.workspace = true
 # a queue, to every subscriber of a publisher and to the application copies
 # no payload.
 bytes.workspace = true
+# `SO_KEEPALIVE` with an idle time, a probe interval and a probe count on a TCP
+# connection, as `ZMQ_TCP_KEEPALIVE` and its three tuning options ask. The
+# count is behind `socket2`'s `all` feature, which `tokio` enables for itself
+# anyway: naming it here keeps this crate building if that ever changes.
+socket2 = { workspace = true, features = ["all"] }
 # The executor the blocking facade drives its futures on, and only that: the
 # reactor's own threads are busy driving the connections, so a blocking caller
 # polls the socket's future on the thread that asked. `weida-runtime`'s Exec

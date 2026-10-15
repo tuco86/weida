@@ -1,9 +1,9 @@
 //! I/O-free core model of the weida messaging framework.
 //!
 //! This crate contains no networking, no `tokio` and no serialization: only the
-//! vocabulary types (endpoint addresses, limits, trace context, errors) that
-//! the wire codec and the transport share. Everything here is unit-testable
-//! without a socket.
+//! vocabulary types (endpoint addresses, limits, trace context, errors, the
+//! host a peer counts as) that the wire codec and the transport share.
+//! Everything here is unit-testable without a socket.
 //!
 //! There are no correlation or acknowledgement state machines here: Req/Rep
 //! rides one bidirectional QUIC stream, so the stream *is* the correlation, and
@@ -12,6 +12,7 @@
 
 pub mod addr;
 pub mod error;
+pub mod host;
 pub mod identity;
 pub mod limits;
 pub mod trace;
@@ -22,6 +23,7 @@ pub use addr::{
     SCHEME_PIPE, SCHEME_UNIX, UnixAddr, validate_endpoint_path,
 };
 pub use error::{Error, ErrorCode, LossCause, Result, StopReason};
+pub use host::{HostKey, host_key};
 pub use identity::{Fingerprint, LocalPrincipal, PeerIdentity, WindowsPrincipal};
 pub use limits::{Congestion, DEFAULT_DATAGRAM_RECEIVE_BYTES, Limits};
 pub use trace::{TraceContext, TraceError};

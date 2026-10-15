@@ -109,6 +109,42 @@ impl XPubSocket {
         self.events.recv_within(&self.core, limit).await
     }
 
+    /// Receives the next subscription or message the way a forwarding device
+    /// needs it: [`XPubSocket::recv`], with each subscriber's share of the
+    /// table the device forwards into kept.
+    ///
+    /// - **A prefix is reported once however many subscribers hold it**: its
+    ///   `%x01` when the first subscriber takes it and its `%x00` when the last
+    ///   lets go or leaves, and nothing in between. [`XPubSocket::recv`] reports
+    ///   per subscriber, which is what an application that counts them wants and
+    ///   what a device must not forward as it comes: upstream would hold one
+    ///   subscription per subscriber, and — libzmq's publisher keeps a *set* of
+    ///   connections per prefix — the first subscriber to leave would cancel the
+    ///   prefix for everybody still holding it.
+    /// - **No subscriber has more than its share forwarded**, which is
+    ///   [`upstream_share`](crate::upstream_share) of `max_subscriptions`
+    ///   distinct prefixes, and the table as a whole holds at most
+    ///   `max_subscriptions`. The subscription that would cross either line is
+    ///   not reported; its subscriber is sent an `ERROR` naming why, once, which
+    ///   is what [`XPubSocket::refuse`] sends. 37/ZMTP has a peer treat that as
+    ///   fatal, so a subscriber that heeds it ends its own connection and its
+    ///   prefixes are cancelled as it goes; one that does not is kept, and its
+    ///   refused prefixes stay out of the table. A cancel for a prefix that was
+    ///   not forwarded is not reported either.
+    ///
+    /// Messages a subscriber sends pass as they come. The table is
+    /// `max_subscriptions` prefixes because the device's XSUB is given the same
+    /// number: a smaller one upstream refuses, in silence, what this allowed.
+    /// A socket with `ZMQ_XPUB_MANUAL` is read as [`XPubSocket::recv`] reads it:
+    /// what it reports are requests for the application to grant, not
+    /// holdings to count.
+    ///
+    /// This is the receive [`proxy`](crate::proxy()) uses on an XPUB end.
+    /// Bounded by `ZMQ_RCVTIMEO`.
+    pub async fn recv_forwarded(&mut self) -> Result<Multipart> {
+        self.events.recv_forwarded(&self.core).await
+    }
+
     /// Applies a subscription on this socket's own authority, for
     /// `ZMQ_XPUB_MANUAL`.
     ///
