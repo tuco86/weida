@@ -940,3 +940,305 @@ async fn a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for() {
 
     client.shutdown().await;
 }
+
+/// A receiver that drops a message unread — the header read, the body not —
+/// stops that one transfer with `STOP_SENDING`. The subscription is the
+/// connection's, not the message's: the next message must still arrive.
+#[tokio::test]
+async fn a_subscriber_that_refuses_one_message_keeps_its_subscription() {
+    // Larger than the 1 MiB stream window, so the publisher is still writing
+    // when the refusal reaches it.
+    const BIG: usize = 3 * 1024 * 1024;
+
+    let server = Server::start().await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+    let client = server.client_runtime();
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    assert_eq!(
+        publisher.publish("big", vec![0u8; BIG]).expect("publish"),
+        1
+    );
+    drop(within(sub.recv()).await.expect("the big message arrives"));
+
+    assert_eq!(
+        publisher
+            .publish("small", &b"0123456789"[..])
+            .expect("publish"),
+        1
+    );
+    assert_eq!(
+        recv_one(&sub).await,
+        ("small".to_owned(), b"0123456789".to_vec()),
+        "the refused message ended itself, not the subscription"
+    );
+    assert_eq!(
+        publisher.dropped(),
+        0,
+        "a refusal is the subscriber's choice, not a drop"
+    );
+    assert_eq!(publisher.subscriber_count(), 1);
+
+    client.shutdown().await;
+}
+
+/// A topic a subscriber's decoder refuses is refused at the publisher, with
+/// nothing written: the decoder's answer would be to close the connection,
+/// and the connection is every subscription on it.
+#[tokio::test]
+async fn a_topic_above_the_cap_is_refused_and_no_connection_is_closed() {
+    let server = Server::start().await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+    let client = server.client_runtime();
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    let long = "t".repeat(257);
+    assert!(matches!(
+        publisher.publish(&long, &b"x"[..]),
+        Err(Error::LimitExceeded)
+    ));
+    let mut fan = publisher.open(&long);
+    assert!(matches!(
+        fan.write_now(&b"x"[..]),
+        Err(Error::LimitExceeded)
+    ));
+    assert_eq!(fan.finish(), 0);
+
+    // Still connected, and still receiving: a topic at the cap is fine.
+    let at_the_cap = "t".repeat(256);
+    assert_eq!(
+        publisher.publish(&at_the_cap, &b"ok"[..]).expect("publish"),
+        1
+    );
+    assert_eq!(recv_one(&sub).await, (at_the_cap, b"ok".to_vec()));
+
+    client.shutdown().await;
+}
+
+/// Two publishers of one listener that use one topic string are two
+/// producers: a subscriber of one must see its own numbers, dense, and no
+/// gap for the other's messages.
+#[tokio::test]
+async fn two_publishers_of_one_topic_number_it_separately() {
+    let detect = GuaranteeSet {
+        ordering: OrderingMode::PerProducerDetect,
+        ..GuaranteeSet::CORE
+    };
+    let config = RuntimeConfig {
+        guarantees: detect,
+        ..RuntimeConfig::default()
+    };
+    let server = Server::start_with_config(config.clone()).await;
+    let a = server.listener.publisher("/a").expect("publisher a");
+    let b = server.listener.publisher("/b").expect("publisher b");
+
+    let client_a = server.client_runtime_with_config(config.clone());
+    let client_b = server.client_runtime_with_config(config);
+    let sub_a = client_a.subscriber(server.trust());
+    let sub_b = client_b.subscriber(server.trust());
+    within(sub_a.connect(&server.url("/a")))
+        .await
+        .expect("connect a");
+    within(sub_b.connect(&server.url("/b")))
+        .await
+        .expect("connect b");
+    within(sub_a.subscribe("#")).await.expect("subscribe a");
+    within(sub_b.subscribe("#")).await.expect("subscribe b");
+    await_filters(&a, 1).await;
+    await_filters(&b, 1).await;
+
+    for _ in 0..4 {
+        assert_eq!(a.publish("t", &b"a"[..]).expect("publish a"), 1);
+        assert_eq!(b.publish("t", &b"b"[..]).expect("publish b"), 1);
+    }
+    for (name, sub) in [("a", &sub_a), ("b", &sub_b)] {
+        for expected in 0..4u64 {
+            let transfer = within(sub.recv()).await.expect("recv");
+            let meta = transfer.meta().clone();
+            assert_eq!(meta.sequence, Some(expected), "{name}'s own numbering");
+            assert_eq!(meta.gap, None, "{name} lost nothing: {meta:?}");
+            within(transfer.collect(16)).await.expect("collect");
+        }
+    }
+
+    client_a.shutdown().await;
+    client_b.shutdown().await;
+}
+
+/// Subscribers that stall are waited for together: the bound of
+/// `write_within` is for the call, so eight stalled subscribers cost one
+/// bound and not eight.
+#[tokio::test]
+async fn stalled_subscribers_are_waited_for_together() {
+    const BUDGET: usize = 64 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    const SUBSCRIBERS: usize = 8;
+    const BOUND: Duration = Duration::from_millis(250);
+
+    let server = Server::start_with(Limits {
+        subscriber_buffer_bytes: BUDGET,
+        ..Limits::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    // One runtime each, so that each is its own connection; small windows,
+    // so that a subscriber that never reads stops taking bytes at once.
+    let mut clients = Vec::new();
+    let mut subs = Vec::new();
+    for _ in 0..SUBSCRIBERS {
+        let client = server.client_runtime_with(Limits {
+            connection_receive_window: 128 * 1024,
+            stream_receive_window: 64 * 1024,
+            ..Limits::default()
+        });
+        let sub = client.subscriber(server.trust());
+        within(sub.connect(&server.url("/md")))
+            .await
+            .expect("connect");
+        within(sub.subscribe("")).await.expect("subscribe");
+        clients.push(client);
+        subs.push(sub);
+    }
+    await_filters(&publisher, SUBSCRIBERS).await;
+
+    let mut fan = publisher.open("px.eur");
+    assert_eq!(fan.subscribers(), SUBSCRIBERS);
+    let started = std::time::Instant::now();
+    let chunk = vec![0x5au8; CHUNK];
+    within(async {
+        while fan.subscribers() > 0 {
+            fan.write_within(chunk.clone(), BOUND).await.expect("write");
+        }
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    // Every subscriber stalls at the same chunk, and the call that finds
+    // them out waits for all of them together: one bound, plus slack. One
+    // after the other it would take eight.
+    assert!(
+        elapsed < BOUND * 4,
+        "{SUBSCRIBERS} stalled subscribers took {elapsed:?} against a bound of {BOUND:?}"
+    );
+    assert_eq!(fan.finish(), 0);
+    assert_eq!(
+        publisher
+            .dropped_on("px.eur")
+            .expect("drops")
+            .subscriber_budget,
+        SUBSCRIBERS as u64
+    );
+
+    for client in clients {
+        client.shutdown().await;
+    }
+}
+
+/// A streamed publish may be driven from any executor: its bounded wait is
+/// timed on the runtime of the subscribers' connections, and creating a
+/// timer on the caller's thread would panic on one that has no reactor.
+#[tokio::test]
+async fn a_streamed_publish_can_be_driven_without_a_reactor() {
+    const BUDGET: usize = 64 * 1024;
+    const CHUNK: usize = 16 * 1024;
+
+    let server = Server::start_with(Limits {
+        subscriber_buffer_bytes: BUDGET,
+        ..Limits::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+    // Never reads, so the budget fills and the wait is a real one.
+    let client = server.client_runtime_with(Limits {
+        connection_receive_window: 128 * 1024,
+        stream_receive_window: 64 * 1024,
+        ..Limits::default()
+    });
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    let mut fan = publisher.open("px.eur");
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        // A plain thread: no Tokio runtime is entered on it.
+        let chunk = vec![0x5au8; CHUNK];
+        let remaining = futures::executor::block_on(async {
+            let mut remaining = fan.subscribers();
+            while remaining > 0 {
+                remaining = fan
+                    .write_within(chunk.clone(), Duration::from_millis(100))
+                    .await
+                    .expect("write");
+            }
+            remaining
+        });
+        let _ = done.send(remaining);
+    });
+    assert_eq!(
+        within(outcome).await.expect("the thread did not panic"),
+        0,
+        "the subscriber that never reads loses the transfer"
+    );
+
+    client.shutdown().await;
+}
+
+/// A chunk no budget can ever hold is refused at once, instead of every
+/// copy waiting for room that cannot exist and then being aborted.
+#[tokio::test]
+async fn a_chunk_above_the_budget_is_refused_without_waiting() {
+    const BUDGET: usize = 64 * 1024;
+
+    let server = Server::start_with(Limits {
+        subscriber_buffer_bytes: BUDGET,
+        ..Limits::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+    let client = server.client_runtime();
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    let mut fan = publisher.open("px.eur");
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        fan.write_within(vec![0u8; BUDGET + 1], Duration::from_secs(5))
+            .await,
+        Err(Error::LimitExceeded)
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "refused up front, not after a wait"
+    );
+    assert!(matches!(
+        fan.write_now(vec![0u8; BUDGET + 1]),
+        Err(Error::LimitExceeded)
+    ));
+    assert_eq!(fan.subscribers(), 1, "nothing was aborted");
+    assert_eq!(
+        fan.write_now(vec![0u8; 1024]).expect("a chunk that fits"),
+        1
+    );
+    assert_eq!(fan.finish(), 1);
+
+    client.shutdown().await;
+}

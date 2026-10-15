@@ -23,6 +23,12 @@
 //! output, in the sense that a client needs nothing else, so they go to stdout
 //! exactly as `transform_server` prints them.
 //!
+//! **Bounds.** A stalled sender cannot hold `serve`: each body that `--sink`
+//! or `--echo` receives is abandoned after `RuntimeConfig::receive_timeout`
+//! (30 s), and `--echo` answers at most 64 requests at a time. `sub
+//! --framing length` holds a whole payload, so `--max-bytes` caps that hold;
+//! the other framings stream and need no cap.
+//!
 //! **Trust.** A `weida://sha256:…@host:port/path` address names the key that
 //! must answer and needs no file (`Trust::by_address`); `--ca PATH` trusts a
 //! certificate as an anchor instead and then a plain address is verified
@@ -52,18 +58,24 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use std::io::{Read as _, Write as _};
 
 use tokio::io::AsyncReadExt;
 use weida::{
-    Address, Error, Identity, IncomingRequest, Publisher, Puller, Replier, Runtime, RuntimeConfig,
-    TransferMeta, Trust,
+    Address, Error, Identity, IncomingRequest, IncomingTransfer, Publisher, Puller, Replier,
+    Runtime, RuntimeConfig, TransferMeta, Trust,
 };
 
 /// Read and write in 64 KiB pieces, the size the examples use: large enough
 /// that a megabyte is sixteen syscalls, small enough to stream.
 const CHUNK: usize = 64 * 1024;
+
+/// The most one `sub --framing length` holds of a payload when `--max-bytes`
+/// is not given. The payload is held whole to be framed, so this is what one
+/// publisher can take from the subscriber's memory.
+const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// How `sub` separates one payload from the next on stdout.
 ///
@@ -123,7 +135,7 @@ impl Framing {
 const USAGE: &str = "usage:
   weida send    [--ca PATH] URL [FILE]        one-way transfer; payload from FILE or stdin
   weida request [--ca PATH] URL [FILE]        exchange; the reply goes to stdout
-  weida sub     [--ca PATH] [--filter F] [--count N] [--framing FORM] URL
+  weida sub     [--ca PATH] [--filter F] [--count N] [--framing FORM] [--max-bytes N] URL
   weida serve   (--echo | --sink | --pub) URL [--identity PATH] [--cert-out PATH]
 
 options:
@@ -133,6 +145,7 @@ options:
   --filter F       subscribe to this topic filter; the default takes every topic
   --count N        exit after N messages; without it, sub runs until stopped
   --framing FORM   how sub separates payloads on stdout: line (default), raw, nul, length
+  --max-bytes N    with --framing length, refuse a payload above N bytes (default 67108864)
   --version        print the version
   --help           print this
 
@@ -190,6 +203,7 @@ enum Command {
         filter: String,
         count: Option<u64>,
         framing: Framing,
+        max_bytes: usize,
         ca: Option<PathBuf>,
     },
     Serve {
@@ -220,6 +234,7 @@ fn parse_args() -> Command {
     let mut filter = None;
     let mut count = None;
     let mut framing = Framing::Line;
+    let mut max_bytes = DEFAULT_MAX_BYTES;
     let mut role = None;
 
     let next = |args: &mut dyn Iterator<Item = String>, what: &str| -> String {
@@ -241,6 +256,12 @@ fn parse_args() -> Command {
                 );
             }
             "--framing" => framing = Framing::parse(&next(&mut args, "--framing")),
+            "--max-bytes" => {
+                let value = next(&mut args, "--max-bytes");
+                max_bytes = value
+                    .parse::<usize>()
+                    .unwrap_or_else(|e| fail(format!("--max-bytes: {e}")));
+            }
             "--echo" => role = Some(Role::Echo),
             "--sink" => role = Some(Role::Sink),
             "--pub" => role = Some(Role::Publish),
@@ -267,6 +288,7 @@ fn parse_args() -> Command {
             filter: filter.unwrap_or_default(),
             count,
             framing,
+            max_bytes,
             ca,
         },
         "serve" => Command::Serve {
@@ -353,8 +375,20 @@ async fn main() -> ExitCode {
             filter,
             count,
             framing,
+            max_bytes,
             ca,
-        } => subscribe(&runtime, url, filter, *count, *framing, ca.as_ref()).await,
+        } => {
+            subscribe(
+                &runtime,
+                url,
+                filter,
+                *count,
+                *framing,
+                *max_bytes,
+                ca.as_ref(),
+            )
+            .await
+        }
         Command::Serve {
             url,
             role,
@@ -450,6 +484,7 @@ async fn subscribe(
     filter: &str,
     count: Option<u64>,
     framing: Framing,
+    max_bytes: usize,
     ca: Option<&PathBuf>,
 ) -> Result<(), Error> {
     let subscriber = runtime.subscriber(trust(ca));
@@ -467,10 +502,9 @@ async fn subscribe(
         let mut transfer = subscriber.recv().await?;
         let topic = transfer.meta().topic.clone().unwrap_or_default();
         // `length` framing has to know the size before the bytes, so it holds
-        // the payload; every other form streams. The hold is bounded by the
-        // publisher's own `max_message_size` for a whole publish, and by
-        // nothing for a streamed one — which is why it is not the default and
-        // why the help text says what each form costs.
+        // the payload, and `--max-bytes` is the ceiling on that hold: the
+        // publisher is a peer, and a streamed publish has no size of its own.
+        // Every other form streams and holds nothing.
         let mut held = Vec::new();
         let mut bytes = 0u64;
         loop {
@@ -480,6 +514,10 @@ async fn subscribe(
             }
             bytes += n as u64;
             if framing == Framing::Length {
+                if held.len() + n > max_bytes {
+                    eprintln!("weida: payload of topic {topic:?} exceeds --max-bytes {max_bytes}");
+                    return Err(Error::LimitExceeded);
+                }
                 held.extend_from_slice(&chunk[..n]);
             } else {
                 stdout.write_all(&chunk[..n]).map_err(Error::Io)?;
@@ -497,8 +535,8 @@ async fn subscribe(
         // fan-out drop is silent unless `PerProducer` is negotiated, and then
         // it is a number.
         match transfer.meta().gap.as_ref() {
-            Some(gap) => eprintln!("topic={topic} bytes={bytes} missed={}", gap.missed()),
-            None => eprintln!("topic={topic} bytes={bytes}"),
+            Some(gap) => eprintln!("topic={topic:?} bytes={bytes} missed={}", gap.missed()),
+            None => eprintln!("topic={topic:?} bytes={bytes}"),
         }
         seen += 1;
     }
@@ -565,8 +603,8 @@ async fn serve(
     println!("{printed}");
 
     match role {
-        Role::Echo => echo(listener.replier(&path)?).await,
-        Role::Sink => sink(listener.puller(&path)?).await,
+        Role::Echo => echo(runtime, listener.replier(&path)?).await,
+        Role::Sink => sink(runtime, listener.puller(&path)?).await,
         Role::Publish => publish(listener.publisher(&path)?).await,
     }
 }
@@ -618,11 +656,42 @@ fn bind_local(listener: &weida::Listener, url: &str) -> Result<(String, String),
     }
 }
 
-async fn echo(replier: Replier) -> Result<(), Error> {
+/// Echoes running at once. A request past this waits in the endpoint queue,
+/// where QUIC flow control holds it, instead of costing a task and a buffer.
+const MAX_ECHOES: usize = 64;
+
+/// What one echo copies at a time. Small, because every running echo holds one.
+const ECHO_CHUNK: usize = 8 * 1024;
+
+/// Answers requests with their own bodies, at most `MAX_ECHOES` at a time.
+///
+/// Each exchange is bounded by `RuntimeConfig::receive_timeout`, and the bound
+/// covers the reply as well as the request body: a requester that stops
+/// reading its reply holds its slot as surely as one that stops sending.
+async fn echo(runtime: &Runtime, replier: Replier) -> Result<(), Error> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_ECHOES));
+    let limit = runtime.config().receive_timeout;
+    let exec = runtime.exec().clone();
     loop {
+        // Taken before the request is accepted, so a request past the bound is
+        // not even taken off the queue until an echo finishes.
+        let permit = Arc::clone(&slots)
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::Runtime(e.to_string()))?;
         let request = replier.accept().await?;
+        let exec = exec.clone();
         tokio::spawn(async move {
-            if let Err(e) = echo_one(request).await {
+            // Released when the task ends, however it ends.
+            let _permit = permit;
+            let outcome = match limit {
+                Some(limit) => exec
+                    .within(limit, echo_one(request))
+                    .await
+                    .unwrap_or(Err(Error::Expired)),
+                None => echo_one(request).await,
+            };
+            if let Err(e) = outcome {
                 eprintln!("weida: request failed: {e}");
             }
         });
@@ -632,7 +701,7 @@ async fn echo(replier: Replier) -> Result<(), Error> {
 async fn echo_one(mut request: IncomingRequest) -> Result<(), Error> {
     let mut body = request.take_body();
     let mut out = request.reply(TransferMeta::default()).await?;
-    let mut chunk = vec![0u8; CHUNK];
+    let mut chunk = vec![0u8; ECHO_CHUNK];
     let mut total = 0u64;
     loop {
         let n = body.read(&mut chunk).await?;
@@ -647,22 +716,51 @@ async fn echo_one(mut request: IncomingRequest) -> Result<(), Error> {
     Ok(())
 }
 
-async fn sink(puller: Puller) -> Result<(), Error> {
+/// Writes every payload the puller receives to stdout, one transfer at a time.
+///
+/// Sequential on purpose: two payloads written at once would interleave on
+/// stdout. A transfer whose body does not finish within
+/// `RuntimeConfig::receive_timeout` is dropped, which stops its stream, and the
+/// next one is taken, so one stalled sender cannot hold the sink.
+async fn sink(runtime: &Runtime, puller: Puller) -> Result<(), Error> {
     let mut stdout = std::io::stdout();
     let mut chunk = vec![0u8; CHUNK];
+    let limit = runtime.config().receive_timeout;
     loop {
         let mut transfer = puller.recv().await?;
         let mut total = 0u64;
-        loop {
-            let n = transfer.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+        let copy = copy_body(&mut transfer, &mut stdout, &mut chunk, &mut total);
+        let finished = match limit {
+            Some(limit) => runtime.exec().within(limit, copy).await.ok_or(limit),
+            None => Ok(copy.await),
+        };
+        match finished {
+            Ok(result) => {
+                result?;
+                stdout.flush().map_err(Error::Io)?;
+                eprintln!("received bytes={total}");
             }
-            total += n as u64;
-            stdout.write_all(&chunk[..n]).map_err(Error::Io)?;
+            Err(limit) => {
+                eprintln!("weida: transfer abandoned after {limit:?}, {total} bytes written");
+            }
         }
-        stdout.flush().map_err(Error::Io)?;
-        eprintln!("received bytes={total}");
+    }
+}
+
+/// Copies one transfer's body to stdout as it arrives, counting what was written.
+async fn copy_body(
+    transfer: &mut IncomingTransfer,
+    stdout: &mut std::io::Stdout,
+    chunk: &mut [u8],
+    total: &mut u64,
+) -> Result<(), Error> {
+    loop {
+        let n = transfer.read(chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        stdout.write_all(&chunk[..n]).map_err(Error::Io)?;
+        *total += n as u64;
     }
 }
 

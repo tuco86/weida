@@ -1064,3 +1064,71 @@ async fn a_handoff_is_refused_where_it_does_not_belong() {
         other => panic!("garbage is refused, got {other:?}"),
     }
 }
+
+/// Claim: a successor sends only what a handover can have held. The bytes
+/// come from outside this process, so a destination no client has and more
+/// datagrams than a handover holds are refused before anything is sent.
+#[tokio::test]
+async fn a_handoff_is_bounded_by_what_a_handover_holds() {
+    fn put_addr(out: &mut Vec<u8>, addr: SocketAddr) {
+        let std::net::IpAddr::V4(ip) = addr.ip() else {
+            panic!("the test names IPv4 addresses");
+        };
+        out.push(4);
+        out.extend_from_slice(&ip.octets());
+        out.extend_from_slice(&addr.port().to_be_bytes());
+    }
+
+    let certs = Certs::generate();
+    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let listener = runtime.listener();
+    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+    let binding = within(listener.bind_quic(loopback, certs.server_tls()))
+        .await
+        .expect("binding");
+    let local = binding.local_addr();
+
+    // The documented byte format: magic, version, the binding's address, a
+    // count, and per datagram its destination, a tag for its source address
+    // and its length-prefixed bytes.
+    let blob = |entries: &[(SocketAddr, Vec<u8>)]| {
+        let mut out = b"WDHO".to_vec();
+        out.push(1);
+        put_addr(&mut out, local);
+        out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (destination, contents) in entries {
+            put_addr(&mut out, *destination);
+            out.push(0);
+            out.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+            out.extend_from_slice(contents);
+        }
+        out
+    };
+    let refused = |outcome: Result<usize, Error>, what: &str| match outcome {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}"),
+        other => panic!("{what} is refused as invalid data, got {other:?}"),
+    };
+
+    // The discard port of the loopback: a client address nobody answers on.
+    let client: SocketAddr = "127.0.0.1:9".parse().expect("client");
+    let packet = vec![0x40, 1, 2, 3];
+    let sent = within(binding.take_over(&blob(&[(client, packet.clone())])))
+        .await
+        .expect("what a handover holds is sent");
+    assert_eq!(sent, 1);
+
+    let multicast: SocketAddr = "224.0.0.251:5353".parse().expect("multicast");
+    refused(
+        within(binding.take_over(&blob(&[(multicast, packet.clone())]))).await,
+        "a multicast destination",
+    );
+    refused(
+        within(binding.take_over(&blob(&[(client, vec![0x40; 65_000])]))).await,
+        "a datagram larger than any packet this process sends",
+    );
+    let flood: Vec<(SocketAddr, Vec<u8>)> = (0..100_000).map(|_| (client, vec![0x40])).collect();
+    refused(
+        within(binding.take_over(&blob(&flood))).await,
+        "far more datagrams than a handover holds",
+    );
+}

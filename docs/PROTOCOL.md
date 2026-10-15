@@ -611,11 +611,15 @@ decodes both and §8 pins their bytes, so a second implementation has one defini
 one per implementation — and a decoder that meets either accepts it, while a decoder that meets
 an unknown key still skips it under §5.
 
-`sequence` is a monotonically increasing `uint` scoped to (producer, endpoint or topic)
-([decisions/0001](decisions/0001-sequence-field.md) §7.1). It is not a transfer identifier and
-it does not correlate anything: an exchange is still correlated by its stream (§9.1). Its
-purpose is ordering and gap detection, and a receiver that has not negotiated a `PerProducer`
-level (§6.5) MUST ignore it.
+`sequence` is a monotonically increasing `uint` scoped to (producer, endpoint) for a transfer
+with no `topic`, and to (producer, endpoint, topic) for a published copy
+([decisions/0001](decisions/0001-sequence-field.md) §7.1). The endpoint is part of a published
+copy's scope because it names the *publisher*: two publishers on one listener that publish one
+topic string are two producers, each numbering the topic on its own, so a subscriber of one sees
+its numbers dense and no hole for the other's messages, and a receiver subscribed to both keeps
+their numbers apart. It is not a transfer identifier and it does not correlate anything: an
+exchange is still correlated by its stream (§9.1). Its purpose is ordering and gap detection,
+and a receiver that has not negotiated a `PerProducer` level (§6.5) MUST ignore it.
 
 `producer` names the producer when the producer is **not** the connection peer — a relay, an
 L2 hop forwarding another producer's output, or a stable name supplied by an L2 subscription.
@@ -1511,7 +1515,7 @@ Per connection (`Limits`):
 | `idle_timeout` | 30 s | QUIC idle timeout, applied in both directions (§2.4) |
 | `hello_timeout_ms` | 10 s | time a connection may exist without a processed peer HELLO |
 | `max_subscriptions` | `256` | subscription filters one peer connection may hold, summed over paths; exceeding it closes the connection with `LIMIT_EXCEEDED` (§6.4) |
-| `subscriber_buffer_bytes` | 8 MiB | payload bytes a publisher will hold queued for one subscriber; a message that does not fit is dropped for that subscriber (§9.5) |
+| `subscriber_buffer_bytes` | 8 MiB | payload bytes a publisher will hold queued for one subscriber, which is one connection however many paths it subscribes to; a message that does not fit is dropped for that subscriber (§9.5) |
 | `max_sequence_scopes` | `1024` | producer scopes — paths and topics — a receiver tracks per connection for gap detection or reassembly under `PerProducer` ordering; the peer names the scopes, so at the cap a new one is simply not tracked |
 | `max_reorder_hold` | `256` | transfers a receiver holds back at once, over all scopes, under `PerProducer(reassemble)`; at the cap the oldest held transfer is released out of order with its gap reported (§6.5, [GUARANTEES.md](GUARANTEES.md) §3). A held transfer is an unread stream, so the bytes it pins are bounded again by `stream_receive_window` and `connection_receive_window` |
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |

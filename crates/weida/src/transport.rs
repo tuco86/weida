@@ -427,6 +427,25 @@ impl SendHalf {
         }
     }
 
+    /// Writes a shared buffer without copying it where the transport can
+    /// avoid that.
+    ///
+    /// `quinn` copies a slice into a chunk of its own on every `write_all`,
+    /// so a payload handed to N subscribers as a slice is allocated and
+    /// copied N times; a `Bytes` is queued by reference count instead. The
+    /// local transports write into an OS or in-process buffer, which is a
+    /// copy either way, so they write the slice.
+    pub(crate) async fn write_chunk(&mut self, chunk: bytes::Bytes) -> Result<(), Error> {
+        match self {
+            SendHalf::Quic(s) => s.write_chunk(chunk).await.map_err(write_error),
+            SendHalf::Local(s) => s.write_all(&chunk).await,
+            #[cfg(unix)]
+            SendHalf::Unix(s) => s.write_all(&chunk).await,
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => s.write_all(&chunk).await,
+        }
+    }
+
     /// Queues the FIN. Synchronous on every transport: nothing is flushed
     /// here, which is what keeps a fire-and-forget send free of an await.
     pub(crate) fn finish(&mut self) -> Result<(), Error> {

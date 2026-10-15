@@ -11,6 +11,8 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{Certs, Server};
@@ -938,7 +940,7 @@ async fn datagrams(dish: &Dish, count: usize) -> Vec<(u64, usize)> {
                 segment,
                 payload,
             })) => {
-                assert_eq!(topic, "voice");
+                assert_eq!(&*topic, "voice");
                 seen.push((segment, payload.len()));
             }
             Ok(Ok(other)) => panic!("expected a datagram, got {other:?}"),
@@ -1023,6 +1025,95 @@ async fn a_datagram_larger_than_the_dish_carries_is_counted_too_large() {
         "nothing too large arrived in any other form"
     );
     runtime.shutdown().await;
+}
+
+/// A raw dish on `server`, joined to `voice` with the datagram capability. It
+/// counts the FLOW streams the radio opens toward it; the first `refuse` of
+/// them are stopped with STOP_SENDING and the rest are kept open. The endpoint
+/// and the connection are returned, and must stay alive for the flows.
+async fn raw_dish(
+    server: &Server,
+    refuse: usize,
+) -> (quinn::Endpoint, quinn::Connection, Arc<AtomicUsize>) {
+    use common::raw;
+    use weida::codes;
+    use weida_protocol::{CAPABILITY_DATAGRAM, FrameKind, Hello, SubscriptionHeader};
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
+        .await
+        .expect("handshake");
+    let mut hello = Hello::v0(16 * 1024, 1024);
+    hello.capabilities = vec![CAPABILITY_DATAGRAM];
+    raw::send_frame(&conn, FrameKind::Hello, &hello.encode()).await;
+    let subscribe = SubscriptionHeader::new("/r", "voice").encode();
+    raw::send_frame(&conn, FrameKind::Subscribe, &subscribe).await;
+
+    let opened = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&opened);
+    let accepting = conn.clone();
+    tokio::spawn(async move {
+        let mut kept = Vec::new();
+        while let Ok(mut stream) = accepting.accept_uni().await {
+            let (preamble, _) = raw::read_frame(&mut stream).await;
+            if preamble.kind != FrameKind::Flow {
+                continue;
+            }
+            let seen = counted.fetch_add(1, Ordering::SeqCst) + 1;
+            if seen <= refuse {
+                let code = quinn::VarInt::from_u64(codes::REJECTED).expect("varint");
+                let _ = stream.stop(code);
+            } else {
+                kept.push(stream);
+            }
+        }
+    });
+    (endpoint, conn, opened)
+}
+
+#[tokio::test]
+async fn a_dish_that_refuses_every_flow_costs_a_few_opens_not_one_per_datagram() {
+    let server = Server::start_with(with_datagrams()).await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let (_endpoint, conn, opened) = raw_dish(&server, usize::MAX).await;
+    dishes(&radio, 1).await;
+
+    // A datagram a millisecond, so each refusal arrives between two sends:
+    // without a backoff every send would open a flow of its own.
+    within(async {
+        for _ in 0..1000 {
+            radio.datagram("voice", vec![0x33; 150]).expect("send");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    let flows = opened.load(Ordering::SeqCst);
+    assert!(flows <= 8, "{flows} flows opened for 1000 datagrams");
+    let drops = radio.dropped_on("voice").expect("drops on voice");
+    assert!(drops.subscriber_queue >= 900, "{drops:?}");
+    conn.close(0u32.into(), b"done");
+}
+
+#[tokio::test]
+async fn a_refused_flow_is_opened_again_after_its_backoff_and_takes_datagrams() {
+    let server = Server::start_with(with_datagrams()).await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let (_endpoint, conn, opened) = raw_dish(&server, 1).await;
+    dishes(&radio, 1).await;
+
+    // The first flow is refused. Until its backoff is over the datagrams are
+    // dropped; then a second flow opens, which the dish keeps, and takes one.
+    within(async {
+        loop {
+            let handed = radio.datagram("voice", vec![0x33; 150]).expect("send");
+            if handed == 1 && opened.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    conn.close(0u32.into(), b"done");
 }
 
 // --- admission and eviction ------------------------------------------------------
@@ -1276,4 +1367,106 @@ async fn dish_drops_names_the_dish_that_lost_and_forgets_it_when_it_leaves() {
     .await;
     assert_eq!(radio.dish_drops()[0].peer, Some(reading_peer));
     reading_rt.shutdown().await;
+}
+
+/// A dish on its own runtime, joined to each `(filter, terms)` and connected
+/// to `/r` of `server`.
+async fn dish_joined_to(server: &Server, runtime: &Runtime, joins: &[(&str, JoinTerms)]) -> Dish {
+    let dish = runtime.dish(server.trust());
+    for (filter, terms) in joins {
+        within(dish.join(filter, terms.clone()))
+            .await
+            .expect("join");
+    }
+    within(dish.connect(&server.url("/r")))
+        .await
+        .expect("connect");
+    dish
+}
+
+#[tokio::test]
+async fn a_dish_holding_filters_it_misses_is_reached_once_per_segment() {
+    // Each dish holds 40 filters that never match `v`, and `v` itself: its
+    // matching filters are one delivery, so each segment arrives once.
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtimes: Vec<Runtime> = (0..4).map(|_| server.client_runtime()).collect();
+    let mut owned: Vec<(String, JoinTerms)> = (0..40)
+        .map(|i| (format!("miss.{i}"), JoinTerms::default()))
+        .collect();
+    owned.push(("v".to_owned(), JoinTerms::default()));
+    let joins: Vec<(&str, JoinTerms)> = owned
+        .iter()
+        .map(|(filter, terms)| (filter.as_str(), terms.clone()))
+        .collect();
+    let mut dish_list = Vec::new();
+    for runtime in &runtimes {
+        dish_list.push(dish_joined_to(&server, runtime, &joins).await);
+    }
+    dishes(&radio, 4).await;
+
+    send(&radio, "v", 1, 1024);
+    for dish in &dish_list {
+        let received = segment_of(within(dish.recv()).await.expect("recv"));
+        assert_eq!(received.meta().topic.as_deref(), Some("v"));
+        assert_eq!(
+            within(received.collect(4096)).await.expect("body").len(),
+            1024
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), dish.recv())
+                .await
+                .is_err(),
+            "a second copy reached a dish that joined `v` once"
+        );
+    }
+    for runtime in runtimes {
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn filters_of_one_dish_combine_their_layer_caps_by_the_largest() {
+    // The matching filters of one dish combine: the largest cap applies, and
+    // a matching filter without a cap lifts it.
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtimes: Vec<Runtime> = (0..3).map(|_| server.client_runtime()).collect();
+    let base = JoinTerms::default().with_max_layer(0);
+    let capped = dish_joined_to(&server, &runtimes[0], &[("v", base.clone())]).await;
+    let uncapped = dish_joined_to(
+        &server,
+        &runtimes[1],
+        &[("v", base.clone()), ("#", JoinTerms::default())],
+    )
+    .await;
+    let wider = dish_joined_to(
+        &server,
+        &runtimes[2],
+        &[
+            ("v", base.clone()),
+            ("*", JoinTerms::default().with_max_layer(1)),
+        ],
+    )
+    .await;
+    dishes(&radio, 3).await;
+
+    let mut segment = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
+    assert_eq!(segment.write_layer(0, vec![0; 1024]).expect("write"), 3);
+    assert_eq!(segment.write_layer(1, vec![1; 1024]).expect("write"), 2);
+    segment.finish();
+
+    let layers_of = |heard: Vec<(u8, Result<Vec<u8>, Error>)>| {
+        let mut layers: Vec<u8> = heard.iter().map(|(layer, _)| *layer).collect();
+        layers.sort_unstable();
+        layers
+    };
+    assert_eq!(layers_of(layers_heard(&capped).await), vec![0]);
+    assert_eq!(layers_of(layers_heard(&uncapped).await), vec![0, 1]);
+    assert_eq!(layers_of(layers_heard(&wider).await), vec![0, 1]);
+    for runtime in runtimes {
+        runtime.shutdown().await;
+    }
 }

@@ -22,7 +22,6 @@ use weida_protocol::{
     codes, decode_cursor_record, encode_frame, negotiate, parse_preamble,
 };
 
-use crate::cursor::CursorSet;
 use crate::dedup::DedupWindow;
 use crate::identity::PeerChain;
 use crate::listener::{Namespace, Route};
@@ -675,7 +674,7 @@ fn refuse_cursor(mut stream: RecvHalf) -> Result<(), Error> {
 ///   no state exists for an id we never handed out, which is the hostile
 ///   case;
 /// * a record that repeats an offset or moves one backwards changes nothing,
-///   and neither does a level the sender never ordered: [`CursorSet::advance`]
+///   and neither does a level the sender never ordered: [`crate::cursor::CursorSet::advance`]
 ///   keeps the maximum, so the peer is told nothing and no notification is
 ///   sent;
 /// * a record truncated at FIN **is** a violation. A record is at most
@@ -695,7 +694,6 @@ async fn handle_cursor(ctx: &ConnHandle, mut stream: RecvHalf, header: &[u8]) ->
     // record plus one read.
     let mut buf = [0u8; 64];
     let mut pending: Vec<u8> = Vec::with_capacity(64 + MAX_CURSOR_RECORD_LEN);
-    let mut set = CursorSet::default();
     loop {
         match stream.read(&mut buf).await {
             Ok(Some(0)) => continue,
@@ -707,9 +705,7 @@ async fn handle_cursor(ctx: &ConnHandle, mut stream: RecvHalf, header: &[u8]) ->
                     Err(e) => return violation(ctx, &e.to_string()),
                 } {
                     at += used;
-                    if set.advance(level, offset) {
-                        tx.send_replace(set);
-                    }
+                    tx.send_if_modified(|shared| shared.advance(level, offset));
                 }
                 pending.drain(..at);
             }
@@ -867,7 +863,7 @@ async fn handle_subscription(
                 header.filter,
                 header.max_age_ms,
                 header.max_layer,
-                || subs.reserve(conn_id),
+                || subs.reserve(ctx),
             );
             if joined.is_err() {
                 return too_many_subscriptions(ctx);
@@ -880,7 +876,7 @@ async fn handle_subscription(
 
     if let Some(Route::Raw(queue)) = ctx.namespace.lookup(&header.endpoint) {
         if subscribe {
-            if subs.reserve(conn_id).is_err() {
+            if subs.reserve(ctx).is_err() {
                 return too_many_subscriptions(ctx);
             }
             ctx.namespace.note_consumer(conn_id, &header.endpoint);

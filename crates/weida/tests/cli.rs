@@ -16,9 +16,9 @@
 #![cfg(feature = "generate")]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Long enough for a QUIC handshake on a loaded machine, short enough that a
 /// hang is a failure rather than a coffee break.
@@ -39,6 +39,9 @@ struct Served {
     /// it. Read by the `--sink` tests on both platforms, each through its
     /// own local transport.
     stdout: Option<BufReader<std::process::ChildStdout>>,
+    /// What a `--pub` reads its messages from. Held open, so that the test
+    /// decides when each message goes out.
+    stdin: Option<ChildStdin>,
 }
 
 impl Served {
@@ -47,12 +50,13 @@ impl Served {
         let mut child = Command::new(BIN)
             .arg("serve")
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn the binary");
         let stdout = child.stdout.take().expect("piped stdout");
+        let stdin = child.stdin.take();
         // On a thread, because a `serve` that never binds must time out here
         // rather than block the test for ever.
         let (tx, rx) = mpsc::channel();
@@ -75,7 +79,16 @@ impl Served {
             child,
             address,
             stdout: Some(stdout),
+            stdin,
         }
+    }
+
+    /// Writes one line to the served process's stdin: what a `--pub` reads as
+    /// one message per line.
+    fn say(&mut self, line: &str) {
+        let stdin = self.stdin.as_mut().expect("a piped stdin");
+        writeln!(stdin, "{line}").expect("write a message");
+        stdin.flush().expect("flush a message");
     }
 }
 
@@ -240,4 +253,102 @@ fn a_send_reaches_a_sink_over_a_named_pipe() {
         sunk(&mut server, b"over a named pipe".len()),
         b"over a named pipe"
     );
+}
+
+/// A child killed when this goes out of scope, however the test ends.
+struct Stopped(Child);
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts `sub` with `args`, its output piped so that a test can read it.
+fn spawn_sub(args: &[&str]) -> Stopped {
+    Stopped(
+        Command::new(BIN)
+            .arg("sub")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the subscriber"),
+    )
+}
+
+/// Publishes `line` until `sub` exits, and returns its exit code with what it
+/// wrote to stdout and stderr. A publish that lands before the subscription
+/// is registered is dropped by design, so the line is repeated.
+fn publish_until_exit(
+    publisher: &mut Served,
+    line: &str,
+    sub: &mut Stopped,
+) -> (i32, Vec<u8>, Vec<u8>) {
+    let until = Instant::now() + DEADLINE;
+    loop {
+        publisher.say(line);
+        if let Some(status) = sub.0.try_wait().expect("poll the subscriber") {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            sub.0
+                .stdout
+                .take()
+                .expect("piped stdout")
+                .read_to_end(&mut stdout)
+                .expect("read the subscriber's stdout");
+            sub.0
+                .stderr
+                .take()
+                .expect("piped stderr")
+                .read_to_end(&mut stderr)
+                .expect("read the subscriber's stderr");
+            return (status.code().unwrap_or(-1), stdout, stderr);
+        }
+        assert!(
+            Instant::now() < until,
+            "the subscriber did not finish within {DEADLINE:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `--max-bytes` is the ceiling on what `sub --framing length` holds: a
+/// payload above it is refused, the cap is named, and nothing is framed out.
+#[test]
+fn a_length_framed_payload_above_max_bytes_is_refused() {
+    let mut publisher = Served::start(&["--pub", "weida://127.0.0.1:0/md"]);
+    let mut sub = spawn_sub(&[
+        &publisher.address,
+        "--framing",
+        "length",
+        "--max-bytes",
+        "16",
+        "--count",
+        "1",
+    ]);
+    let message = format!("t {}", "x".repeat(64));
+    let (code, stdout, stderr) = publish_until_exit(&mut publisher, &message, &mut sub);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(code, 1, "stderr was {stderr:?}");
+    assert!(
+        stdout.is_empty(),
+        "a refused payload must not be framed out"
+    );
+    assert!(stderr.contains("--max-bytes 16"), "stderr was {stderr:?}");
+}
+
+/// A topic is any UTF-8 a publisher sends, escape sequences included, so the
+/// operator's terminal is given it escaped: no raw ESC byte reaches stderr.
+#[test]
+fn a_topic_with_escape_sequences_is_printed_escaped() {
+    let mut publisher = Served::start(&["--pub", "weida://127.0.0.1:0/md"]);
+    let mut sub = spawn_sub(&[&publisher.address, "--count", "1"]);
+    let (code, _, stderr) = publish_until_exit(&mut publisher, "\u{1b}[2J hello", &mut sub);
+    let text = String::from_utf8_lossy(&stderr);
+    assert_eq!(code, 0, "stderr was {text:?}");
+    assert!(!stderr.contains(&0x1b), "a raw ESC byte reached stderr");
+    assert!(text.contains(r"\u{1b}[2J"), "stderr was {text:?}");
 }

@@ -645,7 +645,11 @@ impl PyDish {
                     topic,
                     segment,
                     payload,
-                } => Ok(Heard::Datagram(topic, segment, payload.to_vec())),
+                } => Ok(Heard::Datagram(
+                    topic.to_string(),
+                    segment,
+                    payload.to_vec(),
+                )),
             }
         })
     }

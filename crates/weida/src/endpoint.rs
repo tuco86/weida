@@ -432,7 +432,8 @@ impl Publisher {
     /// Fails with [`Error::LimitExceeded`] when `payload` is larger than
     /// `Limits::subscriber_buffer_bytes`: such a message could never be
     /// enqueued for anyone, so reporting it beats silently dropping it for
-    /// every subscriber.
+    /// every subscriber. It fails the same way for a `topic` above 256 bytes,
+    /// which a subscriber's decoder refuses by closing its connection.
     ///
     /// No `traceparent` is written unless one is propagated: see
     /// [`Publisher::publish_with_trace`] and
@@ -464,10 +465,9 @@ impl Publisher {
             return Err(Error::LimitExceeded);
         }
         let want = u32::try_from(payload.len()).map_err(|_| Error::LimitExceeded)?;
-        Ok(self
-            .state
+        self.state
             .registry
-            .publish(&self.state.path, topic, payload, trace, want))
+            .publish(&self.state.path, topic, payload, trace, want)
     }
 
     /// Opens a streamed publish: one stream per matched subscriber, written
@@ -485,7 +485,10 @@ impl Publisher {
     /// The subscriber set is fixed at this call: a subscriber that arrives
     /// while the payload is in flight would receive a fragment with no way to
     /// know it, so it gets the next message instead. Zero subscribers is not
-    /// an error, exactly as for [`Publisher::publish`].
+    /// an error, exactly as for [`Publisher::publish`]. A `topic` above 256
+    /// bytes cannot be sent to anyone, since a subscriber's decoder refuses
+    /// it by closing its connection: the fan-out reaches nobody and refuses
+    /// every write with [`Error::LimitExceeded`].
     ///
     /// Every guarantee of [`Publisher::publish`] holds per subscriber rather
     /// than per publish: see [`FanOut`].

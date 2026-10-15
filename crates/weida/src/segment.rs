@@ -33,7 +33,8 @@
 //! under a whole-segment cause. Nothing here ever waits for a receiver:
 //! [`Segment::write_layer`] is synchronous.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -45,8 +46,7 @@ use weida_core::Error;
 use weida_protocol::{DataHeader, codes};
 
 use crate::conn::ConnHandle;
-use crate::pubsub::{Causes, DropCause, DropTable};
-use crate::transfer::write_data_preamble;
+use crate::pubsub::{Causes, DropCause, DropTable, Frame};
 use crate::transport::SendHalf;
 
 /// How many layers a stream segment can carry: `0..=15`, the cap of DATA
@@ -231,17 +231,55 @@ struct TopicState {
 /// segment on it supersedes. A radio holds one per path, a [`crate::Peer`]
 /// one for its own copies.
 pub(crate) struct SegmentTopics {
-    /// Per-topic state, and the number a topic created after an eviction
-    /// starts from.
-    topics: Mutex<(HashMap<Arc<str>, TopicState>, u64)>,
+    /// The topics: their state, their eviction order and the floor.
+    topics: Mutex<TopicTable>,
     max_scopes: usize,
+}
+
+/// The topics of one [`SegmentTopics`], with the order they are evicted in.
+#[derive(Default)]
+struct TopicTable {
+    /// Per-topic state.
+    states: HashMap<Arc<str>, TopicState>,
+    /// Every key of `states`, first to be evicted at the front. A topic
+    /// passed over for its copy in flight moves to the back.
+    order: VecDeque<Arc<str>>,
+    /// The number a topic created after an eviction starts from: above every
+    /// number an evicted topic reached.
+    floor: u64,
+}
+
+impl TopicTable {
+    /// Evicts the first topic in eviction order with no copy in flight and
+    /// raises the floor above the number it reached. A topic with a copy in
+    /// flight goes to the back as it is passed. Every topic is looked at at
+    /// most once, so `false` means every topic has a copy in flight.
+    fn evict_idle(&mut self) -> bool {
+        for _ in 0..self.order.len() {
+            let Some(topic) = self.order.pop_front() else {
+                break;
+            };
+            let Some(state) = self.states.get_mut(&topic) else {
+                continue;
+            };
+            state.live.retain(|copy| copy.live());
+            if state.live.is_empty() {
+                if let Some(state) = self.states.remove(&topic) {
+                    self.floor = self.floor.max(state.next);
+                }
+                return true;
+            }
+            self.order.push_back(topic);
+        }
+        false
+    }
 }
 
 impl SegmentTopics {
     /// A table of at most `max_scopes` topics.
     pub(crate) fn new(max_scopes: usize) -> SegmentTopics {
         SegmentTopics {
-            topics: Mutex::new((HashMap::new(), 0)),
+            topics: Mutex::new(TopicTable::default()),
             max_scopes,
         }
     }
@@ -251,35 +289,29 @@ impl SegmentTopics {
     /// `max_scopes` topics all have a copy in flight.
     pub(crate) fn next(&self, topic: &Arc<str>) -> Result<u64, Error> {
         let mut guard = lock(&self.topics);
-        let (topics, floor) = &mut *guard;
-        if !topics.contains_key(topic) && topics.len() >= self.max_scopes {
-            // The table is the application's, but still bounded: a topic
-            // with no copy in flight has nothing to supersede and can go.
-            let idle = topics.iter_mut().find_map(|(topic, state)| {
-                state.live.retain(|c| c.live());
-                state
-                    .live
-                    .is_empty()
-                    .then(|| (Arc::clone(topic), state.next))
-            });
-            match idle {
-                Some((idle, next)) => {
-                    topics.remove(&idle);
-                    // A topic that comes back must not restart below what a
-                    // receiver already delivered on it, or the receiver would
-                    // discard it as stale: numbering resumes above every
-                    // number an evicted topic reached.
-                    *floor = (*floor).max(next);
-                }
-                None => return Err(Error::LimitExceeded),
-            }
+        let table = &mut *guard;
+        // The table is the application's, but still bounded: a topic with no
+        // copy in flight has nothing to supersede and can go.
+        if !table.states.contains_key(topic)
+            && table.states.len() >= self.max_scopes
+            && !table.evict_idle()
+        {
+            return Err(Error::LimitExceeded);
         }
-        let state = topics
-            .entry(Arc::clone(topic))
-            .or_insert_with(|| TopicState {
-                next: *floor,
-                live: Vec::new(),
-            });
+        // A topic that comes back must not restart below what a receiver
+        // already delivered on it, or the receiver would discard it as stale:
+        // numbering resumes above every number an evicted topic reached.
+        let floor = table.floor;
+        let state = match table.states.entry(Arc::clone(topic)) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                table.order.push_back(Arc::clone(topic));
+                entry.insert(TopicState {
+                    next: floor,
+                    live: Vec::new(),
+                })
+            }
+        };
         let number = state.next;
         state.next += 1;
         for copy in state.live.drain(..) {
@@ -296,7 +328,7 @@ impl SegmentTopics {
     }
 
     fn track(&self, topic: &Arc<str>, copy: &Arc<CopyCtl>) {
-        if let Some(state) = lock(&self.topics).0.get_mut(topic) {
+        if let Some(state) = lock(&self.topics).states.get_mut(topic) {
             state.live.push(Arc::clone(copy));
         }
     }
@@ -375,47 +407,66 @@ type NextNumbers = HashMap<(Arc<str>, Arc<str>), u64>;
 /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
 /// §4.11).
 pub(crate) struct SegmentNumbers {
-    /// The next number per `(path, topic)`, and the number a key created
-    /// after an eviction starts from.
-    table: Mutex<(NextNumbers, u64)>,
+    table: Mutex<NumberTable>,
     max: usize,
+}
+
+/// The entries of one [`SegmentNumbers`], with the order they are evicted in.
+#[derive(Default)]
+struct NumberTable {
+    /// The next number per `(path, topic)`.
+    numbers: NextNumbers,
+    /// Every key of `numbers`, oldest first: the front is evicted first.
+    order: VecDeque<(Arc<str>, Arc<str>)>,
+    /// The number a key created after an eviction starts from: above every
+    /// number an evicted key reached.
+    floor: u64,
+}
+
+impl NumberTable {
+    /// Evicts the oldest key and raises the floor above the number it reached.
+    fn evict_oldest(&mut self) {
+        while let Some(key) = self.order.pop_front() {
+            if let Some(next) = self.numbers.remove(&key) {
+                self.floor = self.floor.max(next);
+                return;
+            }
+        }
+    }
 }
 
 impl SegmentNumbers {
     /// A table of at most `max` `(path, topic)` entries.
     pub(crate) fn new(max: usize) -> SegmentNumbers {
         SegmentNumbers {
-            table: Mutex::new((HashMap::new(), 0)),
+            table: Mutex::new(NumberTable::default()),
             max,
         }
     }
 
     /// Takes the next number on (`path`, `topic`). Never fails: at the cap
-    /// it evicts an entry, and a key that comes back resumes above every
-    /// number an evicted one reached, so a receiver never takes it as stale.
+    /// it evicts the oldest entry, and a key that comes back resumes above
+    /// every number an evicted one reached, so a receiver never takes it as
+    /// stale.
     pub(crate) fn next(&self, path: &Arc<str>, topic: &Arc<str>) -> u64 {
         let mut guard = lock(&self.table);
-        let (table, floor) = &mut *guard;
+        let table = &mut *guard;
         let key = (Arc::clone(path), Arc::clone(topic));
-        if let Some(next) = table.get_mut(&key) {
+        if let Some(next) = table.numbers.get_mut(&key) {
             let number = *next;
             *next += 1;
             return number;
         }
-        if table.len() >= self.max {
-            let evicted = table.keys().next().cloned();
-            if let Some(evicted) = evicted
-                && let Some(next) = table.remove(&evicted)
-            {
-                *floor = (*floor).max(next);
-            }
+        if table.numbers.len() >= self.max {
+            table.evict_oldest();
         }
-        let number = *floor;
-        if table.len() < self.max {
-            table.insert(key, number + 1);
+        let number = table.floor;
+        if table.numbers.len() < self.max {
+            table.order.push_back(key.clone());
+            table.numbers.insert(key, number + 1);
         } else {
             // A table of no entries at all: every segment takes the floor.
-            *floor += 1;
+            table.floor += 1;
         }
         number
     }
@@ -812,24 +863,30 @@ fn release(queued: &AtomicU64, len: usize, budget: &Semaphore) {
     }
 }
 
-/// Resolves once layer `layer` or one below it is cut.
-async fn cut_reached(ctl: &CopyCtl, layer: u8) {
-    let mut cut = ctl.cut_from.subscribe();
-    let _ = cut.wait_for(|cut| *cut <= layer).await;
+/// Resolves once layer `layer` or one below it is cut. `cut` is the copy's
+/// receiver, subscribed once per layer task.
+async fn cut_reached(cut: &mut watch::Receiver<u8>, layer: u8) {
+    let _ = cut.wait_for(|c| *c <= layer).await;
 }
 
-/// Resolves once the copy's segment is superseded.
-async fn superseded(ctl: &CopyCtl) {
-    let mut superseded = ctl.superseded.subscribe();
-    let _ = superseded.wait_for(|s| *s).await;
+/// Resolves once the copy's segment is superseded. `rx` is the copy's
+/// receiver, subscribed once per layer task: `wait_for` reads the value, so a
+/// supersession that came before the subscription counts too.
+async fn superseded(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|s| *s).await;
 }
 
 /// Resolves when the copy is superseded while this layer's writer is still
 /// writing it: such a layer is reset at once. A layer finished before the
 /// successor opened, and a copy that follows upstream, go on: see
-/// [`run_layer`].
-async fn superseded_unfinished(ctl: &CopyCtl, finished: &AtomicBool) {
-    superseded(ctl).await;
+/// [`run_layer`]. Every poll decides as the first poll that saw the
+/// supersession did, since `finished` only goes from false to true.
+async fn superseded_unfinished(
+    rx: &mut watch::Receiver<bool>,
+    ctl: &CopyCtl,
+    finished: &AtomicBool,
+) {
+    superseded(rx).await;
     if ctl.follows_upstream || finished.load(Ordering::Acquire) {
         std::future::pending::<()>().await;
     }
@@ -851,8 +908,8 @@ async fn expiry(spec: &CopySpec) {
 /// Resolves when a layer past its FIN has had its grace after supersession:
 /// the time its path needs to carry the copy's bytes at the congestion
 /// window, one round trip for the receipt and [`SUPERSEDE_SLACK`].
-async fn finish_grace_over(ctl: &CopyCtl, spec: &CopySpec) {
-    superseded(ctl).await;
+async fn finish_grace_over(rx: &mut watch::Receiver<bool>, ctl: &CopyCtl, spec: &CopySpec) {
+    superseded(rx).await;
     let wait = spec
         .conn
         .conn
@@ -903,14 +960,19 @@ async fn run_layer(
     finished: &AtomicBool,
     budget: &Semaphore,
 ) {
+    // Subscribed and timed once per layer: every wake-up below polls these,
+    // so a chunk costs neither a subscription nor a timer.
+    let mut cut = ctl.cut_from.subscribe();
+    let mut superseded_rx = ctl.superseded.subscribe();
+    let mut expire = std::pin::pin!(expiry(spec));
     let opened = tokio::select! {
         biased;
-        () = cut_reached(ctl, layer) => return,
-        () = superseded_unfinished(ctl, finished) => {
+        () = cut_reached(&mut cut, layer) => return,
+        () = superseded_unfinished(&mut superseded_rx, ctl, finished) => {
             ctl.cut(layer, Some(DropCause::Superseded), spec);
             return;
         }
-        () = expiry(spec) => {
+        () = &mut expire => {
             ctl.cut(layer, Some(DropCause::Expired), spec);
             return;
         }
@@ -931,16 +993,16 @@ async fn run_layer(
     loop {
         let item = tokio::select! {
             biased;
-            () = cut_reached(ctl, layer) => {
+            () = cut_reached(&mut cut, layer) => {
                 stream.reset(codes::CANCELED);
                 return;
             }
-            () = superseded_unfinished(ctl, finished) => {
+            () = superseded_unfinished(&mut superseded_rx, ctl, finished) => {
                 stream.reset(codes::CANCELED);
                 ctl.cut(layer, Some(DropCause::Superseded), spec);
                 return;
             }
-            () = expiry(spec) => {
+            () = &mut expire => {
                 stream.reset(codes::CANCELED);
                 ctl.cut(layer, Some(DropCause::Expired), spec);
                 return;
@@ -949,16 +1011,17 @@ async fn run_layer(
         };
         match item {
             Some(SegItem::Chunk(chunk)) => {
+                let len = chunk.len();
                 // The write first: supersession only takes a write that has
                 // to wait.
                 let written = tokio::select! {
                     biased;
-                    written = stream.write_all(&chunk) => Ok(written),
-                    () = cut_reached(ctl, layer) => Err(None),
-                    () = superseded(ctl) => Err(Some(DropCause::Superseded)),
-                    () = expiry(spec) => Err(Some(DropCause::Expired)),
+                    written = stream.write_chunk(chunk) => Ok(written),
+                    () = cut_reached(&mut cut, layer) => Err(None),
+                    () = superseded(&mut superseded_rx) => Err(Some(DropCause::Superseded)),
+                    () = &mut expire => Err(Some(DropCause::Expired)),
                 };
-                release(queued, chunk.len(), budget);
+                release(queued, len, budget);
                 match written {
                     Ok(Ok(())) => {}
                     // The receiver refused the stream or went away.
@@ -985,13 +1048,13 @@ async fn run_layer(
                 // accepted after FIN until then.
                 tokio::select! {
                     biased;
-                    () = cut_reached(ctl, layer) => stream.reset(codes::CANCELED),
-                    () = expiry(spec) => {
+                    () = cut_reached(&mut cut, layer) => stream.reset(codes::CANCELED),
+                    () = &mut expire => {
                         stream.reset(codes::CANCELED);
                         ctl.cut(layer, Some(DropCause::Expired), spec);
                     }
                     _ = stream.stopped() => {}
-                    () = finish_grace_over(ctl, spec) => {
+                    () = finish_grace_over(&mut superseded_rx, ctl, spec) => {
                         stream.reset(codes::CANCELED);
                         ctl.cut(layer, Some(DropCause::Superseded), spec);
                     }
@@ -1011,6 +1074,10 @@ async fn run_layer(
 /// segment number and, above layer 0, the layer (key `14`); the stream gets
 /// its layer-major priority before any byte is queued, the only time
 /// `quinn` guarantees it takes effect.
+///
+/// The header is checked before any stream opens: a header the decoder or the
+/// peer's `max_header_bytes` refuses would close the connection every transfer
+/// on it shares, so it is refused here with `LimitExceeded`.
 async fn open_layer(spec: &CopySpec, layer: u8) -> Result<SendHalf, Error> {
     let header = DataHeader {
         topic: Some(spec.topic.to_string()),
@@ -1018,8 +1085,105 @@ async fn open_layer(spec: &CopySpec, layer: u8) -> Result<SendHalf, Error> {
         layer: (layer > 0).then_some(layer),
         ..DataHeader::addressed(spec.path.as_ref())
     };
+    let frame = Frame::of(&header)?;
+    frame.fits(&spec.conn)?;
     let mut stream = spec.conn.open_uni().await?;
     stream.set_priority(copy_priority(layer, spec.priority));
-    write_data_preamble(&mut stream, &header).await?;
+    stream.write_chunk(frame.bytes).await?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn topic(name: &str) -> Arc<str> {
+        Arc::from(name)
+    }
+
+    /// A copy whose layer tasks are still running, as far as the table sees.
+    fn in_flight() -> Arc<CopyCtl> {
+        Arc::new(CopyCtl::new(false))
+    }
+
+    /// Ends a copy as its last holder does: its handle count drops to zero.
+    fn end(copy: &CopyCtl) {
+        copy.handles.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    #[test]
+    fn numbers_evict_the_oldest_key_and_keep_the_rest_counting() {
+        let numbers = SegmentNumbers::new(2);
+        let path = topic("path");
+        let (a, b, c) = (topic("a"), topic("b"), topic("c"));
+        assert_eq!(numbers.next(&path, &a), 0);
+        assert_eq!(numbers.next(&path, &b), 0);
+        assert_eq!(numbers.next(&path, &b), 1);
+        // `c` evicts `a`, the oldest, which reached 0: the floor becomes 1.
+        assert_eq!(numbers.next(&path, &c), 1);
+        // `b` is not evicted and carries on from its own count.
+        assert_eq!(numbers.next(&path, &b), 2);
+    }
+
+    #[test]
+    fn a_key_that_comes_back_resumes_above_every_evicted_number() {
+        let numbers = SegmentNumbers::new(1);
+        let path = topic("path");
+        let (a, b) = (topic("a"), topic("b"));
+        assert_eq!(numbers.next(&path, &a), 0);
+        assert_eq!(numbers.next(&path, &a), 1);
+        assert_eq!(numbers.next(&path, &a), 2);
+        // `b` evicts `a`, which reached 2: the floor becomes 3.
+        assert_eq!(numbers.next(&path, &b), 3);
+        // `a` evicts `b`, which reached 3: `a` resumes above it, at 4.
+        assert_eq!(numbers.next(&path, &a), 4);
+    }
+
+    #[test]
+    fn topics_evict_the_oldest_idle_topic_and_resume_above_it() {
+        let topics = SegmentTopics::new(2);
+        let (a, b, c) = (topic("a"), topic("b"), topic("c"));
+        assert_eq!(topics.next(&a).ok(), Some(0));
+        assert_eq!(topics.next(&a).ok(), Some(1));
+        assert_eq!(topics.next(&b).ok(), Some(0));
+        // `a` is the oldest and idle: it goes, and the floor is its next, 2.
+        assert_eq!(topics.next(&c).ok(), Some(2));
+        // `b` is the oldest and goes; the floor stays at 2, above its 1.
+        assert_eq!(topics.next(&a).ok(), Some(2));
+    }
+
+    #[test]
+    fn topics_keep_a_topic_with_a_copy_in_flight() {
+        let topics = SegmentTopics::new(2);
+        let (a, b, c) = (topic("a"), topic("b"), topic("c"));
+        assert_eq!(topics.next(&a).ok(), Some(0));
+        assert_eq!(topics.next(&a).ok(), Some(1));
+        let copy = in_flight();
+        topics.track(&a, &copy);
+        assert_eq!(topics.next(&b).ok(), Some(0));
+        // `a` is the oldest but has a copy in flight, so `b` goes: the floor
+        // is `b`'s next, 1.
+        assert_eq!(topics.next(&c).ok(), Some(1));
+        // `a` keeps its count, and its next segment supersedes the copy.
+        assert_eq!(topics.next(&a).ok(), Some(2));
+        assert!(copy.is_superseded());
+    }
+
+    #[test]
+    fn topics_refuse_a_new_topic_while_all_have_a_copy_in_flight() {
+        let topics = SegmentTopics::new(2);
+        let (a, b, c) = (topic("a"), topic("b"), topic("c"));
+        assert_eq!(topics.next(&a).ok(), Some(0));
+        assert_eq!(topics.next(&b).ok(), Some(0));
+        let (copy_a, copy_b) = (in_flight(), in_flight());
+        topics.track(&a, &copy_a);
+        topics.track(&b, &copy_b);
+        assert!(topics.next(&c).is_err());
+        // A topic already in the table still takes its number at the cap.
+        assert_eq!(topics.next(&b).ok(), Some(1));
+        // `a`'s copy has ended, so `a` is idle and goes first; the floor is
+        // its next, 1.
+        end(&copy_a);
+        assert_eq!(topics.next(&c).ok(), Some(1));
+    }
 }

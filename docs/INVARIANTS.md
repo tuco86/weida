@@ -63,8 +63,8 @@ one feature, and the reasoning the table cannot carry.
 | header memory per connection, worst case | `max_header_bytes * (max_concurrent_uni_streams + max_concurrent_bidi_streams)` = **48 MiB** | the product of the caps above ([PROTOCOL.md](PROTOCOL.md) §10) |
 | accepted connections | `max_connections` per binding | excess connections are closed immediately with `LIMIT_EXCEEDED` |
 | connections one peer may hold | `max_connections_per_peer` (64), counted by the fingerprint the peer proved and released when a connection closes | the accept loop. One connection per dialled path lets the dialling side choose the count, which is why the bound exists. Connections that proved no identity are each their own peer, because two anonymous connections cannot be shown to be one, and are bounded only by `max_connections` |
-| subscriptions | `max_subscriptions` filters per connection, each at most 256 B | the connection is closed with `LIMIT_EXCEEDED` past the cap, and its subscriptions are dropped wholesale when it closes ([PROTOCOL.md](PROTOCOL.md) §6.4) |
-| payload queued for one subscriber | `subscriber_buffer_bytes` | the publisher drops and counts a copy that does not fit |
+| subscriptions | `max_subscriptions` filters per connection, each at most 256 B | the connection is closed with `LIMIT_EXCEEDED` past the cap. The registry keeps them under the connection's own record, and they are dropped wholesale when it closes, visiting only the paths that connection holds; a path nobody holds a filter on is not in the registry at all, so a peer that names paths grows nothing that outlives it ([PROTOCOL.md](PROTOCOL.md) §6.4). Matching a message costs its topic's segments and its matches however many exact or `#`-ending filters are held; only filters with a `*` segment are tested one by one, which is what the per-connection cap bounds |
+| payload queued for one subscriber | `subscriber_buffer_bytes`, **per connection**, over every path it subscribes to | the publisher drops and counts a copy that does not fit. A subscriber is a connection, so subscribing to many paths multiplies nothing, and withdrawing and subscribing again does not hand the connection a second budget beside what the first still has queued |
 | gap-detector and reassembler scopes | `max_sequence_scopes` (1024) per connection | a new scope at the cap is left untracked rather than inserted |
 | reassembly hold | `max_reorder_hold` (256) transfers over all scopes | at the cap the oldest held transfer is released out of order with its gap reported, never by growing; a held transfer is an unread stream, so the bytes it pins are quinn's and are bounded again by `connection_receive_window` |
 | deduplication identities | `max_dedup_entries` (4096) per connection, and the negotiated window in time | the oldest entry is evicted at the cap, so a peer that sends fast buys itself missed suppression rather than memory |
@@ -77,6 +77,7 @@ one feature, and the reasoning the table cannot carry.
 | a report order | `MAX_REPORT_LEVELS` (16) | the decoder, before the level vector is reserved; a non-ascending or repeated level is refused rather than stored, so the order costs at most sixteen `u64` pairs however many a peer writes |
 | a CURSOR stream's reader | `MAX_CURSOR_RECORD_LEN` (16 B) | one 64-byte read buffer plus at most one partial record, because a record is self-delimiting and applied as soon as it is whole; the set it fills is a **fixed** `[(u64, u64); 16]` that allocates nothing |
 | a CURSOR stream naming a `report_id` this side never handed out | no state at all | the stream is reset with `CANCELED` before the first record is read ([PROTOCOL.md](PROTOCOL.md) §6.7), which keeps the report table bounded by the `Cursors` handles this side holds rather than by what a peer sends |
+| the handoff a successor takes over | `MAX_HELD_DATAGRAMS` (4096) datagrams of at most `MAX_HELD_DATAGRAM_BYTES` (1500) each | `handoff::decode` refuses more, a larger datagram and a destination no client has (multicast, broadcast, unspecified, port 0), before anything is sent; the predecessor's held socket keeps no more than the same. The bytes still need the integrity of the channel that carries them ([decisions/0039](decisions/0039-handover-says-when.md)) |
 
 **Datagram flows and RADIO/DISH are inside this invariant with a cap each**
 ([decisions/0034](decisions/0034-late-is-lost.md)). `datagram_receive_bytes` (0 by default,
@@ -97,7 +98,10 @@ with no copy in flight; a copy has at most `MAX_SEGMENT_LAYERS` (16) layer strea
 at most 64 queued chunks, all charged against one budget: a dish's `subscriber_buffer_bytes`
 exactly as a subscriber's are, or for `Peer::segment` the `Peer`'s, over all its segments.
 `Radio::dish_drops` holds one record per joined dish connection, removed with it, so at most
-`max_connections`. DATA key `14` and SUBSCRIBE key `3` are refused above 15 at the decoder
+`max_connections`. A datagram flow a dish refuses waits out a backoff, 100 ms doubling to 30 s
+(`FLOW_BACKOFF_START`, `FLOW_BACKOFF_MAX`), before the radio opens another for its topic, so a dish
+that refuses every flow costs a bounded number of stream opens. DATA key `14` and SUBSCRIBE key `3`
+are refused above 15 at the decoder
 ([decisions/0037](decisions/0037-layered-segments.md) §4.3).
 
 **The chain a peer presented is inside this invariant with a cap of its own**

@@ -167,6 +167,18 @@ pub struct RuntimeConfig {
     /// [`GuaranteeSet::backpressure`], because a puller has no say in how
     /// its pusher waits.
     pub outbox_full: OutboxFull,
+    /// How long the body of one received transfer may take, from the moment
+    /// its header was read to the end of the body, where the library collects
+    /// that body for the caller: the blocking receives of `weida::blocking`
+    /// and `weida serve`. Expiry ends that transfer only, which stops
+    /// its stream, and the receive fails with [`Error::Expired`].
+    ///
+    /// The failure this prevents is one peer parking a single-threaded
+    /// consumer. A peer that sends a header and then stalls, or sends one byte
+    /// inside every idle window, keeps `idle_timeout` from ever firing, so the
+    /// consumer would receive nothing from anyone else for as long as that
+    /// connection chose. `None` waits as long as the peer likes.
+    pub receive_timeout: Option<Duration>,
 }
 
 impl Default for RuntimeConfig {
@@ -188,6 +200,7 @@ impl Default for RuntimeConfig {
             outbox_messages: 1000,
             outbox_full: OutboxFull::default(),
             outbox_bytes: 8 * 1024 * 1024,
+            receive_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
