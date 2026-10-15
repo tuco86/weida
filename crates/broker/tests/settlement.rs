@@ -184,6 +184,44 @@ async fn a_reported_delivery_leaves_the_queue_and_frees_its_bytes() {
     );
 }
 
+/// `Processed` is a byte cursor, "consumed up to byte N": progress through a
+/// message is not the message being processed, and deleting it then would
+/// lose it if the consumer failed before the end. Only an offset that covers
+/// the whole body settles.
+#[tokio::test]
+async fn progress_through_a_body_does_not_settle_it() {
+    let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
+    let producer = harness.producer("/jobs").await;
+    let (_consumer_rt, consumer) = harness.consumer("/jobs", 1).await;
+
+    harness.fill(&producer, 1).await;
+    let (body, mut reporter) = take_keeping(&consumer).await;
+    harness
+        .until(DEADLINE, || harness.unsettled("/jobs") == 1)
+        .await;
+
+    reporter
+        .report(PROCESSED, body.len() as u64 - 1)
+        .await
+        .expect("report progress");
+    tokio::time::sleep(SILENCE).await;
+    assert_eq!(
+        harness.unsettled("/jobs"),
+        1,
+        "a consumer one byte short of the end has not processed the message"
+    );
+    assert!(harness.charged("/jobs") > 0, "the queue still owes it");
+
+    reporter
+        .report(PROCESSED, body.len() as u64)
+        .await
+        .expect("report the end");
+    harness
+        .until(DEADLINE, || harness.unsettled("/jobs") == 0)
+        .await;
+    assert_eq!(harness.charged("/jobs"), 0);
+}
+
 /// The claim settlement exists for: a consumer that dies without reporting
 /// gives the message back, and another consumer gets it.
 #[tokio::test]

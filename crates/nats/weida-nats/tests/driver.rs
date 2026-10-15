@@ -183,6 +183,21 @@ async fn close_ends_a_connection_whose_peer_stopped_reading() {
     publisher.abort();
 }
 
+/// When `close` returns, the connection already reports itself over: a
+/// caller that checks `state()` or reuses the handle next must not see a
+/// usable connection whose transport is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_returns_only_once_the_state_says_closed() {
+    for _ in 0..50 {
+        let (nats, _server) = connected(Server::listen().await, PLAIN_INFO, options()).await;
+        tokio::time::timeout(DEADLINE, nats.close())
+            .await
+            .expect("close returned")
+            .expect("closing never fails");
+        assert_eq!(nats.state(), State::Closed);
+    }
+}
+
 /// Everything queued between two writes goes out together, and goes out whole
 /// and in the order it was queued.
 #[tokio::test]

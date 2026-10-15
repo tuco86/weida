@@ -102,6 +102,7 @@ pub(crate) fn spawn(served: &Served, dispatch: Dispatch) {
             // an outcome.
             _ = &mut cancelled => return,
         };
+        let length = body.len() as u64;
         drop(body);
         match sent {
             Ok(Some(cursors)) => {
@@ -109,7 +110,7 @@ pub(crate) fn spawn(served: &Served, dispatch: Dispatch) {
                 // Sent before the watcher exists, so the queue's loop sees the
                 // write end before it can see the delivery settle.
                 if events.send(Event::Written(id)).await.is_ok() {
-                    tokio::spawn(watch(id, cursors, cancelled, events));
+                    tokio::spawn(watch(id, length, cursors, cancelled, events));
                 }
             }
             // No cursors means the header carried no report, which cannot
@@ -256,8 +257,15 @@ async fn send(
 /// for as long as the queue holds the delivery: when `cancelled` resolves the
 /// entry is gone, nothing is owed an outcome, and the task ends and releases
 /// the report entry it holds.
+///
+/// `Processed` is a byte cursor — "consumed up to byte N" — so the delivery
+/// settles when the offset reaches the end of the body, `length`. A consumer
+/// that reports progress through a large message has not finished with it,
+/// and deleting the message then would lose it if the consumer failed before
+/// the end.
 async fn watch(
     delivery: DeliveryId,
+    length: u64,
     mut cursors: Cursors,
     mut cancelled: oneshot::Receiver<()>,
     events: mpsc::Sender<Event>,
@@ -266,10 +274,12 @@ async fn watch(
         tokio::select! {
             _ = &mut cancelled => return,
             changed = cursors.changed() => match changed {
-                Some(set) if set.offset(SETTLEMENT).is_some() => break Event::Settled(delivery),
-                // A level the delivery did not order, or an offset that moved
-                // on a level that is not this one: not a settlement, keep
-                // reading.
+                Some(set) if set.offset(SETTLEMENT).is_some_and(|offset| offset >= length) => {
+                    break Event::Settled(delivery);
+                }
+                // A level the delivery did not order, an offset that has not
+                // reached the end of the body, or one that moved on a level
+                // that is not this one: not a settlement, keep reading.
                 Some(_) => continue,
                 None => break Event::Lost(delivery),
             },

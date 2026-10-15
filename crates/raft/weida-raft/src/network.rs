@@ -183,13 +183,29 @@ impl Target {
             .await?;
         let (mut transfer, reply) = self.requester.open(TransferMeta::default()).await?;
         let len = u32::try_from(header.len()).map_err(|_| weida::Error::LimitExceeded)?;
-        transfer.write_all(&len.to_be_bytes()).await?;
-        transfer.write_all(header).await?;
-        if let Some(data) = snapshot {
-            transfer.write_all(data).await?;
+        let write = async {
+            transfer.write_all(&len.to_be_bytes()).await?;
+            transfer.write_all(header).await?;
+            if let Some(data) = snapshot {
+                transfer.write_all(data).await?;
+            }
+            transfer.finish()
+        };
+        let read = async { reply.recv().await?.collect(max_reply).await };
+        tokio::pin!(write, read);
+        // The peer may answer before it has read the request: a snapshot
+        // under a vote it would refuse is answered at once, and it stops the
+        // request half as it does, which fails this write. The answer is
+        // what the exchange came to, so it is read while the write is still
+        // going and not after it, and a write that failed leaves the reply
+        // to say why.
+        let mut writing = true;
+        loop {
+            tokio::select! {
+                reply = &mut read => return reply,
+                _ = &mut write, if writing => writing = false,
+            }
         }
-        transfer.finish()?;
-        reply.recv().await?.collect(max_reply).await
     }
 }
 
@@ -344,9 +360,21 @@ impl RaftNetwork<TypeConfig> for Peer {
         option: RPCOption,
     ) -> Result<SnapshotResponse<NodeId>, StreamingError<TypeConfig, Fatal<NodeId>>> {
         let Snapshot { meta, snapshot } = snapshot;
-        let header = codec::encode_rpc(&Rpc::Snapshot { vote, meta });
         // The whole buffer, whatever position the cursor was left at.
         let data = snapshot.get_ref().as_slice();
+        // The follower reads up to its cap and refuses what is over, so a
+        // snapshot over the cap is sent for nothing, and again at every
+        // retry. The follower's cap is not known here; the group's is taken
+        // to be this node's own (see `ConsensusConfig::max_snapshot_bytes`).
+        let max = self.network.inner.config.max_snapshot_bytes;
+        if data.len() > max {
+            let refused = Error::Config(format!(
+                "a snapshot of {} bytes is over max_snapshot_bytes ({max})",
+                data.len()
+            ));
+            return Err(Failure::Unreachable(Unreachable::new(&refused)).into());
+        }
+        let header = codec::encode_rpc(&Rpc::Snapshot { vote, meta });
         let call = self.exchange(
             RPCTypes::InstallSnapshot,
             &header,
@@ -377,7 +405,213 @@ fn entries_that_fit(entries: u64, size: usize, max: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::entries_that_fit;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use openraft::metrics::RaftMetrics;
+    use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+    use openraft::raft::VoteRequest;
+    use openraft::{Membership, Snapshot, SnapshotMeta, StoredMembership, Vote};
+    use tokio::sync::watch;
+    use weida::{Alpn, ClientTls, Fingerprint, Identity, Runtime, RuntimeConfig, Trust};
+
+    use super::{Network, entries_that_fit};
+    use crate::{Consensus, ConsensusConfig, MemoryStore, Node, NodeId, TypeConfig};
+
+    fn loopback() -> ConsensusConfig {
+        ConsensusConfig::new("127.0.0.1:0".parse().expect("loopback address"))
+    }
+
+    /// A node that is named and not there.
+    fn node(n: u8) -> Node {
+        Node::new(format!(
+            "weida://{}@127.0.0.1:9/raft",
+            Fingerprint::from_bytes([n; 32])
+        ))
+        .expect("a well-formed node")
+    }
+
+    /// A dialling half with a fresh identity, and the metrics it is told.
+    fn network(
+        runtime: &Runtime,
+        config: ConsensusConfig,
+    ) -> (Network, NodeId, watch::Sender<RaftMetrics<NodeId, Node>>) {
+        let identity = Identity::generate().expect("identity");
+        let id = NodeId::from(identity.fingerprint().expect("fingerprint"));
+        let network = Network::new(
+            id,
+            runtime.clone(),
+            ClientTls::new(Trust::by_address())
+                .with_identity(identity)
+                .with_alpn(Alpn::Raft),
+            Arc::new(config),
+        );
+        let (metrics, receiver) = watch::channel(RaftMetrics::new_initial(id));
+        network.attach(receiver);
+        (network, id, metrics)
+    }
+
+    /// `metrics` as they are when the group lists exactly `listed`.
+    fn listing(metrics: &watch::Sender<RaftMetrics<NodeId, Node>>, listed: &[u8]) {
+        let nodes: BTreeMap<NodeId, Node> = listed
+            .iter()
+            .map(|n| (NodeId([*n; 32]), node(*n)))
+            .collect();
+        let voters: BTreeSet<NodeId> = nodes.keys().copied().collect();
+        metrics.send_modify(|m| {
+            m.membership_config = Arc::new(StoredMembership::new(
+                None,
+                Membership::new(vec![voters], nodes),
+            ));
+        });
+    }
+
+    fn targets(network: &Network) -> BTreeSet<NodeId> {
+        network
+            .inner
+            .targets
+            .lock()
+            .expect("the target map is never poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn snapshot_of(bytes: usize) -> Snapshot<TypeConfig> {
+        Snapshot {
+            meta: SnapshotMeta::default(),
+            snapshot: Box::new(Cursor::new(vec![0; bytes])),
+        }
+    }
+
+    /// A learner that came and went must not keep a requester and its
+    /// connection for the life of the process: making the next target drops
+    /// the ones the group no longer lists, and leaves the ones it does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_the_group_no_longer_lists_is_dropped_when_the_next_is_made() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let (network, _, metrics) = network(&runtime, loopback());
+        listing(&metrics, &[1, 2]);
+
+        let one = network.target(NodeId([1; 32]), &node(1)).expect("target 1");
+        network.target(NodeId([2; 32]), &node(2)).expect("target 2");
+        assert_eq!(
+            targets(&network),
+            BTreeSet::from([NodeId([1; 32]), NodeId([2; 32])])
+        );
+
+        listing(&metrics, &[1]);
+        network.target(NodeId([3; 32]), &node(3)).expect("target 3");
+        assert_eq!(
+            targets(&network),
+            BTreeSet::from([NodeId([1; 32]), NodeId([3; 32])]),
+            "2 left the group and is dropped; 1 is listed and kept; 3 is the one being made"
+        );
+        let again = network.target(NodeId([1; 32]), &node(1)).expect("target 1");
+        assert!(
+            Arc::ptr_eq(&one, &again),
+            "a listed target keeps its requester"
+        );
+    }
+
+    /// A snapshot over the cap is not streamed: the follower would read up to
+    /// its cap and refuse it, at every retry. It is refused where it is
+    /// offered, before the peer is even dialled, as a failure openraft backs
+    /// off from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_snapshot_over_the_cap_is_not_streamed() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let mut config = loopback();
+        config.max_snapshot_bytes = 1024;
+        let (mut network, id, _metrics) = network(&runtime, config);
+        let mut peer = network.new_client(NodeId([1; 32]), &node(1)).await;
+        let option = RPCOption::new(Duration::from_secs(5));
+
+        let refused = peer
+            .full_snapshot(
+                Vote::new_committed(1, id),
+                snapshot_of(1025),
+                std::future::pending(),
+                option.clone(),
+            )
+            .await;
+        match refused {
+            Err(openraft::error::StreamingError::Unreachable(e)) => {
+                assert!(e.to_string().contains("max_snapshot_bytes"), "{e}");
+            }
+            other => panic!("expected a refusal to back off from, got {other:?}"),
+        }
+        assert!(targets(&network).is_empty(), "the peer was dialled");
+
+        // At the cap it is sent, which here means the peer is dialled (and is
+        // not there).
+        let sent = peer
+            .full_snapshot(
+                Vote::new_committed(1, id),
+                snapshot_of(1024),
+                std::future::pending(),
+                option,
+            )
+            .await;
+        assert!(sent.is_err());
+        assert_eq!(targets(&network).len(), 1, "a snapshot at the cap is sent");
+    }
+
+    /// The answer a follower gives a stale leader without reading the body of
+    /// its snapshot is the one thing that tells that leader to step down, and
+    /// the follower stops the request half as it gives it. A snapshot larger
+    /// than the stream window is still being written then, so the answer is
+    /// read while the write goes on, not after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_vote_answer_reaches_a_leader_still_writing_the_body() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let store = MemoryStore::default();
+        let follower = Consensus::start(
+            &runtime,
+            Identity::generate().expect("identity"),
+            store.clone(),
+            store,
+            loopback(),
+        )
+        .await
+        .expect("start the follower");
+        let (mut network, id, _metrics) = network(&runtime, loopback());
+        let mut peer = network.new_client(follower.id(), follower.node()).await;
+        let option = RPCOption::new(Duration::from_secs(10));
+
+        // The follower holds a vote at term 5.
+        let held = peer
+            .vote(
+                VoteRequest {
+                    vote: Vote::new(5, id),
+                    last_log_id: None,
+                },
+                option.clone(),
+            )
+            .await
+            .expect("a vote")
+            .vote;
+        assert_eq!(held.leader_id.term, 5);
+
+        // A snapshot under term 1, four times the default stream window.
+        let answered = tokio::time::timeout(
+            Duration::from_secs(10),
+            peer.full_snapshot(
+                Vote::new_committed(1, id),
+                snapshot_of(4 << 20),
+                std::future::pending(),
+                option,
+            ),
+        )
+        .await
+        .expect("the exchange ended")
+        .expect("the stale-vote answer was read");
+        assert_eq!(answered.vote, held);
+
+        follower.shutdown().await;
+    }
 
     #[test]
     fn the_hint_follows_the_bytes() {

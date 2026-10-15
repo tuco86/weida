@@ -84,6 +84,11 @@ pub const MAX_MESSAGE_BYTES: usize = 1024;
 /// append: one more byte and every follower refuses the envelope, for ever.
 pub const ENTRY_ENVELOPE_OVERHEAD: usize = 512;
 
+/// What the reply to a forwarded write weighs beyond the state machine's
+/// answer, as an upper bound: the map header, three small keys and values and
+/// the byte-string header of an answer of any length.
+pub(crate) const REPLY_ENVELOPE_OVERHEAD: usize = 32;
+
 /// The smallest [`ConsensusConfig::max_rpc_bytes`](crate::ConsensusConfig::max_rpc_bytes)
 /// a node starts with.
 ///
@@ -294,6 +299,7 @@ const FAIL_RAFT: u64 = 4;
 const FAIL_INVALID_NODE: u64 = 5;
 const FAIL_REQUEST_TOO_LARGE: u64 = 6;
 const FAIL_TOO_MANY_NODES: u64 = 7;
+const FAIL_RESPONSE_TOO_LARGE: u64 = 8;
 
 /// Encodes a request envelope.
 pub(crate) fn encode_rpc(rpc: &Rpc) -> Vec<u8> {
@@ -643,6 +649,10 @@ pub(crate) fn decode_forward_outcome(b: &[u8]) -> Result<ForwardOutcome, DecodeE
                         none(&[message.is_some()])?;
                         Error::TooManyNodes
                     }
+                    FAIL_RESPONSE_TOO_LARGE => {
+                        none(&[message.is_some()])?;
+                        Error::ResponseTooLarge
+                    }
                     FAIL_RAFT => Error::Raft(message.ok_or(DecodeError::MissingKey(6))?),
                     FAIL_INVALID_NODE => {
                         Error::InvalidNode(message.ok_or(DecodeError::MissingKey(6))?)
@@ -664,6 +674,7 @@ fn failure_parts(error: &Error) -> (u64, Option<String>) {
         Error::NoLeader => (FAIL_NO_LEADER, None),
         Error::RequestTooLarge => (FAIL_REQUEST_TOO_LARGE, None),
         Error::TooManyNodes => (FAIL_TOO_MANY_NODES, None),
+        Error::ResponseTooLarge => (FAIL_RESPONSE_TOO_LARGE, None),
         Error::InvalidNode(text) => (
             FAIL_INVALID_NODE,
             Some(truncate(text, MAX_MESSAGE_BYTES).to_owned()),
@@ -1958,12 +1969,36 @@ mod tests {
 
     #[test]
     fn the_leaders_refusals_cross_the_wire_by_name() {
-        for error in [Error::RequestTooLarge, Error::TooManyNodes] {
+        for error in [
+            Error::RequestTooLarge,
+            Error::TooManyNodes,
+            Error::ResponseTooLarge,
+        ] {
             let name = error.to_string();
             match rt_outcome(&ForwardOutcome::Failed(error)) {
                 ForwardOutcome::Failed(back) => assert_eq!(back.to_string(), name),
                 other => panic!("not a failure: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn a_reply_weighs_less_than_its_answer_plus_the_overhead() {
+        // The leader refuses an answer that would not fit under the
+        // forwarder's cap once enveloped, so the constant has to be what the
+        // encoder writes, at every width of the byte-string header.
+        for answer in [0usize, 1, 23, 24, 255, 256, 65_535, 65_536, 1 << 20] {
+            let reply =
+                encode_forward_outcome(&ForwardOutcome::Done(Done::Written(Response(vec![
+                    0xab;
+                    answer
+                ]))))
+                .len();
+            assert!(
+                reply <= answer + REPLY_ENVELOPE_OVERHEAD,
+                "an answer of {answer} bytes made a reply of {reply}, more than the \
+                 {REPLY_ENVELOPE_OVERHEAD} the leader allows for"
+            );
         }
     }
 }

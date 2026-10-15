@@ -1531,10 +1531,10 @@ impl Driver {
         match self.closing.take() {
             Some(closing) => {
                 let _ = exec.within(write_timeout, writer.shutdown()).await;
+                self.state.send_replace(outcome);
                 if let Some(done) = closing.done {
                     let _ = done.send(());
                 }
-                self.state.send_replace(outcome);
             }
             None => {
                 self.state.send_replace(outcome);

@@ -445,14 +445,22 @@ async fn read_rpc(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use openraft::raft::{AppendEntriesRequest, VoteRequest};
-    use openraft::{CommittedLeaderId, LogId, SnapshotMeta, Vote};
-    use weida::{Alpn, ClientTls, Identity, Runtime, RuntimeConfig, TransferMeta, Trust};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership, SnapshotMeta, Vote};
+    use tokio::io::AsyncReadExt;
+    use weida::{
+        Alpn, ClientTls, ClientTrust, Fingerprint, Identity, Limits, Runtime, RuntimeConfig,
+        ServerTls, TransferMeta, Trust,
+    };
 
     use crate::codec::{self, Rpc};
-    use crate::{Consensus, ConsensusConfig, MemoryStore, NodeId, Request};
+    use crate::network::{Done, ForwardOutcome};
+    use crate::{Consensus, ConsensusConfig, Error, MemoryStore, Node, NodeId, Request, Response};
 
     /// Sends one RPC and returns the reply.
     async fn send(requester: &weida::Requester, rpc: &Rpc) -> Result<Vec<u8>, weida::Error> {
@@ -813,5 +821,270 @@ mod tests {
 
         learner.shutdown().await;
         voter.shutdown().await;
+    }
+
+    /// A key outside the group is refused in a task of its own, from a pool
+    /// of its own, because that refusal waits on the outsider's own
+    /// flow-control credit. An outsider that never takes its refusals —
+    /// here its receive window is smaller than the frame, and it never
+    /// reads — stalls every refusal in the pool, and the next outsider
+    /// request is dropped instead of waiting. None of it touches what a
+    /// member needs: the member's forwarded write is served beside them,
+    /// from handler permits the outsider never held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stalled_outsider_refusals_do_not_keep_a_member_from_being_served() {
+        fn quick() -> ConsensusConfig {
+            let mut config = loopback();
+            config.heartbeat_interval = Duration::from_millis(100);
+            config.election_timeout_min = Duration::from_millis(300);
+            config.election_timeout_max = Duration::from_millis(1500);
+            config.max_concurrent_rpcs = 2;
+            config
+        }
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let leader = start(&runtime, quick()).await;
+        leader.bootstrap().await.expect("bootstrap");
+        leads(&leader).await;
+        let member = start(&runtime, quick()).await;
+        leader
+            .add_node(member.node().clone())
+            .await
+            .expect("add the member");
+        let id = leader.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while member.leader() != Some(id) {
+            assert!(Instant::now() < deadline, "the member never saw the leader");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The outsider takes nothing it is sent beyond a few bytes.
+        let outsider = Runtime::new(RuntimeConfig {
+            limits: Limits {
+                stream_receive_window: 1,
+                ..Limits::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime of the outsider");
+        let (x_id, requester) = stranger(&outsider, &leader).await;
+        let mut held = Vec::new();
+        for _ in 0..(super::MAX_REFUSALS * 2) {
+            let (mut transfer, reply) =
+                requester.open(TransferMeta::default()).await.expect("open");
+            transfer
+                .write_all(&(1u32 << 20).to_be_bytes())
+                .await
+                .expect("the length prefix");
+            held.push((transfer, reply));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The pool is spent: the next outsider is not queued behind it.
+        let started = Instant::now();
+        let dropped = send(&requester, &vote_by(x_id)).await;
+        assert!(
+            matches!(dropped, Err(weida::Error::NoReply)),
+            "an outsider over the pool of refusals is dropped, got {dropped:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // And the member is served all the while.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            member.write(Request(b"beside the stalled".to_vec())),
+        )
+        .await
+        .expect("the member's write was answered")
+        .expect("the member's write committed");
+
+        drop(held);
+        member.shutdown().await;
+        leader.shutdown().await;
+    }
+
+    /// A scripted peer on the raft path: it answers the requests it gets, in
+    /// order, with the bytes it was given.
+    struct Script {
+        node: Node,
+        requests: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+        _listener: weida::Listener,
+        _binding: weida::Binding,
+    }
+
+    async fn scripted(runtime: &Runtime, identity: Identity, replies: Vec<Vec<u8>>) -> Script {
+        let listener = runtime.listener();
+        let replier = listener.replier(crate::RAFT_PATH).expect("replier");
+        let binding = listener
+            .bind_quic(
+                "127.0.0.1:0".parse().expect("loopback address"),
+                ServerTls::new(identity.clone())
+                    .require_client(ClientTrust::AnyKey)
+                    .with_alpn(Alpn::Raft),
+            )
+            .await
+            .expect("bind");
+        let node = Node::new(format!(
+            "weida://{}@{}/raft",
+            identity.fingerprint().expect("fingerprint"),
+            binding.local_addr()
+        ))
+        .expect("a node");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            let mut replies = replies.into_iter();
+            while let Ok(mut request) = replier.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut sink = Vec::new();
+                let _ = request.body().read_to_end(&mut sink).await;
+                let Some(reply) = replies.next() else {
+                    request.refuse(weida::ErrorCode::Rejected).await;
+                    continue;
+                };
+                let mut out = request
+                    .reply(TransferMeta::default())
+                    .await
+                    .expect("the reply opens");
+                out.write_all(&reply).await.expect("the reply is written");
+                out.finish().expect("the reply ends");
+            }
+        });
+        Script {
+            node,
+            requests,
+            task,
+            _listener: listener,
+            _binding: binding,
+        }
+    }
+
+    /// A node that a redirect names, at an address nobody may be sent to: a
+    /// UDP socket that sees every packet a dial would send.
+    async fn trap(id: NodeId) -> (tokio::net::UdpSocket, Node) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a socket");
+        let node = Node::new(format!(
+            "weida://{}@{}/raft",
+            Fingerprint::from(id),
+            socket.local_addr().expect("its address")
+        ))
+        .expect("a node");
+        (socket, node)
+    }
+
+    async fn untouched(socket: &tokio::net::UdpSocket) -> bool {
+        let mut packet = [0u8; 64];
+        tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut packet))
+            .await
+            .is_err()
+    }
+
+    /// A peer that says "the leader is over there" is naming a node, and it
+    /// is not the authority on where that node lives: the follower resolves
+    /// the name through the membership its own group agreed on. A redirect
+    /// that names a listed node at another address is followed to the listed
+    /// address; one that names a node the follower does not list is not
+    /// followed at all, and nothing is sent to the address it wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redirect_is_followed_by_name_and_never_by_the_address_it_carries() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let follower = start(&runtime, loopback()).await;
+
+        // The leader the follower is told of is a script. It is made known to
+        // the follower the way a real leader is: an append that carries the
+        // membership naming it, sent under its own key.
+        let identity = Identity::generate().expect("identity of the leader");
+        let s_id = NodeId::from(identity.fingerprint().expect("fingerprint"));
+        let (trap_socket, trap_of_s) = trap(s_id).await;
+        let u_id = NodeId([0x55; 32]);
+        let (stray_socket, trap_of_u) = trap(u_id).await;
+        let redirect = |node: &Node| {
+            codec::encode_forward_outcome(&ForwardOutcome::ForwardToLeader(Some(node.clone())))
+        };
+        let answered = codec::encode_forward_outcome(&ForwardOutcome::Done(Done::Written(
+            Response(b"ok".to_vec()),
+        )));
+        let script = scripted(
+            &runtime,
+            identity.clone(),
+            vec![redirect(&trap_of_s), answered, redirect(&trap_of_u)],
+        )
+        .await;
+
+        let requester = runtime.requester(
+            ClientTls::new(Trust::by_address())
+                .with_identity(identity)
+                .with_alpn(Alpn::Raft),
+        );
+        requester
+            .connect(&follower.node().url)
+            .await
+            .expect("connect");
+        let first = LogId::new(CommittedLeaderId::new(1, s_id), 0);
+        let membership = Membership::new(
+            vec![BTreeSet::from([s_id])],
+            BTreeMap::from([
+                (s_id, script.node.clone()),
+                (follower.id(), follower.node().clone()),
+            ]),
+        );
+        let append = Rpc::AppendEntries(AppendEntriesRequest {
+            vote: Vote::new_committed(1, s_id),
+            prev_log_id: None,
+            entries: vec![Entry {
+                log_id: first,
+                payload: EntryPayload::Membership(membership),
+            }],
+            leader_commit: Some(first),
+        });
+        let reply = send(&requester, &append).await.expect("an append");
+        codec::decode_append_response(&reply).expect("an AppendEntriesResponse");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while follower.leader() != Some(s_id) {
+            assert!(
+                Instant::now() < deadline,
+                "the follower never saw its leader"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Told "the leader is S, at the trap", it asks S where the group
+        // lists it, and is answered there.
+        let written = tokio::time::timeout(
+            Duration::from_secs(10),
+            follower.write(Request(b"one".to_vec())),
+        )
+        .await
+        .expect("the write finished")
+        .expect("followed to S by its listed address");
+        assert_eq!(written.0, b"ok");
+        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+        assert!(
+            untouched(&trap_socket).await,
+            "the written address was dialled"
+        );
+
+        // Told "the leader is U", which it does not list, it follows nothing.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            follower.write(Request(b"two".to_vec())),
+        )
+        .await
+        .expect("the write finished");
+        assert!(matches!(refused, Err(Error::NoLeader)), "{refused:?}");
+        assert_eq!(
+            script.requests.load(Ordering::SeqCst),
+            3,
+            "only the first hop of the second write was made"
+        );
+        assert!(
+            untouched(&stray_socket).await,
+            "a node nobody listed was dialled"
+        );
+
+        script.task.abort();
+        follower.shutdown().await;
     }
 }

@@ -228,6 +228,12 @@ pub enum Error {
     /// replicated entry: the followers would refuse it, and a leader that
     /// appended it could commit neither it nor anything behind it.
     RequestTooLarge,
+    /// A write that committed, whose answer from the state machine would not
+    /// fit [`ConsensusConfig::max_rpc_bytes`] as the reply to a forwarded
+    /// request. The leader refuses to return it to anyone, so that a write
+    /// gives the same answer whichever node it is made on: a node that
+    /// forwarded it could not receive the answer. The write itself stands.
+    ResponseTooLarge,
     /// The group already lists [`codec::MAX_MEMBERS`] nodes, the most a
     /// follower decodes.
     TooManyNodes,
@@ -252,6 +258,9 @@ impl fmt::Display for Error {
             Error::NoLeader => f.write_str("no leader is known"),
             Error::RequestTooLarge => f.write_str(
                 "the request does not fit one replicated entry under max_rpc_bytes",
+            ),
+            Error::ResponseTooLarge => f.write_str(
+                "the write committed, but its answer does not fit one reply under max_rpc_bytes",
             ),
             Error::TooManyNodes => write!(
                 f,
@@ -336,6 +345,11 @@ pub struct ConsensusConfig {
     /// commit it or anything behind it. That is
     /// [`codec::ENTRY_ENVELOPE_OVERHEAD`] bytes less than this number.
     ///
+    /// The same number bounds the answer to a forwarded write, which the
+    /// forwarding node collects under it: a leader whose state machine
+    /// answers with more refuses to return it, to its own caller as much as
+    /// to a forwarder, with [`Error::ResponseTooLarge`].
+    ///
     /// The guard is necessary and not sufficient. It keeps out what a
     /// follower would refuse for its size; it cannot know how fast the
     /// link to a follower is, and openraft gives an AppendEntries only
@@ -357,6 +371,11 @@ pub struct ConsensusConfig {
     /// reading its body, so a node holds at most twice this number — more
     /// while the buffer grows — for snapshots. A snapshot offered while two
     /// are being received is refused with `Rejected`.
+    ///
+    /// A leader cannot learn a follower's value, so it takes its own as the
+    /// group's: a snapshot larger than this is not streamed at all, where
+    /// every follower would read up to the cap and refuse it, and the same
+    /// again at every retry. Give every node of a group the same value.
     pub max_snapshot_bytes: usize,
     /// How long a forwarded request or a read barrier may take, and, at
     /// half of it, how long [`Consensus::add_node`] waits for a new node to

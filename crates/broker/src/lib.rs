@@ -56,9 +56,11 @@
 //! reports on a cursor stream and the delivery stays a one-way transfer. The
 //! message moves from the queue to an `unsettled` table and keeps its charge
 //! against `queue_bytes`: it may come back, so it is memory the queue still
-//! owes. When the consumer reports `Processed` the message is dropped and its
-//! charge released. When the report ends without it (the reporter finishes,
-//! the stream is reset, or the connection goes away) the message is requeued
+//! owes. When the consumer reports `Processed` up to the end of the body (a
+//! byte cursor: a smaller offset is progress, not completion) the message is
+//! dropped and its charge released. When the report ends without it (the
+//! reporter finishes, the stream is reset, or the connection goes away) the
+//! message is requeued
 //! and any consumer with credit may take it. A subscription with
 //! [`BrokerConfig::max_unsettled`] deliveries outstanding is given no more,
 //! and neither is a connection with [`BrokerConfig::max_unsettled_per_consumer`]

@@ -164,6 +164,34 @@ fn a_deadline_expires_without_disturbing_the_connection() {
     server.finished();
 }
 
+/// A deadline of `Duration::MAX` — "wait for ever" as a caller writes it — is
+/// not an `Instant + Duration` that overflows and panics: it waits, and the
+/// delivery that arrives is returned.
+#[test]
+fn a_deadline_of_duration_max_waits_instead_of_overflowing() {
+    let server = ScriptedServer::start(vec![vec![
+        Act::Send(connack(Properties::new())),
+        Act::Idle(Duration::from_millis(200)),
+        Act::Send(delivery("room/12", b"late")),
+        Act::Expect,
+    ]]);
+
+    let context = BlockingContext::owned(1).expect("a reactor");
+    let (client, mut deliveries) = context
+        .connect(&server.address, options())
+        .expect("connects");
+
+    let delivered = deliveries
+        .recv_timeout(Duration::MAX)
+        .expect("a delivery, with no deadline to speak of");
+    assert_eq!(delivered.payload, &b"late"[..]);
+
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .expect("disconnects");
+    server.finished();
+}
+
 /// A refusal the facade inherits rather than re-derives: the server declared
 /// `Retain Available` 0 and a retained publish never reaches the wire.
 ///

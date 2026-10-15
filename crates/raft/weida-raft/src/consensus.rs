@@ -174,7 +174,9 @@ impl Consensus {
     /// entry in an AppendEntries, would not fit
     /// [`ConsensusConfig::max_rpc_bytes`](crate::ConsensusConfig::max_rpc_bytes):
     /// the followers refuse such an entry, so a leader that appended it could
-    /// never commit it or anything behind it.
+    /// never commit it or anything behind it. A write whose answer would not
+    /// fit one reply under the same limit commits and is refused with
+    /// [`Error::ResponseTooLarge`], on every node alike.
     pub async fn write(&self, request: Request) -> Result<Response, Error> {
         match self.on_leader(ForwardOp::Write(request)).await? {
             Done::Written(response) => Ok(response),
@@ -473,6 +475,16 @@ impl Ops {
                     return ForwardOutcome::Failed(Error::RequestTooLarge);
                 }
                 match self.raft.client_write(request).await {
+                    // The forwarder collects the reply under the same cap, so
+                    // the leader judges it the same way: an answer a forwarder
+                    // could not take is not handed to the leader's own caller
+                    // either, and a write has one outcome on every node.
+                    Ok(written)
+                        if written.data.0.len() + codec::REPLY_ENVELOPE_OVERHEAD
+                            > self.max_rpc_bytes =>
+                    {
+                        ForwardOutcome::Failed(Error::ResponseTooLarge)
+                    }
                     Ok(written) => ForwardOutcome::Done(Done::Written(written.data)),
                     Err(e) => self.write_failed(e),
                 }
@@ -762,18 +774,24 @@ fn unexpected(done: Done) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fmt::Debug;
     use std::ops::RangeBounds;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
-    use openraft::{Entry, LogId, RaftLogReader, StorageError, StorageIOError, Vote};
+    use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine};
+    use openraft::{
+        ChangeMembers, Entry, EntryPayload, LogId, RaftLogReader, Snapshot, SnapshotMeta,
+        StorageError, StorageIOError, StoredMembership, Vote,
+    };
     use tokio::time::timeout;
-    use weida::{Identity, Runtime, RuntimeConfig};
+    use weida::{Fingerprint, Identity, Runtime, RuntimeConfig};
 
-    use crate::{Consensus, ConsensusConfig, Error, MemoryStore, NodeId, Request, TypeConfig};
+    use crate::{
+        Consensus, ConsensusConfig, Error, MemoryStore, Node, NodeId, Request, Response, TypeConfig,
+    };
 
     /// A log that fails every `append` once `fail` is set.
     #[derive(Clone)]
@@ -898,49 +916,42 @@ mod tests {
         consensus.shutdown().await;
     }
 
-    /// A change of voters is two committed entries, and a caller that stops
-    /// waiting between them must not leave the group in the joint
-    /// configuration. Here the new voters cannot commit the first entry —
-    /// two learners that were replicating are gone — and the caller gives up;
-    /// once they are back the change must end uniform without anybody asking
-    /// again.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_change_of_voters_whose_caller_gave_up_still_ends_uniform() {
-        use weida::Fingerprint;
+    fn quick(listen: &str) -> ConsensusConfig {
+        let mut config = ConsensusConfig::new(listen.parse().expect("loopback address"));
+        config.heartbeat_interval = Duration::from_millis(100);
+        config.election_timeout_min = Duration::from_millis(300);
+        config.election_timeout_max = Duration::from_millis(600);
+        config.forward_timeout = Duration::from_secs(1);
+        config
+    }
 
-        use crate::Node;
+    fn listen_of(node: &Node) -> String {
+        let authority = node.url.split('@').nth(1).expect("an authority");
+        authority.split('/').next().expect("a host").to_owned()
+    }
 
-        fn quick(listen: &str) -> ConsensusConfig {
-            let mut config = ConsensusConfig::new(listen.parse().expect("loopback address"));
-            config.heartbeat_interval = Duration::from_millis(100);
-            config.election_timeout_min = Duration::from_millis(300);
-            config.election_timeout_max = Duration::from_millis(600);
-            config.forward_timeout = Duration::from_secs(1);
-            config
-        }
-        fn listen_of(node: &Node) -> String {
-            let authority = node.url.split('@').nth(1).expect("an authority");
-            authority.split('/').next().expect("a host").to_owned()
-        }
-        async fn configs(consensus: &Consensus) -> usize {
-            consensus
-                .ops
-                .raft
-                .with_raft_state(|st| {
-                    st.membership_state
-                        .effective()
-                        .membership()
-                        .get_joint_config()
-                        .len()
-                })
-                .await
-                .expect("the engine runs")
-        }
+    /// How many configs the node's effective membership holds: two while a
+    /// change of voters is between its entries.
+    async fn configs(consensus: &Consensus) -> usize {
+        consensus
+            .ops
+            .raft
+            .with_raft_state(|st| {
+                st.membership_state
+                    .effective()
+                    .membership()
+                    .get_joint_config()
+                    .len()
+            })
+            .await
+            .expect("the engine runs")
+    }
 
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    /// A one-member group whose only member leads.
+    async fn leader(runtime: &Runtime) -> Consensus {
         let store = MemoryStore::default();
         let a = Consensus::start(
-            &runtime,
+            runtime,
             Identity::generate().expect("identity"),
             store.clone(),
             store,
@@ -954,44 +965,95 @@ mod tests {
             assert!(Instant::now() < deadline, "the node never led");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        a
+    }
 
-        // Two learners that replicate, added without the promotion that
-        // `add_node` would make, and then stopped. The leader still counts
-        // them as replicating: what it knows is what they last matched.
-        let mut gone = Vec::new();
-        for _ in 0..2 {
-            let identity = Identity::generate().expect("identity");
-            let store = MemoryStore::default();
-            let node_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-            let node = Consensus::start(
-                &node_runtime,
-                identity.clone(),
-                store.clone(),
-                store.clone(),
-                quick("127.0.0.1:0"),
+    /// What a stopped node needs to come back as it was.
+    struct Gone {
+        identity: Identity,
+        store: MemoryStore,
+        listen: String,
+    }
+
+    /// A learner of `leader`, added without the promotion `add_node` would
+    /// make, that replicates, and is then stopped. The leader still counts it
+    /// as replicating: what it knows is what the learner last matched.
+    async fn a_learner_that_replicated_and_left(leader: &Consensus) -> Gone {
+        let identity = Identity::generate().expect("identity");
+        let store = MemoryStore::default();
+        let node_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let node = Consensus::start(
+            &node_runtime,
+            identity.clone(),
+            store.clone(),
+            store.clone(),
+            quick("127.0.0.1:0"),
+        )
+        .await
+        .expect("start");
+        leader
+            .ops
+            .raft
+            .add_learner(node.id(), node.node().clone(), false)
+            .await
+            .expect("added as a learner");
+        let id = node.id();
+        leader
+            .ops
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| super::replicating(metrics, &id, 1000),
+                "a learner replicates",
             )
             .await
-            .expect("start");
-            a.ops
-                .raft
-                .add_learner(node.id(), node.node().clone(), false)
-                .await
-                .expect("added as a learner");
-            let id = node.id();
-            a.ops
-                .raft
-                .wait(Some(Duration::from_secs(10)))
-                .metrics(
-                    |metrics| super::replicating(metrics, &id, 1000),
-                    "a learner replicates",
-                )
-                .await
-                .expect("the learner replicates");
-            let listen = listen_of(node.node());
-            node.shutdown().await;
-            node_runtime.shutdown().await;
-            gone.push((identity, store, listen));
+            .expect("the learner replicates");
+        let listen = listen_of(node.node());
+        node.shutdown().await;
+        node_runtime.shutdown().await;
+        Gone {
+            identity,
+            store,
+            listen,
         }
+    }
+
+    /// The node that stopped, started again on its port.
+    async fn comes_back(gone: &Gone, runtime: &Runtime) -> Consensus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // The port of the node that stopped may take a moment to be free.
+            match Consensus::start(
+                runtime,
+                gone.identity.clone(),
+                gone.store.clone(),
+                gone.store.clone(),
+                quick(&gone.listen),
+            )
+            .await
+            {
+                Ok(back) => return back,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "the node never came back: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    /// A change of voters is two committed entries, and a caller that stops
+    /// waiting between them must not leave the group in the joint
+    /// configuration. Here the new voters cannot commit the first entry —
+    /// two learners that were replicating are gone — and the caller gives up;
+    /// once they are back the change must end uniform without anybody asking
+    /// again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_change_of_voters_whose_caller_gave_up_still_ends_uniform() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let a = leader(&runtime).await;
+
+        let first = a_learner_that_replicated_and_left(&a).await;
+        let second = a_learner_that_replicated_and_left(&a).await;
 
         // A third node that never answers, so the call has something to add:
         // it promotes the two that are gone and waits for the first entry to
@@ -1009,27 +1071,8 @@ mod tests {
         assert_eq!(configs(&a).await, 2, "the joint configuration is appended");
 
         // They come back; nobody asks again.
-        let (identity, store, listen) = gone.remove(0);
         let back_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let back = loop {
-            // The port of the node that stopped may take a moment to be free.
-            match Consensus::start(
-                &back_runtime,
-                identity.clone(),
-                store.clone(),
-                store.clone(),
-                quick(&listen),
-            )
-            .await
-            {
-                Ok(back) => break back,
-                Err(e) => {
-                    assert!(Instant::now() < deadline, "the node never came back: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        };
+        let back = comes_back(&first, &back_runtime).await;
         let deadline = Instant::now() + Duration::from_secs(10);
         while configs(&a).await != 1 {
             assert!(
@@ -1039,7 +1082,197 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        drop(second);
         back.shutdown().await;
+        a.shutdown().await;
+    }
+
+    /// A group left in a joint configuration — by a leader that was replaced
+    /// or a process that stopped between the two entries of a change, or by
+    /// anything that drove the engine directly — looks uniform to every
+    /// reader and quietly needs a majority of both configs for every commit.
+    /// The next membership change finds it and ends it first: here a
+    /// removal of a node that is not a member, which changes nothing of its
+    /// own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_next_change_ends_a_joint_configuration_it_finds() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let a = leader(&runtime).await;
+        let gone = a_learner_that_replicated_and_left(&a).await;
+
+        // The first entry of a change that makes the learner a voter; it
+        // cannot commit with the learner away, and the caller leaves before
+        // the second entry is proposed, as openraft's own API allows.
+        let gone_id = NodeId::from(gone.identity.fingerprint().expect("fingerprint"));
+        let both = BTreeSet::from([a.id(), gone_id]);
+        let left = timeout(
+            Duration::from_secs(1),
+            a.ops
+                .raft
+                .change_membership(ChangeMembers::ReplaceAllVoters(both), false),
+        )
+        .await;
+        assert!(left.is_err(), "the first entry cannot commit yet");
+        assert_eq!(configs(&a).await, 2, "the joint configuration is appended");
+
+        // The learner is back and the first entry commits; nothing proposes
+        // the second.
+        let back_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let back = comes_back(&gone, &back_runtime).await;
+        let joint = a.ops.raft.metrics().borrow().last_log_index;
+        a.ops
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(joint, "the joint configuration is committed")
+            .await
+            .expect("the first entry commits once the learner is back");
+        assert_eq!(configs(&a).await, 2, "nothing but the next change ends it");
+
+        timeout(Duration::from_secs(10), a.remove_node(NodeId([77; 32])))
+            .await
+            .expect("the removal finished")
+            .expect("removing a node that is not a member succeeds");
+        assert_eq!(configs(&a).await, 1, "the joint configuration was ended");
+        let voters = a
+            .ops
+            .raft
+            .with_raft_state(|st| {
+                st.membership_state
+                    .effective()
+                    .voter_ids()
+                    .collect::<BTreeSet<_>>()
+            })
+            .await
+            .expect("the engine runs");
+        assert_eq!(
+            voters.len(),
+            2,
+            "the change that was begun is the one ended"
+        );
+
+        back.shutdown().await;
+        a.shutdown().await;
+    }
+
+    /// [`MemoryStore`] as a state machine whose answer to the request `big`
+    /// is `answer` bytes long.
+    #[derive(Clone)]
+    struct Chatty {
+        store: MemoryStore,
+        answer: usize,
+    }
+
+    impl RaftStateMachine<TypeConfig> for Chatty {
+        type SnapshotBuilder = MemoryStore;
+
+        async fn applied_state(
+            &mut self,
+        ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, Node>), StorageError<NodeId>>
+        {
+            self.store.applied_state().await
+        }
+
+        async fn apply<I>(&mut self, entries: I) -> Result<Vec<Response>, StorageError<NodeId>>
+        where
+            I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+        {
+            let entries: Vec<_> = entries.into_iter().collect();
+            let big: Vec<bool> = entries
+                .iter()
+                .map(|entry| matches!(&entry.payload, EntryPayload::Normal(r) if r.0 == b"big"))
+                .collect();
+            let mut answers = self.store.apply(entries).await?;
+            for (answer, big) in answers.iter_mut().zip(big) {
+                if big {
+                    answer.0 = vec![7; self.answer];
+                }
+            }
+            Ok(answers)
+        }
+
+        async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+            self.store.get_snapshot_builder().await
+        }
+
+        async fn begin_receiving_snapshot(
+            &mut self,
+        ) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<NodeId>> {
+            self.store.begin_receiving_snapshot().await
+        }
+
+        async fn install_snapshot(
+            &mut self,
+            meta: &SnapshotMeta<NodeId, Node>,
+            snapshot: Box<std::io::Cursor<Vec<u8>>>,
+        ) -> Result<(), StorageError<NodeId>> {
+            self.store.install_snapshot(meta, snapshot).await
+        }
+
+        async fn get_current_snapshot(
+            &mut self,
+        ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+            self.store.get_current_snapshot().await
+        }
+    }
+
+    /// A write whose answer would not fit the reply the forwarder collects
+    /// has one outcome on every node: the leader judges the answer by the
+    /// forwarder's cap, so its own caller is refused as a forwarded one is,
+    /// where it used to return the answer to itself and fail the follower
+    /// with an error that read as a transport failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_a_forwarder_could_not_take_is_refused_on_every_node() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let node = |runtime: &Runtime| {
+            let runtime = runtime.clone();
+            async move {
+                let mut config = quick("127.0.0.1:0");
+                config.max_rpc_bytes = crate::codec::MIN_RPC_BYTES;
+                let store = MemoryStore::default();
+                let state = Chatty {
+                    store: store.clone(),
+                    answer: crate::codec::MIN_RPC_BYTES + 1,
+                };
+                Consensus::start(
+                    &runtime,
+                    Identity::generate().expect("identity"),
+                    store,
+                    state,
+                    config,
+                )
+                .await
+                .expect("start")
+            }
+        };
+        let a = node(&runtime).await;
+        a.bootstrap().await.expect("bootstrap");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.leader() != Some(a.id()) {
+            assert!(Instant::now() < deadline, "the node never led");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let b = node(&runtime).await;
+        a.add_node(b.node().clone()).await.expect("add the learner");
+        while b.leader() != Some(a.id()) {
+            assert!(
+                Instant::now() < deadline,
+                "the learner never saw the leader"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        for (name, node) in [("the leader", &a), ("a forwarder", &b)] {
+            let refused = node.write(Request(b"big".to_vec())).await;
+            assert!(
+                matches!(refused, Err(Error::ResponseTooLarge)),
+                "{name}: {refused:?}"
+            );
+            node.write(Request(b"small".to_vec()))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: the group still answers: {e}"));
+        }
+
+        b.shutdown().await;
         a.shutdown().await;
     }
 }
