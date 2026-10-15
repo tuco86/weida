@@ -33,38 +33,41 @@
 //! would have accepted" and "will the kernel store this path without
 //! truncating it".
 //!
-//! # An endpoint is not stolen, which libzmq's is
+//! # An endpoint is taken over, as libzmq's is
 //!
 //! `zmq_ipc(7)`: "if a second process binds to an endpoint already bound by a
 //! process, this will succeed and the first process will lose its binding. In
 //! this behaviour, the `ipc` transport is not consistent with the `tcp` or
-//! `inproc` transports" (`docs/research/zeromq.md` §8). **This library does
-//! not reproduce that.** A socket file outlives the process that created it,
-//! so a bind has to replace a stale node or the endpoint would be unbindable
-//! for good after a crash; but a node that something answers on is a live
-//! binding, and `weida-runtime` tells the two apart by connecting to it. A
-//! live node is refused with `EADDRINUSE`, as `tcp` and `inproc` refuse a
-//! second bind, and only a node nobody listens on is replaced. A program
-//! ported from libzmq that takes an endpoint over by binding it again gets
-//! an error instead, which is the one deliberate difference.
+//! `inproc` transports" (`docs/research/zeromq.md` §8). **This library
+//! reproduces that**, because a program ported from libzmq may rely on it to
+//! replace a running peer. A socket file outlives the process that created
+//! it, so a bind has to replace a stale node or the endpoint would be
+//! unbindable for good after a crash; here a node that something answers on
+//! is replaced the same way ([`BoundUnixSocket::bind_replacing`]), and the
+//! first binder keeps the connections it already accepted but receives no new
+//! ones. `weida-runtime`'s plain `BoundUnixSocket::bind`, which `weida` and
+//! `weida-nng` use, refuses a live listener instead.
 //!
 //! What else is done, and what is not:
 //!
 //! - **Only a socket is replaced.** Anything else at the path is refused
 //!   (`EADDRINUSE`), because a bind that deletes a caller's file is worse
 //!   than a bind that fails.
-//! - **The mode is `0600`, set after bind**, never inherited from `umask`.
+//! - **The node is bound in a private `0700` directory and renamed into
+//!   place with mode `0600`**, never visible with a mode inherited from
+//!   `umask`.
 //! - **The node is removed on drop**, so the common case never meets the
-//!   stale node at all.
-//! - **The directory is load-bearing and this library cannot fix it.** The
-//!   probe and the replacement cannot stop a process that may write the
-//!   directory from removing the node and binding its own, which closes only
-//!   "unless directory ownership and permissions prevent endpoint
-//!   substitution" (`docs/research/ipc.md` §1.2, §7). A caller putting a
-//!   socket in a world-writable directory — `/tmp` — can have its endpoint
-//!   substituted by any local user, and no check inside the process can
-//!   prevent it. Put the socket in a directory you own and nobody else may
-//!   write.
+//!   stale node at all. Only the node this binding created is removed, not
+//!   the one of a binder that took the endpoint over.
+//! - **The directory is load-bearing and this library cannot fix it.**
+//!   Nothing inside the process can stop a process that may write the
+//!   directory from removing the node and binding its own, which libzmq
+//!   closes only with "unless directory ownership and permissions prevent
+//!   endpoint substitution" (`docs/research/ipc.md` §1.2, §7). A caller
+//!   putting a socket in a world-writable directory — `/tmp` — can have its
+//!   endpoint substituted by any local user, and no check inside the process
+//!   can prevent it. Put the socket in a directory you own and nobody else
+//!   may write.
 //!
 //! # Credentials, not identity
 //!
@@ -106,14 +109,15 @@ pub struct IpcBinding {
 
 impl IpcBinding {
     /// Binds `path` with the hygiene above: the socket-type check, the
-    /// unlink, the explicit mode and the kernel's path budget.
+    /// private-directory bind and rename, the explicit mode, the kernel's
+    /// path budget, and libzmq's takeover of a live endpoint.
     ///
     /// `exec` is entered while the listener is constructed, because tokio
     /// registers a socket with the reactor as it is created and the calling
     /// thread may have none of its own.
     pub fn bind(exec: &Exec, path: &Path) -> Result<IpcBinding> {
         let _guard = exec.enter();
-        let (node, listener) = BoundUnixSocket::bind(path).map_err(ipc_error)?;
+        let (node, listener) = BoundUnixSocket::bind_replacing(path).map_err(ipc_error)?;
         Ok(IpcBinding { node, listener })
     }
 
@@ -222,8 +226,8 @@ mod tests {
 
     /// Claim: a stale socket file — the node a crash leaves behind, with
     /// nobody listening — is replaced, because otherwise the endpoint would
-    /// be permanently unbindable. A node somebody *is* listening on is not a
-    /// stale one and is refused (`tests/ipc.rs`).
+    /// be permanently unbindable. A node somebody *is* listening on is taken
+    /// over as libzmq does (`tests/ipc.rs`).
     #[tokio::test]
     async fn a_stale_node_is_replaced() {
         let exec = exec();

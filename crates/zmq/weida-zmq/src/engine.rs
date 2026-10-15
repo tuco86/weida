@@ -38,7 +38,7 @@
 //! would be a ZeroMQ implementation that speaks nothing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -465,17 +465,17 @@ const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
 /// The longest sleep between accept attempts while they keep failing.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
-/// The divisor that sizes one address's share of `max_peers`.
+/// The divisor that sizes one host's share of `max_peers`.
 const PER_ADDRESS_DIVISOR: usize = 8;
 
-/// The fewest peers one address may hold, whatever `max_peers` is.
+/// The fewest peers one host may hold, whatever `max_peers` is.
 const PER_ADDRESS_FLOOR: usize = 8;
 
 /// How often a refused connection or a failed accept is logged, per socket or
 /// per listener.
 const LOG_PERIOD: Duration = Duration::from_secs(1);
 
-/// How many accepted peers one address may hold: its `1 / PER_ADDRESS_DIVISOR`
+/// How many accepted peers one host may hold: its `1 / PER_ADDRESS_DIVISOR`
 /// share of `max_peers`, never fewer than [`PER_ADDRESS_FLOOR`] and never more
 /// than `max_peers`. A default socket admits 128 peers from one host, and a PAIR
 /// with a `max_peers` of 1 admits one.
@@ -483,6 +483,37 @@ fn per_address_cap(max_peers: usize) -> usize {
     (max_peers / PER_ADDRESS_DIVISOR)
         .max(PER_ADDRESS_FLOOR)
         .min(max_peers)
+}
+
+/// What the per-address cap counts a peer at `ip` under, or `None` for a peer
+/// it does not count.
+///
+/// An IPv4 peer is counted by its address and an IPv6 peer by its `/64`. An
+/// IPv6 host is routed a whole `/64`, so a count per address would be a count
+/// per suffix the host chooses: one host could hold every slot of the table
+/// while staying under the cap of each address it connects from. An
+/// IPv4-mapped IPv6 address — what an IPv4 client looks like to a dual-stack
+/// listener, `tcp://[::]:port` — is counted as the IPv4 address it carries, so
+/// one host is one key however it reaches the listener. This is the key
+/// `weida-nng` counts its peers under (`PeerKey::host`), so that the two
+/// libraries bound the same threat the same way.
+///
+/// Loopback is this host's own processes, which a test or a sidecar
+/// legitimately opens by the thousand, so it is not counted. It is judged on
+/// the canonical address, which is why `::ffff:127.0.0.1` is exempt like
+/// `127.0.0.1`.
+fn counted_address(ip: IpAddr) -> Option<IpAddr> {
+    let ip = ip.to_canonical();
+    if ip.is_loopback() {
+        return None;
+    }
+    Some(match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+    })
 }
 
 /// One accepted peer whose handshake has not completed.
@@ -496,18 +527,18 @@ struct Handshaking {
 }
 
 /// What the engine knows about accepted peers beyond [`EngineState`]: how many
-/// of them each address holds, and which handshakes are still running, since
-/// those are the ones a newcomer may evict. Lock order: `state`, then
+/// of them each address key holds, and which handshakes are still running,
+/// since those are the ones a newcomer may evict. Lock order: `state`, then
 /// `admission`.
 #[derive(Default)]
 struct Admission {
     /// The accepted peers whose handshake has not completed, in id order, which
     /// is admission order.
     handshaking: BTreeMap<PeerId, Handshaking>,
-    /// The address of each accepted peer that counts against the per-address
-    /// cap. Loopback peers have no entry.
+    /// The key of each accepted peer that counts against the per-address cap,
+    /// as [`counted_address`] makes it. Loopback peers have no entry.
     addresses: HashMap<PeerId, IpAddr>,
-    /// How many accepted peers each counted address holds.
+    /// How many accepted peers each key holds.
     per_address: HashMap<IpAddr, usize>,
 }
 
@@ -1301,10 +1332,11 @@ impl EngineInner {
     /// a `Pipe` of `ZMQ_SNDHWM`/`ZMQ_RCVHWM` messages per direction, so an
     /// unbounded count multiplies that product by a number a stranger picks.
     ///
-    /// One address may hold only [`per_address_cap`] of the table, so one host
-    /// cannot take every slot. A full table or a full address makes room only by
-    /// evicting a handshake that has stalled for [`HANDSHAKE_EVICT_AFTER`] as of
-    /// `now`: a silent peer gives way to a newcomer, and a live one never does.
+    /// One host may hold only [`per_address_cap`] of the table, so it cannot
+    /// take every slot; a host is what [`counted_address`] says it is. A full
+    /// table or a full host makes room only by evicting a handshake that has
+    /// stalled for [`HANDSHAKE_EVICT_AFTER`] as of `now`: a silent peer gives
+    /// way to a newcomer, and a live one never does.
     fn admit(
         &self,
         address: Option<IpAddr>,
@@ -1317,10 +1349,9 @@ impl EngineInner {
             return Admitted::SocketClosed;
         }
         let mut admission = lock_unpoisoned(&self.admission);
-        // Loopback is this host's own processes, and `ipc` and `inproc` peers
-        // have no address at all. A test or a sidecar legitimately opens
-        // thousands of these, so none of them counts against the cap.
-        let counted = address.filter(|address| !address.is_loopback());
+        // `ipc` and `inproc` peers have no address at all, and loopback is not
+        // counted: see [`counted_address`].
+        let counted = address.and_then(counted_address);
         let cap = per_address_cap(self.options.max_peers);
         let address_full = counted.is_some_and(|address| {
             admission
@@ -1511,7 +1542,8 @@ struct Accepted {
     /// The peer's address for a ZAP request: the IP of a `tcp://` peer, and
     /// empty for a local transport, which has no address to report.
     address: String,
-    /// The IP that the per-address cap counts. `None` for a local transport.
+    /// The peer's IP as the kernel reported it, from which the per-address cap
+    /// derives its key ([`counted_address`]). `None` for a local transport.
     ip: Option<IpAddr>,
     /// The kernel's statement about a local peer, where the transport has one.
     credentials: Option<weida_core::LocalPrincipal>,
@@ -3010,6 +3042,73 @@ mod tests {
             .get(&host)
             .copied();
         assert_eq!(held_by_host, Some(8), "the eviction returned its count");
+    }
+
+    /// Claim: **the per-address cap counts a host, not an address it picks.**
+    /// An IPv6 host is routed a whole `/64`, so two addresses of one `/64` are
+    /// one host; an IPv4 client of a dual-stack listener arrives as an
+    /// IPv4-mapped address and is the IPv4 address it carries; and loopback is
+    /// exempt however it is written.
+    #[tokio::test]
+    async fn the_per_address_cap_counts_a_host_and_not_the_address_it_picks() {
+        let ctx = context();
+        // The cap for 64 is 64 / 8 = 8, which is also its floor.
+        let engine = Engine::new(
+            &ctx,
+            SocketOptions {
+                max_peers: 64,
+                ..options()
+            },
+            Recorder::new(),
+        )
+        .expect("engine");
+        let now = Instant::now();
+        let admit = |address: &str| {
+            engine.inner.admit(
+                Some(address.parse().expect("address")),
+                None,
+                Pipe::new(options().pipe),
+                now,
+            )
+        };
+
+        // Eight addresses of one /64: every one is under any per-address cap.
+        for suffix in 1..=8 {
+            assert!(
+                matches!(admit(&format!("2001:db8:0:1::{suffix}")), Admitted::Peer(_)),
+                "address {suffix} of a /64 is under the cap"
+            );
+        }
+        assert!(
+            matches!(admit("2001:db8:0:1:ffff::9"), Admitted::PerAddress),
+            "a ninth address of the same /64 is the same host"
+        );
+        assert!(
+            matches!(admit("2001:db8:0:2::1"), Admitted::Peer(_)),
+            "another /64 is another host"
+        );
+
+        // An IPv4 host reaching a dual-stack listener, and reaching it plain.
+        for _ in 0..8 {
+            assert!(matches!(admit("::ffff:192.0.2.1"), Admitted::Peer(_)));
+        }
+        assert!(
+            matches!(admit("192.0.2.1"), Admitted::PerAddress),
+            "the mapped form and the plain one are one host"
+        );
+        assert!(
+            matches!(admit("::ffff:192.0.2.1"), Admitted::PerAddress),
+            "and the mapped form is held to the same count"
+        );
+
+        for loopback in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            for _ in 0..10 {
+                assert!(
+                    matches!(admit(loopback), Admitted::Peer(_)),
+                    "{loopback} is exempt from the cap"
+                );
+            }
+        }
     }
 
     /// Claim: a newcomer takes the slot of a stalled handshake and never the

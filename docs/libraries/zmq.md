@@ -80,7 +80,7 @@ is refused too, with "this library speaks tcp, ipc and inproc".
 | Transport | Verdict |
 | --- | --- |
 | `tcp://` | present — wildcard, IP literal and name forms kept apart; `ZMQ_LAST_ENDPOINT` readable after a wildcard bind; `DEFAULT_MAX_RESOLVED_ADDRESSES` = 8 caps what a name may expand to |
-| `ipc://` | present on Unix — `AF_UNIX` with an explicit mode, a socket-type check before anything is replaced, the 113-octet Linux path budget (`MAX_IPC_ENDPOINT_BYTES`), and peer credentials available to authorization. A node nobody listens on is replaced, and **a node somebody listens on is refused with `EADDRINUSE`**, where libzmq lets a second bind steal the endpoint |
+| `ipc://` | present on Unix — `AF_UNIX` bound in a private `0700` directory and renamed into place with mode `0600`, a socket-type check before anything is replaced, the 113-octet Linux path budget (`MAX_IPC_ENDPOINT_BYTES`), and peer credentials available to authorization. Parity with libzmq: a second bind of a path somebody listens on **takes the endpoint over** and the first binder loses it, as `zmq_ipc(7)` documents |
 | `inproc://` | present — context-scoped namespace, libzmq's 256-character budget (`MAX_INPROC_NAME_BYTES`), connect-before-bind working as libzmq 4.0 fixed it, and two contexts in one process never meeting |
 | `pgm://`, `epgm://` | refused with a reason: reliable multicast is out of scope until a user asks. What is missing: the multicast family, the datagram-alignment offset field and subscriber-side filtering |
 | `udp://` | refused with a reason: the multicast/datagram family is out of scope. What is missing: RADIO/DISH, which is the only pattern libzmq allows on it |
@@ -362,7 +362,7 @@ than a magic value:
 | `weida_zmtp::MAX_PROPERTIES` | 64 | properties in one `READY` or `INITIATE` dictionary. The codec bounded a property's size and not their number, so a megabyte of five-octet properties was a hundred thousand entries |
 | `MESSAGE_IVL` and `MIN_MESSAGE_RATE` | 30 s, plus 1 s per 4 KiB that arrives | how long a started message may stay incomplete, with the heartbeat on or off. The deadline moves out only by octets that arrive, so declaring a large message earns nothing and a peer that trickles one ends the connection |
 | `OUT_HIGH_WATER` | 256 KiB | the output a connection builds before it stops taking messages from its pipe, so a peer that does not read holds this much plus one batch, and the heartbeat still ends the connection |
-| `PER_ADDRESS_DIVISOR`, `PER_ADDRESS_FLOOR` | `max_peers / 8`, at least 8 | the peers one remote IP address may hold (128 at the default `max_peers`); loopback, `ipc` and `inproc` are exempt, so a local multi-process deployment is not capped |
+| `PER_ADDRESS_DIVISOR`, `PER_ADDRESS_FLOOR` | `max_peers / 8`, at least 8 | the peers one remote host may hold (128 at the default `max_peers`). A host is an IPv4 address or an IPv6 `/64` — an IPv6 host is routed a whole `/64`, and a count per address would be a count per suffix it picks — and an IPv4-mapped address, which is what an IPv4 client looks like to a dual-stack listener, counts as the IPv4 address it carries; this is the key `weida-nng` counts under. Loopback in any form, `ipc` and `inproc` are exempt, so a local multi-process deployment is not capped |
 | `HANDSHAKE_EVICT_AFTER` | 2 s | how long a handshake may stall in a full socket or address before a newcomer takes its place; a peer that completes a handshake is never evicted |
 | `ACCEPT_BACKOFF_MIN`, `ACCEPT_BACKOFF_MAX` | 10 ms, 1 s | the pause between accept attempts while they keep failing, so a descriptor ceiling slows a listener down instead of ending it or spinning on it; each failure is counted and published as `AcceptFailed`, logged at most once a second |
 
@@ -373,8 +373,10 @@ number for the `inproc` transport and the resolver.
 binds a ROUTER's routing ids to the user the ZAP handler authenticated: an announced id is
 accepted only if it is byte for byte the user id the handler returned for that connection, so
 nobody authorized as one user can squat the id of another or take it over with
-`ZMQ_ROUTER_HANDOVER`. libzmq's routing id is whatever the peer announces, and so it stays
-here until the option is set; the option needs ZAP and is refused on any other socket type.
+`ZMQ_ROUTER_HANDOVER`. A peer the ROUTER refuses — under the option, or for a routing id already
+in use — is disconnected, and a message it sent while the ROUTER was already waiting is dropped
+with it rather than delivered. libzmq's routing id is whatever the peer announces, and so it
+stays here until the option is set; the option needs ZAP and is refused on any other socket type.
 
 **One capability libzmq's API does not have.** `XPubSocket::refuse` sends 37/ZMTP's `ERROR`
 command to the subscriber whose subscription arrived last, and

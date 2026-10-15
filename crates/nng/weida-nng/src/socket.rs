@@ -355,24 +355,36 @@ impl SocketCore {
     /// Takes one message from whichever pipe has one, advancing the
     /// rotation.
     ///
-    /// A message that arrived on a pipe which has since been retired comes
-    /// first: it crossed the wire before the peer closed, and the close
-    /// does not un-arrive it (see
-    /// [`Engine::take_arrived`](crate::Engine::take_arrived)).
+    /// What arrived on pipes which have since been retired is one more
+    /// member of the rotation, taking its turn after the last pipe (see
+    /// [`Engine::take_arrived`](crate::Engine::take_arrived)): it crossed
+    /// the wire before the peer closed, and the close does not un-arrive it.
+    /// It is **not served first**. A peer that connects, sends and closes as
+    /// fast as the application receives would keep that buffer full for ever,
+    /// and every pipe behind it unread; as a member it is one share of the
+    /// rotation, as a persistent flooder is.
     ///
     /// Allocates nothing: the pipes are one shared set and a pipe with
     /// nothing queued is passed with a load.
     pub fn try_take_any(&self) -> Option<(PipeId, Message)> {
-        if let Some(arrived) = self.engine.take_arrived() {
-            return Some(arrived);
-        }
         let pipes = self.pipes();
-        if pipes.is_empty() {
+        // The leftovers have a slot only while they hold something, so a
+        // socket with none rotates over its pipes alone.
+        let slots = pipes.len() + usize::from(self.engine.has_arrived());
+        if slots == 0 {
             return None;
         }
         let start = self.cursor.load(Ordering::Relaxed);
-        for offset in 0..pipes.len() {
-            let index = (start.wrapping_add(offset)) % pipes.len();
+        for offset in 0..slots {
+            let index = (start.wrapping_add(offset)) % slots;
+            if index == pipes.len() {
+                if let Some(arrived) = self.engine.take_arrived() {
+                    // The turn after the leftovers' is the first pipe's.
+                    self.cursor.store(0, Ordering::Relaxed);
+                    return Some(arrived);
+                }
+                continue;
+            }
             let pipe = &pipes[index];
             if !pipe.incoming().has_messages() {
                 continue;

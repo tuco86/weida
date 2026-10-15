@@ -1347,6 +1347,13 @@ pub struct Wire<S> {
     /// what makes reading cancel-safe; the other half is that octets are
     /// appended only once a read has **completed** — see [`Wire::fill`].
     inbound: BytesMut,
+    /// The size of the allocation `inbound` points into, which is what a frame
+    /// sliced off it keeps alive. `BytesMut::capacity` is not that: it counts
+    /// from the front of what has been taken, so a buffer a large frame was
+    /// sliced off reports only the few kilobytes behind it. Set where the
+    /// buffer is given an allocation ([`Wire::reserve_spare`]) and zero for
+    /// none.
+    allocated: usize,
     /// Output not yet written: whole frames, appended by the `queue_*`
     /// methods and written by [`Wire::write_some`], so that everything queued
     /// between two writes goes out in one.
@@ -1389,6 +1396,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         Wire {
             io,
             inbound: BytesMut::new(),
+            allocated: 0,
             outbound: Vec::new(),
             written: 0,
             flush_due: false,
@@ -1418,10 +1426,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         self.inbound.len()
     }
 
-    /// The receive buffer's capacity.
+    /// The size of the allocation the receive buffer holds on to.
     #[cfg(test)]
     pub(crate) fn receive_capacity(&self) -> usize {
-        self.inbound.capacity()
+        self.allocated
     }
 
     /// Installs the CURVE session keys a handshake agreed, after which every
@@ -1726,11 +1734,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// payload is copied by nobody after the kernel's read; a small one is
     /// copied out, because a slice keeps the whole allocation alive for as
     /// long as it is queued and a few octets must not pin a read buffer.
+    ///
+    /// **Large is judged against the allocation** ([`Wire::allocated`]) and
+    /// not against `BytesMut::capacity`, which counts from the front of what
+    /// is left: frames taken off the front before this one are not in it. A
+    /// small frame that arrived in the slack behind a megabyte-sized one
+    /// would be a large share of that slack, and would keep the megabyte
+    /// resident for a few kilobytes of charge in whatever queue holds it.
     fn take_body(&mut self, len: usize) -> Bytes {
         if len == 0 {
             return Bytes::new();
         }
-        if len >= SLICE_MIN && len.saturating_mul(SLICE_SHARE) >= self.inbound.capacity() {
+        if len >= SLICE_MIN && len.saturating_mul(SLICE_SHARE) >= self.allocated {
             return self.inbound.split_to(len).freeze();
         }
         let body = Message::copy_of(&self.inbound[..len]).into_inner();
@@ -1746,8 +1761,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         // The slack is what keeps the last read of a large frame from finding
         // less than [`MIN_READ_SPARE`] and growing — which would copy the
         // whole frame to make room for a few octets.
-        self.inbound
-            .reserve(end - self.inbound.len() + MIN_READ_SPARE);
+        self.reserve_spare(end - self.inbound.len() + MIN_READ_SPARE);
+    }
+
+    /// Makes sure `spare` more octets fit behind what the buffer holds.
+    ///
+    /// When they do not, the buffer moves to an allocation sized for them and
+    /// what it held is copied across. It is done here rather than by
+    /// `BytesMut::reserve`, which reuses an allocation, grows it in place or
+    /// replaces it as it finds convenient and does not say which:
+    /// [`Wire::allocated`] has to be the size of the allocation the buffer
+    /// points into, and this is the one place that makes one.
+    fn reserve_spare(&mut self, spare: usize) {
+        if self.inbound.capacity() - self.inbound.len() >= spare {
+            return;
+        }
+        let mut grown = BytesMut::with_capacity(self.inbound.len() + spare);
+        grown.extend_from_slice(&self.inbound);
+        self.allocated = grown.capacity();
+        self.inbound = grown;
     }
 
     /// Bookkeeping after a message or command has been handed on.
@@ -1761,9 +1793,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         };
         self.message_origin = self.received - self.inbound.len() as u64;
         // A connection that once received a large message does not keep its
-        // buffer for the rest of its life.
-        if self.inbound.is_empty() && self.inbound.capacity() > RETAINED_BUFFER {
+        // buffer for the rest of its life. The size of the allocation is what
+        // counts: an empty buffer still points into the one a large frame was
+        // sliced off, and reports only the few kilobytes behind it.
+        if self.inbound.is_empty() && self.allocated > RETAINED_BUFFER {
             self.inbound = BytesMut::new();
+            self.allocated = 0;
         }
     }
 
@@ -1936,7 +1971,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// frames.
     async fn fill(&mut self) -> Result<()> {
         if self.inbound.capacity() - self.inbound.len() < MIN_READ_SPARE {
-            self.inbound.reserve(READ_CHUNK);
+            self.reserve_spare(READ_CHUNK);
         }
         let before = self.received;
         let read = self.io.read_buf(&mut self.inbound).await?;
@@ -3418,6 +3453,46 @@ mod tests {
             crate::message::copied_bytes(),
             before,
             "a large frame is a slice of the receive buffer"
+        );
+        assert!(
+            wire.receive_capacity() <= RETAINED_BUFFER,
+            "the empty buffer kept {} octets",
+            wire.receive_capacity()
+        );
+    }
+
+    /// Claim: **a small frame that arrives behind a large one does not keep
+    /// the large one's allocation alive.** A SUB drops a large message at a
+    /// full queue and keeps a later small one, so a small frame that was a
+    /// slice of the large frame's allocation would turn a kilobyte of queue
+    /// charge into a megabyte resident. The two arrive in one read, which
+    /// puts the small one in the slack the large one's allocation was given.
+    #[tokio::test]
+    async fn a_small_frame_behind_a_large_one_does_not_keep_its_allocation_alive() {
+        let (ours, mut theirs) = tokio::io::duplex(4 << 20);
+        let mut wire = Wire::new(ours, MessageLimits::new(2 * 1024 * 1024, 16));
+        let mut both = Multipart::single(vec![1u8; 1_000_000]).encode();
+        both.extend_from_slice(&Multipart::single(vec![2u8; 1_200]).encode());
+        theirs.write_all(&both).await.expect("write");
+
+        let Incoming::Message(large) = within(wire.read_next()).await.expect("the large message")
+        else {
+            panic!("expected a message");
+        };
+        let Incoming::Message(small) = within(wire.read_next()).await.expect("the small message")
+        else {
+            panic!("expected a message");
+        };
+        assert_eq!(small.total_bytes(), 1_200);
+
+        // The large frame ends where the slack of its allocation begins, and a
+        // slice of that slack starts inside it.
+        let large = large.frames()[0].as_slice();
+        let slack_at = large.as_ptr() as usize + large.len();
+        let small_at = small.frames()[0].as_slice().as_ptr() as usize;
+        assert!(
+            !(slack_at..slack_at + MIN_READ_SPARE).contains(&small_at),
+            "the small frame is a slice of the large frame's allocation"
         );
         assert!(
             wire.receive_capacity() <= RETAINED_BUFFER,

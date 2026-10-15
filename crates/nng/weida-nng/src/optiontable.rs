@@ -402,10 +402,11 @@ pub const OPTIONS: &[OptionRow] = &[
         name: "NNG_OPT_IPC_PERMISSIONS",
         scope: Scope::Listener,
         disposition: Disposition::Refused(Refusal::ReplacedByRuntime),
-        note: "weida-runtime binds AF_UNIX with an explicit 0600 after the bind rather than \
-               whatever umask allowed; a caller that wants the socket reachable by another \
-               user places it in a directory that says so, because the mode alone cannot \
-               close the unlink-then-bind substitution race",
+        note: "weida-runtime binds AF_UNIX in a private 0700 directory and renames it into \
+               place with mode 0600, so the node is never visible with whatever umask allowed; \
+               a caller that wants the socket reachable by another user places it in a \
+               directory that says so, because the mode alone cannot stop a user who may write \
+               the directory from renaming over the node",
     },
     // -- the transports this library does not implement ---------------
     OptionRow {

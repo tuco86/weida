@@ -419,6 +419,40 @@ mod tests {
         );
     }
 
+    /// Claim: a subscriber that held a prefix twice and left is owed **two**
+    /// unsubscribes under `ZMQ_XPUB_VERBOSE`, which handed its application
+    /// both subscribes. A proxy that forwarded each one upstream would
+    /// otherwise keep a subscription there that nobody holds.
+    #[tokio::test]
+    async fn a_departing_subscriber_owes_an_unsubscribe_for_each_subscribe_delivered() {
+        let ctx = context();
+        let mut verbose = XPubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                xpub_verbose: true,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xpub");
+        let endpoint = verbose.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| verbose.subscriber_count() == 1).await;
+        subscriber.subscribe("a").expect("one");
+        subscriber.subscribe("a").expect("two");
+        assert_eq!(next(&mut verbose).await, b"\x01a".to_vec());
+        assert_eq!(next(&mut verbose).await, b"\x01a".to_vec());
+
+        drop(subscriber);
+        assert_eq!(next(&mut verbose).await, b"\x00a".to_vec());
+        let second = verbose.recv_timeout(Duration::from_secs(2)).await;
+        assert_eq!(
+            second.map(|message| bytes(&message)).ok(),
+            Some(b"\x00a".to_vec()),
+            "the second subscribe is answered too"
+        );
+    }
+
     /// Claim: `ZMQ_XPUB_MANUAL` reports subscriptions without applying them,
     /// so the application decides what this socket matches — which is how a
     /// broker authorizes a subscription instead of honouring it.

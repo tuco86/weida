@@ -704,4 +704,44 @@ mod drop_tests {
             serving.await.expect("task");
         }
     }
+
+    /// Claim: the same holds when the replier is the side that **dialled**.
+    /// A dialled connection's session runs inside the task of its dialer, so
+    /// a close that stopped the dialers first would drop the writer before it
+    /// had taken the reply; a socket dropped with a message queued stops
+    /// dialling and still writes what it holds.
+    #[tokio::test]
+    async fn a_reply_sent_just_before_a_dialling_replier_is_dropped_is_delivered() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let options = SocketOptions {
+            recv_timeout: Some(Duration::from_secs(5)),
+            send_timeout: Some(Duration::from_secs(5)),
+            ..SocketOptions::default()
+        };
+        for round in 0..30 {
+            let req = ReqSocket::with_options(&ctx, options.clone()).expect("req");
+            let url = req
+                .listen("tcp://127.0.0.1:0")
+                .await
+                .expect("listen")
+                .url()
+                .to_string();
+            let rep = RepSocket::with_options(&ctx, options.clone()).expect("rep");
+            rep.dial(&url).await.expect("dial");
+            let serving = tokio::spawn(async move {
+                let request = rep.recv().await.expect("a request");
+                rep.send(request.body().to_vec()).await.expect("the reply");
+                // `rep` goes out of scope here, with the reply queued behind a
+                // connection it dialled.
+            });
+            let body = format!("round {round}").into_bytes();
+            req.send(body.clone()).await.expect("send");
+            let reply = req
+                .recv()
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: the reply was lost: {error}"));
+            assert_eq!(reply.body(), &body[..]);
+            serving.await.expect("task");
+        }
+    }
 }

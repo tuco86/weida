@@ -86,7 +86,7 @@ with "this library speaks tcp, tls+tcp, ipc and inproc". Every URL is bounded by
 | --- | --- |
 | `tcp://` | present — wildcard, IPv4/IPv6 literal and name forms kept apart; the bound port readable after a wildcard listen (`NNG_OPT_TCP_BOUND_PORT`, `NNG_OPT_URL`); `DEFAULT_MAX_ADDRESSES` = 8 caps what one name may expand to; Nagle off and keepalive on, both always (§5) |
 | `tls+tcp://` | present — TLS 1.2 and 1.3 over TCP through `tokio-rustls`, pure Rust, so `unsafe_code = "forbid"` survives it; the four `NNG_OPT_TLS_AUTH_MODE` values, a CA file, a certificate/key file, `NNG_OPT_TLS_SERVER_NAME`, and the peer's verification state, common name and subject alternative names readable afterwards. The server configuration is built once when the listener binds; each handshake runs in its own connection's task, after the pipe slot is reserved and under `handshake_timeout`, so a peer that says nothing stops nobody and holds one slot for at most that long; at most `max_tls_handshakes` run at once (§9) |
-| `ipc://` | present on Unix — `AF_UNIX` with unlink-then-bind, a socket-type check before unlinking, both path budgets checked (`MAX_LEGACY_IPC_PATH_BYTES` = 121 for the legacy form, and the platform's `sun_path`), and the kernel's `SO_PEERCRED` answer available as uid, gid and pid |
+| `ipc://` | present on Unix — `AF_UNIX` bound in a private `0700` directory and renamed into place with mode `0600`, a socket-type check before anything is replaced, a live listener refused with `EADDRINUSE` as NNG refuses it while a stale node is replaced, both path budgets checked (`MAX_LEGACY_IPC_PATH_BYTES` = 121 for the legacy form, and the platform's `sun_path`), and the kernel's `SO_PEERCRED` answer available as uid, gid and pid |
 | `inproc://` | present — context-scoped namespace on `weida-runtime`'s `NameRegistry`, a name bounded by `MAX_INPROC_NAME_BYTES` (`NNG_MAXADDRLEN` minus `inproc://`), a dial that waits for the bind rather than failing outright, as NNG's does, and two contexts in one process never meeting |
 | `ws://`, `wss://` | refused with a reason: the WebSocket mapping needs an HTTP server and is out of scope until a user asks. What is missing: the `Sec-WebSocket-Protocol` negotiation of the SP WebSocket mapping, its binary framing, and the four `NNG_OPT_WS*` header options (§5 here) |
 | `zt://` | refused with a reason: ZeroTier is experimental in NNG itself and its connection setup can take a minute. What is missing: the ZeroTier transport and its five options |
@@ -269,11 +269,14 @@ observable as NNG behaviour to an honest peer, and each is a row above or a sent
   the refusal is discarded, not handed to the application.
 - **What a retired pipe had already received is kept under one pipe's ceilings** — the receive
   depth in messages and 8 MiB in octets, with one message always accepted — so peers that
-  reconnect in a loop cannot grow it.
+  reconnect in a loop cannot grow it. It is received in turn with the live pipes, one share of
+  the rotation after the last pipe, and not ahead of them: a peer that connects, sends and
+  leaves as fast as the application receives would otherwise keep every pipe that stays unread.
 - **Dropping the last handle of a socket closes it**, after what is already queued for each
-  peer has been written (for at most `DEFAULT_CLOSE_BUDGET`); an explicit `close()` discards the
-  queue, as `nng_close()` does. A listener bound by a socket nobody can reach any more is not
-  kept bound.
+  peer has been written (for at most `DEFAULT_CLOSE_BUDGET`) — on a connection the socket
+  dialled as on one it accepted, and including the message a connection's writer has already
+  taken; an explicit `close()` discards the queue, as `nng_close()` does. A listener bound by
+  a socket nobody can reach any more is not kept bound.
 
 **One thing this library refuses to offer**, and it is a refusal rather than a gap: a sender
 identity (§4 here). Adding one would be a private extension no NNG peer could read.

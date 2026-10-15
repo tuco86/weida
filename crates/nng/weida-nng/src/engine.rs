@@ -371,6 +371,27 @@ struct EndpointEntry {
     task: JoinHandle<()>,
 }
 
+/// What closing a socket does to the sessions of the connections its dialers
+/// hold.
+///
+/// **A dialled connection's session is a local of its dialer's task**:
+/// `dialer_loop` awaits `run_pipe`, which awaits the session, so aborting
+/// the dialer drops the reader and the writer where they stand. An accepted
+/// connection has a task of its own, which no abort of a listener reaches,
+/// so the choice exists for dialled connections only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialedSessions {
+    /// Stopped with their dialers, with whatever the writer holds unwritten:
+    /// what `nng_close()` asks for, which discards.
+    Abort,
+    /// Left running. Closing each pipe ends its session, because the writer
+    /// finishes the message it has taken and then finds its queue closed, so
+    /// a message handed to the writer is written however soon the socket is
+    /// dropped behind it. The dialer returns when its session has, and a
+    /// dialer with no connection up has nothing to finish and is aborted.
+    Finish,
+}
+
 struct EngineState {
     pipes: HashMap<PipeId, PipeEntry>,
     /// Pipes per source, the numbers [`SocketOptions::max_pipes_per_peer`]
@@ -736,6 +757,10 @@ impl Engine {
     /// sent just before its socket went out of scope would otherwise be lost
     /// in the moment between the queue and the connection's writer. A socket
     /// with nothing queued closes on the spot.
+    ///
+    /// **This holds for a connection the socket dialled as it does for one
+    /// it accepted**, and for a message the writer has already taken as for
+    /// one still queued: see [`DialedSessions::Finish`].
     pub(crate) fn close_after_flush(&self) {
         let waiting: Vec<Pipe> = self
             .pipes()
@@ -744,22 +769,16 @@ impl Engine {
             .cloned()
             .collect();
         if waiting.is_empty() {
-            self.close();
+            self.shut(DialedSessions::Finish);
             return;
         }
-        let (dialers, listeners) = {
+        let stopped = {
             let mut state = self.lock();
             state.closed = true;
-            (
-                state.dialers.drain().collect::<Vec<_>>(),
-                state.listeners.drain().collect::<Vec<_>>(),
-            )
+            Self::take_endpoints(&mut state, DialedSessions::Finish)
         };
-        for (_, entry) in dialers {
-            entry.task.abort();
-        }
-        for (_, entry) in listeners {
-            entry.task.abort();
+        for task in stopped {
+            task.abort();
         }
         // Receivers parked on this socket find it closed now.
         self.membership_changed();
@@ -770,34 +789,61 @@ impl Engine {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let _ = engine.exec().within(left, pipe.outgoing().drained()).await;
             }
-            engine.close();
+            engine.shut(DialedSessions::Finish);
         });
     }
 
     /// `nng_close()`: stop dialling and accepting, and destroy every pipe.
     pub fn close(&self) {
-        let (dialers, listeners, pipes) = {
+        self.shut(DialedSessions::Abort);
+    }
+
+    /// Closes the socket: the endpoints stop, and every pipe is taken out of
+    /// the table and destroyed.
+    fn shut(&self, sessions: DialedSessions) {
+        let (stopped, pipes) = {
             let mut state = self.lock();
             state.closed = true;
+            // Before the pipes leave the table: which dialers hold a
+            // connection is read from it.
+            let stopped = Self::take_endpoints(&mut state, sessions);
             let pipes: Vec<PipeEntry> = state.pipes.drain().map(|(_, entry)| entry).collect();
             state.sources.clear();
             self.publish(&state);
-            (
-                state.dialers.drain().collect::<Vec<_>>(),
-                state.listeners.drain().collect::<Vec<_>>(),
-                pipes,
-            )
+            (stopped, pipes)
         };
-        for (_, entry) in dialers {
-            entry.task.abort();
-        }
-        for (_, entry) in listeners {
-            entry.task.abort();
+        for task in stopped {
+            task.abort();
         }
         for entry in pipes {
             self.finish(entry);
         }
         self.membership_changed();
+    }
+
+    /// Takes every listener and dialer out of the table and returns the tasks
+    /// that are to be aborted: all of them for [`DialedSessions::Abort`], and
+    /// for [`DialedSessions::Finish`] all but the dialers whose connection is
+    /// up, which are left running.
+    fn take_endpoints(state: &mut EngineState, sessions: DialedSessions) -> Vec<JoinHandle<()>> {
+        let mut stopped: Vec<JoinHandle<()>> = state
+            .listeners
+            .drain()
+            .map(|(_, entry)| entry.task)
+            .collect();
+        for (id, entry) in state.dialers.drain() {
+            let connected = state
+                .pipes
+                .values()
+                .any(|pipe| pipe.admitted && pipe.dialer == Some(id));
+            if sessions == DialedSessions::Finish && connected {
+                // Dropping a handle detaches its task, which is the point: the
+                // task ends by itself, see the variant's documentation.
+                continue;
+            }
+            stopped.push(entry.task);
+        }
+        stopped
     }
 
     fn dialer_handle(&self, id: DialerId, url: Endpoint) -> Dialer {
@@ -1128,9 +1174,11 @@ impl Engine {
     /// The next message that arrived on a pipe which has since been
     /// retired, if any.
     ///
-    /// A socket takes from here before it looks at its pipes: a message
-    /// that crossed the wire has arrived, and the peer closing afterwards
-    /// does not un-arrive it.
+    /// A socket takes from here as one more member of the rotation it
+    /// receives in, with a turn after its last pipe and not ahead of them: a
+    /// message that crossed the wire has arrived, and the peer closing
+    /// afterwards does not un-arrive it, but a peer that comes and goes
+    /// quickly must not keep the pipes that stay waiting behind it.
     pub fn take_arrived(&self) -> Option<(PipeId, Message)> {
         if !self.inner.has_leftovers.load(Ordering::Acquire) {
             return None;
@@ -1297,6 +1345,12 @@ async fn dialer_loop(
                     tracing::debug!(%endpoint, %error, "SP dial failed; retrying");
                 }
             }
+        }
+        // A closed socket redials nothing, and the task ends here, as soon as
+        // the connection it was running has, rather than after one more
+        // pause: the engine it holds is released with it.
+        if ctx.engine.is_closed() {
+            return;
         }
         let delay = ctx.engine.inner.options.reconnect_delay(attempt);
         attempt = attempt.saturating_add(1);
@@ -2494,5 +2548,71 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), wait)
             .await
             .expect("the wait saw the pipe arrive although it was first polled afterwards");
+    }
+
+    /// Claim: what a retired pipe left in the socket's buffer takes its turn
+    /// among the live pipes and is not served ahead of them. A peer that
+    /// connects, sends and goes as fast as the application receives would
+    /// otherwise keep that buffer full for ever, and a pipe that stays would
+    /// never be read.
+    #[tokio::test]
+    async fn what_a_retired_pipe_left_behind_takes_its_turn_among_the_live_pipes() {
+        async fn bounded<T>(step: impl Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(10), step)
+                .await
+                .expect("the step finished within 10 s")
+        }
+
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let core =
+            crate::socket::SocketCore::new(&ctx, EndpointType::Pull, SocketOptions::default())
+                .expect("pull");
+        let listener = bounded(core.listen("tcp://127.0.0.1:0"))
+            .await
+            .expect("listen");
+        let addr = listener.url().to_string();
+
+        // One peer that stays, with three messages waiting in its pipe.
+        let mut peer = bounded(tokio::net::TcpStream::connect(
+            addr.trim_start_matches("tcp://"),
+        ))
+        .await
+        .expect("connect");
+        bounded(peer.write_all(&weida_sp::ProtocolHeader::new(EndpointType::Push).encode()))
+            .await
+            .expect("our header");
+        let mut theirs = [0u8; weida_sp::HEADER_LEN];
+        bounded(peer.read_exact(&mut theirs))
+            .await
+            .expect("their header");
+        for n in 0..3 {
+            let message = weida_sp::message::encode(format!("live {n}").as_bytes());
+            bounded(peer.write_all(&message)).await.expect("a message");
+        }
+        bounded(async {
+            while !core
+                .pipes()
+                .first()
+                .is_some_and(|pipe| pipe.incoming().len() == 3)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        // And two messages from a pipe that has gone.
+        core.engine().store_arrived(
+            PipeId::new(500),
+            vec![
+                Message::from_body(b"gone 0".to_vec()),
+                Message::from_body(b"gone 1".to_vec()),
+            ],
+        );
+
+        let mut order = Vec::new();
+        while let Some((_, message)) = core.try_take_any() {
+            order.push(String::from_utf8(message.body().to_vec()).expect("utf8"));
+        }
+        assert_eq!(order, ["live 0", "gone 0", "live 1", "gone 1", "live 2"]);
     }
 }

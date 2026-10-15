@@ -820,6 +820,66 @@ mod tests {
         assert!(engine.peer(newcomer).is_some(), "and the newcomer holds it");
     }
 
+    /// Claim: **a message from a peer the table refuses is not delivered**,
+    /// even when it is taken while the ROUTER is already waiting. The first
+    /// look the table takes at such a peer is then with its message in hand,
+    /// and that look is where a routing id that is not the user's gets the
+    /// peer disconnected: what a peer policy turned away sent must not reach
+    /// the application under an id nobody gave it, and the receive goes on to
+    /// the next message.
+    #[tokio::test]
+    async fn a_message_from_a_peer_the_table_refuses_is_not_delivered() {
+        let ctx = context();
+        let router = RouterSocket::with_options(
+            &ctx,
+            SocketOptions {
+                router_bind_identity_to_user: true,
+                zap_domain: "test".to_string(),
+                reconnect_ivl: None,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("router");
+        let engine = router.core.engine().clone();
+        let (_send, mut recv) = router.split();
+        let waiting = tokio::spawn(async move { recv.recv_timeout(Duration::from_secs(5)).await });
+        // The receive reaches its wait before either peer exists.
+        tokio::task::yield_now().await;
+
+        let nowhere =
+            |port: u16| Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
+        let alpha = || Some(RoutingId::new(b"alpha".to_vec()).expect("a routing id"));
+        // Authorized as "bravo" and announcing the id of "alpha": refused.
+        let hijacker = engine.connect(&nowhere(9)).expect("connect");
+        engine.assume(hijacker, Some(ZapUserId::new("bravo")), alpha());
+        // Authorized as "alpha" and announcing it: the owner.
+        let owner = engine.connect(&nowhere(10)).expect("connect");
+        engine.assume(owner, Some(ZapUserId::new("alpha")), alpha());
+        for (peer, text) in [(hijacker, "forged"), (owner, "hello")] {
+            engine
+                .pipe_of(peer)
+                .expect("the peer's pipe")
+                .incoming()
+                .send(Multipart::single(text))
+                .await
+                .expect("queued");
+        }
+
+        let heard = waiting
+            .await
+            .expect("the receive task")
+            .expect("the owner's message");
+        assert_eq!(
+            body(&heard),
+            vec![b"alpha".to_vec(), b"hello".to_vec()],
+            "the first message heard was the refused peer's"
+        );
+        assert!(
+            engine.peer(hijacker).is_none(),
+            "the refused peer was disconnected"
+        );
+    }
+
     /// Claim: the binding is refused where it cannot work — without ZAP, where
     /// no peer would ever have a user to compare with, and on any socket type
     /// but ROUTER.

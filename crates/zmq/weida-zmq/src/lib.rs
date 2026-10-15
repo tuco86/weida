@@ -73,10 +73,11 @@
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //! - `IpcBinding` (unix only) — the `ipc` transport on `AF_UNIX`, with
-//!   `weida-runtime`'s bind hygiene (socket-type check, unlink-then-bind,
-//!   explicit `0600`, the node removed on drop), the kernel's path budget
-//!   beside libzmq's published 113, the peer's credentials captured at
-//!   connect time and kept on the [`Peer`], and the endpoint-stealing hazard
+//!   `weida-runtime`'s bind hygiene (socket-type check, a private-directory
+//!   bind renamed into place, explicit `0600`, the node removed on drop), the
+//!   kernel's path budget beside libzmq's published 113, the peer's
+//!   credentials captured at connect time and kept on the [`Peer`], and
+//!   libzmq's endpoint takeover by a second bind kept, with its hazard
 //!   documented where it lives rather than papered over.
 //! - [`Inproc`] — the `inproc` transport: a context-scoped namespace on
 //!   `weida-runtime`'s registry with libzmq's 256-character budget, a

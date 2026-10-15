@@ -21,18 +21,19 @@
 //!
 //! **The bind hygiene is `weida-runtime`'s and is not re-derived.**
 //! [`BoundUnixSocket::bind`](weida_runtime::BoundUnixSocket::bind) does the
-//! four things a filesystem endpoint needs — the `sun_path` budget, the
-//! socket-type check *before* unlinking anything, unlink-then-bind, and an
-//! explicit `0600` set after the bind rather than whatever `umask`
-//! allowed — and removes the node when the binding drops. NNG's `ipc://`
-//! has every one of those hazards; a caller of this transport inherits the
-//! answers.
+//! things a filesystem endpoint needs — the `sun_path` budget, the
+//! socket-type check *before* anything is replaced, a probe that refuses a
+//! node a live listener answers on (`EADDRINUSE`, as NNG's own `ipc://`
+//! does), a bind in a private `0700` directory followed by a `rename` over a
+//! stale node, and mode `0600` set before the node is visible rather than
+//! whatever `umask` allowed — and removes the node when the binding drops.
+//! NNG's `ipc://` has every one of those hazards; a caller of this transport
+//! inherits the answers.
 //!
-//! **The directory is load-bearing.** Unlink-then-bind opens a
-//! substitution race that only directory ownership and permissions close,
-//! so the socket belongs in a directory this process owns and no other
-//! user may write. That is a deployment property no library can enforce,
-//! and it is said here rather than nowhere.
+//! **The directory is load-bearing.** Whoever can write the directory can
+//! rename over the node afterwards, so the socket belongs in a directory this
+//! process owns and no other user may write. That is a deployment property no
+//! library can enforce, and it is said here rather than nowhere.
 
 use std::path::Path;
 

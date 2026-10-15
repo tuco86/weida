@@ -415,8 +415,9 @@ async fn forward(
 
     if broadcasts(to.raw_protocol()) {
         // A single-socket device re-broadcasting a BUS message must not
-        // reflect it to the pipe it came from (§4).
-        let broadcast = if std::ptr::eq(from, to) {
+        // reflect it to the pipe it came from (§4). The two handles are one
+        // socket when they share a core, whichever clone of it each is.
+        let broadcast = if Arc::ptr_eq(&from.core, &to.core) {
             to.send_to_all_excluding(ingress, &onward)
         } else {
             to.send_to_all(&onward)

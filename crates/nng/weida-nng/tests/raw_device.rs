@@ -7,7 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 use weida_nng::{
-    Context, ContextConfig, Error, Message, RawSocket, RepSocket, ReqSocket, SocketOptions, raw,
+    BusSocket, Context, ContextConfig, Error, Message, RawSocket, RepSocket, ReqSocket,
+    SocketOptions, raw,
 };
 use weida_sp::header::{HEADER_LEN, ProtocolHeader};
 use weida_sp::{Backtrace, EndpointType, backtrace, message};
@@ -691,4 +692,42 @@ async fn device_ends_after_closing(ctx: &Context, close_front: bool) {
         .expect("the device ends within 2 s of one of its sockets closing")
         .expect("the device task did not panic")
         .expect("the device ends without an error");
+}
+
+/// Claim: a device over **one** BUS socket does not reflect a message to the
+/// pipe it arrived on, whichever handles of that socket it is given. The
+/// exclusion is what BUS's re-broadcast owes the sender; a device that told
+/// "one socket" from "two" by the address of the handle it was passed would
+/// echo every message to its sender as soon as it was passed two clones.
+#[tokio::test]
+async fn a_device_over_one_bus_socket_does_not_echo_to_the_sender() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let hub = RawSocket::with_options(&ctx, EndpointType::Bus, options()).expect("raw bus");
+    let url = bounded(hub.listen("tcp://127.0.0.1:0"))
+        .await
+        .expect("listen")
+        .url()
+        .to_string();
+    let forwarding = spawn_device(&hub, &hub);
+
+    let near = BusSocket::with_options(&ctx, options()).expect("bus");
+    let far = BusSocket::with_options(&ctx, options()).expect("bus");
+    bounded(near.dial(&url)).await.expect("dial");
+    bounded(far.dial(&url)).await.expect("dial");
+    eventually(|| hub.pipe_count() == 2).await;
+
+    near.send(b"from near".to_vec()).expect("send");
+    let heard = bounded(far.recv()).await.expect("far hears near");
+    assert_eq!(heard.body(), b"from near");
+
+    // What was reflected to `near` would be ahead of this in its pipe, which
+    // carries the two in the order the device forwarded them.
+    far.send(b"from far".to_vec()).expect("send");
+    let heard = bounded(near.recv()).await.expect("near hears far");
+    assert_eq!(
+        heard.body(),
+        b"from far",
+        "near was handed its own message back"
+    );
+    forwarding.abort();
 }

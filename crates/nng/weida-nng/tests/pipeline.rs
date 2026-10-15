@@ -604,3 +604,57 @@ async fn a_receive_never_misses_a_pipe_that_arrives_while_it_looks() {
         .expect("the iteration finished within 5 s");
     }
 }
+
+/// A PULL peer driven by hand that **listens**: accepts one connection and
+/// exchanges protocol headers, which is what a dialling PUSH waits for.
+async fn accept_pull_peer(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    let (mut peer, _) = bounded(listener.accept()).await.expect("accept");
+    bounded(peer.write_all(&ProtocolHeader::new(EndpointType::Pull).encode()))
+        .await
+        .expect("our header");
+    let mut theirs = [0u8; HEADER_LEN];
+    bounded(peer.read_exact(&mut theirs))
+        .await
+        .expect("their header");
+    peer
+}
+
+/// Claim: a pusher that **dialled** still writes the message its writer has
+/// taken when its last handle is dropped. The writer holds the message, so
+/// nothing is queued and the drop has nothing to wait for - and the writer of
+/// a dialled connection runs inside the task of the dialer, which the drop
+/// must not stop. The message is far larger than what the kernel buffers, so
+/// that the writer is still in the middle of it when the socket goes.
+#[tokio::test]
+async fn a_dialling_pusher_dropped_mid_message_still_writes_the_whole_of_it() {
+    const BODY: usize = 32 * 1024 * 1024;
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let listener = bounded(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .await
+        .expect("bind");
+    let url = format!("tcp://{}", listener.local_addr().expect("address"));
+    let push = PushSocket::with_options(&ctx, options()).expect("push");
+    let (dialled, mut peer) = tokio::join!(bounded(push.dial(&url)), accept_pull_peer(&listener));
+    dialled.expect("dial");
+    bounded(push.send(vec![7u8; BODY]))
+        .await
+        .expect("the message is handed over");
+
+    // Octets of it have reached the peer, so the writer has taken it, and the
+    // rest is held back by the peer not reading.
+    let mut head = vec![0u8; 64 * 1024];
+    bounded(peer.read_exact(&mut head))
+        .await
+        .expect("the start of the message");
+    drop(push);
+
+    let mut rest = vec![0u8; 8 + BODY - head.len()];
+    bounded(peer.read_exact(&mut rest))
+        .await
+        .expect("the rest of the message, written after the socket was dropped");
+    assert_eq!(&head[..8], &(BODY as u64).to_be_bytes());
+    assert!(
+        rest.iter().all(|&octet| octet == 7),
+        "the message arrived whole"
+    );
+}
