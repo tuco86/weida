@@ -40,13 +40,41 @@
 //! * **Ours to answer.** A server `PING` is answered with `PONG` immediately.
 //!   The server's own `ping_interval` (2 minutes) and `max_pings_out` (2) are
 //!   its half of the rule (§11): miss enough of them and it disconnects us as
-//!   stale.
-//! * **Ours to send, and ours to bound.** This client pings on
-//!   [`ConnectionOptions::ping_interval`] and counts how many went
-//!   unanswered. At [`ConnectionOptions::max_pings_out`] the connection is
-//!   reported [`State::Failed`] rather than pinged forever — a client that
-//!   kept pinging a server that never answers has replaced a failure with a
-//!   silence, and the application would wait on it indefinitely.
+//!   stale. A `PONG` answers every `PING` that came before it, so a burst of
+//!   them is answered once while the socket is busy.
+//! * **Ours to send, and ours to bound.** This client pings every
+//!   [`ConnectionOptions::ping_interval`] — a period, not a silence timeout,
+//!   so a connection that never pauses still tests its peer — and counts how
+//!   many went unanswered. At [`ConnectionOptions::max_pings_out`] the
+//!   connection is reported [`State::Failed`] rather than pinged forever — a
+//!   client that kept pinging a server that never answers has replaced a
+//!   failure with a silence, and the application would wait on it
+//!   indefinitely.
+//!
+//! # One task reads, writes and keeps time, and none of them waits for another
+//!
+//! The driver is a single task, and a single task that `await`s a socket write
+//! is a task that cannot do anything else while the peer is not reading: no
+//! read, no `PONG`, no ping clock, nothing. A peer that stops draining the
+//! socket — a stalled link, a black hole, a server that sends `PING`s and never
+//! looks at the answers — would hold the connection, every caller waiting to
+//! publish on it and the socket itself for as long as it liked.
+//!
+//! So the driver never awaits a write. Everything it has to say is *queued*
+//! ([`OpWriter::queue`]) and the socket is offered the queue from the same
+//! `select!` that reads, takes commands and keeps the ping clock. When the
+//! queue is long the driver stops taking commands, which is how a slow peer
+//! pushes back on the callers; it never stops reading. Two clocks keep it
+//! honest: the ping clock above, and a stall clock
+//! ([`ConnectionOptions::write_timeout`]) that runs while output is waiting and
+//! is restarted whenever the socket takes anything — no progress at all for
+//! that long fails the connection with [`Error::WriteTimeout`]. Neither clock
+//! is restarted by anything else, so a busy reader or a busy publisher cannot
+//! postpone them.
+//!
+//! Everything queued between two writes goes out in one write and one flush.
+//! A caller that publishes a hundred small messages while the socket is busy
+//! costs one system call, not a hundred.
 //!
 //! # Asynchronous `INFO`
 //!
@@ -79,7 +107,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use weida_nats_codec::limits::DEFAULT_MAX_PAYLOAD;
@@ -89,6 +117,7 @@ use weida_runtime::Exec;
 use crate::error::{Error, Result};
 use crate::message::{Message, OwnedHeaders};
 use crate::options::{ConnectionOptions, Credentials, LANG, NonceSignature};
+use crate::queue::{Budget, Queued};
 use crate::request::{self, Inbox, Pending};
 use crate::subscription::{Delivered, Subscription, Table};
 use crate::transport::{self, Incoming, OpReader, OpWriter, Wire};
@@ -128,6 +157,12 @@ pub struct RemoteInfo {
     /// "If this is true, then the client must perform the TLS/1.2
     /// handshake" — before ordinary protocol exchange.
     pub tls_required: bool,
+    /// "If this is true, the server accepts TLS but does not require it": the
+    /// mixed mode a server runs in while some of its clients are not yet
+    /// encrypted. A client that wants TLS may upgrade where this is set; one
+    /// that finds neither this nor `tls_required` has been told the server
+    /// offers no TLS.
+    pub tls_available: bool,
     /// "If this is true, the client must provide a valid certificate during
     /// the TLS handshake."
     pub tls_verify: bool,
@@ -154,6 +189,7 @@ impl Default for RemoteInfo {
             headers: false,
             auth_required: false,
             tls_required: false,
+            tls_available: false,
             tls_verify: false,
             nonce: None,
             connect_urls: Vec::new(),
@@ -171,7 +207,8 @@ impl RemoteInfo {
         Ok(info)
     }
 
-    /// Applies a later `INFO` over this one.
+    /// Applies a later `INFO` over this one, and says whether anything it
+    /// stated was different from what was already known.
     ///
     /// Only the fields the server *stated* are replaced. A later `INFO` is
     /// commonly a topology notice and need not repeat the handshake's
@@ -181,57 +218,74 @@ impl RemoteInfo {
     /// `ldm` is the one field that only ever moves one way: a server that has
     /// entered Lame Duck Mode does not leave it, so a later `INFO` without
     /// the flag does not cancel the drain notice.
-    fn merge(&mut self, parsed: &ServerInfo<'_>, max_connect_urls: usize) {
-        if let Some(value) = &parsed.server_id {
-            self.server_id = Some(value.to_string());
-        }
-        if let Some(value) = &parsed.server_name {
-            self.server_name = Some(value.to_string());
-        }
-        if let Some(value) = &parsed.version {
-            self.version = Some(value.to_string());
-        }
-        if let Some(value) = parsed.proto {
-            self.proto = value;
-        }
-        if let Some(value) = &parsed.host {
-            self.host = Some(value.to_string());
-        }
-        if let Some(value) = parsed.port {
+    ///
+    /// The answer is what keeps a flood of identical `INFO` lines cheap: a
+    /// field is written only where it differs, so a repeat allocates nothing
+    /// and the caller, told that nothing changed, wakes nobody and logs
+    /// nothing.
+    fn merge(&mut self, parsed: &ServerInfo<'_>, max_connect_urls: usize) -> bool {
+        let mut changed = false;
+        changed |= replace_text(&mut self.server_id, parsed.server_id.as_deref());
+        changed |= replace_text(&mut self.server_name, parsed.server_name.as_deref());
+        changed |= replace_text(&mut self.version, parsed.version.as_deref());
+        changed |= replace(&mut self.proto, parsed.proto);
+        changed |= replace_text(&mut self.host, parsed.host.as_deref());
+        if let Some(value) = parsed.port
+            && self.port != Some(value)
+        {
             self.port = Some(value);
+            changed = true;
         }
-        if let Some(value) = parsed.max_payload {
-            self.max_payload = value;
-        }
-        if let Some(value) = parsed.headers {
-            self.headers = value;
-        }
-        if let Some(value) = parsed.auth_required {
-            self.auth_required = value;
-        }
-        if let Some(value) = parsed.tls_required {
-            self.tls_required = value;
-        }
-        if let Some(value) = parsed.tls_verify {
-            self.tls_verify = value;
-        }
-        if let Some(value) = &parsed.nonce {
-            self.nonce = Some(value.to_string());
-        }
+        changed |= replace(&mut self.max_payload, parsed.max_payload);
+        changed |= replace(&mut self.headers, parsed.headers);
+        changed |= replace(&mut self.auth_required, parsed.auth_required);
+        changed |= replace(&mut self.tls_required, parsed.tls_required);
+        changed |= replace(&mut self.tls_available, parsed.tls_available);
+        changed |= replace(&mut self.tls_verify, parsed.tls_verify);
+        changed |= replace_text(&mut self.nonce, parsed.nonce.as_deref());
         if let Some(urls) = &parsed.connect_urls {
             // Replaced rather than merged: "an `INFO` message is sent to the
             // client with an updated `connect_urls` list", so the list is the
             // topology as it now is and a client that accumulated would keep
             // servers that have left the cluster.
-            self.connect_urls = urls
-                .iter()
-                .take(max_connect_urls)
-                .map(std::string::ToString::to_string)
-                .collect();
+            let kept = urls.iter().take(max_connect_urls);
+            let same = kept
+                .clone()
+                .map(|url| &**url)
+                .eq(self.connect_urls.iter().map(String::as_str));
+            if !same {
+                self.connect_urls = kept.map(|url| url.to_string()).collect();
+                changed = true;
+            }
         }
-        if parsed.ldm == Some(true) {
+        if parsed.ldm == Some(true) && !self.lame_duck {
             self.lame_duck = true;
+            changed = true;
         }
+        changed
+    }
+}
+
+/// Stores `new` in `slot` where it is stated and different.
+fn replace<T: PartialEq>(slot: &mut T, new: Option<T>) -> bool {
+    match new {
+        Some(value) if *slot != value => {
+            *slot = value;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Stores `new` in `slot` where it is stated and different, copying the text
+/// only then.
+fn replace_text(slot: &mut Option<String>, new: Option<&str>) -> bool {
+    match new {
+        Some(value) if slot.as_deref() != Some(value) => {
+            *slot = Some(value.to_owned());
+            true
+        }
+        _ => false,
     }
 }
 
@@ -278,7 +332,7 @@ pub(crate) enum Command {
     /// first where this is the connection's first request.
     Register {
         reply_subject: Vec<u8>,
-        replies: mpsc::Sender<Message>,
+        replies: mpsc::Sender<Queued>,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Drops a reply subject, because its caller is done waiting.
@@ -306,10 +360,22 @@ enum TlsChoice {
     },
 }
 
+impl TlsChoice {
+    /// Whether the caller handed over what TLS needs, which is how a caller
+    /// says it wants TLS: nobody builds a `rustls::ClientConfig` for a
+    /// connection they are content to leave in the clear.
+    const fn is_available(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
 /// A NATS core connection.
 ///
 /// Cloning shares the connection: every clone speaks to the same driver task
-/// and sees the same state.
+/// and sees the same state. The connection lives as long as any handle does —
+/// a clone, or a [`Subscription`] taken from it, which keeps messages arriving
+/// after the `Connection` itself is gone — and ends when the last one is
+/// dropped: what was queued is written, and then the transport is closed.
 #[derive(Clone, Debug)]
 pub struct Connection {
     inner: Arc<Inner>,
@@ -360,9 +426,17 @@ impl Connection {
         Self::establish(exec, Wire::new(stream), options, TlsChoice::Unavailable).await
     }
 
-    /// Connects to `host:port`, completing TLS before any ordinary traffic
-    /// where the server's `INFO` requires it or
-    /// [`ConnectionOptions::require_tls`] asks for it.
+    /// Connects to `host:port` and completes TLS before any ordinary traffic.
+    ///
+    /// **Handing over a `config` is asking for TLS**, and the answer to that
+    /// is not up to the `INFO`: it arrives before TLS, unauthenticated, and an
+    /// attacker on the path can rewrite `"tls_required":true` to `false` or
+    /// leave it out. A client that took that at its word would send its
+    /// `CONNECT` — token, password, JWT and signature — in the clear to
+    /// whoever edited the line. So TLS is upgraded whatever
+    /// [`ConnectionOptions::require_tls`] says, and an `INFO` that offers none
+    /// (neither `tls_required` nor `tls_available`) is [`Error::Tls`], before
+    /// a `CONNECT` is written.
     ///
     /// `config` is the caller's: which certificates are valid is the
     /// application's decision. The SNI name is
@@ -403,17 +477,14 @@ impl Connection {
         let options = Arc::new(options);
         let max_connect_urls = options.max_connect_urls as usize;
         let mut limits = limits_for(&options, DEFAULT_MAX_PAYLOAD);
+        let handshake = Handshake::start(exec, &options);
 
         // The server speaks first, unprompted. Nothing has been written yet
         // and nothing may be: the `CONNECT` this client is going to send is
         // assembled out of what this `INFO` says.
-        let opening = step(
-            exec,
-            &options,
-            "the server's opening INFO",
-            wire.read_op(limits),
-        )
-        .await?;
+        let opening = handshake
+            .step("the server's opening INFO", wire.read_op(limits))
+            .await?;
         let Incoming::Info(json) = opening else {
             return Err(Error::Protocol(format!(
                 "the first operation on a connection is INFO, and the server \
@@ -424,7 +495,9 @@ impl Connection {
         let mut info = RemoteInfo::parse(&json, limits, max_connect_urls)?;
         limits = limits_for(&options, info.max_payload);
 
-        let want_tls = info.tls_required || options.require_tls;
+        // A caller that handed over a TLS configuration has asked for TLS.
+        // The `INFO` can add to that demand and cannot withdraw it.
+        let want_tls = info.tls_required || options.require_tls || tls.is_available();
         if want_tls {
             match tls {
                 #[cfg(feature = "tls")]
@@ -432,11 +505,26 @@ impl Connection {
                     config,
                     server_name,
                 } => {
+                    if !info.tls_required && !info.tls_available {
+                        return Err(Error::Tls(
+                            "a TLS configuration was supplied and the server's INFO offers \
+                             no TLS (neither tls_required nor tls_available); refusing to \
+                             send CONNECT in the clear"
+                                .into(),
+                        ));
+                    }
                     // Before any ordinary traffic: the only octets that have
                     // crossed are the server's `INFO`, and everything this
-                    // client says travels inside the session.
-                    let stream =
-                        transport::upgrade_tls(wire.into_stream()?, config, &server_name).await?;
+                    // client says travels inside the session. Inside the
+                    // handshake's deadline like every other step: a server
+                    // that goes quiet after the `ClientHello` holds the
+                    // connect for as long as it likes otherwise.
+                    let stream = handshake
+                        .step(
+                            "the TLS handshake",
+                            transport::upgrade_tls(wire.into_stream()?, config, &server_name),
+                        )
+                        .await?;
                     wire = Wire::new(stream);
                 }
                 TlsChoice::Unavailable => {
@@ -460,25 +548,30 @@ impl Connection {
         // the only acknowledgement the protocol offers for the `CONNECT`.
         let mut out = Vec::new();
         Op::Connect(connect).encode(&mut out)?;
-        Op::Ping.encode(&mut out)?;
-        wire.write_all(&out).await?;
-
-        loop {
-            let answer = step(
-                exec,
-                &options,
-                "the PONG that confirms the CONNECT",
-                wire.read_op(limits),
-            )
+        out.extend_from_slice(transport::PING);
+        handshake
+            .step("the CONNECT reaching the server", wire.write_all(&out))
             .await?;
+
+        // Every operation of this loop is read inside what is left of the one
+        // budget. A budget per operation would let a server that answers each
+        // with a `PING` or an `INFO` a moment before the deadline keep the
+        // handshake open for ever without sending the `PONG`.
+        loop {
+            let answer = handshake
+                .step("the PONG that confirms the CONNECT", wire.read_op(limits))
+                .await?;
             match answer {
                 Incoming::Pong => break,
                 // A server that pings during the handshake gets its answer;
                 // the rule is bidirectional from the first octet.
                 Incoming::Ping => {
-                    let mut pong = Vec::new();
-                    Op::Pong.encode(&mut pong)?;
-                    wire.write_all(&pong).await?;
+                    handshake
+                        .step(
+                            "the PONG answering the server's PING",
+                            wire.write_all(transport::PONG),
+                        )
+                        .await?;
                 }
                 // An asynchronous `INFO` may arrive at any time, the
                 // handshake included.
@@ -505,23 +598,29 @@ impl Connection {
         let (commands, rx) = mpsc::channel(options.outgoing_queue);
         let (state_tx, state) = watch::channel(State::Connected);
         let (info_tx, info_rx) = watch::channel(info);
-        let inbox = Inbox::new(&options.inbox_prefix);
+        let inbox = Inbox::new(&options.inbox_prefix)?;
 
         let driver = Driver {
             exec: exec.clone(),
             options: Arc::clone(&options),
             rx,
-            commands: commands.clone(),
+            commands: commands.downgrade(),
             state: state_tx,
             info: info_tx,
             max_payload: Arc::clone(&max_payload),
             table: Table::new(options.max_subscriptions),
             pending: Pending::new(options.max_pending_requests),
+            budget: Budget::new(options.max_queued_bytes),
             inbox_pattern: inbox.pattern(),
             inbox_sid: None,
             next_sid: 1,
             pings_out: 0,
             flushes: Vec::new(),
+            pings_sent: 0,
+            pongs_seen: 0,
+            closing: None,
+            sid_text: Vec::new(),
+            line: Vec::new(),
         };
         exec.spawn(driver.run(reader, writer, limits));
 
@@ -708,7 +807,7 @@ impl Connection {
             )
             .await?;
             match self.inner.exec.within(window, replies.recv()).await {
-                Some(Some(message)) => request::outcome(message),
+                Some(Some(queued)) => request::outcome(queued.into_message()),
                 Some(None) => Err(Error::ConnectionGone),
                 None => Err(Error::RequestTimeout { after: window }),
             }
@@ -765,7 +864,7 @@ impl Connection {
                 .within(window, async {
                     while collected.len() < max_responses {
                         match replies.recv().await {
-                            Some(message) => collected.push(message),
+                            Some(queued) => collected.push(queued.into_message()),
                             None => break,
                         }
                     }
@@ -787,6 +886,11 @@ impl Connection {
     /// The protocol's only round trip, and therefore the only way to learn
     /// that the server has read everything written before it. It is not a
     /// delivery confirmation: Core NATS has none.
+    ///
+    /// The `PONG` that completes a flush is the one answering **its own**
+    /// `PING`. The server answers them in order, so a `PONG` for an earlier
+    /// `PING` — one the server read before the writes this flush follows —
+    /// does not complete it.
     pub async fn flush(&self) -> Result<()> {
         let (done, wait) = oneshot::channel();
         self.send(Command::Flush { done }).await?;
@@ -809,7 +913,9 @@ impl Connection {
     /// There is no `CLOSE` verb: "a normal client protocol close has no
     /// dedicated `CLOSE` verb; ending the transport ends the connection and
     /// its subscriptions" (§1). Every operation queued before this call is
-    /// written first, because the driver takes commands in order.
+    /// written first, because the driver takes commands in order — within
+    /// [`ConnectionOptions::write_timeout`], so a peer that is not reading
+    /// cannot hold a close open.
     ///
     /// Idempotent: closing a closed connection is `Ok(())`.
     pub async fn close(&self) -> Result<()> {
@@ -872,7 +978,7 @@ impl Connection {
 
     /// Registers a reply subject and returns it with the channel its replies
     /// will arrive on.
-    async fn register(&self, capacity: usize) -> Result<(Vec<u8>, mpsc::Receiver<Message>)> {
+    async fn register(&self, capacity: usize) -> Result<(Vec<u8>, mpsc::Receiver<Queued>)> {
         let reply_subject = self.inner.inbox.next_reply_subject().into_bytes();
         let (replies, rx) = mpsc::channel(capacity);
         let (reply, wait) = oneshot::channel();
@@ -954,11 +1060,11 @@ impl Connection {
         }
 
         let mut out = Vec::with_capacity(declared as usize + subject.len() + 32);
-        match &borrowed {
+        match borrowed {
             Some(block) => Op::Hpub {
                 subject,
                 reply_to,
-                headers: block.clone(),
+                headers: block,
                 payload,
             }
             .encode(&mut out)?,
@@ -995,6 +1101,14 @@ fn check_control_line(encoded: &[u8], max: usize) -> Result<()> {
 
 /// The codec bounds this connection applies to the server's octets.
 ///
+/// `max_payload` is **the smaller** of `INFO.max_payload` and
+/// [`ConnectionOptions::max_inbound_payload`], never `INFO.max_payload` alone:
+/// that number is the *server's* bound on what a client publishes, and it is
+/// announced by the peer itself — in a line that arrives before TLS and before
+/// authentication, and again in any later `INFO`. `INFO.max_payload` is
+/// therefore only ever allowed to lower what this client will accept, and the
+/// bound on memory a peer can make it commit is the caller's.
+///
 /// `max_connect_urls` is deliberately **not** the retention bound here. The
 /// codec *refuses* a `connect_urls` array longer than its cap, because a JSON
 /// array announces no length and the only place to stop is while reading it.
@@ -1004,10 +1118,11 @@ fn check_control_line(encoded: &[u8], max: usize) -> Result<()> {
 /// and a preference must not turn a cluster that grew past it into a dropped
 /// connection. How many are kept is applied in
 /// [`RemoteInfo::merge`] instead.
-fn limits_for(options: &ConnectionOptions, max_payload: u64) -> Limits {
+fn limits_for(options: &ConnectionOptions, info_max_payload: u64) -> Limits {
     Limits {
-        max_payload,
-        max_control_line: options.max_control_line,
+        max_payload: info_max_payload.min(options.max_inbound_payload),
+        max_control_line: options.max_inbound_control_line,
+        max_info_line: options.max_info_line,
         max_header_entries: options.max_header_entries,
         max_connect_urls: options
             .max_connect_urls
@@ -1113,23 +1228,49 @@ fn local_connect<'a>(
     connect
 }
 
-/// Bounds one handshake step on wall-clock time.
+/// One wall-clock budget for the whole handshake, spent a step at a time.
 ///
-/// Every step needs it and none of them has a deadline in the protocol — not
+/// Every step needs a deadline and none of them has one in the protocol — not
 /// even the opening `INFO`, which a server that accepts a TCP connection and
-/// then says nothing never sends.
-async fn step<T, F>(
-    exec: &Exec,
-    options: &ConnectionOptions,
-    name: &'static str,
-    future: F,
-) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
-    match exec.within(options.handshake_timeout, future).await {
-        Some(result) => result,
-        None => Err(Error::HandshakeTimeout { step: name }),
+/// then says nothing never sends. A deadline *per step* is not enough: the
+/// last step is a loop that reads until the `PONG`, and a server that answers
+/// each read with a `PING`, an `INFO` or a byte of a long line, a moment
+/// before that step's deadline, starts the clock afresh every time and keeps
+/// the handshake open for as long as it likes. So there is one end time, and
+/// every step gets what is left of it.
+struct Handshake<'a> {
+    exec: &'a Exec,
+    /// Where the budget runs out. `None` only where `handshake_timeout` is so
+    /// large that the instant cannot be represented, in which case no step is
+    /// given less than the whole of it.
+    ends: Option<Instant>,
+    whole: Duration,
+}
+
+impl<'a> Handshake<'a> {
+    fn start(exec: &'a Exec, options: &ConnectionOptions) -> Self {
+        Self {
+            exec,
+            ends: Instant::now().checked_add(options.handshake_timeout),
+            whole: options.handshake_timeout,
+        }
+    }
+
+    /// Runs `future`, which is the step called `name`, in what is left.
+    async fn step<T, F>(&self, name: &'static str, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let left = self.ends.map_or(self.whole, |ends| {
+            ends.saturating_duration_since(Instant::now())
+        });
+        if left.is_zero() {
+            return Err(Error::HandshakeTimeout { step: name });
+        }
+        match self.exec.within(left, future).await {
+            Some(result) => result,
+            None => Err(Error::HandshakeTimeout { step: name }),
+        }
     }
 }
 
@@ -1144,20 +1285,54 @@ fn describe(incoming: &Incoming) -> &'static str {
     }
 }
 
+/// How much output the driver lets build up before it stops taking commands.
+///
+/// Past this the callers wait in the command queue, which is how a slow peer
+/// pushes back on them; below it, everything queued between two writes goes out
+/// in one. A single command can be larger — a publish may be as large as the
+/// server's `max_payload` — and is taken whole.
+const WRITE_HIGH_WATER: usize = 64 * 1024;
+
+/// Appends `n` in decimal without allocating.
+fn push_decimal(out: &mut Vec<u8>, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[at..]);
+}
+
+/// How a connection ends once what is queued has been written.
+struct Closing {
+    /// The caller of [`Connection::close`], told when the transport has ended.
+    done: Option<oneshot::Sender<()>>,
+    state: State,
+}
+
 /// The task that owns the wire once the handshake is done.
 struct Driver {
     exec: Exec,
     options: Arc<ConnectionOptions>,
     rx: mpsc::Receiver<Command>,
-    /// Kept so that a `Subscription` handed to a caller can be given a
-    /// sender to unsubscribe through, without the driver having to clone one
-    /// out of its own receiver.
-    commands: mpsc::Sender<Command>,
+    /// Held **weakly**, and only so that a `Subscription` handed to a caller
+    /// can be given a sender to unsubscribe through. A strong clone here
+    /// would keep `rx.recv()` from ever returning `None`, so a connection
+    /// whose every handle had been dropped would never end.
+    commands: mpsc::WeakSender<Command>,
     state: watch::Sender<State>,
     info: watch::Sender<RemoteInfo>,
     max_payload: Arc<AtomicU64>,
     table: Table,
     pending: Pending,
+    /// The octets of delivered messages waiting for readers, over the
+    /// subscription table and the pending requests together.
+    budget: Arc<Budget>,
     /// `<inbox stem>.>`, subscribed to lazily on the first request.
     inbox_pattern: String,
     /// The `sid` of that one subscription.
@@ -1169,8 +1344,26 @@ struct Driver {
     inbox_sid: Option<u64>,
     next_sid: u64,
     pings_out: u32,
-    /// Callers waiting for a `PONG`.
-    flushes: Vec<oneshot::Sender<Result<()>>>,
+    /// Callers waiting for a `PONG`, each with the number of the `PING` it
+    /// sent: how many `PING`s this client had queued, its own included. The
+    /// server answers `PING`s in order, one `PONG` each, so a flush is done
+    /// when that many have been answered — not when *a* `PONG` arrives, which
+    /// can be the answer to a `PING` queued before the writes the flush is a
+    /// barrier for.
+    flushes: Vec<(u64, oneshot::Sender<Result<()>>)>,
+    /// How many `PING`s this client has queued, the ping clock's and the
+    /// flushes' together.
+    pings_sent: u64,
+    /// How many of them the server has answered.
+    pongs_seen: u64,
+    /// Set once the connection is to end after what is queued has been
+    /// written: no more commands are taken, and the loop ends when the queue
+    /// is empty.
+    closing: Option<Closing>,
+    /// A `sid` as decimal text, reused: a `SUB` or `UNSUB` allocates nothing.
+    sid_text: Vec<u8>,
+    /// A control line as it is encoded, reused for the same reason.
+    line: Vec<u8>,
 }
 
 impl Driver {
@@ -1178,25 +1371,70 @@ impl Driver {
         let exec = self.exec.clone();
         let ping_interval = self.options.ping_interval;
         let max_pings_out = self.options.max_pings_out;
+        let write_timeout = self.options.write_timeout;
         let max_connect_urls = self.options.max_connect_urls as usize;
-        let outcome: State;
 
-        loop {
+        // Each clock is one `Sleep` that lives across passes of the loop, and
+        // is moved only by the event it measures. A `Sleep` built afresh at
+        // the top of every pass would be restarted by every command and every
+        // inbound operation, so a connection that never went quiet would
+        // never ping and never time out a stalled write.
+        //
+        // `ping_clock` is moved when it fires and nowhere else. `stall_clock`
+        // is moved when output appears after a quiet spell and whenever the
+        // socket takes something, and only runs while output is waiting.
+        let mut ping_clock = std::pin::pin!(exec.sleep(ping_interval));
+        let mut stall_clock = std::pin::pin!(exec.sleep(write_timeout));
+        let mut writing = false;
+
+        let outcome = loop {
+            let owed = writer.has_output();
+            if owed && !writing {
+                stall_clock.set(exec.sleep(write_timeout));
+            }
+            writing = owed;
+
+            // Closing, and everything queued has been written.
+            if !owed && let Some(closing) = &self.closing {
+                break closing.state.clone();
+            }
+            // Commands wait while the socket has a long queue, and only then.
+            // Reading never waits for anything.
+            let take_commands = self.closing.is_none() && writer.queued() < WRITE_HIGH_WATER;
+
+            // Not `biased`: with the command queue first, an application that
+            // keeps it non-empty would starve the read below, and with it
+            // every `PING` the server sends.
             tokio::select! {
-                biased;
+                // The socket takes some of what is queued. `step` is
+                // cancel-safe, and returns after one write so that this arm
+                // is also the progress the stall clock below measures.
+                result = writer.step(), if owed => match result {
+                    Ok(()) => stall_clock.set(exec.sleep(write_timeout)),
+                    Err(error) => break State::Failed(error.to_string()),
+                },
 
-                command = self.rx.recv() => match command {
+                // Output has been waiting and the socket has taken nothing.
+                () = &mut stall_clock, if owed => {
+                    break State::Failed(
+                        Error::WriteTimeout { after: write_timeout }.to_string(),
+                    );
+                }
+
+                command = self.rx.recv(), if take_commands => match command {
                     Some(command) => {
-                        if let Some(state) = self.command(command, &mut writer).await {
-                            outcome = state;
-                            break;
+                        if let Some(state) = self.command(command, &mut writer) {
+                            break state;
                         }
                     }
                     // Every handle is gone. There is no `CLOSE` verb to
-                    // write: ending the transport is the close.
+                    // write: ending the transport is the close, after what
+                    // was queued has gone out.
                     None => {
-                        outcome = State::Closed;
-                        break;
+                        self.closing = Some(Closing {
+                            done: None,
+                            state: State::Closed,
+                        });
                     }
                 },
 
@@ -1205,45 +1443,40 @@ impl Driver {
                 // keeps every octet it had buffered.
                 incoming = reader.next_op(limits) => match incoming {
                     Ok(op) => {
-                        match self.incoming(op, &mut writer, &mut limits, max_connect_urls).await {
-                            Ok(()) => {}
-                            Err(error) => {
-                                outcome = State::Failed(error.to_string());
-                                break;
-                            }
+                        if let Err(error) =
+                            self.incoming(op, &mut writer, &mut limits, max_connect_urls)
+                        {
+                            break State::Failed(error.to_string());
                         }
                     }
-                    Err(error) => {
-                        outcome = State::Failed(error.to_string());
-                        break;
-                    }
+                    Err(error) => break State::Failed(error.to_string()),
                 },
 
-                () = exec.sleep(ping_interval) => {
+                () = &mut ping_clock => {
+                    ping_clock.set(exec.sleep(ping_interval));
                     if self.pings_out >= max_pings_out {
                         // Bounded rather than infinite: a client that keeps
                         // pinging a server that never answers has replaced a
                         // failure with a silence.
-                        outcome = State::Failed(
+                        break State::Failed(
                             Error::StaleConnection {
                                 unanswered: self.pings_out,
                                 max: max_pings_out,
                             }
                             .to_string(),
                         );
-                        break;
                     }
-                    let mut ping = Vec::new();
-                    if Op::Ping.encode(&mut ping).is_ok() {
-                        if let Err(error) = writer.send(&ping).await {
-                            outcome = State::Failed(error.to_string());
-                            break;
-                        }
-                        self.pings_out += 1;
+                    writer.queue(transport::PING);
+                    self.pings_out += 1;
+                    self.pings_sent += 1;
+                    // Once per interval is often enough to find the
+                    // subscriptions whose readers have gone, and cheap.
+                    if let Err(error) = self.sweep(&mut writer) {
+                        break State::Failed(error.to_string());
                     }
                 }
             }
-        }
+        };
 
         // "Core subscriptions vanish with the connection and have no stored
         // session" (§12 P2). Dropping the table and the inbox closes every
@@ -1251,21 +1484,36 @@ impl Driver {
         // request finds out rather than waiting forever.
         self.table.clear();
         self.pending.clear();
-        for flush in self.flushes.drain(..) {
+        for (_, flush) in self.flushes.drain(..) {
             let _ = flush.send(Err(Error::ConnectionGone));
         }
-        let _ = writer.shutdown().await;
-        self.state.send_replace(outcome);
+
+        // Ending the transport can wait on a peer as well — a TLS session
+        // writes its closing alert first — so it is given what a write is
+        // given and no more. A failed connection says so before it tries; a
+        // close is only over once the transport is.
+        match self.closing.take() {
+            Some(closing) => {
+                let _ = exec.within(write_timeout, writer.shutdown()).await;
+                if let Some(done) = closing.done {
+                    let _ = done.send(());
+                }
+                self.state.send_replace(outcome);
+            }
+            None => {
+                self.state.send_replace(outcome);
+                let _ = exec.within(write_timeout, writer.shutdown()).await;
+            }
+        }
     }
 
     /// One command. `Some(state)` ends the connection.
-    async fn command(&mut self, command: Command, writer: &mut OpWriter) -> Option<State> {
+    ///
+    /// Nothing here waits for the socket: what a command has to say is queued
+    /// on the writer and goes out from the loop.
+    fn command(&mut self, command: Command, writer: &mut OpWriter) -> Option<State> {
         match command {
-            Command::Write(bytes) => {
-                if let Err(error) = writer.send(&bytes).await {
-                    return Some(State::Failed(error.to_string()));
-                }
-            }
+            Command::Write(bytes) => writer.queue(&bytes),
 
             Command::Subscribe {
                 subject,
@@ -1273,34 +1521,39 @@ impl Driver {
                 reply,
             } => {
                 if !self.table.has_room() {
+                    // An entry whose reader has gone stays until a message
+                    // finds it, and the `UNSUB` that would have removed it
+                    // can be lost. Those do not count against the bound.
+                    if let Err(error) = self.sweep(writer) {
+                        return Some(State::Failed(error.to_string()));
+                    }
+                }
+                if !self.table.has_room() {
                     let _ = reply.send(Err(Error::TooManySubscriptions {
                         max: self.table.max(),
                     }));
                     return None;
                 }
                 let sid = self.take_sid();
-                match self
-                    .write_sub(writer, &subject, queue_group.as_deref(), sid)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(error) => {
-                        let fatal = matches!(error, Error::Io(_));
-                        let message = error.to_string();
-                        let _ = reply.send(Err(error));
-                        // A refused encode is the caller's problem and the
-                        // connection survives it; a broken socket is not.
-                        return fatal.then_some(State::Failed(message));
-                    }
+                if let Err(error) = self.queue_sub(writer, &subject, queue_group.as_deref(), sid) {
+                    // A refused encode is the caller's problem and the
+                    // connection survives it.
+                    let _ = reply.send(Err(error));
+                    return None;
                 }
                 let (tx, rx) = mpsc::channel(self.options.subscription_queue);
-                self.table.insert(sid, subject.clone(), tx);
+                let dropped = self.table.insert(sid, subject.clone(), tx);
                 let _ = reply.send(Ok(Subscription::new(
                     sid,
                     subject,
                     queue_group,
                     rx,
-                    self.commands.clone(),
+                    // A handle that is gone leaves nobody to unsubscribe
+                    // through; the sender that stands in for it is inert.
+                    self.commands
+                        .upgrade()
+                        .unwrap_or_else(|| mpsc::channel(1).0),
+                    dropped,
                 )));
             }
 
@@ -1319,7 +1572,7 @@ impl Driver {
                     // server about a `sid` it no longer has.
                     return None;
                 }
-                if let Err(error) = self.write_unsub(writer, sid, max_msgs).await {
+                if let Err(error) = self.queue_unsub(writer, sid, max_msgs) {
                     return Some(State::Failed(error.to_string()));
                 }
             }
@@ -1332,8 +1585,7 @@ impl Driver {
                 if self.inbox_sid.is_none() {
                     let sid = self.take_sid();
                     let pattern = self.inbox_pattern.clone();
-                    if let Err(error) = self.write_sub(writer, pattern.as_bytes(), None, sid).await
-                    {
+                    if let Err(error) = self.queue_sub(writer, pattern.as_bytes(), None, sid) {
                         let message = error.to_string();
                         let _ = reply.send(Err(error));
                         return Some(State::Failed(message));
@@ -1352,29 +1604,30 @@ impl Driver {
             Command::Forget { reply_subject } => self.pending.remove(&reply_subject),
 
             Command::Flush { done } => {
-                let mut ping = Vec::new();
-                if Op::Ping.encode(&mut ping).is_ok() {
-                    if let Err(error) = writer.send(&ping).await {
-                        let message = error.to_string();
-                        let _ = done.send(Err(error));
-                        return Some(State::Failed(message));
-                    }
-                    self.pings_out += 1;
-                    self.flushes.push(done);
-                }
+                // A caller that stopped waiting dropped its receiver and left
+                // this behind; with a peer that never answers they would
+                // otherwise pile up until the connection is declared stale.
+                self.flushes.retain(|(_, waiting)| !waiting.is_closed());
+                writer.queue(transport::PING);
+                self.pings_out += 1;
+                self.pings_sent += 1;
+                self.flushes.push((self.pings_sent, done));
             }
 
             Command::Close { done } => {
-                let _ = writer.shutdown().await;
-                let _ = done.send(());
-                return Some(State::Closed);
+                // Everything queued before this is written first, which is
+                // what the loop does until the queue is empty.
+                self.closing = Some(Closing {
+                    done: Some(done),
+                    state: State::Closed,
+                });
             }
         }
         None
     }
 
     /// One operation from the server.
-    async fn incoming(
+    fn incoming(
         &mut self,
         op: Incoming,
         writer: &mut OpWriter,
@@ -1382,39 +1635,23 @@ impl Driver {
         max_connect_urls: usize,
     ) -> Result<()> {
         match op {
-            Incoming::Ping => {
-                // Bidirectional from the first octet: the server pings on its
-                // own `ping_interval` and disconnects a client that does not
-                // answer.
-                let mut pong = Vec::new();
-                Op::Pong.encode(&mut pong)?;
-                writer.send(&pong).await?;
-            }
+            // Bidirectional from the first octet: the server pings on its own
+            // `ping_interval` and disconnects a client that does not answer.
+            Incoming::Ping => writer.queue_pong(),
             Incoming::Pong => {
                 self.pings_out = 0;
-                // A `PONG` says the server has read everything written
-                // before the `PING` that earned it, which is what every
-                // waiting flush was asking.
-                for flush in self.flushes.drain(..) {
+                // A `PONG` answers the oldest `PING` still waiting, and a
+                // flush is done once its own has been answered. An extra
+                // `PONG` nobody asked for answers nothing.
+                self.pongs_seen = (self.pongs_seen + 1).min(self.pings_sent);
+                let ready = self
+                    .flushes
+                    .partition_point(|(seq, _)| *seq <= self.pongs_seen);
+                for (_, flush) in self.flushes.drain(..ready) {
                     let _ = flush.send(Ok(()));
                 }
             }
-            Incoming::Info(json) => {
-                let parsed = ServerInfo::parse(&json, *limits)?;
-                self.info.send_modify(|info| {
-                    info.merge(&parsed, max_connect_urls);
-                });
-                let info = self.info.borrow().clone();
-                self.max_payload.store(info.max_payload, Ordering::Relaxed);
-                *limits = limits_for(&self.options, info.max_payload);
-                tracing::info!(
-                    server_id = info.server_id.as_deref().unwrap_or("?"),
-                    connect_urls = info.connect_urls.len(),
-                    lame_duck = info.lame_duck,
-                    max_payload = info.max_payload,
-                    "asynchronous INFO"
-                );
-            }
+            Incoming::Info(json) => self.merge_info(&json, limits, max_connect_urls)?,
             Incoming::Ok => {}
             Incoming::Err(reason) => {
                 // "A protocol, authorization, or other runtime connection
@@ -1423,16 +1660,52 @@ impl Driver {
                 // and ignored.
                 return Err(Error::Server(reason));
             }
-            Incoming::Msg(message) => self.dispatch(message, writer).await?,
+            Incoming::Msg(message) => self.dispatch(message, writer)?,
+        }
+        Ok(())
+    }
+
+    /// Applies an asynchronous `INFO`.
+    ///
+    /// A flood of them is the server's to send and costs a parse each, and
+    /// nothing more where they say what is already known: no clone of the
+    /// whole view, no notification, no log record.
+    fn merge_info(
+        &mut self,
+        json: &[u8],
+        limits: &mut Limits,
+        max_connect_urls: usize,
+    ) -> Result<()> {
+        let parsed = ServerInfo::parse(json, *limits)?;
+        let mut max_payload = 0;
+        let mut entered_lame_duck = false;
+        let changed = self.info.send_if_modified(|info| {
+            let was_lame_duck = info.lame_duck;
+            let changed = info.merge(&parsed, max_connect_urls);
+            max_payload = info.max_payload;
+            entered_lame_duck = info.lame_duck && !was_lame_duck;
+            changed
+        });
+        if !changed {
+            return Ok(());
+        }
+        self.max_payload.store(max_payload, Ordering::Relaxed);
+        *limits = limits_for(&self.options, max_payload);
+        if entered_lame_duck {
+            // Once: a server does not leave Lame Duck Mode, and the merge
+            // reports only the first time it is stated.
+            tracing::info!(max_payload, "the server entered lame duck mode");
+        } else {
+            tracing::debug!(max_payload, "asynchronous INFO changed what is known");
         }
         Ok(())
     }
 
     /// Hands one message to whatever asked for it: the inbox, or the
     /// subscription whose `sid` it carries.
-    async fn dispatch(&mut self, message: Message, writer: &mut OpWriter) -> Result<()> {
+    fn dispatch(&mut self, message: Message, writer: &mut OpWriter) -> Result<()> {
         if Some(message.sid) == self.inbox_sid {
-            if !self.pending.dispatch(message) {
+            if !self.pending.dispatch(message, &self.budget) {
                 // A reply whose caller has given up, or one that arrived for
                 // a window that is over. Core NATS keeps nothing for replay,
                 // so there is nothing to do but say so.
@@ -1441,31 +1714,38 @@ impl Driver {
             return Ok(());
         }
         let sid = message.sid;
-        match self.table.dispatch(sid, message) {
+        match self.table.dispatch(sid, message, &self.budget) {
             Delivered::Ok { exhausted } => {
                 if exhausted {
                     tracing::debug!(sid, "the auto-unsubscribe count was reached");
                 }
             }
-            Delivered::Dropped => {
-                let subject = self
-                    .table
-                    .subject(sid)
-                    .map(|subject| String::from_utf8_lossy(subject).into_owned())
-                    .unwrap_or_default();
+            Delivered::Dropped { reason, report } => {
                 // One copy, not the connection. Blocking here would stall
                 // every other subscription and then earn a slow-consumer
-                // disconnect anyway.
-                tracing::warn!(
-                    sid,
-                    subject,
-                    queue = self.options.subscription_queue,
-                    "dropped a message: the subscription's queue is full"
-                );
+                // disconnect anyway. Counted every time, said once a second:
+                // the peer sets the rate, and the subject is only turned into
+                // text for a line that is actually written.
+                if let Some(dropped) = report {
+                    let subject = self
+                        .table
+                        .subject(sid)
+                        .map(String::from_utf8_lossy)
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        sid,
+                        subject = %subject,
+                        dropped,
+                        ?reason,
+                        queue = self.options.subscription_queue,
+                        max_queued_bytes = self.options.max_queued_bytes,
+                        "dropped messages: the subscription cannot take them"
+                    );
+                }
             }
             Delivered::Gone => {
                 // The reader went away without an `UNSUB` reaching us first.
-                self.write_unsub(writer, sid, None).await?;
+                self.queue_unsub(writer, sid, None)?;
             }
             Delivered::Unknown => {
                 tracing::debug!(
@@ -1477,39 +1757,56 @@ impl Driver {
         Ok(())
     }
 
-    async fn write_sub(
-        &self,
+    /// Queues the `UNSUB`s owed to subscriptions whose readers have gone.
+    ///
+    /// A `Subscription` sends its own on drop, but a drop cannot wait for room
+    /// in a full command queue, so that one can be lost, and the entry would
+    /// otherwise stay — and keep the server sending — until a message happened
+    /// to arrive for it.
+    fn sweep(&mut self, writer: &mut OpWriter) -> Result<()> {
+        for sid in self.table.take_closed() {
+            self.queue_unsub(writer, sid, None)?;
+        }
+        Ok(())
+    }
+
+    fn queue_sub(
+        &mut self,
         writer: &mut OpWriter,
         subject: &[u8],
         queue_group: Option<&[u8]>,
         sid: u64,
     ) -> Result<()> {
-        let sid_text = sid.to_string();
-        let mut out = Vec::new();
+        self.sid_text.clear();
+        push_decimal(&mut self.sid_text, sid);
+        self.line.clear();
         Op::Sub {
             subject,
             queue_group,
-            sid: sid_text.as_bytes(),
+            sid: &self.sid_text,
         }
-        .encode(&mut out)?;
-        check_control_line(&out, self.options.max_control_line)?;
-        writer.send(&out).await
+        .encode(&mut self.line)?;
+        check_control_line(&self.line, self.options.max_control_line)?;
+        writer.queue(&self.line);
+        Ok(())
     }
 
-    async fn write_unsub(
-        &self,
+    fn queue_unsub(
+        &mut self,
         writer: &mut OpWriter,
         sid: u64,
         max_msgs: Option<u64>,
     ) -> Result<()> {
-        let sid_text = sid.to_string();
-        let mut out = Vec::new();
+        self.sid_text.clear();
+        push_decimal(&mut self.sid_text, sid);
+        self.line.clear();
         Op::Unsub {
-            sid: sid_text.as_bytes(),
+            sid: &self.sid_text,
             max_msgs,
         }
-        .encode(&mut out)?;
-        writer.send(&out).await
+        .encode(&mut self.line)?;
+        writer.queue(&self.line);
+        Ok(())
     }
 
     /// A `sid` no other subscription on this connection has had.
@@ -1750,5 +2047,88 @@ mod tests {
         assert_eq!(connect.headers, Some(true));
         assert_eq!(connect.no_responders, Some(true));
         assert_eq!(connect.echo, Some(false));
+    }
+
+    /// An `INFO` that says what is already known changes nothing, and says
+    /// so: that answer is what keeps a flood of identical lines from waking
+    /// every watcher, rebuilding the url list and writing a log record each.
+    #[test]
+    fn a_repeated_info_changes_nothing() {
+        let json = b"{\"server_id\":\"S1\",\"max_payload\":64,\"headers\":true,\
+                     \"connect_urls\":[\"10.0.0.1:4222\",\"10.0.0.2:4222\"],\"ldm\":true}";
+        let parsed = ServerInfo::parse(json, Limits::DEFAULT).expect("an INFO");
+        let mut known = RemoteInfo::default();
+        assert!(known.merge(&parsed, 8), "the first says something");
+        for _ in 0..3 {
+            assert!(!known.merge(&parsed, 8), "the same INFO again is not news");
+        }
+        assert_eq!(known.connect_urls.len(), 2);
+    }
+
+    /// Any one field that differs is a change, the url list included, and a
+    /// shorter retention bound than the list is applied before the comparison:
+    /// a list that was truncated to what is kept is the same list again.
+    #[test]
+    fn a_field_that_differs_is_a_change() {
+        let mut known = RemoteInfo::default();
+        let first = ServerInfo::parse(
+            b"{\"connect_urls\":[\"a:1\",\"b:2\",\"c:3\"],\"max_payload\":64}",
+            Limits::DEFAULT,
+        )
+        .expect("an INFO");
+        assert!(known.merge(&first, 2));
+        assert_eq!(known.connect_urls, vec!["a:1".to_owned(), "b:2".to_owned()]);
+        assert!(
+            !known.merge(&first, 2),
+            "the same three, kept as the same two"
+        );
+
+        let moved = ServerInfo::parse(b"{\"connect_urls\":[\"a:1\",\"x:9\"]}", Limits::DEFAULT)
+            .expect("an INFO");
+        assert!(known.merge(&moved, 2), "the list differs");
+        let payload =
+            ServerInfo::parse(b"{\"max_payload\":128}", Limits::DEFAULT).expect("an INFO");
+        assert!(known.merge(&payload, 2), "the bound differs");
+        let mixed =
+            ServerInfo::parse(b"{\"tls_available\":true}", Limits::DEFAULT).expect("an INFO");
+        assert!(known.merge(&mixed, 2) && known.tls_available);
+    }
+
+    /// The server announces `max_payload` itself, before TLS and before
+    /// authentication, so it can lower what this client accepts and never
+    /// raise it past the caller's bound.
+    #[test]
+    fn the_server_cannot_raise_the_inbound_bound() {
+        let options = ConnectionOptions::new();
+        assert_eq!(
+            limits_for(&options, u64::MAX).max_payload,
+            options.max_inbound_payload,
+            "a peer that announces 2^64 - 1 gets the caller's bound"
+        );
+        assert_eq!(
+            limits_for(&options, 1024).max_payload,
+            1024,
+            "a lower announcement is honoured"
+        );
+        assert_eq!(
+            limits_for(&options, 1024).max_info_line,
+            options.max_info_line
+        );
+        assert_eq!(
+            limits_for(&options, 1024).max_control_line,
+            options.max_inbound_control_line,
+            "what is accepted has its own bound, apart from the one on what is written"
+        );
+    }
+
+    /// The sid text is the decimal the codec writes for any other number.
+    #[test]
+    fn a_sid_is_written_in_decimal_without_an_allocation_per_call() {
+        let mut out = Vec::new();
+        for n in [0u64, 7, 10, 4096, u64::MAX] {
+            out.clear();
+            push_decimal(&mut out, n);
+            assert_eq!(out, n.to_string().as_bytes(), "{n}");
+        }
     }
 }

@@ -70,7 +70,7 @@ pub enum Op<'a> {
     /// Carried as raw octets. `INFO` is the one object whose *fields* a
     /// client reads but whose *text* it never writes, and a server may add a
     /// field at any version; [`ServerInfo::parse`](crate::ServerInfo::parse)
-    /// reads the fourteen fields a client acts on and steps over the rest.
+    /// reads the fifteen fields a client acts on and steps over the rest.
     /// Keeping the octets means an `INFO` also survives a round trip
     /// unchanged.
     Info {
@@ -174,9 +174,16 @@ impl<'a> Op<'a> {
     /// `limits` is the caller's bounds, and both of the ones that matter here
     /// are checked before anything is read: the control line is bounded while
     /// the `CRLF` is searched for, and the declared payload count is bounded
-    /// from the control line alone.
+    /// from the control line alone. An `INFO` line is bounded by
+    /// [`Limits::max_info_line`]; every other line by
+    /// [`Limits::max_control_line`].
     pub fn decode(input: &'a [u8], limits: Limits) -> Result<(Self, usize), DecodeError> {
-        let line_end = find_control_line(input, limits.max_control_line)?;
+        let max_line = if starts_info_line(input) {
+            limits.max_info_line
+        } else {
+            limits.max_control_line
+        };
+        let line_end = find_control_line(input, max_line)?;
         let line = &input[..line_end];
         let after = line_end + 2;
         let (verb, rest) = split_verb(line);
@@ -410,7 +417,7 @@ impl<'a> Op<'a> {
                 out.extend_from_slice(subject);
                 push_optional(out, *reply_to);
                 push_header_counts(out, headers, payload);
-                write_body(out, headers, payload)?;
+                write_body(out, headers, payload);
             }
             Op::Sub {
                 subject,
@@ -474,7 +481,7 @@ impl<'a> Op<'a> {
                 out.extend_from_slice(sid);
                 push_optional(out, *reply_to);
                 push_header_counts(out, headers, payload);
-                write_body(out, headers, payload)?;
+                write_body(out, headers, payload);
             }
             Op::Ping => out.extend_from_slice(b"PING\r\n"),
             Op::Pong => out.extend_from_slice(b"PONG\r\n"),
@@ -625,9 +632,19 @@ fn find_control_line(input: &[u8], max: usize) -> Result<usize, DecodeError> {
             b'\r' => match window.get(at + 1) {
                 Some(b'\n') => return Ok(at),
                 Some(_) => return Err(DecodeError::ControlLineHasNewline),
-                // The `LF` may simply not have arrived yet, or may be past
-                // the bound; both are settled below.
-                None => break,
+                // The input ends on the `CR`, so the `LF` may simply not have
+                // arrived yet. The line is `at` octets long: incomplete where
+                // that is within the bound, too long where it is not. It is
+                // judged by the line and not by how much has been read, or a
+                // line of exactly `max` octets would be refused whenever a
+                // read ended between its `CR` and its `LF`.
+                None => {
+                    return Err(if at <= max {
+                        DecodeError::Incomplete { needed: 1 }
+                    } else {
+                        DecodeError::ControlLineTooLong { max }
+                    });
+                }
             },
             b'\n' => return Err(DecodeError::ControlLineHasNewline),
             _ => {}
@@ -639,6 +656,25 @@ fn find_control_line(input: &[u8], max: usize) -> Result<usize, DecodeError> {
     Err(DecodeError::Incomplete {
         needed: 2usize.saturating_sub(input.len()).max(1),
     })
+}
+
+/// Whether the line is an `INFO`, judged from its first five octets.
+///
+/// The verb is matched ignoring ASCII case and must end at a space, a tab or
+/// the `CR` of the `CRLF`, so that `INFOX` keeps the control-line bound. Input
+/// shorter than five octets is not judged: the `CRLF` search then reports
+/// `Incomplete` under the control-line bound, as it does for any short input.
+fn starts_info_line(input: &[u8]) -> bool {
+    matches!(
+        input.get(..5),
+        Some([
+            b'I' | b'i',
+            b'N' | b'n',
+            b'F' | b'f',
+            b'O' | b'o',
+            b' ' | b'\t' | b'\r'
+        ])
+    )
 }
 
 fn split_verb(line: &[u8]) -> (&[u8], &[u8]) {
@@ -803,9 +839,14 @@ fn push_header_counts(out: &mut Vec<u8>, headers: &Headers<'_>, payload: &[u8]) 
     out.extend_from_slice(b"\r\n");
 }
 
-fn write_body(out: &mut Vec<u8>, headers: &Headers<'_>, payload: &[u8]) -> Result<(), EncodeError> {
+/// Append the header block and then the payload, with the `CRLF` after it.
+///
+/// The block is not checked again here: the operation encoder has already run
+/// [`Headers::check`] on it before writing the control line, which is what
+/// keeps a refused operation from leaving bytes behind.
+fn write_body(out: &mut Vec<u8>, headers: &Headers<'_>, payload: &[u8]) {
     let before = out.len();
-    headers.encode(out)?;
+    headers.encode_checked(out);
     debug_assert_eq!(
         out.len() - before,
         headers.encoded_len(),
@@ -813,12 +854,13 @@ fn write_body(out: &mut Vec<u8>, headers: &Headers<'_>, payload: &[u8]) -> Resul
     );
     out.extend_from_slice(payload);
     out.extend_from_slice(b"\r\n");
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::info::ServerInfo;
+    use crate::limits::{DEFAULT_MAX_CONTROL_LINE, DEFAULT_MAX_INFO_LINE};
 
     const LIMITS: Limits = Limits::DEFAULT;
 
@@ -941,5 +983,176 @@ mod tests {
         };
         assert!(bad.encode(&mut out).is_err());
         assert_eq!(out, b"PING\r\n", "no half-written control line");
+    }
+
+    /// An `INFO` line carrying `count` server URLs, in the shape a server sends.
+    fn info_with_urls(count: usize) -> String {
+        let urls: Vec<String> = (0..count)
+            .map(|i| format!("\"10.0.0.{i}.cluster.internal.example:4222\""))
+            .collect();
+        format!("INFO {{\"connect_urls\":[{}]}}\r\n", urls.join(","))
+    }
+
+    #[test]
+    fn a_large_info_line_is_bounded_by_its_own_limit() {
+        // 200 URLs make a line longer than a control line may be, so only the
+        // INFO bound lets it through.
+        let wire = info_with_urls(200);
+        assert!(wire.len() > DEFAULT_MAX_CONTROL_LINE);
+        assert!(wire.len() < DEFAULT_MAX_INFO_LINE);
+        let (op, used) = decode(wire.as_bytes()).expect("decodes");
+        assert_eq!(used, wire.len());
+        let Op::Info { json } = op else {
+            panic!("an INFO");
+        };
+        let urls = ServerInfo::parse(json, LIMITS)
+            .expect("parses")
+            .connect_urls
+            .expect("present");
+        assert_eq!(urls.len(), 200);
+        assert_eq!(urls[199], "10.0.0.199.cluster.internal.example:4222");
+    }
+
+    #[test]
+    fn an_info_line_above_its_bound_is_refused_at_that_bound() {
+        let wire = info_with_urls(200);
+        let limits = Limits {
+            max_info_line: 1024,
+            ..LIMITS
+        };
+        assert!(wire.len() > 1024);
+        assert_eq!(
+            Op::decode(wire.as_bytes(), limits),
+            Err(DecodeError::ControlLineTooLong { max: 1024 })
+        );
+    }
+
+    #[test]
+    fn a_msg_line_keeps_the_control_line_bound() {
+        // Longer than `max_control_line` and shorter than `max_info_line`: the
+        // larger bound belongs to INFO alone.
+        let wire = format!("MSG {} 1 0\r\n\r\n", "a".repeat(5000));
+        assert!(wire.len() > DEFAULT_MAX_CONTROL_LINE);
+        assert!(wire.len() < DEFAULT_MAX_INFO_LINE);
+        assert_eq!(
+            decode(wire.as_bytes()),
+            Err(DecodeError::ControlLineTooLong {
+                max: DEFAULT_MAX_CONTROL_LINE
+            })
+        );
+    }
+
+    #[test]
+    fn the_info_verb_takes_the_info_bound_in_any_case() {
+        let wire = info_with_urls(200).replacen("INFO", "info", 1);
+        assert!(wire.len() > DEFAULT_MAX_CONTROL_LINE);
+        let (op, used) = decode(wire.as_bytes()).expect("decodes");
+        assert_eq!(used, wire.len());
+        assert!(matches!(op, Op::Info { .. }));
+    }
+
+    #[test]
+    fn a_verb_that_only_starts_with_info_keeps_the_control_line_bound() {
+        let wire = info_with_urls(200).replacen("INFO ", "INFOX ", 1);
+        assert!(wire.len() > DEFAULT_MAX_CONTROL_LINE);
+        assert_eq!(
+            decode(wire.as_bytes()),
+            Err(DecodeError::ControlLineTooLong {
+                max: DEFAULT_MAX_CONTROL_LINE
+            })
+        );
+    }
+
+    #[test]
+    fn debug_of_an_operation_redacts_its_connect_secrets() {
+        use std::borrow::Cow;
+        let op = Op::Connect(Connect {
+            pass: Some(Cow::Borrowed("hunter2")),
+            auth_token: Some(Cow::Borrowed("t0k3n")),
+            jwt: Some(Cow::Borrowed("ey.J.W.T")),
+            sig: Some(Cow::Borrowed("SIGNATURE")),
+            user: Some(Cow::Borrowed("alice")),
+            ..Connect::default()
+        });
+        let shown = format!("{op:?}");
+        for secret in ["hunter2", "t0k3n", "ey.J.W.T", "SIGNATURE"] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("alice"), "{shown}");
+    }
+
+    #[test]
+    fn a_refused_header_block_writes_nothing() {
+        let mut headers = Headers::new();
+        headers.push("Bar", " padded ");
+        let refused = Op::Hpub {
+            subject: b"a",
+            reply_to: None,
+            headers,
+            payload: b"",
+        };
+        let mut out = Vec::from(*b"PING\r\n");
+        assert_eq!(
+            refused.encode(&mut out),
+            Err(EncodeError::HeaderValueInvalid)
+        );
+        assert_eq!(out, b"PING\r\n", "no half-written HPUB");
+    }
+
+    /// A line of exactly the bound is legal, and so it is when a read ends
+    /// right after its `CR` and the `LF` comes in the next one: the reader
+    /// must ask for more, not refuse a line that fits. One octet more is too
+    /// long however much of it has arrived.
+    #[test]
+    fn a_line_of_exactly_the_bound_is_accepted_across_a_split_crlf() {
+        let limits = Limits {
+            max_control_line: 16,
+            ..LIMITS
+        };
+        // `-ERR '` + nine octets + `'` is sixteen octets before the CRLF.
+        let line = b"-ERR 'abcdefghi'";
+        assert_eq!(line.len(), 16);
+
+        let mut cut_after_cr = line.to_vec();
+        cut_after_cr.push(b'\r');
+        assert_eq!(
+            Op::decode(&cut_after_cr, limits),
+            Err(DecodeError::Incomplete { needed: 1 }),
+            "the LF has not arrived yet"
+        );
+
+        let mut whole = cut_after_cr.clone();
+        whole.push(b'\n');
+        assert_eq!(
+            Op::decode(&whole, limits).expect("decodes"),
+            (
+                Op::Err {
+                    reason: b"abcdefghi"
+                },
+                18
+            )
+        );
+
+        // Every prefix of the legal line is merely incomplete.
+        for prefix in 0..whole.len() {
+            let error = Op::decode(&whole[..prefix], limits).expect_err("incomplete");
+            assert!(!error.is_violation(), "{prefix}: {error}");
+        }
+
+        // Seventeen octets before the CR is one too many, with or without the
+        // LF having arrived.
+        let long = b"-ERR 'abcdefghij'";
+        assert_eq!(long.len(), 17);
+        let mut long_cr = long.to_vec();
+        long_cr.push(b'\r');
+        assert_eq!(
+            Op::decode(&long_cr, limits),
+            Err(DecodeError::ControlLineTooLong { max: 16 })
+        );
+        assert_eq!(
+            Op::decode(long, limits),
+            Err(DecodeError::ControlLineTooLong { max: 16 })
+        );
     }
 }

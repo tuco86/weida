@@ -31,34 +31,58 @@
 //! # A full queue drops the copy
 //!
 //! Each subscription has a bounded queue and a message that arrives for a
-//! full one is dropped with a log line. The alternative — blocking the read
-//! loop until the application collects — stalls every *other* subscription on
-//! the connection and then earns a slow-consumer disconnect from the server
+//! full one is dropped and counted. The alternative — blocking the read loop
+//! until the application collects — stalls every *other* subscription on the
+//! connection and then earns a slow-consumer disconnect from the server
 //! anyway, since the server buffers only `max_pending` (64 MiB) per client
 //! before dropping it (`docs/research/nats.md` §5, §11). Core NATS is
 //! at-most-once and stores nothing for replay, so a dropped copy is a loss
 //! the delivery contract already allows; a stalled connection is not.
+//!
+//! There are two ways a queue is full: it holds `subscription_queue`
+//! messages, or the connection as a whole holds `max_queued_bytes` of
+//! delivered messages that nobody has collected (`crate::queue`). A message
+//! count is not a memory bound, so both are checked, and both end the same
+//! way. [`Subscription::dropped`] says how many copies this subscription has
+//! lost; the log says so too, but at most once a second per subscription,
+//! because the peer decides how fast messages arrive and an overloaded client
+//! that logged every loss would spend what it has left on the log.
+//!
+//! # A subscription that is gone is found out
+//!
+//! Dropping a [`Subscription`] sends an `UNSUB`, but a `Drop` cannot wait for
+//! room in a full command queue, so the `UNSUB` can be lost. The driver does
+//! not rely on it: an entry whose reader has gone is swept — on every ping, and
+//! before the table refuses a subscription for being full — and the `UNSUB`
+//! written from there.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use crate::connection::Command;
 use crate::message::Message;
+use crate::queue::{Budget, Queued};
 
 /// One live subscription.
 ///
 /// Dropping it unsubscribes: the handle is the subscription's lifetime, which
 /// is what keeps the table from filling with interest nobody reads. The
 /// `UNSUB` is best-effort on the drop path, because a `Drop` cannot await and
-/// a connection that is already gone has no subscriptions to remove anyway.
+/// a connection that is already gone has no subscriptions to remove anyway;
+/// the driver sweeps up after any that are lost.
 #[derive(Debug)]
 pub struct Subscription {
     sid: u64,
     subject: Vec<u8>,
     queue_group: Option<Vec<u8>>,
-    messages: mpsc::Receiver<Message>,
+    messages: mpsc::Receiver<Queued>,
     commands: mpsc::Sender<Command>,
+    /// Shared with this subscription's table entry.
+    dropped: Arc<AtomicU64>,
     /// Set once an `UNSUB` has been asked for, so `Drop` does not send a
     /// second one.
     released: bool,
@@ -69,8 +93,9 @@ impl Subscription {
         sid: u64,
         subject: Vec<u8>,
         queue_group: Option<Vec<u8>>,
-        messages: mpsc::Receiver<Message>,
+        messages: mpsc::Receiver<Queued>,
         commands: mpsc::Sender<Command>,
+        dropped: Arc<AtomicU64>,
     ) -> Self {
         Self {
             sid,
@@ -78,6 +103,7 @@ impl Subscription {
             queue_group,
             messages,
             commands,
+            dropped,
             released: false,
         }
     }
@@ -101,18 +127,30 @@ impl Subscription {
         self.queue_group.as_deref()
     }
 
+    /// How many messages addressed to this subscription were dropped because
+    /// it could not take them: its queue was full, or the connection already
+    /// held [`max_queued_bytes`](crate::options::ConnectionOptions::max_queued_bytes)
+    /// of messages waiting for readers.
+    ///
+    /// Core NATS is at-most-once, so a reader that falls behind loses copies
+    /// rather than stalling the connection; this is how much it has lost.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     /// The next message, or `None` once the subscription has ended.
     ///
     /// Ends when the subscription is unsubscribed, when an auto-unsubscribe
     /// count is reached, or when the connection goes away — a Core NATS
     /// subscription has no existence apart from its connection.
     pub async fn next(&mut self) -> Option<Message> {
-        self.messages.recv().await
+        self.messages.recv().await.map(Queued::into_message)
     }
 
     /// The next message if one is already waiting.
     pub fn try_next(&mut self) -> Option<Message> {
-        self.messages.try_recv().ok()
+        self.messages.try_recv().ok().map(Queued::into_message)
     }
 
     /// `UNSUB <sid>`: remove the subscription now.
@@ -152,13 +190,23 @@ impl Drop for Subscription {
             return;
         }
         // Best-effort: a `Drop` cannot await, and a driver that is gone or
-        // whose queue is full has either ended the subscription already or is
-        // about to notice the closed channel on its next delivery.
+        // whose queue is full has either ended the subscription already or
+        // will find the closed channel when it next sweeps the table.
         let _ = self.commands.try_send(Command::Unsubscribe {
             sid: self.sid,
             max_msgs: None,
         });
     }
+}
+
+/// Why a copy was dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropReason {
+    /// The subscription already held `subscription_queue` messages.
+    QueueFull,
+    /// The connection already held `max_queued_bytes` of messages waiting for
+    /// readers.
+    OverBudget,
 }
 
 /// What one delivery attempt did.
@@ -170,8 +218,15 @@ pub(crate) enum Delivered {
         /// Whether this was the last message the subscription asked for.
         exhausted: bool,
     },
-    /// The subscription's queue was full and the copy was dropped.
-    Dropped,
+    /// The copy was dropped and counted. `report` is how many copies were
+    /// dropped since the last time this subscription's drops were reported,
+    /// where it is time to report them again, and `None` where it is not.
+    Dropped {
+        /// Why.
+        reason: DropReason,
+        /// Set at most once a second per subscription.
+        report: Option<u64>,
+    },
     /// Nobody is reading any more; the entry has been removed and an `UNSUB`
     /// is due.
     Gone,
@@ -179,15 +234,49 @@ pub(crate) enum Delivered {
     Unknown,
 }
 
+/// How often one subscription's drops are logged at most.
+const REPORT_EVERY: Duration = Duration::from_secs(1);
+
+/// The rate limit on the log line a drop earns.
+///
+/// The peer sets the rate at which messages arrive, so the rate at which they
+/// are dropped is the peer's too; one line per drop would put the cost of an
+/// overload — a lossy subject conversion, a log record — on the client at
+/// exactly the moment it has the least to spare.
+#[derive(Debug, Default)]
+struct DropLog {
+    last: Option<Instant>,
+    unreported: u64,
+}
+
+impl DropLog {
+    /// Notes one drop at `now`: `Some(n)` where `n` drops, this one included,
+    /// are due a log line, and `None` where one was written lately enough.
+    fn record(&mut self, now: Instant) -> Option<u64> {
+        self.unreported += 1;
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= REPORT_EVERY);
+        if !due {
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.unreported))
+    }
+}
+
 /// One entry of the subscription table.
 #[derive(Debug)]
 struct Entry {
     subject: Vec<u8>,
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<Queued>,
     /// How many messages have been delivered on this `sid`, which is the
     /// number `UNSUB <sid> <max_msgs>` counts.
     delivered: u64,
     max_msgs: Option<u64>,
+    /// Copies dropped; the [`Subscription`] holds the other end.
+    dropped: Arc<AtomicU64>,
+    log: DropLog,
 }
 
 /// The subscription table, owned by the connection driver.
@@ -220,7 +309,15 @@ impl Table {
         self.max
     }
 
-    pub(crate) fn insert(&mut self, sid: u64, subject: Vec<u8>, tx: mpsc::Sender<Message>) {
+    /// Adds a subscription and returns the counter of what it will drop, which
+    /// the [`Subscription`] handed to the caller shares.
+    pub(crate) fn insert(
+        &mut self,
+        sid: u64,
+        subject: Vec<u8>,
+        tx: mpsc::Sender<Queued>,
+    ) -> Arc<AtomicU64> {
+        let dropped = Arc::new(AtomicU64::new(0));
         self.entries.insert(
             sid,
             Entry {
@@ -228,8 +325,11 @@ impl Table {
                 tx,
                 delivered: 0,
                 max_msgs: None,
+                dropped: Arc::clone(&dropped),
+                log: DropLog::default(),
             },
         );
+        dropped
     }
 
     /// Removes a subscription. `true` where there was one to remove, which is
@@ -262,11 +362,22 @@ impl Table {
     /// subjects. A client that re-matched subjects here would be second
     /// guessing the server's own routing, and would deliver a copy to a
     /// subscription whose `UNSUB` had already been processed.
-    pub(crate) fn dispatch(&mut self, sid: u64, message: Message) -> Delivered {
+    ///
+    /// The message is charged against `budget` before it is queued; where it
+    /// does not fit, or the queue is full, it is dropped and counted.
+    pub(crate) fn dispatch(
+        &mut self,
+        sid: u64,
+        message: Message,
+        budget: &Arc<Budget>,
+    ) -> Delivered {
         let Some(entry) = self.entries.get_mut(&sid) else {
             return Delivered::Unknown;
         };
-        match entry.tx.try_send(message) {
+        let Some(charge) = budget.try_charge(message.queued_len()) else {
+            return entry.record_drop(DropReason::OverBudget);
+        };
+        match entry.tx.try_send(Queued::new(message, charge)) {
             Ok(()) => {
                 entry.delivered += 1;
                 let exhausted = entry.max_msgs.is_some_and(|max| entry.delivered >= max);
@@ -275,7 +386,9 @@ impl Table {
                 }
                 Delivered::Ok { exhausted }
             }
-            Err(mpsc::error::TrySendError::Full(_)) => Delivered::Dropped,
+            // The message, and the charge it carried, are dropped with the
+            // error.
+            Err(mpsc::error::TrySendError::Full(_)) => entry.record_drop(DropReason::QueueFull),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.entries.remove(&sid);
                 Delivered::Gone
@@ -288,11 +401,40 @@ impl Table {
         self.entries.get(&sid).map(|entry| entry.subject.as_slice())
     }
 
+    /// Removes every entry whose reader has gone, returning their `sid`s so
+    /// the caller can write the `UNSUB`s that are owed.
+    ///
+    /// The backstop for a `Subscription` whose own `UNSUB` was lost: a
+    /// `Drop` cannot wait for room in a full command queue.
+    pub(crate) fn take_closed(&mut self) -> Vec<u64> {
+        let gone: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.tx.is_closed())
+            .map(|(sid, _)| *sid)
+            .collect();
+        for sid in &gone {
+            self.entries.remove(sid);
+        }
+        gone
+    }
+
     /// Closes every subscription, which is what the end of the connection
     /// does to them: "core subscriptions vanish with the connection and have
     /// no stored session".
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+    }
+}
+
+impl Entry {
+    /// Counts a drop and says whether this one is due a log line.
+    fn record_drop(&mut self, reason: DropReason) -> Delivered {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        Delivered::Dropped {
+            reason,
+            report: self.log.record(Instant::now()),
+        }
     }
 }
 
@@ -303,15 +445,25 @@ mod tests {
     fn message(sid: u64) -> Message {
         Message {
             sid,
-            subject: b"a.b".to_vec(),
+            subject: bytes::Bytes::from_static(b"a.b"),
             ..Message::default()
         }
+    }
+
+    /// A budget that is not the thing under test.
+    fn roomy() -> Arc<Budget> {
+        Budget::new(usize::MAX / 2)
+    }
+
+    fn received(rx: &mut mpsc::Receiver<Queued>) -> Message {
+        rx.try_recv().expect("delivered").into_message()
     }
 
     /// A `MSG` goes to the subscription its `sid` names and to no other, even
     /// where both subscriptions match the same subject.
     #[test]
     fn a_message_reaches_only_the_sid_that_asked() {
+        let budget = roomy();
         let mut table = Table::new(8);
         let (tx1, mut rx1) = mpsc::channel(4);
         let (tx2, mut rx2) = mpsc::channel(4);
@@ -319,15 +471,15 @@ mod tests {
         table.insert(2, b"a.b".to_vec(), tx2);
 
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: false }
         );
-        assert_eq!(rx1.try_recv().expect("delivered").sid, 1);
+        assert_eq!(received(&mut rx1).sid, 1);
         assert!(
             rx2.try_recv().is_err(),
             "the other subscription matches the same subject and still gets nothing"
         );
-        assert_eq!(table.dispatch(9, message(9)), Delivered::Unknown);
+        assert_eq!(table.dispatch(9, message(9), &budget), Delivered::Unknown);
     }
 
     /// The count is a total, honoured locally: the fourth message on a
@@ -335,26 +487,27 @@ mod tests {
     /// wrote it.
     #[test]
     fn an_auto_unsubscribe_count_is_a_total_and_is_honoured_locally() {
+        let budget = roomy();
         let mut table = Table::new(8);
         let (tx, mut rx) = mpsc::channel(8);
         table.insert(1, b"a.b".to_vec(), tx);
 
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: false }
         );
         assert!(table.set_max_msgs(1, 3), "the subscription is still there");
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: false }
         );
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: true },
             "the third is the last one asked for"
         );
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Unknown,
             "a fourth message the server had already written is not delivered"
         );
@@ -369,56 +522,146 @@ mod tests {
     /// is what "the total delivered" means.
     #[test]
     fn a_count_already_reached_ends_the_subscription_immediately() {
+        let budget = roomy();
         let mut table = Table::new(8);
         let (tx, _rx) = mpsc::channel(8);
         table.insert(1, b"a.b".to_vec(), tx);
-        table.dispatch(1, message(1));
-        table.dispatch(1, message(1));
+        table.dispatch(1, message(1), &budget);
+        table.dispatch(1, message(1), &budget);
         assert!(table.set_max_msgs(1, 2));
-        assert_eq!(table.dispatch(1, message(1)), Delivered::Unknown);
+        assert_eq!(table.dispatch(1, message(1), &budget), Delivered::Unknown);
         assert!(
             !table.set_max_msgs(1, 5),
             "and there is nothing left to cap"
         );
     }
 
-    /// A full queue costs one copy, not the connection.
+    /// A full queue costs one copy, not the connection, and the copy is
+    /// counted where the subscription's owner can read it.
     #[test]
-    fn a_full_queue_drops_the_copy() {
+    fn a_full_queue_drops_and_counts_the_copy() {
+        let budget = roomy();
         let mut table = Table::new(8);
         let (tx, mut rx) = mpsc::channel(1);
-        table.insert(1, b"a.b".to_vec(), tx);
+        let dropped = table.insert(1, b"a.b".to_vec(), tx);
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: false }
         );
-        assert_eq!(table.dispatch(1, message(1)), Delivered::Dropped);
+        assert!(matches!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Dropped {
+                reason: DropReason::QueueFull,
+                report: Some(1)
+            }
+        ));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert!(rx.try_recv().is_ok());
         assert!(
             rx.try_recv().is_err(),
             "the dropped copy is gone, and the subscription is still live"
         );
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: false },
             "a drop is not a removal"
         );
+    }
+
+    /// A message that does not fit the byte budget is dropped and counted
+    /// however many slots the queue has free, and the bytes of what was
+    /// queued come back when the reader takes it.
+    #[test]
+    fn a_message_over_the_byte_budget_is_dropped_and_the_bytes_come_back() {
+        let one = message(1).queued_len();
+        let budget = Budget::new(one * 2);
+        let mut table = Table::new(8);
+        let (tx, mut rx) = mpsc::channel(100);
+        let dropped = table.insert(1, b"a.b".to_vec(), tx);
+
+        for _ in 0..2 {
+            assert_eq!(
+                table.dispatch(1, message(1), &budget),
+                Delivered::Ok { exhausted: false }
+            );
+        }
+        assert!(matches!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Dropped {
+                reason: DropReason::OverBudget,
+                ..
+            }
+        ));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        // The reader takes one; the budget has room for exactly one more.
+        let _ = received(&mut rx);
+        assert_eq!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Ok { exhausted: false }
+        );
+        assert!(matches!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Dropped { .. }
+        ));
+    }
+
+    /// The budget is the connection's, not the subscription's: two readers
+    /// that are both behind share it.
+    #[test]
+    fn the_budget_is_shared_by_every_subscription() {
+        let one = message(1).queued_len();
+        let budget = Budget::new(one);
+        let mut table = Table::new(8);
+        let (tx1, _rx1) = mpsc::channel(100);
+        let (tx2, _rx2) = mpsc::channel(100);
+        table.insert(1, b"a.b".to_vec(), tx1);
+        table.insert(2, b"a.b".to_vec(), tx2);
+        assert_eq!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Ok { exhausted: false }
+        );
+        assert!(matches!(
+            table.dispatch(2, message(2), &budget),
+            Delivered::Dropped {
+                reason: DropReason::OverBudget,
+                ..
+            }
+        ));
     }
 
     /// A reader that has gone away takes its entry with it, so the driver can
     /// write the one `UNSUB` that is due.
     #[test]
     fn a_dropped_reader_removes_its_entry_once() {
+        let budget = roomy();
         let mut table = Table::new(8);
         let (tx, rx) = mpsc::channel(1);
         table.insert(1, b"a.b".to_vec(), tx);
         drop(rx);
-        assert_eq!(table.dispatch(1, message(1)), Delivered::Gone);
+        assert_eq!(table.dispatch(1, message(1), &budget), Delivered::Gone);
         assert_eq!(
-            table.dispatch(1, message(1)),
+            table.dispatch(1, message(1), &budget),
             Delivered::Unknown,
             "and only once"
         );
+    }
+
+    /// An entry whose reader went away with its `UNSUB` lost is swept without
+    /// waiting for a message to find it, and the sweep names it so the
+    /// `UNSUB` can be written.
+    #[test]
+    fn a_sweep_finds_the_readers_that_are_gone() {
+        let mut table = Table::new(8);
+        let (live_tx, _live_rx) = mpsc::channel(1);
+        let (gone_tx, gone_rx) = mpsc::channel(1);
+        table.insert(1, b"a".to_vec(), live_tx);
+        table.insert(2, b"b".to_vec(), gone_tx);
+        drop(gone_rx);
+
+        assert_eq!(table.take_closed(), vec![2]);
+        assert!(table.take_closed().is_empty(), "swept once");
+        assert!(table.subject(1).is_some() && table.subject(2).is_none());
     }
 
     /// The bound is the client's, because the `sid` is.
@@ -435,5 +678,27 @@ mod tests {
         assert!(table.remove(0));
         assert!(table.has_room());
         assert!(!table.remove(0), "removing twice is not two removals");
+    }
+
+    /// A flood of drops is one log line a second, carrying the count of what
+    /// it stands for.
+    #[test]
+    fn drops_are_reported_at_most_once_a_second() {
+        let start = Instant::now();
+        let mut log = DropLog::default();
+        assert_eq!(log.record(start), Some(1), "the first is reported at once");
+        for n in 1..=1000u32 {
+            assert_eq!(
+                log.record(start + Duration::from_millis(u64::from(n) % 900)),
+                None,
+                "inside the second after the last report"
+            );
+        }
+        assert_eq!(
+            log.record(start + Duration::from_millis(1500)),
+            Some(1001),
+            "the next report stands for every drop since the last"
+        );
+        assert_eq!(log.record(start + Duration::from_millis(1600)), None);
     }
 }

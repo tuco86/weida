@@ -50,9 +50,11 @@ use crate::errors::raise;
 const KEYWORDS: &str = "name, token, user, password, jwt, signer, nkey_signer, verbose, \
                         pedantic, headers, no_responders, echo, ping_interval, max_pings_out, \
                         inbox_prefix, max_subscriptions, max_pending_requests, \
-                        subscription_queue, outgoing_queue, max_connect_urls, \
-                        max_header_entries, max_control_line, handshake_timeout, \
-                        max_resolved_addresses";
+                        subscription_queue, max_queued_bytes, outgoing_queue, \
+                        max_connect_urls, max_header_entries, max_control_line, \
+                        max_inbound_control_line, max_info_line, max_inbound_payload, \
+                        handshake_timeout, \
+                        write_timeout, max_resolved_addresses";
 
 /// Reads `**options` into the library's configuration.
 ///
@@ -93,12 +95,21 @@ pub fn from_kwargs(
                 "max_subscriptions" => options.max_subscriptions = value.extract()?,
                 "max_pending_requests" => options.max_pending_requests = value.extract()?,
                 "subscription_queue" => options.subscription_queue = value.extract()?,
+                "max_queued_bytes" => options.max_queued_bytes = value.extract()?,
                 "outgoing_queue" => options.outgoing_queue = value.extract()?,
                 "max_connect_urls" => options.max_connect_urls = value.extract()?,
                 "max_header_entries" => options.max_header_entries = value.extract()?,
                 "max_control_line" => options.max_control_line = value.extract()?,
+                "max_inbound_control_line" => {
+                    options.max_inbound_control_line = value.extract()?;
+                }
+                "max_info_line" => options.max_info_line = value.extract()?,
+                "max_inbound_payload" => options.max_inbound_payload = value.extract()?,
                 "handshake_timeout" => {
                     options.handshake_timeout = seconds(py, "handshake_timeout", &value)?;
+                }
+                "write_timeout" => {
+                    options.write_timeout = seconds(py, "write_timeout", &value)?;
                 }
                 "max_resolved_addresses" => options.max_resolved_addresses = value.extract()?,
                 unknown => {

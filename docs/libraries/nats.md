@@ -100,7 +100,7 @@ to, and that is the whole of it (`request.rs`).
 | The mandatory window | present, and **mandatory on purpose**: `request` takes a `Duration` and there is no form without one, because a request API that can hang is the failure the type exists to prevent |
 | `request_many` | present — a bounded collection inside one window, so a misbehaving responder cannot fill memory |
 | The 503 no-responder answer | present — negotiated in `CONNECT` as `no_responders`, and reported as `Error::NoResponders`, which is **never** collapsed into `Error::RequestTimeout`: 503 means "nobody was listening, now" and a timeout means "somebody may well have been" |
-| The inbox token | present, and **not secret**: built from the process id, a nanosecond clock reading and a process-local counter. An inbox name is a routing token; authorization is the server's, so guessing the subject buys exactly what a subject permission already allows. What correctness needs is that two requests never share a reply subject, and those three sources give that within a process, across processes and across a restart. A caller who needs an unguessable inbox sets `inbox_prefix` from a source it trusts |
+| The inbox token | present, and **unguessable**: 128 random bits from the operating system's generator, hex encoded, under `inbox_prefix`, with a per-request counter after it. Uniqueness is all correctness needs, but the reply subject is also the only thing that decides who may answer a request: another client in the account that can publish to `_INBOX.>` — every client, in the default account — could otherwise forge the reply to a guessable inbox. A connection that cannot get the random bits does not open. The unit tests in `request.rs` pin the width and that no hex digit of the token is constant across connections |
 
 ## 6. Authentication and transports
 
@@ -108,8 +108,8 @@ to, and that is the whole of it (`request.rs`).
 | --- | --- |
 | No credentials | present — and **refused at connect time** where `INFO.auth_required` is set, rather than sent and rejected |
 | `auth_token` | present — `Credentials::Token` |
-| `user` and `pass` | present — `Credentials::UserPassword`, with `require_tls` beside it, because the password is in the clear otherwise |
-| NKey (Ed25519 over `INFO.nonce`) | present — `Credentials::Nkey`, and the **signing is the caller's**: `options::Signer` is a closure that receives the nonce unchanged and returns the signature and the public key. There is no cryptographic dependency in this crate, for the same reason the `rustls::ClientConfig` is the caller's — a messaging library that held a private key and chose an algorithm would be making the application's security decision. `tests/handshake.rs` pins that the nonce arrives byte for byte and the answer lands in `CONNECT.sig` |
+| `user` and `pass` | present — `Credentials::UserPassword`, with `require_tls` beside it, because the password is in the clear otherwise. `connect_tls` upgrades whatever the `INFO` says, so the password cannot be talked into the clear by an edited `INFO` |
+| NKey (Ed25519 over `INFO.nonce`) | present — `Credentials::Nkey`, and the **signing is the caller's**: `options::Signer` is a closure that receives the nonce unchanged and returns the signature and the public key. There is no signing dependency in this crate (its one cryptographic dependency is the operating system's random number generator, for the inbox token), for the same reason the `rustls::ClientConfig` is the caller's — a messaging library that held a private key and chose an algorithm would be making the application's security decision. `tests/handshake.rs` pins that the nonce arrives byte for byte and the answer lands in `CONNECT.sig`. No credential, signature or JWT appears in any `Debug` output |
 | User JWT (`.creds`) | present — `Credentials::Jwt`, the JWT as the credentials file carries it plus the same caller-supplied signer |
 | Mutual TLS (the client certificate as the identity) | present — the certificate is in the caller's `rustls::ClientConfig`, so this is a configuration of the transport rather than a `CONNECT` field |
 | Exactly one credential form per connection | present **by construction**: `Credentials` is one enum, so a connection cannot carry two and let the server choose |
@@ -117,7 +117,7 @@ to, and that is the whole of it (`request.rs`).
 | Transport | Verdict |
 | --- | --- |
 | TCP, port 4222 | present — `transport.rs`, the reference's "a client normally connects through a TCP/IP socket" |
-| TLS | present — completed **before** ordinary traffic where `INFO.tls_required` says so, which makes it the server's decision rather than the client's; `--no-default-features` turns the stack off for a build that has no business linking one |
+| TLS | present — completed **before** ordinary traffic where `INFO.tls_required` says so, which makes it the server's decision, and **always** where the caller handed `connect_tls` a `rustls::ClientConfig`, which makes it the caller's: the first `INFO` arrives before TLS and before authentication, so an attacker on the path could rewrite `tls_required` to `false`, and a client that took that at its word would send its `CONNECT` — password, token or JWT — in the clear. An `INFO` that offers no TLS at all (neither `tls_required` nor `tls_available`) is `Error::Tls` before a `CONNECT` is written (`tests/handshake.rs`). The TLS handshake is inside the handshake's deadline. `--no-default-features` turns the stack off for a build that has no business linking one |
 | The trust anchors | **deliberately not in the crate** — the caller's `rustls::ClientConfig`, because which certificates an application trusts is the application's decision and a library that chooses cannot be audited |
 | WebSocket | **absent** — what is missing: the WebSocket handshake, its subprotocol and the framing over it. The server supports it and the client protocol inside it is identical, so this is an addition to `transport.rs` and nothing else; no caller has asked |
 | UNIX-domain sockets | **absent, and not reachable from here**: the reference offers them only "when embedded in Go", so there is no wire form for a Rust client to speak |
@@ -130,17 +130,22 @@ protocol's own or ours ([INVARIANTS.md](../INVARIANTS.md)).
 | Bound | Default | Whose, and what it bounds |
 | --- | --- | --- |
 | `INFO.max_payload` | the server's | the protocol's. Learned from `INFO` and **enforced locally, before the wire**: the server would answer `-ERR 'Maximum Payload Violation'` and close, and one comparison in the caller's own task keeps the connection. For a headered publish the number checked is the total |
-| `max_control_line` | the server's | the protocol's. Checked on every line this client writes |
+| `max_control_line` | the server's | the protocol's. Checked on every line this client **writes** |
+| `max_inbound_control_line` | 4160 | ours. Every line the server sends except `INFO`. The server's `max_control_line` bounds what *clients* send it, and the lines it sends back are built from those — a `MSG` is the `PUB` it answers with the subscriber's `sid` added — so this is the same number plus 64 octets, not the same option |
+| `max_info_line` | 64 KiB | ours. One `INFO` line, which grows with the cluster (`connect_urls`, the nonce, account fields) and so cannot share `max_inbound_control_line`: 4096 octets holds about a hundred and fifty urls, below the 256 the codec accepts |
+| `max_inbound_payload` | 8 MiB | ours. The largest `MSG` or `HMSG` this client accepts, headers included. `INFO.max_payload` is what the server accepts *from* the client; it is announced by the peer itself, before TLS and authentication, so as the bound on what the client *receives* it would let the peer choose how much memory to commit. The decode bound is the smaller of the two: a server can lower it and never raise it. A message above it ends the connection from its control line, before the body is read or reserved |
 | `max_pending` | 64 MiB, the server's | the protocol's, and **the server's to enforce**: a client cannot set it. What a client controls is how fast it drains, which is `subscription_queue` below |
 | `max_pings_out` | 2 | the protocol's number for the server's pings, **ours** for the client's — the same number the server documents. At the bound the connection is `State::Failed` |
-| `ping_interval` | 2 min | ours, and the same number `nats-server`'s own `ping_interval` defaults to |
+| `ping_interval` | 2 min | ours, and the same number `nats-server`'s own `ping_interval` defaults to. A fixed period rather than a silence timeout: traffic does not restart it, so a publisher that never pauses still tests its peer |
 | `max_subscriptions` | 4096 | **ours, and it cannot be anyone else's**: the `sid` is "generated by the client", so nothing but the client is in a position to stop the table from growing |
 | `max_pending_requests` | 1024 | ours. Inbox entries, each a request that may never be answered; the protocol has no notion of the map at all |
-| `subscription_queue` | 512 | ours. Messages waiting for one application reader; a full queue **drops** the copy with a `tracing::warn!` rather than blocking, because Core NATS is at-most-once, blocking would stall every other subscription on the connection, and the server's own answer to a client that will not read is to buffer `max_pending` and then disconnect it |
-| `outgoing_queue` | 256 | ours. Operations queued for the driver |
+| `subscription_queue` | 512 | ours. Messages waiting for one application reader. A full queue **drops** the copy and counts it (`Subscription::dropped`), with a log line at most once a second per subscription, rather than blocking: Core NATS is at-most-once, blocking would stall every other subscription on the connection, and the server's own answer to a client that will not read is to buffer `max_pending` and then disconnect it |
+| `max_queued_bytes` | 64 MiB | ours. **A message count is not a memory bound** ([INVARIANTS.md](../INVARIANTS.md)): 512 messages of `max_inbound_payload` is 4 GiB for one subscription, and there may be thousands. Every message handed to a reader — a subscription's, or the reply a request waits for — is charged its octets plus a 4 KiB floor, which stands for the 16 KiB read-buffer chunk its slices keep alive, and is dropped and counted where it does not fit. The charge travels with the message and is returned when the reader takes it. 64 MiB is the server's own `max_pending`, and retained memory stays within a small constant factor (about four) of what is charged. The budget is the **connection's**: a subscription nobody reads can use all of it, and what arrives for every other subscription is dropped and counted until that one is read or dropped |
+| `outgoing_queue` | 256 | ours. Operations queued for the driver; once the socket's own queue passes 64 KiB the driver takes no more of them, which is how a slow peer pushes back on its publishers |
 | `max_connect_urls` | 256 | ours, for **retention**. The codec refuses an array above its cap — a JSON array announces no length, so the only place to stop is while reading it — but a caller who wants to keep 2 must not turn a cluster that grew to 300 into a dropped connection, so the decode cap is never lowered below the default and the retention bound truncates afterwards |
 | `max_header_entries` | 128 | ours. Entries in one `NATS/1.0` block, which the block's byte count bounds only weakly |
-| `handshake_timeout` | 15 s | ours. The protocol gives no deadline, not even for the opening `INFO` |
+| `handshake_timeout` | 15 s | ours. **One budget for the whole handshake**, from the opening `INFO` through the TLS handshake to the `PONG`: the protocol gives no deadline, not even for the opening `INFO`, and a budget per step would let a server that answers each with a `PING` a moment before the deadline keep it open for ever. Also how long `flush`, `subscribe`, `close` and the inbox registration wait for the driver |
+| `write_timeout` | 10 s | ours, and `nats-server`'s own `write_deadline` default. How long the socket may accept **nothing** while output waits for it; the clock restarts whenever it takes anything. A peer that stops reading — a stalled link, a hostile server that sends `PING`s and never reads the `PONG`s — fills the kernel's buffers, and without this bound one such peer holds the connection, every caller waiting to publish and the socket for ever. The driver never awaits a write, so reads, `PONG`s and the ping clock go on while one is blocked (`tests/driver.rs`); the failure is `Error::WriteTimeout` |
 | `max_resolved_addresses` | 8 | ours. What a hostname may expand to |
 
 ## 8. JetStream, clusters, gateways and leaf nodes
@@ -170,8 +175,8 @@ agree; a queue group holding one subscriber of each client with twenty jobs, ass
 **count** rather than the split; request-reply in both directions; the 503 arriving immediately
 and distinguished from a timeout; and headers crossing the server and coming back.
 
-What exists instead, and what it is worth: `tests/handshake.rs` (18), `tests/subscriptions.rs`
-(12) and `tests/request_reply.rs` (10) drive a scripted in-process server that replays the
+What exists instead, and what it is worth: `tests/handshake.rs` (23), `tests/subscriptions.rs`
+(12), `tests/request_reply.rs` (11) and `tests/driver.rs` (10) drive a scripted in-process server that replays the
 reference's own byte sequences. They are assertions about the bytes this client writes and
 reads, checked against the protocol reference — **not** evidence that a real server accepts
 them. `cargo tree -p weida-nats --no-dev-dependencies` reaches neither `weida` nor
@@ -186,7 +191,7 @@ this workspace rather than adding a second TLS stack.
 | --- | --- |
 | 1. Every verb of the client protocol reference implemented or absent with a reason | **met** — §2: all twelve present |
 | 2. The transports the reference defines, with the rest named absent | **met** — §6: TCP and TLS present; WebSocket absent with what is missing named; UNIX-domain sockets have no wire form for a non-Go client |
-| 3. The authentication mechanisms a client can offer | **met** — §6: all five credential forms present, exactly one per connection by construction, and no cryptographic dependency |
+| 3. The authentication mechanisms a client can offer | **met** — §6: all five credential forms present, exactly one per connection by construction, and no signing dependency |
 | 4. Interop in both roles against an independent implementation | **NOT met, and stated rather than worked around** — §9. `nats-server` is absent and there is no pure-Rust substitute, because `async-nats` is a client. This is the one clause this library cannot claim, and it stays unclaimed until the binary is installed and `cargo test -p weida-nats --test interop_nats_server -- --ignored` runs |
 | 5. The subject model: both wildcards, queue groups, request-reply over inboxes | **met** — §3, §4, §5 |
 | 6. A feature-parity table, row by row, where no row says "partial" without saying what is missing | **met** — this document |

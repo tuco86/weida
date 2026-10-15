@@ -15,9 +15,11 @@
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use weida_nats::Connection;
 use weida_nats::options::ConnectionOptions;
 use weida_nats_codec::{Headers, Limits, Op};
+use weida_runtime::Exec;
 
 /// Every await in a test is bounded by this.
 pub const DEADLINE: Duration = Duration::from_secs(5);
@@ -38,6 +40,19 @@ pub struct Server {
 impl Server {
     pub async fn listen() -> (TcpListener, u16) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// A listener whose accepted sockets have a **small receive buffer**, so
+    /// that a peer that stops reading stalls the sender after a few kilobytes
+    /// instead of after the several megabytes loopback would otherwise absorb.
+    /// The tests that need a stall use it, so that they pay milliseconds.
+    pub async fn listen_small_window() -> (TcpListener, u16) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
         let port = listener.local_addr().unwrap().port();
         (listener, port)
     }
@@ -286,4 +301,37 @@ pub fn options() -> ConnectionOptions {
     options.handshake_timeout = Duration::from_secs(2);
     options.ping_interval = Duration::from_secs(60);
     options
+}
+
+/// An `INFO` that offers headers and nothing that needs a reaction.
+pub const PLAIN_INFO: &str =
+    "{\"server_id\":\"S1\",\"proto\":1,\"max_payload\":1048576,\"headers\":true}";
+
+/// A connection whose handshake is done, and the scripted server on its far
+/// end. `listener` is where the connection dials: [`Server::listen`] or
+/// [`Server::listen_small_window`].
+pub async fn connected(
+    (listener, port): (TcpListener, u16),
+    info: &str,
+    options: ConnectionOptions,
+) -> (Connection, Server) {
+    let exec = Exec::current().unwrap();
+    let info = info.to_owned();
+    let server = tokio::spawn(async move {
+        let mut server = Server::accept(&listener).await;
+        server.handshake(&info).await;
+        server
+    });
+    let nats = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options),
+    )
+    .await
+    .expect("the handshake finished")
+    .expect("the connection opened");
+    let server = tokio::time::timeout(DEADLINE, server)
+        .await
+        .expect("the server script finished")
+        .expect("the server script did not panic");
+    (nats, server)
 }

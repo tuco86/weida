@@ -42,11 +42,41 @@
 //! next call continues it. The alternative — a task that reads ahead and
 //! forwards — would have to guess how far ahead to read, and the bound on
 //! that guess would be one more bound nobody asked for.
+//!
+//! # A message is cut out of the buffer, not copied out of it
+//!
+//! The reader fills one [`BytesMut`]. A decoded `MSG` or `HMSG` is split off
+//! its front as a reference-counted [`Bytes`] frame and the message's subject,
+//! reply subject and payload are slices of that frame: no allocation per
+//! message and no copy of the payload. The buffer's own allocation is renewed
+//! once per 16 KiB chunk of traffic, or once per message that is larger. The
+//! price is that a slice keeps its chunk alive; `crate::queue` charges for it
+//! while a message waits, and [`crate::message`] says what it means for an
+//! application that holds one.
+//!
+//! A message declared larger than what has been read is never grown towards by
+//! doubling: the codec checks the declared count against the decode bound
+//! before it reports how much is missing, so the reader asks for what the
+//! message needs and never more than the decode bound allows. (The buffer
+//! grows by at least doubling, so the allocation can be up to twice the
+//! message.)
+//!
+//! # Writing is queued, and never awaited by whoever queues
+//!
+//! [`OpWriter`] holds what is waiting for the socket in one buffer. Queueing
+//! never blocks; the driver offers the socket the buffer from its own
+//! `select!`, so that **a peer that stops reading cannot stop the driver
+//! reading, answering or timing out**. Everything queued between two writes
+//! goes out in one write and one flush, which is also what keeps a TLS session
+//! from sealing a record per operation.
 
+use std::fmt;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use weida_nats_codec::error::DecodeError;
@@ -57,21 +87,50 @@ use crate::error::{Error, Result};
 use crate::message::{Message, OwnedHeaders};
 use crate::options::ConnectionOptions;
 
-/// One operation from the server, owned.
+/// `PING`, as it is written.
+pub(crate) const PING: &[u8] = b"PING\r\n";
+
+/// `PONG`, as it is written.
+pub(crate) const PONG: &[u8] = b"PONG\r\n";
+
+/// The room a read is offered, and the size one buffer allocation is renewed
+/// in.
 ///
-/// Owned because it has to outlive the read buffer it was decoded from: a
-/// `MSG` travels down a channel to whatever task holds the subscription, and
-/// a borrow would tie that task's lifetime to the driver's buffer.
+/// Every message queued for an application reader keeps the chunk it was read
+/// into alive, so this is also the most that one small message can pin;
+/// `crate::queue::PER_MESSAGE_OVERHEAD` is a quarter of it for that reason.
+pub(crate) const READ_CHUNK: usize = 16 * 1024;
+
+/// Spare room below which a read is not offered what is left: a read into a
+/// few hundred octets is a system call per few hundred octets.
+const MIN_READ: usize = 2 * 1024;
+
+/// The most an idle buffer is allowed to keep. After a large message the
+/// buffer is empty and still pointing at an allocation as big as the message;
+/// it is let go rather than held for the life of the connection.
+const RETAIN_MAX: usize = 4 * READ_CHUNK;
+
+/// The most one `reserve` asks for. The declared count is already under the
+/// caller's `max_inbound_payload`; this keeps a caller who configured that
+/// absurdly high from turning one control line into an allocation failure.
+const RESERVE_MAX: usize = 1 << 30;
+
+/// One operation from the server.
 ///
-/// The four server-to-client verbs that carry no state — `PING`, `PONG`,
-/// `+OK` — cost nothing to own. `INFO` keeps its JSON octets unparsed,
-/// because the fields a client acts on are
+/// Owned because it has to outlive the read it was decoded from: a `MSG`
+/// travels down a channel to whatever task holds the subscription, and a
+/// borrow would tie that task's lifetime to the driver's buffer. Owned does not
+/// mean copied: the octets of a `MSG` are slices of the read buffer.
+///
+/// The server-to-client verbs that carry no state — `PING`, `PONG`, `+OK` —
+/// cost nothing to own. `INFO` keeps its JSON octets unparsed, because the
+/// fields a client acts on are
 /// [`ServerInfo`](weida_nats_codec::ServerInfo)'s to read and the connection
 /// is the layer that acts on them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Incoming {
     /// `INFO {json}`: the object octets, `{` through `}`.
-    Info(Vec<u8>),
+    Info(Bytes),
     /// `MSG` or `HMSG`, dispatched by `sid`.
     Msg(Message),
     /// `PING`, which must be answered with `PONG`.
@@ -216,7 +275,9 @@ pub async fn connect(
 /// Puts TLS under an already-connected stream.
 ///
 /// `server_name` is what the certificate is validated against and what goes
-/// in SNI. The caller's `config` decides what "valid" means.
+/// in SNI. The caller's `config` decides what "valid" means. Unbounded in
+/// time by itself — a server that goes quiet after the `ClientHello` holds
+/// it — so the caller wraps it in the handshake's deadline.
 #[cfg(feature = "tls")]
 pub async fn upgrade_tls(
     stream: Stream,
@@ -240,16 +301,23 @@ pub async fn upgrade_tls(
 ///
 /// The buffer exists because a control line arrives in however many TCP
 /// segments the network chose and the codec needs it contiguous. Its growth
-/// is bounded by the two bounds the codec already applies: a line with no
-/// `CRLF` inside `max_control_line` is refused, and a declared payload above
-/// `max_payload` is refused from the control line alone — so nothing is ever
-/// reserved on the server's word.
-#[derive(Debug)]
+/// is bounded by the bounds the codec already applies: a line with no `CRLF`
+/// inside its bound is refused, and a declared payload above the decode bound
+/// is refused from the control line alone — so nothing is ever reserved on the
+/// server's word.
 pub struct Wire {
     stream: Stream,
-    buf: Vec<u8>,
-    /// Where the unconsumed octets start inside `buf`.
-    from: usize,
+    buf: BytesMut,
+}
+
+impl fmt::Debug for Wire {
+    /// How much is buffered, not what: the octets are the server's traffic.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Wire")
+            .field("stream", &self.stream)
+            .field("buffered", &self.buf.len())
+            .finish()
+    }
 }
 
 impl Wire {
@@ -258,8 +326,7 @@ impl Wire {
     pub fn new(stream: Stream) -> Self {
         Self {
             stream,
-            buf: Vec::new(),
-            from: 0,
+            buf: BytesMut::new(),
         }
     }
 
@@ -278,7 +345,7 @@ impl Wire {
 
     /// Reads one operation.
     pub async fn read_op(&mut self, limits: Limits) -> Result<Incoming> {
-        next_op(&mut self.stream, &mut self.buf, &mut self.from, limits).await
+        next_op(&mut self.stream, &mut self.buf, limits).await
     }
 
     /// Consumes the wire, handing back the stream for the TLS upgrade.
@@ -289,11 +356,11 @@ impl Wire {
     /// clear, and carrying it into the session or dropping it would both mean
     /// treating unencrypted protocol as though it had been protected.
     pub fn into_stream(self) -> Result<Stream> {
-        if self.buf.len() > self.from {
+        if !self.buf.is_empty() {
             return Err(Error::Protocol(format!(
                 "{} octet(s) arrived after INFO and before the TLS handshake, \
                  in the clear",
-                self.buf.len() - self.from
+                self.buf.len()
             )));
         }
         Ok(self.stream)
@@ -312,19 +379,25 @@ impl Wire {
             OpReader {
                 read,
                 buf: self.buf,
-                from: self.from,
             },
-            OpWriter { write },
+            OpWriter::over(write),
         )
     }
 }
 
 /// Reads whole operations from one half of a split wire.
-#[derive(Debug)]
 pub struct OpReader {
     read: tokio::io::ReadHalf<Stream>,
-    buf: Vec<u8>,
-    from: usize,
+    buf: BytesMut,
+}
+
+impl fmt::Debug for OpReader {
+    /// How much is buffered, not what: the octets are the server's traffic.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpReader")
+            .field("buffered", &self.buf.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpReader {
@@ -336,21 +409,118 @@ impl OpReader {
     /// `max_payload` changes when an asynchronous `INFO` arrives, and the
     /// value in force is the driver's to know.
     pub async fn next_op(&mut self, limits: Limits) -> Result<Incoming> {
-        next_op(&mut self.read, &mut self.buf, &mut self.from, limits).await
+        next_op(&mut self.read, &mut self.buf, limits).await
     }
 }
 
-/// Writes to one half of a split wire.
-#[derive(Debug)]
-pub struct OpWriter {
-    write: tokio::io::WriteHalf<Stream>,
+/// Writes to one half of a split wire, from a buffer that whoever has
+/// something to say can add to without waiting.
+///
+/// [`queue`](Self::queue) never blocks. [`step`](Self::step) is what offers
+/// the socket the buffer, one write at a time, so that the caller can stand it
+/// in a `select!` beside everything else it has to do and keep a clock on
+/// whether it makes progress.
+pub struct OpWriter<W = tokio::io::WriteHalf<Stream>> {
+    write: W,
+    /// Everything queued and not yet accepted by the socket.
+    out: BytesMut,
+    /// The octets the socket has accepted, so that "has this `PONG` gone yet"
+    /// is a comparison of two numbers rather than a search of the buffer.
+    written: u64,
+    /// Where the `PONG` queued last ends, in the same count.
+    pong_end: u64,
+    /// The socket has accepted octets since the last flush. A TLS session
+    /// holds sealed records until it is flushed; a plain socket has nothing to
+    /// flush and says so at once.
+    flush_due: bool,
 }
 
-impl OpWriter {
-    /// Writes `bytes` and flushes.
-    pub async fn send(&mut self, bytes: &[u8]) -> Result<()> {
-        self.write.write_all(bytes).await?;
-        self.write.flush().await?;
+impl<W> fmt::Debug for OpWriter<W> {
+    /// How much is waiting, not what: the octets are the application's
+    /// publications.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpWriter")
+            .field("queued", &self.out.len())
+            .field("written", &self.written)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W: AsyncWrite + Unpin> OpWriter<W> {
+    /// A writer over `write`, with nothing queued.
+    #[must_use]
+    pub fn over(write: W) -> Self {
+        Self {
+            write,
+            out: BytesMut::new(),
+            written: 0,
+            pong_end: 0,
+            flush_due: false,
+        }
+    }
+
+    /// Queues `bytes` behind whatever is waiting. Never blocks and never
+    /// writes: the octets leave in [`step`](Self::step).
+    pub fn queue(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
+    }
+
+    /// Queues a `PONG` unless the one queued last has not gone yet.
+    ///
+    /// A `PONG` answers every `PING` the server has sent before it: the
+    /// server counts unanswered pings and a `PONG` resets the count. What this
+    /// buys is that a peer that sends `PING`s and does not read the answers
+    /// costs one queued `PONG` while the socket is stuck, and not one per
+    /// `PING` at line rate.
+    pub fn queue_pong(&mut self) {
+        if self.pong_end > self.written {
+            return;
+        }
+        self.out.extend_from_slice(PONG);
+        self.pong_end = self.written + self.out.len() as u64;
+    }
+
+    /// How many octets are waiting for the socket.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Whether [`step`](Self::step) has anything left to do: octets waiting,
+    /// or a flush owed for the ones already written.
+    #[must_use]
+    pub fn has_output(&self) -> bool {
+        !self.out.is_empty() || self.flush_due
+    }
+
+    /// One step towards an empty buffer: a write if octets are waiting, and
+    /// once none are, the flush the writes before it owe.
+    ///
+    /// Returns after **one** write, not after the buffer is empty, so that a
+    /// caller can tell progress from a stall by whether this keeps returning.
+    /// **Cancel-safe**: the state is in `self`, a write that is dropped wrote
+    /// nothing, and a flush that is dropped is owed again.
+    pub async fn step(&mut self) -> Result<()> {
+        if !self.out.is_empty() {
+            let wrote = self.write.write_buf(&mut self.out).await?;
+            if wrote == 0 {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "the socket accepted no octets",
+                )));
+            }
+            self.written += wrote as u64;
+            self.flush_due = true;
+        }
+        if self.out.is_empty() {
+            if self.flush_due {
+                self.write.flush().await?;
+                self.flush_due = false;
+            }
+            if self.out.capacity() > RETAIN_MAX {
+                self.out = BytesMut::new();
+            }
+        }
         Ok(())
     }
 
@@ -368,33 +538,36 @@ impl OpWriter {
 /// One operation out of `buf`, filling from `reader` until there is one.
 async fn next_op<R: AsyncRead + Unpin>(
     reader: &mut R,
-    buf: &mut Vec<u8>,
-    from: &mut usize,
+    buf: &mut BytesMut,
     limits: Limits,
 ) -> Result<Incoming> {
+    // How much has to be buffered before decoding is worth another try. The
+    // codec says how much of a declared body is missing, so a large message is
+    // not decoded again after every read of it.
+    let mut ready_at = 0;
     loop {
-        if buf.len() > *from {
-            match Op::decode(&buf[*from..], limits) {
-                Ok((op, used)) => {
-                    let incoming = own(&op)?;
-                    *from += used;
-                    if *from == buf.len() {
-                        // Everything buffered is spent, which is the common
-                        // case: reset rather than grow and drain later.
-                        buf.clear();
-                        *from = 0;
+        if !buf.is_empty() && buf.len() >= ready_at {
+            match take(buf, limits)? {
+                Taken::Op(incoming) => {
+                    // After a large message the buffer is empty and still
+                    // points at an allocation as large as it: let that go.
+                    if buf.is_empty() && buf.capacity() > RETAIN_MAX {
+                        *buf = BytesMut::new();
                     }
                     return Ok(incoming);
                 }
-                Err(DecodeError::Incomplete { .. }) => {}
-                Err(error) => return Err(Error::Decode(error)),
+                Taken::More(missing) => {
+                    ready_at = buf.len().saturating_add(missing);
+                    // `missing` is what is left of a count the codec has
+                    // already checked against the decode bound, so this
+                    // reserves what the message needs and nothing a peer
+                    // merely announced beyond it.
+                    buf.reserve(missing.min(RESERVE_MAX));
+                }
             }
         }
-        // Reclaim the consumed prefix before reading more, so that a run of
-        // short control lines inside one segment is not memmoved per line.
-        if *from > 0 {
-            buf.drain(..*from);
-            *from = 0;
+        if buf.capacity() - buf.len() < MIN_READ {
+            buf.reserve(READ_CHUNK);
         }
         let read = reader.read_buf(buf).await?;
         if read == 0 {
@@ -406,39 +579,115 @@ async fn next_op<R: AsyncRead + Unpin>(
     }
 }
 
-/// Copies one decoded operation out of the read buffer.
-fn own(op: &Op<'_>) -> Result<Incoming> {
+/// What one attempt to take an operation off the front of the buffer found.
+enum Taken {
+    /// A whole operation, which has left the buffer.
+    Op(Incoming),
+    /// Part of one: this many more octets are needed.
+    More(usize),
+}
+
+/// What a decoded operation is, with its octets as offsets into the buffer it
+/// was decoded from rather than borrows of it, so that the buffer can be
+/// split once the decode is over.
+enum Parsed {
+    Info(Range<usize>),
+    Msg {
+        subject: Range<usize>,
+        sid: u64,
+        reply_to: Option<Range<usize>>,
+        headers: Option<OwnedHeaders>,
+        payload: Range<usize>,
+    },
+    Ping,
+    Pong,
+    Ok,
+    Err(String),
+}
+
+/// Takes one operation off the front of `buf`, if a whole one is there.
+fn take(buf: &mut BytesMut, limits: Limits) -> Result<Taken> {
+    // Only the address: the offsets below are measured from it, and holding
+    // it does not hold a borrow of `buf`.
+    let base = buf.as_ptr() as usize;
+    let (parsed, used) = match Op::decode(&buf[..], limits) {
+        Ok((op, used)) => (parse(&op, base)?, used),
+        Err(DecodeError::Incomplete { needed }) => return Ok(Taken::More(needed)),
+        Err(error) => return Err(Error::Decode(error)),
+    };
+    Ok(Taken::Op(match parsed {
+        Parsed::Ping => {
+            buf.advance(used);
+            Incoming::Ping
+        }
+        Parsed::Pong => {
+            buf.advance(used);
+            Incoming::Pong
+        }
+        Parsed::Ok => {
+            buf.advance(used);
+            Incoming::Ok
+        }
+        Parsed::Err(reason) => {
+            buf.advance(used);
+            Incoming::Err(reason)
+        }
+        Parsed::Info(json) => {
+            let frame = buf.split_to(used).freeze();
+            Incoming::Info(cut(&frame, json))
+        }
+        Parsed::Msg {
+            subject,
+            sid,
+            reply_to,
+            headers,
+            payload,
+        } => {
+            let frame = buf.split_to(used).freeze();
+            Incoming::Msg(Message {
+                subject: cut(&frame, subject),
+                sid,
+                reply_to: reply_to.map(|range| cut(&frame, range)),
+                headers,
+                payload: cut(&frame, payload),
+            })
+        }
+    }))
+}
+
+/// Reads a decoded operation into the form that outlives the decode.
+fn parse(op: &Op<'_>, base: usize) -> Result<Parsed> {
     Ok(match op {
-        Op::Info { json } => Incoming::Info((*json).to_vec()),
+        Op::Info { json } => Parsed::Info(offsets(base, json)),
         Op::Msg {
             subject,
             sid,
             reply_to,
             payload,
-        } => Incoming::Msg(Message {
-            subject: (*subject).to_vec(),
+        } => Parsed::Msg {
+            subject: offsets(base, subject),
             sid: parse_sid(sid)?,
-            reply_to: reply_to.map(<[u8]>::to_vec),
+            reply_to: reply_to.map(|reply_to| offsets(base, reply_to)),
             headers: None,
-            payload: (*payload).to_vec(),
-        }),
+            payload: offsets(base, payload),
+        },
         Op::Hmsg {
             subject,
             sid,
             reply_to,
             headers,
             payload,
-        } => Incoming::Msg(Message {
-            subject: (*subject).to_vec(),
+        } => Parsed::Msg {
+            subject: offsets(base, subject),
             sid: parse_sid(sid)?,
-            reply_to: reply_to.map(<[u8]>::to_vec),
+            reply_to: reply_to.map(|reply_to| offsets(base, reply_to)),
             headers: Some(OwnedHeaders::from_borrowed(headers)),
-            payload: (*payload).to_vec(),
-        }),
-        Op::Ping => Incoming::Ping,
-        Op::Pong => Incoming::Pong,
-        Op::Ok => Incoming::Ok,
-        Op::Err { reason } => Incoming::Err(String::from_utf8_lossy(reason).into_owned()),
+            payload: offsets(base, payload),
+        },
+        Op::Ping => Parsed::Ping,
+        Op::Pong => Parsed::Pong,
+        Op::Ok => Parsed::Ok,
+        Op::Err { reason } => Parsed::Err(String::from_utf8_lossy(reason).into_owned()),
         // A client is never sent these. `CONNECT`, `PUB`, `HPUB`, `SUB` and
         // `UNSUB` are client-to-server verbs, so a server writing one is a
         // server this client cannot reason about.
@@ -449,6 +698,28 @@ fn own(op: &Op<'_>) -> Result<Incoming> {
             )));
         }
     })
+}
+
+/// Where `part`, a slice of the buffer that starts at address `base`, lies in
+/// it.
+fn offsets(base: usize, part: &[u8]) -> Range<usize> {
+    let start = (part.as_ptr() as usize).saturating_sub(base);
+    start..start.saturating_add(part.len())
+}
+
+/// The part of `frame` at `range`, as a slice of it and not a copy.
+///
+/// `range` comes from [`offsets`] over slices the decoder cut out of the same
+/// octets, so it is always inside; an empty answer rather than a panic is what
+/// a range that was not would get, because the octets are a peer's.
+fn cut(frame: &Bytes, range: Range<usize>) -> Bytes {
+    match frame.get(range) {
+        Some(part) => frame.slice_ref(part),
+        None => {
+            debug_assert!(false, "an offset outside the frame it was measured in");
+            Bytes::new()
+        }
+    }
 }
 
 /// The `sid` a `MSG` came back on.
@@ -473,19 +744,55 @@ fn parse_sid(sid: &[u8]) -> Result<u64> {
 mod tests {
     use super::*;
 
+    /// A reader that hands out at most `step` octets per read, the way a
+    /// network hands out a message in segments.
+    struct Segments {
+        data: Vec<u8>,
+        at: usize,
+        step: usize,
+    }
+
+    impl Segments {
+        fn new(data: &[u8], step: usize) -> Self {
+            Self {
+                data: data.to_vec(),
+                at: 0,
+                step,
+            }
+        }
+    }
+
+    impl AsyncRead for Segments {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            let rest = &this.data[this.at..];
+            let take = rest.len().min(this.step).min(buf.remaining());
+            buf.put_slice(&rest[..take]);
+            this.at += take;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime")
+    }
+
     /// Reads every operation out of one buffer of octets, so the framing is
     /// tested without a socket.
     fn read_all(wire: &[u8]) -> Vec<Incoming> {
-        let mut buf = Vec::new();
-        let mut from = 0;
+        let mut buf = BytesMut::new();
         let mut out = Vec::new();
         // A finite reader: once the octets are gone, `next_op` sees EOF.
         let mut reader = std::io::Cursor::new(wire.to_vec());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a runtime");
+        let runtime = runtime();
         loop {
-            let next = runtime.block_on(next_op(&mut reader, &mut buf, &mut from, Limits::DEFAULT));
+            let next = runtime.block_on(next_op(&mut reader, &mut buf, Limits::DEFAULT));
             match next {
                 Ok(op) => out.push(op),
                 Err(_) => return out,
@@ -506,15 +813,19 @@ mod tests {
                      -ERR 'Stale Connection'\r\n";
         let ops = read_all(wire);
         assert_eq!(ops.len(), 5, "{ops:?}");
-        assert_eq!(ops[0], Incoming::Info(b"{\"max_payload\":1024}".to_vec()));
+        assert_eq!(
+            ops[0],
+            Incoming::Info(Bytes::from_static(b"{\"max_payload\":1024}"))
+        );
         assert_eq!(ops[1], Incoming::Ping);
         let Incoming::Msg(message) = &ops[2] else {
             panic!("expected a MSG, got {:?}", ops[2]);
         };
         assert_eq!(message.sid, 7);
-        assert_eq!(message.subject, b"a.b");
+        assert_eq!(message.subject, &b"a.b"[..]);
         assert_eq!(
-            message.payload, b"hi\r\nx",
+            message.payload,
+            &b"hi\r\nx"[..],
             "the declared count delimits the payload, not a search for CRLF"
         );
         assert_eq!(ops[3], Incoming::Pong);
@@ -535,19 +846,66 @@ mod tests {
         assert!(message.is_no_responders());
     }
 
+    /// The subject, reply subject and payload of one message are slices of the
+    /// same frame, and each is exactly its own octets: a slice that was off by
+    /// one would hand a payload the `CRLF` that follows it.
+    #[test]
+    fn the_parts_of_a_message_are_exactly_their_own_octets() {
+        let wire = b"MSG orders.created 12 _INBOX.r 6\r\nabc\r\nd\r\nMSG empty 1 0\r\n\r\n";
+        let ops = read_all(wire);
+        let [Incoming::Msg(first), Incoming::Msg(second)] = &ops[..] else {
+            panic!("two messages expected, got {ops:?}");
+        };
+        assert_eq!(first.subject, &b"orders.created"[..]);
+        assert_eq!(first.reply_to.as_deref(), Some(&b"_INBOX.r"[..]));
+        assert_eq!(first.payload, &b"abc\r\nd"[..]);
+        assert_eq!(second.subject, &b"empty"[..]);
+        assert!(second.reply_to.is_none());
+        assert!(second.payload.is_empty());
+    }
+
+    /// A message far larger than one read arrives whole when the network hands
+    /// it over in small segments, and the message after it is read from what
+    /// the same buffer holds next.
+    #[test]
+    fn a_large_message_arrives_whole_across_small_segments() {
+        let body: Vec<u8> = (0..300_000u32).map(|n| (n % 251) as u8).collect();
+        let mut wire = format!("MSG big 1 {}\r\n", body.len()).into_bytes();
+        wire.extend_from_slice(&body);
+        wire.extend_from_slice(b"\r\nPING\r\n");
+
+        let limits = Limits {
+            max_payload: 1 << 20,
+            ..Limits::DEFAULT
+        };
+        let mut reader = Segments::new(&wire, 1000);
+        let mut buf = BytesMut::new();
+        let runtime = runtime();
+        let first = runtime
+            .block_on(next_op(&mut reader, &mut buf, limits))
+            .expect("the message");
+        let Incoming::Msg(message) = first else {
+            panic!("a MSG expected, got {first:?}");
+        };
+        assert_eq!(message.payload.len(), body.len());
+        assert_eq!(&message.payload[..], &body[..]);
+        assert_eq!(
+            runtime
+                .block_on(next_op(&mut reader, &mut buf, limits))
+                .expect("what followed"),
+            Incoming::Ping
+        );
+    }
+
     /// A `sid` this client could not have written is the server inventing
     /// one, and inventing a number to match it would route a message to a
     /// subscription that never asked for it.
     #[test]
     fn a_sid_the_client_did_not_generate_is_a_protocol_error() {
-        let mut buf = Vec::new();
-        let mut from = 0;
+        let mut buf = BytesMut::new();
         let mut reader = std::io::Cursor::new(b"MSG a.b abc 0\r\n\r\n".to_vec());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a runtime");
-        let error = runtime
-            .block_on(next_op(&mut reader, &mut buf, &mut from, Limits::DEFAULT))
+        let error = runtime()
+            .block_on(next_op(&mut reader, &mut buf, Limits::DEFAULT))
             .expect_err("refused");
         assert!(matches!(error, Error::Protocol(_)), "{error}");
     }
@@ -556,18 +914,131 @@ mod tests {
     /// no idea which side of the connection it is on.
     #[test]
     fn a_client_to_server_verb_from_the_server_is_refused() {
-        let mut buf = Vec::new();
-        let mut from = 0;
+        let mut buf = BytesMut::new();
         let mut reader = std::io::Cursor::new(b"PUB a.b 0\r\n\r\n".to_vec());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a runtime");
-        let error = runtime
-            .block_on(next_op(&mut reader, &mut buf, &mut from, Limits::DEFAULT))
+        let error = runtime()
+            .block_on(next_op(&mut reader, &mut buf, Limits::DEFAULT))
             .expect_err("refused");
         assert!(
             matches!(&error, Error::Protocol(why) if why.contains("PUB")),
             "{error}"
         );
+    }
+
+    /// A declared count above the decode bound is refused from the control
+    /// line, before a single octet of the body is read or reserved.
+    #[test]
+    fn a_declared_count_above_the_bound_is_refused_before_the_body() {
+        let limits = Limits {
+            max_payload: 1024,
+            ..Limits::DEFAULT
+        };
+        let mut buf = BytesMut::new();
+        // The body is never sent: the line alone is enough to be refused.
+        let mut reader = std::io::Cursor::new(b"MSG a 1 3221225472\r\n".to_vec());
+        let error = runtime()
+            .block_on(next_op(&mut reader, &mut buf, limits))
+            .expect_err("refused");
+        assert!(
+            matches!(
+                error,
+                Error::Decode(DecodeError::PayloadTooLarge {
+                    declared: 3_221_225_472,
+                    cap: 1024
+                })
+            ),
+            "{error}"
+        );
+        assert!(
+            buf.capacity() <= READ_CHUNK,
+            "nothing was reserved on the strength of the declared count"
+        );
+    }
+
+    /// A buffer that has held a large message does not keep its allocation
+    /// for the life of the connection.
+    #[test]
+    fn an_idle_buffer_lets_a_large_allocation_go() {
+        let body = vec![b'x'; 200_000];
+        let mut wire = format!("MSG big 1 {}\r\n", body.len()).into_bytes();
+        wire.extend_from_slice(&body);
+        wire.extend_from_slice(b"\r\n");
+        let mut buf = BytesMut::new();
+        let mut reader = std::io::Cursor::new(wire);
+        let limits = Limits {
+            max_payload: 1 << 20,
+            ..Limits::DEFAULT
+        };
+        let message = runtime()
+            .block_on(next_op(&mut reader, &mut buf, limits))
+            .expect("the message");
+        assert!(matches!(message, Incoming::Msg(_)));
+        assert!(buf.is_empty());
+        assert!(
+            buf.capacity() <= RETAIN_MAX,
+            "the idle buffer kept {} octets",
+            buf.capacity()
+        );
+    }
+
+    /// The writer queues without waiting and writes what it queued, in order,
+    /// in as few writes as the socket allows.
+    #[tokio::test]
+    async fn queued_octets_are_written_in_order() {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let mut writer = OpWriter::over(near);
+        writer.queue(b"SUB a 1\r\n");
+        writer.queue(b"PUB a 1\r\nx\r\n");
+        assert_eq!(writer.queued(), 9 + 12);
+        while writer.has_output() {
+            writer.step().await.expect("written");
+        }
+        assert_eq!(writer.queued(), 0);
+
+        let mut got = vec![0u8; 21];
+        far.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, b"SUB a 1\r\nPUB a 1\r\nx\r\n");
+    }
+
+    /// A `PONG` that is already waiting answers every `PING` that arrives
+    /// before it is written; one that has gone is answered afresh.
+    #[tokio::test]
+    async fn pongs_are_coalesced_only_while_one_is_waiting() {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let mut writer = OpWriter::over(near);
+        for _ in 0..1000 {
+            writer.queue_pong();
+        }
+        assert_eq!(
+            writer.queued(),
+            PONG.len(),
+            "a thousand PINGs while the socket is stuck are one PONG"
+        );
+        while writer.has_output() {
+            writer.step().await.expect("written");
+        }
+        writer.queue_pong();
+        assert_eq!(writer.queued(), PONG.len(), "the first one has gone");
+        while writer.has_output() {
+            writer.step().await.expect("written");
+        }
+        let mut got = vec![0u8; 2 * PONG.len()];
+        far.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, b"PONG\r\nPONG\r\n");
+    }
+
+    /// A socket that takes nothing leaves the step pending rather than
+    /// failing or spinning, which is what lets the driver put a clock on it.
+    #[tokio::test]
+    async fn a_stuck_socket_leaves_the_step_pending() {
+        let (near, _far) = tokio::io::duplex(8);
+        let mut writer = OpWriter::over(near);
+        writer.queue(&[b'x'; 4096]);
+        // The first step takes what the pipe holds; the second can take
+        // nothing, because nobody reads the far end.
+        writer.step().await.expect("the pipe had room for a little");
+        let stuck = tokio::time::timeout(std::time::Duration::from_millis(100), writer.step());
+        assert!(stuck.await.is_err(), "no progress, and no error either");
+        assert!(writer.has_output());
     }
 }

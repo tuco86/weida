@@ -26,6 +26,14 @@ weida-nats-codec.workspace = true
 # Connection lifecycle logging: a reconnect loop that says nothing is a
 # reconnect loop nobody can debug.
 tracing.workspace = true
+# The read buffer and the delivered `Message`: a message's subject, reply
+# subject and payload are reference-counted slices of the one buffer the
+# server's octets were read into, so receiving a message copies nothing.
+bytes.workspace = true
+# The inbox token is unguessable (`request.rs`): any other client in the
+# account that can publish on `_INBOX.>` could otherwise forge a reply. The
+# operating system's generator, nothing hand-rolled.
+rand.workspace = true
 # TLS, on by default. `INFO.tls_required` makes it the server's decision
 # rather than the client's, so a client that cannot do it is a client that
 # cannot connect to a large share of deployments.

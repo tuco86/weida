@@ -38,7 +38,8 @@ pub enum DecodeError {
         needed: usize,
     },
 
-    /// No `CRLF` appeared within the caller's `max_control_line`.
+    /// No `CRLF` appeared within the caller's bound for the line: the
+    /// `max_control_line`, or the `max_info_line` for an `INFO`.
     ///
     /// The protocol reference names this one on the wire: the server answers
     /// `-ERR 'Maximum Control Line Exceeded'` when "message destination

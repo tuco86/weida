@@ -85,10 +85,12 @@ impl PyMessage {
     /// publisher and receiver. A dict would have to fold one of the two away.
     #[getter]
     fn headers(&self) -> Option<Vec<(String, String)>> {
-        self.inner
-            .headers
-            .as_ref()
-            .map(|headers| headers.entries().to_vec())
+        self.inner.headers.as_ref().map(|headers| {
+            headers
+                .entries()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect()
+        })
     }
 
     /// The `NATS/1.0` status, where the block carried one.
@@ -235,6 +237,13 @@ impl PyRemoteInfo {
     #[getter]
     fn tls_required(&self) -> bool {
         self.inner.tls_required
+    }
+
+    /// "If this is true, the server accepts TLS but does not require it": a
+    /// server in mixed mode.
+    #[getter]
+    fn tls_available(&self) -> bool {
+        self.inner.tls_available
     }
 
     /// "If this is true, the client must provide a valid certificate during

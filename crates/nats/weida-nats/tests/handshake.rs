@@ -292,7 +292,7 @@ async fn auth_required_with_no_credentials_is_refused_before_the_connect() {
 /// The NKey path: the nonce reaches the caller's signer **unchanged**, and
 /// what the signer returned lands in `CONNECT.sig` and `CONNECT.nkey`.
 ///
-/// The signing itself is the application's — this crate has no cryptographic
+/// The signing itself is the application's — this crate has no signing
 /// dependency and will not grow one — so what is asserted here is the whole
 /// of this client's part: the octets in, the two fields out.
 #[tokio::test]
@@ -908,4 +908,245 @@ impl TlsServer {
         self.stream.write_all(bytes).await.unwrap();
         self.stream.flush().await.unwrap();
     }
+}
+
+/// A certificate for `localhost`, and the two configurations that present and
+/// trust it.
+#[cfg(feature = "tls")]
+fn tls_configs() -> (
+    std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
+) {
+    use std::sync::Arc;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert = CertificateDer::from(issued.cert.der().to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()));
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+    let client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    (Arc::new(client), Arc::new(server))
+}
+
+/// The TLS handshake is inside the handshake's deadline. A server that sends
+/// an `INFO` demanding TLS and then goes quiet after the `ClientHello` would
+/// otherwise hold the connect, and the socket, for as long as it liked.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn a_tls_handshake_that_never_finishes_hits_the_handshake_deadline() {
+    let exec = Exec::current().unwrap();
+    let (client_config, _) = tls_configs();
+    let (listener, port) = Server::listen().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = Server::accept(&listener).await;
+        server.expect_silence().await;
+        server
+            .send_info("{\"server_id\":\"S1\",\"tls_required\":true}")
+            .await;
+        // The `ClientHello` arrives and is never answered.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drop(server);
+    });
+
+    let mut options = options();
+    options.handshake_timeout = Duration::from_millis(300);
+    options.tls_server_name = Some("localhost".to_owned());
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect_tls(&exec, "127.0.0.1", port, options, client_config),
+    )
+    .await
+    .expect("the connect returned instead of waiting on the TLS handshake")
+    .expect_err("no TLS session was ever established");
+    assert!(
+        matches!(&error, Error::HandshakeTimeout { step } if step.contains("TLS")),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "the deadline is the handshake's, not the server's"
+    );
+    server.abort();
+}
+
+/// A caller that hands over a TLS configuration has asked for TLS, and an
+/// `INFO` that says the server has none is an answer to refuse, not to obey:
+/// it arrives before TLS and before authentication, so an attacker on the path
+/// can rewrite `tls_required` to `false`. The client writes no `CONNECT` — and
+/// above all no password — in the clear.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn connect_tls_refuses_an_info_that_offers_no_tls_and_sends_no_credentials() {
+    let exec = Exec::current().unwrap();
+    let (client_config, _) = tls_configs();
+    let (listener, port) = Server::listen().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = Server::accept(&listener).await;
+        server.expect_silence().await;
+        server
+            .send_info("{\"server_id\":\"S1\",\"auth_required\":true,\"tls_required\":false}")
+            .await;
+        // Not one octet: `expect_end_of_stream` fails with whatever arrived.
+        server.expect_end_of_stream().await;
+    });
+
+    let mut options = options();
+    options.credentials = Credentials::UserPassword {
+        user: "alice".into(),
+        password: "s3cret".into(),
+    };
+    options.tls_server_name = Some("localhost".to_owned());
+    let error = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect_tls(&exec, "127.0.0.1", port, options, client_config),
+    )
+    .await
+    .expect("finished")
+    .expect_err("the server offered no TLS");
+    assert!(
+        matches!(&error, Error::Tls(why) if why.contains("INFO")),
+        "{error}"
+    );
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .expect("the server script finished")
+        .expect("the client wrote nothing in the clear");
+}
+
+/// A server in mixed mode offers TLS without demanding it. A caller that asked
+/// for TLS takes the offer, and the `CONNECT` goes inside the session.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn connect_tls_upgrades_where_the_server_only_offers_tls() {
+    let exec = Exec::current().unwrap();
+    let (client_config, server_config) = tls_configs();
+    let (listener, port) = Server::listen().await;
+
+    let server = tokio::spawn(async move {
+        let mut plain = Server::accept(&listener).await;
+        plain.expect_silence().await;
+        plain
+            .send_info("{\"server_id\":\"S1\",\"tls_available\":true,\"proto\":1}")
+            .await;
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let tls = acceptor
+            .accept(plain.stream)
+            .await
+            .expect("the client started TLS on an offer");
+        let mut inside = TlsServer {
+            stream: tls,
+            buf: Vec::new(),
+            from: 0,
+        };
+        let connect = inside.read_op().await;
+        assert!(connect.contains("\"tls_required\":true"), "{connect}");
+        assert_eq!(inside.read_op().await, "PING");
+        inside.write(b"PONG\r\n").await;
+    });
+
+    let mut options = options();
+    options.tls_server_name = Some("localhost".to_owned());
+    let nats = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect_tls(&exec, "127.0.0.1", port, options, client_config),
+    )
+    .await
+    .expect("finished")
+    .expect("opened inside TLS");
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(DEADLINE, nats.close())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// The handshake is **one** budget. A server that answers everything the
+/// client says with a `PING` a moment before the deadline never lets a clock
+/// that restarts per operation run out, and never sends the `PONG`.
+#[tokio::test]
+async fn a_server_that_keeps_the_handshake_busy_without_a_pong_runs_into_one_deadline() {
+    let exec = Exec::current().unwrap();
+    let (listener, port) = Server::listen().await;
+
+    let server = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+
+        let mut server = Server::accept(&listener).await;
+        server.expect_silence().await;
+        server.send_info("{\"server_id\":\"S1\"}").await;
+        assert!(server.read_op().await.starts_with("CONNECT"));
+        assert_eq!(server.read_op().await, "PING");
+        // A `PING` every hundred milliseconds and never the `PONG`.
+        while server.stream.write_all(b"PING\r\n").await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    let mut options = options();
+    options.handshake_timeout = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options),
+    )
+    .await
+    .expect("the connect returned instead of being kept busy for ever")
+    .expect_err("the PONG never came");
+    assert!(
+        matches!(&error, Error::HandshakeTimeout { step } if step.contains("PONG")),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "the budget is the handshake's, whatever the server keeps sending"
+    );
+    server.abort();
+}
+
+/// An `INFO` grows with the cluster. Two hundred servers' worth of
+/// `connect_urls` is a legitimate line well past the 4096 octets that bound a
+/// `MSG`, and the connection has to be made.
+#[tokio::test]
+async fn a_large_info_from_a_big_cluster_is_accepted() {
+    let exec = Exec::current().unwrap();
+    let (listener, port) = Server::listen().await;
+    let urls: Vec<String> = (0..200)
+        .map(|n| format!("\"10.0.{n}.1.cluster.internal.example:4222\""))
+        .collect();
+    let info = format!(
+        "{{\"server_id\":\"S1\",\"headers\":true,\"connect_urls\":[{}]}}",
+        urls.join(",")
+    );
+    assert!(info.len() > 4096, "the line is above the bound of a MSG");
+
+    let server = tokio::spawn(async move {
+        let mut server = Server::accept(&listener).await;
+        server.handshake(&info).await;
+    });
+    let nats = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options()),
+    )
+    .await
+    .expect("finished")
+    .expect("a large INFO is not a protocol violation");
+    assert_eq!(nats.info().connect_urls.len(), 200);
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
 }

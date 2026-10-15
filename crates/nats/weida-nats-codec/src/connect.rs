@@ -14,6 +14,7 @@
 //! newline. None of the three can end the string, the object, or the line.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use crate::error::DecodeError;
 use crate::json::{ObjectWriter, Scanner, set_once};
@@ -27,7 +28,7 @@ use crate::limits::Limits;
 /// optional and is written only when present, because "absent" and "false"
 /// are different answers to `echo` and to `headers`: the server reads an
 /// absent `echo` as the old protocol rather than as `echo: false`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Connect<'a> {
     /// "Turns on `+OK` protocol acknowledgements." Most clients send `false`;
     /// the server's own default is `true`, which is why it is always written.
@@ -74,6 +75,47 @@ pub struct Connect<'a> {
     /// verify the signature (`sig`) against the `nonce` provided in the
     /// `INFO` message."
     pub nkey: Option<Cow<'a, str>>,
+}
+
+/// Prints every field, but only whether each secret is set.
+///
+/// The derived form would print the password, token, JWT and signature in any
+/// `{:?}` (a `tracing` field, an `unwrap` message, a failing assertion). The
+/// nkey is a public key and is printed like the other identifiers.
+impl fmt::Debug for Connect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connect")
+            .field("verbose", &self.verbose)
+            .field("pedantic", &self.pedantic)
+            .field("tls_required", &self.tls_required)
+            .field("auth_token", &Redacted(self.auth_token.as_deref()))
+            .field("user", &self.user)
+            .field("pass", &Redacted(self.pass.as_deref()))
+            .field("name", &self.name)
+            .field("lang", &self.lang)
+            .field("version", &self.version)
+            .field("protocol", &self.protocol)
+            .field("echo", &self.echo)
+            .field("sig", &Redacted(self.sig.as_deref()))
+            .field("jwt", &Redacted(self.jwt.as_deref()))
+            .field("no_responders", &self.no_responders)
+            .field("headers", &self.headers)
+            .field("nkey", &self.nkey)
+            .finish()
+    }
+}
+
+/// A secret, shown only as whether it is present. The value is never
+/// formatted, so it cannot leak through a width, precision or alternate flag.
+struct Redacted<'a>(Option<&'a str>);
+
+impl fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("Some(<redacted>)"),
+            None => f.write_str("None"),
+        }
+    }
 }
 
 impl<'a> Connect<'a> {
@@ -244,5 +286,27 @@ mod tests {
 
         let echoing = Connect::parse(br#"{"echo":false}"#, Limits::DEFAULT).expect("decodes");
         assert_eq!(echoing.echo, Some(false));
+    }
+
+    #[test]
+    fn debug_shows_whether_each_secret_is_set_and_nothing_of_it() {
+        let connect = Connect {
+            pass: Some(Cow::Borrowed("hunter2")),
+            auth_token: Some(Cow::Borrowed("t0k3n")),
+            jwt: Some(Cow::Borrowed("ey.J.W.T")),
+            sig: Some(Cow::Borrowed("SIGNATURE")),
+            user: Some(Cow::Borrowed("alice")),
+            ..Connect::default()
+        };
+        let shown = format!("{connect:?}");
+        for secret in ["hunter2", "t0k3n", "ey.J.W.T", "SIGNATURE"] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("alice"), "{shown}");
+        assert!(shown.contains("auth_token: Some(<redacted>)"), "{shown}");
+
+        let empty = format!("{:?}", Connect::default());
+        assert!(empty.contains("pass: None"), "{empty}");
     }
 }

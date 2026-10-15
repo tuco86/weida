@@ -39,6 +39,7 @@ const ITERATIONS: usize = 100_000;
 const LIMITS: Limits = Limits {
     max_payload: 4096,
     max_control_line: 256,
+    max_info_line: 1024,
     max_header_entries: 8,
     max_connect_urls: 4,
 };

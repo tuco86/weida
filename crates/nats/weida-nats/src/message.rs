@@ -3,24 +3,44 @@
 //!
 //! `weida-nats-codec`'s `Op` and `Headers` borrow from the buffer they were
 //! decoded from, which is exactly right for a codec and exactly wrong for a
-//! message that travels down a channel to another task. So one copy is made,
-//! once, at the point the operation leaves the read buffer — and it is the
-//! only copy on the receive path.
+//! message that travels down a channel to another task. A [`Message`] gets
+//! around that without copying: its `subject`, `reply_to` and `payload` are
+//! [`Bytes`] — reference-counted slices of the buffer the server's octets were
+//! read into — so receiving a message allocates nothing per message and moves
+//! no payload. The header block is the one part that is copied out, because
+//! its entries are text the application compares and the block is small.
+//!
+//! # What a slice keeps alive
+//!
+//! A [`Bytes`] slice keeps the buffer chunk it was cut from alive, however
+//! little of it the slice covers. A message that is held for a long time holds
+//! up to one read chunk (16 KiB) of memory its neighbours have long released;
+//! an application that keeps small payloads around for good should copy them
+//! (`Bytes::copy_from_slice`) rather than keep the message. While a message is
+//! waiting for its reader the connection accounts for this: every queued
+//! message is charged at least a quarter chunk against
+//! [`ConnectionOptions::max_queued_bytes`](crate::options::ConnectionOptions::max_queued_bytes).
 //!
 //! # Octets, not text
 //!
-//! `subject`, `reply_to` and `payload` are `Vec<u8>`. The payload is opaque
-//! by definition: "the protocol assigns no payload schema or content type"
-//! (`docs/research/nats.md` §3). The subject and the reply subject are remote
-//! input, and a client that refused a non-UTF-8 subject would refuse a
-//! message a conforming server delivered — the same reason the codec keeps
-//! them as octets. [`Message::subject_str`] and [`Message::reply_to_str`] are
-//! there for the ordinary case where they are text.
+//! The payload is opaque by definition: "the protocol assigns no payload
+//! schema or content type" (`docs/research/nats.md` §3). The subject and the
+//! reply subject are remote input, and a client that refused a non-UTF-8
+//! subject would refuse a message a conforming server delivered — the same
+//! reason the codec keeps them as octets. [`Message::subject_str`] and
+//! [`Message::reply_to_str`] are there for the ordinary case where they are
+//! text.
 //!
-//! Header names and values are `String`, because ADR-4's grammar is
-//! HTTP-like text and a client compares them.
+//! Header names and values are text, because ADR-4's grammar is HTTP-like and
+//! a client compares them.
 
+use std::fmt;
+use std::ops::Range;
+
+use bytes::Bytes;
 use weida_nats_codec::Headers;
+
+use crate::queue::PER_MESSAGE_OVERHEAD;
 
 /// The `NATS/1.0` status a server sends when a request found no responder.
 ///
@@ -34,7 +54,7 @@ pub const NO_RESPONDERS: u16 = 503;
 pub struct Message {
     /// "Subject name this message was received on" — the literal subject the
     /// publisher used, not the pattern that matched it.
-    pub subject: Vec<u8>,
+    pub subject: Bytes,
     /// The `sid` of the subscription this copy was delivered to.
     ///
     /// Kept because it is the one field that says *which* subscription
@@ -44,12 +64,12 @@ pub struct Message {
     /// "The subject on which the publisher is listening for responses", where
     /// there was one. This is what a responder publishes its answer to, and
     /// it is the whole of request-reply's correlation.
-    pub reply_to: Option<Vec<u8>>,
+    pub reply_to: Option<Bytes>,
     /// The header block, where the message arrived as `HMSG`.
     pub headers: Option<OwnedHeaders>,
     /// The payload, exactly as long as the control line declared. May be
     /// empty, and may hold `CRLF`.
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl Message {
@@ -84,22 +104,41 @@ impl Message {
     pub fn is_no_responders(&self) -> bool {
         self.status() == Some(NO_RESPONDERS)
     }
+
+    /// What this message costs while it waits for its reader: its octets plus
+    /// [`PER_MESSAGE_OVERHEAD`], so that a flood of empty messages is bounded
+    /// by the same budget as a flood of large ones.
+    pub(crate) fn queued_len(&self) -> usize {
+        PER_MESSAGE_OVERHEAD
+            .saturating_add(self.subject.len())
+            .saturating_add(self.reply_to.as_ref().map_or(0, Bytes::len))
+            .saturating_add(self.headers.as_ref().map_or(0, OwnedHeaders::byte_len))
+            .saturating_add(self.payload.len())
+    }
 }
 
 /// A `NATS/1.0` header block that owns its names and values.
 ///
-/// A vector of pairs rather than a map, for the two reasons the codec gives:
+/// A sequence of pairs rather than a map, for the two reasons the codec gives:
 /// names may repeat with different values ("including supporting multi-value
 /// headers") and case is preserved between publisher and receiver. A map
 /// would have to fold one of the two away.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Every name and value lives in **one** string, back to back, with the pairs
+/// kept as offsets into it. A block of `n` entries is therefore two
+/// allocations however large `n` is, where a `String` per name and per value
+/// would be `2n + 1`, and a message may carry `max_header_entries` of them.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct OwnedHeaders {
     /// The three-digit status after `NATS/1.0`, where the version line
     /// carried one.
     pub status: Option<u16>,
     /// The text after the status, where there was one.
     pub description: Option<String>,
-    entries: Vec<(String, String)>,
+    /// Every name and value, in order, with nothing between them.
+    text: String,
+    /// Where each entry's name and value sit in `text`.
+    entries: Vec<(Range<usize>, Range<usize>)>,
 }
 
 impl OwnedHeaders {
@@ -109,19 +148,29 @@ impl OwnedHeaders {
         Self {
             status: None,
             description: None,
+            text: String::new(),
             entries: Vec::new(),
         }
     }
 
     /// Append an entry, keeping its case and its position.
-    pub fn push(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.entries.push((name.into(), value.into()));
+    pub fn push(&mut self, name: impl AsRef<str>, value: impl AsRef<str>) {
+        let name_at = self.text.len();
+        self.text.push_str(name.as_ref());
+        let value_at = self.text.len();
+        self.text.push_str(value.as_ref());
+        self.entries
+            .push((name_at..value_at, value_at..self.text.len()));
     }
 
     /// Every entry, in order, duplicates kept.
-    #[must_use]
-    pub fn entries(&self) -> &[(String, String)] {
-        &self.entries
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (&str, &str)> + '_ {
+        self.entries.iter().map(|(name, value)| {
+            (
+                &self.text[name.start..name.end],
+                &self.text[value.start..value.end],
+            )
+        })
     }
 
     /// Whether the block holds no entries. A block with a status and no
@@ -140,10 +189,9 @@ impl OwnedHeaders {
     /// The first value stored under exactly this name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|(stored, _)| stored == name)
-            .map(|(_, value)| value.as_str())
+        self.entries()
+            .find(|(stored, _)| *stored == name)
+            .map(|(_, value)| value)
     }
 
     /// The first value whose name matches ignoring ASCII case.
@@ -153,24 +201,29 @@ impl OwnedHeaders {
     /// have to ignore it. What must not happen is the storage folding it.
     #[must_use]
     pub fn get_ignore_ascii_case(&self, name: &str) -> Option<&str> {
-        self.entries
-            .iter()
+        self.entries()
             .find(|(stored, _)| stored.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
+            .map(|(_, value)| value)
     }
 
     /// Copies a decoded block out of the read buffer it borrows from.
     #[must_use]
     pub fn from_borrowed(headers: &Headers<'_>) -> Self {
-        Self {
+        let size = headers
+            .entries()
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let mut block = Self {
             status: headers.status,
             description: headers.description.map(str::to_owned),
-            entries: headers
-                .entries()
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect(),
+            text: String::with_capacity(size),
+            entries: Vec::with_capacity(headers.len()),
+        };
+        for (name, value) in headers.entries() {
+            block.push(name, value);
         }
+        block
     }
 
     /// The borrowed form, for putting this block back on the wire.
@@ -179,10 +232,27 @@ impl OwnedHeaders {
         let mut headers = Headers::new();
         headers.status = self.status;
         headers.description = self.description.as_deref();
-        for (name, value) in &self.entries {
-            headers.push(name.as_str(), value.as_str());
+        for (name, value) in self.entries() {
+            headers.push(name, value);
         }
         headers
+    }
+
+    /// The octets of text this block holds, for what it costs while queued.
+    pub(crate) fn byte_len(&self) -> usize {
+        self.text.len() + self.description.as_ref().map_or(0, String::len)
+    }
+}
+
+impl fmt::Debug for OwnedHeaders {
+    /// The entries as pairs: the offsets are how they are stored, not what
+    /// they are.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedHeaders")
+            .field("status", &self.status)
+            .field("description", &self.description)
+            .field("entries", &self.entries().collect::<Vec<_>>())
+            .finish()
     }
 }
 
@@ -213,6 +283,41 @@ mod tests {
         assert_eq!(out, wire);
     }
 
+    /// Entries keep their order and their duplicates, and a name that is the
+    /// tail of another is not confused with it: they share one string.
+    #[test]
+    fn entries_keep_order_and_duplicates_in_one_string() {
+        let mut block = OwnedHeaders::new();
+        block.push("Link", "a");
+        block.push("Link", "b");
+        block.push("k", "Link");
+        block.push("", "");
+        assert_eq!(
+            block.entries().collect::<Vec<_>>(),
+            [("Link", "a"), ("Link", "b"), ("k", "Link"), ("", "")]
+        );
+        assert_eq!(block.get("Link"), Some("a"), "the first of a repeated name");
+        assert_eq!(block.get("k"), Some("Link"));
+        assert_eq!(block.len(), 4);
+    }
+
+    /// A block built by hand and one copied out of a decode are the same
+    /// block when they hold the same entries.
+    #[test]
+    fn a_built_block_equals_a_decoded_one() {
+        let decoded = Headers::decode(
+            b"NATS/1.0 100 Idle Heartbeat\r\nA: 1\r\nB: 2\r\n\r\n",
+            Limits::DEFAULT,
+        )
+        .expect("a block");
+        let mut built = OwnedHeaders::new();
+        built.status = Some(100);
+        built.description = Some("Idle Heartbeat".to_owned());
+        built.push("A", "1");
+        built.push("B", "2");
+        assert_eq!(OwnedHeaders::from_borrowed(&decoded), built);
+    }
+
     /// The no-responder answer is a status and nothing else, and that is what
     /// `is_no_responders` keys on.
     #[test]
@@ -226,5 +331,19 @@ mod tests {
         assert!(message.is_no_responders());
         assert!(message.headers.as_ref().expect("headers").is_empty());
         assert!(!Message::default().is_no_responders());
+    }
+
+    /// What a queued message costs is its octets plus the floor, so an empty
+    /// message is not free.
+    #[test]
+    fn an_empty_message_still_costs_the_floor() {
+        assert_eq!(Message::default().queued_len(), PER_MESSAGE_OVERHEAD);
+        let message = Message {
+            subject: Bytes::from_static(b"a.b"),
+            reply_to: Some(Bytes::from_static(b"_INBOX.x")),
+            payload: Bytes::from_static(b"12345"),
+            ..Message::default()
+        };
+        assert_eq!(message.queued_len(), PER_MESSAGE_OVERHEAD + 3 + 8 + 5);
     }
 }

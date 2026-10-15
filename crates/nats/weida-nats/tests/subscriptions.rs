@@ -67,7 +67,7 @@ async fn a_sub_carries_a_client_chosen_sid_and_the_msg_comes_back_on_it() {
         Some("orders.created"),
         "the literal subject the publisher used, not the pattern that matched"
     );
-    assert_eq!(message.payload, b"{\"id\":7}");
+    assert_eq!(message.payload, &b"{\"id\":7}"[..]);
     assert!(message.reply_to.is_none());
     assert!(message.headers.is_none(), "a MSG has no header block");
 
@@ -121,7 +121,7 @@ async fn an_hmsg_is_dispatched_with_its_header_block() {
         Some("abc-1"),
         "case is preserved on the wire and ignorable on lookup"
     );
-    assert_eq!(message.payload, b"body");
+    assert_eq!(message.payload, &b"body"[..]);
     assert!(message.status().is_none());
 
     tokio::time::timeout(DEADLINE, nats.close())
@@ -177,13 +177,13 @@ async fn a_delivery_reaches_the_sid_it_names_and_no_other() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!((first.sid, first.payload.as_slice()), (1, &b"first"[..]));
+    assert_eq!((first.sid, &first.payload[..]), (1, &b"first"[..]));
 
     let second = tokio::time::timeout(DEADLINE, trailing.next())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!((second.sid, second.payload.as_slice()), (2, &b"second"[..]));
+    assert_eq!((second.sid, &second.payload[..]), (2, &b"second"[..]));
     let nested = tokio::time::timeout(DEADLINE, trailing.next())
         .await
         .unwrap()
@@ -279,12 +279,12 @@ async fn a_queue_group_is_one_argument_between_subject_and_sid() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(to_a.payload, b"to-worker-a");
+    assert_eq!(to_a.payload, &b"to-worker-a"[..]);
     let to_observer = tokio::time::timeout(DEADLINE, observer.next())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(to_observer.payload, b"to-the-observer");
+    assert_eq!(to_observer.payload, &b"to-the-observer"[..]);
     assert!(
         worker_b.try_next().is_none(),
         "the copy addressed to sid 1 is not delivered to sid 2"

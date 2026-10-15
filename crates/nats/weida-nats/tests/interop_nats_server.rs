@@ -218,7 +218,7 @@ async fn an_async_nats_publish_reaches_our_subscriber() {
         .await
         .expect("the server delivered")
         .expect("a message");
-    assert_eq!(message.payload, b"from async-nats");
+    assert_eq!(message.payload, &b"from async-nats"[..]);
     assert_eq!(message.subject_str(), Some("interop.two"));
     assert_eq!(message.reply_to, None);
 
@@ -387,7 +387,7 @@ async fn our_request_is_answered_by_an_async_nats_responder() {
     .await
     .expect("within the window")
     .expect("an answer");
-    assert_eq!(answer.payload, b"ping");
+    assert_eq!(answer.payload, &b"ping"[..]);
     // The inbox is ours and the reply subject the responder saw is the one we
     // generated, which is the whole of Core NATS request-reply: there is no
     // request verb, only a subject nobody else subscribes to.

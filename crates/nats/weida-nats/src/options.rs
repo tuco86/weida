@@ -15,16 +15,21 @@
 //! | Bound | Whose | Where it comes from |
 //! | --- | --- | --- |
 //! | `max_payload` | **the protocol's own** | `INFO.max_payload`, learned at connect time, enforced locally before every publish |
-//! | `max_control_line` | **the protocol's own** | the `max_control_line` server option; the server answers `-ERR 'Maximum Control Line Exceeded'`, so it is checked locally too |
+//! | `max_control_line` | **the protocol's own** | the `max_control_line` server option; the server answers `-ERR 'Maximum Control Line Exceeded'`, so it is checked locally on every line this client **writes** |
+//! | [`ConnectionOptions::max_inbound_control_line`] | **ours** | every line the server sends except `INFO`. The server's option bounds what *clients* send it, and the lines it sends back are built from those — a `MSG` adds the `sid` to the `PUB` it answers — so the two bounds are different numbers that happen to start equal |
 //! | `max_pending` | **the protocol's own**, and the *server's* to enforce | 64 MiB of pending outbound bytes per client, after which the server disconnects a slow consumer. A client cannot set it; what a client controls is how fast it drains, which is [`ConnectionOptions::subscription_queue`] |
 //! | `max_pings_out` | **the protocol's own** for the server's pings, **ours** for the client's | the server's documented default is 2 unanswered pings before a stale disconnect; [`DEFAULT_MAX_PINGS_OUT`] is this client applying the same rule to its own |
 //! | [`ConnectionOptions::max_subscriptions`] | **ours** | the protocol bounds the subscription table nowhere, and the client picks its own `sid`s |
 //! | [`ConnectionOptions::max_pending_requests`] | **ours** | the inbox map, likewise unbounded by the protocol |
 //! | [`ConnectionOptions::max_connect_urls`] | **ours** | `INFO.connect_urls` grows with the cluster and announces no length |
 //! | [`ConnectionOptions::max_header_entries`] | **ours** | one `NATS/1.0` block's entries, which its byte count bounds only weakly |
-//! | [`ConnectionOptions::subscription_queue`] | **ours** | messages waiting for an application to collect them |
+//! | [`ConnectionOptions::subscription_queue`] | **ours** | messages waiting for an application to collect them, per subscription |
+//! | [`ConnectionOptions::max_queued_bytes`] | **ours** | the octets of every delivered message waiting for an application, over the whole connection: a message count is not a memory bound |
+//! | [`ConnectionOptions::max_inbound_payload`] | **ours** | the largest `MSG` or `HMSG` this client accepts. `INFO.max_payload` is the *server's* bound on what a client publishes, announced by the peer itself and unauthenticated, so it cannot be the bound on what the client receives |
+//! | [`ConnectionOptions::max_info_line`] | **ours** | one `INFO` line, which grows with the cluster and so cannot share `max_control_line` |
 //! | [`ConnectionOptions::outgoing_queue`] | **ours** | operations queued for the driver |
-//! | [`ConnectionOptions::handshake_timeout`] | **ours** | the protocol gives no deadline for the opening `INFO` or for anything else |
+//! | [`ConnectionOptions::handshake_timeout`] | **ours** | the whole handshake, from the opening `INFO` to the `PONG`: the protocol gives no deadline for any of it |
+//! | [`ConnectionOptions::write_timeout`] | **ours** | how long the socket may accept nothing while output waits for it: the protocol gives a client no write deadline |
 //! | [`ConnectionOptions::max_resolved_addresses`] | **ours** | a resolver answer is remote input |
 //!
 //! # Where this client's defaults differ from the protocol's stated ones
@@ -62,7 +67,7 @@ pub const INBOX_PREFIX: &str = "_INBOX.";
 /// What this client puts in `CONNECT.lang`.
 pub const LANG: &str = "rust";
 
-/// How often this client sends its own `PING` when nothing else is going out.
+/// How often this client sends its own `PING`.
 ///
 /// **Ours.** The protocol has no client ping interval; `ping_interval` in
 /// `docs/research/nats.md` §11 is the *server's* setting for the pings it
@@ -70,6 +75,10 @@ pub const LANG: &str = "rust";
 /// number for its own pings, because the two clocks measure the same thing
 /// from opposite ends and picking a different period would only mean
 /// discovering a dead connection at a different arbitrary time.
+///
+/// A fixed period, not a silence timeout: the clock is not restarted by
+/// traffic, so a connection that never pauses — a publisher, above all —
+/// still tests its peer every interval.
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(120);
 
 /// How many of this client's `PING`s may be outstanding before the connection
@@ -111,9 +120,37 @@ pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 1024;
 /// that let one slow application subscription block its read loop would stall
 /// every other subscription on the connection, and then be disconnected as a
 /// slow consumer anyway. So the queue is bounded and a message that arrives
-/// for a full queue is dropped with a log line, which is what Core NATS
-/// at-most-once delivery already permits.
+/// for a full queue is dropped and counted ([`Subscription::dropped`]), which
+/// is what Core NATS at-most-once delivery already permits.
+///
+/// A count, and a count is not a memory bound: see
+/// [`DEFAULT_MAX_QUEUED_BYTES`] for the one that is.
+///
+/// [`Subscription::dropped`]: crate::Subscription::dropped
 pub const DEFAULT_SUBSCRIPTION_QUEUE: usize = 512;
+
+/// How many octets of delivered messages may wait for application readers,
+/// over the whole connection.
+///
+/// **Ours.** `subscription_queue` counts messages, so on its own it bounds
+/// nothing: 512 messages of [`DEFAULT_MAX_INBOUND_PAYLOAD`] each is 4 GiB for
+/// one subscription, and there may be thousands. Every message handed to a
+/// reader — a subscription's, or the reply a request is waiting for — is
+/// charged its octets plus a floor that stands for the read buffer chunk it
+/// keeps alive, and a message that does not fit is dropped and counted rather
+/// than queued. The charge is returned when the reader takes the message.
+///
+/// 64 MiB is the server's own `max_pending` for a slow client (§11), which is
+/// the same trade one hop on: past it the data is somebody else's problem,
+/// and Core NATS stores nothing for replay. Keep it above
+/// [`DEFAULT_MAX_INBOUND_PAYLOAD`], or the largest legal message can never be
+/// queued.
+///
+/// The budget is the connection's, not a subscription's: a subscription nobody
+/// reads can use all of it, and what arrives for every other subscription is
+/// then dropped and counted until that one is read or dropped. An application
+/// with one slow consumer among fast ones reads it or unsubscribes it.
+pub const DEFAULT_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 
 /// How many operations may be queued for the driver before a caller waits.
 ///
@@ -121,13 +158,35 @@ pub const DEFAULT_SUBSCRIPTION_QUEUE: usize = 512;
 /// application outrun the socket without ever being told.
 pub const DEFAULT_OUTGOING_QUEUE: usize = 256;
 
-/// How long each step of the handshake may take.
+/// How long the whole handshake may take, from the opening `INFO` to the
+/// `PONG` that confirms the `CONNECT`.
 ///
-/// **Ours.** The protocol gives no deadline for any of them — not for the
+/// **Ours.** The protocol gives no deadline for any of it — not for the
 /// `INFO` the server is supposed to send unprompted — so a server that
 /// accepts a TCP connection and then says nothing would hold a client
-/// forever.
+/// forever. One budget for the lot rather than one per step: a server that
+/// answers every operation with a `PING` a moment before the deadline never
+/// lets a per-step clock expire and never sends the `PONG`.
+///
+/// The same number is how long [`Connection::flush`](crate::Connection::flush),
+/// `subscribe`, `close` and the inbox registration wait for the driver to
+/// answer them.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the socket may accept nothing while output is waiting for it.
+///
+/// **Ours.** The protocol gives a client no write deadline; `nats-server`'s
+/// own `write_deadline`, 10 seconds by default, is what it applies to a slow
+/// *client*. A peer that stops reading — a stalled link, a black hole, a
+/// hostile server — fills the kernel's buffers, after which a write never
+/// completes. Without a bound that one peer holds the connection, everything
+/// waiting to publish on it, and the socket itself for as long as it likes.
+///
+/// The clock restarts every time the socket accepts octets, so a slow link
+/// that keeps moving is not a stall: what is bounded is no progress at all.
+/// Reads are not affected either way; the driver keeps reading while a write
+/// is blocked.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many addresses a hostname may expand to.
 ///
@@ -152,11 +211,53 @@ pub const DEFAULT_MAX_CONNECT_URLS: u32 = weida_nats_codec::limits::DEFAULT_MAX_
 /// rather than four octets.
 pub const DEFAULT_MAX_HEADER_ENTRIES: u32 = weida_nats_codec::limits::DEFAULT_MAX_HEADER_ENTRIES;
 
+/// The largest `MSG` or `HMSG` this client accepts from the server, in octets
+/// (the total, headers included, for `HMSG`).
+///
+/// **Ours.** `INFO.max_payload` is "the maximum payload size the server will
+/// accept *from the client*": it bounds what this client publishes. It is also
+/// a number the peer announces itself, in a line that arrives before TLS and
+/// before authentication, so using it as the bound on what the client
+/// *receives* would let the peer choose how much memory to commit — `INFO
+/// {"max_payload":18446744073709551615}` is a legal line. The decode bound is
+/// the smaller of the two: a server cannot raise it, only lower it. A message
+/// above it ends the connection: the codec refuses the declared count from the
+/// control line, before any of the body is read, and carrying on would mean
+/// reading and discarding as many octets as the peer cares to send.
+///
+/// 8 MiB is eight times the server's documented default of 1 MiB and half of
+/// what `nats-server` allows at most (64 MiB). A client whose servers are
+/// configured above this raises it, knowingly.
+pub const DEFAULT_MAX_INBOUND_PAYLOAD: u64 = 8 * 1024 * 1024;
+
+/// The largest `INFO` line this client accepts, in octets before the `CRLF`.
+///
+/// **Ours**, and the codec's own default
+/// (`weida_nats_codec::limits::DEFAULT_MAX_INFO_LINE`). An `INFO` grows with
+/// the cluster — `connect_urls`, `ws_connect_urls`, account fields, the nonce —
+/// so it cannot share the 4096-octet bound of `MSG` and `PING` without a large
+/// cluster becoming a connection that cannot be made.
+pub const DEFAULT_MAX_INFO_LINE: usize = weida_nats_codec::limits::DEFAULT_MAX_INFO_LINE;
+
+/// The largest control line, `INFO` aside, this client accepts from the server.
+///
+/// **Ours.** The server's `max_control_line` bounds what *clients* send it,
+/// and the lines it sends back are built from those: a `MSG` is the `PUB` it
+/// answers with the subscriber's `sid` added (up to twenty digits and a
+/// separator), so a message published on a line at the server's own limit
+/// arrives on a line longer than it. The default is the codec's starting value
+/// plus room for that, so the largest legal publication is not one this client
+/// cannot receive.
+pub const DEFAULT_MAX_INBOUND_CONTROL_LINE: usize =
+    weida_nats_codec::limits::DEFAULT_MAX_CONTROL_LINE + 64;
+
 /// What a caller's signer returns for one nonce.
 ///
 /// Two strings, both base64url as the reference's `sig` and `nkey` fields
-/// carry them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// carry them. `Debug` prints the public key and never the signature: a
+/// signature over a server nonce is single-use, but it is also the proof of
+/// holding the key, and nothing that logs a value has a reason to keep it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct NonceSignature {
     /// `CONNECT.sig`: "in case the server has responded with a `nonce` on
     /// `INFO`, then a NATS client must use this field to reply with the
@@ -171,6 +272,24 @@ pub struct NonceSignature {
     pub public_key: Option<String>,
 }
 
+impl fmt::Debug for NonceSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NonceSignature")
+            .field("signature", &Redacted)
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
+/// What a secret prints as.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// What a nonce signer is, as a function.
 ///
 /// Named rather than written out at the one place it is used, because the
@@ -183,7 +302,7 @@ pub type SignNonce = dyn Fn(&[u8]) -> std::result::Result<NonceSignature, String
 ///
 /// **The signing is the application's, not this crate's.** An NKey signature
 /// is an Ed25519 signature over the server's nonce with the user's seed, and
-/// this crate has no cryptographic dependency and will not grow one: the key
+/// this crate has no signing dependency and will not grow one: the key
 /// material is the application's, exactly as the `rustls::ClientConfig` for
 /// TLS is the application's. Giving a messaging library a private key to hold
 /// and an algorithm to choose would be making the application's security
@@ -226,7 +345,11 @@ impl fmt::Debug for Signer {
 /// is a `CONNECT` whose author did not know which one the server wants. Which
 /// one is *required* is the server's to say through `INFO.auth_required`; this
 /// type makes "exactly one" structural.
-#[derive(Clone, Debug, Default)]
+///
+/// `Debug` prints which form this is and, for a user name, the name — and never
+/// a token, a password or a JWT, so that a `{:?}` of the options in a log
+/// line, a failed assertion or a `tracing` field cannot carry them out.
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub enum Credentials {
     /// No credentials. Refused at connect time where `INFO.auth_required` is
@@ -267,6 +390,26 @@ pub enum Credentials {
     /// nonce in `CONNECT`" (`docs/research/nats.md` §1), so this form needs a
     /// nonce and fails without one.
     Nkey(Signer),
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Token(_) => f.debug_tuple("Token").field(&Redacted).finish(),
+            Self::UserPassword { user, .. } => f
+                .debug_struct("UserPassword")
+                .field("user", user)
+                .field("password", &Redacted)
+                .finish(),
+            Self::Jwt { signer, .. } => f
+                .debug_struct("Jwt")
+                .field("jwt", &Redacted)
+                .field("signer", signer)
+                .finish(),
+            Self::Nkey(signer) => f.debug_tuple("Nkey").field(signer).finish(),
+        }
+    }
 }
 
 impl Credentials {
@@ -324,6 +467,10 @@ pub struct ConnectionOptions {
     ///
     /// This becomes `CONNECT.tls_required`. Useful beside
     /// [`Credentials::UserPassword`], which otherwise travels in the clear.
+    /// [`Connection::connect_tls`](crate::Connection::connect_tls) insists
+    /// whatever this says: a caller that hands over a TLS configuration has
+    /// said it wants TLS, and an `INFO` that omits the flag must not be able to
+    /// talk it out of it.
     pub require_tls: bool,
     /// The name to validate the server certificate against, and to put in
     /// SNI. Defaults to the host that was dialled.
@@ -346,6 +493,9 @@ pub struct ConnectionOptions {
     /// How many messages may wait for one subscription's reader. See
     /// [`DEFAULT_SUBSCRIPTION_QUEUE`].
     pub subscription_queue: usize,
+    /// How many octets of delivered messages may wait for readers, over the
+    /// whole connection. See [`DEFAULT_MAX_QUEUED_BYTES`].
+    pub max_queued_bytes: usize,
     /// How many operations may be queued for the driver. See
     /// [`DEFAULT_OUTGOING_QUEUE`].
     pub outgoing_queue: usize,
@@ -360,11 +510,26 @@ pub struct ConnectionOptions {
     /// How many `name: value` entries one `NATS/1.0` header block may hold.
     /// See [`DEFAULT_MAX_HEADER_ENTRIES`].
     pub max_header_entries: u32,
-    /// The largest control line this client will write, in octets before the
-    /// `CRLF`. The server's own `max_control_line`; see the module table.
+    /// The largest control line this client will **write**, in octets before
+    /// the `CRLF`. The server's own `max_control_line`; see the module table.
+    /// What it accepts is [`max_inbound_control_line`](Self::max_inbound_control_line).
     pub max_control_line: usize,
-    /// Per-step handshake deadline. See [`DEFAULT_HANDSHAKE_TIMEOUT`].
+    /// The largest control line this client accepts from the server, `INFO`
+    /// aside. See [`DEFAULT_MAX_INBOUND_CONTROL_LINE`].
+    pub max_inbound_control_line: usize,
+    /// The largest `INFO` line this client accepts. See
+    /// [`DEFAULT_MAX_INFO_LINE`].
+    pub max_info_line: usize,
+    /// The largest `MSG` or `HMSG` this client accepts, headers included. The
+    /// decode bound is the smaller of this and `INFO.max_payload`. See
+    /// [`DEFAULT_MAX_INBOUND_PAYLOAD`].
+    pub max_inbound_payload: u64,
+    /// How long the whole handshake may take. See
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`].
     pub handshake_timeout: Duration,
+    /// How long the socket may accept nothing while output waits for it. See
+    /// [`DEFAULT_WRITE_TIMEOUT`].
+    pub write_timeout: Duration,
     /// How many addresses a hostname may expand to. See
     /// [`DEFAULT_MAX_RESOLVED_ADDRESSES`].
     pub max_resolved_addresses: usize,
@@ -396,11 +561,16 @@ impl ConnectionOptions {
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
             max_pending_requests: DEFAULT_MAX_PENDING_REQUESTS,
             subscription_queue: DEFAULT_SUBSCRIPTION_QUEUE,
+            max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
             outgoing_queue: DEFAULT_OUTGOING_QUEUE,
             max_connect_urls: DEFAULT_MAX_CONNECT_URLS,
             max_header_entries: DEFAULT_MAX_HEADER_ENTRIES,
             max_control_line: weida_nats_codec::limits::DEFAULT_MAX_CONTROL_LINE,
+            max_inbound_control_line: DEFAULT_MAX_INBOUND_CONTROL_LINE,
+            max_info_line: DEFAULT_MAX_INFO_LINE,
+            max_inbound_payload: DEFAULT_MAX_INBOUND_PAYLOAD,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             max_resolved_addresses: DEFAULT_MAX_RESOLVED_ADDRESSES,
         }
     }
@@ -437,6 +607,13 @@ impl ConnectionOptions {
                     .into(),
             ));
         }
+        if self.write_timeout.is_zero() {
+            return Err(Error::Configuration(
+                "write_timeout must be non-zero: zero would call every write a \
+                 stall before the socket had a chance to take it"
+                    .into(),
+            ));
+        }
         if self.max_subscriptions == 0 {
             return Err(Error::Configuration(
                 "max_subscriptions must be at least 1".into(),
@@ -452,6 +629,13 @@ impl ConnectionOptions {
                 "subscription_queue must be at least 1".into(),
             ));
         }
+        if self.max_queued_bytes == 0 {
+            return Err(Error::Configuration(
+                "max_queued_bytes must be non-zero: with no budget every \
+                 delivered message would be dropped"
+                    .into(),
+            ));
+        }
         if self.outgoing_queue == 0 {
             return Err(Error::Configuration(
                 "outgoing_queue must be at least 1".into(),
@@ -465,6 +649,23 @@ impl ConnectionOptions {
         if self.max_control_line == 0 {
             return Err(Error::Configuration(
                 "max_control_line must be non-zero".into(),
+            ));
+        }
+        if self.max_inbound_control_line == 0 {
+            return Err(Error::Configuration(
+                "max_inbound_control_line must be non-zero".into(),
+            ));
+        }
+        if self.max_info_line == 0 {
+            return Err(Error::Configuration(
+                "max_info_line must be non-zero".into(),
+            ));
+        }
+        if self.max_inbound_payload == 0 {
+            return Err(Error::Configuration(
+                "max_inbound_payload must be non-zero: it is the largest message \
+                 this client will accept, and zero accepts only empty ones"
+                    .into(),
             ));
         }
         // The inbox prefix becomes the leading tokens of every reply subject,
@@ -574,5 +775,87 @@ mod tests {
             signer.sign(b"abc").expect("signed").signature,
             "seed-material:3"
         );
+    }
+
+    /// Every credential form prints without its secret: a `{:?}` of the
+    /// options is what lands in a log line, a failed assertion or a `tracing`
+    /// field, and the password, token and JWT must not be in it.
+    #[test]
+    fn no_credential_form_debugs_its_secret() {
+        let forms = [
+            Credentials::Token("t0k3n-secret".into()),
+            Credentials::UserPassword {
+                user: "alice".into(),
+                password: "hunter2-secret".into(),
+            },
+            Credentials::Jwt {
+                jwt: "ey.jwt-secret.sig".into(),
+                signer: Some(Signer::new(|_| Err("unused".to_owned()))),
+            },
+            Credentials::Nkey(Signer::new(|_| Err("unused".to_owned()))),
+        ];
+        for credentials in forms {
+            let name = credentials.name();
+            let options = ConnectionOptions {
+                credentials: credentials.clone(),
+                ..ConnectionOptions::new()
+            };
+            for rendered in [format!("{credentials:?}"), format!("{options:?}")] {
+                for secret in ["t0k3n-secret", "hunter2-secret", "jwt-secret"] {
+                    assert!(!rendered.contains(secret), "{name}: {rendered}");
+                }
+            }
+        }
+        let password = format!(
+            "{:?}",
+            Credentials::UserPassword {
+                user: "alice".into(),
+                password: "hunter2-secret".into(),
+            }
+        );
+        assert!(password.contains("alice"), "a user name is not a secret");
+        assert!(password.contains("<redacted>"), "{password}");
+    }
+
+    /// A signature is the proof of holding the key; the public key beside it
+    /// is public.
+    #[test]
+    fn a_nonce_signature_debugs_without_its_signature() {
+        let rendered = format!(
+            "{:?}",
+            NonceSignature {
+                signature: "SIGNATURE-secret".into(),
+                public_key: Some("UPUBLICKEY".into()),
+            }
+        );
+        assert!(!rendered.contains("SIGNATURE-secret"), "{rendered}");
+        assert!(rendered.contains("UPUBLICKEY"), "{rendered}");
+    }
+
+    /// A bound of zero would refuse everything the connection exists to do, so
+    /// it is refused where it is configured.
+    #[test]
+    fn a_zero_bound_is_refused() {
+        type Zero = fn(&mut ConnectionOptions);
+        let zeroes: [(&str, Zero); 6] = [
+            ("write_timeout", |o| o.write_timeout = Duration::ZERO),
+            ("max_queued_bytes", |o| o.max_queued_bytes = 0),
+            ("max_inbound_payload", |o| o.max_inbound_payload = 0),
+            ("max_inbound_control_line", |o| {
+                o.max_inbound_control_line = 0
+            }),
+            ("max_info_line", |o| o.max_info_line = 0),
+            ("handshake_timeout", |o| {
+                o.handshake_timeout = Duration::ZERO
+            }),
+        ];
+        for (name, zero) in zeroes {
+            let mut options = ConnectionOptions::new();
+            zero(&mut options);
+            assert!(
+                matches!(options.validate(), Err(Error::Configuration(why)) if why.contains(name)),
+                "{name} of zero must be refused by name"
+            );
+        }
     }
 }

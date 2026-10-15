@@ -29,30 +29,29 @@
 //! request. The map is remote-influenced in size — one entry per outstanding
 //! request — so it has a named bound of ours,
 //! [`ConnectionOptions::max_pending_requests`](crate::options::ConnectionOptions::max_pending_requests),
-//! because the protocol bounds it nowhere.
+//! because the protocol bounds it nowhere. A request whose caller stopped
+//! waiting — its future dropped, a timeout of the caller's own — leaves its
+//! entry behind until the table is full; the table then sweeps the entries
+//! whose waiter has gone before it refuses anyone, so abandoned requests cost a
+//! slot for a while and never the ability to make the next one.
 //!
-//! # The inbox token is unique, not secret
+//! # The inbox token is unguessable
 //!
-//! `_INBOX.` plus "something unique" is all the protocol asks for. This crate
-//! builds that token from three things it already has: the process id, a
-//! nanosecond clock reading, and a process-local counter. **It is not
-//! cryptographically random and is not meant to be.**
+//! `_INBOX.` plus "something unique" is all the protocol asks for, and
+//! uniqueness is all correctness needs: two requests must never share a reply
+//! subject. But the reply subject is also the only thing that decides who may
+//! answer. Anyone who can publish to this client's inbox can make their
+//! payload the reply to its request, and in the default account — where
+//! nothing restricts who may publish where — that is every other client. So
+//! the token is 128 bits from the operating system's random number generator,
+//! hex encoded: finding the subject is a search over 2^128, and a connection
+//! that cannot get the bits does not open. The counter after it only keeps one
+//! connection's reply subjects apart from each other.
 //!
-//! That is acceptable here because an inbox name is a routing token rather
-//! than a secret. Authorization is the server's: "connections authenticate
-//! with configured credentials ... then are authorized by account and subject
-//! permissions" (`docs/research/nats.md` §12 P14), and a `_INBOX.>`
-//! permission is how deployments scope inboxes. Guessing this client's inbox
-//! subject gains an attacker exactly what a subject permission already allows
-//! it — nothing more — while what correctness actually needs is that two
-//! requests never share a reply subject. The counter gives that inside one
-//! process, the process id across processes on one host, and the clock
-//! reading across restarts that reuse a process id.
-//!
-//! Where an application needs an unguessable inbox, it sets
-//! [`ConnectionOptions::inbox_prefix`](crate::options::ConnectionOptions::inbox_prefix)
-//! to a prefix it generated with a source of randomness it trusts — the same
-//! division of labour as the TLS trust anchors and the NKey signature.
+//! Where an application wants its inboxes under a prefix of its own — so that a
+//! server permission can be written against it — it sets
+//! [`ConnectionOptions::inbox_prefix`](crate::options::ConnectionOptions::inbox_prefix);
+//! the unguessable token goes after it.
 //!
 //! # The window is the caller's and is mandatory
 //!
@@ -76,15 +75,23 @@
 //! and costs the caller the whole window to find out.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::message::Message;
+use crate::queue::{Budget, Queued};
 
-/// The inbox of one connection: a unique stem and a counter under it.
+/// How many octets of the operating system's randomness go into an inbox
+/// stem: 128 bits, which is out of reach of a search and past the 96 that
+/// nothing less than a collision-free identifier should have.
+const ENTROPY_BYTES: usize = 16;
+
+/// The inbox of one connection: an unguessable stem and a counter under it.
 #[derive(Debug)]
 pub(crate) struct Inbox {
     /// `<prefix><token>`, without a trailing dot.
@@ -100,18 +107,31 @@ impl Inbox {
     /// [`ConnectionOptions::validate`](crate::options::ConnectionOptions::validate)
     /// has already checked, so the stem is `prefix` plus a token of hex
     /// digits — no dot, no space, nothing a control line would split on.
-    pub(crate) fn new(prefix: &str) -> Self {
-        /// Distinguishes two connections made in the same nanosecond by the
-        /// same process, which is the case a clock reading alone misses.
-        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    ///
+    /// Fails where the operating system has no random bits to give: an inbox
+    /// that anyone can guess is not one this client will subscribe to.
+    pub(crate) fn new(prefix: &str) -> Result<Self> {
+        let mut entropy = [0u8; ENTROPY_BYTES];
+        OsRng.try_fill_bytes(&mut entropy).map_err(|error| {
+            Error::Runtime(weida_core::Error::Runtime(format!(
+                "the operating system's random number generator failed, and an \
+                 inbox that could be guessed is not one this client opens: {error}"
+            )))
+        })?;
+        Ok(Self::from_entropy(prefix, &entropy))
+    }
 
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos());
-        let pid = std::process::id();
+    /// The stem for `entropy`, hex encoded under `prefix`.
+    fn from_entropy(prefix: &str, entropy: &[u8]) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut stem = String::with_capacity(prefix.len() + 2 * entropy.len());
+        stem.push_str(prefix);
+        for byte in entropy {
+            stem.push(char::from(HEX[usize::from(byte >> 4)]));
+            stem.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
         Self {
-            stem: format!("{prefix}{pid:x}{nanos:x}{sequence:x}"),
+            stem,
             next: AtomicU64::new(0),
         }
     }
@@ -138,7 +158,7 @@ impl Inbox {
 /// of ours.
 #[derive(Debug)]
 pub(crate) struct Pending {
-    entries: HashMap<Vec<u8>, mpsc::Sender<Message>>,
+    entries: HashMap<Vec<u8>, mpsc::Sender<Queued>>,
     max: usize,
 }
 
@@ -156,9 +176,18 @@ impl Pending {
     }
 
     /// Registers a waiter. `false` where the map is full.
-    pub(crate) fn insert(&mut self, reply_subject: Vec<u8>, tx: mpsc::Sender<Message>) -> bool {
+    ///
+    /// "Full" is counted after the entries whose waiter has gone are swept
+    /// out. A request whose caller dropped the future, or timed out on its own
+    /// clock, never says so: its receiver is closed and its entry stays. If
+    /// those were counted, enough abandoned requests would make every later
+    /// one fail for the life of the connection.
+    pub(crate) fn insert(&mut self, reply_subject: Vec<u8>, tx: mpsc::Sender<Queued>) -> bool {
         if self.entries.len() >= self.max {
-            return false;
+            self.entries.retain(|_, waiter| !waiter.is_closed());
+            if self.entries.len() >= self.max {
+                return false;
+            }
         }
         self.entries.insert(reply_subject, tx);
         true
@@ -173,14 +202,20 @@ impl Pending {
     /// The subject is the only key. A reply that arrives for a request that
     /// has already given up is dropped, which is the honest answer: the
     /// caller's window is over and Core NATS keeps nothing for replay.
-    pub(crate) fn dispatch(&mut self, message: Message) -> bool {
-        let Some(tx) = self.entries.get(&message.subject) else {
+    ///
+    /// The reply is charged against the connection's byte budget like any
+    /// other queued message, and is dropped where it does not fit.
+    pub(crate) fn dispatch(&mut self, message: Message, budget: &Arc<Budget>) -> bool {
+        let Some(tx) = self.entries.get(&message.subject[..]) else {
+            return false;
+        };
+        let Some(charge) = budget.try_charge(message.queued_len()) else {
             return false;
         };
         // Bounded and non-blocking: the waiter's channel is sized for the
         // responses it asked for, and a request that got its answers does not
         // get to stall the driver with the ones that came late.
-        tx.try_send(message).is_ok()
+        tx.try_send(Queued::new(message, charge)).is_ok()
     }
 
     /// Ends every outstanding request, which is what the end of the
@@ -203,16 +238,22 @@ pub(crate) fn outcome(message: Message) -> Result<Message> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
     use crate::message::{NO_RESPONDERS, OwnedHeaders};
+
+    fn roomy() -> Arc<Budget> {
+        Budget::new(usize::MAX / 2)
+    }
 
     /// Two connections in one process must not share an inbox stem, or one
     /// connection's replies would arrive on the other's wildcard
     /// subscription.
     #[test]
     fn two_inboxes_in_one_process_differ() {
-        let first = Inbox::new("_INBOX.");
-        let second = Inbox::new("_INBOX.");
+        let first = Inbox::new("_INBOX.").expect("an inbox");
+        let second = Inbox::new("_INBOX.").expect("an inbox");
         assert_ne!(first.stem, second.stem);
         assert!(first.stem.starts_with("_INBOX."));
         assert!(
@@ -226,7 +267,7 @@ mod tests {
     /// that collects them.
     #[test]
     fn the_inbox_token_is_one_subject_token() {
-        let inbox = Inbox::new("_INBOX.");
+        let inbox = Inbox::new("_INBOX.").expect("an inbox");
         let token = inbox.stem.strip_prefix("_INBOX.").expect("the prefix");
         assert!(
             token.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -238,11 +279,57 @@ mod tests {
             .expect("a reply subject is a literal subject");
     }
 
+    /// The token is not something a neighbour in the account can enumerate: it
+    /// carries at least 96 bits, and they are not the pid or the clock — every
+    /// hex digit of it varies from one connection to the next.
+    #[test]
+    fn the_inbox_token_is_random() {
+        let stems: Vec<String> = (0..256)
+            .map(|_| Inbox::new("_INBOX.").expect("an inbox").stem)
+            .collect();
+        let tokens: Vec<&str> = stems
+            .iter()
+            .map(|stem| stem.strip_prefix("_INBOX.").expect("the prefix"))
+            .collect();
+        let width = tokens[0].len();
+        assert!(width >= 24, "{width} hex digits is under 96 bits");
+        assert!(tokens.iter().all(|token| token.len() == width));
+
+        let distinct: std::collections::HashSet<&&str> = tokens.iter().collect();
+        assert_eq!(distinct.len(), tokens.len(), "no two inboxes alike");
+
+        // A digit position that came from a constant, a pid or a clock's high
+        // half would hold one value across all of them. Random digits hold
+        // most of the sixteen over 256 draws.
+        for position in 0..width {
+            let seen: std::collections::HashSet<u8> = tokens
+                .iter()
+                .map(|token| token.as_bytes()[position])
+                .collect();
+            assert!(
+                seen.len() >= 8,
+                "digit {position} took only {} values over 256 inboxes",
+                seen.len()
+            );
+        }
+    }
+
+    /// The stem is the entropy in hex and nothing else, under the prefix the
+    /// caller chose.
+    #[test]
+    fn the_stem_is_the_prefix_and_the_entropy() {
+        let inbox = Inbox::from_entropy("app.replies.", &[0x00, 0xab, 0xff, 0x10]);
+        assert_eq!(inbox.stem, "app.replies.00abff10");
+        assert_eq!(inbox.pattern(), "app.replies.00abff10.>");
+        assert_eq!(inbox.next_reply_subject(), "app.replies.00abff10.0");
+        assert_eq!(inbox.next_reply_subject(), "app.replies.00abff10.1");
+    }
+
     /// Each request gets its own reply subject, because that subject is the
     /// whole of the correlation.
     #[test]
     fn every_request_gets_its_own_reply_subject() {
-        let inbox = Inbox::new("_INBOX.");
+        let inbox = Inbox::new("_INBOX.").expect("an inbox");
         let first = inbox.next_reply_subject();
         let second = inbox.next_reply_subject();
         assert_ne!(first, second);
@@ -257,33 +344,59 @@ mod tests {
     /// waiter is dropped rather than delivered somewhere.
     #[test]
     fn a_reply_goes_to_the_subject_that_asked() {
+        let budget = roomy();
         let mut pending = Pending::new(4);
         let (tx, mut rx) = mpsc::channel(1);
         assert!(pending.insert(b"_INBOX.a.1".to_vec(), tx));
 
         let mine = Message {
-            subject: b"_INBOX.a.1".to_vec(),
-            payload: b"answer".to_vec(),
+            subject: Bytes::from_static(b"_INBOX.a.1"),
+            payload: Bytes::from_static(b"answer"),
             ..Message::default()
         };
-        assert!(pending.dispatch(mine));
-        assert_eq!(rx.try_recv().expect("delivered").payload, b"answer");
+        assert!(pending.dispatch(mine, &budget));
+        assert_eq!(
+            rx.try_recv().expect("delivered").into_message().payload,
+            &b"answer"[..]
+        );
 
         let stray = Message {
-            subject: b"_INBOX.a.2".to_vec(),
+            subject: Bytes::from_static(b"_INBOX.a.2"),
             ..Message::default()
         };
-        assert!(!pending.dispatch(stray), "no waiter, no delivery");
+        assert!(!pending.dispatch(stray, &budget), "no waiter, no delivery");
 
         pending.remove(b"_INBOX.a.1");
         let late = Message {
-            subject: b"_INBOX.a.1".to_vec(),
+            subject: Bytes::from_static(b"_INBOX.a.1"),
             ..Message::default()
         };
         assert!(
-            !pending.dispatch(late),
+            !pending.dispatch(late, &budget),
             "a reply that arrives after the caller gave up has nowhere to go"
         );
+    }
+
+    /// A reply is queued under the same byte budget as every other message,
+    /// and is dropped where it does not fit.
+    #[test]
+    fn a_reply_over_the_byte_budget_is_dropped() {
+        let reply = Message {
+            subject: Bytes::from_static(b"_INBOX.a.1"),
+            ..Message::default()
+        };
+        let budget = Budget::new(reply.queued_len());
+        let mut pending = Pending::new(4);
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(pending.insert(b"_INBOX.a.1".to_vec(), tx));
+
+        assert!(pending.dispatch(reply.clone(), &budget));
+        assert!(
+            !pending.dispatch(reply.clone(), &budget),
+            "the budget holds one"
+        );
+        drop(rx.try_recv().expect("the first reply"));
+        assert!(pending.dispatch(reply, &budget), "and room came back");
     }
 
     /// The map is bounded, because every entry is a request that may never be
@@ -296,6 +409,43 @@ mod tests {
         assert!(pending.insert(b"_INBOX.a.1".to_vec(), first));
         assert!(!pending.insert(b"_INBOX.a.2".to_vec(), second));
         assert_eq!(pending.max(), 1);
+    }
+
+    /// A request whose caller stopped waiting — the receiver is gone — does
+    /// not count against the bound once the map is full: it is swept, and the
+    /// next request gets its slot. Abandoned requests must not accumulate into
+    /// a connection that refuses every request for the rest of its life.
+    #[test]
+    fn abandoned_requests_are_swept_before_the_map_refuses() {
+        let mut pending = Pending::new(2);
+        let (live_tx, _live_rx) = mpsc::channel(1);
+        let (gone_tx, gone_rx) = mpsc::channel(1);
+        assert!(pending.insert(b"_INBOX.a.live".to_vec(), live_tx));
+        assert!(pending.insert(b"_INBOX.a.gone".to_vec(), gone_tx));
+
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(
+            !pending.insert(b"_INBOX.a.new".to_vec(), tx.clone()),
+            "two waiters are both still there"
+        );
+
+        // The caller of one gives up — the future is dropped — and says
+        // nothing.
+        drop(gone_rx);
+        assert!(
+            pending.insert(b"_INBOX.a.new".to_vec(), tx),
+            "the abandoned entry is swept to make room"
+        );
+        let budget = roomy();
+        let reply = |subject: &'static [u8]| Message {
+            subject: Bytes::from_static(subject),
+            ..Message::default()
+        };
+        assert!(pending.dispatch(reply(b"_INBOX.a.live"), &budget));
+        assert!(
+            !pending.dispatch(reply(b"_INBOX.a.gone"), &budget),
+            "the abandoned entry is gone"
+        );
     }
 
     /// A 503 is not an answer, and the conversion says so in one place so the
@@ -311,12 +461,12 @@ mod tests {
         assert!(matches!(outcome(message), Err(Error::NoResponders)));
 
         let ordinary = Message {
-            payload: b"answer".to_vec(),
+            payload: Bytes::from_static(b"answer"),
             ..Message::default()
         };
         assert_eq!(
             outcome(ordinary).expect("a reply").payload,
-            b"answer",
+            &b"answer"[..],
             "an ordinary reply passes through untouched"
         );
     }

@@ -1,7 +1,8 @@
 //! `weida-nats`'s failure vocabulary, as this module's exception classes.
 //!
 //! `weida_nats.NoResponders`, `weida_nats.RequestTimeout`,
-//! `weida_nats.PayloadTooLarge` and eighteen more, each its own class under
+//! `weida_nats.PayloadTooLarge` and every other variant of the library's
+//! error enum, each its own class under
 //! `weida_nats.NatsError`, each instance carrying `errno` and `cause`. A
 //! caller writes the branch request-reply is made of — `except NoResponders`
 //! for "nobody was listening, now", `except RequestTimeout` for "somebody may
@@ -64,6 +65,7 @@ failures!(
     RequestTimeout,
     StaleConnection,
     HandshakeTimeout,
+    WriteTimeout,
     ConnectionGone,
     TooManySubscriptions,
     TooManyPendingRequests,

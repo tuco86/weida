@@ -471,6 +471,7 @@ def test_the_exception_family_is_the_librarys_enum():
         "RequestTimeout",
         "StaleConnection",
         "HandshakeTimeout",
+        "WriteTimeout",
         "ConnectionGone",
         "TooManySubscriptions",
         "TooManyPendingRequests",

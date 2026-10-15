@@ -95,7 +95,7 @@ async fn a_request_carries_an_inbox_reply_subject_and_the_answer_returns_on_it()
     .await
     .expect("the request finished")
     .expect("a reply");
-    assert_eq!(reply.payload, b"pong");
+    assert_eq!(reply.payload, &b"pong"[..]);
 
     let (pattern, reply_to) = tokio::time::timeout(DEADLINE, server)
         .await
@@ -166,8 +166,8 @@ async fn requests_share_one_inbox_subscription_and_never_share_a_reply_subject()
     .expect("finished")
     .expect("a reply");
 
-    assert_eq!(first.payload, b"one");
-    assert_eq!(second.payload, b"two");
+    assert_eq!(first.payload, &b"one"[..]);
+    assert_eq!(second.payload, &b"two"[..]);
 
     let (first_reply, second_reply) = tokio::time::timeout(DEADLINE, server)
         .await
@@ -218,7 +218,10 @@ async fn scatter_gather_collects_several_responses_inside_one_window() {
         .expect("the window closed")
         .expect("responses");
 
-    let payloads: Vec<Vec<u8>> = replies.into_iter().map(|reply| reply.payload).collect();
+    let payloads: Vec<Vec<u8>> = replies
+        .into_iter()
+        .map(|reply| reply.payload.to_vec())
+        .collect();
     assert_eq!(
         payloads,
         vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
@@ -581,6 +584,73 @@ async fn the_pending_request_map_is_bounded() {
         "{:?}",
         outcomes.2.as_ref().map(|_| ())
     );
+
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(DEADLINE, nats.close())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// A request whose caller stopped waiting — a timeout of the caller's own, a
+/// dropped future — does not use up a slot for good.
+///
+/// The caller never tells the connection: the future is simply dropped, so
+/// whatever it registered stays registered. A map that counted those would be
+/// full after `max_pending_requests` of them and refuse every later request
+/// for the life of the connection, for an application that does nothing more
+/// unusual than wrap `request` in its own timeout.
+#[tokio::test]
+async fn abandoned_requests_do_not_exhaust_the_pending_map() {
+    let exec = Exec::current().unwrap();
+    let (listener, port) = Server::listen().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = Server::accept(&listener).await;
+        server.handshake_full().await;
+        // Reads everything and answers only the request whose payload says
+        // `last`.
+        loop {
+            let op = server.read_op().await;
+            if op.ends_with(" last") {
+                let reply_to = reply_subject_of(&op);
+                server.send_msg(&reply_to, "1", None, b"answered").await;
+                return server;
+            }
+        }
+    });
+
+    let mut options = options();
+    options.max_pending_requests = 4;
+    let nats = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options),
+    )
+    .await
+    .expect("finished")
+    .expect("opened");
+
+    // Sixteen requests, each abandoned by the caller's own clock a moment
+    // after it was made. Counted, they would fill the map four times over.
+    for _ in 0..16 {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(5),
+            nats.request("slow.service", b"x", Duration::from_secs(30)),
+        )
+        .await;
+    }
+
+    let reply = tokio::time::timeout(
+        DEADLINE,
+        nats.request("slow.service", b"last", Duration::from_secs(2)),
+    )
+    .await
+    .expect("finished")
+    .expect("abandoned requests did not cost the connection the next one");
+    assert_eq!(reply.payload, &b"answered"[..]);
 
     tokio::time::timeout(DEADLINE, server)
         .await

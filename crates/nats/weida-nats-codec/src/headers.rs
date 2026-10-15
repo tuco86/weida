@@ -143,10 +143,18 @@ impl<'a> Headers<'a> {
         let line_end = find_crlf(rest).ok_or(DecodeError::HeaderBlockNotTerminated)?;
         let (status, description) = decode_version_tail(&rest[..line_end])?;
 
+        // The version line and the blank line that ends the block are not
+        // entries, so `newlines - 2` bounds their count. Reserving that once,
+        // capped by the entry limit, avoids growing the vector by doubling.
+        let newlines = block.iter().filter(|byte| **byte == b'\n').count();
         let mut headers = Self {
             status,
             description,
-            entries: Vec::new(),
+            entries: Vec::with_capacity(
+                newlines
+                    .saturating_sub(2)
+                    .min(limits.max_header_entries as usize),
+            ),
         };
         let mut at = VERSION.len() + line_end + 2;
         loop {
@@ -184,6 +192,16 @@ impl<'a> Headers<'a> {
     /// [`EncodeError::HeaderValueInvalid`].
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.check()?;
+        self.encode_checked(out);
+        Ok(())
+    }
+
+    /// Append the block without checking it first.
+    ///
+    /// Only for callers that have already run [`check`](Self::check) on this
+    /// block. The operation encoders check each block once, before they write
+    /// the control line that declares its size.
+    pub(crate) fn encode_checked(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(VERSION.as_bytes());
         if let Some(status) = self.status {
             out.push(b' ');
@@ -203,7 +221,6 @@ impl<'a> Headers<'a> {
             out.extend_from_slice(b"\r\n");
         }
         out.extend_from_slice(b"\r\n");
-        Ok(())
     }
 
     /// How many octets [`encode`](Self::encode) will append.

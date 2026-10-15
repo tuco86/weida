@@ -18,7 +18,7 @@
 //! * [`Headers`] — the `NATS/1.0` block: repeated names in order, case
 //!   preserved, and the optional status and description that carry the
 //!   no-responder answer.
-//! * [`ServerInfo`] — the fourteen `INFO` fields a client acts on, read out
+//! * [`ServerInfo`] — the fifteen `INFO` fields a client acts on, read out
 //!   of the raw JSON on demand.
 //! * [`Connect`] — the one JSON object this crate writes, escaped so that no
 //!   credential can end the string it is in.
@@ -137,6 +137,10 @@
 //!   4096 for several major versions. [`limits::DEFAULT_MAX_CONTROL_LINE`] is
 //!   the larger, with the reasoning at its definition — and it is a caller
 //!   argument regardless.
+//! * **`INFO` has a bound of its own.** It grows with the cluster, so it is
+//!   checked against [`Limits::max_info_line`] and every other line against
+//!   [`Limits::max_control_line`]. The verb is recognised from its first five
+//!   octets, ignoring ASCII case.
 //! * **The `HPUB`/`HMSG` cap is on the total, not the payload.** "Headers
 //!   count within the `HPUB` total size and therefore within the server's
 //!   accepted message size" (`docs/research/nats.md` §3), so

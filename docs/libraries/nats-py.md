@@ -35,11 +35,11 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 | `servers=[...]` with a pool and `dont_randomize` | - | absent: one host and one port. `INFO.connect_urls` is retained and readable (`info().connect_urls`), which is the whole client-visible surface of a cluster, and choosing the next address is the caller's |
 | `allow_reconnect`, `reconnect_time_wait`, `max_reconnect_attempts`, `Backoff` | - | absent, in the library too: "client reconnection policy is a client-library policy, not a Core NATS wire guarantee" ([`nats.md`](nats.md) §1). What a policy needs is exposed - `closed()`, `info().connect_urls`, `lame_duck_notice()` |
 | `error_cb`, `disconnected_cb`, `reconnected_cb`, `closed_cb`, `discovered_server_cb` | `await connection.closed()`, `state()`, `lame_duck_notice()` | present as values rather than callbacks: the two things a callback would report are "it ended, here is why" and "the server is draining", and both are awaitable |
-| `name`, `verbose`, `pedantic`, `no_echo`, `ping_interval`, `max_outstanding_pings`, `inbox_prefix` | `name=`, `verbose=`, `pedantic=`, `echo=`, `ping_interval=`, `max_pings_out=`, `inbox_prefix=` | present, by their `CONNECT` field names. **24 keyword options** in all, and an unknown one is **refused** with `weida_nats.Configuration` naming it - `tests/test_asyncio.py::test_an_unknown_connection_option_is_refused` |
+| `name`, `verbose`, `pedantic`, `no_echo`, `ping_interval`, `max_outstanding_pings`, `inbox_prefix` | `name=`, `verbose=`, `pedantic=`, `echo=`, `ping_interval=`, `max_pings_out=`, `inbox_prefix=` | present, by their `CONNECT` field names. **29 keyword options** in all - every bound of the library, among them `max_queued_bytes`, `max_inbound_payload`, `max_inbound_control_line`, `max_info_line` and `write_timeout` - and an unknown one is **refused** with `weida_nats.Configuration` naming it - `tests/test_asyncio.py::test_an_unknown_connection_option_is_refused` |
 | `user`/`password`/`token` | same three | present |
 | `nkeys_seed`, `user_credentials`, `user_jwt_cb`, `signature_cb` | `jwt=`, `signer=`, `nkey_signer=` | present as **closures**: the nonce arrives unchanged and the caller returns the signature. No key file is read and no algorithm is chosen here, for the same reason the TLS trust store is not chosen here |
 | `tls=ssl.SSLContext`, `tls_hostname`, `tls_handshake_first` | - | absent from **this binding**: `weida-nats` completes TLS where `INFO` demands it and takes the caller's `rustls::ClientConfig`, which has no Python spelling. A server whose `INFO` says `tls_required` arrives as `weida_nats.TlsRequired` rather than as a silent cleartext `CONNECT`. §8.5 says what adding it would need |
-| `nc.max_payload`, `client_id`, `connected_url`, `servers`, `discovered_servers` | `await connection.max_payload()`, `info()` -> `RemoteInfo` with all fourteen `INFO` fields | present, and `INFO` is one object rather than five accessors |
+| `nc.max_payload`, `client_id`, `connected_url`, `servers`, `discovered_servers` | `await connection.max_payload()`, `info()` -> `RemoteInfo` with all fifteen `INFO` fields | present, and `INFO` is one object rather than five accessors |
 | `nc.is_connected`, `is_closed`, `is_reconnecting`, `is_draining` | `await connection.state()` -> `State` with `name`, `is_usable`, `why` | present as one question with three answers (`connected`, `closed`, `failed`). The reconnecting and draining states do not exist here because neither reconnection nor drain does |
 | - | `Connection.connect_current`, `Connection.connect_sharing`, `sync.connect_sharing` | present, and nats-py has no counterpart: a second connection on the first one's reactor, so ten connections are not ten thread pools |
 
@@ -50,7 +50,7 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 | `await nc.publish(subject, payload, reply=None, headers=None)` | `await connection.publish(subject, payload)` and `publish_with(subject, *, reply_to=None, headers=None, payload=None)` | present, split in two because the short form is the common one |
 | `await nc.subscribe(subject)` returning a `Subscription` | `await connection.subscribe(subject)` | present - `subscription.rs` |
 | `await nc.subscribe(subject, queue="workers")` | `await connection.subscribe_with_queue_group(subject, queue_group)` | present, and the test asserts the group **on the wire** in the `SUB` line rather than in the object - `tests/test_asyncio.py::test_a_queue_group_travels_in_the_sub_line` |
-| `cb=` push callbacks, `pending_msgs_limit`, `pending_bytes_limit`, `SlowConsumerError` | - | absent as an API shape: a subscription is pulled from, never pushed into. The queue behind it is bounded by `subscription_queue` and a copy for a full queue is dropped, which is what the server does to a client that will not read ([`nats.md`](nats.md) §5) |
+| `cb=` push callbacks, `pending_msgs_limit`, `pending_bytes_limit`, `SlowConsumerError` | - | absent as an API shape: a subscription is pulled from, never pushed into. The queue behind it is bounded by `subscription_queue` messages and, over the whole connection, by `max_queued_bytes` octets, and a copy for a full queue is dropped and counted, which is what the server does to a client that will not read ([`nats.md`](nats.md) §5, §7). The count is `Subscription::dropped()` in Rust and is not exposed here |
 | `async for msg in sub` | `async for message in subscription`, `await subscription.next()`, `subscription.try_next()` | present, all three - `tests/test_asyncio.py::test_a_subscription_is_an_async_iterator` |
 | `await sub.next_msg(timeout=1.0)` | `subscription.next_msg(timeout)` on the **synchronous** surface | present. On the asyncio surface the answer to "how do I stop waiting" is cancellation, and a cancelled `next()` leaves the subscription usable - `tests/test_asyncio.py::test_a_cancelled_next_leaves_the_subscription_usable` |
 | `await sub.unsubscribe(limit=0)` | `await subscription.unsubscribe()`, `unsubscribe_after(max_msgs)` | present, two methods for the two meanings, and the count is honoured by this client and not only by the server - `test_unsubscribe_after_one_ends_the_subscription` |
@@ -70,7 +70,7 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 | `nats.errors.TimeoutError` | `weida_nats.RequestTimeout`, carrying the window that elapsed | present |
 | scatter-gather | `await connection.request_many(subject, payload, timeout, max_replies)` | present, and nats-py has no counterpart: it collects what arrived inside one window, bounded by `max_replies` - `test_request_many_collects_what_arrived_in_the_window` |
 | `old_style=True` request (one inbox per request) | - | absent: the new style is a single wildcard inbox subscription per connection, which is what both the reference and nats-py's default do. There is no second implementation of the pattern to keep |
-| `nc.new_inbox()` | `weida_nats.INBOX_PREFIX` | present as the prefix; the token is built by the library. §8.7 says why it is not cryptographic and what to do if a caller needs it to be |
+| `nc.new_inbox()` | `weida_nats.INBOX_PREFIX` | present as the prefix; the token after it is built by the library and is unguessable. §8.7 says what that buys |
 | `headers=` on a request | `publish_with(headers=...)` plus a subscription, and `request` carries the same block | present - `test_headers_cross_in_both_directions` |
 | `no_responders` negotiation | automatic, and **refused** where the server did not offer headers: `weida_nats.HeadersUnsupported` | present - `test_no_responders_needs_headers` |
 
@@ -78,7 +78,7 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 
 | nats-py | This binding | Verdict |
 | --- | --- | --- |
-| 28 classes under `nats.errors.Error` | **24 classes under `weida_nats.NatsError`**, one per `weida_nats::Error` variant, each carrying `errno` | present - `errors.rs`, `tests/test_asyncio.py::test_the_exception_family_is_the_librarys_enum` |
+| 28 classes under `nats.errors.Error` | **25 classes under `weida_nats.NatsError`**, one per `weida_nats::Error` variant, each carrying `errno` | present - `errors.rs`, `tests/test_asyncio.py::test_the_exception_family_is_the_librarys_enum` |
 | `NoRespondersError`, `TimeoutError`, `StaleConnectionError`, `MaxPayloadError`, `BadSubjectError`, `AuthorizationError`, `ProtocolError`, `ConnectionClosedError`, `SecureConnRequiredError` | `NoResponders`, `RequestTimeout`, `StaleConnection`, `PayloadTooLarge`, `InvalidSubject`, `AuthenticationRequired`, `Protocol`, `ConnectionGone`, `TlsRequired` | present, name for name |
 | `SlowConsumerError`, `OutboundBufferLimitError`, `DrainTimeoutError`, `ConnectionDrainingError`, `ConnectionReconnectingError`, `NotJSMessageError`, `MsgAlreadyAckdError` | - | absent because the mechanism is: no push callbacks, no drain, no reconnect loop, no JetStream |
 | `InvalidCallbackTypeError`, `BadTimeoutError`, `NoServersError`, `ServerNotInPoolError` | `weida_nats.Configuration` at the call that configured it | present as one class for one kind of mistake: a value this client will not send, refused where it was given and naming the value - `tests/test_sync.py::test_a_bad_timeout_is_refused_where_it_was_given` |
@@ -144,11 +144,14 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 6. **A subject is `bytes`.** The protocol calls it a name and never a string; `subject_str`
    decodes it where it is UTF-8. The same rule makes a payload `bytes` with no `send_string`
    and no JSON helper.
-7. **The inbox token is unique, not secret.** It is built from the process id, a nanosecond
-   clock reading and a process-local counter rather than from a cryptographic source: an inbox
-   name is a routing token and authorization is the server's, per-account subject permissions
-   ([`nats.md`](nats.md) §10). A caller that needs an unguessable inbox sets `inbox_prefix`
-   from a source it trusts.
+7. **The inbox token is unguessable, not merely unique.** It is 128 random bits from the
+   operating system's generator, hex encoded, under `inbox_prefix`, with a per-request counter
+   after it. nats-py's `new_inbox()` is a random token too, and for the same reason: the reply
+   subject is the only thing that decides who may answer a request, and any client in the
+   account that can publish to `_INBOX.>` - in the default account, every client - could
+   otherwise forge the reply to a guessable one ([`nats.md`](nats.md) §5). An application that
+   wants its inboxes under a prefix of its own, so that a server permission can be written
+   against it, sets `inbox_prefix`.
 8. **`try_next` raises `BlockingIOError` when another coroutine holds the subscription**,
    rather than returning `None`: "no message" and "somebody else is reading" are different
    facts, and `BlockingIOError` is Python's own `EAGAIN`.

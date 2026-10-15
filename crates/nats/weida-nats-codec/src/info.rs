@@ -9,7 +9,7 @@
 //! the caller asks: an `INFO` whose unknown fields a future server changed is
 //! still an `INFO` whose `max_payload` this reads.
 //!
-//! Fourteen fields, and no others, because these are the ones a client
+//! Fifteen fields, and no others, because these are the ones a client
 //! *acts* on:
 //!
 //! * identity for logging and for the reconnect list: `server_id`,
@@ -17,12 +17,13 @@
 //! * capability, which decides what the `CONNECT` may claim: `proto`,
 //!   `headers`, `max_payload`;
 //! * security, which decides what the `CONNECT` must carry and whether TLS
-//!   comes first: `auth_required`, `tls_required`, `tls_verify`, `nonce`;
+//!   comes first: `auth_required`, `tls_required`, `tls_available`,
+//!   `tls_verify`, `nonce`;
 //! * topology and lifecycle: `connect_urls`, `ldm`.
 //!
 //! Everything else the reference lists — `go`, `git_commit`, `client_id`,
 //! `client_ip`, `cluster`, `domain`, `jetstream`, `ws_connect_urls`,
-//! `tls_available`, `ip` — is stepped over. A field a client does not act on
+//! `ip` — is stepped over. A field a client does not act on
 //! is a field it should not fail on either, so an unknown or unread field
 //! never makes an `INFO` unreadable; only a *known* field of the wrong shape
 //! does.
@@ -75,6 +76,10 @@ pub struct ServerInfo<'a> {
     /// "If this is true, then the client must perform the TLS/1.2
     /// handshake" — before ordinary protocol exchange, not after it.
     pub tls_required: Option<bool>,
+    /// If this is true, the server accepts TLS but does not require it. This
+    /// is the mixed-mode server, which takes a plaintext client as well as a
+    /// TLS one, so a client chooses whether to upgrade.
+    pub tls_available: Option<bool>,
     /// "If this is true, the client must provide a valid certificate during
     /// the TLS handshake."
     pub tls_verify: Option<bool>,
@@ -144,6 +149,11 @@ impl<'a> ServerInfo<'a> {
                     &mut info.tls_required,
                     "tls_required",
                     scanner.bool_value("tls_required")?,
+                )?,
+                b"tls_available" => set_once(
+                    &mut info.tls_available,
+                    "tls_available",
+                    scanner.bool_value("tls_available")?,
                 )?,
                 b"tls_verify" => set_once(
                     &mut info.tls_verify,
@@ -242,5 +252,16 @@ mod tests {
         let info = ServerInfo::parse(json, Limits::DEFAULT).expect("decodes");
         assert_eq!(info.ldm, Some(true));
         assert_eq!(info.nonce, None, "an explicit null is an absent field");
+    }
+
+    #[test]
+    fn tls_available_is_read_beside_tls_required() {
+        let info = ServerInfo::parse(
+            br#"{"tls_required":false,"tls_available":true}"#,
+            Limits::DEFAULT,
+        )
+        .expect("decodes");
+        assert_eq!(info.tls_required, Some(false));
+        assert_eq!(info.tls_available, Some(true));
     }
 }

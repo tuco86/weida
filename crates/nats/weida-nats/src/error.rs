@@ -119,7 +119,12 @@ pub enum Error {
     TlsUnsupported,
 
     /// The TLS handshake failed, or the server name is not one TLS can
-    /// validate against.
+    /// validate against, or the caller supplied a TLS configuration and the
+    /// server's `INFO` offers no TLS at all.
+    ///
+    /// The last is refused before a `CONNECT` is written: a client that asked
+    /// for TLS and carried on in the clear because an unauthenticated `INFO`
+    /// said it could would hand its credentials to whoever edited that line.
     Tls(String),
 
     /// A publish above the server's `INFO.max_payload`, refused before
@@ -178,10 +183,24 @@ pub enum Error {
     /// A step of the handshake did not finish inside its deadline.
     ///
     /// The protocol gives no deadline for any of them — not for the `INFO`
-    /// that opens the connection — so this one is ours.
+    /// that opens the connection — so this one is ours. The deadline is one
+    /// budget for the whole handshake, and `step` names the step that was
+    /// waiting when it ran out.
     HandshakeTimeout {
         /// Which step, as the reference names it.
         step: &'static str,
+    },
+
+    /// The socket accepted no octets for `after` while output was waiting for
+    /// it: the peer has stopped reading.
+    ///
+    /// Fails the connection. A write that never completes would otherwise
+    /// hold the connection, everything waiting to publish on it and the
+    /// socket for as long as the peer likes; the clock restarts whenever the
+    /// socket takes anything, so only no progress at all is a stall.
+    WriteTimeout {
+        /// How long the socket took nothing.
+        after: Duration,
     },
 
     /// The connection is gone; nothing further can be sent on it.
@@ -269,6 +288,11 @@ impl fmt::Display for Error {
                  the connection is stale"
             ),
             Self::HandshakeTimeout { step } => write!(f, "{step} did not finish in time"),
+            Self::WriteTimeout { after } => write!(
+                f,
+                "the socket accepted no octets for {after:?} while output was waiting: \
+                 the peer has stopped reading"
+            ),
             Self::ConnectionGone => f.write_str("the connection is gone"),
             Self::TooManySubscriptions { max } => {
                 write!(f, "the subscription table is full at {max} entries")

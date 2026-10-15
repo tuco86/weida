@@ -17,11 +17,12 @@
 //! default for that setting, offered as a starting value — never used as the
 //! cap by this crate, which has no way to reach for it.
 //!
-//! Four numbers, because a peer has four ways to make a decoder commit
-//! memory: a declared payload count, a control line that never ends, a header
-//! block with unboundedly many entries, and a `connect_urls` array naming
-//! unboundedly many servers. Only the first of the four is length-prefixed;
-//! the other three are counted as they are walked.
+//! Five numbers, because a peer has five ways to make a decoder commit
+//! memory: a declared payload count, a control line that never ends, an
+//! `INFO` line that never ends, a header block with unboundedly many entries,
+//! and a `connect_urls` array naming unboundedly many servers. Only the first
+//! of the five is length-prefixed; the other four are bounded while they are
+//! walked or searched for.
 
 /// The server documentation's default for `max_payload`, one mebibyte
 /// (`docs/research/nats.md` §11).
@@ -44,6 +45,19 @@ pub const DEFAULT_MAX_PAYLOAD: u64 = 1024 * 1024;
 /// sent, while choosing the smaller would refuse a legal `HMSG` carrying a
 /// long subject, a long `_INBOX` reply and a `sid`.
 pub const DEFAULT_MAX_CONTROL_LINE: usize = 4096;
+
+/// A starting value for `max_info_line`, in octets before the `CRLF`.
+///
+/// A **named constant, not a cap**: the cap is [`Limits::max_info_line`].
+///
+/// `INFO` is the one line whose length grows with the cluster: `connect_urls`
+/// names up to [`DEFAULT_MAX_CONNECT_URLS`] servers, and the line also carries
+/// a nonce and account fields. Sharing the 4096-octet bound of `MSG`, `HMSG`
+/// and `PING` would end the connection on a legitimate `INFO` from a large
+/// cluster and leave the URL cap unreachable. 64 KiB holds 256 URLs of typical
+/// length with room to spare. The bound still applies while the `CRLF` is
+/// searched for, so a peer cannot make the reader buffer an unending `INFO`.
+pub const DEFAULT_MAX_INFO_LINE: usize = 64 * 1024;
 
 /// A starting value for the number of entries in one `NATS/1.0` header block.
 ///
@@ -98,12 +112,20 @@ pub struct Limits {
     /// Set it from the server's `INFO.max_payload`;
     /// [`DEFAULT_MAX_PAYLOAD`] is the documented default of that setting.
     pub max_payload: u64,
-    /// The largest control line, in octets before its `CRLF`.
+    /// The largest control line other than `INFO`, in octets before its `CRLF`.
     ///
     /// This bounds the search for the `CRLF` itself, so a peer that sends a
     /// gigabyte without one is stopped at the bound rather than at the end of
     /// the buffer.
     pub max_control_line: usize,
+    /// The largest `INFO` line, in octets before its `CRLF`.
+    ///
+    /// `INFO` follows the size of the cluster, so it cannot share the bound of
+    /// the other lines: a legitimate `INFO` carrying a long `connect_urls` list
+    /// must not be refused under `max_control_line`. The bound is applied to
+    /// the `CRLF` search exactly as `max_control_line` is, so an `INFO` that
+    /// never ends is refused here rather than after the reader's buffer fills.
+    pub max_info_line: usize,
     /// The largest number of `name: value` entries in one header block.
     pub max_header_entries: u32,
     /// The largest number of elements in `INFO.connect_urls`.
@@ -119,6 +141,7 @@ impl Limits {
     pub const DEFAULT: Self = Self {
         max_payload: DEFAULT_MAX_PAYLOAD,
         max_control_line: DEFAULT_MAX_CONTROL_LINE,
+        max_info_line: DEFAULT_MAX_INFO_LINE,
         max_header_entries: DEFAULT_MAX_HEADER_ENTRIES,
         max_connect_urls: DEFAULT_MAX_CONNECT_URLS,
     };
@@ -159,6 +182,7 @@ mod tests {
         let learned = Limits::DEFAULT.with_max_payload(8 * 1024 * 1024);
         assert_eq!(learned.max_payload, 8 * 1024 * 1024);
         assert_eq!(learned.max_control_line, DEFAULT_MAX_CONTROL_LINE);
+        assert_eq!(learned.max_info_line, DEFAULT_MAX_INFO_LINE);
         assert_eq!(learned.max_header_entries, DEFAULT_MAX_HEADER_ENTRIES);
         assert_eq!(learned.max_connect_urls, DEFAULT_MAX_CONNECT_URLS);
     }
