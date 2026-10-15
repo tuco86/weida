@@ -4,6 +4,71 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-334 — Python bindings: no interpreter freeze, no lost result, no secret in a repr
+kind: code | size: 90 | status: in_progress 2026-10-15T02:05Z | needs: [B-325, B-326, B-327, B-328]
+acceptance: findings #1, #3, #4, #5, #7, #8, #11-#14, #17, #19 of the 2026-10-15 Python binding audit, for `weida-py-core` and the mqtt, nats, nng and amqp bindings: no getter takes a lock with the GIL held, a value computed for a cancelled asyncio task is re-stashed rather than dropped where it consumed a message, completions reach the loop without a reactor worker blocking on the GIL, unbounded blocking waits are interruptible by signals, Python-supplied durations and counts raise instead of panicking, one `Slot`/`Lease` in `weida-py-core`; each binding's `develop.sh` suite green.
+
+### B-335 — weida-py and weida-zmq-py: the binding findings left for after the library merges
+kind: code | size: 60 | status: ready | needs: [B-334]
+acceptance: audit findings #2 (`SyncRuntime.bind` holds its mutex across `py.detach`), #9 (`CurveKey` repr, hash and equality leak or compare a secret key), #10 (zmq sync sockets hold their mutex across a blocking `recv`, so `close` from another thread hangs), #11 for weida-py and zmq-py (the `interruptible` helper of B-334), #15, #16 (`IncomingStream.read(max_bytes)` allocates `max_bytes` up front and aborts on a huge value), #18 (poison-tolerant locks), and zmq-py moved onto `weida-py-core`'s `Lease`; both `develop.sh` suites green.
+
+### B-336 — The leftovers of the hardening pass, each with its failure
+kind: code | size: 90 | status: ready | needs: []
+acceptance: (1) `weida::Pem::Bytes` holds its key bytes in a zeroizing buffer, and `bind_unix` in `crates/weida/src/listener.rs` and `crates/nng/weida-nng/src/ipc.rs` describe the bind as it is now (the runtime refuses a live listener and never shows the node in the umask's mode); (2) `weida-zmq` honours `ZMQ_TCP_KEEPALIVE*` (the rows are refused today, so an idle half-open TCP peer holds a slot until the heartbeat, which is off by default); (3) a zmq proxy gives each downstream peer a share of the upstream subscription table and forwards a prefix once however many subscribers hold it; (4) `weida-nats`: `unsubscribe_after` counts dropped messages too, `close()` signals after the state change, and a non-fatal `-ERR` (permission violation) does not end the connection; (5) `weida-runtime`'s resolver: a connect deadline also ends the `getaddrinfo` it is waiting on, or the doc says the thread outlives it; (6) the raft tests B-330 did not write: stalled outsider refusals beside a served member, the scripted forward redirect, the `targets` prune, and a `TooManyNodes` integration test that does not hang.
+
+### B-337 — Allocation work that needs a type redesign
+kind: code | size: 90 | status: ready | needs: []
+acceptance: `DataHeader` borrows its strings for encoding so a send builds no owned copy per field (Protocol audit #11); `OutgoingTransfer::finish` stops boxing quinn's `stopped()` future per message (WeidaConn audit #12); `weida-nats` publish takes `Bytes` so a payload is copied once into the write buffer; AMQP encodes a message straight into its frame buffer. Each measured before and after with the existing benches; numbers into IMPLEMENTATION.md.
+
+### B-333 — zmq sockets: one peer snapshot, a prefix tree, a proxy that survives
+kind: code | size: 90 | status: done 7b171f5 | needs: []
+acceptance: findings #1-#4 and #6-#14 of the 2026-10-15 `weida-zmq` sockets audit: the peer set is one `Arc` snapshot rebuilt on change and waits are allocation-free without lost wake-ups; XPUB never clones subscription tables per event and synthesizes unsubscribes only for what its application was handed; queue accounting charges frame and message overhead; a proxy counts and skips per-message refusals; subscription matching is a compressed prefix tree; a blocking send waits for room for its own size; `router_bind_identity_to_user` (opt-in); `SocketOptions` redacts `plain_password`.
+note: done on a worktree branch (0352c8c) and merged. The merge also makes an XPUB's receive queue block whatever its options say, so a subscription notification is never dropped (session.rs awaits it on that peer's session since 497a735). Left: per-downstream quota and upstream dedup in the proxy (B-336).
+
+### B-332 — weida fan-out: pruned registry, an index, concurrent waits
+kind: code | size: 90 | status: done 4fa1e39 | needs: []
+acceptance: findings of the 2026-10-15 weida pub/sub audit except the sequencer: `SubRegistry` holds a path only while a filter holds it; exact and `#`-ending filters are matched through an index; stalled subscribers are waited for together under one deadline; a refused copy does not end a subscription; sequence numbers per (publisher path, topic); `RuntimeConfig::receive_timeout` for the blocking receives and `weida serve --sink`; `SendHalf::write_chunk` so fan-out shares one payload; one subscriber budget per connection; a refused datagram flow backs off; the CLI caps `--framing length` and escapes topics; the handoff decoder bounds count, size and destinations.
+note: done on a worktree branch (9f0cbff) and merged with B-329's conn.rs and config.rs.
+
+### B-331 — zmq engine: linear decode, CURVE without leftovers, ZAP as libzmq asks
+kind: code | size: 90 | status: done 497a735 | needs: []
+acceptance: the 19 findings of the 2026-10-15 ZMTP/engine audit: accept loops survive EMFILE, `Multipart::decode` is linear, a per-address peer cap and stalled-handshake eviction, a persistent heartbeat timer and writes in their own arm, 64 KiB handshake frames and 64 metadata properties, ZAP asked by libzmq 4.3.5's measured rule, `X-Local-Principal` cannot be posed by a PLAIN username, ZAP takes no socket slot, CURVE on `curve25519-dalek` and `crypto_secretbox` with every secret zeroized and small-order points refused, `Message` is `Bytes`-backed, batched writes; the `command` fuzz target compiles again and every zmtp target ran 120 s clean; libzmq interop 19 passed.
+note: an ipc bind no longer steals a live endpoint (libzmq unlinks it): the runtime refuses a live listener since 074ffc9, and the zmq tests and parity row say so.
+
+### B-330 — broker, raft, openbao: nobody waits on a peer
+kind: code | size: 90 | status: done 074ffc9 | needs: []
+acceptance: the 2026-10-15 infrastructure audit: the broker's queue loop never awaits a peer (reads in their own task under a deadline and a minimum rate, one delivery writer per subscription, a stalled consumer dropped and its deliveries requeued), the delivery scan is no longer O(queue x subscriptions x unsettled), `max_unsettled_per_consumer`; raft refuses what followers would refuse, bounds refusals and snapshot buffering, needs a voter for membership changes and resolves redirects through its own membership; openbao sends no token across hosts, refuses `http://` unless allowed, caps response bodies, wraps secrets in a zeroizing `Secret`; the runtime's unix bind never shows the node in the umask's mode.
+note: `PER_MESSAGE_OVERHEAD` went from 256 to 1024, which cuts a queue's message-count ceiling about four times.
+
+### B-329 — weida connections: handshakes, headers, local peers, resumption
+kind: code | size: 90 | status: done f1135d7 | needs: [B-324]
+acceptance: the 2026-10-15 connection audit: QUIC Initials refused at `max_connections` and `max_handshakes`, a stateless Retry above `retry_above_handshakes`; frame heads read as they arrive under `header_timeout_ms`, at most `max_header_streams` at once; UNSUBSCRIBE releases only what it holds; no TLS 1.3 tickets and no server session storage, so withdrawn client trust is not bypassed by resumption; consumers recorded per filter; local connections hold a `max_connections` place, a preamble deadline and are torn down when the peer leaves; a second HELLO is a violation; redial backoff survives short-lived successes; `collect` reads without a 64 KiB scratch; connection ids are a process serial; every DATA, SUBSCRIBE, CREDIT and FLOW header is checked before it is written.
+
+### B-328 — nng: one slow peer no longer stalls a socket or device
+kind: code | size: 90 | status: done 41a2482 | needs: []
+acceptance: the 20 findings of the 2026-10-15 NNG audit: TLS handshakes off the accept loop under a deadline and `max_tls_handshakes`, REP/RESPONDENT drop a reply to a full pipe, `device()` pumps both directions independently, one pipe snapshot and socket-wide signals, `Bytes` bodies, a too-deep stack costs the message not the pipe, PUB and PUSH discard what peers write, `max_pipes_per_peer`, TCP keepalive; NNG interop 11 passed, weida-sp fuzz targets 60 s clean, `develop.sh` 56 passed.
+note: REP dropping a reply at a full pipe is a decision, not a measured NNG behaviour; `docs/libraries/nng.md` says so.
+
+### B-327 — amqp: zero-width arrays capped, the driver never blocks on a peer
+kind: code | size: 90 | status: done f1ef7a5 | needs: []
+acceptance: the 17 findings of the 2026-10-15 AMQP audit and three fuzz crashes: `Limits::max_zero_width_elements` bounds what nested null arrays decode to (586 wire bytes made 12.6 MB), a described array element is depth-checked as built, the driver awaits no queue and no socket write (`write_timeout`), the unsettled cap and credit are enforced, duplicate attach/begin refused, SASL credentials redacted; four fuzz targets 120 s clean, `develop.sh` 17 passed.
+
+### B-326 — mqtt: verify the server's authentication, never wedge on a stalled broker
+kind: code | size: 90 | status: done c00c72a | needs: []
+acceptance: the 19 findings of the 2026-10-15 MQTT audit: `Authenticator::finish` verifies the server's final data and a CONNACK that skips the exchange is refused, writes in their own arm under `write_timeout`, the event queue has a byte budget, a delivery over the user-property cap is truncated rather than fatal, alias tables bounded in bytes, credentials redacted; interop against rumqttd 0.20.0 and rmqtt 0.23.1 (24 passed), seven fuzz targets 60 s clean, `develop.sh` 45 passed.
+
+### B-325 — nats: bound what a hostile server can make the client hold or wait for
+kind: code | size: 90 | status: done 328f122 | needs: []
+acceptance: the 14 findings of the 2026-10-15 NATS audit plus four found on the way: writes never block reads (`write_timeout`), `max_inbound_payload` and `max_queued_bytes`, the TLS upgrade and the whole handshake under one deadline, `connect_tls` refuses an INFO without TLS before any CONNECT, credentials redacted, abandoned requests swept, `Bytes` message parts, coalesced writes, `max_info_line`, a 128-bit random inbox, a dropped last handle ends the driver, a flush answered by its own PONG; four fuzz targets 60 s clean, `develop.sh` 36 passed.
+
+### B-324 — protocol: undeclared axes are not reached, headers checked on send
+kind: code | size: 30 | status: done 1e85cf1 | needs: []
+acceptance: `GuaranteeSet::intersect` keeps `durability`/`replicas` only when both sides declared them (PROTOCOL §6.5), `filter::validate` enforces 256 bytes, `check()` on every header type and `Agreed::check_header_len`, one definition of each wire cap in `weida-core`, `to_traceparent` without per-byte writes.
+
+### B-323 — rustls 0.23.46 for four advisories
+kind: code | size: 15 | status: done a9b7b6f | needs: []
+acceptance: `cargo deny check advisories` is clean; RUSTSEC-2026-0285, -0346, -0348 and -0349 fixed by rustls 0.23.46, and the published TLS crates (`weida`, `weida-openbao`) carry a direct `rustls` floor so a downstream lockfile cannot resolve an affected version.
+
 ### B-322 — Raft admission by membership, bounded RPC reads, and a stopped signal
 kind: code | size: 90 | status: done 57ad19e | needs: [B-224]
 acceptance: [requirements/griasdi-raft-admission.md](requirements/griasdi-raft-admission.md) §5: once a node's effective membership is non-empty, every raft RPC whose proved key is not in it is refused with `Rejected` before a byte of it is read, and an uninitialized node still accepts engine RPCs from anyone; the length prefix, envelope and end-of-envelope check are read under `election_timeout_max`, a snapshot body under `install_snapshot_timeout`, the envelope allocated as it arrives, and `ConsensusConfig::max_concurrent_rpcs` handlers at most, one more refused; `Consensus::stopped()` resolves when the engine ended on its own. Tests in `server.rs` and `consensus.rs` named in the item's note.
