@@ -72,8 +72,11 @@
 //!   progress for [`ConnectionOptions::write_timeout`] fails the connection
 //!   with [`Error::WriteTimeout`]. Past
 //!   [`OUTBOX_HIGH_WATER`](crate::transport::OUTBOX_HIGH_WATER) queued octets
-//!   the driver stops reading the peer and stops taking frames from local
-//!   senders, which bounds what a peer that never reads can make it hold.
+//!   the driver stops taking frames from local senders, and it stops reading
+//!   the peer once the *answers* to the peer's own frames are what is past it:
+//!   the application's frames do not count against reading, or a peer
+//!   streaming in both directions would stop both ends reading at once. The
+//!   two together bound what a peer that never reads can make it hold.
 //! * **No application is waited for.** What a link or a session tells its
 //!   handle goes into a queue the driver never waits on
 //!   (`crate::queue`), and what bounds those queues is where their
@@ -263,8 +266,11 @@ enum Command {
 /// An AMQP 1.0 connection.
 ///
 /// Cloning shares the connection: every clone speaks to the same driver task
-/// and sees the same state, which is what lets a session hold one without
-/// owning it.
+/// and sees the same state. The connection lives as long as any handle does —
+/// a clone, a [`Session`] begun on it, a [`Link`] attached on that — and ends
+/// when the last one is dropped: what was queued is written, `close` follows,
+/// and then the transport is closed. A session or a link therefore goes on
+/// working after the `Connection` it came from has left scope.
 #[derive(Clone, Debug)]
 pub struct Connection {
     inner: Arc<Inner>,
@@ -300,6 +306,30 @@ struct Inner {
     remote: RemoteOpen,
     commands: mpsc::Sender<Command>,
     state: watch::Receiver<State>,
+}
+
+/// What keeps the connection alive for a handle that is not a
+/// [`Connection`]: a sender into the driver's command queue, whose last copy
+/// being dropped is what ends the connection. A [`Session`] and a [`Link`]
+/// each hold one, so that `Connection::connect(..).await?.begin(..).await?`
+/// does not close the connection under the session it returns.
+///
+/// Held by the driver only weakly, because a strong copy there would keep the
+/// queue open for ever and no connection whose handles had all gone would
+/// end. `None` where there is no copy left to make, which is a handle nobody
+/// can be waiting on.
+#[derive(Debug)]
+pub(crate) struct Lease {
+    /// Held for what dropping it does, which is nothing until it is the last.
+    _commands: Option<mpsc::Sender<Command>>,
+}
+
+impl Lease {
+    fn of(commands: &mpsc::WeakSender<Command>) -> Self {
+        Self {
+            _commands: commands.upgrade(),
+        }
+    }
 }
 
 impl Connection {
@@ -408,6 +438,7 @@ impl Connection {
         options: ConnectionOptions,
         _reserved: Option<()>,
     ) -> Result<Self> {
+        options.validate()?;
         let options = Arc::new(options);
 
         if options.sasl != Sasl::None {
@@ -498,6 +529,7 @@ impl Connection {
             options: Arc::clone(&options),
             remote: remote.clone(),
             rx,
+            commands: commands.downgrade(),
             outbound_rx,
             outbound: outbound.clone(),
             state: state_tx,
@@ -720,6 +752,8 @@ struct Driver {
     options: Arc<ConnectionOptions>,
     remote: RemoteOpen,
     rx: mpsc::Receiver<Command>,
+    /// Held weakly, for the [`Lease`] a session or a link is handed.
+    commands: mpsc::WeakSender<Command>,
     outbound_rx: mpsc::Receiver<Outbound>,
     /// Kept so that a `Session` handed to a caller can be given a sender
     /// without the driver having to clone one out of thin air.
@@ -849,15 +883,24 @@ impl Driver {
                 // Read inline rather than through a forwarding task:
                 // `next_frame` is cancel-safe, so a `select!` that drops it
                 // keeps every octet it had buffered, and the reader goes when
-                // the driver does. Not read while the peer is not reading
-                // what is already queued for it.
-                incoming = reader.next_frame(), if !out.congested() => match incoming {
+                // the driver does. Not read while what is queued as an answer
+                // to the peer's own frames is past the high-water mark, and
+                // the application's frames do not count: a peer streaming in
+                // both directions would otherwise stop reading for as long as
+                // the socket was slower than the application.
+                incoming = reader.next_frame(), if !out.answers_congested() => match incoming {
                     Ok(frame) => {
                         // The one event the read threshold measures from.
                         if let Some(period) = deadline {
                             expiry.as_mut().reset(Instant::now() + period);
                         }
-                        match self.handle(frame, &mut out, closing) {
+                        // Whatever this frame makes the driver queue is an
+                        // answer to the peer, counted apart from what the
+                        // application queued.
+                        let answers_from = out.end();
+                        let handled = self.handle(frame, &mut out, closing);
+                        out.answered(answers_from);
+                        match handled {
                             Ok(None) => {}
                             Ok(Some(state)) => {
                                 if let Some(done) = close_done.take() {
@@ -1278,7 +1321,12 @@ impl Driver {
                     max_frame_size: outgoing_frame_size,
                     frame_budget,
                     next_tag: Mutex::new(0),
-                    unsettled: Mutex::new(Unsettled::new(DEFAULT_MAX_UNSETTLED)),
+                    unsettled: Mutex::new(match options.role {
+                        // A sender's answers are kept until they are read.
+                        Role::Sender => Unsettled::for_sender(DEFAULT_MAX_UNSETTLED),
+                        Role::Receiver => Unsettled::new(DEFAULT_MAX_UNSETTLED),
+                    }),
+                    send_lock: Arc::new(tokio::sync::Mutex::new(())),
                 }),
                 events,
                 pending: Some(reply),
@@ -1589,7 +1637,7 @@ impl Driver {
                             owed.push((delivery_id, outcome.clone()));
                             // Settled here as well now, so the delivery is
                             // over at this end.
-                            link.settle_here(delivery_id);
+                            link.finish_here(delivery_id);
                         }
                         link.events.push(LinkEvent::Outcome {
                             delivery_id,
@@ -1725,7 +1773,13 @@ impl Driver {
         *link.shared.state.lock().expect("not poisoned") = LinkState::Attached;
         let handed = match (link.pending.take(), link.rx.take()) {
             (Some(reply), Some(rx)) => {
-                let handle = Link::new(Arc::clone(&link.shared), link.outbound.clone(), rx);
+                let handle = Link::new(
+                    Arc::clone(&link.shared),
+                    link.outbound.clone(),
+                    rx,
+                    self.exec.clone(),
+                    Lease::of(&self.commands),
+                );
                 let _ = reply.send(Ok(handle));
                 true
             }
@@ -1846,6 +1900,7 @@ impl Driver {
                     rx,
                     exec,
                     attach_timeout,
+                    Lease::of(&self.commands),
                 );
                 let _ = reply.send(Ok(session));
                 true

@@ -316,6 +316,16 @@ impl Credit {
     /// a drain becomes visible: the sender advanced the count to the limit, so
     /// the recomputed credit is zero and the receiver knows its grant was
     /// consumed rather than spent on a message.
+    ///
+    /// **A count behind this end's own is not adopted.** `flow` and `transfer`
+    /// are ordered on the session, so every delivery the sender counted
+    /// before a `flow` was received before it, and the count in the `flow` is
+    /// never behind: it is level with this end's, or ahead of it by what a
+    /// drain consumed. A count that has moved backwards is a peer rewinding
+    /// it, and adopting it would hand back credit that was already spent —
+    /// `link-credit` would be recomputed from the old count and the next
+    /// deliveries would pass the check against the highest limit ever
+    /// announced again, for ever. What was counted stays counted.
     pub fn apply_sender_state(&mut self, delivery_count: Option<u32>, available: Option<u32>) {
         debug_assert_eq!(self.role, Role::Receiver);
         if let Some(available) = available {
@@ -324,8 +334,11 @@ impl Credit {
         let Some(count) = delivery_count else {
             return;
         };
-        let limit = self.delivery_limit();
         self.seen_remote_attach = true;
+        if serial_gt(self.delivery_count, count) {
+            return;
+        }
+        let limit = self.delivery_limit();
         self.delivery_count = count;
         self.link_credit = serial_distance(limit, count);
     }
@@ -420,6 +433,54 @@ mod tests {
         credit.apply_grant(Some(3), Some(0), true);
         assert_eq!(credit.consume_for_drain(), 0);
         assert_eq!(credit.delivery_count(), 3);
+    }
+
+    /// A sender that rewinds its count in a `flow` does not get the credit
+    /// back: grant ten, receive ten, and a `flow` claiming the count is zero
+    /// would — adopted — recompute ten credits out of the same limit and let
+    /// the next ten deliveries pass for ever.
+    #[test]
+    fn a_flow_that_rewinds_the_count_does_not_reopen_credit() {
+        let mut credit = Credit::receiver();
+        credit.seen_sender_attach(0);
+        credit.grant(10);
+        for _ in 0..10 {
+            assert!(credit.record_received());
+        }
+        assert_eq!(credit.link_credit(), 0);
+        assert_eq!(credit.delivery_count(), 10);
+
+        credit.apply_sender_state(Some(0), Some(0));
+
+        assert_eq!(credit.delivery_count(), 10, "the rewind is not adopted");
+        assert_eq!(credit.link_credit(), 0, "and nothing was handed back");
+        assert!(
+            !credit.record_received(),
+            "the eleventh was never granted, whatever the flow said"
+        );
+    }
+
+    /// Behind in serial arithmetic, which is what a wrap makes of a count
+    /// that went the wrong way across it; and level or ahead — a drain — is
+    /// still taken.
+    #[test]
+    fn only_a_count_that_is_level_or_ahead_is_adopted() {
+        let mut credit = Credit::receiver();
+        credit.seen_sender_attach(u32::MAX - 1);
+        credit.grant(4);
+        for _ in 0..3 {
+            assert!(credit.record_received());
+        }
+        assert_eq!(credit.delivery_count(), 1, "wrapped");
+
+        credit.apply_sender_state(Some(u32::MAX - 1), None);
+        assert_eq!(credit.delivery_count(), 1, "behind across the wrap");
+
+        credit.apply_sender_state(Some(1), None);
+        assert_eq!(credit.delivery_count(), 1, "level changes nothing");
+        credit.apply_sender_state(Some(2), None);
+        assert_eq!(credit.delivery_count(), 2, "ahead: a drain consumed credit");
+        assert_eq!(credit.link_credit(), 0, "up to the limit and no further");
     }
 
     #[test]

@@ -46,6 +46,21 @@
 //! credit while settling nothing — so the bound is ours:
 //! [`DEFAULT_MAX_UNSETTLED`]. At the bound `send` waits, exactly as it waits
 //! for credit, rather than growing a map nobody bounded.
+//!
+//! # A sender keeps the answer until it has been read
+//!
+//! When the receiver settles a delivery its outcome is the answer to the
+//! `send`, and it exists nowhere else: the frame that carried it is gone and
+//! this end has nothing to remember it by but the record. So a sender's map
+//! does not forget a delivery the peer has settled; it marks it finished and
+//! keeps it, with the outcome, until the application has taken that outcome
+//! ([`Unsettled::take_final`]). A finished delivery counts against the bound
+//! like any other, which makes the bound what stops a producer from running
+//! ahead of the answers nobody has read: an application that wants to send
+//! without ever learning an outcome attaches with `snd-settle-mode=settled`,
+//! where there is none to keep. A receiver's map forgets as before: what the
+//! sender settles there is the end of a dance whose outcome this end chose
+//! itself.
 
 use std::collections::BTreeMap;
 
@@ -214,6 +229,14 @@ pub struct Pending {
     pub theirs: Option<Outcome>,
     /// Whether this end has settled. Once true, never false.
     pub settled_here: bool,
+    /// Whether the peer has settled, which makes `theirs` its final answer.
+    ///
+    /// The delivery is over at both ends; what this end still holds is the
+    /// outcome, kept until the application takes it
+    /// ([`Link::settled`](crate::Link::settled), or the
+    /// [`LinkEvent::Outcome`](crate::link::LinkEvent::Outcome) that reported
+    /// it). Only a sender's deliveries are ever kept this way.
+    pub settled_there: bool,
 }
 
 /// What applying a peer's `disposition` to one delivery amounts to.
@@ -247,6 +270,9 @@ pub enum Settlement {
 pub struct Unsettled {
     by_id: BTreeMap<u32, Record>,
     max: usize,
+    /// Whether a delivery the peer has finished stays until its outcome is
+    /// taken: a sender's, where the outcome is the answer to what was sent.
+    keep_final: bool,
 }
 
 /// The longest `delivery-tag` there is: Part 3 §3.2.1 bounds it at 32 octets
@@ -290,15 +316,32 @@ struct Record {
     /// Whether a provisional answer has been reported for this delivery, so
     /// that a peer repeating its `disposition` is not reported twice.
     reported: bool,
+    /// Whether the delivery is over at both ends and what is left is the
+    /// outcome, kept for the application to take. Only in a keeping map.
+    finished: bool,
 }
 
 impl Unsettled {
-    /// A map bounded at `max` deliveries.
+    /// A map bounded at `max` deliveries, which forgets a delivery as soon as
+    /// the peer has settled it. A receiver's.
     #[must_use]
     pub const fn new(max: usize) -> Self {
         Self {
             by_id: BTreeMap::new(),
             max,
+            keep_final: false,
+        }
+    }
+
+    /// A map bounded at `max` deliveries that keeps each one the peer has
+    /// settled, finished, until [`Unsettled::take_final`] hands its outcome
+    /// to the application. A sender's.
+    #[must_use]
+    pub const fn for_sender(max: usize) -> Self {
+        Self {
+            by_id: BTreeMap::new(),
+            max,
+            keep_final: true,
         }
     }
 
@@ -343,6 +386,7 @@ impl Unsettled {
                 theirs: None,
                 settled_here: false,
                 reported: false,
+                finished: false,
             },
         );
         true
@@ -366,7 +410,9 @@ impl Unsettled {
     }
 
     /// The delivery-ids this end holds that fall in `first..=last`, in serial
-    /// order.
+    /// order, **leaving out the finished ones**: a delivery that is over at
+    /// both ends has nothing left to settle or to be told about, and what a
+    /// range of them would cost is a walk for nothing.
     ///
     /// Serial arithmetic, because a delivery-id is an RFC 1982 serial number:
     /// a range that wraps is an ordinary range and not an empty one, and a
@@ -380,26 +426,31 @@ impl Unsettled {
         let span = serial_distance(last, first);
         let end = first.wrapping_add(span);
         let mut ids = Vec::new();
+        let open = |(id, record): (&u32, &Record)| (!record.finished).then_some(*id);
         if end >= first {
-            ids.extend(self.by_id.range(first..=end).map(|(id, _)| *id));
+            ids.extend(self.by_id.range(first..=end).filter_map(open));
         } else {
             // Across the wrap: the top of the space, then the bottom, which
             // is also the order the ids were issued in.
-            ids.extend(self.by_id.range(first..).map(|(id, _)| *id));
-            ids.extend(self.by_id.range(..=end).map(|(id, _)| *id));
+            ids.extend(self.by_id.range(first..).filter_map(open));
+            ids.extend(self.by_id.range(..=end).filter_map(open));
         }
         ids
     }
 
     /// Publishes this end's outcome for a delivery, and settles where asked.
     ///
-    /// Returns `false` where there is nothing to publish it on — unknown or
-    /// already forgotten — which is the idempotent case rather than an error.
-    /// An outcome already published is **not** replaced: it is terminal.
+    /// Returns `false` where there is nothing to publish it on — unknown,
+    /// already forgotten or finished — which is the idempotent case rather
+    /// than an error. An outcome already published is **not** replaced: it is
+    /// terminal.
     pub fn record_ours(&mut self, delivery_id: u32, outcome: &Outcome, settle: bool) -> bool {
         let Some(record) = self.by_id.get_mut(&delivery_id) else {
             return false;
         };
+        if record.finished {
+            return false;
+        }
         if record.ours.is_none() {
             record.ours = Some(outcome.clone());
         }
@@ -421,6 +472,39 @@ impl Unsettled {
         self.by_id.remove(&delivery_id).is_some()
     }
 
+    /// Ends a delivery at this end after the peer's outcome for it is final,
+    /// as [`Unsettled::settle_here`] does, except that a keeping map holds on
+    /// to it, finished, until its outcome is taken.
+    pub fn finish_here(&mut self, delivery_id: u32) -> bool {
+        if !self.keep_final {
+            return self.settle_here(delivery_id);
+        }
+        let Some(record) = self.by_id.get_mut(&delivery_id) else {
+            return false;
+        };
+        if record.theirs.is_none() && record.ours.is_none() {
+            // Nothing to keep: a finished record without an outcome would
+            // hold a slot for an answer nobody can read.
+            self.by_id.remove(&delivery_id);
+            return true;
+        }
+        record.settled_here = true;
+        record.finished = true;
+        true
+    }
+
+    /// Takes the final outcome of a finished delivery and forgets the
+    /// delivery, which is what frees its place. `None` where there is no
+    /// finished delivery with that id: unknown, already taken, or not yet
+    /// answered.
+    pub fn take_final(&mut self, delivery_id: u32) -> Option<Outcome> {
+        if !self.by_id.get(&delivery_id)?.finished {
+            return None;
+        }
+        let record = self.by_id.remove(&delivery_id)?;
+        record.theirs.or(record.ours)
+    }
+
     /// Applies the peer's `disposition` to one delivery.
     ///
     /// `outcome` is `None` where the frame carried no state at all or a
@@ -440,6 +524,12 @@ impl Unsettled {
         let Some(record) = self.by_id.get_mut(&delivery_id) else {
             return Settlement::Nothing;
         };
+        // Over, and kept only for its outcome to be read: a repeat of the
+        // frame, or a different answer, changes nothing, which is what a
+        // delivery already forgotten does as well.
+        if record.finished {
+            return Settlement::Nothing;
+        }
         if let Some(outcome) = outcome
             && record.theirs.is_none()
         {
@@ -454,7 +544,12 @@ impl Unsettled {
         // this end published itself.
         let known = record.theirs.clone().or_else(|| record.ours.clone());
         if settled {
-            self.by_id.remove(&delivery_id);
+            if self.keep_final && known.is_some() {
+                record.settled_here = true;
+                record.finished = true;
+            } else {
+                self.by_id.remove(&delivery_id);
+            }
             return known.map_or(Settlement::Nothing, Settlement::Settled);
         }
         if record.reported {
@@ -478,6 +573,7 @@ impl Record {
             ours: self.ours.clone(),
             theirs: self.theirs.clone(),
             settled_here: self.settled_here,
+            settled_there: self.finished,
         }
     }
 }
@@ -641,6 +737,103 @@ mod tests {
         // And it is terminal here too.
         assert!(map.record_ours(1, &Outcome::Released, false));
         assert_eq!(map.get(1).unwrap().ours, Some(Outcome::Accepted));
+    }
+
+    fn sender_map() -> Unsettled {
+        let mut map = Unsettled::for_sender(4);
+        assert!(map.insert(1, b"t-1"));
+        assert!(map.insert(2, b"t-2"));
+        map
+    }
+
+    /// A sender's answer exists nowhere but in its record, so a delivery the
+    /// peer has settled is kept, finished, with the outcome, until the
+    /// application takes it — and the record keeps its place meanwhile.
+    #[test]
+    fn a_senders_settled_delivery_is_kept_until_its_outcome_is_taken() {
+        let rejected = Outcome::Rejected {
+            error: Some(Condition::new("amqp:not-allowed")),
+        };
+        let mut map = sender_map();
+        assert_eq!(
+            map.record_theirs(1, Some(&rejected), true),
+            Settlement::Settled(rejected.clone())
+        );
+        let kept = map.get(1).expect("kept, not forgotten");
+        assert!(kept.settled_there && kept.settled_here);
+        assert_eq!(kept.theirs, Some(rejected.clone()));
+        assert_eq!(map.len(), 2, "it still holds its place");
+
+        assert_eq!(map.take_final(1), Some(rejected));
+        assert_eq!(map.get(1), None, "taking it is what forgets it");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.take_final(1), None, "and it is taken once");
+        assert_eq!(map.take_final(2), None, "an unanswered one has no outcome");
+    }
+
+    /// What keeps the place is what bounds the producer: with the map full of
+    /// answers nobody has taken, one more delivery does not fit, and taking
+    /// one makes room.
+    #[test]
+    fn answers_nobody_has_taken_hold_the_bound() {
+        let mut map = Unsettled::for_sender(2);
+        assert!(map.insert(1, b"a") && map.insert(2, b"b"));
+        let _ = map.record_theirs(1, Some(&Outcome::Accepted), true);
+        let _ = map.record_theirs(2, Some(&Outcome::Released), true);
+        assert!(!map.has_room(), "two answers, unread, are two deliveries");
+        assert!(!map.insert(3, b"c"));
+        assert_eq!(map.take_final(1), Some(Outcome::Accepted));
+        assert!(map.has_room());
+    }
+
+    /// The first answer is the answer: a repeat of the frame, or a different
+    /// outcome after it, changes nothing about a delivery that is over.
+    #[test]
+    fn a_finished_delivery_is_not_answered_twice() {
+        let mut map = sender_map();
+        let _ = map.record_theirs(1, Some(&Outcome::Accepted), true);
+        assert_eq!(
+            map.record_theirs(1, Some(&Outcome::Released), true),
+            Settlement::Nothing
+        );
+        assert_eq!(map.record_theirs(1, None, false), Settlement::Nothing);
+        assert!(!map.record_ours(1, &Outcome::Released, true));
+        assert_eq!(map.take_final(1), Some(Outcome::Accepted));
+    }
+
+    /// A finished delivery is over: a range over it settles nothing and a
+    /// walk of the map does not find it.
+    #[test]
+    fn a_finished_delivery_is_not_found_by_a_range() {
+        let mut map = sender_map();
+        let _ = map.record_theirs(1, Some(&Outcome::Accepted), true);
+        assert_eq!(map.ids_in(1, 2), vec![2]);
+    }
+
+    /// The second half of `rcv-settle-mode=second`: this end settles because
+    /// the receiver's outcome is final, and the outcome is still an answer.
+    #[test]
+    fn finishing_here_keeps_a_senders_answer_and_forgets_a_receivers() {
+        let mut sender = sender_map();
+        let _ = sender.record_theirs(1, Some(&Outcome::Accepted), false);
+        assert!(sender.finish_here(1));
+        assert_eq!(sender.take_final(1), Some(Outcome::Accepted));
+
+        let mut receiver = map();
+        let _ = receiver.record_theirs(1, Some(&Outcome::Accepted), false);
+        assert!(receiver.finish_here(1));
+        assert_eq!(receiver.get(1), None, "a receiver's map forgets as before");
+        assert_eq!(receiver.take_final(1), None);
+    }
+
+    /// A receiver's map is unchanged: what the sender settles there is the
+    /// end of a dance whose outcome this end chose itself.
+    #[test]
+    fn a_receivers_map_still_forgets_what_the_peer_settles() {
+        let mut map = map();
+        let _ = map.record_theirs(1, Some(&Outcome::Accepted), true);
+        assert_eq!(map.get(1), None);
+        assert_eq!(map.take_final(1), None);
     }
 
     #[test]

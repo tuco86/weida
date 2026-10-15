@@ -420,3 +420,29 @@ async fn a_flush_is_answered_by_its_own_pong_and_not_an_earlier_ones() {
         .expect("the task ran")
         .expect("its own PONG answered it");
 }
+
+/// A deadline meant as "never" — `Duration::MAX` — is a clock that cannot be
+/// represented as an instant, and it must not be added to one: the driver
+/// would panic the first time it armed the stall clock, and the connection
+/// would die with the caller none the wiser. Here every deadline goes through
+/// the runtime's timer, which saturates, so the connection works and the
+/// publish reaches the server.
+#[tokio::test]
+async fn a_timeout_too_large_to_add_to_an_instant_does_not_panic_the_driver() {
+    let mut options = options();
+    options.handshake_timeout = Duration::MAX;
+    options.write_timeout = Duration::MAX;
+    options.ping_interval = Duration::MAX;
+    let (nats, mut server) = connected(Server::listen().await, PLAIN_INFO, options).await;
+
+    nats.publish("never", b"x").await.expect("queued");
+    let seen = tokio::time::timeout(DEADLINE, server.read_op())
+        .await
+        .expect("the driver wrote the publish rather than dying");
+    assert_eq!(seen, "PUB never - x");
+    assert!(nats.state().is_usable());
+    tokio::time::timeout(DEADLINE, nats.close())
+        .await
+        .expect("the close finished")
+        .expect("closed");
+}

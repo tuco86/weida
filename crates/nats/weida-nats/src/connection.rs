@@ -109,7 +109,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use weida_nats_codec::limits::DEFAULT_MAX_PAYLOAD;
 use weida_nats_codec::{Connect, Limits, Op, ServerInfo};
 use weida_runtime::Exec;
@@ -118,6 +118,8 @@ use crate::error::{Error, Result};
 use crate::message::{Message, OwnedHeaders};
 use crate::options::{ConnectionOptions, Credentials, LANG, NonceSignature};
 use crate::queue::{Budget, Queued};
+use crate::refusal::{self, Refusal, Refusals};
+use crate::report::ReportLog;
 use crate::request::{self, Inbox, Pending};
 use crate::subscription::{Delivered, Subscription, Table};
 use crate::transport::{self, Incoming, OpReader, OpWriter, Wire};
@@ -397,6 +399,11 @@ struct Inner {
     info: watch::Receiver<RemoteInfo>,
     commands: mpsc::Sender<Command>,
     state: watch::Receiver<State>,
+    /// A reader of the refusals channel that never reads, kept so that
+    /// [`Connection::refusals`] can start a reader at the channel's tail
+    /// without this side holding a sender: the driver is the only sender, so
+    /// the readers see the end of the connection when it stops.
+    refusals: broadcast::Receiver<Refusal>,
     inbox: Inbox,
 }
 
@@ -598,6 +605,7 @@ impl Connection {
         let (commands, rx) = mpsc::channel(options.outgoing_queue);
         let (state_tx, state) = watch::channel(State::Connected);
         let (info_tx, info_rx) = watch::channel(info);
+        let (refusals_tx, refusals) = broadcast::channel(options.refusal_queue);
         let inbox = Inbox::new(&options.inbox_prefix)?;
 
         let driver = Driver {
@@ -607,6 +615,8 @@ impl Connection {
             commands: commands.downgrade(),
             state: state_tx,
             info: info_tx,
+            refusals: refusals_tx,
+            refusal_log: ReportLog::default(),
             max_payload: Arc::clone(&max_payload),
             table: Table::new(options.max_subscriptions),
             pending: Pending::new(options.max_pending_requests),
@@ -633,6 +643,7 @@ impl Connection {
                 info: info_rx,
                 commands,
                 state,
+                refusals,
                 inbox,
             }),
         })
@@ -642,6 +653,26 @@ impl Connection {
     #[must_use]
     pub fn info(&self) -> RemoteInfo {
         self.inner.info.borrow().clone()
+    }
+
+    /// The refusals the server sends from now on: an `-ERR` that did not end
+    /// the connection.
+    ///
+    /// A publish outside the user's permissions, a subscription it may not
+    /// have, a subject the server finds malformed and the server's
+    /// subscription limit are the server saying no to one operation and going
+    /// on. The operation that caused it returned long ago — Core NATS has no
+    /// acknowledgement to give it back in — so this is where the application
+    /// learns that a message was not accepted. A refused subscription is also
+    /// reported on its [`Subscription`] ([`Subscription::refusal`]).
+    ///
+    /// Every other `-ERR` ends the connection; see [`crate::refusal`] for
+    /// which is which. What is kept for a reader that does not come is
+    /// bounded by [`ConnectionOptions::refusal_queue`], so a server that
+    /// refuses without end costs the oldest refusals and not memory.
+    #[must_use]
+    pub fn refusals(&self) -> Refusals {
+        Refusals::new(self.inner.refusals.resubscribe())
     }
 
     /// The server's `max_payload`, as the last `INFO` left it.
@@ -1327,6 +1358,11 @@ struct Driver {
     commands: mpsc::WeakSender<Command>,
     state: watch::Sender<State>,
     info: watch::Sender<RemoteInfo>,
+    /// Where a recoverable `-ERR` is told to the application. The only sender
+    /// there is, so readers see the connection end when this task does.
+    refusals: broadcast::Sender<Refusal>,
+    /// How often a refusal is logged: the server sets the rate.
+    refusal_log: ReportLog,
     max_payload: Arc<AtomicU64>,
     table: Table,
     pending: Pending,
@@ -1542,7 +1578,9 @@ impl Driver {
                     return None;
                 }
                 let (tx, rx) = mpsc::channel(self.options.subscription_queue);
-                let dropped = self.table.insert(sid, subject.clone(), tx);
+                let shared = self
+                    .table
+                    .insert(sid, subject.clone(), queue_group.clone(), tx);
                 let _ = reply.send(Ok(Subscription::new(
                     sid,
                     subject,
@@ -1553,7 +1591,7 @@ impl Driver {
                     self.commands
                         .upgrade()
                         .unwrap_or_else(|| mpsc::channel(1).0),
-                    dropped,
+                    shared,
                 )));
             }
 
@@ -1653,16 +1691,40 @@ impl Driver {
             }
             Incoming::Info(json) => self.merge_info(&json, limits, max_connect_urls)?,
             Incoming::Ok => {}
-            Incoming::Err(reason) => {
+            Incoming::Err(reason) => match refusal::classify(&reason) {
+                // The server said no to one operation and went on: telling
+                // the application is the whole of the answer, because the
+                // connection, its subscriptions and its pending requests are
+                // all still good.
+                Some((refusal, named)) => self.refused(refusal, named.as_ref()),
                 // "A protocol, authorization, or other runtime connection
                 // error", and most of them are followed by the server
                 // closing. Reported as the failure it is rather than logged
                 // and ignored.
-                return Err(Error::Server(reason));
-            }
+                None => return Err(Error::Server(reason)),
+            },
             Incoming::Msg(message) => self.dispatch(message, writer)?,
         }
         Ok(())
+    }
+
+    /// A recoverable `-ERR`: counts it, says so at most once a second, ends
+    /// the subscription it names and tells every reader of
+    /// [`Connection::refusals`].
+    fn refused(&mut self, refusal: Refusal, named: Option<&refusal::Named>) {
+        let ended = named.map_or(0, |named| self.table.refuse(named, &refusal));
+        if let Some(refused) = self.refusal_log.record(Instant::now()) {
+            tracing::warn!(
+                refused,
+                ended,
+                kind = ?refusal.kind,
+                reason = %refusal.reason,
+                "the server refused an operation and kept the connection"
+            );
+        }
+        // There is always a receiver while a `Connection` lives, and none
+        // is an application that is not listening: neither is a failure.
+        let _ = self.refusals.send(refusal);
     }
 
     /// Applies an asynchronous `INFO`.
@@ -1726,16 +1788,12 @@ impl Driver {
                 // disconnect anyway. Counted every time, said once a second:
                 // the peer sets the rate, and the subject is only turned into
                 // text for a line that is actually written.
-                if let Some(dropped) = report {
-                    let subject = self
-                        .table
-                        .subject(sid)
-                        .map(String::from_utf8_lossy)
-                        .unwrap_or_default();
+                if let Some(report) = report {
+                    let subject = String::from_utf8_lossy(&report.subject);
                     tracing::warn!(
                         sid,
                         subject = %subject,
-                        dropped,
+                        dropped = report.dropped,
                         ?reason,
                         queue = self.options.subscription_queue,
                         max_queued_bytes = self.options.max_queued_bytes,

@@ -75,6 +75,7 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -235,40 +236,118 @@ impl AsyncWrite for Stream {
 /// the other. The count is capped by
 /// [`ConnectionOptions::max_resolved_addresses`], because a resolver answer is
 /// remote input.
+///
+/// The name lookup and every attempt share **one** budget,
+/// [`ConnectionOptions::handshake_timeout`]. A budget per address would let a
+/// handful of addresses that swallow packets hold the caller for that long
+/// each, and a lookup outside any budget would hold it for as long as the
+/// resolver took.
 pub async fn connect(
     exec: &Exec,
     host: &str,
     port: u16,
     options: &ConnectionOptions,
 ) -> Result<Stream> {
-    let addrs = exec
-        .resolve(host, port, options.max_resolved_addresses)
-        .await?;
+    let budget = Budget::start(options.handshake_timeout);
+    let lookup = exec.resolve(host, port, options.max_resolved_addresses);
+    connect_to(exec, &budget, lookup).await
+}
+
+/// [`connect`] with the lookup handed in: what the resolver answers, inside
+/// what is left of `budget`.
+async fn connect_to<L>(exec: &Exec, budget: &Budget, lookup: L) -> Result<Stream>
+where
+    L: Future<Output = std::result::Result<Vec<SocketAddr>, weida_core::Error>>,
+{
+    let addrs = match exec.within(budget.left(), lookup).await {
+        Some(answer) => answer?,
+        None => {
+            return Err(Error::HandshakeTimeout {
+                step: "the name lookup",
+            });
+        }
+    };
+    dial(exec, &addrs, budget).await
+}
+
+/// What is left of one time budget, spent a step at a time.
+struct Budget {
+    /// Where the budget runs out. `None` only where the total is so large
+    /// that the instant cannot be represented, in which case no step is
+    /// given less than the whole of it.
+    ends: Option<Instant>,
+    whole: Duration,
+}
+
+impl Budget {
+    fn start(whole: Duration) -> Self {
+        Self {
+            ends: Instant::now().checked_add(whole),
+            whole,
+        }
+    }
+
+    fn left(&self) -> Duration {
+        self.ends.map_or(self.whole, |ends| {
+            ends.saturating_duration_since(Instant::now())
+        })
+    }
+}
+
+/// Tries `addrs` in order inside what is left of `budget`.
+///
+/// Every attempt but the last gets half of what is left, so an address that
+/// swallows packets — the unreachable IPv6 half of a dual-stack name — leaves
+/// the next one time to answer. An attempt that runs out is aborted rather
+/// than left to finish a connect nobody is waiting for.
+async fn dial(exec: &Exec, addrs: &[SocketAddr], budget: &Budget) -> Result<Stream> {
+    if addrs.is_empty() {
+        return Err(Error::Runtime(weida_core::Error::InvalidAddress(
+            "the resolver offered no addresses".into(),
+        )));
+    }
     let mut last = None;
-    for addr in &addrs {
-        match exec
-            .within(options.handshake_timeout, TcpStream::connect(addr))
-            .await
-        {
-            Some(Ok(stream)) => {
+    for (index, addr) in addrs.iter().enumerate() {
+        let left = budget.left();
+        let share = if index + 1 < addrs.len() {
+            left / 2
+        } else {
+            left
+        };
+        if share.is_zero() {
+            last = Some(Error::HandshakeTimeout {
+                step: "the TCP connect",
+            });
+            break;
+        }
+        // `TcpStream::connect` registers the socket with the reactor as it is
+        // built, and a caller driving this future on its own executor is not
+        // inside one. Spawning puts the constructor where the reactor is.
+        let mut attempt = exec.spawn(TcpStream::connect(*addr));
+        match exec.within(share, &mut attempt).await {
+            Some(Ok(Ok(stream))) => {
                 // Nagle off: the handshake is a run of short control lines
                 // that each need an answer, and a request-reply round trip is
                 // two more. Coalescing them adds a delay to every one.
                 let _ = stream.set_nodelay(true);
                 return Ok(Stream::Plain(stream));
             }
-            Some(Err(error)) => last = Some(Error::Io(error)),
+            Some(Ok(Err(error))) => last = Some(Error::Io(error)),
+            Some(Err(error)) => {
+                last = Some(Error::Runtime(weida_core::Error::Runtime(format!(
+                    "connect task failed: {error}"
+                ))));
+            }
             None => {
+                attempt.abort();
                 last = Some(Error::HandshakeTimeout {
                     step: "the TCP connect",
                 });
             }
         }
     }
-    Err(last.unwrap_or_else(|| {
-        Error::Runtime(weida_core::Error::InvalidAddress(format!(
-            "{host}:{port} resolved to no addresses"
-        )))
+    Err(last.unwrap_or(Error::HandshakeTimeout {
+        step: "the TCP connect",
     }))
 }
 
@@ -1040,5 +1119,97 @@ mod tests {
         let stuck = tokio::time::timeout(std::time::Duration::from_millis(100), writer.step());
         assert!(stuck.await.is_err(), "no progress, and no error either");
         assert!(writer.has_output());
+    }
+
+    /// A listener whose accept queue is full, which makes a connect to it
+    /// neither complete nor fail: the kernel drops the `SYN`, as a link that
+    /// swallows packets does. Linux only, because it is the Linux queue that
+    /// is being filled.
+    #[cfg(target_os = "linux")]
+    async fn blackhole() -> (tokio::net::TcpListener, Vec<TcpStream>, SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("bound");
+        let listener = socket.listen(1).expect("listening");
+        let addr = listener.local_addr().expect("an address");
+        let mut held = Vec::new();
+        // Connections nobody accepts: they fill the queue, and the first
+        // connect that finds it full is the one that hangs.
+        while let Ok(stream) =
+            tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr)).await
+        {
+            held.push(stream.expect("the queue still had room"));
+            assert!(held.len() < 32, "the accept queue never filled");
+        }
+        (listener, held, addr)
+    }
+
+    /// Several addresses that swallow packets share the one budget, instead
+    /// of each being given the whole of it: three of them under a 600 ms
+    /// budget end in about 600 ms, not in 1.8 s.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn addresses_that_swallow_packets_share_one_budget() {
+        let exec = Exec::current().expect("a runtime");
+        let (_l1, _h1, first) = blackhole().await;
+        let (_l2, _h2, second) = blackhole().await;
+        let (_l3, _h3, third) = blackhole().await;
+
+        let budget = Budget::start(Duration::from_millis(600));
+        let started = Instant::now();
+        let error = dial(&exec, &[first, second, third], &budget)
+            .await
+            .expect_err("nothing answers");
+        let took = started.elapsed();
+
+        assert!(matches!(error, Error::HandshakeTimeout { .. }), "{error}");
+        assert!(
+            took < Duration::from_millis(1200),
+            "three addresses took {took:?} out of a 600 ms budget"
+        );
+    }
+
+    /// An address that swallows packets leaves the next one time to answer:
+    /// it is given half of what is left and not all of it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_black_hole_leaves_the_next_address_time_to_answer() {
+        let exec = Exec::current().expect("a runtime");
+        let (_hole, _held, dead) = blackhole().await;
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bound");
+        let live_addr = live.local_addr().expect("an address");
+
+        let budget = Budget::start(Duration::from_secs(2));
+        let stream = dial(&exec, &[dead, live_addr], &budget)
+            .await
+            .expect("the second address answers");
+        assert!(matches!(stream, Stream::Plain(_)));
+    }
+
+    /// A resolver that never answers does not hold the caller past the
+    /// budget, and the failure says what was being waited for.
+    #[tokio::test]
+    async fn a_lookup_that_never_answers_ends_inside_the_budget() {
+        let exec = Exec::current().expect("a runtime");
+        let silent =
+            std::future::pending::<std::result::Result<Vec<SocketAddr>, weida_core::Error>>();
+        let budget = Budget::start(Duration::from_millis(200));
+        let started = Instant::now();
+        let error = connect_to(&exec, &budget, silent)
+            .await
+            .expect_err("it never answers");
+        assert!(
+            matches!(
+                error,
+                Error::HandshakeTimeout {
+                    step: "the name lookup"
+                }
+            ),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

@@ -28,6 +28,13 @@
 //! certainly writes any message already in flight. A client that only sent
 //! the count would deliver messages past the one the caller asked to stop at.
 //!
+//! The server counts every `MSG` it writes on the `sid`, whether or not this
+//! client could queue the copy, so the table counts the same thing: a copy
+//! dropped for want of room (below) still advances the count. A table that
+//! counted only what it queued would stay behind the server for ever after
+//! one drop, and a subscription the server has already ended would never end
+//! here.
+//!
 //! # A full queue drops the copy
 //!
 //! Each subscription has a bounded queue and a message that arrives for a
@@ -57,15 +64,26 @@
 //! written from there.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
 use crate::connection::Command;
 use crate::message::Message;
 use crate::queue::{Budget, Queued};
+use crate::refusal::{Named, Refusal};
+use crate::report::ReportLog;
+
+/// What a table entry and the [`Subscription`] handed to the caller share.
+#[derive(Debug, Default)]
+pub(crate) struct Shared {
+    /// Copies dropped.
+    dropped: AtomicU64,
+    /// The refusal that ended the subscription, where the server refused it.
+    refusal: OnceLock<Refusal>,
+}
 
 /// One live subscription.
 ///
@@ -82,7 +100,7 @@ pub struct Subscription {
     messages: mpsc::Receiver<Queued>,
     commands: mpsc::Sender<Command>,
     /// Shared with this subscription's table entry.
-    dropped: Arc<AtomicU64>,
+    shared: Arc<Shared>,
     /// Set once an `UNSUB` has been asked for, so `Drop` does not send a
     /// second one.
     released: bool,
@@ -95,7 +113,7 @@ impl Subscription {
         queue_group: Option<Vec<u8>>,
         messages: mpsc::Receiver<Queued>,
         commands: mpsc::Sender<Command>,
-        dropped: Arc<AtomicU64>,
+        shared: Arc<Shared>,
     ) -> Self {
         Self {
             sid,
@@ -103,7 +121,7 @@ impl Subscription {
             queue_group,
             messages,
             commands,
-            dropped,
+            shared,
             released: false,
         }
     }
@@ -136,14 +154,30 @@ impl Subscription {
     /// rather than stalling the connection; this is how much it has lost.
     #[must_use]
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.shared.dropped.load(Ordering::Relaxed)
+    }
+
+    /// The refusal that ended this subscription, where the server refused it.
+    ///
+    /// `Some` once the server has answered the `SUB` with a permissions
+    /// violation naming this subscription: the server holds no such
+    /// subscription, so no message will ever arrive, and [`next`](Self::next)
+    /// has ended. `None` for a subscription that was not refused, including
+    /// one that ended some other way. Refusals the server does not tie to a
+    /// subscription are on [`Connection::refusals`](crate::Connection::refusals)
+    /// only.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&Refusal> {
+        self.shared.refusal.get()
     }
 
     /// The next message, or `None` once the subscription has ended.
     ///
     /// Ends when the subscription is unsubscribed, when an auto-unsubscribe
-    /// count is reached, or when the connection goes away — a Core NATS
-    /// subscription has no existence apart from its connection.
+    /// count is reached — as the *server* counts it, so a copy this client
+    /// had no room for counts too — when the server refuses the subscription
+    /// ([`refusal`](Self::refusal)), or when the connection goes away: a Core
+    /// NATS subscription has no existence apart from its connection.
     pub async fn next(&mut self) -> Option<Message> {
         self.messages.recv().await.map(Queued::into_message)
     }
@@ -210,7 +244,7 @@ pub(crate) enum DropReason {
 }
 
 /// What one delivery attempt did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Delivered {
     /// Handed to the subscription. `exhausted` means an auto-unsubscribe
     /// count was reached and the entry is gone.
@@ -218,14 +252,13 @@ pub(crate) enum Delivered {
         /// Whether this was the last message the subscription asked for.
         exhausted: bool,
     },
-    /// The copy was dropped and counted. `report` is how many copies were
-    /// dropped since the last time this subscription's drops were reported,
-    /// where it is time to report them again, and `None` where it is not.
+    /// The copy was dropped and counted. `report` is set where it is time to
+    /// say so again, and `None` where it is not.
     Dropped {
         /// Why.
         reason: DropReason,
         /// Set at most once a second per subscription.
-        report: Option<u64>,
+        report: Option<DropReport>,
     },
     /// Nobody is reading any more; the entry has been removed and an `UNSUB`
     /// is due.
@@ -234,49 +267,36 @@ pub(crate) enum Delivered {
     Unknown,
 }
 
-/// How often one subscription's drops are logged at most.
-const REPORT_EVERY: Duration = Duration::from_secs(1);
-
-/// The rate limit on the log line a drop earns.
+/// What a log line about dropped copies says.
 ///
-/// The peer sets the rate at which messages arrive, so the rate at which they
-/// are dropped is the peer's too; one line per drop would put the cost of an
-/// overload — a lossy subject conversion, a log record — on the client at
-/// exactly the moment it has the least to spare.
-#[derive(Debug, Default)]
-struct DropLog {
-    last: Option<Instant>,
-    unreported: u64,
-}
-
-impl DropLog {
-    /// Notes one drop at `now`: `Some(n)` where `n` drops, this one included,
-    /// are due a log line, and `None` where one was written lately enough.
-    fn record(&mut self, now: Instant) -> Option<u64> {
-        self.unreported += 1;
-        let due = self
-            .last
-            .is_none_or(|last| now.saturating_duration_since(last) >= REPORT_EVERY);
-        if !due {
-            return None;
-        }
-        self.last = Some(now);
-        Some(std::mem::take(&mut self.unreported))
-    }
+/// Carried with the answer because the entry the copy was dropped for may be
+/// gone by the time the caller looks: a drop can be the copy that reaches an
+/// auto-unsubscribe count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropReport {
+    /// How many copies were dropped since the last time this subscription's
+    /// drops were reported, this one included.
+    pub(crate) dropped: u64,
+    /// What the subscription asked for.
+    pub(crate) subject: Vec<u8>,
 }
 
 /// One entry of the subscription table.
 #[derive(Debug)]
 struct Entry {
     subject: Vec<u8>,
+    queue_group: Option<Vec<u8>>,
     tx: mpsc::Sender<Queued>,
-    /// How many messages have been delivered on this `sid`, which is the
-    /// number `UNSUB <sid> <max_msgs>` counts.
-    delivered: u64,
+    /// How many `MSG`s the server has sent on this `sid`, which is the number
+    /// `UNSUB <sid> <max_msgs>` counts. Every one counts, a copy that was
+    /// dropped for want of room included, because the server counted it when
+    /// it wrote it.
+    received: u64,
     max_msgs: Option<u64>,
-    /// Copies dropped; the [`Subscription`] holds the other end.
-    dropped: Arc<AtomicU64>,
-    log: DropLog,
+    /// What the [`Subscription`] holds the other end of: the copies dropped
+    /// and the refusal, where there was one.
+    shared: Arc<Shared>,
+    log: ReportLog,
 }
 
 /// The subscription table, owned by the connection driver.
@@ -309,27 +329,29 @@ impl Table {
         self.max
     }
 
-    /// Adds a subscription and returns the counter of what it will drop, which
-    /// the [`Subscription`] handed to the caller shares.
+    /// Adds a subscription and returns what it shares with the
+    /// [`Subscription`] handed to the caller.
     pub(crate) fn insert(
         &mut self,
         sid: u64,
         subject: Vec<u8>,
+        queue_group: Option<Vec<u8>>,
         tx: mpsc::Sender<Queued>,
-    ) -> Arc<AtomicU64> {
-        let dropped = Arc::new(AtomicU64::new(0));
+    ) -> Arc<Shared> {
+        let shared = Arc::new(Shared::default());
         self.entries.insert(
             sid,
             Entry {
                 subject,
+                queue_group,
                 tx,
-                delivered: 0,
+                received: 0,
                 max_msgs: None,
-                dropped: Arc::clone(&dropped),
-                log: DropLog::default(),
+                shared: Arc::clone(&shared),
+                log: ReportLog::default(),
             },
         );
-        dropped
+        shared
     }
 
     /// Removes a subscription. `true` where there was one to remove, which is
@@ -341,13 +363,13 @@ impl Table {
     /// Records an auto-unsubscribe count.
     ///
     /// `false` where the subscription no longer exists. The entry is removed
-    /// immediately where it has already received that many, because the count
-    /// is a total and not a further N.
+    /// immediately where the server has already sent that many, because the
+    /// count is a total and not a further N.
     pub(crate) fn set_max_msgs(&mut self, sid: u64, max_msgs: u64) -> bool {
         let Some(entry) = self.entries.get_mut(&sid) else {
             return false;
         };
-        if entry.delivered >= max_msgs {
+        if entry.received >= max_msgs {
             self.entries.remove(&sid);
             return true;
         }
@@ -365,6 +387,11 @@ impl Table {
     ///
     /// The message is charged against `budget` before it is queued; where it
     /// does not fit, or the queue is full, it is dropped and counted.
+    ///
+    /// Every copy that reaches an entry counts toward its auto-unsubscribe
+    /// count, the dropped ones too: the server counted each of them when it
+    /// wrote it, and an entry that counted only what it queued would never
+    /// reach the count the server already has.
     pub(crate) fn dispatch(
         &mut self,
         sid: u64,
@@ -374,31 +401,27 @@ impl Table {
         let Some(entry) = self.entries.get_mut(&sid) else {
             return Delivered::Unknown;
         };
-        let Some(charge) = budget.try_charge(message.queued_len()) else {
-            return entry.record_drop(DropReason::OverBudget);
-        };
-        match entry.tx.try_send(Queued::new(message, charge)) {
-            Ok(()) => {
-                entry.delivered += 1;
-                let exhausted = entry.max_msgs.is_some_and(|max| entry.delivered >= max);
-                if exhausted {
+        entry.received += 1;
+        let exhausted = entry.max_msgs.is_some_and(|max| entry.received >= max);
+        let delivered = match budget.try_charge(message.queued_len()) {
+            None => entry.record_drop(DropReason::OverBudget),
+            Some(charge) => match entry.tx.try_send(Queued::new(message, charge)) {
+                Ok(()) => Delivered::Ok { exhausted },
+                // The message, and the charge it carried, are dropped with
+                // the error.
+                Err(mpsc::error::TrySendError::Full(_)) => entry.record_drop(DropReason::QueueFull),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.entries.remove(&sid);
+                    return Delivered::Gone;
                 }
-                Delivered::Ok { exhausted }
-            }
-            // The message, and the charge it carried, are dropped with the
-            // error.
-            Err(mpsc::error::TrySendError::Full(_)) => entry.record_drop(DropReason::QueueFull),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.entries.remove(&sid);
-                Delivered::Gone
-            }
+            },
+        };
+        // The server has ended the subscription: dropping the sender is what
+        // lets the reader take what is queued and then see the end.
+        if exhausted {
+            self.entries.remove(&sid);
         }
-    }
-
-    /// The subject a `sid` subscribed to, for a log line.
-    pub(crate) fn subject(&self, sid: u64) -> Option<&[u8]> {
-        self.entries.get(&sid).map(|entry| entry.subject.as_slice())
+        delivered
     }
 
     /// Removes every entry whose reader has gone, returning their `sid`s so
@@ -419,6 +442,35 @@ impl Table {
         gone
     }
 
+    /// Ends every subscription `named` says the server has refused or
+    /// removed, telling each one why, and returns how many there were.
+    ///
+    /// A `sid` is exact. Without one the server has only named a subject and
+    /// a queue group, and every subscription asking for exactly that is
+    /// ended: the server decided on the subject and the group, so it refused
+    /// each of them alike. The server holds none of these any more, so no
+    /// `UNSUB` is owed for them, and dropping their senders is what lets a
+    /// reader take what is queued and then see the end.
+    pub(crate) fn refuse(&mut self, named: &Named, refusal: &Refusal) -> usize {
+        let hit: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(sid, entry)| match named.sid {
+                Some(exact) => **sid == exact,
+                None => entry.subject == named.subject && entry.queue_group == named.queue_group,
+            })
+            .map(|(sid, _)| *sid)
+            .collect();
+        for sid in &hit {
+            if let Some(entry) = self.entries.remove(sid) {
+                // The first refusal is the reason; a second one for the same
+                // subscription changes nothing.
+                let _ = entry.shared.refusal.set(refusal.clone());
+            }
+        }
+        hit.len()
+    }
+
     /// Closes every subscription, which is what the end of the connection
     /// does to them: "core subscriptions vanish with the connection and have
     /// no stored session".
@@ -430,11 +482,12 @@ impl Table {
 impl Entry {
     /// Counts a drop and says whether this one is due a log line.
     fn record_drop(&mut self, reason: DropReason) -> Delivered {
-        self.dropped.fetch_add(1, Ordering::Relaxed);
-        Delivered::Dropped {
-            reason,
-            report: self.log.record(Instant::now()),
-        }
+        self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+        let report = self.log.record(Instant::now()).map(|dropped| DropReport {
+            dropped,
+            subject: self.subject.clone(),
+        });
+        Delivered::Dropped { reason, report }
     }
 }
 
@@ -467,8 +520,8 @@ mod tests {
         let mut table = Table::new(8);
         let (tx1, mut rx1) = mpsc::channel(4);
         let (tx2, mut rx2) = mpsc::channel(4);
-        table.insert(1, b"a.b".to_vec(), tx1);
-        table.insert(2, b"a.b".to_vec(), tx2);
+        table.insert(1, b"a.b".to_vec(), None, tx1);
+        table.insert(2, b"a.b".to_vec(), None, tx2);
 
         assert_eq!(
             table.dispatch(1, message(1), &budget),
@@ -490,7 +543,7 @@ mod tests {
         let budget = roomy();
         let mut table = Table::new(8);
         let (tx, mut rx) = mpsc::channel(8);
-        table.insert(1, b"a.b".to_vec(), tx);
+        table.insert(1, b"a.b".to_vec(), None, tx);
 
         assert_eq!(
             table.dispatch(1, message(1), &budget),
@@ -525,7 +578,7 @@ mod tests {
         let budget = roomy();
         let mut table = Table::new(8);
         let (tx, _rx) = mpsc::channel(8);
-        table.insert(1, b"a.b".to_vec(), tx);
+        table.insert(1, b"a.b".to_vec(), None, tx);
         table.dispatch(1, message(1), &budget);
         table.dispatch(1, message(1), &budget);
         assert!(table.set_max_msgs(1, 2));
@@ -536,14 +589,19 @@ mod tests {
         );
     }
 
-    /// A full queue costs one copy, not the connection, and the copy is
-    /// counted where the subscription's owner can read it.
+    /// The server counts every `MSG` it writes on the `sid`, so a copy this
+    /// client had no room for still advances the count: with the queue full
+    /// the subscription ends when the server's count says it has, and its
+    /// reader sees the end rather than waiting for a message that will never
+    /// come.
     #[test]
-    fn a_full_queue_drops_and_counts_the_copy() {
+    fn a_dropped_copy_still_counts_toward_the_auto_unsubscribe_count() {
         let budget = roomy();
         let mut table = Table::new(8);
         let (tx, mut rx) = mpsc::channel(1);
-        let dropped = table.insert(1, b"a.b".to_vec(), tx);
+        let shared = table.insert(1, b"a.b".to_vec(), None, tx);
+        assert!(table.set_max_msgs(1, 3), "the subscription is still there");
+
         assert_eq!(
             table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: false }
@@ -552,10 +610,81 @@ mod tests {
             table.dispatch(1, message(1), &budget),
             Delivered::Dropped {
                 reason: DropReason::QueueFull,
-                report: Some(1)
+                ..
             }
         ));
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Dropped {
+                reason: DropReason::QueueFull,
+                ..
+            }
+        ));
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Unknown,
+            "three copies were written, the third was the last one asked for"
+        );
+
+        assert_eq!(received(&mut rx).sid, 1, "what was queued is still there");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "and then the reader sees the end, not an empty queue"
+        );
+    }
+
+    /// The same count where the copy is refused by the connection's byte
+    /// budget rather than by the subscription's own queue, and the log line
+    /// for the drop that ends the subscription still names its subject.
+    #[test]
+    fn a_copy_over_the_byte_budget_counts_too_and_the_report_names_the_subject() {
+        let one = message(1).queued_len();
+        let budget = Budget::new(one);
+        let mut table = Table::new(8);
+        let (tx, mut rx) = mpsc::channel(8);
+        table.insert(1, b"a.b".to_vec(), None, tx);
+        assert!(table.set_max_msgs(1, 2));
+
+        assert_eq!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Ok { exhausted: false }
+        );
+        assert!(matches!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Dropped {
+                reason: DropReason::OverBudget,
+                report: Some(DropReport { ref subject, .. })
+            } if subject == b"a.b"
+        ));
+        assert_eq!(table.dispatch(1, message(1), &budget), Delivered::Unknown);
+        let _ = received(&mut rx);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    /// A full queue costs one copy, not the connection, and the copy is
+    /// counted where the subscription's owner can read it.
+    #[test]
+    fn a_full_queue_drops_and_counts_the_copy() {
+        let budget = roomy();
+        let mut table = Table::new(8);
+        let (tx, mut rx) = mpsc::channel(1);
+        let shared = table.insert(1, b"a.b".to_vec(), None, tx);
+        assert_eq!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Ok { exhausted: false }
+        );
+        assert!(matches!(
+            table.dispatch(1, message(1), &budget),
+            Delivered::Dropped {
+                reason: DropReason::QueueFull,
+                report: Some(DropReport { dropped: 1, ref subject })
+            } if subject == b"a.b"
+        ));
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 1);
         assert!(rx.try_recv().is_ok());
         assert!(
             rx.try_recv().is_err(),
@@ -577,7 +706,7 @@ mod tests {
         let budget = Budget::new(one * 2);
         let mut table = Table::new(8);
         let (tx, mut rx) = mpsc::channel(100);
-        let dropped = table.insert(1, b"a.b".to_vec(), tx);
+        let shared = table.insert(1, b"a.b".to_vec(), None, tx);
 
         for _ in 0..2 {
             assert_eq!(
@@ -592,7 +721,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 1);
 
         // The reader takes one; the budget has room for exactly one more.
         let _ = received(&mut rx);
@@ -615,8 +744,8 @@ mod tests {
         let mut table = Table::new(8);
         let (tx1, _rx1) = mpsc::channel(100);
         let (tx2, _rx2) = mpsc::channel(100);
-        table.insert(1, b"a.b".to_vec(), tx1);
-        table.insert(2, b"a.b".to_vec(), tx2);
+        table.insert(1, b"a.b".to_vec(), None, tx1);
+        table.insert(2, b"a.b".to_vec(), None, tx2);
         assert_eq!(
             table.dispatch(1, message(1), &budget),
             Delivered::Ok { exhausted: false }
@@ -637,7 +766,7 @@ mod tests {
         let budget = roomy();
         let mut table = Table::new(8);
         let (tx, rx) = mpsc::channel(1);
-        table.insert(1, b"a.b".to_vec(), tx);
+        table.insert(1, b"a.b".to_vec(), None, tx);
         drop(rx);
         assert_eq!(table.dispatch(1, message(1), &budget), Delivered::Gone);
         assert_eq!(
@@ -655,13 +784,22 @@ mod tests {
         let mut table = Table::new(8);
         let (live_tx, _live_rx) = mpsc::channel(1);
         let (gone_tx, gone_rx) = mpsc::channel(1);
-        table.insert(1, b"a".to_vec(), live_tx);
-        table.insert(2, b"b".to_vec(), gone_tx);
+        table.insert(1, b"a".to_vec(), None, live_tx);
+        table.insert(2, b"b".to_vec(), None, gone_tx);
         drop(gone_rx);
 
         assert_eq!(table.take_closed(), vec![2]);
         assert!(table.take_closed().is_empty(), "swept once");
-        assert!(table.subject(1).is_some() && table.subject(2).is_none());
+        assert_eq!(
+            table.dispatch(1, message(1), &roomy()),
+            Delivered::Ok { exhausted: false },
+            "the live one is still there"
+        );
+        assert_eq!(
+            table.dispatch(2, message(2), &roomy()),
+            Delivered::Unknown,
+            "the swept one is not"
+        );
     }
 
     /// The bound is the client's, because the `sid` is.
@@ -671,7 +809,7 @@ mod tests {
         for sid in 0..2 {
             let (tx, _rx) = mpsc::channel(1);
             assert!(table.has_room());
-            table.insert(sid, b"a".to_vec(), tx);
+            table.insert(sid, b"a".to_vec(), None, tx);
         }
         assert!(!table.has_room());
         assert_eq!(table.max(), 2);
@@ -680,25 +818,80 @@ mod tests {
         assert!(!table.remove(0), "removing twice is not two removals");
     }
 
-    /// A flood of drops is one log line a second, carrying the count of what
-    /// it stands for.
-    #[test]
-    fn drops_are_reported_at_most_once_a_second() {
-        let start = Instant::now();
-        let mut log = DropLog::default();
-        assert_eq!(log.record(start), Some(1), "the first is reported at once");
-        for n in 1..=1000u32 {
-            assert_eq!(
-                log.record(start + Duration::from_millis(u64::from(n) % 900)),
-                None,
-                "inside the second after the last report"
-            );
+    fn named(subject: &[u8], queue_group: Option<&[u8]>, sid: Option<u64>) -> Named {
+        Named {
+            subject: subject.to_vec(),
+            queue_group: queue_group.map(<[u8]>::to_vec),
+            sid,
         }
+    }
+
+    fn refusal() -> Refusal {
+        crate::refusal::classify(r#"Permissions Violation for Subscription to "secret.>""#)
+            .expect("a refusal")
+            .0
+    }
+
+    /// A refused subscription ends, its reader sees the end after what was
+    /// queued, and it carries the reason; one nobody named is untouched.
+    #[test]
+    fn a_refused_subscription_ends_with_its_reason_and_others_do_not() {
+        let budget = roomy();
+        let mut table = Table::new(8);
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+        let refused = table.insert(1, b"secret.>".to_vec(), None, tx1);
+        let other = table.insert(2, b"public.>".to_vec(), None, tx2);
+        table.dispatch(1, message(1), &budget);
+
+        assert_eq!(table.refuse(&named(b"secret.>", None, None), &refusal()), 1);
+
+        assert_eq!(refused.refusal.get(), Some(&refusal()));
+        assert_eq!(other.refusal.get(), None);
         assert_eq!(
-            log.record(start + Duration::from_millis(1500)),
-            Some(1001),
-            "the next report stands for every drop since the last"
+            received(&mut rx1).sid,
+            1,
+            "what was queued is still readable"
         );
-        assert_eq!(log.record(start + Duration::from_millis(1600)), None);
+        assert!(matches!(
+            rx1.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert_eq!(table.dispatch(1, message(1), &budget), Delivered::Unknown);
+        assert_eq!(
+            table.dispatch(2, message(2), &budget),
+            Delivered::Ok { exhausted: false }
+        );
+    }
+
+    /// The queue group is part of what the server named: a subscription on
+    /// the same subject in another group is a different subscription, and a
+    /// `sid` is exact whatever the subject says.
+    #[test]
+    fn a_refusal_is_matched_on_the_group_and_exactly_on_a_sid() {
+        let mut table = Table::new(8);
+        let (plain, _r1) = mpsc::channel(1);
+        let (grouped, _r2) = mpsc::channel(1);
+        let (twin, _r3) = mpsc::channel(1);
+        table.insert(1, b"jobs".to_vec(), None, plain);
+        table.insert(2, b"jobs".to_vec(), Some(b"workers".to_vec()), grouped);
+        table.insert(3, b"jobs".to_vec(), Some(b"workers".to_vec()), twin);
+
+        assert_eq!(
+            table.refuse(&named(b"jobs", Some(b"workers"), Some(3)), &refusal()),
+            1,
+            "a sid names one subscription"
+        );
+        assert_eq!(
+            table.refuse(&named(b"jobs", Some(b"workers"), None), &refusal()),
+            1,
+            "the other member of the group"
+        );
+        assert_eq!(
+            table.refuse(&named(b"jobs", Some(b"workers"), None), &refusal()),
+            0,
+            "and only once"
+        );
+        assert!(table.remove(1), "the ungrouped one was never named");
     }
 }

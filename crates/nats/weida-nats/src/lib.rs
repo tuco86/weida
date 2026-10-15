@@ -41,6 +41,10 @@
 //!   between no responder and no answer.
 //! * [`Error`] — why something failed, in the protocol's own words where it
 //!   has any.
+//! * [`Refusal`] — an `-ERR` the server sent without ending the connection: a
+//!   publish or a subscription outside the user's permissions, a malformed
+//!   subject, the subscription limit. Read on [`Connection::refusals`], and
+//!   on the [`Subscription`] that a refused `SUB` ends.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -202,6 +206,8 @@ pub mod error;
 pub mod message;
 pub mod options;
 mod queue;
+pub mod refusal;
+mod report;
 pub mod request;
 pub mod subject;
 pub mod subscription;
@@ -211,4 +217,5 @@ pub use connection::{Connection, RemoteInfo, State};
 pub use error::{Error, Result};
 pub use message::{Message, NO_RESPONDERS, OwnedHeaders};
 pub use options::{ConnectionOptions, Credentials, NonceSignature, Signer};
+pub use refusal::{Refusal, RefusalKind, Refusals};
 pub use subscription::Subscription;

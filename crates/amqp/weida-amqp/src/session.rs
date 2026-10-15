@@ -176,6 +176,8 @@ pub struct Session {
     /// protocol gives no deadline for it, so the deadline is ours.
     exec: Exec,
     attach_timeout: Duration,
+    /// Keeps the connection alive as long as this handle is.
+    _lease: crate::connection::Lease,
 }
 
 impl Session {
@@ -185,6 +187,7 @@ impl Session {
         events: queue::Receiver<SessionEvent>,
         exec: Exec,
         attach_timeout: Duration,
+        lease: crate::connection::Lease,
     ) -> Self {
         Self {
             shared,
@@ -192,6 +195,7 @@ impl Session {
             events,
             exec,
             attach_timeout,
+            _lease: lease,
         }
     }
 
@@ -277,25 +281,46 @@ impl Session {
     /// frame. `echo` asks the peer for its own state at the earliest
     /// convenient opportunity — and answering an echo with an echo loops
     /// forever, so this client never sets it in response to one.
+    ///
+    /// Cancel-safe: the window is replenished in one step with queueing the
+    /// `flow` that says so, after the room for it is reserved, so a dropped
+    /// future has changed nothing.
     pub async fn flow(&self, echo: bool) -> Result<()> {
-        let (next_incoming_id, next_outgoing_id, outgoing_window, incoming_window) = {
-            let mut windows = self.shared.windows.lock().expect("not poisoned");
-            windows.replenish_incoming(self.shared.options.incoming_window);
-            (
-                windows.wire_next_incoming_id(),
-                windows.next_outgoing_id,
-                windows.outgoing_window,
-                windows.incoming_window,
-            )
-        };
-        let mut flow = Flow::session(incoming_window, next_outgoing_id, outgoing_window);
-        flow.next_incoming_id = next_incoming_id;
+        let permit = self.permit().await?;
+        let mut windows = self.shared.windows.lock().expect("not poisoned");
+        let before = *windows;
+        windows.replenish_incoming(self.shared.options.incoming_window);
+        let mut flow = Flow::session(
+            windows.incoming_window,
+            windows.next_outgoing_id,
+            windows.outgoing_window,
+        );
+        flow.next_incoming_id = windows.wire_next_incoming_id();
         flow.echo = echo;
-        self.send(Performative::Flow(flow)).await
+        match self.encode(Performative::Flow(flow)) {
+            Ok(bytes) => {
+                permit.send(crate::connection::Outbound::Frame(bytes));
+                Ok(())
+            }
+            Err(error) => {
+                *windows = before;
+                Err(error)
+            }
+        }
     }
 
-    /// Sends one performative on this session's outgoing channel.
-    pub(crate) async fn send(&self, performative: Performative<'_>) -> Result<()> {
+    /// Room for one frame in the driver's queue, reserved: what is done with
+    /// it afterwards cannot wait, so a state change made with a permit in hand
+    /// and the frame that reports it are one step.
+    async fn permit(&self) -> Result<mpsc::Permit<'_, crate::connection::Outbound>> {
+        self.outbound
+            .reserve()
+            .await
+            .map_err(|_| Error::ConnectionGone)
+    }
+
+    /// One performative on this session's outgoing channel, encoded.
+    fn encode(&self, performative: Performative<'_>) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         frame::write(
             &mut bytes,
@@ -304,10 +329,7 @@ impl Session {
             u32::MAX,
             |body| performative.encode(body),
         )?;
-        self.outbound
-            .send(crate::connection::Outbound::Frame(bytes))
-            .await
-            .map_err(|_| Error::ConnectionGone)
+        Ok(bytes)
     }
 
     /// Ends the session.
@@ -325,18 +347,23 @@ impl Session {
     /// trustworthy, so acting on anything in it would be acting on a
     /// misunderstanding.
     pub async fn end_with(&self, error: Option<Condition>) -> Result<()> {
-        {
-            let mut state = self.shared.state.lock().expect("not poisoned");
-            if matches!(*state, SessionState::Ended(_)) {
-                return Ok(());
-            }
-            *state = match &error {
-                Some(condition) => SessionState::Discarding(condition.clone()),
-                None => SessionState::Ending,
-            };
+        let ended = |state: &SessionState| matches!(state, SessionState::Ended(_));
+        if ended(&self.shared.state.lock().expect("not poisoned")) {
+            return Ok(());
         }
         let codec = error.as_ref().map(Condition::as_codec);
-        self.send(Performative::End(End { error: codec })).await
+        let bytes = self.encode(Performative::End(End { error: codec }))?;
+        let permit = self.permit().await?;
+        let mut state = self.shared.state.lock().expect("not poisoned");
+        if ended(&state) {
+            return Ok(());
+        }
+        *state = match &error {
+            Some(condition) => SessionState::Discarding(condition.clone()),
+            None => SessionState::Ending,
+        };
+        permit.send(crate::connection::Outbound::Frame(bytes));
+        Ok(())
     }
 }
 

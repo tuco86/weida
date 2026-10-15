@@ -73,13 +73,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, mpsc, oneshot};
 use weida_amqp_codec::message::{Message, Progress, Reassembly};
 use weida_amqp_codec::performative::{Attach, Detach, Disposition, Flow, Performative, Transfer};
 use weida_amqp_codec::state::DeliveryState;
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{DecodeError, ReceiverSettleMode, Role, SenderSettleMode};
+use weida_runtime::Exec;
 
+use crate::connection::{Lease, Outbound};
 use crate::credit::Credit;
 use crate::delivery::{Delivery, Sent};
 use crate::error::{Condition, Error, Result};
@@ -98,8 +100,10 @@ use crate::window::Windows;
 /// against credit the application granted itself. An outcome or a credit
 /// update is also held in the link's own state, so once this many are waiting
 /// the oldest is let go and the current state is still one call away
-/// ([`Link::unsettled`], [`Link::credit`]). An application that reads its
-/// events never loses one.
+/// ([`Link::unsettled`], [`Link::credit`]): a sender keeps the delivery the
+/// peer settled, with its outcome, until the application has taken the
+/// outcome, and that is also what bounds how many a sender can have waiting.
+/// An application that reads its events never loses one.
 pub const MAX_QUEUED_REPORTS: usize = 1024;
 
 /// The queue a link's events travel in.
@@ -280,7 +284,13 @@ pub enum LinkEvent {
     ///
     /// A report: one that has not been read when [`MAX_QUEUED_REPORTS`] more
     /// have arrived is let go, and the state it described is still in
-    /// [`Link::unsettled`].
+    /// [`Link::unsettled`]. That holds for the answer to a delivery this end
+    /// *sent*, final ones included: the delivery stays there, finished and
+    /// with its outcome, until the application takes the outcome by reading
+    /// this event or by [`Link::settled`], so the only copy of a rejection is
+    /// never the event. What a *receiver* is told when the sender settles —
+    /// the end of the `second` dance — confirms an outcome this end chose
+    /// itself, and is gone from `unsettled` by then.
     Outcome {
         /// Which delivery.
         delivery_id: u32,
@@ -362,26 +372,40 @@ pub(crate) struct Shared {
     /// delivery here as it sends, and the driver retires it when the
     /// receiver's `disposition` arrives.
     pub(crate) unsettled: Mutex<Unsettled>,
+    /// Held while a delivery is on its way out, so that two deliveries on one
+    /// link never interleave (Part 2 §2.6.14) however many tasks send on it.
+    /// An async lock, taken by the sender before it looks at credit or the
+    /// window, so a waiting sender holds nothing but its place in the line.
+    pub(crate) send_lock: Arc<AsyncMutex<()>>,
 }
 
 /// An AMQP 1.0 link.
 #[derive(Debug)]
 pub struct Link {
     shared: Arc<Shared>,
-    outbound: mpsc::Sender<crate::connection::Outbound>,
+    outbound: mpsc::Sender<Outbound>,
     events: queue::Receiver<LinkEvent>,
+    /// The reactor, for the one task a dropped `send` can leave behind: the
+    /// frame that closes a delivery whose first frames are already out.
+    exec: Exec,
+    /// Keeps the connection alive as long as this handle is.
+    _lease: Lease,
 }
 
 impl Link {
     pub(crate) fn new(
         shared: Arc<Shared>,
-        outbound: mpsc::Sender<crate::connection::Outbound>,
+        outbound: mpsc::Sender<Outbound>,
         events: queue::Receiver<LinkEvent>,
+        exec: Exec,
+        lease: Lease,
     ) -> Self {
         Self {
             shared,
             outbound,
             events,
+            exec,
+            _lease: lease,
         }
     }
 
@@ -440,8 +464,41 @@ impl Link {
 
     /// The next event, or `None` once the link has detached and everything
     /// queued has been taken.
+    ///
+    /// Reading the final outcome of a delivery this end sent is what takes
+    /// it: the delivery is forgotten with the event, which makes its place in
+    /// the unsettled map free for the next one.
     pub async fn next_event(&mut self) -> Option<LinkEvent> {
-        self.events.recv().await
+        let event = self.events.recv().await?;
+        self.taken(&event);
+        Some(event)
+    }
+
+    /// The application has this event, so what it stood for is no longer
+    /// owed: a sender's finished delivery, kept for its outcome, is let go.
+    fn taken(&self, event: &LinkEvent) {
+        if self.shared.role != Role::Sender {
+            return;
+        }
+        if let LinkEvent::Outcome {
+            delivery_id,
+            settled: true,
+            ..
+        } = event
+            && self.take_outcome(*delivery_id).is_some()
+        {
+            self.shared.flow.notify_waiters();
+        }
+    }
+
+    /// The final outcome of a delivery this end sent, and the delivery with
+    /// it, if the peer has settled it.
+    fn take_outcome(&self, delivery_id: u32) -> Option<Outcome> {
+        self.shared
+            .unsettled
+            .lock()
+            .expect("not poisoned")
+            .take_final(delivery_id)
     }
 
     /// The next whole message, skipping the events that are not one.
@@ -504,12 +561,11 @@ impl Link {
     pub async fn grant_credit(&self, credit: u32) -> Result<()> {
         self.role_must_be(Role::Receiver, "grant credit")?;
         self.check_room_for(credit)?;
-        {
-            let mut state = self.shared.credit.lock().expect("not poisoned");
+        self.change_and_flow(false, |state, _| {
             state.grant(credit);
             state.set_drain(false);
-        }
-        self.send_flow(false).await
+        })
+        .await
     }
 
     /// Refuses a grant of `credit` where the unsettled map could not hold what
@@ -547,12 +603,8 @@ impl Link {
     /// get, and a get-with-timeout is built out of exactly that.
     pub async fn drain(&self) -> Result<()> {
         self.role_must_be(Role::Receiver, "drain")?;
-        self.shared
-            .credit
-            .lock()
-            .expect("not poisoned")
-            .set_drain(true);
-        self.send_flow(false).await
+        self.change_and_flow(false, |state, _| state.set_drain(true))
+            .await
     }
 
     /// A **receiver**: stops the link with `flow(link-credit=0, echo=true)`.
@@ -563,12 +615,11 @@ impl Link {
     /// "stopped" is a hope rather than an observation (Part 2 §2.6.10).
     pub async fn stop(&self) -> Result<()> {
         self.role_must_be(Role::Receiver, "stop")?;
-        {
-            let mut state = self.shared.credit.lock().expect("not poisoned");
+        self.change_and_flow(true, |state, _| {
             state.grant(0);
             state.set_drain(false);
-        }
-        self.send_flow(true).await
+        })
+        .await
     }
 
     /// A **receiver**: restores the session's incoming window and tells the
@@ -580,19 +631,16 @@ impl Link {
     /// its sender with credit in hand.
     pub async fn replenish_session_window(&self) -> Result<()> {
         let window = self.shared.session.options.incoming_window;
-        self.shared
-            .session
-            .windows
-            .lock()
-            .expect("not poisoned")
-            .replenish_incoming(window);
-        self.send_flow(false).await
+        self.change_and_flow(false, |_, windows| windows.replenish_incoming(window))
+            .await
     }
 
     /// The deliveries this end still holds state for, in delivery-id order.
     ///
     /// Empty is the answer an application usually wants: it means nothing is
-    /// outstanding in either direction.
+    /// outstanding in either direction. A sender's list also holds the
+    /// deliveries the peer has settled whose outcome nobody has taken yet,
+    /// marked [`Pending::settled_there`]: the answer is kept with them.
     #[must_use]
     pub fn unsettled(&self) -> Vec<Pending> {
         self.shared
@@ -673,6 +721,11 @@ impl Link {
     /// An error where the acknowledgement could not reach the peer: the
     /// connection is gone, or the link has detached and the peer destroyed
     /// what it held for these deliveries, so they will be offered again.
+    ///
+    /// Cancel-safe: dropping the future before it finishes leaves every
+    /// delivery held and nothing written, so the call can simply be made
+    /// again. Waiting is for room in the driver's queue, and no delivery is
+    /// forgotten until the place for its `disposition` is already reserved.
     pub async fn settle(&self, first: u32, last: u32, outcome: &Outcome) -> Result<()> {
         // A sender may also publish a state — that is the `second` dance's
         // second half — but naming an outcome is the receiver's move.
@@ -680,35 +733,54 @@ impl Link {
             self.negotiated().map(|n| n.rcv_settle_mode),
             Some(ReceiverSettleMode::Second)
         );
-        let detached = match self.state() {
-            LinkState::Detached(condition) => Some(condition),
-            _ => None,
-        };
-        let covered = {
+        // Nothing here to settle is `Ok` and no wait: writing a frame anyway
+        // would be harmless for the peer and a lie to a reader of the log.
+        if self.to_settle(first, last)?.is_empty() {
+            return Ok(());
+        }
+        // Built before anything is changed: a frame that cannot be encoded
+        // is an error with every delivery still held.
+        let frame = self.disposition_frame(first, last, Some(outcome), !second)?;
+        let permit = self.permit().await?;
+
+        // No wait from here to the end: the deliveries are forgotten and the
+        // `disposition` is queued as one step.
+        let covered = self.to_settle(first, last)?;
+        if covered.is_empty() {
+            // The peer settled them while this waited for room.
+            return Ok(());
+        }
+        {
             let mut map = self.shared.unsettled.lock().expect("not poisoned");
-            let covered = map.ids_in(first, last);
-            if let Some(condition) = detached
-                && !covered.is_empty()
-            {
-                return Err(Error::Closed(condition));
-            }
             for id in &covered {
                 // Under `second` this end does *not* settle yet: it publishes
                 // the outcome and waits for the sender to settle first, which
                 // is the whole difference between the two modes.
                 map.record_ours(*id, outcome, !second);
             }
-            covered
-        };
-        if covered.is_empty() {
-            // Nothing here to settle. Writing the frame anyway would be
-            // harmless for the peer and a lie to a reader of the log.
-            return Ok(());
         }
         // The map made room, so a sender parked on it can go.
         self.shared.flow.notify_waiters();
-        self.send_disposition(first, last, Some(outcome), !second)
-            .await
+        permit.send(Outbound::Frame(frame));
+        Ok(())
+    }
+
+    /// The deliveries `settle` would settle in `first..=last`. An error where
+    /// there are some and the link has gone: the peer destroyed what it held
+    /// for them.
+    fn to_settle(&self, first: u32, last: u32) -> Result<Vec<u32>> {
+        let covered = self
+            .shared
+            .unsettled
+            .lock()
+            .expect("not poisoned")
+            .ids_in(first, last);
+        if !covered.is_empty()
+            && let LinkState::Detached(condition) = self.state()
+        {
+            return Err(Error::Closed(condition));
+        }
+        Ok(covered)
     }
 
     /// The outcome of one delivery, waited for.
@@ -717,7 +789,19 @@ impl Link {
     /// point at which the answer cannot change. Under
     /// `rcv-settle-mode=first` that is the receiver's single `disposition`;
     /// under `second` it is the end of the three-frame dance.
+    ///
+    /// A sender's answer is kept with the delivery until it is taken, here or
+    /// by reading the [`LinkEvent::Outcome`] that reported it, so this finds
+    /// it whether it arrived before the call or while the call was waiting,
+    /// and whether or not the event was let go of in between. Taking it is
+    /// what frees the delivery's place in the unsettled map.
+    ///
+    /// Cancel-safe: the answer is taken in one step with returning it, so a
+    /// dropped future has not lost it.
     pub async fn settled(&mut self, delivery_id: u32) -> Result<Outcome> {
+        if let Some(outcome) = self.answered(delivery_id) {
+            return Ok(outcome);
+        }
         if self
             .shared
             .unsettled
@@ -738,22 +822,54 @@ impl Link {
                     delivery_id: id,
                     outcome,
                     settled: true,
-                }) if id == delivery_id => return Ok(outcome),
-                Some(LinkEvent::Detached(condition)) => return Err(Error::Closed(condition)),
-                Some(_) => {}
+                }) if id == delivery_id => {
+                    // The record holds the same answer; taking it is what
+                    // makes room.
+                    self.take_outcome(delivery_id);
+                    self.shared.flow.notify_waiters();
+                    return Ok(outcome);
+                }
+                Some(LinkEvent::Detached(condition)) => {
+                    // An answer that arrived before the link went is still
+                    // an answer.
+                    return self.answered(delivery_id).ok_or(Error::Closed(condition));
+                }
+                // Another delivery's event, read through. This one's own may
+                // have been let go while others were being read: its answer
+                // is in the record.
+                Some(_) => {
+                    if let Some(outcome) = self.answered(delivery_id) {
+                        return Ok(outcome);
+                    }
+                }
                 None => return Err(Error::ConnectionGone),
             }
         }
     }
 
-    /// Writes one `disposition` covering `first..=last`.
-    async fn send_disposition(
+    /// Takes the answer a sender kept for `delivery_id`, if there is one, with
+    /// the event that reported it, so that reading the queue afterwards does
+    /// not answer the same question twice.
+    fn answered(&mut self, delivery_id: u32) -> Option<Outcome> {
+        let outcome = self.take_outcome(delivery_id)?;
+        self.events.discard(|event| {
+            matches!(
+                event,
+                LinkEvent::Outcome { delivery_id: id, settled: true, .. } if *id == delivery_id
+            )
+        });
+        self.shared.flow.notify_waiters();
+        Some(outcome)
+    }
+
+    /// One `disposition` covering `first..=last`, encoded.
+    fn disposition_frame(
         &self,
         first: u32,
         last: u32,
         outcome: Option<&Outcome>,
         settled: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         let state = outcome.map(Outcome::to_state);
         let mut disposition = Disposition::new(self.shared.role, first);
         // `last` unset means `first` alone, so a single delivery is the
@@ -761,8 +877,7 @@ impl Link {
         disposition.last = (last != first).then_some(last);
         disposition.settled = settled;
         disposition.state = state.as_ref().map(DeliveryState::to_value);
-        self.send_performative(Performative::Disposition(disposition))
-            .await
+        self.frame(Performative::Disposition(disposition), &[])
     }
 
     /// A **sender**: sends one message, stalling until both schemes permit
@@ -772,6 +887,8 @@ impl Link {
     /// in messages; a session window unit is taken for **each frame**, which
     /// is what makes a large message dribble out under a tight window instead
     /// of violating it.
+    ///
+    /// Cancel-safe, as [`Link::send_payload`] says.
     pub async fn send(&self, message: &Message<'_>) -> Result<Sent> {
         let mut payload = Vec::with_capacity(SEND_PAYLOAD_ROOM);
         message.encode(&mut payload)?;
@@ -783,87 +900,66 @@ impl Link {
     /// The sections are not re-parsed: a forwarder that received octets and
     /// is passing them on has nothing to gain from a decode and re-encode,
     /// and the specification's message identity is the octets.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future is safe wherever it is, which matters because the
+    /// call waits — for credit, for window, for room in the driver's queue —
+    /// and a `timeout` around it is the obvious thing to write.
+    ///
+    /// Until the first frame is queued nothing has been taken: not the
+    /// credit, not the place in the unsettled map, not the window. A message
+    /// that fits one frame is queued with everything it takes in one step.
+    /// A message of several frames is never left half-sent: once its first
+    /// frame is queued the delivery is open, and a future dropped before the
+    /// last frame closes it with `transfer(aborted=true)` — queued by a task
+    /// as soon as the session window has room for the frame — and forgets it
+    /// here, so the receiver discards what it holds and the next send on the
+    /// link starts a clean delivery. The credit it took stays spent: the
+    /// receiver counted it when the first frame arrived.
+    ///
+    /// Sends on one link take turns, in the order they asked, because the
+    /// deliveries of a link do not interleave (Part 2 §2.6.14).
     pub async fn send_payload(&self, payload: &[u8]) -> Result<Sent> {
         self.role_must_be(Role::Sender, "send")?;
+        // A task waiting for its turn holds nothing but its place in line.
+        let turn = Arc::clone(&self.shared.send_lock).lock_owned().await;
         let settled = matches!(self.settle_mode(), SenderSettleMode::Settled);
-        let tag = self.next_tag();
+        let tag = self.peek_tag();
         let budget = self.shared.frame_budget;
+        let egress = self.egress();
 
-        // One unit of link credit, for the message. Taken before the first
+        let mut end = budget.min(payload.len());
+        let mut more = end < payload.len();
+        // One unit of link credit, for the message, taken before the first
         // frame and not per frame: "one unit of link-credit permits the
         // delivery-count to advance by one", and a multi-frame message
         // advances it once.
-        self.take_credit(settled).await?;
+        let delivery_id = egress.first(settled, &tag, &payload[..end], more).await?;
+        self.advance_tag();
 
-        let mut delivery_id = 0u32;
-        let mut frames = 0usize;
-        let mut offset = 0usize;
-        loop {
-            let end = (offset + budget).min(payload.len());
-            let more = end < payload.len();
-            let id = match self.take_window().await {
-                Ok(id) => id,
-                Err(error) => {
-                    // Half a delivery on the wire is worse than none: `abort`
-                    // tells the receiver to discard what it has, and an
-                    // aborted delivery is implicitly settled, so this end
-                    // forgets it too (Part 2 §2.7.5).
-                    self.abort(delivery_id, &tag, frames).await;
-                    self.shared
-                        .unsettled
-                        .lock()
-                        .expect("not poisoned")
-                        .settle_here(delivery_id);
-                    return Err(error);
-                }
+        let mut frames = 1;
+        if more {
+            // From here to the last frame no future may be dropped without
+            // the receiver being told: this closes the delivery if one is.
+            let mut open = Open {
+                egress: egress.clone(),
+                exec: self.exec.clone(),
+                delivery_id,
+                tag,
+                settled,
+                turn: Some(turn),
+                closed: false,
             };
-            if frames == 0 {
-                // A delivery's id is the transfer-id of its first frame. The
-                // specification never states the relation between the two
-                // sequences; every implementation derives both from the one
-                // counter, and a peer that expected otherwise would have no
-                // way to say so.
-                delivery_id = id;
-                if !settled {
-                    // Unsettled: this end keeps state for the delivery until
-                    // the receiver's `disposition` retires it. A settled
-                    // transfer is recorded nowhere, because the sender has
-                    // already forgotten it — which is what "settled on send"
-                    // means and why it proves nothing about the message.
-                    self.shared
-                        .unsettled
-                        .lock()
-                        .expect("not poisoned")
-                        .insert(delivery_id, &tag);
-                }
+            let mut offset = end;
+            while more {
+                end = (offset + budget).min(payload.len());
+                more = end < payload.len();
+                egress.next(&payload[offset..end], more).await?;
+                frames += 1;
+                offset = end;
             }
-            let fragment = &payload[offset..end];
-            let mut transfer = Transfer::new(self.shared.output_handle);
-            if frames == 0 {
-                transfer.delivery_id = Some(delivery_id);
-                transfer.delivery_tag = Some(&tag);
-                transfer.message_format = Some(0);
-                transfer.settled = Some(settled);
-            }
-            transfer.more = more;
-            let frame = self.frame(Performative::Transfer(transfer), fragment);
-            match frame {
-                Ok(bytes) => self.write(bytes).await?,
-                Err(error) => {
-                    self.abort(delivery_id, &tag, frames).await;
-                    self.shared
-                        .unsettled
-                        .lock()
-                        .expect("not poisoned")
-                        .settle_here(delivery_id);
-                    return Err(error);
-                }
-            }
-            frames += 1;
-            offset = end;
-            if !more {
-                break;
-            }
+            open.closed = true;
         }
 
         Ok(Sent {
@@ -898,160 +994,94 @@ impl Link {
         )))
     }
 
-    /// The next delivery-tag: a per-link counter, eight octets.
+    /// The delivery-tag the next delivery will carry: a per-link counter,
+    /// eight octets.
     ///
     /// The requirement is that a tag be "unique among the deliveries either
     /// end could consider unsettled on this link", which a counter satisfies
     /// without a random source — and the field allows 32 octets, so eight is
     /// a quarter of the budget for a number that cannot repeat before the
     /// connection has outlived everything.
-    fn next_tag(&self) -> [u8; TAG_LEN] {
+    ///
+    /// Read here and moved by [`Link::advance_tag`] once the delivery's first
+    /// frame is queued, so a send that gives up before that leaves no gap in
+    /// the sequence. Sends take turns, which makes the two one step.
+    fn peek_tag(&self) -> [u8; TAG_LEN] {
+        self.shared
+            .next_tag
+            .lock()
+            .expect("not poisoned")
+            .to_be_bytes()
+    }
+
+    fn advance_tag(&self) {
         let mut next = self.shared.next_tag.lock().expect("not poisoned");
-        let tag = *next;
         *next = next.wrapping_add(1);
-        tag.to_be_bytes()
     }
 
-    /// Waits until this link has credit **and room to remember the delivery**,
-    /// and takes one unit of credit.
+    /// What puts this link's frames on the wire, detached from the handle.
+    fn egress(&self) -> Egress {
+        Egress {
+            shared: Arc::clone(&self.shared),
+            outbound: self.outbound.clone(),
+        }
+    }
+
+    /// Room for one frame in the driver's queue, reserved: what is done with
+    /// it afterwards cannot wait, so a state change made with a permit in hand
+    /// and the frame that reports it are one step.
     ///
-    /// Two conditions, because two things can be exhausted: the credit the
-    /// receiver granted, and the unsettled map this end keeps. The second
-    /// only applies to an unsettled delivery — a settled one is recorded
-    /// nowhere — and is a bound of ours, because a receiver that keeps
-    /// granting credit while settling nothing would otherwise grow the map
-    /// without limit ([`crate::settlement::DEFAULT_MAX_UNSETTLED`]).
-    ///
-    /// Registered with the waker *before* the state is read, so a `flow` or a
-    /// `disposition` landing between the two is not a lost wake-up.
-    async fn take_credit(&self, settled: bool) -> Result<()> {
-        loop {
-            let notified = self.shared.flow.notified();
-            let mut notified = std::pin::pin!(notified);
-            notified.as_mut().enable();
-            self.still_usable()?;
-            let room = settled
-                || self
-                    .shared
-                    .unsettled
-                    .lock()
-                    .expect("not poisoned")
-                    .has_room();
-            if room
-                && self
-                    .shared
-                    .credit
-                    .lock()
-                    .expect("not poisoned")
-                    .record_sent()
-            {
-                return Ok(());
-            }
-            notified.await;
-        }
+    /// Cancel-safe: a future dropped while waiting has changed nothing.
+    async fn permit(&self) -> Result<mpsc::Permit<'_, Outbound>> {
+        self.outbound
+            .reserve()
+            .await
+            .map_err(|_| Error::ConnectionGone)
     }
 
-    /// Waits until the session window has room for one frame, and takes it,
-    /// reporting the transfer-id that frame will carry.
-    async fn take_window(&self) -> Result<u32> {
-        loop {
-            let notified = self.shared.flow.notified();
-            let mut notified = std::pin::pin!(notified);
-            notified.as_mut().enable();
-            self.still_usable()?;
-            let reserved = self
-                .shared
-                .session
-                .windows
-                .lock()
-                .expect("not poisoned")
-                .reserve();
-            if let Some(id) = reserved {
-                return Ok(id);
-            }
-            notified.await;
-        }
-    }
-
-    /// Refuses to keep waiting on a link that has gone.
-    fn still_usable(&self) -> Result<()> {
-        let state = self.state();
-        if state.is_usable() {
-            return Ok(());
-        }
-        match state {
-            LinkState::Detached(Some(condition)) => Err(Error::Closed(Some(condition))),
-            _ => Err(Error::ConnectionGone),
-        }
-    }
-
-    /// Tells the receiver to discard a delivery this end could not finish.
-    async fn abort(&self, delivery_id: u32, tag: &[u8], frames: usize) {
-        if frames == 0 {
-            // Nothing left our hands, so there is nothing to discard and no
-            // delivery-id the peer would recognise.
-            return;
-        }
-        let mut transfer = Transfer::new(self.shared.output_handle);
-        transfer.delivery_id = Some(delivery_id);
-        transfer.delivery_tag = Some(tag);
-        transfer.aborted = true;
-        if let Ok(bytes) = self.frame(Performative::Transfer(transfer), &[]) {
-            let _ = self.write(bytes).await;
-        }
-    }
-
-    /// This end's `flow`, carrying both link and session state.
+    /// Changes the state a `flow` reports and queues the `flow`, with nothing
+    /// that can be dropped between the two.
     ///
     /// Every `flow` carries the session's three mandatory fields whether or
     /// not it names a handle, so a link-level `flow` refreshes the session
     /// too — which is also why an `echo` asking for session state is
-    /// satisfied by one.
-    async fn send_flow(&self, echo: bool) -> Result<()> {
-        let credit = *self.shared.credit.lock().expect("not poisoned");
-        let windows = *self.shared.session.windows.lock().expect("not poisoned");
+    /// satisfied by one. A frame that cannot be encoded puts the state back.
+    async fn change_and_flow(
+        &self,
+        echo: bool,
+        change: impl FnOnce(&mut Credit, &mut Windows),
+    ) -> Result<()> {
+        let permit = self.permit().await?;
+        // One order wherever these are held together: credit, the map, the
+        // window.
+        let mut credit = self.shared.credit.lock().expect("not poisoned");
+        let mut windows = self.shared.session.windows.lock().expect("not poisoned");
+        let (was_credit, was_windows) = (*credit, *windows);
+        change(&mut credit, &mut windows);
         let flow = flow_frame(&windows, &credit, self.shared.output_handle, echo);
-        self.send_performative(Performative::Flow(flow)).await
-    }
-
-    /// Sends one performative on this link's session channel.
-    pub(crate) async fn send_performative(&self, performative: Performative<'_>) -> Result<()> {
-        let bytes = self.frame(performative, &[])?;
-        self.write(bytes).await
+        match self.frame(Performative::Flow(flow), &[]) {
+            Ok(bytes) => {
+                permit.send(Outbound::Frame(bytes));
+                Ok(())
+            }
+            Err(error) => {
+                *credit = was_credit;
+                *windows = was_windows;
+                Err(error)
+            }
+        }
     }
 
     /// Encodes one frame: a performative and, for a `transfer`, the payload
     /// that follows it in the same body.
     fn frame(&self, performative: Performative<'_>, payload: &[u8]) -> Result<Vec<u8>> {
-        // Sized for the whole frame up front, so that building it never
-        // reallocates and the payload is copied exactly once.
-        let mut bytes = Vec::with_capacity(FRAME_HEADER + FRAME_PERFORMATIVE_ROOM + payload.len());
-        weida_amqp_codec::frame::write(
-            &mut bytes,
-            weida_amqp_codec::frame::FrameKind::Amqp,
-            self.shared.channel,
-            self.shared.max_frame_size,
-            |body| {
-                performative.encode(body)?;
-                body.extend_from_slice(payload);
-                Ok(())
-            },
-        )?;
-        Ok(bytes)
-    }
-
-    /// Hands a frame to the connection driver, which is what keeps `close`
-    /// the last thing ever written.
-    async fn write(&self, bytes: Vec<u8>) -> Result<()> {
-        self.outbound
-            .send(crate::connection::Outbound::Frame(bytes))
-            .await
-            .map_err(|_| Error::ConnectionGone)
+        encode(&self.shared, performative, payload)
     }
 
     /// Detaches the link, destroying the endpoint at both ends.
     ///
-    /// Idempotent.
+    /// Idempotent. Cancel-safe: the link is `Detaching` only once the
+    /// `detach` is queued, so a dropped call leaves it attached.
     pub async fn detach(&self) -> Result<()> {
         self.detach_with(true, None).await
     }
@@ -1061,21 +1091,262 @@ impl Link {
     /// An errored endpoint is destroyed and **its handle is never reused for
     /// the life of the session**: the peer is entitled to still be sending
     /// frames for it, and a reused handle would deliver them to a live link.
+    ///
+    /// Cancel-safe, as [`Link::detach`] says.
     pub async fn detach_with(&self, closed: bool, error: Option<Condition>) -> Result<()> {
-        {
-            let mut state = self.shared.state.lock().expect("not poisoned");
-            if matches!(*state, LinkState::Detached(_)) {
-                return Ok(());
-            }
-            *state = LinkState::Detaching;
+        let ended =
+            |state: &LinkState| matches!(state, LinkState::Detaching | LinkState::Detached(_));
+        if ended(&self.state()) {
+            return Ok(());
         }
         let codec = error.as_ref().map(Condition::as_codec);
-        self.send_performative(Performative::Detach(Detach {
-            handle: self.shared.output_handle,
-            closed,
-            error: codec,
-        }))
+        let bytes = self.frame(
+            Performative::Detach(Detach {
+                handle: self.shared.output_handle,
+                closed,
+                error: codec,
+            }),
+            &[],
+        )?;
+        let permit = self.permit().await?;
+        let mut state = self.shared.state.lock().expect("not poisoned");
+        if ended(&state) {
+            return Ok(());
+        }
+        *state = LinkState::Detaching;
+        permit.send(Outbound::Frame(bytes));
+        Ok(())
+    }
+}
+
+/// Refuses to keep waiting on a link that has gone.
+fn usable(shared: &Shared) -> Result<()> {
+    let state = shared.state.lock().expect("not poisoned");
+    if state.is_usable() {
+        return Ok(());
+    }
+    Err(match &*state {
+        LinkState::Detached(Some(condition)) => Error::Closed(Some(condition.clone())),
+        _ => Error::ConnectionGone,
+    })
+}
+
+/// Encodes one frame of a link: a performative and, for a `transfer`, the
+/// payload that follows it in the same body.
+fn encode(shared: &Shared, performative: Performative<'_>, payload: &[u8]) -> Result<Vec<u8>> {
+    // Sized for the whole frame up front, so that building it never
+    // reallocates and the payload is copied exactly once.
+    let mut bytes = Vec::with_capacity(FRAME_HEADER + FRAME_PERFORMATIVE_ROOM + payload.len());
+    weida_amqp_codec::frame::write(
+        &mut bytes,
+        weida_amqp_codec::frame::FrameKind::Amqp,
+        shared.channel,
+        shared.max_frame_size,
+        |body| {
+            performative.encode(body)?;
+            body.extend_from_slice(payload);
+            Ok(())
+        },
+    )?;
+    Ok(bytes)
+}
+
+/// What puts one link's frames on the wire, apart from the handle that asked
+/// for them.
+///
+/// A delivery's way out can outlive the future that began it: if that future
+/// is dropped with a message half sent, the frame that closes the delivery
+/// has to be written by something that is not the caller. So everything a
+/// frame needs is held here by value, and a clone can be handed to a task.
+#[derive(Clone)]
+struct Egress {
+    shared: Arc<Shared>,
+    outbound: mpsc::Sender<Outbound>,
+}
+
+impl Egress {
+    fn frame(&self, performative: Performative<'_>, payload: &[u8]) -> Result<Vec<u8>> {
+        encode(&self.shared, performative, payload)
+    }
+
+    /// Waits until `commit` can put a frame on the wire, and puts it there.
+    ///
+    /// `commit` is offered a place in the driver's queue whenever the link
+    /// may be ready. It answers `Ok(Some(..))` where it took what it needed
+    /// and used the place, `Ok(None)` where the credit, the window or the room
+    /// it wants is not there yet, and `Err` where the link cannot send at
+    /// all. It never waits, so what it takes and the frame it queues are one
+    /// step: a dropped future loses a wait and never half of a commit.
+    ///
+    /// Registered with the waker *before* the state is read, so a `flow` or a
+    /// `disposition` landing between the two is not a lost wake-up.
+    async fn queue<T>(
+        &self,
+        mut commit: impl FnMut(mpsc::Permit<'_, Outbound>) -> Result<Option<T>>,
+    ) -> Result<T> {
+        loop {
+            let notified = self.shared.flow.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            usable(&self.shared)?;
+            let permit = self
+                .outbound
+                .reserve()
+                .await
+                .map_err(|_| Error::ConnectionGone)?;
+            if let Some(done) = commit(permit)? {
+                return Ok(done);
+            }
+            notified.await;
+        }
+    }
+
+    /// The first frame of a delivery. Takes, in one step with queueing it,
+    /// one unit of link credit for the message, a place in the unsettled map
+    /// where the delivery is not settled on send, and the first unit of
+    /// session window. Reports the delivery-id, which is the transfer-id of
+    /// this frame.
+    ///
+    /// Two things can be exhausted besides the window: the credit the
+    /// receiver granted, and the unsettled map this end keeps. The map only
+    /// matters for an unsettled delivery — a settled one is recorded nowhere
+    /// — and is a bound of ours, because a receiver that keeps granting
+    /// credit while settling nothing, or a sender that never reads the
+    /// answers, would otherwise grow it without limit
+    /// ([`crate::settlement::DEFAULT_MAX_UNSETTLED`]).
+    async fn first(
+        &self,
+        settled: bool,
+        tag: &[u8; TAG_LEN],
+        fragment: &[u8],
+        more: bool,
+    ) -> Result<u32> {
+        self.queue(|permit| {
+            let mut credit = self.shared.credit.lock().expect("not poisoned");
+            let mut unsettled = self.shared.unsettled.lock().expect("not poisoned");
+            let mut windows = self.shared.session.windows.lock().expect("not poisoned");
+            if !credit.may_send() || !(settled || unsettled.has_room()) || !windows.may_send() {
+                return Ok(None);
+            }
+            // A delivery's id is the transfer-id of its first frame. The
+            // specification never states the relation between the two
+            // sequences; every implementation derives both from the one
+            // counter, and a peer that expected otherwise would have no way
+            // to say so.
+            let delivery_id = windows.next_outgoing_id;
+            let mut transfer = Transfer::new(self.shared.output_handle);
+            transfer.delivery_id = Some(delivery_id);
+            transfer.delivery_tag = Some(tag);
+            transfer.message_format = Some(0);
+            transfer.settled = Some(settled);
+            transfer.more = more;
+            // Built before anything is taken: a frame that cannot be encoded
+            // leaves every count where it was.
+            let bytes = self.frame(Performative::Transfer(transfer), fragment)?;
+            let reserved = windows.reserve();
+            debug_assert_eq!(reserved, Some(delivery_id));
+            credit.record_sent();
+            if !settled {
+                // Unsettled: this end keeps state for the delivery until the
+                // receiver's `disposition` retires it and the application has
+                // taken the answer. A settled transfer is recorded nowhere,
+                // because the sender has already forgotten it — which is what
+                // "settled on send" means and why it proves nothing about the
+                // message.
+                unsettled.insert(delivery_id, tag);
+            }
+            permit.send(Outbound::Frame(bytes));
+            Ok(Some(delivery_id))
+        })
         .await
+    }
+
+    /// A later frame of an open delivery: the next unit of session window,
+    /// taken in one step with queueing the frame.
+    async fn next(&self, fragment: &[u8], more: bool) -> Result<()> {
+        self.queue(|permit| {
+            let mut windows = self.shared.session.windows.lock().expect("not poisoned");
+            if !windows.may_send() {
+                return Ok(None);
+            }
+            let mut transfer = Transfer::new(self.shared.output_handle);
+            transfer.more = more;
+            let bytes = self.frame(Performative::Transfer(transfer), fragment)?;
+            windows.reserve();
+            permit.send(Outbound::Frame(bytes));
+            Ok(Some(()))
+        })
+        .await
+    }
+
+    /// Tells the receiver to discard a delivery this end could not finish. A
+    /// `transfer` like any other, so it waits for window like any other.
+    async fn abort(&self, delivery_id: u32, tag: &[u8; TAG_LEN]) -> Result<()> {
+        self.queue(|permit| {
+            let mut windows = self.shared.session.windows.lock().expect("not poisoned");
+            if !windows.may_send() {
+                return Ok(None);
+            }
+            let mut transfer = Transfer::new(self.shared.output_handle);
+            transfer.delivery_id = Some(delivery_id);
+            transfer.delivery_tag = Some(tag);
+            transfer.aborted = true;
+            let bytes = self.frame(Performative::Transfer(transfer), &[])?;
+            windows.reserve();
+            permit.send(Outbound::Frame(bytes));
+            Ok(Some(()))
+        })
+        .await
+    }
+}
+
+/// A delivery of several frames between its first frame and its last.
+///
+/// Half a delivery on the wire is worse than none, and a future can be
+/// dropped at any wait in between. Dropping this before `closed` is set is
+/// what closes the delivery: this end forgets it — "an aborted delivery is
+/// implicitly settled" (Part 2 §2.7.5) — and a task writes `transfer(aborted)`
+/// so the receiver discards what it holds, as soon as the window has room for
+/// the frame. The task holds the link's turn until it has, so the next
+/// delivery cannot start in the middle of it.
+struct Open {
+    egress: Egress,
+    exec: Exec,
+    delivery_id: u32,
+    tag: [u8; TAG_LEN],
+    settled: bool,
+    /// The link's send lock, held until the delivery is closed on the wire.
+    turn: Option<OwnedMutexGuard<()>>,
+    closed: bool,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let shared = &self.egress.shared;
+        if !self.settled
+            && let Ok(mut map) = shared.unsettled.lock()
+        {
+            map.settle_here(self.delivery_id);
+        }
+        // The place is free, and a sender parked on it can go.
+        shared.flow.notify_waiters();
+        // A link that is gone has nobody to tell: the peer destroyed what it
+        // held with the endpoint.
+        if usable(shared).is_err() {
+            return;
+        }
+        let egress = self.egress.clone();
+        let (delivery_id, tag) = (self.delivery_id, self.tag);
+        let turn = self.turn.take();
+        self.exec.spawn(async move {
+            let _turn = turn;
+            if let Err(error) = egress.abort(delivery_id, &tag).await {
+                tracing::debug!(delivery_id, %error, "a dropped send could not close its delivery");
+            }
+        });
     }
 }
 
@@ -1426,13 +1697,14 @@ impl Entry {
         )
     }
 
-    /// Settles a delivery at this end after the peer has settled it.
-    pub(crate) fn settle_here(&self, delivery_id: u32) {
+    /// Ends a delivery at this end after the peer's outcome for it is final.
+    /// A sender keeps the delivery, finished, until the answer is taken.
+    pub(crate) fn finish_here(&self, delivery_id: u32) {
         self.shared
             .unsettled
             .lock()
             .expect("not poisoned")
-            .settle_here(delivery_id);
+            .finish_here(delivery_id);
     }
 }
 
@@ -1744,7 +2016,11 @@ mod tests {
                 max_frame_size: weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE,
                 frame_budget: 400,
                 next_tag: Mutex::new(0),
-                unsettled: Mutex::new(Unsettled::new(crate::settlement::DEFAULT_MAX_UNSETTLED)),
+                unsettled: Mutex::new(match role {
+                    Role::Sender => Unsettled::for_sender(crate::settlement::DEFAULT_MAX_UNSETTLED),
+                    Role::Receiver => Unsettled::new(crate::settlement::DEFAULT_MAX_UNSETTLED),
+                }),
+                send_lock: Arc::new(AsyncMutex::new(())),
             }),
             events,
             pending: None,

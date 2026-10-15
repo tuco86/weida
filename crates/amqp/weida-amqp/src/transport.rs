@@ -32,9 +32,11 @@
 //! credentials" — so getting it from the dialled host rather than from
 //! nowhere is a protocol behaviour, not a convenience.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -137,40 +139,118 @@ impl AsyncWrite for Stream {
 /// the other. The count is capped by
 /// [`ConnectionOptions::max_resolved_addresses`], because a resolver answer is
 /// remote input.
+///
+/// The name lookup and every attempt share **one** budget,
+/// [`ConnectionOptions::handshake_timeout`]. A budget per address would let a
+/// handful of addresses that swallow packets hold the caller for that long
+/// each, and a lookup outside any budget would hold it for as long as the
+/// resolver took.
 pub async fn connect(
     exec: &Exec,
     host: &str,
     port: u16,
     options: &ConnectionOptions,
 ) -> Result<Stream> {
-    let addrs = exec
-        .resolve(host, port, options.max_resolved_addresses)
-        .await?;
+    let budget = Budget::start(options.handshake_timeout);
+    let lookup = exec.resolve(host, port, options.max_resolved_addresses);
+    connect_to(exec, &budget, lookup).await
+}
+
+/// [`connect`] with the lookup handed in: what the resolver answers, inside
+/// what is left of `budget`.
+async fn connect_to<L>(exec: &Exec, budget: &Budget, lookup: L) -> Result<Stream>
+where
+    L: Future<Output = std::result::Result<Vec<SocketAddr>, weida_core::Error>>,
+{
+    let addrs = match exec.within(budget.left(), lookup).await {
+        Some(answer) => answer?,
+        None => {
+            return Err(Error::HandshakeTimeout {
+                step: "the name lookup",
+            });
+        }
+    };
+    dial(exec, &addrs, budget).await
+}
+
+/// What is left of one time budget, spent a step at a time.
+struct Budget {
+    /// Where the budget runs out. `None` only where the total is so large
+    /// that the instant cannot be represented, in which case no step is given
+    /// less than the whole of it.
+    ends: Option<Instant>,
+    whole: Duration,
+}
+
+impl Budget {
+    fn start(whole: Duration) -> Self {
+        Self {
+            ends: Instant::now().checked_add(whole),
+            whole,
+        }
+    }
+
+    fn left(&self) -> Duration {
+        self.ends.map_or(self.whole, |ends| {
+            ends.saturating_duration_since(Instant::now())
+        })
+    }
+}
+
+/// Tries `addrs` in order inside what is left of `budget`.
+///
+/// Every attempt but the last gets half of what is left, so an address that
+/// swallows packets — the unreachable IPv6 half of a dual-stack name — leaves
+/// the next one time to answer. An attempt that runs out is aborted rather
+/// than left to finish a connect nobody is waiting for.
+async fn dial(exec: &Exec, addrs: &[SocketAddr], budget: &Budget) -> Result<Stream> {
+    if addrs.is_empty() {
+        return Err(Error::Runtime(weida_core::Error::InvalidAddress(
+            "the resolver offered no addresses".into(),
+        )));
+    }
     let mut last = None;
-    for addr in &addrs {
-        match exec
-            .within(options.handshake_timeout, TcpStream::connect(addr))
-            .await
-        {
-            Some(Ok(stream)) => {
+    for (index, addr) in addrs.iter().enumerate() {
+        let left = budget.left();
+        let share = if index + 1 < addrs.len() {
+            left / 2
+        } else {
+            left
+        };
+        if share.is_zero() {
+            last = Some(Error::HandshakeTimeout {
+                step: "the TCP connect",
+            });
+            break;
+        }
+        // `TcpStream::connect` registers the socket with the reactor as it is
+        // built, and a caller driving this future on its own executor is not
+        // inside one. Spawning puts the constructor where the reactor is.
+        let mut attempt = exec.spawn(TcpStream::connect(*addr));
+        match exec.within(share, &mut attempt).await {
+            Some(Ok(Ok(stream))) => {
                 // Nagle off: an AMQP handshake is a sequence of small frames
                 // that each need an answer, and coalescing them adds a round
                 // trip's worth of delay to every step.
                 let _ = stream.set_nodelay(true);
                 return Ok(Stream::Plain(stream));
             }
-            Some(Err(error)) => last = Some(Error::Io(error)),
+            Some(Ok(Err(error))) => last = Some(Error::Io(error)),
+            Some(Err(error)) => {
+                last = Some(Error::Runtime(weida_core::Error::Runtime(format!(
+                    "connect task failed: {error}"
+                ))));
+            }
             None => {
+                attempt.abort();
                 last = Some(Error::HandshakeTimeout {
                     step: "the TCP connect",
                 });
             }
         }
     }
-    Err(last.unwrap_or_else(|| {
-        Error::Runtime(weida_core::Error::InvalidAddress(format!(
-            "{host}:{port} resolved to no addresses"
-        )))
+    Err(last.unwrap_or(Error::HandshakeTimeout {
+        step: "the TCP connect",
     }))
 }
 
@@ -503,10 +583,14 @@ pub(crate) enum Step {
 ///
 /// **A bound of ours.** Everything the connection writes is queued in an
 /// outbox and goes out as the socket takes it; a peer that has stopped
-/// reading leaves it queued. Past this the driver stops reading the peer and
-/// stops taking frames from local senders, so what a stalled peer can make it
-/// hold is this plus the answers to one frame, and the stall clock
-/// ([`ConnectionOptions::write_timeout`]) ends the connection if it lasts.
+/// reading leaves it queued. Past this the driver stops taking frames from
+/// local senders, and it stops reading the peer once the *answers* to the
+/// peer's own frames are what is past it — not what the application queued,
+/// which a peer streaming in both directions would otherwise turn into a
+/// reason for neither side ever to read. So what a stalled peer can make the
+/// driver hold is this much of the application's frames plus this much of
+/// answers, and the stall clock ([`ConnectionOptions::write_timeout`]) ends
+/// the connection if it lasts.
 pub const OUTBOX_HIGH_WATER: usize = 256 * 1024;
 
 /// Octets queued for the peer, and how far the socket has taken them.
@@ -524,6 +608,15 @@ pub(crate) struct Outbox {
     dirty: bool,
     /// The largest frame the peer will take.
     max_frame_size: u32,
+    /// Where `buf[0]` sits among every octet ever queued, counted from the
+    /// first: what lets a stretch of the queue be named after the fact.
+    base: u64,
+    /// The stretches of the queue that are answers to what the peer sent,
+    /// `(from, to)` in the counting above and oldest first, as far as the
+    /// socket has not taken them.
+    answers: VecDeque<(u64, u64)>,
+    /// How many octets of `answers` are still waiting for the socket.
+    answering: usize,
 }
 
 impl Outbox {
@@ -533,6 +626,9 @@ impl Outbox {
             sent: 0,
             dirty: false,
             max_frame_size,
+            base: 0,
+            answers: VecDeque::new(),
+            answering: 0,
         }
     }
 
@@ -582,16 +678,49 @@ impl Outbox {
         self.buf.len() - self.sent
     }
 
-    /// Whether so much is waiting that nothing more should be taken in.
+    /// Whether so much is waiting that nothing more should be taken from
+    /// local senders.
     pub(crate) fn congested(&self) -> bool {
         self.len() >= OUTBOX_HIGH_WATER
     }
 
+    /// Where the next octet queued will sit, in the counting
+    /// [`Outbox::answered`] takes.
+    pub(crate) fn end(&self) -> u64 {
+        self.base + self.buf.len() as u64
+    }
+
+    /// Records that everything queued since `from`, a position taken from
+    /// [`Outbox::end`], is an answer to something the peer sent: a `flow` it
+    /// asked for, a `disposition` it owes a reply to, a `close` it provoked.
+    pub(crate) fn answered(&mut self, from: u64) {
+        let to = self.end();
+        if to > from {
+            self.answers.push_back((from, to));
+            self.answering += usize::try_from(to - from).unwrap_or(usize::MAX);
+        }
+    }
+
+    /// Whether the answers to the peer's frames, alone, are past the
+    /// high-water mark: what a peer that never reads can make the driver
+    /// hold of what it provoked, and the reason to stop reading it.
+    ///
+    /// Not [`Outbox::congested`]: that counts the application's frames too,
+    /// and an application streaming to a peer that is streaming back would
+    /// keep it true for as long as the socket is slower than the
+    /// application, so neither end would ever read.
+    pub(crate) fn answers_congested(&self) -> bool {
+        self.answering >= OUTBOX_HIGH_WATER
+    }
+
     /// Records that the socket took `taken` octets.
     pub(crate) fn took(&mut self, taken: usize) {
+        // Where the socket has got to, in the counting of `base`.
+        let through = self.base + (self.sent + taken) as u64;
         self.sent += taken;
         self.dirty = true;
         if self.sent == self.buf.len() {
+            self.base += self.buf.len() as u64;
             self.buf.clear();
             self.sent = 0;
             // A burst should not leave a large buffer behind for good.
@@ -600,8 +729,22 @@ impl Outbox {
             }
         } else if self.sent >= self.buf.len() / 2 && self.sent >= MIN_READ {
             // Never let the dead prefix outgrow what is still waiting.
+            self.base += self.sent as u64;
             self.buf.drain(..self.sent);
             self.sent = 0;
+        }
+        while let Some((from, to)) = self.answers.front_mut() {
+            if *from >= through {
+                break;
+            }
+            let upto = (*to).min(through);
+            self.answering -= usize::try_from(upto - *from).unwrap_or(usize::MAX);
+            if *to <= through {
+                self.answers.pop_front();
+            } else {
+                *from = through;
+                break;
+            }
         }
     }
 
@@ -787,5 +930,144 @@ mod tests {
         drop(server);
         let error = wire.read_frame().await.expect_err("the peer is gone");
         assert!(matches!(error, Error::Io(_)), "{error}");
+    }
+
+    /// What the application queued does not count as answers to the peer:
+    /// 300 KiB of its frames congest the outbox and leave reading alone, which
+    /// is what lets two peers that both stream bulk go on reading each other.
+    #[test]
+    fn the_applications_frames_are_not_answers_to_the_peer() {
+        let mut out = Outbox::new(512);
+        out.push(&vec![0u8; 300 * 1024]);
+        assert!(out.congested(), "the application's frames fill the outbox");
+        assert!(
+            !out.answers_congested(),
+            "and say nothing about what the peer is owed"
+        );
+    }
+
+    /// What the peer provoked is counted from where it was queued, wherever
+    /// the application's frames sit around it, and stops counting as the
+    /// socket takes it — the application's octets taken first, the answers
+    /// after, and a partial take of an answer counted down to the octet.
+    #[test]
+    fn answers_are_counted_where_they_sit_and_leave_as_the_socket_takes_them() {
+        let mut out = Outbox::new(512);
+        out.push(&[1u8; 1000]);
+        let from = out.end();
+        out.push(&[2u8; OUTBOX_HIGH_WATER]);
+        out.answered(from);
+        out.push(&[3u8; 500]);
+        assert!(out.answers_congested(), "the answers alone fill the mark");
+
+        out.took(1000);
+        assert!(out.answers_congested(), "the application's octets went");
+        out.took(1);
+        assert!(!out.answers_congested(), "one octet of the answers went");
+        out.took(OUTBOX_HIGH_WATER - 1);
+        assert!(!out.answers_congested());
+        assert_eq!(out.len(), 500, "only the application's octets are left");
+        out.took(500);
+        assert!(!out.owes() || out.needs_flush());
+        assert!(!out.has_pending());
+
+        // And a position taken again after everything was taken still means
+        // the same octets.
+        let from = out.end();
+        out.push(&[4u8; OUTBOX_HIGH_WATER]);
+        out.answered(from);
+        assert!(out.answers_congested());
+    }
+
+    /// A listener whose accept queue is full, which makes a connect to it
+    /// neither complete nor fail: the kernel drops the `SYN`, as a link that
+    /// swallows packets does. Linux only, because it is the Linux queue that
+    /// is being filled.
+    #[cfg(target_os = "linux")]
+    async fn blackhole() -> (tokio::net::TcpListener, Vec<TcpStream>, SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("bound");
+        let listener = socket.listen(1).expect("listening");
+        let addr = listener.local_addr().expect("an address");
+        let mut held = Vec::new();
+        // Connections nobody accepts: they fill the queue, and the first
+        // connect that finds it full is the one that hangs.
+        while let Ok(stream) =
+            tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr)).await
+        {
+            held.push(stream.expect("the queue still had room"));
+            assert!(held.len() < 32, "the accept queue never filled");
+        }
+        (listener, held, addr)
+    }
+
+    /// Several addresses that swallow packets share the one budget, instead
+    /// of each being given the whole of it: three of them under a 600 ms
+    /// budget end in about 600 ms, not in 1.8 s.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn addresses_that_swallow_packets_share_one_budget() {
+        let exec = Exec::current().expect("a runtime");
+        let (_l1, _h1, first) = blackhole().await;
+        let (_l2, _h2, second) = blackhole().await;
+        let (_l3, _h3, third) = blackhole().await;
+
+        let budget = Budget::start(Duration::from_millis(600));
+        let started = Instant::now();
+        let error = dial(&exec, &[first, second, third], &budget)
+            .await
+            .expect_err("nothing answers");
+        let took = started.elapsed();
+
+        assert!(matches!(error, Error::HandshakeTimeout { .. }), "{error}");
+        assert!(
+            took < Duration::from_millis(1200),
+            "three addresses took {took:?} out of a 600 ms budget"
+        );
+    }
+
+    /// An address that swallows packets leaves the next one time to answer:
+    /// it is given half of what is left and not all of it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_black_hole_leaves_the_next_address_time_to_answer() {
+        let exec = Exec::current().expect("a runtime");
+        let (_hole, _held, dead) = blackhole().await;
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bound");
+        let live_addr = live.local_addr().expect("an address");
+
+        let budget = Budget::start(Duration::from_secs(2));
+        let stream = dial(&exec, &[dead, live_addr], &budget)
+            .await
+            .expect("the second address answers");
+        assert!(matches!(stream, Stream::Plain(_)));
+    }
+
+    /// A resolver that never answers does not hold the caller past the
+    /// budget, and the failure says what was being waited for.
+    #[tokio::test]
+    async fn a_lookup_that_never_answers_ends_inside_the_budget() {
+        let exec = Exec::current().expect("a runtime");
+        let silent =
+            std::future::pending::<std::result::Result<Vec<SocketAddr>, weida_core::Error>>();
+        let budget = Budget::start(Duration::from_millis(200));
+        let started = Instant::now();
+        let error = connect_to(&exec, &budget, silent)
+            .await
+            .expect_err("it never answers");
+        assert!(
+            matches!(
+                error,
+                Error::HandshakeTimeout {
+                    step: "the name lookup"
+                }
+            ),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

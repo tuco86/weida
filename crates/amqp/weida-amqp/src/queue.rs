@@ -16,7 +16,9 @@
 //! * a **report** — an outcome, a credit update — is a fact the link also
 //!   keeps in its own state, so it is merged into the report behind it where
 //!   it says the same thing and, past the bound the channel was made with,
-//!   the oldest one is let go. An application that wants every report reads
+//!   the oldest one is let go. That includes the final outcome of a delivery
+//!   a sender sent: the link keeps the delivery, with the outcome, until the
+//!   application has taken it. An application that wants every report reads
 //!   them; one that does not loses the oldest and keeps the current state,
 //!   which it can always ask for.
 //!
@@ -171,6 +173,24 @@ impl<T: Queued> Receiver<T> {
             // landed between the check and this await is not missed.
             self.shared.ready.notified().await;
         }
+    }
+
+    /// Drops every queued item `unwanted` picks out.
+    ///
+    /// For an item that has been answered another way, so that reading the
+    /// queue afterwards does not answer the same question twice.
+    pub(crate) fn discard(&mut self, unwanted: impl Fn(&T) -> bool) {
+        let mut state = self.shared.state.lock().expect("not poisoned");
+        let mut gone = 0;
+        state.items.retain(|item| {
+            if unwanted(item) {
+                gone += usize::from(item.is_report());
+                false
+            } else {
+                true
+            }
+        });
+        state.reports -= gone;
     }
 }
 

@@ -106,6 +106,16 @@ pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`docs/INVARIANTS.md`). `localhost` routinely yields two.
 pub const DEFAULT_MAX_RESOLVED_ADDRESSES: usize = 8;
 
+/// The longest any deadline of a connection may be set to.
+///
+/// **Ours.** A deadline is added to the current instant, and an instant has
+/// an end: a duration meant as "never" — `Duration::MAX` — cannot be added to
+/// one, and the driver would panic the first time it armed a clock with it,
+/// long after the options were accepted. A year is past any wait that means
+/// anything and well inside what every platform can represent; a connection
+/// that wants no idle expiry says `idle_time_out: None`.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// The IANA port for AMQP: `PORT` (Part 2 §2.8.19).
 pub const PORT: u16 = 5672;
 
@@ -340,6 +350,39 @@ impl ConnectionOptions {
                     .into(),
             ));
         }
+        if self.close_budget.is_zero() {
+            return Err(Error::Configuration(
+                "close_budget must be non-zero: zero would drop the transport \
+                 before `close` had a chance to leave"
+                    .into(),
+            ));
+        }
+        if self.idle_time_out.is_some_and(|limit| limit.is_zero()) {
+            return Err(Error::Configuration(
+                "idle_time_out must be non-zero where it is set: zero would \
+                 call the connection idle before a frame could arrive, and \
+                 `None` is how the expiry is turned off"
+                    .into(),
+            ));
+        }
+        let deadlines = [
+            ("handshake_timeout", Some(self.handshake_timeout)),
+            ("write_timeout", Some(self.write_timeout)),
+            ("close_budget", Some(self.close_budget)),
+            ("idle_time_out", self.idle_time_out),
+        ];
+        for (name, limit) in deadlines {
+            if let Some(limit) = limit
+                && limit > MAX_TIMEOUT
+            {
+                return Err(Error::Configuration(format!(
+                    "{name} of {limit:?} is past the longest deadline a connection \
+                     accepts, {MAX_TIMEOUT:?}: a deadline is added to the current \
+                     instant, which has an end, and the way to ask for no idle \
+                     expiry is idle_time_out: None"
+                )));
+            }
+        }
         if matches!(self.tls, TlsMode::None) && self.tls_server_name.is_some() {
             return Err(Error::Configuration(
                 "tls_server_name is set but tls is TlsMode::None".into(),
@@ -473,5 +516,50 @@ mod tests {
         options.write_timeout = Duration::ZERO;
         let error = options.validate().expect_err("refused");
         assert!(error.to_string().contains("write_timeout"), "{error}");
+    }
+
+    /// A zero deadline that is not already refused — the idle threshold and
+    /// the close budget — is refused by name too; `None` is how the idle
+    /// expiry is turned off.
+    #[test]
+    fn a_zero_idle_threshold_or_close_budget_is_refused() {
+        let mut options = ConnectionOptions::new("c1");
+        options.idle_time_out = Some(Duration::ZERO);
+        let error = options.validate().expect_err("refused");
+        assert!(error.to_string().contains("idle_time_out"), "{error}");
+        options.idle_time_out = None;
+        options.validate().expect("no expiry is not a zero one");
+
+        options.close_budget = Duration::ZERO;
+        let error = options.validate().expect_err("refused");
+        assert!(error.to_string().contains("close_budget"), "{error}");
+    }
+
+    /// `Duration::MAX` for "never" cannot be added to an instant: the driver
+    /// would panic the first time it armed a clock with it. It is refused
+    /// where it is configured, for each of the four deadlines, and a
+    /// deadline at the limit is still fine.
+    #[test]
+    fn a_deadline_too_large_to_add_to_an_instant_is_refused_where_it_is_configured() {
+        type Set = fn(&mut ConnectionOptions, Duration);
+        let setters: [(&str, Set); 4] = [
+            ("handshake_timeout", |o, d| o.handshake_timeout = d),
+            ("write_timeout", |o, d| o.write_timeout = d),
+            ("close_budget", |o, d| o.close_budget = d),
+            ("idle_time_out", |o, d| o.idle_time_out = Some(d)),
+        ];
+        for (name, set) in setters {
+            for huge in [Duration::MAX, MAX_TIMEOUT + Duration::from_secs(1)] {
+                let mut options = ConnectionOptions::new("c1");
+                set(&mut options, huge);
+                let error = options.validate().expect_err("refused");
+                assert!(error.to_string().contains(name), "{name}: {error}");
+            }
+            let mut options = ConnectionOptions::new("c1");
+            set(&mut options, MAX_TIMEOUT);
+            options
+                .validate()
+                .unwrap_or_else(|error| panic!("{name} at the limit: {error}"));
+        }
     }
 }

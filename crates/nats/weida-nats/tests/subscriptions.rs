@@ -466,6 +466,72 @@ async fn unsub_with_a_count_is_honoured_locally_as_well_as_sent() {
         .unwrap();
 }
 
+/// The count in `UNSUB <sid> <max_msgs>` is what the *server* sent, so a copy
+/// this client had no room for still counts. With a queue of one and a cap of
+/// three, the second and third copies are dropped, and the subscription must
+/// still end with the third — the server has already ended it — so that the
+/// reader sees the end instead of waiting for a message that never comes.
+#[tokio::test]
+async fn a_dropped_copy_still_counts_toward_the_auto_unsubscribe_count() {
+    let exec = Exec::current().unwrap();
+    let (listener, port) = Server::listen().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = Server::accept(&listener).await;
+        server.handshake_full().await;
+        assert_eq!(server.read_op().await, "SUB events - 1");
+        assert_eq!(server.read_op().await, "UNSUB 1 3");
+        for n in 0..3u8 {
+            server.send_msg("events", "1", None, &[b'0' + n]).await;
+        }
+        assert_eq!(server.read_op().await, "PING");
+        server.write(b"PONG\r\n").await;
+        server
+    });
+
+    let mut options = options();
+    options.subscription_queue = 1;
+    let nats = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options),
+    )
+    .await
+    .expect("finished")
+    .expect("opened");
+    let mut events = nats.subscribe("events").await.expect("subscribed");
+    events.unsubscribe_after(3).await;
+
+    // The PONG establishes that all three MSG lines reached the driver while
+    // nobody was reading, which is what makes two of them drops.
+    tokio::time::timeout(DEADLINE, nats.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    let _server = tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(events.dropped(), 2, "the queue held one copy of three");
+
+    let first = tokio::time::timeout(DEADLINE, events.next())
+        .await
+        .expect("the queued copy is readable")
+        .expect("it is a message");
+    assert_eq!(first.payload, &b"0"[..]);
+    assert!(
+        tokio::time::timeout(DEADLINE, events.next())
+            .await
+            .expect("the subscription ended rather than waiting for a fourth")
+            .is_none(),
+        "three copies were sent, so the count is reached"
+    );
+
+    tokio::time::timeout(DEADLINE, nats.close())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 /// The subscription table is bounded, and the bound is ours because the `sid`
 /// is: nothing in the protocol could stop the table from growing.
 #[tokio::test]

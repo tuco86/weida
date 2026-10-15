@@ -28,7 +28,8 @@
 //! | [`ConnectionOptions::max_inbound_payload`] | **ours** | the largest `MSG` or `HMSG` this client accepts. `INFO.max_payload` is the *server's* bound on what a client publishes, announced by the peer itself and unauthenticated, so it cannot be the bound on what the client receives |
 //! | [`ConnectionOptions::max_info_line`] | **ours** | one `INFO` line, which grows with the cluster and so cannot share `max_control_line` |
 //! | [`ConnectionOptions::outgoing_queue`] | **ours** | operations queued for the driver |
-//! | [`ConnectionOptions::handshake_timeout`] | **ours** | the whole handshake, from the opening `INFO` to the `PONG`: the protocol gives no deadline for any of it |
+//! | [`ConnectionOptions::refusal_queue`] | **ours** | refusals kept for a reader of [`Connection::refusals`](crate::Connection::refusals): the server decides how many `-ERR`s it sends |
+//! | [`ConnectionOptions::handshake_timeout`] | **ours** | the whole handshake, from the opening `INFO` to the `PONG`, and once more for the TCP connect before it (name lookup and every address together): the protocol gives no deadline for any of it |
 //! | [`ConnectionOptions::write_timeout`] | **ours** | how long the socket may accept nothing while output waits for it: the protocol gives a client no write deadline |
 //! | [`ConnectionOptions::max_resolved_addresses`] | **ours** | a resolver answer is remote input |
 //!
@@ -158,6 +159,22 @@ pub const DEFAULT_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 /// application outrun the socket without ever being told.
 pub const DEFAULT_OUTGOING_QUEUE: usize = 256;
 
+/// How many refusals the connection keeps for a reader of
+/// [`Connection::refusals`](crate::Connection::refusals) that falls behind.
+///
+/// **Ours.** The server decides how many `-ERR`s it sends and how fast, and a
+/// client that kept every one for a reader that never comes would let it
+/// decide how much memory that costs. Past this the oldest are let go and
+/// counted in [`Refusals::lost`](crate::Refusals::lost).
+pub const DEFAULT_REFUSAL_QUEUE: usize = 16;
+
+/// The most [`ConnectionOptions::refusal_queue`] may be set to.
+///
+/// The queue is a ring that is allocated whole, so a number the caller did not
+/// mean — `usize::MAX` for "unbounded" — is refused where it is configured
+/// rather than reserved.
+pub const MAX_REFUSAL_QUEUE: usize = 1 << 16;
+
 /// How long the whole handshake may take, from the opening `INFO` to the
 /// `PONG` that confirms the `CONNECT`.
 ///
@@ -167,6 +184,11 @@ pub const DEFAULT_OUTGOING_QUEUE: usize = 256;
 /// forever. One budget for the lot rather than one per step: a server that
 /// answers every operation with a `PING` a moment before the deadline never
 /// lets a per-step clock expire and never sends the `PONG`.
+///
+/// The TCP connect before it has a budget of the same size, once: the name
+/// lookup and every address tried share it, so a resolver that does not
+/// answer, or a handful of addresses that swallow packets, cannot hold a
+/// caller for the handshake's budget again and again.
 ///
 /// The same number is how long [`Connection::flush`](crate::Connection::flush),
 /// `subscribe`, `close` and the inbox registration wait for the driver to
@@ -499,6 +521,10 @@ pub struct ConnectionOptions {
     /// How many operations may be queued for the driver. See
     /// [`DEFAULT_OUTGOING_QUEUE`].
     pub outgoing_queue: usize,
+    /// How many refusals the connection keeps for a reader of
+    /// [`Connection::refusals`](crate::Connection::refusals) that falls
+    /// behind. See [`DEFAULT_REFUSAL_QUEUE`].
+    pub refusal_queue: usize,
     /// How many `connect_urls` are **retained** from an `INFO`. See
     /// [`DEFAULT_MAX_CONNECT_URLS`].
     ///
@@ -563,6 +589,7 @@ impl ConnectionOptions {
             subscription_queue: DEFAULT_SUBSCRIPTION_QUEUE,
             max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
             outgoing_queue: DEFAULT_OUTGOING_QUEUE,
+            refusal_queue: DEFAULT_REFUSAL_QUEUE,
             max_connect_urls: DEFAULT_MAX_CONNECT_URLS,
             max_header_entries: DEFAULT_MAX_HEADER_ENTRIES,
             max_control_line: weida_nats_codec::limits::DEFAULT_MAX_CONTROL_LINE,
@@ -640,6 +667,12 @@ impl ConnectionOptions {
             return Err(Error::Configuration(
                 "outgoing_queue must be at least 1".into(),
             ));
+        }
+        if !(1..=MAX_REFUSAL_QUEUE).contains(&self.refusal_queue) {
+            return Err(Error::Configuration(format!(
+                "refusal_queue must be between 1 and {MAX_REFUSAL_QUEUE}, and is {}",
+                self.refusal_queue
+            )));
         }
         if self.max_resolved_addresses == 0 {
             return Err(Error::Configuration(
@@ -857,5 +890,23 @@ mod tests {
                 "{name} of zero must be refused by name"
             );
         }
+    }
+
+    /// The refusal queue is a ring allocated whole, so zero and a number
+    /// nobody meant are both refused where they are configured, by name.
+    #[test]
+    fn the_refusal_queue_must_be_a_usable_size() {
+        let mut options = ConnectionOptions::new();
+        assert_eq!(options.refusal_queue, DEFAULT_REFUSAL_QUEUE);
+        options.validate().expect("the default is usable");
+        for size in [0, MAX_REFUSAL_QUEUE + 1, usize::MAX] {
+            options.refusal_queue = size;
+            assert!(
+                matches!(options.validate(), Err(Error::Configuration(why)) if why.contains("refusal_queue")),
+                "{size} must be refused by name"
+            );
+        }
+        options.refusal_queue = MAX_REFUSAL_QUEUE;
+        options.validate().expect("the largest is still fine");
     }
 }
