@@ -42,6 +42,8 @@ rustls-pki-types.workspace = true
 # and a SHA-256, and these are the ones rustls links anyway.
 rustls-webpki.workspace = true
 ring.workspace = true
+# `Pem::Bytes` holds a private key, so its buffer is wiped on drop.
+zeroize.workspace = true
 rcgen = { workspace = true, optional = true }
 # The blocking facade drives this crate's own futures on the calling thread
 # with `futures::executor::block_on`; the async surface needs none of it.

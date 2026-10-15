@@ -81,6 +81,6 @@ pub use exec::{Exec, OwnedReactor};
 #[cfg(windows)]
 pub use pipe::{BoundPipe, client_principal, connect_pipe, server_principal};
 pub use registry::NameRegistry;
-pub use resolve::{Resolved, Resolver, SharedResolver, SystemResolver};
+pub use resolve::{MAX_OUTSTANDING_LOOKUPS, Resolved, Resolver, SharedResolver, SystemResolver};
 #[cfg(unix)]
 pub use unix::{BoundUnixSocket, peer_credentials};

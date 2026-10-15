@@ -300,7 +300,9 @@ async fn pki_anchor_refreshes_and_kv_reads_an_identity() {
     let trust = within(anchor.start(client.clone())).await.expect("anchor");
     assert_eq!(
         trust.current().anchors,
-        vec![weida::Pem::Bytes(ca_a.into_bytes())]
+        vec![weida::Pem::Bytes(zeroize::Zeroizing::new(
+            ca_a.into_bytes()
+        ))]
     );
     let mut events = trust.events();
     assert_eq!(
@@ -309,7 +311,9 @@ async fn pki_anchor_refreshes_and_kv_reads_an_identity() {
     );
     assert_eq!(
         trust.current().anchors,
-        vec![weida::Pem::Bytes(ca_b.into_bytes())]
+        vec![weida::Pem::Bytes(zeroize::Zeroizing::new(
+            ca_b.into_bytes()
+        ))]
     );
 
     let identity = within(Kv::new("svc/identity").start(client))

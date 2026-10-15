@@ -144,7 +144,9 @@ impl AsyncWrite for Stream {
 /// [`ConnectionOptions::handshake_timeout`]. A budget per address would let a
 /// handful of addresses that swallow packets hold the caller for that long
 /// each, and a lookup outside any budget would hold it for as long as the
-/// resolver took.
+/// resolver took. The caller is released at the budget; a system lookup's
+/// thread is not, and keeps one of `weida_runtime`'s
+/// `MAX_OUTSTANDING_LOOKUPS` places until `getaddrinfo` returns.
 pub async fn connect(
     exec: &Exec,
     host: &str,

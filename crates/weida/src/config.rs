@@ -13,6 +13,7 @@ use std::time::Duration;
 use weida_core::{Error, Fingerprint, Limits};
 use weida_protocol::header::GuaranteeSet;
 use weida_runtime::SharedResolver;
+use zeroize::Zeroizing;
 
 use crate::identity::{IdentitySource, TrustSource};
 use crate::reconnect::{OutboxFull, ReconnectPolicy};
@@ -142,6 +143,12 @@ pub struct RuntimeConfig {
     /// [`weida_runtime::Resolver`] is how it brings its own answer
     /// ([decisions/0020](../../../docs/decisions/0020-cluster-and-discovery.md)
     /// §4.2).
+    ///
+    /// A deadline a caller puts around a dial (`send_timeout`, a timeout
+    /// around `connect`) ends the wait for the resolver, not the lookup: the
+    /// system resolver's thread outlives the deadline until the OS answers,
+    /// and [`weida_runtime::SystemResolver`] caps how many such lookups are
+    /// outstanding at once.
     pub resolver: SharedResolver,
     /// How long a dial waits on one resolved address before trying the next.
     ///
@@ -152,6 +159,14 @@ pub struct RuntimeConfig {
     /// resolving to `::1` before `127.0.0.1`, where the first address answers
     /// nothing at all and QUIC has no refusal to observe, so without a bound
     /// the second address is reached only after a handshake timeout.
+    ///
+    /// It does **not** cover the name lookup that precedes the first
+    /// attempt: the system resolver's `getaddrinfo` blocks a thread and no
+    /// deadline can end it. The wait for it can be dropped, the lookup thread
+    /// outlives the deadline, and at most
+    /// [`weida_runtime::MAX_OUTSTANDING_LOOKUPS`] of them exist at once; a dial
+    /// beyond that fails with [`crate::Error::LimitExceeded`] rather than
+    /// waiting for a free place.
     pub connect_attempt_timeout: Duration,
     /// How a dialling endpoint redials an address whose connection it lost
     /// ([decisions/0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md)
@@ -161,6 +176,10 @@ pub struct RuntimeConfig {
     /// How long an `open` on a dialling endpoint waits for a peer to come
     /// back before it fails with the loss cause; `None` waits as long as the
     /// redial does (0031 §4.4). ZeroMQ's `ZMQ_SNDTIMEO`, with its default.
+    ///
+    /// The redial it waits on starts with a name lookup, and a lookup the
+    /// deadline abandons keeps its thread until the system resolver answers
+    /// ([`weida_runtime::SystemResolver`]).
     pub send_timeout: Option<Duration>,
     /// Bodies a dialling endpoint's outbox holds while no peer is live, and
     /// the bytes they may sum to (0031 §4.2). At either bound
@@ -244,12 +263,26 @@ impl Default for RuntimeConfig {
 /// Kubernetes secret already in memory. Requiring a path would force callers
 /// to write private keys to disk just to hand them back — so both sources are
 /// first class, and neither is a workaround for the other.
-#[derive(Clone, PartialEq, Eq, Hash)]
+///
+/// The in-memory form is a [`Zeroizing`] buffer: the key it may hold is wiped
+/// when the last copy is dropped, and a clone is itself a zeroizing buffer, so
+/// cloning an [`Identity`] never leaves an unwiped copy of the key behind.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Pem {
     /// PEM bytes already in memory.
-    Bytes(Vec<u8>),
+    Bytes(Zeroizing<Vec<u8>>),
     /// A PEM file, read when the TLS configuration is built.
     File(PathBuf),
+}
+
+impl std::hash::Hash for Pem {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Pem::Bytes(bytes) => bytes.as_slice().hash(state),
+            Pem::File(path) => path.hash(state),
+        }
+    }
 }
 
 impl Pem {
@@ -331,8 +364,10 @@ impl Identity {
         let generated = rcgen::generate_simple_self_signed(names)
             .map_err(|e| Error::Tls(format!("generating an identity: {e}")))?;
         Ok(Identity {
-            cert_chain: Pem::Bytes(generated.cert.pem().into_bytes()),
-            key: Pem::Bytes(generated.signing_key.serialize_pem().into_bytes()),
+            cert_chain: Pem::Bytes(Zeroizing::new(generated.cert.pem().into_bytes())),
+            key: Pem::Bytes(Zeroizing::new(
+                generated.signing_key.serialize_pem().into_bytes(),
+            )),
         })
     }
 
@@ -342,10 +377,15 @@ impl Identity {
     /// filesystem, so there is no key file to create, protect and unlink. The
     /// two buffers may be the same bytes; sections of the wrong kind are
     /// skipped.
+    ///
+    /// The buffers are kept in zeroizing storage: handing a `Vec<u8>` or a
+    /// `String` moves it in without a copy, and the memory is wiped when the
+    /// identity and every clone of it are gone. A borrowed `&str` or `&[u8]`
+    /// is copied once, and the caller's own buffer is the caller's to wipe.
     pub fn from_pem(cert_chain: impl Into<Vec<u8>>, key: impl Into<Vec<u8>>) -> Identity {
         Identity {
-            cert_chain: Pem::Bytes(cert_chain.into()),
-            key: Pem::Bytes(key.into()),
+            cert_chain: Pem::Bytes(Zeroizing::new(cert_chain.into())),
+            key: Pem::Bytes(Zeroizing::new(key.into())),
         }
     }
 
@@ -385,6 +425,9 @@ impl Identity {
     ///
     /// Contains the private key. Write it with owner-only permissions and
     /// load it back with [`Identity::from_pem_file`].
+    ///
+    /// The returned `String` is an ordinary buffer holding the key, and
+    /// wiping it is the caller's job (wrap it in `zeroize::Zeroizing`).
     pub fn to_pem(&self) -> Result<String, Error> {
         let mut out = self.certificate_pem()?;
         out.push_str(&crate::tls::key_pem(&self.key)?);
@@ -443,7 +486,7 @@ impl Trust {
 
     /// Adds the certificate authorities in a PEM buffer.
     pub fn and_anchor(mut self, pem: impl Into<Vec<u8>>) -> Trust {
-        self.anchors.push(Pem::Bytes(pem.into()));
+        self.anchors.push(Pem::Bytes(Zeroizing::new(pem.into())));
         self
     }
 
@@ -656,7 +699,10 @@ mod tests {
     fn a_pem_source_never_prints_its_bytes() {
         // Error messages and Debug output must not leak key material.
         assert_eq!(Pem::File("/tmp/ca.pem".into()).describe(), "/tmp/ca.pem");
-        assert_eq!(Pem::Bytes(b"secret".to_vec()).describe(), "in-memory PEM");
+        assert_eq!(
+            Pem::Bytes(Zeroizing::new(b"secret".to_vec())).describe(),
+            "in-memory PEM"
+        );
         let debug = format!("{:?}", Identity::from_pem("-cert-", "-secret-key-"));
         assert!(!debug.contains("secret"), "{debug}");
     }
@@ -666,7 +712,10 @@ mod tests {
         let fp = Fingerprint::from_bytes([7; 32]);
         let t = Trust::pin(fp).and_pin(fp).and_anchor("-ca-");
         assert_eq!(t.pins, vec![fp]);
-        assert_eq!(t.anchors, vec![Pem::Bytes(b"-ca-".to_vec())]);
+        assert_eq!(
+            t.anchors,
+            vec![Pem::Bytes(Zeroizing::new(b"-ca-".to_vec()))]
+        );
         assert!(!t.is_empty());
         assert!(Trust::by_address().is_empty());
     }

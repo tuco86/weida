@@ -135,7 +135,7 @@ impl PkiSign {
                     .ok_or_else(|| Error::Shape("`data.expiration` is out of range".into()))
             })?;
         let identity = Identity {
-            cert_chain: Pem::Bytes(chain.into_bytes()),
+            cert_chain: Pem::Bytes(zeroize::Zeroizing::new(chain.into_bytes())),
             key: key.clone(),
         };
         Ok((identity, expires))

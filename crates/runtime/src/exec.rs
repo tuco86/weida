@@ -110,6 +110,11 @@ impl Exec {
     /// it held is released. This is the only place an await is bounded on
     /// wall-clock time, for the same reason [`Exec::sleep`] lives here: the
     /// timer belongs to the runtime, not to the caller.
+    ///
+    /// Dropping the future ends the *wait* and nothing else: work it handed
+    /// to a blocking thread — a name lookup ([`Exec::resolve`]) — runs on
+    /// until the OS returns, so a connect timeout or handshake budget built
+    /// on this bounds the caller's time, not that thread's.
     pub async fn within<F: Future>(&self, limit: Duration, future: F) -> Option<F::Output> {
         let deadline = self.sleep(limit);
         tokio::select! {
@@ -129,6 +134,14 @@ impl Exec {
     ///
     /// One implementation, two entry points: this delegates to
     /// [`crate::SystemResolver`].
+    ///
+    /// **A deadline around this call ends the wait, not the lookup.**
+    /// `getaddrinfo` blocks a thread and cannot be cancelled, so a connect
+    /// timeout or handshake budget that expires while this is pending drops
+    /// the future and returns to the caller, while the lookup thread runs on
+    /// until the OS answers. At most [`crate::MAX_OUTSTANDING_LOOKUPS`] such
+    /// lookups exist at once; a call beyond that fails with
+    /// [`Error::LimitExceeded`] instead of waiting for one.
     pub async fn resolve(
         &self,
         host: &str,

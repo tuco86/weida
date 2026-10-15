@@ -21,6 +21,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use weida_core::{DEFAULT_PORT, Error};
 
@@ -64,6 +65,14 @@ pub type Resolved<'a> = Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, Erro
 /// demanded its caller be inside one would be the mistake `Exec` exists to
 /// prevent. A resolver that spawns work does so through the handle it is
 /// passed.
+///
+/// # Deadlines
+///
+/// A caller's deadline around [`Resolver::resolve`] ends the *wait*, not the
+/// work: the future is dropped, but a lookup that blocks a thread (the system
+/// resolver's `getaddrinfo`) runs on until the OS answers. A resolver that
+/// does that should bound how many such lookups it leaves outstanding, as
+/// [`SystemResolver`] does with [`MAX_OUTSTANDING_LOOKUPS`].
 pub trait Resolver: fmt::Debug + Send + Sync + 'static {
     /// Resolves `name` into the addresses to dial, in order.
     fn resolve<'a>(
@@ -83,8 +92,99 @@ pub trait Resolver: fmt::Debug + Send + Sync + 'static {
 /// a literal, a plain name and a Kubernetes headless Service, whose A/AAAA
 /// answer *is* the set of Pod addresses. It cannot express a port-forwarding
 /// load balancer; [`Resolver`] is how that deployment brings its own answer.
+///
+/// # A deadline does not end a lookup
+///
+/// `getaddrinfo` blocks an OS thread and cannot be cancelled. A caller that
+/// puts a deadline around [`Resolver::resolve`] (a connect timeout, a
+/// handshake budget, [`Exec::within`]) stops *waiting* when it expires, but the
+/// thread running the lookup keeps going until the system resolver answers,
+/// which can be as long as its own retry schedule (tens of seconds). To keep
+/// a name server that never answers from accumulating blocked threads, at
+/// most [`MAX_OUTSTANDING_LOOKUPS`] lookups run at once in the process; a
+/// lookup asked for beyond that is refused with [`Error::LimitExceeded`]
+/// instead of queueing. An IP literal never counts, because it is parsed in
+/// place.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemResolver;
+
+/// The most system name lookups ([`SystemResolver`]) in flight in one process.
+///
+/// Each one holds a blocking-pool thread inside `getaddrinfo` for as long as
+/// the system resolver takes, and a caller's deadline does not shorten that.
+/// The cap keeps a name server that stops answering from turning every
+/// timed-out dial into one more stuck thread. A slot frees when the lookup
+/// itself returns, not when the caller that asked for it gave up.
+pub const MAX_OUTSTANDING_LOOKUPS: usize = 64;
+
+/// The lookups of this process that have not returned yet.
+static LOOKUPS: Lookups = Lookups::new(MAX_OUTSTANDING_LOOKUPS);
+
+/// A count of lookups in flight, with a ceiling.
+struct Lookups {
+    cap: usize,
+    outstanding: AtomicUsize,
+}
+
+/// One lookup's place under the ceiling; freed when the lookup returns.
+struct Slot(&'static Lookups);
+
+impl Lookups {
+    const fn new(cap: usize) -> Lookups {
+        Lookups {
+            cap,
+            outstanding: AtomicUsize::new(0),
+        }
+    }
+
+    /// Takes a place, or `None` when `cap` lookups are already in flight.
+    fn claim(&'static self) -> Option<Slot> {
+        let mut taken = self.outstanding.load(Ordering::Acquire);
+        loop {
+            if taken >= self.cap {
+                return None;
+            }
+            match self.outstanding.compare_exchange_weak(
+                taken,
+                taken + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Slot(self)),
+                Err(seen) => taken = seen,
+            }
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Runs `work` on the runtime under one of `lookups`' places.
+///
+/// The place travels with the spawned task, not with this future: dropping
+/// this future (a caller's deadline) detaches the task, which keeps its place
+/// until `work` returns.
+async fn bounded<F>(
+    exec: &Exec,
+    lookups: &'static Lookups,
+    work: F,
+) -> Result<std::io::Result<Vec<SocketAddr>>, Error>
+where
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'static,
+{
+    let slot = lookups.claim().ok_or(Error::LimitExceeded)?;
+    exec.spawn(async move {
+        let answer = work.await;
+        drop(slot);
+        answer
+    })
+    .await
+    .map_err(|e| Error::Runtime(format!("name resolution task failed: {e}")))
+}
 
 impl Resolver for SystemResolver {
     fn resolve<'a>(
@@ -100,14 +200,12 @@ impl Resolver for SystemResolver {
                 return Ok(vec![SocketAddr::new(ip, port)]);
             }
             let query = (name.to_owned(), port);
-            let looked_up = exec
-                .spawn(async move {
-                    tokio::net::lookup_host(query)
-                        .await
-                        .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
-                })
-                .await
-                .map_err(|e| Error::Runtime(format!("name resolution task failed: {e}")))?;
+            let looked_up = bounded(exec, &LOOKUPS, async move {
+                tokio::net::lookup_host(query)
+                    .await
+                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+            })
+            .await?;
             let addrs: Vec<SocketAddr> = looked_up
                 .map_err(|e| Error::InvalidAddress(format!("cannot resolve {name}:{port}: {e}")))?
                 .into_iter()
@@ -171,6 +269,7 @@ impl Eq for SharedResolver {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A resolver that answers from a table, which is what a test needs and
     /// also what a static deployment would write.
@@ -311,5 +410,48 @@ mod tests {
             .expect("localhost");
         assert_eq!(capped.len(), 1, "the cap must bound the answer");
         assert_eq!(capped[0], all[0], "and it must keep the resolver's order");
+    }
+
+    /// Claim: a deadline that ends the wait does not free the lookup's place,
+    /// because the thread behind it is still in `getaddrinfo`; a lookup asked
+    /// for beyond the cap is refused rather than queued, and a place frees
+    /// when the lookup returns.
+    #[tokio::test]
+    async fn a_lookup_the_caller_gave_up_on_keeps_its_place_until_it_returns() {
+        static CAPPED: Lookups = Lookups::new(2);
+        let exec = Exec::current().expect("ambient runtime");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let stuck = |gate: Arc<tokio::sync::Semaphore>| async move {
+            let _ = gate.acquire().await;
+            Ok(Vec::new())
+        };
+        for _ in 0..2 {
+            let waited = exec
+                .within(
+                    Duration::from_millis(20),
+                    bounded(&exec, &CAPPED, stuck(Arc::clone(&gate))),
+                )
+                .await;
+            assert!(waited.is_none(), "the lookup is still blocked");
+        }
+
+        let refused = bounded(&exec, &CAPPED, stuck(Arc::clone(&gate))).await;
+        assert!(
+            matches!(refused, Err(Error::LimitExceeded)),
+            "both places are held by lookups nobody waits for any more"
+        );
+
+        gate.add_permits(2);
+        exec.within(Duration::from_secs(5), async {
+            while CAPPED.outstanding.load(Ordering::Acquire) != 0 {
+                exec.sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the places free once the lookups return");
+        bounded(&exec, &CAPPED, async { Ok(Vec::new()) })
+            .await
+            .expect("admitted again")
+            .expect("answered");
     }
 }

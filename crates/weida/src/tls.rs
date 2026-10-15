@@ -35,6 +35,7 @@ use quinn::rustls::{
 };
 use quinn::{TransportConfig, VarInt};
 use weida_core::{Error, Fingerprint, Limits};
+use zeroize::Zeroizing;
 
 use crate::config::{ClientTls, ClientTrust, Identity, Pem, ServerTls, Trust};
 use crate::identity::{IdentitySource, PeerChain, TrustSource};
@@ -77,8 +78,9 @@ pub(crate) fn certificate_pem(pem: &Pem) -> Result<String, Error> {
     Ok(out)
 }
 
-/// Re-encodes the private key of a PEM source as a PKCS#8 PEM block.
-pub(crate) fn key_pem(pem: &Pem) -> Result<String, Error> {
+/// Re-encodes the private key of a PEM source as a PKCS#8 PEM block, in a
+/// buffer that is wiped on drop.
+pub(crate) fn key_pem(pem: &Pem) -> Result<Zeroizing<String>, Error> {
     let key = key_from(pem)?;
     let (label, der) = match &key {
         PrivateKeyDer::Pkcs8(k) => ("PRIVATE KEY", k.secret_pkcs8_der()),
@@ -86,7 +88,7 @@ pub(crate) fn key_pem(pem: &Pem) -> Result<String, Error> {
         PrivateKeyDer::Sec1(k) => ("EC PRIVATE KEY", k.secret_sec1_der()),
         _ => return Err(Error::Tls("unsupported private key encoding".into())),
     };
-    let mut out = String::new();
+    let mut out = Zeroizing::new(String::new());
     pem_block(&mut out, label, der);
     Ok(out)
 }

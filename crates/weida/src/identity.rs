@@ -159,6 +159,8 @@ enum Kind {
     /// A value: equal to another static source holding the same value, so
     /// two endpoints configured alike still share a pooled connection.
     Static,
+    /// Generated in memory, so it exists only where something can generate.
+    #[cfg(feature = "generate")]
     Ephemeral,
     Files(Files),
     /// Driven from outside through [`IdentitySource::update`].
@@ -506,6 +508,7 @@ impl std::fmt::Debug for IdentitySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match &self.inner.kind {
             Kind::Static => "static",
+            #[cfg(feature = "generate")]
             Kind::Ephemeral => "ephemeral",
             Kind::Files(_) => "files",
             Kind::External => "external",
