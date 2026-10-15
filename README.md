@@ -23,7 +23,7 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 
 **Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
 `weida-broker`, `weida-raft` and `weida-openbao` are published on crates.io, all at
-`0.1.0-alpha.6`. The other seventeen members are not published: `weida-py-core`, every Python
+`0.1.0-alpha.7`. The other seventeen members are not published: `weida-py-core`, every Python
 binding and all five protocol libraries with their codecs. The one exception on crates.io,
 `weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI
 and there are no prebuilt binaries. Wire protocol version `0` is experimental and breaking
