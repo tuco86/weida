@@ -159,8 +159,47 @@ impl std::error::Error for DecodeError {
 }
 
 type Res<T> = Result<T, DecodeError>;
-type Enc = Encoder<Vec<u8>>;
+type Enc = Encoder<Sink>;
 type EncResult = Result<(), minicbor::encode::Error<Infallible>>;
+
+/// Where an encoder writes: into a buffer, or nowhere, counting what it was
+/// given.
+///
+/// The count is how a leader learns what an envelope weighs without building
+/// it: a batch of entries that each weigh almost the cap would otherwise be
+/// copied whole just to be told it is too large.
+enum Sink {
+    Bytes(Vec<u8>),
+    Count(usize),
+}
+
+impl Sink {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Sink::Bytes(bytes) => bytes,
+            Sink::Count(_) => Vec::new(),
+        }
+    }
+
+    fn written(&self) -> usize {
+        match self {
+            Sink::Bytes(bytes) => bytes.len(),
+            Sink::Count(count) => *count,
+        }
+    }
+}
+
+impl minicbor::encode::Write for Sink {
+    type Error = Infallible;
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), Infallible> {
+        match self {
+            Sink::Bytes(bytes) => bytes.extend_from_slice(buf),
+            Sink::Count(count) => *count += buf.len(),
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public codec
@@ -258,35 +297,47 @@ const FAIL_TOO_MANY_NODES: u64 = 7;
 
 /// Encodes a request envelope.
 pub(crate) fn encode_rpc(rpc: &Rpc) -> Vec<u8> {
-    build(|e| {
-        e.map(2)?;
-        match rpc {
-            Rpc::Vote(req) => {
-                e.u64(0)?.u64(RPC_VOTE)?;
-                e.u64(1)?;
-                put_vote_request(e, req)
-            }
-            Rpc::AppendEntries(req) => {
-                e.u64(0)?.u64(RPC_APPEND)?;
-                e.u64(1)?;
-                put_append_request(e, req)
-            }
-            Rpc::Snapshot { vote, meta } => {
-                e.u64(0)?.u64(RPC_SNAPSHOT)?;
-                e.u64(1)?;
-                e.map(2)?;
-                e.u64(0)?;
-                put_vote(e, vote)?;
-                e.u64(1)?;
-                put_snapshot_meta(e, meta)
-            }
-            Rpc::Forward(op) => {
-                e.u64(0)?.u64(RPC_FORWARD)?;
-                e.u64(1)?;
-                put_forward_op(e, op)
-            }
+    build(|e| write_rpc(e, rpc))
+}
+
+/// What [`encode_rpc`] would write, counted and not written.
+pub(crate) fn rpc_len(rpc: &Rpc) -> usize {
+    measure(|e| write_rpc(e, rpc))
+}
+
+/// What [`encode_entry`] would write, counted and not written.
+pub(crate) fn entry_len(entry: &Entry<TypeConfig>) -> usize {
+    measure(|e| put_entry(e, entry))
+}
+
+fn write_rpc(e: &mut Enc, rpc: &Rpc) -> EncResult {
+    e.map(2)?;
+    match rpc {
+        Rpc::Vote(req) => {
+            e.u64(0)?.u64(RPC_VOTE)?;
+            e.u64(1)?;
+            put_vote_request(e, req)
         }
-    })
+        Rpc::AppendEntries(req) => {
+            e.u64(0)?.u64(RPC_APPEND)?;
+            e.u64(1)?;
+            put_append_request(e, req)
+        }
+        Rpc::Snapshot { vote, meta } => {
+            e.u64(0)?.u64(RPC_SNAPSHOT)?;
+            e.u64(1)?;
+            e.map(2)?;
+            e.u64(0)?;
+            put_vote(e, vote)?;
+            e.u64(1)?;
+            put_snapshot_meta(e, meta)
+        }
+        Rpc::Forward(op) => {
+            e.u64(0)?.u64(RPC_FORWARD)?;
+            e.u64(1)?;
+            put_forward_op(e, op)
+        }
+    }
 }
 
 /// Decodes a request envelope.
@@ -648,9 +699,16 @@ fn truncate(s: &str, max: usize) -> &str {
 
 /// Runs an encoder against a fresh buffer.
 fn build(f: impl FnOnce(&mut Enc) -> EncResult) -> Vec<u8> {
-    let mut e = Encoder::new(Vec::new());
+    let mut e = Encoder::new(Sink::Bytes(Vec::new()));
     f(&mut e).expect("encoding into a Vec is infallible");
-    e.into_writer()
+    e.into_writer().into_bytes()
+}
+
+/// Runs an encoder against nothing and says how many bytes it was given.
+fn measure(f: impl FnOnce(&mut Enc) -> EncResult) -> usize {
+    let mut e = Encoder::new(Sink::Count(0));
+    f(&mut e).expect("counting is infallible");
+    e.into_writer().written()
 }
 
 /// `1` when the optional key will be written, else `0`: the map-length term.

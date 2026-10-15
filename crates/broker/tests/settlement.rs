@@ -287,3 +287,66 @@ async fn an_unsettled_delivery_still_counts_against_the_budget() {
         "handing a message out changes whose turn it is, not what it costs"
     );
 }
+
+/// The tasks alive in this runtime once their number has stopped moving.
+///
+/// The broker, its consumers and its producers share the test's runtime, so
+/// the count is the sum of all of them; what a test learns from it is how it
+/// *changes*.
+async fn quiet_tasks() -> usize {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    tokio::time::timeout(DEADLINE, async {
+        let mut last = metrics.num_alive_tasks();
+        let mut steady = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = metrics.num_alive_tasks();
+            if now == last {
+                steady += 1;
+                if steady == 4 {
+                    return now;
+                }
+            } else {
+                steady = 0;
+                last = now;
+            }
+        }
+    })
+    .await
+    .expect("the number of tasks never settled")
+}
+
+/// A delivery watches its consumer's report in a task and in an entry of the
+/// report table of that consumer's connection. When the queue takes the
+/// delivery back, nothing is left to report to, so both go with it: a
+/// consumer that unsubscribes with deliveries it never reported, and keeps
+/// its connection, must not leave one task per delivery behind for as long
+/// as the connection lives.
+#[tokio::test]
+async fn a_delivery_the_queue_takes_back_stops_being_watched() {
+    const DELIVERIES: usize = 48;
+    let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
+    let producer = harness.producer("/jobs").await;
+    let (_consumer_rt, consumer) = harness.consumer("/jobs", DELIVERIES as u64).await;
+
+    harness.fill(&producer, DELIVERIES).await;
+    for _ in 0..DELIVERIES {
+        take(&consumer).await;
+    }
+    harness
+        .until(DEADLINE, || harness.unsettled("/jobs") == DELIVERIES)
+        .await;
+    let watched = quiet_tasks().await;
+
+    consumer.unsubscribe("").await.expect("unsubscribe");
+    harness
+        .until(DEADLINE, || harness.held("/jobs") == DELIVERIES)
+        .await;
+    assert_eq!(harness.unsettled("/jobs"), 0, "the queue has them back");
+    let released = quiet_tasks().await;
+    assert!(
+        watched >= released + DELIVERIES / 2,
+        "{watched} tasks while {DELIVERIES} deliveries were out, {released} after the queue \
+         took them back: the watchers outlived their deliveries"
+    );
+}

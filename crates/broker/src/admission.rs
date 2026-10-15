@@ -9,10 +9,14 @@
 //! reservation and one parked task until the deadline, and costs every other
 //! producer and every consumer nothing.
 //!
-//! Three things bound what that concurrency can hold:
+//! Four things bound what that concurrency can hold:
 //!
 //! - **permits**: at most `max_inflight_admissions` admissions are in flight
 //!   per queue, and the loop stops reading streams while they all are;
+//! - **shares**: no single connection holds more than
+//!   `max_inflight_admissions_per_connection` of them, and neither do the
+//!   connections of one proved peer together, so the one that stalls is the
+//!   one that cannot take the permits everybody else needs ([`Shares`]);
 //! - **reservations**: a payload is charged to the queue's budget as it is
 //!   buffered, in steps, so a thousand readers cannot each be told the whole
 //!   remainder ([`crate::queue::Queue::reserve`]);
@@ -23,14 +27,17 @@
 //! finished message back until an unfinished one in front of it is done would
 //! hand a stalled producer exactly the power this design takes from it.
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::OwnedSemaphorePermit;
 use weida::{
-    CursorLevel, ErrorCode, IncomingMeta, IncomingRequest, IncomingTransfer, Reporter, TransferMeta,
+    ConnectionId, CursorLevel, ErrorCode, IncomingMeta, IncomingRequest, IncomingTransfer,
+    PeerIdentity, Reporter, TransferMeta,
 };
 
 use crate::broker::{Achieved, Served};
@@ -47,22 +54,147 @@ use crate::queue::{QueuedMessage, Refusal, labels_cost};
 /// producer that declares a gigabyte and sends nothing must not reserve one.
 const FIRST_READ: usize = 1024;
 
-/// Starts admitting an exchange, holding `permit` until it is over.
+/// Rejections of exchanges past a peer's share that may be in flight at once.
+///
+/// A rejection is an ERROR frame written to the peer's own flow-control
+/// credit, and a peer that withholds credit holds the write until the
+/// deadline. The rejections of a peer over its share are the ones that peer
+/// can prolong at will, so they get a small pool of their own instead of the
+/// admission permits it was refused for; past the pool the request is
+/// dropped, which the requester sees as an exchange nobody answered.
+pub(crate) const MAX_REJECTIONS_IN_FLIGHT: usize = 64;
+
+/// How many admissions each connection has in flight on one queue, and each
+/// proved peer across its connections.
+///
+/// A connection is what tells two senders apart when neither has proved who
+/// it is, so every anonymous connection has a share of its own. A proved key
+/// may hold several connections, and those count together as well, so that
+/// dialling again does not multiply a peer's share. The tables hold an entry
+/// only while their connection or peer has an admission in flight, so what a
+/// sender can make them grow to is the permit pool, whatever it presents.
+///
+/// Generic over the connection's identity so that the rule can be tested
+/// without one; the broker instantiates it with [`weida::ConnectionId`].
+pub(crate) struct Shares<C> {
+    held: Mutex<Held<C>>,
+    cap: usize,
+}
+
+struct Held<C> {
+    connections: HashMap<C, usize>,
+    peers: HashMap<PeerIdentity, usize>,
+}
+
+/// One admission's claim on its connection's share, and on its peer's when it
+/// has one, returned when it is dropped.
+pub(crate) struct Share<C: Copy + Eq + Hash> {
+    shares: Arc<Shares<C>>,
+    connection: C,
+    peer: Option<PeerIdentity>,
+}
+
+impl<C: Copy + Eq + Hash> Shares<C> {
+    /// Shares of `cap` admissions each, and at least one.
+    pub(crate) fn new(cap: usize) -> Shares<C> {
+        Shares {
+            held: Mutex::new(Held {
+                connections: HashMap::new(),
+                peers: HashMap::new(),
+            }),
+            cap: cap.max(1),
+        }
+    }
+
+    /// A claim on one admission for `connection`, whose sender proved `peer`,
+    /// or `None` when either already holds its whole share. Both are checked
+    /// before either is spent.
+    pub(crate) fn claim(
+        self: &Arc<Shares<C>>,
+        connection: C,
+        peer: Option<&PeerIdentity>,
+    ) -> Option<Share<C>> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let full = |count: Option<&usize>| count.is_some_and(|count| *count >= self.cap);
+        if full(held.connections.get(&connection))
+            || peer.is_some_and(|peer| full(held.peers.get(peer)))
+        {
+            return None;
+        }
+        *held.connections.entry(connection).or_insert(0) += 1;
+        if let Some(peer) = peer {
+            *held.peers.entry(peer.clone()).or_insert(0) += 1;
+        }
+        Some(Share {
+            shares: Arc::clone(self),
+            connection,
+            peer: peer.cloned(),
+        })
+    }
+}
+
+impl<C: Copy + Eq + Hash> Drop for Share<C> {
+    fn drop(&mut self) {
+        // A poisoned table is taken rather than propagated: this runs in a
+        // destructor, and a panic there during an unwind aborts the process.
+        let mut held = self.shares.held.lock().unwrap_or_else(|e| e.into_inner());
+        release(&mut held.connections, &self.connection);
+        if let Some(peer) = &self.peer {
+            release(&mut held.peers, peer);
+        }
+    }
+}
+
+/// Gives one claim on `key` back, and forgets the key when it holds none.
+fn release<K: Eq + Hash>(table: &mut HashMap<K, usize>, key: &K) {
+    if let Some(count) = table.get_mut(key) {
+        *count -= 1;
+        if *count == 0 {
+            table.remove(key);
+        }
+    }
+}
+
+/// Refuses an exchange from a connection past its share, without an
+/// admission permit and without waiting for the peer.
+///
+/// The refusal is written in a task of its own, from a small pool of its own
+/// ([`MAX_REJECTIONS_IN_FLIGHT`]), and past that pool the request is dropped.
+pub(crate) fn reject_over_share(served: &Served, request: IncomingRequest) {
+    tracing::debug!(
+        path = served.acceptor.path(),
+        "a connection is past its share of admissions; refusing an exchange"
+    );
+    let Ok(permit) = Arc::clone(&served.rejections).try_acquire_owned() else {
+        return;
+    };
+    let io_timeout = served.io_timeout;
+    tokio::spawn(async move {
+        refuse(request, io_timeout).await;
+        drop(permit);
+    });
+}
+
+/// Starts admitting an exchange, holding `permit` and `share` until it is
+/// over.
 pub(crate) fn start_exchange(
     served: &Arc<Served>,
     request: IncomingRequest,
     permit: OwnedSemaphorePermit,
+    share: Share<ConnectionId>,
 ) {
-    tokio::spawn(admit_exchange(Arc::clone(served), request, permit));
+    tokio::spawn(admit_exchange(Arc::clone(served), request, permit, share));
 }
 
-/// Starts admitting a one-way transfer, holding `permit` until it is over.
+/// Starts admitting a one-way transfer, holding `permit` and `share` until it
+/// is over.
 pub(crate) fn start_stream(
     served: &Arc<Served>,
     transfer: IncomingTransfer,
     permit: OwnedSemaphorePermit,
+    share: Share<ConnectionId>,
 ) {
-    tokio::spawn(admit_stream(Arc::clone(served), transfer, permit));
+    tokio::spawn(admit_stream(Arc::clone(served), transfer, permit, share));
 }
 
 /// Admits a producer's exchange and confirms it, or refuses it on the reply
@@ -76,6 +208,7 @@ async fn admit_exchange(
     served: Arc<Served>,
     mut request: IncomingRequest,
     _permit: OwnedSemaphorePermit,
+    _share: Share<ConnectionId>,
 ) {
     let io_timeout = served.io_timeout;
     let Some(reservation) = Reservation::open(&served, request.meta()) else {
@@ -126,6 +259,7 @@ async fn admit_stream(
     served: Arc<Served>,
     transfer: IncomingTransfer,
     _permit: OwnedSemaphorePermit,
+    _share: Share<ConnectionId>,
 ) {
     // Dropping an unread payload is the refusal: the handle stops the stream
     // with `REJECTED`, which is the only answer a unidirectional stream can
@@ -630,5 +764,106 @@ mod tests {
             "the trickle was never cut"
         );
         trickle.abort();
+    }
+
+    fn peer(n: u8) -> PeerIdentity {
+        PeerIdentity::Key(weida::Fingerprint::from_bytes([n; 32]))
+    }
+
+    /// Connections are numbered, as the runtime numbers them.
+    type Shares = super::Shares<u32>;
+
+    #[test]
+    fn a_connection_holds_no_more_than_its_share_and_gets_each_one_back() {
+        let shares = Arc::new(Shares::new(2));
+        let first = shares.claim(1, None).expect("the first of two");
+        let _second = shares.claim(1, None).expect("the second of two");
+        assert!(shares.claim(1, None).is_none(), "a third is past it");
+
+        drop(first);
+        assert!(
+            shares.claim(1, None).is_some(),
+            "an admission that ended frees its place"
+        );
+    }
+
+    #[test]
+    fn anonymous_connections_each_have_a_share_of_their_own() {
+        let shares = Arc::new(Shares::new(2));
+        let _one = shares.claim(1, None).expect("an anonymous connection");
+        let _two = shares.claim(1, None).expect("its second");
+        assert!(shares.claim(1, None).is_none(), "its whole share is held");
+        assert!(
+            shares.claim(2, None).is_some(),
+            "another anonymous connection is not one of them: nothing about \
+             who they are is shared, so nothing about what they hold is"
+        );
+    }
+
+    #[test]
+    fn the_connections_of_one_proved_peer_hold_one_share_between_them() {
+        let shares = Arc::new(Shares::new(2));
+        let one = peer(1);
+        let _first = shares.claim(1, Some(&one)).expect("its first connection");
+        let _second = shares.claim(2, Some(&one)).expect("its second connection");
+        assert!(
+            shares.claim(3, Some(&one)).is_none(),
+            "the peer holds its share across its connections, however many it dials, \
+             although this connection holds nothing"
+        );
+        assert!(
+            shares.claim(3, Some(&peer(2))).is_some(),
+            "another peer on a connection of its own is not refused for it"
+        );
+        assert!(
+            shares.claim(3, None).is_some(),
+            "and neither is an anonymous one"
+        );
+    }
+
+    #[test]
+    fn a_refusal_spends_nothing() {
+        let shares = Arc::new(Shares::new(1));
+        let one = peer(1);
+        let _held = shares.claim(1, Some(&one)).expect("the connection's share");
+        // Refused by the connection's bound: the peer's count must not have
+        // moved, or the peer would be told it holds more than it does.
+        assert!(shares.claim(1, Some(&one)).is_none());
+        drop(_held);
+        assert!(
+            shares.claim(2, Some(&one)).is_some(),
+            "the refused claim left nothing behind"
+        );
+    }
+
+    #[test]
+    fn the_tables_hold_only_what_has_an_admission_in_flight() {
+        let shares = Arc::new(Shares::new(4));
+        let claims: Vec<_> = (0..64u8)
+            .map(|n| {
+                shares
+                    .claim(u32::from(n), Some(&peer(n)))
+                    .expect("each has a share")
+            })
+            .collect();
+        {
+            let held = shares.held.lock().expect("table");
+            assert_eq!((held.connections.len(), held.peers.len()), (64, 64));
+        }
+        drop(claims);
+        let held = shares.held.lock().expect("table");
+        assert!(
+            held.connections.is_empty() && held.peers.is_empty(),
+            "what holds nothing is not remembered"
+        );
+    }
+
+    #[test]
+    fn a_share_is_at_least_one() {
+        let shares = Arc::new(Shares::new(0));
+        assert!(
+            shares.claim(1, None).is_some(),
+            "a connection that could hold nothing could do nothing"
+        );
     }
 }

@@ -8,7 +8,10 @@
 //! key, because that is how a node being added learns its group. A forwarded
 //! write or read barrier needs a member, and a forwarded membership change
 //! needs a **voter**: a learner replicates the group's log and is not one of
-//! the nodes that decides who belongs to it.
+//! the nodes that decides who belongs to it. For the same reason an engine
+//! message — a vote, an append, a snapshot — needs a voter: candidates and
+//! leaders are voters, and openraft would follow a learner that named itself
+//! in a higher vote.
 //!
 //! **What a stranger can cost.** The binding admits any key that proves
 //! possession of one, so who is *in* the group is only known after the engine
@@ -226,10 +229,26 @@ impl Server {
         // its vote, and that sender must be the key that proved itself in the
         // handshake. A forwarded client operation must come from a member, and
         // one that changes the membership from a voter.
+        //
+        // An engine message also has to come from a node that can lead. A vote
+        // asks for the leadership and an append or a snapshot exercises it,
+        // and openraft applies a vote at or above its own whoever sent it —
+        // it does not ask whether the sender is a voter — so a learner that
+        // named itself in a higher vote would be followed as the leader and
+        // its entries, a membership that makes it a voter among them, would
+        // be committed. The only engine sender that is not a voter yet is the
+        // leader of a node that has no membership at all, which is how that
+        // node learns its group.
         let permitted = match &rpc {
-            Rpc::Vote(rpc) => claim(proved, rpc.vote.leader_id.node_id),
-            Rpc::AppendEntries(rpc) => claim(proved, rpc.vote.leader_id.node_id),
-            Rpc::Snapshot { vote, .. } => claim(proved, vote.leader_id.node_id),
+            Rpc::Vote(rpc) => {
+                may_lead(proved, admission) && claim(proved, rpc.vote.leader_id.node_id)
+            }
+            Rpc::AppendEntries(rpc) => {
+                may_lead(proved, admission) && claim(proved, rpc.vote.leader_id.node_id)
+            }
+            Rpc::Snapshot { vote, .. } => {
+                may_lead(proved, admission) && claim(proved, vote.leader_id.node_id)
+            }
             Rpc::Forward(op) => {
                 let allowed = match op {
                     ForwardOp::AddNode(_) | ForwardOp::RemoveNode(_) => {
@@ -351,6 +370,23 @@ fn claim(proved: NodeId, claimed: NodeId) -> bool {
         return true;
     }
     tracing::warn!(%proved, %claimed, "raft RPC claims a sender other than the proved key");
+    false
+}
+
+/// Can this sender send engine messages at all?
+///
+/// Candidates and leaders are voters. A node with no membership accepts its
+/// leader from any key — it has no membership to compare the key with — and
+/// that is the one exception.
+fn may_lead(proved: NodeId, admission: Admission) -> bool {
+    if matches!(admission, Admission::Voter | Admission::Uninitialized) {
+        return true;
+    }
+    tracing::warn!(
+        %proved,
+        ?admission,
+        "an engine message from a node that votes on nothing"
+    );
     false
 }
 
@@ -698,5 +734,84 @@ mod tests {
         );
 
         consensus.shutdown().await;
+    }
+
+    /// A learner replicates the group's log and decides nothing: a vote that
+    /// asks for the leadership, an append or a snapshot that exercises it,
+    /// sent by a learner, is refused before the engine sees it. openraft
+    /// follows a higher vote whoever sent it, so a learner that named itself
+    /// would otherwise unseat the leader and commit entries as its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_learner_cannot_vote_or_lead() {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let voter = start(&runtime, loopback()).await;
+        voter.bootstrap().await.expect("bootstrap");
+        leads(&voter).await;
+
+        let identity = Identity::generate().expect("identity of the learner");
+        let learner_id = NodeId::from(identity.fingerprint().expect("fingerprint"));
+        let store = MemoryStore::default();
+        let learner =
+            Consensus::start(&runtime, identity.clone(), store.clone(), store, loopback())
+                .await
+                .expect("start the learner");
+        assert_eq!(
+            voter
+                .add_node(learner.node().clone())
+                .await
+                .expect("add the learner"),
+            crate::Role::Learner,
+            "the second member of a group is parked"
+        );
+
+        let requester = runtime.requester(
+            ClientTls::new(Trust::by_address())
+                .with_identity(identity)
+                .with_alpn(Alpn::Raft),
+        );
+        requester.connect(&voter.node().url).await.expect("connect");
+
+        let vote = Rpc::Vote(VoteRequest {
+            vote: Vote::new(1_000, learner_id),
+            last_log_id: Some(LogId::new(CommittedLeaderId::new(1_000, learner_id), 1_000)),
+        });
+        assert!(
+            matches!(send(&requester, &vote).await, Err(weida::Error::Rejected)),
+            "a learner's vote must be refused"
+        );
+        let append = Rpc::AppendEntries(AppendEntriesRequest {
+            vote: Vote::new_committed(1_000, learner_id),
+            prev_log_id: None,
+            entries: vec![],
+            leader_commit: None,
+        });
+        assert!(
+            matches!(send(&requester, &append).await, Err(weida::Error::Rejected)),
+            "a learner's AppendEntries must be refused"
+        );
+        let snapshot = Rpc::Snapshot {
+            vote: Vote::new_committed(1_000, learner_id),
+            meta: SnapshotMeta::default(),
+        };
+        assert!(
+            matches!(
+                send(&requester, &snapshot).await,
+                Err(weida::Error::Rejected)
+            ),
+            "a learner's snapshot must be refused"
+        );
+
+        assert_eq!(
+            voter.leader(),
+            Some(voter.id()),
+            "the leader was not unseated"
+        );
+        voter
+            .write(Request(b"after".to_vec()))
+            .await
+            .expect("the voter still leads and commits");
+
+        learner.shutdown().await;
+        voter.shutdown().await;
     }
 }

@@ -9,12 +9,12 @@
 //! stopped reading: `max_concurrent_uni_streams` and a one-deep endpoint queue
 //! are what `weida`'s own backpressure tests use for it.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::time::timeout;
 use weida::{
-    Acknowledgement, IncomingTransfer, Limits, Pusher, Requester, Runtime, RuntimeConfig,
-    Subscriber, TransferMeta,
+    Acknowledgement, IncomingTransfer, Limits, LossCause, PeerEvent, Pusher, Requester, Runtime,
+    RuntimeConfig, Subscriber, TransferMeta,
 };
 use weida_broker::BrokerConfig;
 
@@ -233,6 +233,76 @@ async fn a_stalled_peer_is_reclaimed_at_the_deadline() {
         })
         .await;
     drop(held);
+}
+
+/// A consumer that stops reading is not only unsubscribed: its connection is
+/// closed, so its client notices and its redial subscribes again. It is closed
+/// within the deadline plus a margin, a healthy consumer beside it keeps
+/// receiving throughout, and what the stalled one held is the healthy one's
+/// to take.
+#[tokio::test]
+async fn a_consumer_that_stops_reading_has_its_connection_closed() {
+    const IO_TIMEOUT: Duration = Duration::from_millis(400);
+    /// What the close may take beyond the deadline: the broker's reaction and
+    /// the loopback, not a second deadline.
+    const MARGIN: Duration = Duration::from_millis(1500);
+
+    let harness = Harness::start(BrokerConfig {
+        io_timeout: IO_TIMEOUT,
+        ..BrokerConfig::with_queues(["/jobs"])
+    })
+    .await;
+    let (_stalled_rt, stalled) = harness.stalled_consumer("/jobs").await;
+    let mut events = stalled.events();
+    // Subscribed before anything is published and given credit only once the
+    // stalled consumer has been handed its messages, so it joins before the
+    // stall and cannot take the stalled consumer's share.
+    let (_healthy_rt, healthy) = harness
+        .consumer("/jobs", &[""], RuntimeConfig::default())
+        .await;
+
+    let producer = harness.requester("/jobs").await;
+    for i in 0..6 {
+        within(PROMPTLY, producer.request(format!("job-{i}").as_bytes()))
+            .await
+            .expect("confirmed");
+    }
+    let stalled_since = Instant::now();
+    healthy.grant("", 100).await.expect("grant");
+
+    let lost = within(IO_TIMEOUT + MARGIN, async {
+        loop {
+            match events.recv().await.expect("the endpoint lives") {
+                PeerEvent::Lost { cause, .. } => break cause,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+    assert_eq!(lost, LossCause::PeerClosed);
+    assert!(
+        stalled_since.elapsed() < IO_TIMEOUT + MARGIN,
+        "closed after {:?}",
+        stalled_since.elapsed()
+    );
+
+    // The healthy consumer ends up with every message, the ones the stalled
+    // consumer was holding included.
+    let mut seen = std::collections::BTreeSet::new();
+    within(DEADLINE, async {
+        while seen.len() < 6 {
+            seen.insert(body_of(healthy.recv().await.expect("a delivery")).await);
+        }
+    })
+    .await;
+
+    // The redial subscribes again: the queue counts two consumers once more.
+    within(DEADLINE, async {
+        while harness.broker.consumer_count("/jobs") != Some(2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }
 
 /// One connection's filters add up: eight messages and three matching

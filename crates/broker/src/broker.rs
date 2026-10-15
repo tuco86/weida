@@ -1,17 +1,21 @@
 //! The broker: queues at endpoint paths, and the loop that serves each.
 
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
-use weida::{Acceptor, Acknowledgement, Consumer, ConsumerId, Error, Incoming, Listener};
+use weida::{
+    Acceptor, Acknowledgement, ConnectionId, Consumer, ConsumerId, Error, Incoming, Listener,
+};
 
-use crate::admission::{self, MAX_REPORTS_IN_FLIGHT};
+use crate::admission::{self, MAX_REJECTIONS_IN_FLIGHT, MAX_REPORTS_IN_FLIGHT, Shares};
 use crate::consumers::{Consumers, SubKey};
 use crate::delivery::{self, Dispatch};
-use crate::queue::{DeliveryId, Queue, QueueStats};
+use crate::queue::{DeliveryId, MAX_REFUSALS, Outgoing, Queue, QueueStats, Refused};
 
 /// What this broker can certify about a message, and the list is the whole
 /// list.
@@ -115,12 +119,39 @@ pub struct BrokerConfig {
     /// takes. This prevents a flood of producers that stop mid-message from
     /// costing the queue a task each without bound. At the limit the queue
     /// stops reading new streams until an admission finishes, which QUIC's flow
-    /// control turns into producers waiting — nothing is refused for being
-    /// busy, and nothing waits in a buffer of the broker's own. One producer
-    /// that stops holds one admission, for at most
-    /// [`BrokerConfig::io_timeout`]; it takes as many stalled producers as this
-    /// number to make anyone else wait.
+    /// control turns into producers waiting, and nothing waits in a buffer of
+    /// the broker's own. One producer that stops holds one admission, for at
+    /// most [`BrokerConfig::io_timeout`].
+    ///
+    /// What one **connection** may hold of them is
+    /// [`BrokerConfig::max_inflight_admissions_per_connection`]: without that
+    /// bound it would take a single connection to make everybody else wait.
     pub max_inflight_admissions: usize,
+    /// Admissions one **connection** may have in flight on one queue. Default
+    /// 256, a quarter of the default [`BrokerConfig::max_inflight_admissions`],
+    /// and at least 1.
+    ///
+    /// The pool of admissions is shared, so on its own one connection could
+    /// hold all of it: a connection may open as many streams as its limits
+    /// allow, send a valid header and a byte on each, and keep them for
+    /// [`BrokerConfig::io_timeout`], and the queue would stop reading streams
+    /// — control frames such as SUBSCRIBE and CREDIT included — until they
+    /// ended. This is how many of them one connection may hold. A stream past
+    /// it is refused at once, without a permit: an exchange is answered with
+    /// [`weida::ErrorCode::Rejected`], a one-way transfer is stopped with
+    /// `REJECTED`. The connection pays for its own excess and everybody else
+    /// is served.
+    ///
+    /// Every connection counts for itself, so peers that proved nothing do not
+    /// share one number. What a connection proved changes one thing: the
+    /// connections of one proved key hold this many **together**, so that
+    /// dialling again does not multiply a peer's share.
+    ///
+    /// It is a share, not a guarantee: `max_inflight_admissions` divided by
+    /// this many connections together can still hold the whole pool, and the
+    /// runtime's `max_connections_per_peer` is what bounds how many one peer
+    /// opens. Set them together; a share at or above the pool bounds nothing.
+    pub max_inflight_admissions_per_connection: usize,
     /// How long a wait on a peer may go without progress. Default 10 s.
     ///
     /// Every read of a producer's payload, every write of a delivery, every
@@ -132,9 +163,21 @@ pub struct BrokerConfig {
     /// peer cannot hold on by sending a byte per window.
     ///
     /// A producer past it loses the message it was sending. A consumer past
-    /// it loses its subscription — the message it was being given goes back
-    /// to the head of the queue — and resubscribes like any consumer that was
-    /// removed: the broker has no way to speak to it outside a delivery.
+    /// it has its connection closed with
+    /// [`weida::codes::LIMIT_EXCEEDED`], and so loses every subscription it
+    /// held on that connection: the messages it was holding go back to the
+    /// head of the queue, and the client's redial subscribes again. The
+    /// same happens to a consumer whose delivery write fails at the
+    /// transport. A subscription dropped without closing would leave a client
+    /// that still believes it is subscribed, and the broker has no way to
+    /// speak to a consumer outside a delivery.
+    ///
+    /// A delivery that **never started** because its header is more than
+    /// the consumer's connection says it will read is not a stall and does
+    /// not close anything: that message goes back for other consumers and
+    /// is not offered to that connection again, and after
+    /// [`crate::MAX_REFUSALS`] connections have refused it the queue drops it
+    /// and counts it ([`crate::QueueStats::dropped`]).
     pub io_timeout: Duration,
 }
 
@@ -147,6 +190,7 @@ impl Default for BrokerConfig {
             max_unsettled: 256,
             max_unsettled_per_consumer: 1024,
             max_inflight_admissions: 1024,
+            max_inflight_admissions_per_connection: 256,
             io_timeout: Duration::from_secs(10),
         }
     }
@@ -177,9 +221,15 @@ pub(crate) enum Event {
     /// The bytes are out: the subscription may be given another message while
     /// this one waits for its report.
     Written(DeliveryId),
-    /// The write failed or the consumer stopped reading: the message goes back
-    /// and the subscription is dropped.
+    /// The write failed or the consumer stopped reading: the message goes back,
+    /// the subscription is dropped and the consumer's connection has been
+    /// closed.
     Failed(DeliveryId),
+    /// The delivery never started: its header is more than the consumer's
+    /// connection says it will read. The connection is untouched; the
+    /// message goes back for other consumers and is not offered to that
+    /// connection again.
+    Refused(DeliveryId),
     /// The consumer reported the level the delivery ordered.
     Settled(DeliveryId),
     /// No further cursors are coming and the level never arrived: the
@@ -230,6 +280,12 @@ pub(crate) struct Served {
     pub(crate) admissions: Arc<Semaphore>,
     /// Cursor reports in flight, one permit each.
     pub(crate) reports: Arc<Semaphore>,
+    /// Admissions in flight per connection and per proved peer. See
+    /// [`BrokerConfig::max_inflight_admissions_per_connection`].
+    pub(crate) shares: Arc<Shares<ConnectionId>>,
+    /// Rejections of exchanges past a connection's share, in flight, one
+    /// permit each.
+    pub(crate) rejections: Arc<Semaphore>,
     /// See [`BrokerConfig::io_timeout`].
     pub(crate) io_timeout: Duration,
 }
@@ -292,6 +348,8 @@ impl Broker {
                     wake: Notify::new(),
                     admissions: Arc::new(Semaphore::new(config.max_inflight_admissions.max(1))),
                     reports: Arc::new(Semaphore::new(MAX_REPORTS_IN_FLIGHT)),
+                    shares: Arc::new(Shares::new(config.max_inflight_admissions_per_connection)),
+                    rejections: Arc::new(Semaphore::new(MAX_REJECTIONS_IN_FLIGHT)),
                     io_timeout: config.io_timeout,
                 }),
             );
@@ -413,13 +471,18 @@ impl std::fmt::Debug for Broker {
 /// selected rather than polled in turn, and `accept` returning an error ends
 /// the loop either way.
 ///
-/// **A permit comes before the accept.** The loop reads the next stream off
-/// the transport only while it holds one of the queue's admission permits, and
-/// hands it to the admission task it starts. At the limit the loop stops
-/// reading — QUIC's flow control holds the producers back, with no message
-/// refused and none queued in a second buffer — until an admission finishes,
-/// and what an admission waits on is bounded by its deadline. Control frames
-/// share the channel, so they wait their turn behind streams while it lasts.
+/// **A permit comes before the accept, and a connection's share before the permit.**
+/// The loop reads the next stream off the transport only while it holds one
+/// of the queue's admission permits, and hands it to the admission task it
+/// starts. At the limit the loop stops reading — QUIC's flow control holds the
+/// producers back, with no message queued in a second buffer — until an
+/// admission finishes, and what an admission waits on is bounded by its
+/// deadline. Control frames share the channel, so they wait their turn behind
+/// streams while it lasts, and that is what one peer must not be able to cause
+/// alone: a stream from a connection that already holds its share of the
+/// permits ([`BrokerConfig::max_inflight_admissions_per_connection`]) is
+/// refused before it takes one, so the pool a stalled connection can empty is
+/// its own share of it.
 async fn serve_queue(served: Arc<Served>) {
     let mut events = served
         .event_rx
@@ -471,7 +534,9 @@ async fn serve_queue(served: Arc<Served>) {
 ///
 /// A producer's message does not: it is read in a task that takes the permit,
 /// and when it lands the task rings [`Served::wake`] — only then is there
-/// something to deliver. Anything else leaves the permit for the next accept.
+/// something to deliver. Anything else leaves the permit for the next accept,
+/// and so does a stream from a connection that already holds its share of the
+/// permits: that one is refused here, and costs nobody else a wait.
 fn handle(
     served: &Arc<Served>,
     incoming: Incoming,
@@ -479,13 +544,32 @@ fn handle(
 ) -> bool {
     match incoming {
         Incoming::Exchange(request) => {
+            let Some(share) = served
+                .shares
+                .claim(request.connection(), request.meta().peer.as_ref())
+            else {
+                admission::reject_over_share(served, request);
+                return false;
+            };
             let permit = permit.take().expect("an accept follows a permit");
-            admission::start_exchange(served, request, permit);
+            admission::start_exchange(served, request, permit, share);
             false
         }
         Incoming::Stream(transfer) => {
+            let Some(share) = served
+                .shares
+                .claim(transfer.connection(), transfer.meta().peer.as_ref())
+            else {
+                // Dropping the unread transfer stops the stream with
+                // `REJECTED`, which is the only refusal a one-way stream has.
+                tracing::debug!(
+                    path = served.acceptor.path(),
+                    "a connection is past its share of admissions; refusing a one-way transfer"
+                );
+                return false;
+            };
             let permit = permit.take().expect("an accept follows a permit");
-            admission::start_stream(served, transfer, permit);
+            admission::start_stream(served, transfer, permit, share);
             false
         }
         Incoming::Subscribed(consumer) => {
@@ -592,6 +676,27 @@ fn apply(served: &Served, event: Event) {
                 );
             }
         }
+        Event::Refused(id) => match queue.refuse(id) {
+            Some(Refused::Returned(owner)) => {
+                consumers.refused(&owner, id);
+                tracing::debug!(
+                    path = served.acceptor.path(),
+                    "a consumer refused a message its connection will not read; \
+                     it goes back for other consumers"
+                );
+            }
+            Some(Refused::Dropped(owner)) => {
+                consumers.refused(&owner, id);
+                // A message the producer was told was accepted, and no
+                // consumer will read: the operator has to hear of it.
+                tracing::warn!(
+                    path = served.acceptor.path(),
+                    refusals = MAX_REFUSALS,
+                    "dropping a message that every consumer offered it refused"
+                );
+            }
+            None => {}
+        },
         Event::Failed(id) => {
             if let Some(owner) = queue.requeue(id) {
                 consumers.fail(&owner);
@@ -621,8 +726,8 @@ fn apply(served: &Served, event: Event) {
 ///
 /// Every iteration moves one message out of the line, so the loop ends. A
 /// delivery that later fails puts its message back and drops its subscription,
-/// and the event that says so runs this again: nobody is retried in a loop
-/// here, which is what the old per-scan exclusion list was for.
+/// and the event that says so runs this again; one that is refused goes back
+/// with its refuser remembered on it, so nobody is retried in a loop here.
 fn pump(served: &Served) {
     while let Some(dispatch) = take_next(served) {
         delivery::spawn(served, dispatch);
@@ -636,45 +741,535 @@ fn pump(served: &Served) {
 /// in this order — queue, then consumers. A message is taken **only** when a
 /// consumer for it exists: a queue with no credit keeps its messages, which is
 /// the point of a queue.
+fn take_next(served: &Served) -> Option<Dispatch> {
+    let mut queue = served.queue.lock().expect("queue mutex poisoned");
+    let mut consumers = served.consumers.lock().expect("consumer mutex poisoned");
+    let (outgoing, consumer) = select(&mut queue, &mut consumers)?;
+    Some(Dispatch { consumer, outgoing })
+}
+
+/// The first message in line that some ready subscription may have, taken out
+/// of the line and counted against that subscription.
 ///
-/// **What this costs is bounded by what changed, not by what is queued.** With
-/// no ready subscription it is one comparison — however many messages wait
-/// and however many subscriptions are silent. With some, the scan starts where
-/// the last one stopped looking ([`Queue::scan_from`]), so an admission costs
-/// one message's worth of matching, and the whole line is walked again only
-/// when a subscription became ready or a message went back to the front. A
-/// consumer with a filter nothing queued selects, and a backlog nobody ready
-/// wants, were each a full pass per event.
+/// **What this costs is bounded by what is new, not by what is queued.** Each
+/// ready subscription remembers what it has been offered
+/// ([`crate::queue::Seen`]), so a scan visits only the messages that at least
+/// one ready subscription has not seen, and offers each message only to the
+/// subscriptions that have not. With nothing new it is one comparison,
+/// however many messages wait and however many subscriptions are silent. A
+/// subscription whose write ended is offered the messages that arrived while
+/// it was busy and nothing else; a message that went back is new to
+/// everybody and is offered once. Offering the whole line to every ready
+/// consumer again after each write would cost the backlog times the number
+/// of idle consumers per delivery, which is what the marks avoid.
+///
+/// **A message is offered in line order and taken by the first message's
+/// taker**, so a backlog nobody wants never blocks what is behind it, and a
+/// connection that refused a message is not asked about it again.
 ///
 /// **`max_unsettled` and `max_unsettled_per_consumer` are enforced by who is
 /// ready**, which is the one place they can be: a subscription at its bound is
 /// not in the set, so a consumer that stops reporting stops being given
 /// messages — and the ones it already holds stay charged against the queue's
 /// budget until it reports or its subscription goes.
-fn take_next(served: &Served) -> Option<Dispatch> {
-    let mut queue = served.queue.lock().expect("queue mutex poisoned");
-    let mut consumers = served.consumers.lock().expect("consumer mutex poisoned");
-    if consumers.take_gained() {
-        queue.rescan();
-    }
-    if !consumers.any_ready() {
-        return None;
-    }
-    for index in queue.scan_from()..queue.len() {
-        // The topic is borrowed for exactly the length of the question, so a
-        // scan that finds nothing allocates nothing.
-        let topic = queue.topic_at(index).expect("index is in range");
-        let Some(key) = consumers.pick(topic) else {
+fn select<I, H>(
+    queue: &mut Queue<SubKey<I>>,
+    consumers: &mut Consumers<I, H>,
+) -> Option<(Outgoing, Arc<H>)>
+where
+    I: Copy + Ord + Hash + Debug,
+{
+    consumers.observe(queue.frontier());
+    let from = consumers.oldest_unseen()?;
+    for index in queue.unseen_from(from) {
+        // Borrowed for exactly the length of the question, so a scan that
+        // finds nothing allocates nothing.
+        let message = queue.peek(index).expect("index is in range");
+        let at = message.at;
+        let Some(key) = consumers.pick(at, message.topic, |connection| {
+            message.refused.contains(connection)
+        }) else {
             continue;
         };
+        // Before the taker leaves the ready set, so that its own mark moves
+        // with everybody else's.
+        consumers.offered_through(at);
         let outgoing = queue
             .dispatch(index, key.clone())
             .expect("index is in range");
         let consumer = consumers
             .dispatch(&key, outgoing.id)
             .expect("a picked subscription exists");
-        return Some(Dispatch { consumer, outgoing });
+        return Some((outgoing, consumer));
     }
-    queue.scanned();
+    consumers.offered_all();
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use weida::filter::matches;
+
+    use super::*;
+    use crate::queue::QueuedMessage;
+
+    type Line = Queue<SubKey<u32>>;
+    /// The handle is the subscription's own name, so that a test can tell who
+    /// was given a message.
+    type Table = Consumers<u32, (u32, String)>;
+
+    fn key(id: u32, filter: &str) -> SubKey<u32> {
+        SubKey {
+            id,
+            filter: Arc::from(filter),
+        }
+    }
+
+    fn line() -> Line {
+        Queue::new(usize::MAX / 2)
+    }
+
+    /// Puts a message with `topic` at the back of the line; its payload is
+    /// `n`, so that a test can tell which message it was given.
+    fn add(line: &mut Line, topic: &str, n: u16) {
+        let message = QueuedMessage {
+            body: Arc::new(n.to_be_bytes().to_vec()),
+            topic: Some(topic.to_owned()),
+            content_type: None,
+            trace: None,
+            attempts: 0,
+        };
+        let cost = message.charge();
+        assert!(line.reserve(cost), "room for the message");
+        line.push(cost, message).expect("room for the message");
+    }
+
+    fn table() -> Table {
+        Consumers::new(3, 5)
+    }
+
+    /// Subscribes `filter` on connection `id` and grants it `limit`.
+    fn join(table: &mut Table, id: u32, filter: &str, limit: u64) {
+        table.subscribe(id, Arc::from(filter), (id, filter.to_owned()));
+        table.grant(id, filter, limit);
+    }
+
+    /// One scan: which message went to whom, as which delivery.
+    fn take(line: &mut Line, table: &mut Table) -> Option<(u16, SubKey<u32>, DeliveryId)> {
+        let (outgoing, handle) = select(line, table)?;
+        let message = u16::from_be_bytes([outgoing.body[0], outgoing.body[1]]);
+        Some((message, key(handle.0, &handle.1), outgoing.id))
+    }
+
+    /// The write of delivery `id` ended.
+    fn written(line: &mut Line, table: &mut Table, id: DeliveryId) {
+        let owner = line.written(id).expect("outstanding").clone();
+        table.written(&owner, id);
+    }
+
+    #[test]
+    fn a_backlog_nobody_wants_does_not_block_what_is_behind_it() {
+        let mut line = line();
+        let mut table = table();
+        add(&mut line, "cold", 1);
+        add(&mut line, "hot", 2);
+        join(&mut table, 1, "hot", 10);
+
+        let (message, taker, _) = take(&mut line, &mut table).expect("the hot message");
+        assert_eq!((message, taker), (2, key(1, "hot")));
+        assert_eq!(line.len(), 1, "the unwanted message is still there");
+    }
+
+    #[test]
+    fn a_scan_that_found_nothing_is_not_repeated_until_something_is_new() {
+        let mut line = line();
+        let mut table = table();
+        for n in 0..50 {
+            add(&mut line, "cold", n);
+        }
+        join(&mut table, 1, "hot", 10);
+        assert!(take(&mut line, &mut table).is_none());
+        table.observe(line.frontier());
+        assert_eq!(
+            table.oldest_unseen(),
+            None,
+            "everything ready has been offered everything"
+        );
+
+        // A delivery and the end of its write change nothing for the backlog
+        // behind it.
+        add(&mut line, "hot", 100);
+        let (_, _, id) = take(&mut line, &mut table).expect("the hot message");
+        written(&mut line, &mut table, id);
+        table.observe(line.frontier());
+        assert_eq!(
+            table.oldest_unseen(),
+            None,
+            "back in the set to a queue with nothing new: no scan, not even of the backlog"
+        );
+        assert!(take(&mut line, &mut table).is_none());
+    }
+
+    #[test]
+    fn a_subscription_that_was_busy_is_offered_what_arrived_meanwhile() {
+        let mut line = line();
+        let mut table = table();
+        join(&mut table, 1, "a", 10);
+        join(&mut table, 2, "b", 10);
+        add(&mut line, "a", 1);
+        let (_, taker, id) = take(&mut line, &mut table).expect("offered");
+        assert_eq!(taker, key(1, "a"));
+
+        // Subscription 1 is writing; the next message is its to take and
+        // nobody ready wants it.
+        add(&mut line, "a", 2);
+        assert!(take(&mut line, &mut table).is_none());
+
+        written(&mut line, &mut table, id);
+        let (message, taker, _) = take(&mut line, &mut table).expect("offered");
+        assert_eq!(
+            (message, taker),
+            (2, key(1, "a")),
+            "it was not ready when the message was offered, so it is new to it"
+        );
+    }
+
+    #[test]
+    fn a_message_that_went_back_is_offered_to_everybody_once() {
+        let mut line = line();
+        let mut table = table();
+        join(&mut table, 1, "a", 10);
+        add(&mut line, "a", 1);
+        let (_, owner, id) = take(&mut line, &mut table).expect("offered");
+        written(&mut line, &mut table, id);
+
+        // The report ended without a settlement: the message is the queue's.
+        line.requeue(id).expect("outstanding");
+        table.released(&owner, id);
+        let (message, taker, _) = take(&mut line, &mut table).expect("offered again");
+        assert_eq!(
+            (message, taker),
+            (1, key(1, "a")),
+            "the same subscription is offered it again: it is not the refuser"
+        );
+    }
+
+    #[test]
+    fn a_refused_message_goes_to_another_connection_and_never_back_to_the_refuser() {
+        let mut line = line();
+        let mut table = table();
+        join(&mut table, 1, "a", 10);
+        join(&mut table, 1, "#", 10);
+        add(&mut line, "a", 1);
+        let (message, first, id) = take(&mut line, &mut table).expect("offered");
+        assert_eq!(message, 1);
+
+        // Connection 1 refuses it; the credit comes back and both of its
+        // subscriptions are ready again, and neither is offered it.
+        assert_eq!(line.refuse(id), Some(Refused::Returned(first.clone())));
+        table.refused(&first, id);
+        assert_eq!(table.delivered(1, &first.filter), Some(0));
+        assert!(
+            take(&mut line, &mut table).is_none(),
+            "the connection that refused it holds the only subscriptions there are"
+        );
+        assert_eq!(line.len(), 1, "it waits for somebody who will read it");
+
+        join(&mut table, 2, "#", 10);
+        let (message, taker, _) = take(&mut line, &mut table).expect("offered to the new one");
+        assert_eq!((message, taker), (1, key(2, "#")));
+    }
+
+    /// What the test believes about one subscription, kept apart from the
+    /// table so that the table is checked against something simpler than
+    /// itself.
+    #[derive(Clone, Debug)]
+    struct Believed {
+        limit: u64,
+        delivered: u64,
+        unsettled: usize,
+        writing: Option<DeliveryId>,
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as usize % n
+        }
+    }
+
+    const TOPICS: [&str; 4] = ["a", "b", "a.x", "b.x"];
+    const FILTERS: [&str; 6] = ["", "a", "b", "a.*", "#", "b.x"];
+    const MAX_UNSETTLED: usize = 3;
+    const PER_CONNECTION: usize = 5;
+
+    struct World {
+        line: Line,
+        table: Table,
+        believed: BTreeMap<(u32, String), Believed>,
+        /// Outstanding deliveries and who holds each.
+        out: Vec<(DeliveryId, SubKey<u32>)>,
+        arrivals: u16,
+        seed: u64,
+        step: usize,
+        deliveries: usize,
+        refusals: usize,
+    }
+
+    fn name(key: &SubKey<u32>) -> (u32, String) {
+        (key.id, key.filter.to_string())
+    }
+
+    impl World {
+        fn new(seed: u64) -> World {
+            World {
+                line: line(),
+                table: Consumers::new(MAX_UNSETTLED, PER_CONNECTION),
+                believed: BTreeMap::new(),
+                out: Vec::new(),
+                arrivals: 0,
+                seed,
+                step: 0,
+                deliveries: 0,
+                refusals: 0,
+            }
+        }
+
+        fn ready(&self, id: u32, filter: &str) -> bool {
+            let sub = &self.believed[&(id, filter.to_owned())];
+            let connection: usize = self
+                .believed
+                .iter()
+                .filter(|((other, _), _)| *other == id)
+                .map(|(_, sub)| sub.unsettled)
+                .sum();
+            sub.delivered < sub.limit
+                && sub.writing.is_none()
+                && sub.unsettled < MAX_UNSETTLED
+                && connection < PER_CONNECTION
+        }
+
+        /// What a scan has to answer, worked out from first principles: the
+        /// first message in line that some ready subscription whose
+        /// connection has not refused it selects, and who those are.
+        fn expected(&self) -> Option<(u16, BTreeSet<(u32, String)>)> {
+            for index in 0..self.line.len() {
+                let message = self.line.peek(index).expect("in range");
+                let takers: BTreeSet<(u32, String)> = self
+                    .believed
+                    .keys()
+                    .filter(|(id, filter)| {
+                        self.ready(*id, filter)
+                            && !message.refused.contains(id)
+                            && matches(message.topic, filter)
+                    })
+                    .cloned()
+                    .collect();
+                if !takers.is_empty() {
+                    let body = self.line.body_at(index).expect("in range");
+                    return Some((u16::from_be_bytes([body[0], body[1]]), takers));
+                }
+            }
+            None
+        }
+
+        /// Runs the scan until it finds nothing, checking every answer.
+        fn pump(&mut self) {
+            let (seed, step) = (self.seed, self.step);
+            loop {
+                let expected = self.expected();
+                let got = take(&mut self.line, &mut self.table);
+                match (expected, got) {
+                    (None, None) => return,
+                    (Some((message, takers)), Some((got, taker, id))) => {
+                        let who = name(&taker);
+                        assert_eq!(
+                            got, message,
+                            "seed {seed} step {step}: not the first message somebody wants"
+                        );
+                        assert!(
+                            takers.contains(&who),
+                            "seed {seed} step {step}: {who:?} may not take it, {takers:?} may"
+                        );
+                        let sub = self.believed.get_mut(&who).expect("believed");
+                        sub.delivered += 1;
+                        sub.unsettled += 1;
+                        sub.writing = Some(id);
+                        self.out.push((id, taker));
+                        self.deliveries += 1;
+                    }
+                    (expected, got) => panic!(
+                        "seed {seed} step {step}: the scan answered {got:?} where {expected:?} \
+                         was due"
+                    ),
+                }
+            }
+        }
+
+        fn believe(&mut self, owner: &SubKey<u32>) -> &mut Believed {
+            self.believed.get_mut(&name(owner)).expect("believed")
+        }
+
+        /// An outstanding delivery picked by `rng`, as its place in `out`.
+        fn pick(&self, rng: &mut Rng, writing: bool) -> Option<usize> {
+            let candidates: Vec<usize> = (0..self.out.len())
+                .filter(|&i| {
+                    let (id, owner) = &self.out[i];
+                    !writing || self.believed[&name(owner)].writing == Some(*id)
+                })
+                .collect();
+            (!candidates.is_empty()).then(|| candidates[rng.below(candidates.len())])
+        }
+
+        /// A subscription picked by `rng`.
+        fn some_sub(&self, rng: &mut Rng) -> Option<(u32, String)> {
+            self.believed
+                .keys()
+                .nth(rng.below(self.believed.len().max(1)))
+                .cloned()
+        }
+
+        /// One thing a consumer, a producer or the runtime can do to a queue,
+        /// done the way the broker's loop does it.
+        fn act(&mut self, rng: &mut Rng) {
+            match rng.below(12) {
+                0..=3 => {
+                    self.arrivals += 1;
+                    let topic = TOPICS[rng.below(TOPICS.len())];
+                    add(&mut self.line, topic, self.arrivals);
+                }
+                4 => {
+                    let id = 1 + rng.below(3) as u32;
+                    let filter = FILTERS[rng.below(FILTERS.len())];
+                    self.table
+                        .subscribe(id, Arc::from(filter), (id, filter.to_owned()));
+                    let more = rng.below(3) as u64;
+                    let sub = self
+                        .believed
+                        .entry((id, filter.to_owned()))
+                        .or_insert(Believed {
+                            limit: 0,
+                            delivered: 0,
+                            unsettled: 0,
+                            writing: None,
+                        });
+                    sub.limit = sub.limit.max(sub.delivered + 1 + more);
+                    self.table.grant(id, filter, sub.limit);
+                }
+                5 => {
+                    let Some((id, filter)) = self.some_sub(rng) else {
+                        return;
+                    };
+                    let more = rng.below(3) as u64;
+                    let sub = self.believe(&key(id, &filter));
+                    sub.limit = sub.limit.max(sub.delivered + 1 + more);
+                    let limit = sub.limit;
+                    self.table.grant(id, &filter, limit);
+                }
+                6 => {
+                    let Some((id, filter)) = self.some_sub(rng) else {
+                        return;
+                    };
+                    let gone = key(id, &filter);
+                    self.table.remove(id, Some(&filter));
+                    self.line.requeue_all(|owner| *owner == gone);
+                    self.believed.remove(&(id, filter));
+                    self.out.retain(|(_, owner)| *owner != gone);
+                }
+                7 => {
+                    let Some(at) = self.pick(rng, true) else {
+                        return;
+                    };
+                    let (id, owner) = self.out[at].clone();
+                    self.line.written(id).expect("outstanding");
+                    self.table.written(&owner, id);
+                    self.believe(&owner).writing = None;
+                }
+                8 | 9 => {
+                    let Some(at) = self.pick(rng, false) else {
+                        return;
+                    };
+                    let (id, owner) = self.out.remove(at);
+                    // Settled or lost: the table sees the same release.
+                    if rng.below(2) == 0 {
+                        self.line.settle(id).expect("outstanding");
+                    } else {
+                        self.line.requeue(id).expect("outstanding");
+                    }
+                    self.table.released(&owner, id);
+                    let sub = self.believe(&owner);
+                    sub.unsettled -= 1;
+                    if sub.writing == Some(id) {
+                        sub.writing = None;
+                    }
+                }
+                10 => {
+                    let Some(at) = self.pick(rng, true) else {
+                        return;
+                    };
+                    let (id, owner) = self.out.remove(at);
+                    match self.line.refuse(id).expect("outstanding") {
+                        Refused::Returned(held) | Refused::Dropped(held) => {
+                            assert_eq!(held, owner);
+                        }
+                    }
+                    self.refusals += 1;
+                    self.table.refused(&owner, id);
+                    let sub = self.believe(&owner);
+                    sub.delivered -= 1;
+                    sub.unsettled -= 1;
+                    sub.writing = None;
+                }
+                _ => {
+                    let Some(at) = self.pick(rng, true) else {
+                        return;
+                    };
+                    let (id, owner) = self.out[at].clone();
+                    self.line.requeue(id).expect("outstanding");
+                    self.table.fail(&owner);
+                    self.line.requeue_all(|held| *held == owner);
+                    self.believed.remove(&name(&owner));
+                    self.out.retain(|(_, held)| *held != owner);
+                }
+            }
+        }
+    }
+
+    /// The scan agrees, after every step of long random histories, with the
+    /// plain definition: the first message in line that some ready,
+    /// not-refusing subscription selects, and a subscription that may take
+    /// it. It also never answers `None` while such a message exists, which is
+    /// what a mark that moved too far would break.
+    #[test]
+    fn the_scan_finds_exactly_what_a_plain_walk_of_the_line_would() {
+        let (mut deliveries, mut refusals) = (0, 0);
+        for seed in 1..=40u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut world = World::new(seed);
+            for step in 0..600 {
+                world.step = step;
+                world.act(&mut rng);
+                world.pump();
+                assert_eq!(
+                    world.table.len(),
+                    world.believed.len(),
+                    "seed {seed} step {step}: the table and the test disagree on who is subscribed"
+                );
+            }
+            deliveries += world.deliveries;
+            refusals += world.refusals;
+        }
+        // The histories have to exercise what the scan decides, or agreeing
+        // with the plain walk proves nothing.
+        assert!(deliveries > 3_000, "only {deliveries} deliveries were made");
+        assert!(refusals > 200, "only {refusals} deliveries were refused");
+    }
 }

@@ -30,8 +30,19 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// Starts a broker serving `config`'s queues.
+    /// Starts a broker serving `config`'s queues, for peers that need not
+    /// prove anything.
     pub async fn start(config: BrokerConfig) -> Harness {
+        Harness::start_with(config, |tls| tls).await
+    }
+
+    /// Starts a broker serving `config`'s queues behind a server whose TLS
+    /// `shape` has adjusted, for the tests that need peers to be told apart.
+    #[allow(dead_code)]
+    pub async fn start_with(
+        config: BrokerConfig,
+        shape: impl FnOnce(ServerTls) -> ServerTls,
+    ) -> Harness {
         let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
         let listener = runtime.listener();
         let identity = Identity::generate().expect("identity");
@@ -39,7 +50,7 @@ impl Harness {
         let binding = listener
             .bind_quic(
                 "127.0.0.1:0".parse().expect("loopback address"),
-                ServerTls::new(identity),
+                shape(ServerTls::new(identity)),
             )
             .await
             .expect("bind");

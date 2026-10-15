@@ -527,3 +527,67 @@ async fn a_learner_may_write_but_not_change_the_membership() {
     a.consensus.shutdown().await;
     b.consensus.shutdown().await;
 }
+
+/// Claim: the group never lists more nodes than a follower decodes, however
+/// many adds ask at once. With room for exactly one more, two adds that run
+/// together used to both pass the count and both append, giving a membership
+/// every follower refuses for ever; now they take turns, and one of them is
+/// told the group is full.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_adds_racing_for_the_last_place_cannot_both_have_it() {
+    let mut quick = config();
+    quick.forward_timeout = Duration::from_millis(100);
+    let a = TestNode::start(quick).await;
+    a.consensus.bootstrap().await.expect("bootstrap");
+    let id = a.id();
+    eventually("A leads itself", || async {
+        a.consensus.leader() == Some(id)
+    })
+    .await;
+
+    // A and sixty-two nodes that never answer: one place left of
+    // `MAX_MEMBERS`.
+    for n in 1..(weida_raft::codec::MAX_MEMBERS as u8 - 1) {
+        a.consensus
+            .add_node(dead_node(n))
+            .await
+            .expect("a place for it");
+    }
+
+    let (first, second) = tokio::join!(
+        a.consensus.add_node(dead_node(200)),
+        a.consensus.add_node(dead_node(201))
+    );
+    let full = [&first, &second]
+        .iter()
+        .filter(|outcome| matches!(outcome, Err(Error::TooManyNodes)))
+        .count();
+    assert_eq!(
+        (first.is_ok() as u8) + (second.is_ok() as u8),
+        1,
+        "exactly one of two racing adds has the last place: {first:?} / {second:?}"
+    );
+    assert_eq!(full, 1, "the other is told the group is full");
+    a.consensus.shutdown().await;
+}
+
+/// Claim: a node URL longer than a follower decodes is refused where it is
+/// made, so no membership that lists it can be appended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_url_a_follower_could_not_decode_is_refused_where_it_is_made() {
+    let a = bootstrapped().await;
+    let long = Node {
+        url: format!(
+            "weida://{}@{}:9/raft",
+            Fingerprint::from_bytes([5; 32]),
+            "a".repeat(2000)
+        ),
+    };
+    let refused = a.consensus.add_node(long).await;
+    assert!(matches!(refused, Err(Error::InvalidNode(_))), "{refused:?}");
+    a.consensus
+        .write(Request(b"still".to_vec()))
+        .await
+        .expect("the group is as it was");
+    a.consensus.shutdown().await;
+}

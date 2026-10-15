@@ -73,20 +73,35 @@
 //! and reacts to how they end. A producer that stops half way through a
 //! message, and a consumer that grants credit and stops reading, therefore cost
 //! themselves a task and a deadline and cost every other producer and consumer
-//! nothing. Three bounds keep that from becoming the problem it solves:
+//! nothing. Four bounds keep that from becoming the problem it solves:
 //!
 //! - a message is charged to `queue_bytes` **as it arrives**, in steps, so
 //!   concurrent producers cannot each be promised the whole remainder
 //!   ([`QueueStats::reserved`] shows what is promised and unused);
 //! - [`BrokerConfig::max_inflight_admissions`] admissions run at once; past
 //!   that the queue stops reading new streams until one finishes, so producers
-//!   wait on QUIC's flow control and nothing is refused for being busy;
+//!   wait on QUIC's flow control and nothing queues in a buffer of the
+//!   broker's own;
+//! - one connection holds at most
+//!   [`BrokerConfig::max_inflight_admissions_per_connection`] of those, and so
+//!   do the connections of one proved peer together, so the one that stalls is
+//!   the one that is refused: a stream past its share is rejected at once and
+//!   everybody else's is read;
 //! - a peer that moves bytes slower than [`MIN_PEER_RATE`] is treated as
 //!   stalled after about one window, however steadily it trickles.
 //!
 //! What a stall costs: a producer loses the message it was sending; a consumer
-//! loses its subscription, the message it was being given goes back to the
-//! head of the queue, and it resubscribes like any consumer that was removed.
+//! has its connection closed with `LIMIT_EXCEEDED` (`docs/PROTOCOL.md` §7), so
+//! every subscription it held on it ends, the messages it was holding go back
+//! to the head of the queue, and its client's redial subscribes again. A
+//! delivery write that fails at the transport closes the connection the same
+//! way.
+//!
+//! A delivery that never starts is not a stall. When a message's header is more
+//! than a consumer's connection said it will read, the message goes back to the
+//! head of the queue for other consumers, that connection is not offered it
+//! again, and the connection stays open. A message that [`MAX_REFUSALS`]
+//! connections refused is dropped and counted ([`QueueStats::dropped`]).
 //!
 //! Messages enter a queue in the order they **finish arriving**. QUIC orders
 //! bytes within a stream and nothing between streams, and a queue that held a
@@ -135,4 +150,4 @@ mod queue;
 
 pub use broker::{Achieved, Broker, BrokerConfig};
 pub use peer::MIN_PEER_RATE;
-pub use queue::{PER_MESSAGE_OVERHEAD, QueueStats};
+pub use queue::{MAX_REFUSALS, PER_MESSAGE_OVERHEAD, QueueStats};

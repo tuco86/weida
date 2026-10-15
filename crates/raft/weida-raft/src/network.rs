@@ -304,14 +304,20 @@ impl RaftNetwork<TypeConfig> for Peer {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         let entries = rpc.entries.len() as u64;
-        let header = codec::encode_rpc(&Rpc::AppendEntries(rpc));
+        let rpc = Rpc::AppendEntries(rpc);
+        // What the peer measures its cap against, counted without building
+        // it: a batch of entries that each weigh almost the cap is not worth
+        // a second copy of itself to be told it is too large.
+        let size = codec::rpc_len(&rpc);
+        let max = self.network.inner.config.max_rpc_bytes;
         // The peer refuses a message over its cap; asking openraft for a
         // smaller batch is the only way such a batch ever gets through.
-        if header.len() > self.network.inner.config.max_rpc_bytes && entries > 1 {
+        if size > max && entries > 1 {
             return Err(RPCError::PayloadTooLarge(
-                PayloadTooLarge::new_entries_hint(entries / 2),
+                PayloadTooLarge::new_entries_hint(entries_that_fit(entries, size, max)),
             ));
         }
+        let header = codec::encode_rpc(&rpc);
         let reply = self
             .exchange(RPCTypes::AppendEntries, &header, None, option.hard_ttl())
             .await?;
@@ -352,5 +358,49 @@ impl RaftNetwork<TypeConfig> for Peer {
             outcome = call => outcome?,
         };
         Ok(codec::decode_snapshot_response(&reply).map_err(Failure::decode)?)
+    }
+}
+
+/// How many of `entries` entries fit under `max` bytes, judging by what the
+/// whole batch of them weighs.
+///
+/// Derived from the bytes and not halved from the count: one retry usually
+/// fits where halving takes several, each of them a batch loaded and
+/// measured. At least one, because a single entry is sent whatever it
+/// weighs, and never the whole batch, which is the one that was too large.
+fn entries_that_fit(entries: u64, size: usize, max: usize) -> u64 {
+    let fit = u128::from(entries) * max as u128 / size.max(1) as u128;
+    u64::try_from(fit)
+        .unwrap_or(u64::MAX)
+        .clamp(1, entries.saturating_sub(1).max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::entries_that_fit;
+
+    #[test]
+    fn the_hint_follows_the_bytes() {
+        assert_eq!(
+            entries_that_fit(10, 40, 16),
+            4,
+            "a batch of 40 bytes into 16"
+        );
+        assert_eq!(entries_that_fit(64, 128, 64), 32);
+    }
+
+    #[test]
+    fn the_hint_is_never_zero_and_never_the_whole_batch() {
+        assert_eq!(
+            entries_that_fit(10, 1_000_000, 16),
+            1,
+            "one entry is always sent"
+        );
+        assert_eq!(
+            entries_that_fit(10, 17, 16),
+            9,
+            "the batch that was too large is not offered again"
+        );
+        assert_eq!(entries_that_fit(2, 17, 16), 1);
     }
 }

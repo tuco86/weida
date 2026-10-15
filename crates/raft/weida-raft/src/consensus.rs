@@ -129,6 +129,7 @@ impl Consensus {
             id,
             max_rpc_bytes: config.max_rpc_bytes,
             catch_up: config.forward_timeout / 2,
+            membership_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
         let server = runtime.exec().spawn(server::serve(
             replier,
@@ -219,6 +220,12 @@ impl Consensus {
     ///
     /// Refused with [`Error::TooManyNodes`] when the group already lists
     /// [`codec::MAX_MEMBERS`] nodes, and, on the leader, only a voter may ask.
+    ///
+    /// Once begun, the change runs to its end even if this future is dropped
+    /// (a timeout around it, say): a change of voters is two committed
+    /// entries, and abandoning it between them would leave the group in a
+    /// joint configuration. Changes take turns, and one that finds an
+    /// earlier change left unfinished finishes it first.
     pub async fn add_node(&self, node: Node) -> Result<Role, Error> {
         match self.on_leader(ForwardOp::AddNode(node)).await? {
             Done::Added(role) => Ok(role),
@@ -350,6 +357,12 @@ pub(crate) struct Ops {
     /// How long `add_node` waits for a node it just added to catch up before
     /// it answers that the node is still a learner.
     catch_up: Duration,
+    /// Held by a change of membership from its first look at the membership
+    /// to its last step, so that changes take turns. What a change checks —
+    /// that the group has room for another node — and what it does are then
+    /// one step to every other change, and what an earlier change left
+    /// behind is seen by the next.
+    membership_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Ops {
@@ -443,14 +456,14 @@ impl Ops {
     /// Copies the operation to keep the caller's: a client operation that may
     /// still have to be forwarded afterwards needs it again. The server's
     /// path, which does not, uses [`Ops::execute`].
-    pub(crate) async fn execute_local(&self, op: &ForwardOp) -> ForwardOutcome {
+    pub(crate) async fn execute_local(self: &Arc<Self>, op: &ForwardOp) -> ForwardOutcome {
         self.execute(op.clone()).await
     }
 
     /// Carries `op` out on this node, which must lead; never forwards, and
     /// consumes the operation, so a payload of megabytes is moved into the
     /// log instead of copied.
-    pub(crate) async fn execute(&self, op: ForwardOp) -> ForwardOutcome {
+    pub(crate) async fn execute(self: &Arc<Self>, op: ForwardOp) -> ForwardOutcome {
         match op {
             ForwardOp::Write(request) => {
                 // The followers refuse an envelope over their own cap, and a
@@ -474,9 +487,83 @@ impl Ops {
                 }
                 Err(e) => ForwardOutcome::Failed(raft_error(e)),
             },
-            ForwardOp::AddNode(node) => self.add_node(&node).await,
-            ForwardOp::RemoveNode(id) => self.remove_node(&id).await,
+            ForwardOp::AddNode(node) => {
+                self.membership_change(move |ops| async move { ops.add_node(&node).await })
+                    .await
+            }
+            ForwardOp::RemoveNode(id) => {
+                self.membership_change(move |ops| async move { ops.remove_node(&id).await })
+                    .await
+            }
         }
+    }
+
+    /// Carries a membership change out **to its end**, whether or not whoever
+    /// asked keeps waiting.
+    ///
+    /// A change of voters is two committed entries, the joint configuration
+    /// and then the uniform one, and openraft leaves the second to its
+    /// caller: a future dropped between them — the forwarder's timeout, an
+    /// application's — leaves the group in the joint configuration, where every
+    /// commit needs a majority of both. So the change runs in a task of its
+    /// own, and a caller that stops waiting abandons the answer and not the
+    /// change. The turn is waited for here, in the caller's own future, so a
+    /// caller that gives up while it waits starts nothing; once it has the
+    /// turn it is the only change there is, and so the only task there can
+    /// be.
+    async fn membership_change<F, Fut>(self: &Arc<Self>, change: F) -> ForwardOutcome
+    where
+        F: FnOnce(Arc<Ops>) -> Fut + Send + 'static,
+        Fut: Future<Output = ForwardOutcome> + Send + 'static,
+    {
+        let turn = Arc::clone(&self.membership_lock).lock_owned().await;
+        let ops = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let _turn = turn;
+            change(ops).await
+        });
+        match task.await {
+            Ok(outcome) => outcome,
+            Err(e) => ForwardOutcome::Failed(Error::Raft(format!(
+                "a membership change ended without an answer: {e}"
+            ))),
+        }
+    }
+
+    /// The effective membership, read from the engine's own state.
+    ///
+    /// What a change has to start from. The metrics channel trails the
+    /// engine, so a change decided on what it last said can start from a
+    /// membership that has already moved.
+    async fn effective(&self) -> Result<Membership<NodeId, Node>, ForwardOutcome> {
+        self.raft
+            .with_raft_state(|st| st.membership_state.effective().membership().clone())
+            .await
+            .map_err(|e| ForwardOutcome::Failed(raft_error(e)))
+    }
+
+    /// The effective membership once any change of voters that was begun has
+    /// been ended.
+    ///
+    /// Under a joint configuration the group looks uniform — a node is a
+    /// voter if either configuration lists it — and every commit quietly
+    /// needs a majority of both. A change that was begun and never ended, by
+    /// a leader that was replaced or a process that stopped between the two
+    /// entries, would stay that way until some unrelated change moved it on,
+    /// so whoever finds it finishes it first.
+    async fn settled(&self) -> Result<Membership<NodeId, Node>, ForwardOutcome> {
+        let membership = self.effective().await?;
+        let configs = membership.get_joint_config();
+        if configs.len() < 2 {
+            return Ok(membership);
+        }
+        let last = configs.last().cloned().unwrap_or_default();
+        tracing::info!("finishing a membership change that was begun and not ended");
+        self.raft
+            .change_membership(ChangeMembers::ReplaceAllVoters(last), false)
+            .await
+            .map_err(|e| self.write_failed(e))?;
+        self.effective().await
     }
 
     async fn add_node(&self, node: &Node) -> ForwardOutcome {
@@ -487,14 +574,19 @@ impl Ops {
             Ok(id) => id,
             Err(e) => return ForwardOutcome::Failed(e),
         };
-        let membership = self.membership();
+        let membership = match self.settled().await {
+            Ok(membership) => membership,
+            Err(outcome) => return outcome,
+        };
         if membership.voter_ids().any(|voter| voter == id) {
             return ForwardOutcome::Done(Done::Added(Role::Voter));
         }
         // A follower decodes at most `MAX_MEMBERS` nodes in a membership. A
         // leader that appended a larger one would have it refused by every
         // follower for ever, and could not read it back from its own store
-        // after a restart.
+        // after a restart. The count is the engine's own and the turn is
+        // held, so no other change adds a node between this look and the
+        // `add_learner` below.
         if membership.get_node(&id).is_none() && membership.nodes().count() >= codec::MAX_MEMBERS {
             return ForwardOutcome::Failed(Error::TooManyNodes);
         }
@@ -519,7 +611,10 @@ impl Ops {
         // node that was named and is not there, and a voter that is not there
         // raises the quorum the group has to reach without lowering what it
         // can: with enough of them no write commits and no change completes.
-        let membership = self.membership();
+        let membership = match self.effective().await {
+            Ok(membership) => membership,
+            Err(outcome) => return outcome,
+        };
         let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
         let learners: BTreeSet<NodeId> = membership.learner_ids().collect();
         let metrics = self.raft.metrics().borrow().clone();
@@ -547,7 +642,10 @@ impl Ops {
         if let Some(redirect) = self.not_leader() {
             return redirect;
         }
-        let membership = self.membership();
+        let membership = match self.settled().await {
+            Ok(membership) => membership,
+            Err(outcome) => return outcome,
+        };
         let mut voters: BTreeSet<NodeId> = membership.voter_ids().collect();
         let change = if voters.remove(id) {
             if voters.is_empty() {
@@ -798,5 +896,150 @@ mod tests {
         assert!(matches!(stopped, Error::Raft(_)), "got {stopped:?}");
 
         consensus.shutdown().await;
+    }
+
+    /// A change of voters is two committed entries, and a caller that stops
+    /// waiting between them must not leave the group in the joint
+    /// configuration. Here the new voters cannot commit the first entry —
+    /// two learners that were replicating are gone — and the caller gives up;
+    /// once they are back the change must end uniform without anybody asking
+    /// again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_change_of_voters_whose_caller_gave_up_still_ends_uniform() {
+        use weida::Fingerprint;
+
+        use crate::Node;
+
+        fn quick(listen: &str) -> ConsensusConfig {
+            let mut config = ConsensusConfig::new(listen.parse().expect("loopback address"));
+            config.heartbeat_interval = Duration::from_millis(100);
+            config.election_timeout_min = Duration::from_millis(300);
+            config.election_timeout_max = Duration::from_millis(600);
+            config.forward_timeout = Duration::from_secs(1);
+            config
+        }
+        fn listen_of(node: &Node) -> String {
+            let authority = node.url.split('@').nth(1).expect("an authority");
+            authority.split('/').next().expect("a host").to_owned()
+        }
+        async fn configs(consensus: &Consensus) -> usize {
+            consensus
+                .ops
+                .raft
+                .with_raft_state(|st| {
+                    st.membership_state
+                        .effective()
+                        .membership()
+                        .get_joint_config()
+                        .len()
+                })
+                .await
+                .expect("the engine runs")
+        }
+
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let store = MemoryStore::default();
+        let a = Consensus::start(
+            &runtime,
+            Identity::generate().expect("identity"),
+            store.clone(),
+            store,
+            quick("127.0.0.1:0"),
+        )
+        .await
+        .expect("start");
+        a.bootstrap().await.expect("bootstrap");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.leader() != Some(a.id()) {
+            assert!(Instant::now() < deadline, "the node never led");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Two learners that replicate, added without the promotion that
+        // `add_node` would make, and then stopped. The leader still counts
+        // them as replicating: what it knows is what they last matched.
+        let mut gone = Vec::new();
+        for _ in 0..2 {
+            let identity = Identity::generate().expect("identity");
+            let store = MemoryStore::default();
+            let node_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+            let node = Consensus::start(
+                &node_runtime,
+                identity.clone(),
+                store.clone(),
+                store.clone(),
+                quick("127.0.0.1:0"),
+            )
+            .await
+            .expect("start");
+            a.ops
+                .raft
+                .add_learner(node.id(), node.node().clone(), false)
+                .await
+                .expect("added as a learner");
+            let id = node.id();
+            a.ops
+                .raft
+                .wait(Some(Duration::from_secs(10)))
+                .metrics(
+                    |metrics| super::replicating(metrics, &id, 1000),
+                    "a learner replicates",
+                )
+                .await
+                .expect("the learner replicates");
+            let listen = listen_of(node.node());
+            node.shutdown().await;
+            node_runtime.shutdown().await;
+            gone.push((identity, store, listen));
+        }
+
+        // A third node that never answers, so the call has something to add:
+        // it promotes the two that are gone and waits for the first entry to
+        // commit, which it cannot.
+        let never = Node::new(format!(
+            "weida://{}@127.0.0.1:9/raft",
+            Fingerprint::from_bytes([9; 32])
+        ))
+        .expect("a well-formed node");
+        let asked = timeout(Duration::from_millis(2500), a.add_node(never)).await;
+        assert!(
+            asked.is_err(),
+            "the change cannot commit, so it was still waiting"
+        );
+        assert_eq!(configs(&a).await, 2, "the joint configuration is appended");
+
+        // They come back; nobody asks again.
+        let (identity, store, listen) = gone.remove(0);
+        let back_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let back = loop {
+            // The port of the node that stopped may take a moment to be free.
+            match Consensus::start(
+                &back_runtime,
+                identity.clone(),
+                store.clone(),
+                store.clone(),
+                quick(&listen),
+            )
+            .await
+            {
+                Ok(back) => break back,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "the node never came back: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while configs(&a).await != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the change that its caller gave up on was never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        back.shutdown().await;
+        a.shutdown().await;
     }
 }

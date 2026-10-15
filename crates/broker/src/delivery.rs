@@ -9,12 +9,31 @@
 //! consumer is served meanwhile. A write that ends — in bytes out or in
 //! failure — is an event for the loop, which is the only place queue state
 //! moves in response to a consumer.
+//!
+//! **A failure is about the connection or about the message, and the two are
+//! answered differently.** A write that fails or stalls says the consumer's
+//! connection is not taking deliveries: dropping the subscription alone would
+//! leave a client that still believes it is subscribed, so the connection is
+//! closed ([`weida::codes::LIMIT_EXCEEDED`]) and the client's redial
+//! subscribes again. A delivery that never started because its header is one
+//! the consumer's connection will not read says nothing about the connection
+//! — it carries on, and the next message may be fine — so it is only
+//! refused: the message goes back for other consumers and is not offered to
+//! that connection again ([`Undelivered`]). Closing the connection for it
+//! would turn one such message into a loop of redials, each offered the same
+//! message first.
+//!
+//! **A delivery's tasks live as long as the queue's entry for it.** Both the
+//! write and the watcher stop when the entry goes ([`Outgoing::cancelled`]),
+//! so a delivery the queue took back — its subscription ended, its consumer
+//! was dropped — leaves no task behind, and the cursor state its consumer's
+//! connection kept for the report goes with it.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use weida::{Acknowledgement, Consumer, CursorLevel, Cursors, Error, TransferMeta};
+use tokio::sync::{mpsc, oneshot};
+use weida::{Acknowledgement, Consumer, CursorLevel, Cursors, Error, TransferMeta, codes};
 
 use crate::broker::Event;
 use crate::broker::Served;
@@ -62,6 +81,7 @@ pub(crate) fn spawn(served: &Served, dispatch: Dispatch) {
             topic,
             content_type,
             trace,
+            mut cancelled,
         } = outgoing;
         let meta = TransferMeta {
             content_type,
@@ -75,15 +95,21 @@ pub(crate) fn spawn(served: &Served, dispatch: Dispatch) {
         // queue asks its consumer for: `Processed` is the consumer's own
         // statement about its own hop (`GUARANTEES.md` §1).
         .with_report([SETTLEMENT]);
-        let sent = send(&consumer, meta, &body, idle).await;
+        let sent = tokio::select! {
+            sent = send(&consumer, meta, &body, idle) => sent,
+            // The queue took the delivery back while it was being written:
+            // the stream is reset with the future, and nobody is waiting for
+            // an outcome.
+            _ = &mut cancelled => return,
+        };
         drop(body);
-        drop(consumer);
         match sent {
             Ok(Some(cursors)) => {
+                drop(consumer);
                 // Sent before the watcher exists, so the queue's loop sees the
                 // write end before it can see the delivery settle.
                 if events.send(Event::Written(id)).await.is_ok() {
-                    tokio::spawn(watch(id, cursors, events));
+                    tokio::spawn(watch(id, cursors, cancelled, events));
                 }
             }
             // No cursors means the header carried no report, which cannot
@@ -92,12 +118,30 @@ pub(crate) fn spawn(served: &Served, dispatch: Dispatch) {
             // honest answer is to give it back now rather than to hold it
             // forever.
             Ok(None) => {
+                drop(consumer);
                 tracing::error!("a delivery ordered a report and got no cursors; requeuing");
                 let _ = events.send(Event::Written(id)).await;
                 let _ = events.send(Event::Lost(id)).await;
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "a delivery failed; the consumer is dropped and the message goes back");
+            // Nothing was written and the connection is as it was: the
+            // message goes back for somebody else and this consumer goes on.
+            Err(Undelivered::Refused) => {
+                drop(consumer);
+                tracing::debug!(
+                    "a consumer's connection will not read a delivery's header; \
+                     the message goes back for other consumers"
+                );
+                let _ = events.send(Event::Refused(id)).await;
+            }
+            Err(e @ (Undelivered::Stalled | Undelivered::Failed(_))) => {
+                tracing::debug!(error = %e, "a delivery failed; closing the consumer's connection and requeuing the message");
+                // The connection is closed before the queue hears of it. The
+                // subscription is dropped either way, and a consumer left
+                // holding an open connection would never learn that it is
+                // not being served: its redial, which subscribes again, is
+                // triggered by the close and by nothing else.
+                consumer.close(codes::LIMIT_EXCEEDED, e.close_reason());
+                drop(consumer);
                 let _ = events.send(Event::Failed(id)).await;
             }
         }
@@ -105,6 +149,9 @@ pub(crate) fn spawn(served: &Served, dispatch: Dispatch) {
 }
 
 /// Why a delivery did not reach its consumer.
+///
+/// Sorted by **what failed**, because the answers differ: the connection
+/// is closed for the first two and kept for the third.
 #[derive(Debug)]
 enum Undelivered {
     /// The consumer made no progress inside the deadline.
@@ -112,6 +159,10 @@ enum Undelivered {
     /// The transport refused: the connection is gone, or the consumer stopped
     /// the stream.
     Failed(Error),
+    /// A limit that is about this message and not about the connection: the
+    /// header the delivery needs is longer than the consumer's connection said
+    /// it will read, or exceeds a cap no peer would read. Nothing was written.
+    Refused,
 }
 
 impl std::fmt::Display for Undelivered {
@@ -119,6 +170,40 @@ impl std::fmt::Display for Undelivered {
         match self {
             Undelivered::Stalled => f.write_str("the consumer stopped reading"),
             Undelivered::Failed(e) => e.fmt(f),
+            Undelivered::Refused => f.write_str("the consumer will not read this delivery"),
+        }
+    }
+}
+
+impl Undelivered {
+    /// Sorts what opening a delivery failed with.
+    ///
+    /// [`Error::LimitExceeded`] from opening is the message's own: the header
+    /// is checked against what the consumer's connection will read before a
+    /// stream is opened, so nothing was written and the connection is
+    /// untouched. Anything else — a stream that could not be opened, a head
+    /// that could not be written, a connection that is gone — is the
+    /// connection's.
+    ///
+    /// A connection its peer closed with `LIMIT_EXCEEDED` is reported as the
+    /// same variant. That connection is going away on its own and takes its
+    /// subscriptions with it through the runtime's unsubscribe, so counting
+    /// the delivery as refused costs the message one refusal against a
+    /// connection that no longer exists.
+    fn opening(error: Error) -> Undelivered {
+        match error {
+            Error::LimitExceeded => Undelivered::Refused,
+            other => Undelivered::Failed(other),
+        }
+    }
+
+    /// What the consumer's connection is closed with, for its own logs.
+    ///
+    /// Only for the failures that close it.
+    fn close_reason(&self) -> &'static str {
+        match self {
+            Undelivered::Stalled => "consumer stopped reading deliveries",
+            Undelivered::Failed(_) | Undelivered::Refused => "a delivery to this consumer failed",
         }
     }
 }
@@ -141,7 +226,7 @@ async fn send(
         .step(consumer.open(meta))
         .await
         .map_err(|Stalled| Undelivered::Stalled)?
-        .map_err(Undelivered::Failed)?;
+        .map_err(Undelivered::opening)?;
     let cursors = transfer.cursors();
     for slice in body.chunks(WRITE_SLICE) {
         pace.step(transfer.write_all(slice))
@@ -167,15 +252,27 @@ async fn send(
 /// when the connection goes away, so a consumer that vanishes ends this task
 /// without a timer ([0029](https://github.com/tuco86/weida/blob/main/docs/decisions/0029-a-report-is-relayed-a-certificate-is-not.md)
 /// §4.6). A consumer that stays and never reports costs its own unsettled
-/// slots and the queue's budget for the message, and nothing else.
-async fn watch(delivery: DeliveryId, mut cursors: Cursors, events: mpsc::Sender<Event>) {
+/// slots and the queue's budget for the message, and nothing else — and only
+/// for as long as the queue holds the delivery: when `cancelled` resolves the
+/// entry is gone, nothing is owed an outcome, and the task ends and releases
+/// the report entry it holds.
+async fn watch(
+    delivery: DeliveryId,
+    mut cursors: Cursors,
+    mut cancelled: oneshot::Receiver<()>,
+    events: mpsc::Sender<Event>,
+) {
     let outcome = loop {
-        match cursors.changed().await {
-            Some(set) if set.offset(SETTLEMENT).is_some() => break Event::Settled(delivery),
-            // A level the delivery did not order, or an offset that moved on a
-            // level that is not this one: not a settlement, keep reading.
-            Some(_) => continue,
-            None => break Event::Lost(delivery),
+        tokio::select! {
+            _ = &mut cancelled => return,
+            changed = cursors.changed() => match changed {
+                Some(set) if set.offset(SETTLEMENT).is_some() => break Event::Settled(delivery),
+                // A level the delivery did not order, or an offset that moved
+                // on a level that is not this one: not a settlement, keep
+                // reading.
+                Some(_) => continue,
+                None => break Event::Lost(delivery),
+            },
         }
     };
     // A closed channel means the queue stopped serving, which is the one case

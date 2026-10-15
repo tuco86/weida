@@ -142,7 +142,19 @@ impl Node {
     /// The id the URL names, after the same validation as [`Node::new`].
     ///
     /// The `Default` node (an empty URL) fails here.
+    ///
+    /// A URL longer than [`codec::MAX_URL_BYTES`] fails here too: no follower
+    /// decodes a longer one, so a membership that listed it would be refused
+    /// by every follower for ever, and could not be read back from the
+    /// leader's own store after a restart.
     pub fn id(&self) -> Result<NodeId, Error> {
+        if self.url.len() > codec::MAX_URL_BYTES {
+            return Err(Error::InvalidNode(format!(
+                "the URL is {} bytes and a membership carries at most {}",
+                self.url.len(),
+                codec::MAX_URL_BYTES
+            )));
+        }
         let addr = EndpointAddr::parse(&self.url)
             .map_err(|e| Error::InvalidNode(format!("{}: {e}", self.url)))?;
         let invalid = |reason: &str| Error::InvalidNode(format!("{}: {reason}", self.url));
@@ -289,6 +301,11 @@ pub struct ConsensusConfig {
     /// openraft also uses it as the AppendEntries timeout, so it bounds the
     /// time one batch of [`ConsensusConfig::max_payload_entries`] may take
     /// to reach a follower and be answered.
+    ///
+    /// openraft gives one AppendEntries this long however large it is. An
+    /// entry that cannot cross the link to a follower within it is appended
+    /// on the leader and never replicates, and everything behind it waits:
+    /// see [`ConsensusConfig::max_rpc_bytes`].
     pub heartbeat_interval: Duration,
     /// Lower bound of the randomized election timeout. Default 1500 ms.
     pub election_timeout_min: Duration,
@@ -318,6 +335,20 @@ pub struct ConsensusConfig {
     /// refuse such an envelope and a leader that had appended it could not
     /// commit it or anything behind it. That is
     /// [`codec::ENTRY_ENVELOPE_OVERHEAD`] bytes less than this number.
+    ///
+    /// The guard is necessary and not sufficient. It keeps out what a
+    /// follower would refuse for its size; it cannot know how fast the
+    /// link to a follower is, and openraft gives an AppendEntries only
+    /// [`ConsensusConfig::heartbeat_interval`]. A request that cannot cross
+    /// the slowest link within that is appended, never replicates, and
+    /// blocks everything behind it — the failure the guard exists to
+    /// prevent. Choose this number for the slowest link, not for the
+    /// largest request: no more than `heartbeat_interval` times what that
+    /// link sustains.
+    ///
+    /// A log store's `limited_get_log_entries` should stop at about this
+    /// many bytes, so that a leader does not load a whole batch of such
+    /// entries into memory at once; [`MemoryStore`] does.
     pub max_rpc_bytes: usize,
     /// Largest snapshot accepted from a leader. Default 256 MiB.
     ///
@@ -384,6 +415,10 @@ mod tests {
             format!(
                 "weida://{}@127.0.0.1:9000/raft",
                 Fingerprint::from_bytes([0; 32])
+            ),
+            format!(
+                "weida://{fp}@{}:9000/raft",
+                "a".repeat(codec::MAX_URL_BYTES)
             ),
             String::new(),
         ] {

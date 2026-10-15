@@ -118,6 +118,17 @@ fn decode_requests(data: &[u8]) -> Result<Vec<Request>, minicbor::decode::Error>
     Ok(requests)
 }
 
+/// What [`RaftLogReader::limited_get_log_entries`] hands over at most, in
+/// encoded bytes, once it has more than one entry: the default of
+/// [`ConsensusConfig::max_rpc_bytes`](crate::ConsensusConfig::max_rpc_bytes),
+/// which is what one AppendEntries may carry.
+///
+/// A leader asks for up to `max_payload_entries` entries at once and one
+/// entry may weigh almost the whole of `max_rpc_bytes`, so a store that
+/// returns the range as asked puts that many of them in memory — sixty-four
+/// times the largest request by default — to send fewer.
+const READ_BYTES: usize = 16 << 20;
+
 impl RaftLogReader<TypeConfig> for MemoryStore {
     async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug>(
         &mut self,
@@ -125,6 +136,27 @@ impl RaftLogReader<TypeConfig> for MemoryStore {
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
         let inner = self.inner.lock().await;
         Ok(inner.log.range(range).map(|(_, e)| e.clone()).collect())
+    }
+
+    /// Returns the entries of `[start, end)` that fit 16 MiB of encoded bytes,
+    /// and at least one, so that what the leader loads is about what it sends.
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
+        let inner = self.inner.lock().await;
+        let mut taken = 0usize;
+        let mut entries = Vec::new();
+        for (_, entry) in inner.log.range(start..end) {
+            let weight = crate::codec::entry_len(entry);
+            if !entries.is_empty() && taken.saturating_add(weight) > READ_BYTES {
+                break;
+            }
+            taken = taken.saturating_add(weight);
+            entries.push(entry.clone());
+        }
+        Ok(entries)
     }
 }
 
@@ -405,6 +437,48 @@ mod tests {
         assert_eq!(
             target.applied_state().await.expect("state").0,
             source.applied_state().await.expect("state").0
+        );
+    }
+
+    /// A leader asks for a whole batch at once and an entry may weigh almost
+    /// the cap of a request, so what the store hands over is bounded by
+    /// bytes, with one entry whatever it weighs.
+    #[tokio::test]
+    async fn a_read_of_the_log_stops_at_its_byte_budget() {
+        let mut store = MemoryStore::default();
+        {
+            let mut inner = store.inner.lock().await;
+            for index in 1..=5u64 {
+                inner.log.insert(
+                    index,
+                    Entry {
+                        log_id: log_id(index),
+                        payload: EntryPayload::Normal(Request(vec![0; READ_BYTES / 4])),
+                    },
+                );
+            }
+        }
+        let read = store.limited_get_log_entries(1, 6).await.expect("read");
+        assert_eq!(
+            read.len(),
+            3,
+            "a quarter of the budget each, and the envelope of each, leave room for three"
+        );
+        assert_eq!(read[0].get_log_id().index, 1, "from the start of the range");
+
+        let huge = Request(vec![0; READ_BYTES + 1]);
+        store.inner.lock().await.log.insert(
+            6,
+            Entry {
+                log_id: log_id(6),
+                payload: EntryPayload::Normal(huge),
+            },
+        );
+        let alone = store.limited_get_log_entries(6, 7).await.expect("read");
+        assert_eq!(
+            alone.len(),
+            1,
+            "an entry over the budget is still read, alone"
         );
     }
 

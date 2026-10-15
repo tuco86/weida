@@ -6,7 +6,11 @@
 
 use std::time::Duration;
 
-use weida::{Acknowledgement, Error, Pusher, Requester, Runtime, RuntimeConfig};
+use tokio::task::JoinSet;
+use weida::{
+    Acknowledgement, ClientTls, ClientTrust, Error, Identity, Pusher, Requester, Runtime,
+    RuntimeConfig, TransferMeta,
+};
 use weida_broker::{Broker, BrokerConfig, PER_MESSAGE_OVERHEAD};
 
 mod common;
@@ -214,4 +218,216 @@ async fn a_path_another_pattern_holds_is_refused() {
     let again = Broker::new(&listener, BrokerConfig::with_queues(["/free"]))
         .expect_err("the first path is still claimed by the failed attempt");
     assert!(matches!(again, Error::AlreadyRegistered), "{again:?}");
+}
+
+/// What a producer is promised while another peer holds its streams open.
+const PROMPTLY: Duration = Duration::from_secs(2);
+
+/// A broker with room for four admissions at once, two of them per
+/// connection, and the default deadline: what is held below stays held for
+/// the whole test. It asks every peer for a key, so that peers can be told
+/// apart.
+async fn narrow() -> Harness {
+    Harness::start_with(
+        BrokerConfig {
+            max_inflight_admissions: 4,
+            max_inflight_admissions_per_connection: 2,
+            ..BrokerConfig::with_queues(["/jobs"])
+        },
+        |tls| tls.require_client(ClientTrust::AnyKey),
+    )
+    .await
+}
+
+impl Harness {
+    /// The credentials of a peer that proved a key of its own: a different
+    /// peer from every other one.
+    fn peer(&self) -> ClientTls {
+        self.client
+            .clone()
+            .with_identity(Identity::generate().expect("identity"))
+    }
+}
+
+/// One connection can open as many streams as its limits allow and hold each
+/// for the deadline. Past its share of the admissions a peer's streams are
+/// refused at once, and the permits it was refused for are still there for
+/// everybody else.
+#[tokio::test]
+async fn one_peer_cannot_hold_every_admission_and_keeps_the_rest_waiting() {
+    let harness = narrow().await;
+    let hostile = harness.runtime.requester(harness.peer());
+    hostile
+        .connect(&harness.url("/jobs"))
+        .await
+        .expect("connect");
+
+    // Four exchanges, each with its header and one byte of a megabyte it
+    // never finishes.
+    let mut held = Vec::new();
+    let mut replies = JoinSet::new();
+    for _ in 0..4 {
+        let (mut transfer, reply) = tokio::time::timeout(
+            DEADLINE,
+            hostile.open(TransferMeta::default().with_content_len(1 << 20)),
+        )
+        .await
+        .expect("opened in time")
+        .expect("open");
+        tokio::time::timeout(DEADLINE, transfer.write_all(b"x"))
+            .await
+            .expect("written in time")
+            .expect("the byte");
+        held.push(transfer);
+        replies.spawn(async move { reply.recv().await.map(|_| ()) });
+    }
+
+    // Two of them hold the peer's whole share; the other two are refused,
+    // promptly, instead of waiting for permits that would not come.
+    for _ in 0..2 {
+        let outcome = tokio::time::timeout(PROMPTLY, replies.join_next())
+            .await
+            .expect("a refusal inside the deadline")
+            .expect("a reply")
+            .expect("the task");
+        assert!(
+            matches!(outcome, Err(Error::Rejected)),
+            "a stream past the peer's share is `Rejected`: {outcome:?}"
+        );
+    }
+
+    // And a producer that is another peer is read and confirmed while the
+    // first still holds its streams.
+    let other = harness.runtime.requester(harness.peer());
+    other.connect(&harness.url("/jobs")).await.expect("connect");
+    tokio::time::timeout(PROMPTLY, other.request(b"through"))
+        .await
+        .expect("the other peer is not made to wait for the stalled one")
+        .expect("confirmed");
+    assert_eq!(harness.broker.stats("/jobs").expect("queue").messages, 1);
+
+    replies.abort_all();
+    drop(held);
+}
+
+/// The same bound holds for one-way transfers, which have no reply half to
+/// refuse on: the stalled peer's streams hold its share and no more, and
+/// another peer's transfer is admitted.
+#[tokio::test]
+async fn one_peer_holding_one_way_streams_open_does_not_stop_another_peer() {
+    let harness = narrow().await;
+    let hostile = harness.runtime.pusher(harness.peer());
+    hostile
+        .connect(&harness.url("/jobs"))
+        .await
+        .expect("connect");
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let mut transfer = tokio::time::timeout(
+            DEADLINE,
+            hostile.open(TransferMeta::default().with_content_len(1 << 20)),
+        )
+        .await
+        .expect("opened in time")
+        .expect("open");
+        tokio::time::timeout(DEADLINE, transfer.write_all(b"x"))
+            .await
+            .expect("written in time")
+            .expect("the byte");
+        held.push(transfer);
+    }
+
+    let other = harness.runtime.pusher(harness.peer());
+    other.connect(&harness.url("/jobs")).await.expect("connect");
+    tokio::time::timeout(PROMPTLY, other.send(b"through"))
+        .await
+        .expect("sent in time")
+        .expect("queued");
+    let deadline = tokio::time::Instant::now() + PROMPTLY;
+    while harness.broker.stats("/jobs").expect("queue").messages != 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the other peer's transfer was never admitted while the first held its streams"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(held);
+}
+
+/// Peers that proved nothing look alike, so they are told apart by their
+/// connections: one anonymous connection that holds its whole share is
+/// refused for more, and another anonymous connection is admitted. One bucket
+/// for every anonymous peer would let any one of them lock the rest out.
+#[tokio::test]
+async fn anonymous_connections_do_not_share_one_share() {
+    let harness = Harness::start(BrokerConfig {
+        max_inflight_admissions: 4,
+        max_inflight_admissions_per_connection: 2,
+        ..BrokerConfig::with_queues(["/jobs"])
+    })
+    .await;
+    let hostile = harness.requester("/jobs").await;
+
+    // Two exchanges, each with its header and one byte of a megabyte it
+    // never finishes: the connection's whole share.
+    let mut held = Vec::new();
+    let mut replies = JoinSet::new();
+    for _ in 0..2 {
+        let (mut transfer, reply) = tokio::time::timeout(
+            DEADLINE,
+            hostile.open(TransferMeta::default().with_content_len(1 << 20)),
+        )
+        .await
+        .expect("opened in time")
+        .expect("open");
+        tokio::time::timeout(DEADLINE, transfer.write_all(b"x"))
+            .await
+            .expect("written in time")
+            .expect("the byte");
+        held.push(transfer);
+        replies.spawn(async move { reply.recv().await.map(|_| ()) });
+    }
+    // Both are admitted once each holds a reservation.
+    let deadline = tokio::time::Instant::now() + PROMPTLY;
+    while harness.broker.stats("/jobs").expect("queue").reserved < 2 * PER_MESSAGE_OVERHEAD {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the two exchanges were never admitted"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // A third from the same connection is past its share and refused.
+    let (mut third, reply) = tokio::time::timeout(
+        DEADLINE,
+        hostile.open(TransferMeta::default().with_content_len(1 << 20)),
+    )
+    .await
+    .expect("opened in time")
+    .expect("open");
+    tokio::time::timeout(DEADLINE, third.write_all(b"x"))
+        .await
+        .expect("written in time")
+        .expect("the byte");
+    let outcome = tokio::time::timeout(PROMPTLY, reply.recv())
+        .await
+        .expect("a refusal inside the deadline");
+    assert!(
+        matches!(outcome, Err(Error::Rejected)),
+        "a stream past the connection's share is `Rejected`"
+    );
+
+    // Another anonymous connection — a runtime of its own, so a connection of
+    // its own — is read and confirmed while the first holds its share.
+    let other_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let other = other_runtime.requester(harness.client.clone());
+    other.connect(&harness.url("/jobs")).await.expect("connect");
+    tokio::time::timeout(PROMPTLY, other.request(b"through"))
+        .await
+        .expect("another anonymous connection is not made to wait for the stalled one")
+        .expect("confirmed");
+    assert_eq!(harness.broker.stats("/jobs").expect("queue").messages, 1);
+
+    replies.abort_all();
+    drop((held, third));
 }
