@@ -514,6 +514,10 @@ async fn an_auth_exchange_completes_before_the_connack() {
             // bytes made the round trip.
             Ok(data.unwrap_or(b"").to_vec())
         }
+
+        fn finish(&self, _data: Option<&[u8]>) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     let challenge = bytes(&Packet::Auth(weida_mqtt_codec::Auth {
@@ -567,6 +571,10 @@ async fn an_auth_that_switches_method_is_refused() {
     impl weida_mqtt::Authenticator for Echo {
         fn challenge(&self, _data: Option<&[u8]>) -> Result<Vec<u8>, Error> {
             Ok(vec![1])
+        }
+
+        fn finish(&self, _data: Option<&[u8]>) -> Result<(), Error> {
+            Ok(())
         }
     }
 

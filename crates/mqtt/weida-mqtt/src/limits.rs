@@ -22,13 +22,17 @@
 //! so using the peer's declared value *is* the bound, and saying so here is
 //! what stops a later reader from inventing a second one beside it.
 //!
-//! **Two more tables have no protocol ceiling, so [`Limits`] supplies one.**
-//! The Subscription Identifiers a single delivery may carry — "a single copy
-//! carries all matching identifiers ([MQTT-3.3.4-4])" [mqtt5 §4.1] — are
-//! bounded only by the packet size, and the queue of deliveries waiting for
-//! the application is bounded by nothing at all. Both get a named field, and
-//! both say in their own documentation that the number is ours because the
-//! protocol has none.
+//! **More tables have no protocol ceiling, so [`Limits`] supplies one.**
+//! The Subscription Identifiers and the User Properties a single delivery may
+//! carry — "a single copy carries all matching identifiers
+//! ([MQTT-3.3.4-4])" [mqtt5 §4.1] — are bounded only by the packet size; the
+//! queue of deliveries waiting for the application, and the QoS 1 and 2
+//! messages this client keeps while the server has not acknowledged them, are
+//! bounded by a count the protocol does not set and by a number of **bytes**
+//! it cannot, because a count is not a memory bound; and the Topic Alias
+//! tables are bounded in entries by the peer's declaration and in bytes by
+//! nothing but the packet size. Each gets a named field, and each says in its
+//! own documentation that the number is ours because the protocol has none.
 
 use std::time::Duration;
 
@@ -80,8 +84,9 @@ pub struct Limits {
     /// copy carrying every matching identifier ([MQTT-3.3.4-4]) [mqtt5 §4.1],
     /// and the only limit is the packet size, so at `maximum_packet_size` of
     /// 268 MB a single delivery could carry tens of millions. The number is
-    /// ours, and a delivery that exceeds it is a Protocol Error rather than a
-    /// growing vector.
+    /// ours, and a delivery that carries more keeps the first of them and
+    /// says so ([`crate::DeliveryProperties::truncated`]): the cap bounds what
+    /// is *kept*, and a delivery is not worth the connection.
     pub max_subscription_identifiers: usize,
     /// `User Property` pairs this client will keep on one delivery.
     ///
@@ -91,16 +96,58 @@ pub struct Limits {
     /// the packet size: a pair's minimal form is five octets, so even the
     /// default `maximum_packet_size` of 1 MiB admits over 200,000 of them and
     /// a 268 MB one admits over 50 million. The number is ours, and a
-    /// delivery that exceeds it is a Protocol Error rather than a growing
-    /// vector of peer-controlled strings.
+    /// delivery that carries more keeps the first of them and says so
+    /// ([`crate::DeliveryProperties::truncated`]): any publisher who can reach
+    /// a subscribed topic can send one, so a verdict on the connection would
+    /// hand every publisher the power to disconnect every subscriber.
     pub max_user_properties: usize,
     /// Deliveries held for the application before the reader stops reading.
     ///
     /// **The protocol has no ceiling for this one either**, and QoS 0 has no
     /// credit at all [mqtt5 §5], so this queue is the only thing between a
     /// QoS 0 flood and this process's memory. Reaching it stops the socket
-    /// being read, which is backpressure rather than a drop.
+    /// being read, which is backpressure rather than a drop — and only the
+    /// socket: keep-alive, commands and `disconnect` keep running while it is
+    /// full. A count is not a memory bound, so see
+    /// [`Limits::incoming_queue_bytes`], which is the one that is.
     pub incoming_queue: usize,
+    /// Bytes of deliveries held for the application before the reader stops
+    /// reading.
+    ///
+    /// Each delivery is charged the size of the packet that carried it plus a
+    /// fixed overhead, so a flood of large messages, or of empty ones, meets
+    /// this ceiling and not only [`Limits::incoming_queue`]. **A queue that is
+    /// empty still accepts one message of any size**, because a bound that
+    /// refused the only message would be a deadlock; the most this can hold is
+    /// therefore this number less one plus [`Limits::maximum_packet_size`].
+    pub incoming_queue_bytes: usize,
+    /// QoS 1 and 2 messages this client keeps unacknowledged at once,
+    /// whatever the server's `Receive Maximum` allows.
+    ///
+    /// The server's number is the protocol's bound on the send quota
+    /// ([MQTT-4.9.0-1]) and is the **peer's**: a server that declares nothing
+    /// means 65,535, and a silent one never acknowledges any of them. The send
+    /// quota is the smaller of the two, and a publish past it stalls like one
+    /// past the server's own.
+    pub max_inflight: usize,
+    /// Bytes of QoS 1 and 2 messages this client keeps unacknowledged at once.
+    ///
+    /// Each stored message is charged its topic, payload, properties and a
+    /// fixed overhead. A publish that would pass it stalls until
+    /// acknowledgements free room, and **a session holding nothing still
+    /// accepts one message of any size**, for the reason
+    /// [`Limits::incoming_queue_bytes`] gives.
+    pub max_inflight_bytes: usize,
+    /// Bytes of Topic Names one Topic Alias table may hold, charged per entry
+    /// with a fixed overhead.
+    ///
+    /// The tables are bounded in entries by the peer's `Topic Alias Maximum`
+    /// — what we declared for the inbound one, what the server declared for
+    /// the outbound one — and an entry may be a 65,535-byte Topic Name, so the
+    /// entry count is not a memory bound either. An inbound alias that would
+    /// pass this is refused with 0x94; an outbound topic that would pass it is
+    /// simply sent without an alias.
+    pub max_alias_bytes: usize,
     /// Addresses a resolver answer may contribute, since a resolver answer is
     /// remote input ([INVARIANTS.md]).
     pub max_addresses: usize,
@@ -133,6 +180,20 @@ impl Default for Limits {
             // same reasoning that sizes `max_subscription_identifiers`.
             max_user_properties: 64,
             incoming_queue: 1024,
+            // The bound that is a bound: 1024 messages is a count, and a
+            // count at the 1 MiB default packet size is a gigabyte. 8 MiB is
+            // the figure `weida-zmq` gives the same queue, and a client that
+            // is draining at all never meets it.
+            incoming_queue_bytes: 8 * 1024 * 1024,
+            // Mosquitto ships 20 and EMQX 32 as their own in-flight windows,
+            // so 1024 is two orders above what a broker lets a client have
+            // outstanding and still caps the 65,535 a silent one would allow.
+            max_inflight: 1024,
+            max_inflight_bytes: 8 * 1024 * 1024,
+            // 256 KiB holds thousands of aliases for ordinary topic names at
+            // the per-entry overhead, and a peer that wants more than that
+            // from this table is not describing a topic set.
+            max_alias_bytes: 256 * 1024,
             max_addresses: 8,
         }
     }
@@ -183,15 +244,19 @@ impl Limits {
                 "Limits::max_user_properties must be at least 1".into(),
             ));
         }
-        if self.incoming_queue == 0 {
-            return Err(Error::Configuration(
-                "Limits::incoming_queue must be at least 1".into(),
-            ));
-        }
-        if self.max_addresses == 0 {
-            return Err(Error::Configuration(
-                "Limits::max_addresses must be at least 1".into(),
-            ));
+        for (name, value) in [
+            ("incoming_queue", self.incoming_queue),
+            ("incoming_queue_bytes", self.incoming_queue_bytes),
+            ("max_inflight", self.max_inflight),
+            ("max_inflight_bytes", self.max_inflight_bytes),
+            ("max_alias_bytes", self.max_alias_bytes),
+            ("max_addresses", self.max_addresses),
+        ] {
+            if value == 0 {
+                return Err(Error::Configuration(format!(
+                    "Limits::{name} must be at least 1"
+                )));
+            }
         }
         Ok(())
     }
@@ -515,6 +580,22 @@ mod tests {
             },
             Limits {
                 max_addresses: 0,
+                ..Limits::default()
+            },
+            Limits {
+                incoming_queue_bytes: 0,
+                ..Limits::default()
+            },
+            Limits {
+                max_inflight: 0,
+                ..Limits::default()
+            },
+            Limits {
+                max_inflight_bytes: 0,
+                ..Limits::default()
+            },
+            Limits {
+                max_alias_bytes: 0,
                 ..Limits::default()
             },
         ] {

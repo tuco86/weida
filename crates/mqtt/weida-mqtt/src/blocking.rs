@@ -55,6 +55,19 @@
 //! asynchronous surface's cancellation does and is honest about, and what a
 //! method named `publish_timeout` would not be. A caller who wants that runs
 //! the publish on its own thread.
+//!
+//! # One thread, and what an acknowledgement waits behind
+//!
+//! The pattern of the example above — publish, then read deliveries on the same
+//! thread — is safe for QoS 0, whose `publish` returns once the packet has gone
+//! out whatever the delivery queue holds: a full queue stops the socket being
+//! read, and nothing else. A call that waits for an **acknowledgement** — a
+//! QoS 1 or 2 publish, a subscribe — is answered by a packet that arrives
+//! *behind* every delivery the server sent first, so with the queue full and
+//! the only reader blocked in that call it cannot be read: the connection is
+//! not wedged, its keep-alive and `disconnect` still run, but the call waits
+//! for deliveries only this thread can take. A caller that mixes the two
+//! drains [`Deliveries`] between calls, or from another thread.
 
 use std::time::Duration;
 

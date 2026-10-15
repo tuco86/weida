@@ -185,16 +185,53 @@ fn fuzz_smoke_properties_over_an_exact_block_never_ask_for_more() {
     }
 }
 
-/// The whole decoder against arbitrary bytes: nothing panics, an accepted
-/// packet fits the cap, and no rejection reserves memory.
+/// What an accepted packet must satisfy, whoever found the input: a random
+/// draw below, or one a `cargo fuzz` run once broke.
 ///
 /// `encoded_len` is compared against the **re-encoded** length and not against
 /// the bytes consumed, and the difference is the point. An acknowledgement's
 /// all-success tail is omissible (3.4.1) and properties may arrive in any
 /// order [mqtt5 §3], so a legal input may be longer than this codec's
-/// canonical spelling of the same value. `encoded_len <= used` is therefore
-/// the honest invariant: never longer than what arrived, and exactly what the
-/// encoder will write.
+/// canonical spelling of the same value. The converse holds in exactly one
+/// place: a reason code sent without its Property Length (an acknowledgement's
+/// `id, code` body, DISCONNECT's bare code, AUTH's bare code) decodes, and
+/// re-encodes with the explicit zero length every peer writes, one byte
+/// longer. So `encoded_len <= used + 1` is the honest invariant, and the
+/// canonical form must be a fixed point: encoding what it decodes to gives it
+/// back.
+fn check_packet(input: &[u8]) {
+    let Ok((packet, used)) = Packet::decode(input, CAP) else {
+        return;
+    };
+    assert!(used <= input.len());
+    assert!(used as u32 <= CAP);
+
+    let mut out = Vec::new();
+    packet
+        .encode(&mut out)
+        .expect("a decoded packet re-encodes");
+    assert_eq!(packet.encoded_len(), Ok(out.len() as u32));
+    assert!(
+        out.len() <= used + 1,
+        "{input:02X?}: the canonical form is at most the omitted Property Length longer than \
+         what arrived"
+    );
+
+    let (again, used2) = Packet::decode(&out, CAP).expect("the canonical form");
+    assert_eq!(again, packet);
+    assert_eq!(used2, out.len());
+    let mut twice = Vec::new();
+    again
+        .encode(&mut twice)
+        .expect("the canonical form re-encodes");
+    assert_eq!(
+        twice, out,
+        "{input:02X?}: the canonical form is a fixed point"
+    );
+}
+
+/// The whole decoder against arbitrary bytes: nothing panics, an accepted
+/// packet fits the cap, and no rejection reserves memory.
 #[test]
 fn fuzz_smoke_packets_never_panic_and_respect_the_cap() {
     let mut rng = Rng::new(0x5150_4D51_5454_0004);
@@ -203,24 +240,26 @@ fn fuzz_smoke_packets_never_panic_and_respect_the_cap() {
             let len = rng.below(48);
             rng.bytes(len)
         };
-        if let Ok((packet, used)) = Packet::decode(&input, CAP) {
-            assert!(used <= input.len());
-            assert!(used as u32 <= CAP);
+        check_packet(&input);
+    }
+}
 
-            let mut out = Vec::new();
-            packet
-                .encode(&mut out)
-                .expect("a decoded packet re-encodes");
-            assert_eq!(packet.encoded_len(), Ok(out.len() as u32));
-            assert!(
-                out.len() <= used,
-                "the canonical form is never longer than what arrived"
-            );
+/// The input a fuzz run broke the length relation with: a PUBACK whose body is
+/// the identifier and a non-success reason code, with no Property Length, and
+/// the start of another packet behind it. Legal (3.4.2.2), decoded to its
+/// value, and re-encoded one byte longer with the explicit zero length.
+#[test]
+fn a_reason_code_without_a_property_length_canonicalises_one_byte_longer() {
+    check_packet(&[0x40, 0x03, 0x40, 0x03, 0x87, 0x40, 0xF3]);
 
-            let (again, used2) = Packet::decode(&out, CAP).expect("the canonical form");
-            assert_eq!(again, packet);
-            assert_eq!(used2, out.len());
-        }
+    // The same spelling in the other two families that allow it.
+    for bare in [&[0xE0, 0x01, 0x8E][..], &[0xF0, 0x01, 0x18][..]] {
+        let (packet, used) = Packet::decode(bare, CAP).expect("a bare reason code decodes");
+        assert_eq!(used, bare.len());
+        let mut out = Vec::new();
+        packet.encode(&mut out).expect("encodes");
+        assert_eq!(out.len(), bare.len() + 1, "{bare:02X?}");
+        check_packet(bare);
     }
 }
 

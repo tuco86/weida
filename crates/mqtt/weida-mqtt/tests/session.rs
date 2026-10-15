@@ -10,6 +10,7 @@
 
 mod harness;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use harness::{Act, Server, bytes, connack_session, decode};
@@ -27,8 +28,8 @@ fn options(clean_start: bool) -> ConnectOptions {
     options
 }
 
-fn message(topic: &str, qos: QoS) -> StoredPublish {
-    StoredPublish {
+fn message(topic: &str, qos: QoS) -> Arc<StoredPublish> {
+    Arc::new(StoredPublish {
         topic: topic.into(),
         payload: b"body".to_vec(),
         qos,
@@ -39,7 +40,7 @@ fn message(topic: &str, qos: QoS) -> StoredPublish {
         response_topic: None,
         correlation_data: None,
         user_properties: Vec::new(),
-    }
+    })
 }
 
 /// The reconnect: a QoS 1 message left unacknowledged on one connection goes
@@ -545,7 +546,7 @@ async fn the_servers_receive_maximum_becomes_the_sessions_ceiling() {
 
     session.allocate(message("a", QoS::AtLeastOnce)).unwrap();
     session.allocate(message("b", QoS::AtLeastOnce)).unwrap();
-    let error = session
+    let (error, _) = session
         .allocate(message("c", QoS::AtLeastOnce))
         .expect_err("the quota is spent");
     assert!(

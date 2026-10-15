@@ -109,10 +109,9 @@ uncoded!(
     (InvalidTopic),
     (UnexpectedPacket),
     (AuthenticationMethodMismatch),
+    (AuthenticationFailed),
     (SessionPresentWithoutState),
     (QuotaExhausted),
-    (TooManySubscriptionIdentifiers),
-    (TooManyUserProperties),
     (AcknowledgementLengthMismatch),
     (EncodeError),
     (Io),
@@ -233,10 +232,9 @@ pub fn errno_of(error: Error) -> Errno {
         Error::InvalidTopic { .. } => "InvalidTopic",
         Error::UnexpectedPacket { .. } => "UnexpectedPacket",
         Error::AuthenticationMethodMismatch => "AuthenticationMethodMismatch",
+        Error::AuthenticationFailed(_) => "AuthenticationFailed",
         Error::SessionPresentWithoutState => "SessionPresentWithoutState",
         Error::QuotaExhausted { .. } => "QuotaExhausted",
-        Error::TooManySubscriptionIdentifiers { .. } => "TooManySubscriptionIdentifiers",
-        Error::TooManyUserProperties { .. } => "TooManyUserProperties",
         Error::AcknowledgementLengthMismatch { .. } => "AcknowledgementLengthMismatch",
         // The client's judgement that the *server* broke the protocol, and
         // the class is the code this client would send in its DISCONNECT:

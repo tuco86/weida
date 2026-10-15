@@ -41,6 +41,8 @@
 //! subscriber, so it is tolerant. U+FEFF is likewise kept rather than
 //! stripped, which [MQTT-1.5.4-3] requires outright.
 
+use core::fmt;
+
 use crate::error::{DecodeError, EncodeError};
 use crate::varint;
 
@@ -48,15 +50,41 @@ use crate::varint;
 /// length prefix (1.5.4, 1.5.6) [mqtt5 §3].
 pub const MAX_FIELD_LEN: usize = u16::MAX as usize;
 
+/// What a `Debug` shows of a credential: how long it is, and nothing else.
+///
+/// A password, a user name and `Authentication Data` are the three values
+/// this protocol carries whose only purpose is to be secret, and a `{:?}` of a
+/// packet, a property set or a reader is exactly the line an application
+/// writes into a log without reading it. The value holds the length alone, so
+/// there is no content for a formatter to reach.
+pub(crate) struct Redacted(pub(crate) usize);
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<redacted {} bytes>", self.0)
+    }
+}
+
 /// A borrowing cursor over one packet's bytes.
 ///
 /// Every read is bounds-checked and every failure past the end is
 /// [`DecodeError::Incomplete`], so a partially received packet is never
 /// mistaken for a malformed one.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Reader<'a> {
     input: &'a [u8],
     pos: usize,
+}
+
+/// Position and size, never the bytes: a reader is over a whole packet, and a
+/// CONNECT's bytes are the password.
+impl fmt::Debug for Reader<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reader")
+            .field("position", &self.pos)
+            .field("remaining", &self.remaining())
+            .finish()
+    }
 }
 
 impl<'a> Reader<'a> {

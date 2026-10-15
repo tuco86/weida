@@ -334,7 +334,7 @@ async fn a_shared_subscription_splits_deliveries_between_its_members() {
         .expect("publishes");
 
     // The ordinary subscriber always gets one.
-    assert_eq!(delivered(&mut alone_events).await.payload, b"once");
+    assert_eq!(delivered(&mut alone_events).await.payload, &b"once"[..]);
 
     // Exactly one of the two group members gets one, and the other gets
     // nothing - which is the whole difference between a group and a filter.
@@ -404,7 +404,7 @@ async fn a_shared_subscription_receives_no_retained_message() {
         .await
         .expect("subscribed");
     let to_shared = delivered(&mut shared_events).await;
-    assert_eq!(to_shared.payload, b"stored");
+    assert_eq!(to_shared.payload, &b"stored"[..]);
     assert!(
         to_shared.retain,
         "and it arrives from the cache: rmqtt 0.23.1 sends a retained message \
@@ -416,7 +416,7 @@ async fn a_shared_subscription_receives_no_retained_message() {
         .publish(Message::new(&topic, "live").at(QoS::AtLeastOnce))
         .await
         .expect("publishes");
-    assert_eq!(delivered(&mut shared_events).await.payload, b"live");
+    assert_eq!(delivered(&mut shared_events).await.payload, &b"live"[..]);
 
     publisher
         .publish(Message::delete_retained(&topic).at(QoS::AtLeastOnce))
@@ -523,7 +523,7 @@ async fn retain_handling_one_sends_only_on_a_new_subscription() {
         .await
         .expect("subscribed");
     let first = delivered(&mut events).await;
-    assert_eq!(first.payload, b"stored");
+    assert_eq!(first.payload, &b"stored"[..]);
     assert!(first.retain);
 
     // Second subscribe of the same filter: it did exist, so nothing comes -

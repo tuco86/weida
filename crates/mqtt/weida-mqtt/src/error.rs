@@ -123,6 +123,16 @@ pub enum Error {
     /// any successful CONNACK MUST repeat the same method"
     /// ([MQTT-4.12.0-5]) (4.12) [mqtt5 §10].
     AuthenticationMethodMismatch,
+    /// Enhanced authentication did not establish who the server is: the
+    /// [`crate::Authenticator`] refused the server's final `Authentication
+    /// Data`, or — with none given — a server that ended the exchange without
+    /// the proof the mechanism requires. Also what a re-authentication that
+    /// ended in failure reports to the event stream.
+    ///
+    /// "Both sides SHOULD send DISCONNECT and MUST close the Network
+    /// Connection" on failure ([MQTT-4.12.1-2]) (4.12.1) [mqtt5 §10], and this
+    /// client does.
+    AuthenticationFailed(String),
     /// The CONNACK said `Session Present` 1 and this client holds no session
     /// state. "A Client that receives Session Present 1 where it has no
     /// Session State MUST close the Network Connection"
@@ -147,28 +157,6 @@ pub enum Error {
     ReceiveMaximumExceeded {
         /// The ceiling this client declared.
         quota: u16,
-    },
-    /// A delivery carried more Subscription Identifiers than
-    /// [`crate::Limits::max_subscription_identifiers`].
-    ///
-    /// **The protocol has no ceiling for this.** A server MAY send one copy
-    /// carrying every matching identifier ([MQTT-3.3.4-4]) [mqtt5 §4.1] and
-    /// the only limit on the wire is the packet size, so the number is this
-    /// client's and is named in [`crate::Limits`].
-    TooManySubscriptionIdentifiers {
-        /// The ceiling this client set.
-        max: usize,
-    },
-    /// A delivery carried more `User Property` pairs than
-    /// [`crate::Limits::max_user_properties`].
-    ///
-    /// **The protocol has no ceiling for this either.** `User Property` "is
-    /// allowed to appear multiple times" (3.3.2.3.7) [mqtt5 §3] and the only
-    /// limit on the wire is the packet size, so the number is this client's
-    /// and is named in [`crate::Limits`].
-    TooManyUserProperties {
-        /// The ceiling this client set.
-        max: usize,
     },
     /// A Topic Name or Topic Filter breaks the grammar of 4.7 [mqtt5 §4.1],
     /// refused before the packet reaches the wire.
@@ -210,8 +198,12 @@ pub enum Error {
     /// A configuration value is unusable. Refused at configuration time,
     /// which is the rule every option follows.
     Configuration(String),
-    /// Nothing arrived within a bound the client set: the CONNACK deadline,
-    /// or the PINGRESP deadline the specification leaves unquantified.
+    /// Nothing happened within a bound the client set. The text names the
+    /// wait: `"CONNACK"` and the other steps of the connect, which share one
+    /// deadline; `"PINGRESP"`, the deadline the specification leaves
+    /// unquantified; `"write"`, a socket that took not one byte for
+    /// [`crate::ConnectOptions::write_timeout`]; and the AUTH exchange, which
+    /// is bounded in time and in rounds.
     Timeout(&'static str),
     /// The connection is gone; its cause was reported to whoever was holding
     /// the events.
@@ -268,6 +260,9 @@ impl fmt::Display for Error {
             Error::AuthenticationMethodMismatch => f.write_str(
                 "the server named a different authentication method than the CONNECT did",
             ),
+            Error::AuthenticationFailed(why) => {
+                write!(f, "authentication failed: {why}")
+            }
             Error::SessionPresentWithoutState => f.write_str(
                 "the server resumed a session this client has no state for, so the connection \
                  must close ([MQTT-3.2.2-4])",
@@ -292,16 +287,6 @@ impl fmt::Display for Error {
                 f,
                 "the {packet_type} carried {received} reason codes for {sent} filters, so no \
                  code can be matched to a filter ([MQTT-3.9.3-1])"
-            ),
-            Error::TooManySubscriptionIdentifiers { max } => write!(
-                f,
-                "a delivery carried more than {max} subscription identifiers, which is this \
-                 client's ceiling because the protocol has none"
-            ),
-            Error::TooManyUserProperties { max } => write!(
-                f,
-                "a delivery carried more than {max} user properties, which is this client's \
-                 ceiling because the protocol has none"
             ),
             Error::Protocol(error) => write!(f, "the server broke the protocol: {error}"),
             Error::Encode(error) => write!(f, "cannot send this packet: {error}"),
@@ -348,6 +333,29 @@ impl From<weida_core::Error> for Error {
         match error {
             weida_core::Error::Io(io) => Error::Io(io),
             other => Error::Runtime(other.to_string()),
+        }
+    }
+}
+
+impl Error {
+    /// A second error saying what this one says, for a second recipient, where
+    /// the variant allows one: the connection ended once and more than one
+    /// caller is owed the reason.
+    ///
+    /// `Error` is not `Clone` because `io::Error` is not. The variants a
+    /// connection ends with — a timeout, a closed or failed transport, a
+    /// refusal the server put a code on — are copied; any other is reported
+    /// as [`Error::NotConnected`], which is true of it and names no cause the
+    /// event stream has not already given.
+    #[must_use]
+    pub(crate) fn replicate(&self) -> Error {
+        match self {
+            Error::Timeout(what) => Error::Timeout(what),
+            Error::ConnectionClosed => Error::ConnectionClosed,
+            Error::ServerDisconnected(code) => Error::ServerDisconnected(*code),
+            Error::Io(error) => Error::Io(io::Error::new(error.kind(), error.to_string())),
+            Error::AuthenticationFailed(why) => Error::AuthenticationFailed(why.clone()),
+            _ => Error::NotConnected,
         }
     }
 }

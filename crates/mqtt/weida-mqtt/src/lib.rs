@@ -86,19 +86,28 @@
 //! Two of the limits a client needs are the protocol's own and are used as
 //! such: the send quota's ceiling is the server's `Receive Maximum`
 //! ([MQTT-4.9.0-1]) and the outbound alias table's is the server's
-//! `Topic Alias Maximum` ([MQTT-3.3.2-9]) [mqtt5 §5]. Two more have no
-//! protocol ceiling at all — the Subscription Identifiers one delivery may
-//! carry, and the queue of deliveries waiting for the application — so
-//! [`Limits`] names a number for each and says in its own documentation that
-//! the number is ours because the protocol has none. §11's four unbounded
-//! resources are the reason that distinction is worth making.
+//! `Topic Alias Maximum` ([MQTT-3.3.2-9]) [mqtt5 §5]. The rest have no
+//! protocol ceiling at all — the Subscription Identifiers and User Properties
+//! one delivery may carry, the queue of deliveries waiting for the
+//! application, what the client keeps of its own messages while the server has
+//! not acknowledged them, the bytes of a Topic Alias table — so [`Limits`]
+//! names a number for each and says in its own documentation that the number
+//! is ours because the protocol has none. Every one that holds *memory* is
+//! bounded in bytes as well as in entries, because a count is not a memory
+//! bound. §11's four unbounded resources are the reason that distinction is
+//! worth making.
 //!
-//! # The two timers the specification declines to quantify
+//! # The waits the specification declines to quantify
 //!
-//! A missing CONNACK and a missing PINGRESP both get "a reasonable amount of
-//! time" and no number [mqtt5 §1]. Both are fields with finite defaults here
-//! ([`ConnectOptions::connect_timeout`],
-//! [`ConnectOptions::effective_ping_timeout`]), because every wait is bounded.
+//! A missing CONNACK, a missing PINGRESP and a peer that stops reading all get
+//! "a reasonable amount of time" or nothing at all [mqtt5 §1]. Each is a field
+//! with a finite default here ([`ConnectOptions::connect_timeout`],
+//! [`ConnectOptions::effective_ping_timeout`],
+//! [`ConnectOptions::effective_write_timeout`]), because every wait is
+//! bounded — and nothing on a connection waits for the peer *or* for the
+//! application while something else needs doing: a write the socket is not
+//! taking, or an event queue nobody is reading, stops that one thing and
+//! leaves keep-alive, commands and `disconnect` running.
 //!
 //! # The session, and the one place retransmission happens
 //!
@@ -133,7 +142,9 @@ pub mod filter;
 pub mod limits;
 pub mod message;
 pub mod options;
+mod queue;
 pub mod session;
+mod task;
 pub mod transport;
 
 pub use alias::{Aliased, InboundAliases, OutboundAliases};

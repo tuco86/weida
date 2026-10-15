@@ -278,10 +278,17 @@ class TestSession:
             session = weida_mqtt.Session(client_id, options)
             client, _ = await context.connect_session(broker, session, options)
 
+            # `Limits::max_inflight`'s default: the library holds the quota to
+            # its own ceiling whatever the server declares (65,535 when it
+            # declares nothing), and this binding has no keyword to change it.
+            ceiling = 1024
             assert session.receive_maximum == 7, "this client's own declaration"
-            assert session.send_quota == client.server["receive_maximum"], (
+            assert session.send_quota == min(
+                client.server["receive_maximum"], ceiling
+            ), (
                 "the server's number, which replaced the placeholder "
-                "([MQTT-4.9.0-1]) and is not the same field as the client's"
+                "([MQTT-4.9.0-1]) up to the library's own ceiling, and not "
+                "the same field as the client's"
             )
             await client.disconnect(session_expiry=0.0)
 

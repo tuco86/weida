@@ -319,7 +319,7 @@ async fn a_retained_value_is_stored_and_then_deleted() {
         .await
         .expect("publishes retained");
     let live = delivered(&mut early_events).await;
-    assert_eq!(live.payload, b"on");
+    assert_eq!(live.payload, &b"on"[..]);
     assert_eq!(
         live.origin(false),
         RetainedOrigin::Live,
@@ -336,7 +336,7 @@ async fn a_retained_value_is_stored_and_then_deleted() {
         .await
         .expect("subscribed");
     let cached = delivered(&mut late_events).await;
-    assert_eq!(cached.payload, b"on");
+    assert_eq!(cached.payload, &b"on"[..]);
     assert_eq!(
         cached.origin(false),
         RetainedOrigin::Retained,
@@ -404,7 +404,7 @@ async fn retain_handling_two_is_ignored_by_this_broker() {
         .subscribe(vec![Subscription::new(topic, QoS::AtLeastOnce)])
         .await
         .expect("subscribed");
-    assert_eq!(delivered(&mut wants_events).await.payload, b"stored");
+    assert_eq!(delivered(&mut wants_events).await.payload, &b"stored"[..]);
 
     // Retain Handling 2 does not.
     let (declines, mut declines_events) = Client::connect(&context, BROKER, options("w3-sub-rh2"))
@@ -424,7 +424,8 @@ async fn retain_handling_two_is_ignored_by_this_broker() {
     // the broker's and not this client's.
     let anyway = delivered(&mut declines_events).await;
     assert_eq!(
-        anyway.payload, b"stored",
+        anyway.payload,
+        &b"stored"[..],
         "Retain Handling 2 is ignored by this broker version: the retained \
          value is sent at subscribe time regardless"
     );
@@ -438,7 +439,7 @@ async fn retain_handling_two_is_ignored_by_this_broker() {
         .publish(Message::new(topic, "live").at(QoS::AtLeastOnce))
         .await
         .expect("publishes");
-    assert_eq!(delivered(&mut declines_events).await.payload, b"live");
+    assert_eq!(delivered(&mut declines_events).await.payload, &b"live"[..]);
 
     // Clean up the retained value for the next run.
     publisher
@@ -505,7 +506,7 @@ async fn the_will_fires_on_an_abnormal_close_and_not_on_an_orderly_one() {
 
     let published = delivered(&mut events).await;
     assert_eq!(published.topic, "w3/will/abrupt");
-    assert_eq!(published.payload, b"gone");
+    assert_eq!(published.payload, &b"gone"[..]);
     assert_eq!(
         published.qos,
         QoS::AtLeastOnce,

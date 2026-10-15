@@ -364,6 +364,25 @@ mod tests {
         assert_eq!(out, [0xF0, 0x02, 0x00, 0x00]);
     }
 
+    /// The middle form, as for DISCONNECT: a reason code with the property
+    /// length omitted decodes, and the encoder writes the explicit zero length
+    /// back, one byte longer. Zero-length is the refused spelling, not this.
+    #[test]
+    fn an_auth_reason_code_alone_decodes() {
+        let (decoded, used) = Packet::decode(&[0xF0, 0x01, 0x18], varint::MAX).expect("decodes");
+        assert_eq!(used, 3);
+        assert_eq!(
+            decoded,
+            Packet::Auth(Auth {
+                reason_code: AuthReasonCode::ContinueAuthentication,
+                properties: Properties::new(),
+            })
+        );
+        let mut out = Vec::new();
+        decoded.encode(&mut out).expect("encodes");
+        assert_eq!(out, [0xF0, 0x02, 0x18, 0x00]);
+    }
+
     /// AUTH's property set is its own: the method and data belong to it,
     /// `Session Expiry Interval` does not.
     #[test]

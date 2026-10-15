@@ -14,8 +14,14 @@
 //! lost by the walker, a payload-list entry skipped, or a length computed
 //! differently by `body_len` than by the encoder.
 //!
-//! The one length relation that does hold is `encoded_len <= used`: the
-//! canonical spelling is never longer than the spelling that arrived.
+//! The one length relation that holds is `encoded_len <= used + 1`. The
+//! canonical spelling is never longer than the one that arrived, except by the
+//! byte a reason code sent *without* its Property Length leaves out: an
+//! acknowledgement's `id, code` body (3.4.2.2), DISCONNECT's bare code
+//! (3.14.2.1) and AUTH's bare code all decode, and all re-encode with the
+//! explicit zero length that every peer writes, one byte longer. Never longer
+//! than that, and always a fixed point: decoding the canonical form and
+//! encoding it again gives the same bytes.
 //!
 //! The cap stays small so that the allocation bound is exercised rather than
 //! described: a declared quarter-gigabyte body over a fifty-byte input must be
@@ -39,14 +45,17 @@ fuzz_target!(|data: &[u8]| {
         let size = packet.encoded_len().expect("a decoded packet has a length");
         assert_eq!(size as usize, out.len(), "encoded_len agrees with encode");
         assert!(
-            out.len() <= used,
-            "the canonical form is never longer than what arrived"
+            out.len() <= used + 1,
+            "the canonical form is at most the omitted Property Length longer than what arrived"
         );
 
         let (again, used2) = Packet::decode(&out, CAP).expect("the canonical form decodes");
         assert_eq!(again, packet);
         assert_eq!(used2, out.len());
         assert_eq!(again.packet_type(), packet.packet_type());
+        let mut twice = Vec::new();
+        again.encode(&mut twice).expect("the canonical form re-encodes");
+        assert_eq!(twice, out, "the canonical form is a fixed point");
 
         // The refusal on the way out is the mirror of the one on the way in.
         let mut small = Vec::new();

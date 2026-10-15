@@ -27,23 +27,41 @@
 //!
 //! # Where the bound is
 //!
-//! Both tables are bounded by a number the *receiver* declared, so neither can
-//! be grown by the peer: the outbound table by the server's `Topic Alias
-//! Maximum` from CONNACK, the inbound table by
+//! Both tables are bounded in entries by a number the *receiver* declared, so
+//! neither can be grown by the peer: the outbound table by the server's `Topic
+//! Alias Maximum` from CONNACK, the inbound table by
 //! [`crate::Limits::topic_alias_maximum`] from our own CONNECT. A peer that
 //! sends alias 40,000 against our declared 10 does not allocate a 40,000-entry
 //! map; it earns a Protocol Error.
+//!
+//! **An entry count is not a memory bound**, because an entry holds a Topic
+//! Name of up to 65,535 bytes: ten declared aliases of near-64 KiB names are
+//! 640 KiB, and a thousand are 64 MiB for the life of the connection. So each
+//! table also holds a budget of bytes, [`crate::Limits::max_alias_bytes`],
+//! charged per entry with a fixed overhead so that a table of tiny names is
+//! bounded as well. A peer cannot be made to forget an alias it established,
+//! so an inbound one that would pass the budget is refused outright; an
+//! outbound topic that would pass it is only sent without an alias, which
+//! costs a few bytes and no correctness.
 
 use std::collections::HashMap;
 
 use crate::error::{Error, Feature, Result};
 
+/// What an alias entry costs beyond the bytes of its Topic Name: the map slot,
+/// the `String`'s own header and the table's bookkeeping. Without it a peer
+/// could fill the table's *count* with names of one byte each and be charged
+/// next to nothing for it.
+const ENTRY_OVERHEAD: usize = 64;
+
 /// The aliases this client has handed out on this connection.
 ///
-/// Bounded by the server's `Topic Alias Maximum`, which is also the highest
-/// alias value it will accept (3.2.2.3.8): aliases are allocated 1..=max, so
-/// the table's size and the protocol's ceiling are the same number and no
-/// second bound is needed.
+/// Bounded in entries by the server's `Topic Alias Maximum`, which is also
+/// the highest alias value it will accept (3.2.2.3.8): aliases are allocated
+/// 1..=max, so the table's size and the protocol's ceiling are the same
+/// number. The server's number is the peer's, though, and an entry may be a
+/// 65,535-byte Topic Name an application took from remote input, so the table
+/// is also bounded in bytes.
 ///
 /// **No eviction.** Once `max` topics have aliases, further topics are
 /// published with their full Topic Name and no alias. Replacing a mapping is
@@ -57,6 +75,8 @@ use crate::error::{Error, Feature, Result};
 #[derive(Debug)]
 pub struct OutboundAliases {
     max: u16,
+    max_bytes: usize,
+    bytes: usize,
     assigned: HashMap<String, u16>,
 }
 
@@ -75,13 +95,16 @@ pub enum Aliased {
 }
 
 impl OutboundAliases {
-    /// A table bounded by the server's `Topic Alias Maximum`. Zero - the
-    /// protocol's default - means the server accepts no aliases
-    /// ([MQTT-3.2.2-18]), so nothing is ever aliased.
+    /// A table bounded by the server's `Topic Alias Maximum` and by
+    /// `max_bytes` of Topic Names. A maximum of zero, which is the protocol's
+    /// default, means the server accepts no aliases ([MQTT-3.2.2-18]), so
+    /// nothing is ever aliased.
     #[must_use]
-    pub fn new(maximum: u16) -> OutboundAliases {
+    pub fn new(maximum: u16, max_bytes: usize) -> OutboundAliases {
         OutboundAliases {
             max: maximum,
+            max_bytes,
+            bytes: 0,
             assigned: HashMap::new(),
         }
     }
@@ -110,10 +133,36 @@ impl OutboundAliases {
         if next >= self.max {
             return Aliased::Full;
         }
+        // The table's own budget: a topic that would not fit is sent in full,
+        // which is what every topic past the server's maximum does.
+        let cost = topic.len() + ENTRY_OVERHEAD;
+        if self.bytes.saturating_add(cost) > self.max_bytes {
+            return Aliased::Full;
+        }
         // 1..=max: "Topic Alias 0 is a Protocol Error" ([MQTT-3.3.2-8]).
         let alias = next + 1;
+        self.bytes += cost;
         self.assigned.insert(topic.to_owned(), alias);
         Aliased::Establish(alias)
+    }
+
+    /// Takes back what [`OutboundAliases::publish`] decided for `topic` when
+    /// the packet it was for never reached the wire.
+    ///
+    /// An alias is established by the PUBLISH that carries it, so one whose
+    /// PUBLISH was refused locally — it did not fit the server's `Maximum
+    /// Packet Size` — was never established, and a later publish that used it
+    /// would carry a zero-length Topic Name the server has no mapping for.
+    /// Only an [`Aliased::Establish`] leaves anything to take back, and only
+    /// the **latest** one may be: aliases are handed out in order, so this is
+    /// called straight after the failed send and before the next publish.
+    pub fn revoke(&mut self, decision: Aliased, topic: &str) {
+        if let Aliased::Establish(alias) = decision
+            && self.assigned.get(topic) == Some(&alias)
+        {
+            self.assigned.remove(topic);
+            self.bytes -= topic.len() + ENTRY_OVERHEAD;
+        }
     }
 }
 
@@ -125,18 +174,23 @@ impl OutboundAliases {
 /// other direction, 3.1.2.11.5): an alias outside 1..=max is refused before
 /// the map is touched, so the map never holds more than `max` entries however
 /// hostile the peer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InboundAliases {
     max: u16,
+    max_bytes: usize,
+    bytes: usize,
     known: HashMap<u16, String>,
 }
 
 impl InboundAliases {
-    /// A table bounded by what this client declared it would accept.
+    /// A table bounded by what this client declared it would accept, and by
+    /// `max_bytes` of Topic Names.
     #[must_use]
-    pub fn new(maximum: u16) -> InboundAliases {
+    pub fn new(maximum: u16, max_bytes: usize) -> InboundAliases {
         InboundAliases {
             max: maximum,
+            max_bytes,
+            bytes: 0,
             known: HashMap::new(),
         }
     }
@@ -165,8 +219,9 @@ impl InboundAliases {
     /// # Errors
     ///
     /// [`Error::Unavailable`] with 0x94 (Topic Alias invalid) for alias 0, for
-    /// an alias above the maximum this client declared, and for a zero-length
-    /// Topic Name whose alias was never established. The last is not
+    /// an alias above the maximum this client declared, for a zero-length
+    /// Topic Name whose alias was never established, and for a mapping that
+    /// would take the table past its byte budget. The third is not
     /// pedantry - it is the difference between reporting a Protocol Error and
     /// delivering a message on an unknown topic.
     pub fn resolve(&mut self, alias: Option<u16>, topic: &str) -> Result<String> {
@@ -194,6 +249,21 @@ impl InboundAliases {
                 reason_code: Feature::TopicAlias.reason_code(),
             });
         }
+        // A new or replaced mapping is charged, and what it replaces is given
+        // back, before anything is stored.
+        let cost = topic.len() + ENTRY_OVERHEAD;
+        let replaced = self
+            .known
+            .get(&alias)
+            .map_or(0, |old| old.len() + ENTRY_OVERHEAD);
+        let after = self.bytes - replaced + cost;
+        if after > self.max_bytes {
+            return Err(Error::Unavailable {
+                feature: Feature::TopicAlias,
+                reason_code: Feature::TopicAlias.reason_code(),
+            });
+        }
+        self.bytes = after;
         self.known.insert(alias, topic.to_owned());
         Ok(topic.to_owned())
     }
@@ -203,11 +273,14 @@ impl InboundAliases {
 mod tests {
     use super::*;
 
+    /// A budget no test here comes near, for the tests that are not about it.
+    const ROOMY: usize = 1 << 20;
+
     /// An alias is established by a full Topic Name and then used by a
     /// zero-length one, which is the whole mechanism ([MQTT-3.3.4-6]).
     #[test]
     fn an_alias_is_established_once_and_used_after() {
-        let mut aliases = OutboundAliases::new(4);
+        let mut aliases = OutboundAliases::new(4, ROOMY);
         assert_eq!(aliases.publish("a/b"), Aliased::Establish(1));
         assert_eq!(aliases.publish("a/b"), Aliased::Use(1));
         assert_eq!(aliases.publish("a/b"), Aliased::Use(1));
@@ -220,7 +293,7 @@ mod tests {
     /// maximum the server declared.
     #[test]
     fn aliases_run_from_one_to_the_servers_maximum() {
-        let mut aliases = OutboundAliases::new(3);
+        let mut aliases = OutboundAliases::new(3, ROOMY);
         let handed: Vec<Aliased> = ["a", "b", "c", "d", "e"]
             .iter()
             .map(|topic| aliases.publish(topic))
@@ -246,7 +319,7 @@ mod tests {
     /// accepts none ([MQTT-3.2.2-18]), so nothing is ever aliased.
     #[test]
     fn a_maximum_of_zero_aliases_nothing() {
-        let mut aliases = OutboundAliases::new(0);
+        let mut aliases = OutboundAliases::new(0, ROOMY);
         assert_eq!(aliases.publish("a/b"), Aliased::Full);
         assert_eq!(aliases.publish("a/b"), Aliased::Full);
         assert!(aliases.is_empty());
@@ -255,7 +328,7 @@ mod tests {
     /// The inbound half: set by a full Topic Name, read by a zero-length one.
     #[test]
     fn an_inbound_alias_resolves_what_it_was_set_to() {
-        let mut aliases = InboundAliases::new(4);
+        let mut aliases = InboundAliases::new(4, ROOMY);
         assert_eq!(aliases.resolve(Some(1), "a/b").unwrap(), "a/b");
         assert_eq!(aliases.resolve(Some(1), "").unwrap(), "a/b");
         assert_eq!(aliases.resolve(Some(1), "").unwrap(), "a/b");
@@ -275,7 +348,7 @@ mod tests {
     /// Every way an alias can be invalid, each earning 0x94.
     #[test]
     fn an_invalid_inbound_alias_is_a_protocol_error() {
-        let mut aliases = InboundAliases::new(2);
+        let mut aliases = InboundAliases::new(2, ROOMY);
 
         // Zero.
         assert_eq!(
@@ -306,7 +379,7 @@ mod tests {
     /// no alias whatever, because 1 is already above 0.
     #[test]
     fn declaring_zero_refuses_every_alias() {
-        let mut aliases = InboundAliases::new(0);
+        let mut aliases = InboundAliases::new(0, ROOMY);
         assert_eq!(
             aliases.resolve(Some(1), "a").unwrap_err().reason_code(),
             Some(0x94)
@@ -319,8 +392,8 @@ mod tests {
     /// with alias 3 outbound.
     #[test]
     fn the_two_directions_do_not_share_a_table() {
-        let mut outbound = OutboundAliases::new(1);
-        let mut inbound = InboundAliases::new(4);
+        let mut outbound = OutboundAliases::new(1, ROOMY);
+        let mut inbound = InboundAliases::new(4, ROOMY);
 
         assert_eq!(outbound.publish("ours"), Aliased::Establish(1));
         assert_eq!(outbound.publish("second"), Aliased::Full, "our bound is 1");
@@ -331,5 +404,73 @@ mod tests {
         assert_eq!(inbound.resolve(Some(4), "far").unwrap(), "far");
         assert_eq!(inbound.resolve(Some(1), "").unwrap(), "theirs");
         assert_eq!(outbound.publish("ours"), Aliased::Use(1));
+    }
+
+    /// A table of declared entries is not a table of bounded memory: each may
+    /// be a name of nearly 64 KiB. Two such names do not fit a 64 KiB budget,
+    /// and the second is refused rather than stored, with the table left as it
+    /// was.
+    #[test]
+    fn an_inbound_table_is_bounded_in_bytes_not_only_in_entries() {
+        let long = "t".repeat(40 * 1024);
+        let mut aliases = InboundAliases::new(8, 64 * 1024);
+        assert_eq!(aliases.resolve(Some(1), &long).unwrap(), long);
+        assert_eq!(
+            aliases.resolve(Some(2), &long).unwrap_err().reason_code(),
+            Some(0x94)
+        );
+        assert_eq!(aliases.len(), 1, "the refused one stored nothing");
+        assert_eq!(
+            aliases.resolve(Some(1), "").unwrap(),
+            long,
+            "the first stands"
+        );
+
+        // Replacing a mapping gives its bytes back, so a table at its budget
+        // is not stuck at it.
+        assert_eq!(aliases.resolve(Some(1), "short").unwrap(), "short");
+        assert_eq!(aliases.resolve(Some(2), &long).unwrap(), long);
+    }
+
+    /// The per-entry overhead is what bounds a table of tiny names: with it,
+    /// a budget is also a ceiling on the count.
+    #[test]
+    fn tiny_names_are_charged_too() {
+        let mut aliases = InboundAliases::new(1000, 10 * ENTRY_OVERHEAD);
+        let stored = (1..=1000u16)
+            .take_while(|alias| aliases.resolve(Some(*alias), "x").is_ok())
+            .count();
+        assert!((1..=10).contains(&stored), "{stored} entries of one byte");
+    }
+
+    /// An outbound topic that does not fit the budget is sent in full, which
+    /// costs a few bytes and nothing else.
+    #[test]
+    fn an_outbound_topic_past_the_budget_goes_out_without_an_alias() {
+        let long = "t".repeat(40 * 1024);
+        let mut aliases = OutboundAliases::new(8, 64 * 1024);
+        assert_eq!(aliases.publish(&long), Aliased::Establish(1));
+        let other = "u".repeat(40 * 1024);
+        assert_eq!(aliases.publish(&other), Aliased::Full);
+        assert_eq!(aliases.publish(&long), Aliased::Use(1), "the first stands");
+        assert_eq!(aliases.len(), 1);
+    }
+
+    /// An alias whose establishing PUBLISH was refused locally was never
+    /// established, so taking it back leaves the next publish of that topic to
+    /// establish it again, under the same number.
+    #[test]
+    fn a_revoked_alias_is_established_again() {
+        let mut aliases = OutboundAliases::new(4, ROOMY);
+        let decision = aliases.publish("a/b");
+        assert_eq!(decision, Aliased::Establish(1));
+        aliases.revoke(decision, "a/b");
+        assert!(aliases.is_empty());
+        assert_eq!(aliases.publish("a/b"), Aliased::Establish(1));
+
+        // Taking back a use, or a full topic, takes back nothing.
+        aliases.revoke(Aliased::Use(1), "a/b");
+        aliases.revoke(Aliased::Full, "a/b");
+        assert_eq!(aliases.publish("a/b"), Aliased::Use(1));
     }
 }

@@ -44,7 +44,7 @@
 //! Password with no User Name, which 3.1.1 forbade (3.1.2.9) [mqtt5 §10], so a
 //! Password-only CONNECT encodes and decodes here.
 
-use crate::data::{self, Reader};
+use crate::data::{self, Reader, Redacted};
 use crate::error::{DecodeError, EncodeError};
 use crate::property::{Properties, PropertySet};
 use crate::types::QoS;
@@ -73,7 +73,11 @@ pub struct Will<'a> {
 }
 
 /// A CONNECT packet.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Its `Debug` prints the user name and the password as a length: both are
+/// credentials, and `Authentication Data` inside [`Properties`] is redacted by
+/// that type's own `Debug`.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Connect<'a> {
     /// Client Identifier: the key to session state, 1..=65,535 bytes, and
     /// zero-length to ask the server to assign one ([MQTT-3.1.3-6])
@@ -101,6 +105,31 @@ pub struct Connect<'a> {
     /// Password, if the Password Flag is set. Binary Data, and "can be used to
     /// carry any credential information" (3.1.3.6) [mqtt5 §10].
     pub password: Option<&'a [u8]>,
+}
+
+impl core::fmt::Debug for Connect<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Exhaustive on purpose: a field added to `Connect` does not compile
+        // here until someone has decided whether it may be printed.
+        let Connect {
+            client_id,
+            clean_start,
+            keep_alive,
+            properties,
+            will,
+            user_name,
+            password,
+        } = self;
+        f.debug_struct("Connect")
+            .field("client_id", client_id)
+            .field("clean_start", clean_start)
+            .field("keep_alive", keep_alive)
+            .field("properties", properties)
+            .field("will", will)
+            .field("user_name", &user_name.map(|name| Redacted(name.len())))
+            .field("password", &password.map(|secret| Redacted(secret.len())))
+            .finish()
+    }
 }
 
 /// Bit positions in the connect flags byte (3.1.2.3) [mqtt5 §1].
@@ -497,5 +526,41 @@ mod tests {
                 0x00, 0x01, b'u', 0x00, 0x01, 0x70
             ]
         );
+    }
+
+    /// The three things in a CONNECT that exist to be secret never reach a
+    /// formatter, whichever way the packet was made: built by a caller, or
+    /// decoded, where the property block they ride in is borrowed whole.
+    #[test]
+    fn a_connects_debug_hides_every_credential() {
+        let connect = Connect {
+            client_id: "c",
+            clean_start: true,
+            properties: Properties {
+                authentication_method: Some("SCRAM-SHA-256"),
+                authentication_data: Some(b"hunter2-proof"),
+                ..Properties::new()
+            },
+            user_name: Some("operator-7"),
+            password: Some(b"hunter2"),
+            ..Connect::default()
+        };
+        let mut wire = Vec::new();
+        Packet::Connect(connect.clone())
+            .encode(&mut wire)
+            .expect("encodes");
+        let (decoded, _) = Packet::decode(&wire, varint::MAX).expect("decodes");
+
+        for packet in [Packet::Connect(connect), decoded] {
+            let shown = format!("{packet:?}");
+            for secret in ["hunter2", "operator-7"] {
+                assert!(!shown.contains(secret), "{secret} is in {shown}");
+            }
+            // The derived form of `&[u8]` would have spelled the bytes out.
+            assert!(!shown.contains("104, 117, 110"), "{shown}");
+            // What stays is what a log wants: that there is one, and how big.
+            assert!(shown.contains("<redacted 7 bytes>"), "{shown}");
+            assert!(shown.contains("SCRAM-SHA-256"), "{shown}");
+        }
     }
 }

@@ -153,7 +153,28 @@ impl StoredPublish {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect()
     }
+
+    /// What this message costs to hold: its topic, payload and properties,
+    /// and a fixed overhead for the entry itself, so that a store of empty
+    /// messages is bounded by [`Limits::max_inflight_bytes`] as well as by
+    /// their count.
+    #[must_use]
+    pub(crate) fn charge(&self) -> usize {
+        let properties = self.content_type.as_ref().map_or(0, String::len)
+            + self.response_topic.as_ref().map_or(0, String::len)
+            + self.correlation_data.as_ref().map_or(0, Vec::len)
+            + self
+                .user_properties
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>();
+        STORED_OVERHEAD + self.topic.len() + self.payload.len() + properties
+    }
 }
+
+/// What a stored message costs beyond the bytes it holds: the `InFlight` entry
+/// and the allocations behind the message's own fields.
+const STORED_OVERHEAD: usize = 256;
 
 /// How far an outbound QoS > 0 message has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,14 +200,21 @@ pub struct InFlight {
     pub stage: Stage,
     /// The message, for as long as it may still have to be resent.
     ///
+    /// Shared with the connection that is sending it, which encodes from the
+    /// same copy the session keeps: a payload is stored once however many
+    /// times it is written.
+    ///
     /// Dropped on the transition to [`Stage::AwaitingPubcomp`], because from
     /// there only the PUBREL is resent and keeping the payload would be
     /// holding a copy of every in-flight QoS 2 body for a round trip longer
     /// than the protocol needs it.
-    pub message: Option<StoredPublish>,
+    pub message: Option<Arc<StoredPublish>>,
     /// The order this was first sent in, so [`Session::resend`] can honour
     /// "in the order the originals were sent" ([MQTT-4.6.0-1]).
     sequence: u64,
+    /// What `message` is charged against [`Limits::max_inflight_bytes`], and
+    /// what is given back when it is dropped.
+    charge: usize,
 }
 
 /// What to put on the wire when a session resumes.
@@ -197,8 +225,9 @@ pub enum Resend {
     Publish {
         /// The original identifier.
         packet_id: u16,
-        /// The stored message.
-        message: StoredPublish,
+        /// The stored message, shared with the session: collecting what to
+        /// resend copies a pointer per message and not the message.
+        message: Arc<StoredPublish>,
     },
     /// A PUBREL not yet answered by PUBCOMP.
     Pubrel {
@@ -266,15 +295,22 @@ struct State {
     /// `None` until a CONNECT has been built from this session.
     declared_expiry: Option<u32>,
     /// The ceiling on what **this client** may have in flight toward the
-    /// server: the peer's `Receive Maximum` once a CONNACK has said so
-    /// ([MQTT-4.9.0-1]), and the client's own configured value as a
-    /// placeholder before that.
+    /// server: the smaller of the peer's `Receive Maximum` once a CONNACK has
+    /// said so ([MQTT-4.9.0-1]) and [`Limits::max_inflight`], and the client's
+    /// own configured value as a placeholder before that.
     send_quota: u16,
     /// The ceiling on what the **server** may have in flight toward this
     /// client: the `Receive Maximum` this client declared in CONNECT. A
     /// different number from `send_quota`, and never overwritten by the
     /// server's.
     receive_maximum: u16,
+    /// [`Limits::max_inflight`]: the local ceiling on `send_quota`, because
+    /// the server's number is the peer's.
+    max_inflight: usize,
+    /// [`Limits::max_inflight_bytes`].
+    max_inflight_bytes: usize,
+    /// What the stored messages are charged, together.
+    outbound_bytes: usize,
 }
 
 impl Session {
@@ -296,8 +332,11 @@ impl Session {
                 next_packet_id: 1,
                 sequence: 0,
                 declared_expiry: None,
-                send_quota: limits.receive_maximum,
+                send_quota: clamp_quota(limits.receive_maximum, limits.max_inflight),
                 receive_maximum: limits.receive_maximum,
+                max_inflight: limits.max_inflight,
+                max_inflight_bytes: limits.max_inflight_bytes,
+                outbound_bytes: 0,
             })),
         }
     }
@@ -350,6 +389,7 @@ impl Session {
     pub fn clear(&self) {
         let mut state = self.lock();
         state.outbound.clear();
+        state.outbound_bytes = 0;
         state.inbound_qos2.clear();
         state.control.clear();
         // "Subscriptions do not survive Clean Start 1" [mqtt5 §1], so the
@@ -495,10 +535,35 @@ impl Session {
                 },
                 (_, Some(message)) => Resend::Publish {
                     packet_id: entry.packet_id,
-                    message: message.clone(),
+                    message: Arc::clone(message),
                 },
             })
             .collect()
+    }
+
+    /// The message stored against `packet_id`, where there still is one: it
+    /// goes when the exchange completes and when a QoS 2 exchange passes its
+    /// PUBREC.
+    #[must_use]
+    pub fn message_of(&self, packet_id: u16) -> Option<Arc<StoredPublish>> {
+        self.lock()
+            .outbound
+            .get(&packet_id)
+            .and_then(|entry| entry.message.clone())
+    }
+
+    /// Takes the limits the connection about to be made declares.
+    ///
+    /// A session is created once and connected many times, and the numbers
+    /// that bound it — what this client lets the server have in flight toward
+    /// it, and how much it keeps of its own in flight — belong to the
+    /// connection's options, which a caller may change between connections.
+    pub fn apply_limits(&self, limits: &Limits) {
+        let mut state = self.lock();
+        state.receive_maximum = limits.receive_maximum;
+        state.max_inflight = limits.max_inflight;
+        state.max_inflight_bytes = limits.max_inflight_bytes;
+        state.send_quota = clamp_quota(state.send_quota, limits.max_inflight);
     }
 
     /// Replaces the ceiling on concurrent unacknowledged messages with the
@@ -519,12 +584,17 @@ impl Session {
     /// toward this client (3.1.2.11.3, 3.2.2.3.3) [mqtt5 §11]. A server that
     /// declares nothing means 65,535 for the first and changes nothing about
     /// the second.
+    ///
+    /// **And it is held to [`Limits::max_inflight`].** The server's number is
+    /// the peer's, and a server that declares nothing means 65,535 of them,
+    /// each a full stored message: the quota is the smaller of the two.
     pub fn set_send_quota(&self, server_receive_maximum: u16) {
-        self.lock().send_quota = server_receive_maximum;
+        let mut state = self.lock();
+        state.send_quota = clamp_quota(server_receive_maximum, state.max_inflight);
     }
 
-    /// The send quota's ceiling: the server's `Receive Maximum`
-    /// ([MQTT-4.9.0-1]).
+    /// The send quota's ceiling: the smaller of the server's `Receive Maximum`
+    /// ([MQTT-4.9.0-1]) and [`Limits::max_inflight`].
     #[must_use]
     pub fn send_quota(&self) -> u16 {
         self.lock().send_quota
@@ -630,17 +700,31 @@ impl Session {
     /// quota "stalls the sender rather than exceeding it" [mqtt5 §5], and
     /// stalling is the caller's to do — this reports, and
     /// [`crate::Client::publish`] waits.
-    pub fn allocate(&self, message: StoredPublish) -> Result<u16> {
+    pub fn allocate(
+        &self,
+        message: Arc<StoredPublish>,
+    ) -> std::result::Result<u16, (Error, Arc<StoredPublish>)> {
         debug_assert_ne!(message.qos, QoS::AtMostOnce, "QoS 0 is never stored");
+        let charge = message.charge();
         let mut state = self.lock();
+        let state = &mut *state;
         if state.outbound.len() >= usize::from(state.send_quota) {
-            return Err(Error::QuotaExhausted {
-                quota: state.send_quota,
-            });
+            let quota = state.send_quota;
+            return Err((Error::QuotaExhausted { quota }, message));
+        }
+        // A store holding nothing accepts one message of any size: a bound
+        // that refused the only message would be a deadlock.
+        if !state.outbound.is_empty()
+            && state.outbound_bytes.saturating_add(charge) > state.max_inflight_bytes
+        {
+            let quota = state.send_quota;
+            return Err((Error::QuotaExhausted { quota }, message));
         }
 
-        let packet_id = next_free(&state.outbound, &state.control, state.next_packet_id)
-            .ok_or(Error::QuotaExhausted { quota: u16::MAX })?;
+        let Some(packet_id) = next_free(&state.outbound, &state.control, state.next_packet_id)
+        else {
+            return Err((Error::QuotaExhausted { quota: u16::MAX }, message));
+        };
         state.next_packet_id = packet_id.wrapping_add(1).max(1);
 
         let sequence = state.sequence;
@@ -649,6 +733,7 @@ impl Session {
             QoS::AtLeastOnce => Stage::AwaitingPuback,
             _ => Stage::AwaitingPubrec,
         };
+        state.outbound_bytes += charge;
         state.outbound.insert(
             packet_id,
             InFlight {
@@ -656,6 +741,7 @@ impl Session {
                 stage,
                 message: Some(message),
                 sequence,
+                charge,
             },
         );
         Ok(packet_id)
@@ -677,7 +763,31 @@ impl Session {
     /// can tell an acknowledgement it was waiting for from one it was not —
     /// the latter being the mismatch 0x92 and 0x91 report [mqtt5 §8].
     pub fn release(&self, packet_id: u16) -> bool {
-        self.lock().outbound.remove(&packet_id).is_some()
+        let mut state = self.lock();
+        match state.outbound.remove(&packet_id) {
+            Some(entry) => {
+                state.outbound_bytes -= entry.charge;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Releases `packet_id` only if it has reached `stage`.
+    ///
+    /// An acknowledgement settles the exchange it belongs to and no other: a
+    /// PUBACK is the end of a QoS 1 exchange and means nothing to a QoS 2 one
+    /// still waiting for its PUBREC, and a peer that sends one anyway must not
+    /// be able to drop the only stored copy. Returns whether it was released.
+    pub fn release_awaiting(&self, packet_id: u16, stage: Stage) -> bool {
+        let mut state = self.lock();
+        if state.outbound.get(&packet_id).map(|entry| entry.stage) != Some(stage) {
+            return false;
+        }
+        if let Some(entry) = state.outbound.remove(&packet_id) {
+            state.outbound_bytes -= entry.charge;
+        }
+        true
     }
 
     /// Moves `packet_id` from awaiting PUBREC to awaiting PUBCOMP, dropping
@@ -691,10 +801,12 @@ impl Session {
     /// Returns whether the identifier was in [`Stage::AwaitingPubrec`].
     pub fn pubrec_received(&self, packet_id: u16) -> bool {
         let mut state = self.lock();
+        let state = &mut *state;
         match state.outbound.get_mut(&packet_id) {
             Some(entry) if entry.stage == Stage::AwaitingPubrec => {
                 entry.stage = Stage::AwaitingPubcomp;
                 entry.message = None;
+                state.outbound_bytes -= std::mem::take(&mut entry.charge);
                 true
             }
             _ => false,
@@ -767,6 +879,12 @@ fn next_free(
     None
 }
 
+/// The send quota: the server's `Receive Maximum` held to this client's own
+/// ceiling, because the server's number is the peer's.
+fn clamp_quota(server_receive_maximum: u16, max_inflight: usize) -> u16 {
+    server_receive_maximum.min(u16::try_from(max_inflight).unwrap_or(u16::MAX))
+}
+
 /// Seconds, for a `Session Expiry Interval`.
 #[must_use]
 pub(crate) fn expiry_seconds(interval: Option<Duration>) -> Option<u32> {
@@ -777,7 +895,7 @@ pub(crate) fn expiry_seconds(interval: Option<Duration>) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn message(topic: &str, qos: QoS) -> StoredPublish {
+    fn stored(topic: &str, qos: QoS) -> StoredPublish {
         StoredPublish {
             topic: topic.into(),
             payload: topic.as_bytes().to_vec(),
@@ -790,6 +908,10 @@ mod tests {
             correlation_data: None,
             user_properties: Vec::new(),
         }
+    }
+
+    fn message(topic: &str, qos: QoS) -> Arc<StoredPublish> {
+        Arc::new(stored(topic, qos))
     }
 
     fn session(quota: u16) -> Session {
@@ -956,7 +1078,7 @@ mod tests {
         let second = session.allocate(message("b", QoS::AtLeastOnce)).unwrap();
         assert!(matches!(
             session.allocate(message("c", QoS::AtLeastOnce)),
-            Err(Error::QuotaExhausted { quota: 2 })
+            Err((Error::QuotaExhausted { quota: 2 }, _))
         ));
 
         // Releasing one makes room for exactly one more.
@@ -965,7 +1087,7 @@ mod tests {
         assert_ne!(third, second);
         assert!(matches!(
             session.allocate(message("d", QoS::AtLeastOnce)),
-            Err(Error::QuotaExhausted { quota: 2 })
+            Err((Error::QuotaExhausted { quota: 2 }, _))
         ));
 
         // And the server's number replaces the client's once CONNACK says so
@@ -979,6 +1101,136 @@ mod tests {
             "the client's own declared Receive Maximum is untouched"
         );
         assert!(session.allocate(message("d", QoS::AtLeastOnce)).is_ok());
+    }
+
+    /// The server's number is the peer's, and a server that declares nothing
+    /// declares 65,535: the send quota is held to this client's own
+    /// `max_inflight`, so a silent broker cannot make a session store that
+    /// many messages.
+    #[test]
+    fn the_send_quota_is_held_to_the_local_inflight_ceiling() {
+        let limits = Limits {
+            max_inflight: 8,
+            ..Limits::default()
+        };
+        let session = Session::new("c", &limits);
+        session.set_send_quota(65_535);
+        assert_eq!(session.send_quota(), 8);
+        for index in 0..8 {
+            session
+                .allocate(message(&format!("t{index}"), QoS::AtLeastOnce))
+                .unwrap();
+        }
+        let (error, _) = session
+            .allocate(message("ninth", QoS::AtLeastOnce))
+            .expect_err("the ninth is over the local ceiling");
+        assert!(
+            matches!(error, Error::QuotaExhausted { quota: 8 }),
+            "{error}"
+        );
+
+        // A smaller server number still wins: the quota is the smaller of the
+        // two and not the local ceiling.
+        session.set_send_quota(3);
+        assert_eq!(session.send_quota(), 3);
+    }
+
+    /// The ceiling in bytes: past it a publish is not stored (the connection
+    /// stalls it), and a session holding nothing still takes one message of
+    /// any size, because a bound that refused the only message is a deadlock.
+    #[test]
+    fn the_stored_bytes_are_a_ceiling_and_the_first_message_is_exempt() {
+        let limits = Limits {
+            max_inflight_bytes: 2_000,
+            ..Limits::default()
+        };
+        let session = Session::new("c", &limits);
+        let big = |topic: &str| {
+            Arc::new(StoredPublish {
+                payload: vec![0; 1_000],
+                ..stored(topic, QoS::AtLeastOnce)
+            })
+        };
+        // Each costs its payload and the fixed overhead, so one fits and two
+        // do not.
+        let first = session.allocate(big("a")).expect("the first is exempt");
+        let (error, handed_back) = session
+            .allocate(big("b"))
+            .expect_err("the second is over the budget");
+        assert!(matches!(error, Error::QuotaExhausted { .. }), "{error}");
+        assert_eq!(handed_back.topic, "b", "the message comes back unstored");
+        assert_eq!(session.in_flight(), 1);
+
+        // Acknowledged, it gives its bytes back.
+        assert!(session.release(first));
+        assert!(session.allocate(big("b")).is_ok());
+
+        // A message larger than the whole budget is still admitted into an
+        // empty session.
+        session.clear();
+        let huge = Arc::new(StoredPublish {
+            payload: vec![0; 10_000],
+            ..stored("h", QoS::AtLeastOnce)
+        });
+        assert!(session.allocate(huge).is_ok());
+    }
+
+    /// A QoS 2 message past its PUBREC drops its body, and the bytes it was
+    /// charged go with it, so a long PUBCOMP wait does not hold the budget.
+    #[test]
+    fn passing_pubrec_gives_the_charge_back() {
+        let limits = Limits {
+            max_inflight_bytes: 2_000,
+            ..Limits::default()
+        };
+        let session = Session::new("c", &limits);
+        let big = |topic: &str| {
+            Arc::new(StoredPublish {
+                payload: vec![0; 1_000],
+                ..stored(topic, QoS::ExactlyOnce)
+            })
+        };
+        let first = session.allocate(big("a")).unwrap();
+        assert!(session.allocate(big("b")).is_err());
+        assert!(session.pubrec_received(first));
+        assert!(session.allocate(big("b")).is_ok(), "the body is gone");
+    }
+
+    /// An acknowledgement settles the exchange it belongs to and no other: a
+    /// PUBACK is nothing to a QoS 2 message awaiting its PUBREC.
+    #[test]
+    fn an_acknowledgement_only_releases_an_exchange_in_its_stage() {
+        let session = session(10);
+        let qos1 = session.allocate(message("a", QoS::AtLeastOnce)).unwrap();
+        let qos2 = session.allocate(message("b", QoS::ExactlyOnce)).unwrap();
+
+        assert!(!session.release_awaiting(qos2, Stage::AwaitingPuback));
+        assert!(!session.release_awaiting(qos1, Stage::AwaitingPubcomp));
+        assert!(!session.release_awaiting(999, Stage::AwaitingPuback));
+        assert_eq!(session.in_flight(), 2, "nothing was released");
+
+        assert!(session.release_awaiting(qos1, Stage::AwaitingPuback));
+        assert!(session.pubrec_received(qos2));
+        assert!(session.release_awaiting(qos2, Stage::AwaitingPubcomp));
+        assert!(session.is_empty());
+    }
+
+    /// The connection encodes from the copy the session keeps: asking for the
+    /// message is a pointer, and it goes when the exchange does.
+    #[test]
+    fn the_stored_message_is_shared_not_copied() {
+        let session = session(10);
+        let kept = message("a", QoS::AtLeastOnce);
+        let id = session.allocate(Arc::clone(&kept)).unwrap();
+        let fetched = session.message_of(id).expect("stored");
+        assert!(Arc::ptr_eq(&kept, &fetched));
+        match &session.resend()[..] {
+            [Resend::Publish { message, .. }] => assert!(Arc::ptr_eq(message, &kept)),
+            other => panic!("{other:?}"),
+        }
+
+        assert!(session.release(id));
+        assert!(session.message_of(id).is_none());
     }
 
     /// Identifiers are non-zero and are not reused while in flight
@@ -1099,7 +1351,7 @@ mod tests {
         let stored = StoredPublish {
             content_type: Some("text/plain".into()),
             user_properties: vec![("k".into(), "v".into())],
-            ..message("a/b", QoS::AtLeastOnce)
+            ..stored("a/b", QoS::AtLeastOnce)
         };
         let pairs = stored.borrowed_user_properties();
         let publish = stored.to_publish(5, true, &pairs);

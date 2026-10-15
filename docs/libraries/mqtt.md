@@ -88,7 +88,7 @@ test asserts the whole table rather than the packets this client happens to send
 | UNSUBSCRIBE | 10 | present (`unsubscribe.rs`) | present (`Client::unsubscribe`) | bare filters, no options |
 | UNSUBACK | 11 | present (`unsubscribe.rs`) | present | 0x11 `No subscription existed` is a **success** |
 | PINGREQ | 12 | present (`control.rs`) | present (`client.rs`) | sent by the keep-alive timer or by `Client::ping` |
-| PINGRESP | 13 | present (`control.rs`) | present | its absence is bounded by `ConnectOptions::effective_ping_timeout`, a number the specification does not give |
+| PINGRESP | 13 | present (`control.rs`) | present | its absence is bounded by `ConnectOptions::effective_ping_timeout`, a number the specification does not give, measured from the PINGREQ and from nothing else |
 | DISCONNECT | 14 | present (`control.rs`) | present (`Client::disconnect_with`) | in **both** directions: a server DISCONNECT is `Error::ServerDisconnected` carrying its code |
 | AUTH | 15 | present (`control.rs`) | present (`connection.rs`, `Client::reauthenticate`) | in the handshake and on the live connection |
 
@@ -111,7 +111,7 @@ asserts the packet membership both ways.
 | Assigned Client Identifier | 18 | present | `Client::client_id` | a zero-length Client Identifier asks for one |
 | Server Keep Alive | 19 | present | `Client::keep_alive` | the one property that **overrides** the client ([MQTT-3.2.2-21]) |
 | Authentication Method | 21 | present | `ConnectOptions::authentication_method` | repeated by every AUTH and checked, not trusted |
-| Authentication Data | 22 | present | `ConnectOptions::authentication_data`, `Authenticator::challenge` | |
+| Authentication Data | 22 | present | `ConnectOptions::authentication_data`, `Authenticator::challenge`, `Authenticator::finish` | `finish` has no default: the server's proof of itself is the CONNACK's (or AUTH 0x00's) data, and an implementation that forgot it would accept an impostor |
 | Request Problem Information | 23 | present | `ConnectOptions::request_problem_information` | default 1, so only the non-default reaches the wire |
 | Will Delay Interval | 24 | present | `WillMessage::delay` | client-side: sent and asserted; the timer is `server-side` |
 | Request Response Information | 25 | present | `ConnectOptions::request_response_information` | |
@@ -243,12 +243,17 @@ bound at all. A client is on the exposed side of each, so `Limits` names them an
 
 | Bound | Default | Why the protocol has none |
 | --- | --- | --- |
-| `Limits::max_subscription_identifiers` | 32 | a server MAY send one copy carrying every matching identifier ([MQTT-3.3.4-4]) and the only limit on the wire is the packet size |
-| `Limits::max_user_properties` | 64 | `User Property` is repeatable per delivery (3.3.2.3.7) and a pair's minimal wire form is five octets, so even the default 1 MiB `Maximum Packet Size` admits over 200 000 of them and a 268 MB one over 50 million |
-| `Limits::incoming_queue` | 1024 | deliveries held for the application; QoS 0 has no flow control at all |
+| `Limits::max_subscription_identifiers` | 32 | a server MAY send one copy carrying every matching identifier ([MQTT-3.3.4-4]) and the only limit on the wire is the packet size; past it the first are kept and `DeliveryProperties::truncated` says so, because a verdict on the connection would let any publisher disconnect every subscriber |
+| `Limits::max_user_properties` | 64 | `User Property` is repeatable per delivery (3.3.2.3.7) and a pair's minimal wire form is five octets, so even the default 1 MiB `Maximum Packet Size` admits over 200 000 of them and a 268 MB one over 50 million; truncated and flagged like the identifiers |
+| `Limits::incoming_queue` | 1024 | deliveries held for the application; QoS 0 has no flow control at all. The socket stops being read while it is full — keep-alive, commands and `disconnect` do not stop |
+| `Limits::incoming_queue_bytes` | 8 MiB | a count is not a memory bound ([INVARIANTS.md](../INVARIANTS.md)): each delivery is charged its packet's length plus a fixed overhead, and an empty queue still admits one of any size |
+| `Limits::max_inflight`, `Limits::max_inflight_bytes` | 1024, 8 MiB | the server's `Receive Maximum` is the peer's number (65 535 when it declares none); the send quota is the smaller of it and `max_inflight`, and a publish past either stalls in order |
+| `Limits::max_alias_bytes` | 256 KiB | a Topic Alias table holds up to 65 535 names of up to 65 535 bytes; each entry is charged its name plus a fixed overhead |
 | `Limits::max_addresses` | 8 | a resolver's answer is remote input |
-| `ConnectOptions::effective_ping_timeout` | the Keep Alive | "a Client SHOULD close the connection within a reasonable amount of time" with **no number** (sheet §1); an unbounded wait is a hang with a rationale ([LOOP.md](../LOOP.md) §2) |
-| `ConnectOptions::connect_timeout` | 10 s | the specification puts no deadline on the CONNACK either |
+| `ConnectOptions::effective_ping_timeout` | the Keep Alive in force | "a Client SHOULD close the connection within a reasonable amount of time" with **no number** (sheet §1); the interval in force is the server's where `Server Keep Alive` overrode the client's; an unbounded wait is a hang with a rationale ([LOOP.md](../LOOP.md) §2) |
+| `ConnectOptions::connect_timeout` | 10 s | the specification puts no deadline on the CONNACK either; here it covers the whole connect — lookup, dial, TLS, CONNECT, AUTH exchange and CONNACK |
+| `ConnectOptions::write_timeout` | the larger of the PINGRESP wait and 10 s | a peer that stops reading leaves a write the socket takes nothing of; timed from the last byte taken, ended by `Timeout("write")` |
+| `MAX_AUTH_ROUNDS` | 8 | the protocol has no round count; each round costs an `Authenticator::challenge` on the event loop and a write |
 
 Every decode entry point takes the packet-size cap as an **argument**, and the declared
 length is checked from the fixed header before a body is allocated — so a peer announcing a

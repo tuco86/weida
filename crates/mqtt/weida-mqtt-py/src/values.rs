@@ -313,6 +313,10 @@ impl PyDelivery {
             "subscription_ids",
             properties.subscription_identifiers.clone(),
         )?;
+        // Whether the two lists above are all of what the PUBLISH carried:
+        // past the library's per-delivery ceilings the first are kept and
+        // this says so.
+        dict.set_item("truncated", properties.truncated)?;
         Ok(dict)
     }
 

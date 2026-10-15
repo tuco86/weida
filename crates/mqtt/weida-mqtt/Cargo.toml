@@ -18,6 +18,9 @@ categories.workspace = true
 weida-core.workspace = true
 weida-runtime.workspace = true
 tokio.workspace = true
+# The receive buffer: packets are decoded where they were read, and `BytesMut`
+# is a buffer whose front can be consumed in O(1), which a `Vec` is not.
+bytes.workspace = true
 # The sans-I/O MQTT 5.0 codec: the fixed header, the property framework and
 # all fifteen packets, with the declared-length check that makes `Maximum
 # Packet Size` enforceable before a body is allocated. Reused rather than

@@ -117,7 +117,7 @@ fn the_facade_completes_a_round_trip_with_no_ambient_reactor() {
 
     let delivered = deliveries.recv().expect("a delivery");
     assert_eq!(delivered.topic, "room/12");
-    assert_eq!(delivered.payload, b"21.5");
+    assert_eq!(delivered.payload, &b"21.5"[..]);
 
     client
         .disconnect(DisconnectReasonCode::NormalDisconnection)
@@ -156,7 +156,7 @@ fn a_deadline_expires_without_disturbing_the_connection() {
     let delivered = deliveries
         .recv_timeout(Duration::from_secs(5))
         .expect("the delivery that arrived after the deadline");
-    assert_eq!(delivered.payload, b"late");
+    assert_eq!(delivered.payload, &b"late"[..]);
 
     client
         .disconnect(DisconnectReasonCode::NormalDisconnection)
@@ -270,4 +270,49 @@ fn two_threads_each_block_on_their_own_connection() {
             "{completion:?}"
         );
     }
+}
+
+/// The documented one-thread pattern — publish, then read deliveries on the
+/// same thread — must not deadlock when a flood has filled the delivery
+/// queue: the only thread that could drain it is the one `publish` blocks, so
+/// `publish` must not wait for the queue.
+#[test]
+fn a_publish_returns_while_the_delivery_queue_is_full_on_one_thread() {
+    let mut script = vec![Act::Send(connack(Properties::new()))];
+    script.extend((0..1100).map(|_| Act::Send(delivery("t", b"x"))));
+    script.push(Act::Expect); // the publish
+    script.push(Act::Expect); // the DISCONNECT
+    let server = ScriptedServer::start(vec![script]);
+
+    let context = BlockingContext::owned(1).expect("a reactor the context owns");
+    let mut options = options();
+    options.limits.incoming_queue = 16;
+    let (client, mut deliveries) = context.connect(&server.address, options).expect("connects");
+    // Long enough for the flood to arrive and fill the queue.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // On a thread of its own, so that a hang is a failed assertion and not a
+    // hung test run.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let publisher = std::thread::spawn(move || {
+        let published = client.publish(Message::new("t", "x"));
+        let _ = tx.send(published.is_ok());
+        client
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)),
+        Ok(true),
+        "publish returned with 1,100 deliveries waiting"
+    );
+    let client = publisher.join().expect("the publishing thread");
+
+    // Nothing was lost to get there: the deliveries are still to be read.
+    let first = deliveries
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a delivery");
+    assert_eq!(first.payload, b"x");
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .expect("disconnects");
+    server.finished();
 }

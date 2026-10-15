@@ -53,7 +53,7 @@
 //! matters is the one [`crate::FixedHeader::decode`] already applied to the
 //! whole packet.
 
-use crate::data::{self, Reader};
+use crate::data::{self, Reader, Redacted};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::{PacketType, QoS};
 use crate::varint;
@@ -477,7 +477,7 @@ pub enum PayloadFormat {
 /// holds slices the caller owns. The two representations are deliberately not
 /// mixable — a value holds one or the other — which is why the fields are
 /// private and [`Properties::with_user_properties`] clears the wire block.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Repeated<'a> {
     /// The property block a decode borrowed. Empty for a set a caller built.
     wire: &'a [u8],
@@ -485,6 +485,23 @@ pub struct Repeated<'a> {
     user: &'a [(&'a str, &'a str)],
     /// Subscription identifiers a caller supplied, in order.
     ids: &'a [u32],
+}
+
+/// What a property set holds that a log may show.
+///
+/// A decoded set keeps the **whole property block** in `wire`, and
+/// `Authentication Data` is one of the things in it, so the block is shown as
+/// a length. The pairs and the identifiers are what `wire` is borrowed for and
+/// are listed as the values they are.
+impl core::fmt::Debug for Repeated<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Repeated { wire, user, ids } = self;
+        f.debug_struct("Repeated")
+            .field("wire", &Redacted(wire.len()))
+            .field("user", user)
+            .field("ids", ids)
+            .finish()
+    }
 }
 
 impl<'a> Repeated<'a> {
@@ -508,7 +525,11 @@ impl<'a> Repeated<'a> {
 /// [`Properties::subscription_identifiers`], because a decoded set re-walks
 /// the wire bytes for them and allocates nothing, while a set a caller builds
 /// reads them from slices the caller owns.
-#[derive(Clone, Debug, Default)]
+///
+/// Its `Debug` shows `Authentication Data` as a length and never the block a
+/// decoded set was read from, so printing a CONNECT's, a CONNACK's or an AUTH's
+/// properties is not a way to write a secret into a log.
+#[derive(Clone, Default)]
 pub struct Properties<'a> {
     /// 0x01.
     pub payload_format_indicator: Option<PayloadFormat>,
@@ -571,6 +592,101 @@ pub struct Properties<'a> {
     /// [`Properties::with_user_properties`] and
     /// [`Properties::with_subscription_identifiers`] to set them.
     pub repeated: Repeated<'a>,
+}
+
+impl core::fmt::Debug for Properties<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Exhaustive on purpose: a property added to `Properties` does not
+        // compile here until someone has decided whether it may be printed.
+        let Properties {
+            payload_format_indicator,
+            message_expiry_interval,
+            content_type,
+            response_topic,
+            correlation_data,
+            session_expiry_interval,
+            assigned_client_identifier,
+            server_keep_alive,
+            authentication_method,
+            authentication_data,
+            request_problem_information,
+            will_delay_interval,
+            request_response_information,
+            response_information,
+            server_reference,
+            reason_string,
+            receive_maximum,
+            topic_alias_maximum,
+            topic_alias,
+            maximum_qos,
+            retain_available,
+            maximum_packet_size,
+            wildcard_subscription_available,
+            subscription_identifier_available,
+            shared_subscription_available,
+            repeated: _,
+        } = self;
+        f.debug_struct("Properties")
+            .field("payload_format_indicator", payload_format_indicator)
+            .field("message_expiry_interval", message_expiry_interval)
+            .field("content_type", content_type)
+            .field("response_topic", response_topic)
+            .field("correlation_data", correlation_data)
+            .field("session_expiry_interval", session_expiry_interval)
+            .field("assigned_client_identifier", assigned_client_identifier)
+            .field("server_keep_alive", server_keep_alive)
+            .field("authentication_method", authentication_method)
+            .field(
+                "authentication_data",
+                &authentication_data.map(|data| Redacted(data.len())),
+            )
+            .field("request_problem_information", request_problem_information)
+            .field("will_delay_interval", will_delay_interval)
+            .field("request_response_information", request_response_information)
+            .field("response_information", response_information)
+            .field("server_reference", server_reference)
+            .field("reason_string", reason_string)
+            .field("receive_maximum", receive_maximum)
+            .field("topic_alias_maximum", topic_alias_maximum)
+            .field("topic_alias", topic_alias)
+            .field("maximum_qos", maximum_qos)
+            .field("retain_available", retain_available)
+            .field("maximum_packet_size", maximum_packet_size)
+            .field(
+                "wildcard_subscription_available",
+                wildcard_subscription_available,
+            )
+            .field(
+                "subscription_identifier_available",
+                subscription_identifier_available,
+            )
+            .field(
+                "shared_subscription_available",
+                shared_subscription_available,
+            )
+            .field("user_properties", &Listed(|| self.user_properties()))
+            .field(
+                "subscription_identifiers",
+                &Listed(|| self.subscription_identifiers()),
+            )
+            .finish()
+    }
+}
+
+/// A list a formatter walks on demand: the repeatable properties live in the
+/// wire block, so there is no slice to hand `Debug` and no allocation worth
+/// making to get one.
+struct Listed<F>(F);
+
+impl<F, I> core::fmt::Debug for Listed<F>
+where
+    F: Fn() -> I,
+    I: Iterator,
+    I::Item: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries((self.0)()).finish()
+    }
 }
 
 impl<'a> Properties<'a> {
@@ -1247,15 +1363,16 @@ fn skip(reader: &mut Reader<'_>, id: PropertyId) -> Option<()> {
         ValueKind::Varint => {
             reader.varint().ok()?;
         }
-        ValueKind::Utf8 => {
-            reader.string().ok()?;
-        }
-        ValueKind::Binary => {
+        // The block was proved well-formed by `Properties::decode`, so
+        // stepping over a string needs its length and not its UTF-8: validating
+        // every string a walk merely passes costs a pass over the block per
+        // delivery.
+        ValueKind::Utf8 | ValueKind::Binary => {
             reader.binary().ok()?;
         }
         ValueKind::Utf8Pair => {
-            reader.string().ok()?;
-            reader.string().ok()?;
+            reader.binary().ok()?;
+            reader.binary().ok()?;
         }
     }
     Some(())
@@ -1594,5 +1711,36 @@ mod tests {
             );
         }
         assert!(PropertySet::WILL.contains(PropertyId::UserProperty));
+    }
+
+    /// `Authentication Data` is a secret, and a decoded set holds the block it
+    /// arrived in whole: neither the field nor the block reaches a formatter.
+    /// The repeatable properties, which the block is borrowed for, still do.
+    #[test]
+    fn a_property_sets_debug_hides_authentication_data() {
+        let pairs = [("k", "v")];
+        let built = Properties {
+            authentication_method: Some("SCRAM-SHA-256"),
+            authentication_data: Some(b"hunter2-proof"),
+            ..Properties::new()
+        }
+        .with_user_properties(&pairs);
+        let mut wire = Vec::new();
+        built.encode(PropertySet::AUTH, &mut wire).expect("encodes");
+        let decoded = decode(&wire, PropertySet::AUTH).expect("decodes");
+
+        for properties in [&built, &decoded] {
+            for shown in [
+                format!("{properties:?}"),
+                format!("{:?}", properties.repeated),
+            ] {
+                assert!(!shown.contains("hunter2"), "{shown}");
+                assert!(!shown.contains("104, 117, 110"), "{shown}");
+            }
+            let shown = format!("{properties:?}");
+            assert!(shown.contains("<redacted 13 bytes>"), "{shown}");
+            assert!(shown.contains("SCRAM-SHA-256"), "{shown}");
+            assert!(shown.contains("\"k\", \"v\""), "{shown}");
+        }
     }
 }

@@ -348,7 +348,10 @@ async fn an_inbound_alias_is_resolved_before_the_application_sees_it() {
         let Some(Event::Delivered(delivery)) = events.next().await else {
             panic!("a delivery")
         };
-        seen.push((delivery.topic, String::from_utf8(delivery.payload).unwrap()));
+        seen.push((
+            delivery.topic,
+            String::from_utf8(delivery.payload.to_vec()).unwrap(),
+        ));
     }
     assert_eq!(
         seen,
@@ -591,7 +594,7 @@ async fn a_request_carries_its_response_topic_and_correlation_data() {
     let Some(Event::Delivered(reply)) = events.next().await else {
         panic!("a delivery")
     };
-    assert_eq!(reply.payload, b"pong");
+    assert_eq!(reply.payload, &b"pong"[..]);
     assert_eq!(
         reply.properties.correlation_data.as_deref(),
         Some(&b"request-7"[..]),

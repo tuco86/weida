@@ -242,7 +242,9 @@ impl PySession {
     }
 
     /// How many more QoS 1 or 2 publishes may be in flight before the next one
-    /// stalls: the server's `Receive Maximum` minus what is outstanding.
+    /// stalls: the smaller of the server's `Receive Maximum` and the library's
+    /// own in-flight ceiling (1024; this binding has no keyword for it), minus
+    /// what is outstanding.
     #[getter]
     fn send_quota(&self) -> u16 {
         self.inner.send_quota()
@@ -577,16 +579,17 @@ impl PyClient {
 
 /// `weida_mqtt.Events`: the stream of what arrived on one connection.
 ///
-/// `async for delivery in events:` yields deliveries and nothing else; the two
+/// `async for delivery in events:` yields deliveries and nothing else; the
 /// other events are reported differently, because they are not deliveries:
 ///
 /// * the connection ending raises the failure that ended it, which is what
 ///   turns a closed socket into a named reason code;
 /// * an exchange resumed from a previous connection completing has no handle
-///   left to resolve, so it is dropped from the **iterator** and available
-///   through `next_event`, which yields either kind.
+///   left to resolve, and neither does a stored message the library had to
+///   give up on, so both are dropped from the **iterator** and available
+///   through `next_event`, which yields every kind.
 ///
-/// A caller that wants all three uses `next_event`; a caller that wants
+/// A caller that wants all four uses `next_event`; a caller that wants
 /// messages uses the iterator, which is what most callers want.
 #[pyclass(frozen, name = "Events", module = "weida_mqtt")]
 pub struct PyEvents {
@@ -612,9 +615,10 @@ impl PyEvents {
             loop {
                 match events.next().await {
                     Some(Event::Delivered(delivery)) => return Ok(PyDelivery::of(delivery)),
-                    // A resumed exchange completing is not a delivery. It is
-                    // not dropped: `next_event` yields it.
-                    Some(Event::Completed { .. }) => continue,
+                    // A resumed exchange completing, or a stored message given
+                    // up on, is not a delivery. Neither is dropped:
+                    // `next_event` yields them.
+                    Some(Event::Completed { .. } | Event::Abandoned { .. }) => continue,
                     Some(Event::Disconnected(error)) => return Err(errno_of(error)),
                     // `Event` is `#[non_exhaustive]`: a variant added to the
                     // library must not silently become a delivery here, and a
@@ -633,9 +637,11 @@ impl PyEvents {
     }
 
     /// The next event of **any** kind, as a `(kind, value)` pair:
-    /// `("delivered", Delivery)`, `("completed", (packet_id, Completion))`, or
-    /// `None` once the connection task has finished and every event has been
-    /// taken.
+    /// `("delivered", Delivery)`, `("completed", (packet_id, Completion))`,
+    /// or `("abandoned", (packet_id, cause))` for a message the session held
+    /// from an earlier connection that no longer fits what the server
+    /// accepts; and `None` once the connection task has finished and every
+    /// event has been taken.
     ///
     /// The connection ending raises, as in the iterator: a server DISCONNECT
     /// carries a reason code and a caller that only saw `None` would have lost
@@ -652,6 +658,10 @@ impl PyEvents {
                 }) => Ok(Some(Reported::Completed {
                     packet_id,
                     completion,
+                })),
+                Some(Event::Abandoned { packet_id, error }) => Ok(Some(Reported::Abandoned {
+                    packet_id,
+                    cause: error.to_string(),
                 })),
                 Some(Event::Disconnected(error)) => Err(errno_of(error)),
                 // A variant the library added and this binding does not know.
@@ -702,6 +712,10 @@ enum Reported {
         packet_id: u16,
         completion: weida_mqtt::Completion,
     },
+    Abandoned {
+        packet_id: u16,
+        cause: String,
+    },
 }
 
 impl<'py> IntoPyObject<'py> for Reported {
@@ -724,6 +738,9 @@ impl<'py> IntoPyObject<'py> for Reported {
                     .into_pyobject(py)?
                     .into_any())
             }
+            Reported::Abandoned { packet_id, cause } => Ok(("abandoned", (packet_id, cause))
+                .into_pyobject(py)?
+                .into_any()),
         }
     }
 }

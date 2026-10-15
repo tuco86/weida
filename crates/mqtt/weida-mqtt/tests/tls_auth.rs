@@ -59,6 +59,10 @@ impl Authenticator for Counting {
         answer.push(u8::try_from(round).unwrap_or(u8::MAX));
         Ok(answer)
     }
+
+    fn finish(&self, _data: Option<&[u8]>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// An authenticator that refuses, which is a client that cannot answer what
@@ -70,6 +74,10 @@ impl Authenticator for Refusing {
         Err(Error::Configuration(
             "no credential for this challenge".into(),
         ))
+    }
+
+    fn finish(&self, _data: Option<&[u8]>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -427,6 +435,10 @@ async fn an_unanswerable_challenge_ends_the_connection_with_its_cause() {
                 Some(_) => Err(Error::Configuration("cannot answer that".into())),
             }
         }
+
+        fn finish(&self, _data: Option<&[u8]>) -> Result<()> {
+            Ok(())
+        }
     }
     let (client, mut events) = Client::connect_with(
         &context,
@@ -699,4 +711,224 @@ async fn an_unusable_server_name_is_refused_before_the_dial() {
         .expect_err("refused");
     assert!(matches!(error, Error::Configuration(_)), "{error}");
     assert!(error.to_string().contains("server name"));
+}
+
+/// An authenticator for a mechanism that proves the server — SCRAM's shape —
+/// and so refuses an exchange that ends without the proof.
+struct Mutual {
+    proof: &'static [u8],
+}
+
+impl Authenticator for Mutual {
+    fn challenge(&self, _data: Option<&[u8]>) -> Result<Vec<u8>> {
+        Ok(vec![1])
+    }
+
+    fn finish(&self, data: Option<&[u8]>) -> Result<()> {
+        match data {
+            Some(data) if data == self.proof => Ok(()),
+            _ => Err(Error::AuthenticationFailed(
+                "the server did not prove it knows the secret".into(),
+            )),
+        }
+    }
+}
+
+fn scram_options() -> ConnectOptions {
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    options
+}
+
+/// The impostor's shortcut: a CONNACK 0x00 at once, with no exchange and so
+/// no proof. The mechanism refuses it, the connect fails, and the client says
+/// goodbye with a code a client may send.
+#[tokio::test]
+async fn a_connack_that_skips_the_exchange_is_refused() {
+    let mut server = Server::start(vec![
+        Act::Send(connack(Properties::new())),
+        Act::Expect, // the DISCONNECT
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let error = Client::connect_with(
+        &context,
+        &server.address(),
+        scram_options(),
+        Arc::new(Mutual { proof: b"v=ok" }),
+    )
+    .await
+    .expect_err("an impostor is not authenticated");
+    assert!(matches!(error, Error::AuthenticationFailed(_)), "{error}");
+
+    server.finished().await;
+    let seen = server.seen_bytes().await;
+    let (Packet::Disconnect(disconnect), _) = Packet::decode(&seen[1], u32::MAX).expect("a packet")
+    else {
+        panic!("the client sent DISCONNECT")
+    };
+    assert_eq!(
+        disconnect.reason_code,
+        DisconnectReasonCode::UnspecifiedError,
+        "0x87 is the server's to send"
+    );
+}
+
+/// A CONNACK that carries a proof, and the wrong one.
+#[tokio::test]
+async fn a_wrong_server_proof_in_the_connack_is_refused() {
+    let server = Server::start(vec![Act::Send(connack(Properties {
+        authentication_method: Some("SCRAM-SHA-1"),
+        authentication_data: Some(b"v=forged"),
+        ..Properties::new()
+    }))])
+    .await;
+    let context = Context::new().expect("ambient");
+    let error = Client::connect_with(
+        &context,
+        &server.address(),
+        scram_options(),
+        Arc::new(Mutual { proof: b"v=ok" }),
+    )
+    .await
+    .expect_err("the proof is wrong");
+    assert!(matches!(error, Error::AuthenticationFailed(_)), "{error}");
+}
+
+/// And the right one is what the exchange is for.
+#[tokio::test]
+async fn the_right_server_proof_is_accepted() {
+    let mut server = Server::start(vec![
+        Act::Send(connack(Properties {
+            authentication_method: Some("SCRAM-SHA-1"),
+            authentication_data: Some(b"v=ok"),
+            ..Properties::new()
+        })),
+        Act::Expect,
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let (client, _events) = Client::connect_with(
+        &context,
+        &server.address(),
+        scram_options(),
+        Arc::new(Mutual { proof: b"v=ok" }),
+    )
+    .await
+    .expect("authenticates");
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .await
+        .expect("disconnects");
+    server.finished().await;
+}
+
+/// A client that was given no authenticator cannot check a proof, so a
+/// CONNACK that offers one is refused and not ignored.
+#[tokio::test]
+async fn a_proof_nobody_can_check_is_refused() {
+    let server = Server::start(vec![Act::Send(connack(Properties {
+        authentication_method: Some("SCRAM-SHA-1"),
+        authentication_data: Some(b"v=whatever"),
+        ..Properties::new()
+    }))])
+    .await;
+    let context = Context::new().expect("ambient");
+    let error = Client::connect(&context, &server.address(), scram_options())
+        .await
+        .expect_err("unverifiable");
+    assert!(matches!(error, Error::AuthenticationFailed(_)), "{error}");
+}
+
+/// The same on the live connection: the AUTH 0x00 that ends a
+/// re-authentication carries the proof, and a bad one ends the connection.
+#[tokio::test]
+async fn a_re_authentication_that_ends_without_the_proof_ends_the_connection() {
+    let server = Server::start(vec![
+        Act::Send(connack(Properties {
+            authentication_method: Some("SCRAM-SHA-1"),
+            authentication_data: Some(b"v=ok"),
+            ..Properties::new()
+        })),
+        // Answers the client's 0x19 with success, echoing the client's own
+        // data back: not the proof.
+        Act::AnswerAuth(0x00),
+        Act::Idle(Duration::from_secs(2)),
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let (client, mut events) = Client::connect_with(
+        &context,
+        &server.address(),
+        scram_options(),
+        Arc::new(Mutual { proof: b"v=ok" }),
+    )
+    .await
+    .expect("connects");
+
+    let error = client.reauthenticate().await.expect_err("no proof");
+    assert!(matches!(error, Error::AuthenticationFailed(_)), "{error}");
+    let Some(Event::Disconnected(reported)) = events.next().await else {
+        panic!("the connection ends")
+    };
+    assert!(
+        matches!(reported, Error::AuthenticationFailed(_)),
+        "{reported}"
+    );
+}
+
+/// A server that never ends the exchange makes the client do a bounded amount
+/// of work: nine AUTH packets are answered and the tenth is where it stops.
+#[tokio::test]
+async fn an_endless_handshake_exchange_is_cut_off() {
+    let flood: Vec<u8> = (0..20)
+        .flat_map(|_| auth(0x18, "SCRAM-SHA-1", b"again"))
+        .collect();
+    let server = Server::start(vec![Act::Send(flood), Act::Idle(Duration::from_secs(2))]).await;
+    let context = Context::new().expect("ambient");
+    let authenticator = Counting::new();
+    let error = Client::connect_with(
+        &context,
+        &server.address(),
+        scram_options(),
+        authenticator.clone() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect_err("never finishes");
+    assert!(matches!(error, Error::Timeout(_)), "{error}");
+    assert!(
+        authenticator.calls() <= 8,
+        "{} challenges answered",
+        authenticator.calls()
+    );
+}
+
+/// And on the live connection, where nothing else bounded it.
+#[tokio::test]
+async fn an_endless_re_authentication_is_cut_off() {
+    let mut script = vec![Act::Send(connack(Properties::new()))];
+    script.extend((0..12).map(|_| Act::AnswerAuth(0x18)));
+    script.push(Act::Idle(Duration::from_secs(2)));
+    let server = Server::start(script).await;
+    let context = Context::new().expect("ambient");
+    let authenticator = Counting::new();
+    let (client, _events) = Client::connect_with(
+        &context,
+        &server.address(),
+        scram_options(),
+        authenticator.clone() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect("connects");
+
+    let error = tokio::time::timeout(Duration::from_secs(8), client.reauthenticate())
+        .await
+        .expect("the re-authentication ends")
+        .expect_err("never finishes");
+    assert!(matches!(error, Error::Timeout(_)), "{error}");
+    assert!(
+        authenticator.calls() <= 9,
+        "{} challenges answered",
+        authenticator.calls()
+    );
 }

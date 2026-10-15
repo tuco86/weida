@@ -47,7 +47,7 @@ use weida_mqtt_codec::{
     PayloadFormat, Properties, PubackReasonCode, PubcompReasonCode, Publish, PubrecReasonCode, QoS,
 };
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::limits::{Limits, ServerLimits};
 use crate::session::StoredPublish;
 
@@ -251,8 +251,8 @@ pub struct DeliveryProperties {
     ///
     /// `User Property` "is allowed to appear multiple times" (3.3.2.3.7)
     /// [mqtt5 §3] and the protocol puts **no ceiling** on how many one
-    /// delivery may carry, so [`Limits::max_user_properties`] does — see
-    /// [`DeliveryProperties::read`].
+    /// delivery may carry, so [`Limits::max_user_properties`] does: past it
+    /// the first pairs are kept and [`DeliveryProperties::truncated`] says so.
     pub user_properties: Vec<(String, String)>,
     /// The Subscription Identifiers this delivery was caused by.
     ///
@@ -260,44 +260,51 @@ pub struct DeliveryProperties {
     /// multiple copies one each ([MQTT-3.3.4-5])" [mqtt5 §4.1], which is how a
     /// client tells which of its own subscriptions produced a message. The
     /// protocol puts **no ceiling** on how many one delivery may carry, so
-    /// [`Limits::max_subscription_identifiers`] does — see
-    /// [`DeliveryProperties::read`].
+    /// [`Limits::max_subscription_identifiers`] does: past it the first are
+    /// kept and [`DeliveryProperties::truncated`] says so.
     pub subscription_identifiers: Vec<u32>,
+    /// Whether this delivery carried more `User Property` pairs or
+    /// Subscription Identifiers than this client keeps, so that the two lists
+    /// above hold the first of them and not all.
+    ///
+    /// Everything else about the delivery is as sent. A caller that routes on
+    /// a property that might be past the cut checks this before concluding
+    /// that the property is absent.
+    pub truncated: bool,
 }
 
 impl DeliveryProperties {
     /// Reads a PUBLISH's properties, bounded.
     ///
-    /// # Errors
-    ///
-    /// [`Error::TooManySubscriptionIdentifiers`] above
-    /// [`Limits::max_subscription_identifiers`], and
-    /// [`Error::TooManyUserProperties`] above
-    /// [`Limits::max_user_properties`]. Both bounds are this client's because
-    /// the protocol has neither: the only limit on the wire is the packet
-    /// size, so at a 268 MB `Maximum Packet Size` a single delivery could
-    /// carry tens of millions of identifiers, or — a pair's minimal form
-    /// being five octets — tens of millions of pairs.
-    pub fn read(properties: &Properties<'_>, limits: &Limits) -> Result<DeliveryProperties> {
-        let mut subscription_identifiers = Vec::new();
-        for identifier in properties.subscription_identifiers() {
-            if subscription_identifiers.len() >= limits.max_subscription_identifiers {
-                return Err(Error::TooManySubscriptionIdentifiers {
-                    max: limits.max_subscription_identifiers,
-                });
-            }
-            subscription_identifiers.push(identifier);
-        }
-        let mut user_properties = Vec::new();
-        for (key, value) in properties.user_properties() {
-            if user_properties.len() >= limits.max_user_properties {
-                return Err(Error::TooManyUserProperties {
-                    max: limits.max_user_properties,
-                });
-            }
-            user_properties.push((key.to_owned(), value.to_owned()));
-        }
-        Ok(DeliveryProperties {
+    /// **The bound is on what is kept, and it is a verdict on the list and not
+    /// on the delivery.** At most [`Limits::max_subscription_identifiers`]
+    /// identifiers and [`Limits::max_user_properties`] pairs are copied out,
+    /// in order, and [`DeliveryProperties::truncated`] records that more were
+    /// there. The protocol has neither ceiling: the only limit on the wire is
+    /// the packet size, so at a 268 MB `Maximum Packet Size` a single delivery
+    /// could carry tens of millions of identifiers, or — a pair's minimal form
+    /// being five octets — tens of millions of pairs. But any publisher that
+    /// can reach a subscribed topic can send such a message, and the broker
+    /// must forward its User Properties unaltered ([MQTT-3.3.2-17]); refusing
+    /// the connection over one would let every publisher disconnect every
+    /// subscriber, so the delivery is made and the excess is left unread.
+    #[must_use]
+    pub fn read(properties: &Properties<'_>, limits: &Limits) -> DeliveryProperties {
+        let mut identifiers = properties.subscription_identifiers();
+        let subscription_identifiers: Vec<u32> = identifiers
+            .by_ref()
+            .take(limits.max_subscription_identifiers)
+            .collect();
+        let mut pairs = properties.user_properties();
+        let user_properties: Vec<(String, String)> = pairs
+            .by_ref()
+            .take(limits.max_user_properties)
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        // One more step of each walk answers whether anything was left, and
+        // is the whole cost of knowing.
+        let truncated = identifiers.next().is_some() || pairs.next().is_some();
+        DeliveryProperties {
             payload_format_indicator: properties.payload_format_indicator,
             message_expiry_interval: properties.message_expiry_interval,
             content_type: properties.content_type.map(str::to_owned),
@@ -305,7 +312,8 @@ impl DeliveryProperties {
             correlation_data: properties.correlation_data.map(<[u8]>::to_vec),
             user_properties,
             subscription_identifiers,
-        })
+            truncated,
+        }
     }
 }
 
@@ -338,7 +346,12 @@ pub enum RetainedOrigin {
 pub struct Delivery {
     /// Topic Name.
     pub topic: String,
-    /// The payload.
+    /// The payload, copied once out of the receive buffer.
+    ///
+    /// The packet is decoded where it was read, so this is the only copy a
+    /// payload costs after the one the operating system makes into that
+    /// buffer — and an owned one, so that holding a delivery pins nothing of
+    /// the connection's.
     pub payload: Vec<u8>,
     /// The QoS it was **delivered** at, which need not be the QoS it was
     /// published at: "the QoS level used to deliver an Application Message
@@ -365,19 +378,22 @@ pub struct Delivery {
 impl Delivery {
     /// Reads a PUBLISH.
     ///
-    /// # Errors
+    /// `topic` is the Topic Name the delivery is about, which is not always
+    /// the one the PUBLISH carried: a Topic Alias is resolved before an
+    /// application sees one. The payload is copied out of the packet.
     ///
-    /// As [`DeliveryProperties::read`].
-    pub fn read(publish: &Publish<'_>, limits: &Limits) -> Result<Delivery> {
-        Ok(Delivery {
-            topic: publish.topic.to_owned(),
+    /// The properties are bounded as [`DeliveryProperties::read`] describes.
+    #[must_use]
+    pub fn read(publish: &Publish<'_>, topic: String, limits: &Limits) -> Delivery {
+        Delivery {
+            topic,
             payload: publish.payload.to_vec(),
             qos: publish.qos,
             retain: publish.retain,
             dup: publish.dup,
             packet_id: publish.packet_id,
-            properties: DeliveryProperties::read(&publish.properties, limits)?,
-        })
+            properties: DeliveryProperties::read(&publish.properties, limits),
+        }
     }
 
     /// Whether this delivery came out of the server's retained-message cache
@@ -480,59 +496,64 @@ mod tests {
     }
 
     /// The ceiling the protocol does not provide: a delivery carrying more
-    /// Subscription Identifiers than this client will hold is refused rather
-    /// than growing a vector a peer controls.
+    /// Subscription Identifiers than this client will hold keeps the first
+    /// of them and says so, rather than growing a vector a peer controls — or
+    /// costing the connection.
     #[test]
-    fn a_delivery_past_the_subscription_identifier_ceiling_is_refused() {
+    fn a_delivery_past_the_subscription_identifier_ceiling_is_truncated() {
         let limits = Limits {
             max_subscription_identifiers: 2,
             ..Limits::default()
         };
         let ids = [1u32, 2, 3];
         let properties = Properties::new().with_subscription_identifiers(&ids);
-        let error = DeliveryProperties::read(&properties, &limits).expect_err("refused");
-        assert!(
-            matches!(error, Error::TooManySubscriptionIdentifiers { max: 2 }),
-            "{error}"
-        );
+        let read = DeliveryProperties::read(&properties, &limits);
+        assert_eq!(read.subscription_identifiers, [1, 2], "the first, in order");
+        assert!(read.truncated);
 
-        // At the ceiling it is read, and in order: which subscription caused a
-        // delivery is the whole reason the property exists.
+        // At the ceiling it is read whole, and in order: which subscription
+        // caused a delivery is the whole reason the property exists.
         let ids = [7u32, 9];
         let properties = Properties::new().with_subscription_identifiers(&ids);
-        let read = DeliveryProperties::read(&properties, &limits).expect("at the ceiling");
+        let read = DeliveryProperties::read(&properties, &limits);
         assert_eq!(read.subscription_identifiers, [7, 9]);
+        assert!(!read.truncated, "nothing was left out");
     }
 
     /// The other ceiling the protocol does not provide: `User Property` is
     /// equally repeatable (3.3.2.3.7), so a delivery carrying more pairs than
-    /// this client will hold is refused on the same policy as its neighbour
+    /// this client will hold is cut on the same policy as its neighbour,
     /// rather than growing a vector of peer-controlled strings.
     #[test]
-    fn a_delivery_past_the_user_property_ceiling_is_refused() {
+    fn a_delivery_past_the_user_property_ceiling_is_truncated() {
         let limits = Limits {
             max_user_properties: 2,
             ..Limits::default()
         };
         let pairs = [("a", "1"), ("b", "2"), ("c", "3")];
         let properties = Properties::new().with_user_properties(&pairs);
-        let error = DeliveryProperties::read(&properties, &limits).expect_err("refused");
-        assert!(
-            matches!(error, Error::TooManyUserProperties { max: 2 }),
-            "{error}"
+        let read = DeliveryProperties::read(&properties, &limits);
+        assert_eq!(
+            read.user_properties,
+            [
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ]
         );
+        assert!(read.truncated);
 
         // At the ceiling it is read, and in the publisher's order: the pairs
         // are an ordered list and not a map ([MQTT-3.3.2-17]).
         let pairs = [("b", "2"), ("a", "1")];
         let properties = Properties::new().with_user_properties(&pairs);
-        let read = DeliveryProperties::read(&properties, &limits).expect("at the ceiling");
+        let read = DeliveryProperties::read(&properties, &limits);
         let seen: Vec<(&str, &str)> = read
             .user_properties
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
         assert_eq!(seen, [("b", "2"), ("a", "1")]);
+        assert!(!read.truncated);
     }
 
     #[test]
@@ -573,7 +594,7 @@ mod tests {
             packet_id: None,
             properties: Properties::new(),
         };
-        let delivery = Delivery::read(&publish, &Limits::default()).expect("reads");
+        let delivery = Delivery::read(&publish, "a/b".to_owned(), &Limits::default());
         assert_eq!(delivery.qos, QoS::AtMostOnce);
         assert_eq!(delivery.packet_id, None, "no identifier at QoS 0");
         assert!(delivery.retain);

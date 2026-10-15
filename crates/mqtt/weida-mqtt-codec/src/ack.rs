@@ -237,6 +237,39 @@ mod tests {
         assert_eq!(out, [0x40, 0x02, 0x00, 0x0A], "canonicalised to short");
     }
 
+    /// The middle form with a failure code: the identifier and the code, and
+    /// no Property Length (3.4.2.2: "if the Remaining Length is less than 4
+    /// there is no Property Length"). The bytes are the ones a fuzz run found
+    /// the canonical form longer than the input with.
+    ///
+    /// It is legal and decodes to its value. It is also the one place this
+    /// encoder does not return the shortest spelling: a reason code is always
+    /// written with its explicit zero length, which is what every peer emits,
+    /// so the canonical form is one byte longer. Only the all-success tail is
+    /// ever omitted.
+    #[test]
+    fn a_failure_code_without_a_property_length_canonicalises_one_byte_longer() {
+        // The two bytes behind the packet belong to the next one.
+        let input = [0x40, 0x03, 0x40, 0x03, 0x87, 0x40, 0xF3];
+        let (decoded, used) = Packet::decode(&input, varint::MAX).expect("decodes");
+        assert_eq!(used, 5);
+        assert_eq!(
+            decoded,
+            Packet::Puback(Puback {
+                packet_id: 0x4003,
+                reason_code: PubackReasonCode::NotAuthorized,
+                properties: Properties::new(),
+            })
+        );
+
+        let mut out = Vec::new();
+        decoded.encode(&mut out).expect("encodes");
+        assert_eq!(out, [0x40, 0x04, 0x40, 0x03, 0x87, 0x00]);
+        let (again, used) = Packet::decode(&out, varint::MAX).expect("the canonical form");
+        assert_eq!(used, out.len());
+        assert_eq!(again, decoded);
+    }
+
     /// A non-success code, or any property, forces the long form.
     #[test]
     fn a_reason_code_or_a_property_forces_the_long_form() {

@@ -668,7 +668,7 @@ async fn an_inbound_qos_1_publish_is_delivered_and_acknowledged() {
         panic!("the message must be delivered")
     };
     assert_eq!(received.topic, "in/1");
-    assert_eq!(received.payload, b"hello");
+    assert_eq!(received.payload, &b"hello"[..]);
     assert_eq!(received.qos, QoS::AtLeastOnce);
     assert!(received.retain);
     assert_eq!(received.packet_id, Some(77));
@@ -739,7 +739,7 @@ async fn an_inbound_qos_2_repeat_is_answered_again_and_not_delivered_twice() {
     let Some(Event::Delivered(received)) = events.next().await else {
         panic!("the message must be delivered once")
     };
-    assert_eq!(received.payload, b"once");
+    assert_eq!(received.payload, &b"once"[..]);
 
     // Wait for the whole exchange rather than racing it: the script still has
     // the repeat and the PUBREL to send, and a DISCONNECT sent now would cut
