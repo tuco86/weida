@@ -52,7 +52,7 @@ use crate::engine::{Admission, PipeEvent, PipeInfo};
 use crate::error::Result;
 use crate::message::Message;
 use crate::options::SocketOptions;
-use crate::socket::{SocketCore, socket_endpoints};
+use crate::socket::{SocketCore, socket_endpoints, within};
 
 /// Installs the one-peer rule on a socket's pipe-event callback.
 ///
@@ -183,13 +183,13 @@ impl Pair1Socket {
     /// therefore `00 00 00 01` followed by the body, which
     /// `tests/pair.rs` pins as a vector.
     pub async fn send(&self, body: impl Into<Vec<u8>>) -> Result<()> {
-        let message = Message::from_parts(pair::INITIAL_HOPS.to_be_bytes().to_vec(), body.into());
+        let message = Message::from_parts(pair::INITIAL_HOPS.to_be_bytes(), body.into());
         self.core.send_round_robin(message).await.map(|_| ())
     }
 
     /// The non-blocking form.
     pub fn try_send(&self, body: impl Into<Vec<u8>>) -> Result<()> {
-        let message = Message::from_parts(pair::INITIAL_HOPS.to_be_bytes().to_vec(), body.into());
+        let message = Message::from_parts(pair::INITIAL_HOPS.to_be_bytes(), body.into());
         self.core.try_send_round_robin(message).map(|_| ())
     }
 
@@ -206,22 +206,22 @@ impl Pair1Socket {
     /// NNG's zero — because the difference is a count and not a format.
     pub async fn recv(&self) -> Result<Message> {
         let max_hops = self.core.options().max_ttl as u32;
-        loop {
-            let (_, message) = self.core.recv_any().await?;
-            match pair::decode(message.body(), max_hops) {
-                Ok((_, payload)) => {
-                    let payload = payload.to_vec();
-                    let mut message = message;
-                    message
-                        .split_header_off_body(pair::HEADER_LEN)
-                        .expect("the hop count was just decoded");
-                    return Ok(Message::from_parts(message.header().to_vec(), payload));
+        // One timeout around the whole loop, and the untimed receive inside
+        // it: a timeout per receive would restart after every message this
+        // drops, and never expire while a peer keeps sending ones that are
+        // past the ceiling.
+        within(self.core.exec(), self.core.options().recv_timeout, async {
+            loop {
+                let (_, mut message) = self.core.recv_any_untimed().await?;
+                let within_ttl = pair::decode(message.body(), max_hops).is_ok()
+                    && message.split_header_off_body(pair::HEADER_LEN).is_ok();
+                if within_ttl {
+                    return Ok(message);
                 }
-                Err(_) => {
-                    self.over_ttl.fetch_add(1, Ordering::Relaxed);
-                }
+                self.over_ttl.fetch_add(1, Ordering::Relaxed);
             }
-        }
+        })
+        .await
     }
 
     /// Messages dropped because their hop count was past this socket's

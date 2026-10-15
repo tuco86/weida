@@ -31,13 +31,14 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use weida_sp::{Backtrace, EndpointType, backtrace, pair};
+use bytes::Bytes;
+use weida_sp::{EndpointType, backtrace, pair};
 
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::options::SocketOptions;
-use crate::pipe::PipeId;
+use crate::pipe::{PipeId, Sent};
 use crate::socket::{Broadcast, SocketCore, socket_endpoints};
 
 /// A raw socket of any SP protocol: the wire, with the pattern's state
@@ -103,24 +104,14 @@ impl RawSocket {
     /// Offers `message` to every pipe, which is what a raw PUB, BUS or
     /// SURVEYOR send is.
     pub fn send_to_all(&self, message: &Message) -> Broadcast {
-        self.core.send_to_all(message)
+        self.core.send_to_all_except(message, None)
     }
 
     /// Offers `message` to every pipe except `pipe` — a raw BUS
     /// re-broadcast, which "excludes the incoming pipe ID … preventing
     /// immediate reflection in a one-socket device" (§4).
     pub fn send_to_all_excluding(&self, pipe: PipeId, message: &Message) -> Broadcast {
-        let mut broadcast = Broadcast::default();
-        for target in self.core.pipes() {
-            if target.id() == pipe {
-                continue;
-            }
-            match target.outgoing().offer(message.clone()) {
-                Ok(()) => broadcast.queued += 1,
-                Err(_) => broadcast.dropped += 1,
-            }
-        }
-        broadcast
+        self.core.send_to_all_except(message, Some(pipe))
     }
 
     /// Receives the next message from any pipe, with its wire payload
@@ -221,6 +212,12 @@ pub struct Forwarded {
 /// hop count, and exclude the ingress pipe when a raw BUS re-broadcasts
 /// through one socket.
 ///
+/// **The two directions run independently**, so that nothing a peer does
+/// can stall the other side of the device: a request waits for a backend
+/// with room and only requests wait, a reply is discarded when the client
+/// it is for has stopped reading, and neither direction is served ahead of
+/// the other.
+///
 /// Fails with `NNG_ENOTSUP` when the two protocols cannot pair, because a
 /// device between incompatible sockets would forward messages nobody can
 /// interpret.
@@ -238,75 +235,171 @@ pub async fn device(first: &RawSocket, second: &RawSocket) -> Result<Forwarded> 
         ));
     }
 
-    let mut tally = Forwarded::default();
+    // **Each direction is a loop of its own**, as NNG runs them. A request
+    // that finds no backend to take it waits, and a reply to a client that
+    // has stopped reading is discarded rather than waited for, but whatever
+    // one direction waits for, the other keeps going: one slow client or
+    // one full backend must not stop the replies of everybody else, and a
+    // stream of requests must not starve the replies that would make room
+    // for them.
+    let (there, back) = tokio::join!(pump(first, second), pump(second, first));
+    Ok(Forwarded {
+        forwarded: there.forwarded + back.forwarded,
+        dropped: there.dropped + back.dropped,
+    })
+}
+
+/// Whether either of the device's sockets has been closed, which ends the
+/// device in both directions.
+fn either_closed(first: &RawSocket, second: &RawSocket) -> bool {
+    first.core.engine().is_closed() || second.core.engine().is_closed()
+}
+
+/// Waits until either socket is closed.
+async fn closed(first: &RawSocket, second: &RawSocket) {
     loop {
-        if first.core.engine().is_closed() || second.core.engine().is_closed() {
-            return Ok(tally);
+        let (one, other) = (
+            first.core.engine().changed(),
+            second.core.engine().changed(),
+        );
+        if either_closed(first, second) {
+            return;
         }
-        let taken = match first.core.try_take_any() {
-            Some(taken) => Some((true, taken)),
-            None => second.core.try_take_any().map(|taken| (false, taken)),
-        };
-        let Some((from_first, (pipe, message))) = taken else {
-            tokio::select! {
-                () = first.core.wait_for_message() => {}
-                () = second.core.wait_for_message() => {}
-            }
-            continue;
-        };
-        let (from, to) = if from_first {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        match forward(from, to, pipe, message).await {
-            Ok(()) => tally.forwarded += 1,
-            Err(_) => tally.dropped += 1,
+        tokio::select! {
+            () = one => {}
+            () = other => {}
         }
     }
 }
 
+/// One direction of a device: what arrives on `from` is forwarded to `to`,
+/// until either socket is closed.
+async fn pump(from: &RawSocket, to: &RawSocket) -> Forwarded {
+    let mut tally = Forwarded::default();
+    loop {
+        // Created before the look, so that an arrival, or a close of either
+        // socket, between the look and the await ends the wait.
+        let arrived = from.core.message_signal();
+        let (one, other) = (from.core.engine().changed(), to.core.engine().changed());
+        if either_closed(from, to) {
+            return tally;
+        }
+        let Some((ingress, message)) = from.core.try_take_any() else {
+            tokio::select! {
+                () = arrived => {}
+                () = one => {}
+                () = other => {}
+            }
+            continue;
+        };
+        let outcome = tokio::select! {
+            outcome = forward(from, to, ingress, message) => outcome,
+            () = closed(from, to) => return tally,
+        };
+        match outcome {
+            Ok(Forward::Sent) => tally.forwarded += 1,
+            Ok(Forward::Dropped) | Err(_) => tally.dropped += 1,
+        }
+    }
+}
+
+/// What became of one forwarded message that was not an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Forward {
+    /// The other socket took it.
+    Sent,
+    /// The other socket discarded it at a full queue, which is the answer a
+    /// reply to a pipe that cannot take it gets.
+    Dropped,
+}
+
 /// One message across the device.
+///
+/// The body is never copied: what is forwarded is a slice of the octets
+/// that arrived, with a header of at most a few tags in front of it.
 async fn forward(
     from: &RawSocket,
     to: &RawSocket,
     ingress: PipeId,
     message: Message,
-) -> Result<()> {
+) -> Result<Forward> {
     let max_hops = from.core.options().max_ttl;
-    let payload = message.into_body();
+    let payload: Bytes = message.into_body();
+    let malformed = |why: weida_sp::TagError| Error::EPROTO(why.to_string().into());
     let onward = match Routing::of(from.raw_protocol()) {
         Routing::Push => {
-            let (mut stack, body) = backtrace::decode(&payload, max_hops)
-                .map_err(|why| Error::EPROTO(why.to_string().into()))?;
+            let shape = backtrace::measure(&payload, max_hops).map_err(malformed)?;
+            // The payload is judged against the limit of the pipe it came
+            // in on before it goes anywhere: the transport only admitted
+            // it by its declared length with the stack in it, and a message
+            // that is over the limit must be lost here, to its own sender,
+            // and not forwarded to a backend whose pipe to this device is
+            // every client's.
+            if !from.core.payload_fits(ingress, payload.len() - shape.len) {
+                return Err(Error::EMSGSIZE(
+                    "the payload is over NNG_OPT_RECVMAXSZ once the tag stack is taken off".into(),
+                ));
+            }
+            if shape.peers >= max_hops {
+                // The next hop bounds the stack by the same `MAXTTL`, and
+                // it already counts this device's tag against it: a
+                // message forwarded from here would be one the next hop
+                // has to refuse. Dropped here, where only this message is
+                // lost, and not forwarded to be refused there, where the
+                // pipe it arrives on is shared by every client of this
+                // device.
+                return Err(Error::EPROTO(
+                    format!(
+                        "a tag stack of {} peers has no room for this device's under MAXTTL \
+                         {max_hops}",
+                        shape.peers
+                    )
+                    .into(),
+                ));
+            }
             // The forwarder's own peer id goes in front of whatever is
-            // already there, so the outermost hop is popped first (§4).
-            let mut peers = vec![ingress.get()];
-            peers.append(&mut stack.peers);
-            let pushed = Backtrace {
-                peers,
-                id: stack.id,
-            };
-            Some(Message::from_parts(pushed.encode(), body.to_vec()))
+            // already there, so the outermost hop is popped first (§4):
+            // pushing a tag is putting four octets before the stack, which
+            // is otherwise left as it arrived.
+            let stack = payload.get(..shape.len).unwrap_or_default();
+            let mut header = Vec::with_capacity(backtrace::TAG_LEN + stack.len());
+            header.extend_from_slice(&(ingress.get() & backtrace::MAX_ID).to_be_bytes());
+            header.extend_from_slice(stack);
+            Message::from_parts(header, payload.slice(shape.len..))
         }
         Routing::Pop => {
-            let (mut stack, body) = backtrace::decode(&payload, max_hops)
-                .map_err(|why| Error::EPROTO(why.to_string().into()))?;
-            if stack.peers.is_empty() {
+            let shape = backtrace::measure(&payload, max_hops).map_err(malformed)?;
+            if !from.core.payload_fits(ingress, payload.len() - shape.len) {
+                return Err(Error::EMSGSIZE(
+                    "the payload is over NNG_OPT_RECVMAXSZ once the tag stack is taken off".into(),
+                ));
+            }
+            let stack = payload.get(..shape.len).unwrap_or_default();
+            let (Some(first), true) = (
+                stack.first_chunk::<{ backtrace::TAG_LEN }>(),
+                shape.peers > 0,
+            ) else {
                 // Nothing left to pop: this answer was not routed through
                 // here, and there is nowhere to send it.
                 return Err(Error::EPROTO(
                     "a reply reached this device with an empty peer stack".into(),
                 ));
-            }
-            let reverse = PipeId::new(stack.peers.remove(0));
-            let popped = Message::from_parts(stack.encode(), body.to_vec());
-            to.send_to(reverse, popped).await?;
-            None
+            };
+            let reverse = PipeId::new(u32::from_be_bytes(*first));
+            // Popping a tag is dropping the first four octets of the
+            // stack: what remains is the stack the requester's own side
+            // pushed, byte for byte.
+            let popped = Message::from_parts(
+                stack.get(backtrace::TAG_LEN..).unwrap_or_default(),
+                payload.slice(shape.len..),
+            );
+            return match to.core.send_to(reverse, popped).await? {
+                Sent::Queued => Ok(Forward::Sent),
+                Sent::Dropped => Ok(Forward::Dropped),
+            };
         }
         Routing::Hop => {
-            let (hops, body) = pair::decode(&payload, max_hops as u32)
-                .map_err(|why| Error::EPROTO(why.to_string().into()))?;
+            let (hops, _) = pair::decode(&payload, max_hops as u32).map_err(malformed)?;
             let next = pair::next_hop(hops);
             if next as usize > max_hops {
                 // "Reply past the local hop ceiling: dropped on receipt,
@@ -315,17 +408,11 @@ async fn forward(
                     format!("hop count {next} is past this device's MAXTTL of {max_hops}").into(),
                 ));
             }
-            Some(Message::from_parts(
-                next.to_be_bytes().to_vec(),
-                body.to_vec(),
-            ))
+            Message::from_parts(next.to_be_bytes(), payload.slice(pair::HEADER_LEN..))
         }
-        Routing::Plain => Some(Message::from_body(payload)),
+        Routing::Plain => Message::from_body(payload),
     };
 
-    let Some(onward) = onward else {
-        return Ok(());
-    };
     if broadcasts(to.raw_protocol()) {
         // A single-socket device re-broadcasting a BUS message must not
         // reflect it to the pipe it came from (§4).
@@ -337,9 +424,9 @@ async fn forward(
         if broadcast.queued == 0 && broadcast.dropped > 0 {
             return Err(Error::ETIMEDOUT("no peer took the forwarded copy".into()));
         }
-        return Ok(());
+        return Ok(Forward::Sent);
     }
-    to.send(onward).await.map(|_| ())
+    to.send(onward).await.map(|_| Forward::Sent)
 }
 
 #[cfg(test)]

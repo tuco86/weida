@@ -141,6 +141,7 @@ pub mod tls;
 pub mod transport;
 
 pub use bus::BusSocket;
+pub use bytes::Bytes;
 pub use context::{
     Closed, Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, SocketId, SocketSlot,
 };
@@ -149,21 +150,22 @@ pub use endpoint::{
 };
 pub use engine::{
     Admission, Connection, Dialer, DialerId, Engine, HandshakeGate, Listener, ListenerId,
-    PipeCallback, PipeEvent, PipeInfo, Role, Session, SessionFuture,
+    PipeCallback, PipeEvent, PipeInfo, PipeSet, Role, Session, SessionFuture,
 };
 pub use error::{Cause, Error, Result};
 pub use message::{DEFAULT_RECV_MAX_SIZE, Message, RECV_MAX_SIZE_UNLIMITED};
 pub use options::{
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_PIPES, DEFAULT_MAX_TTL,
-    DEFAULT_RECONNECT_MAX, DEFAULT_RECONNECT_MIN, DEFAULT_RESEND_TIME, DEFAULT_SURVEY_TIME,
-    EndpointOptions, NNG_MAX_TTL, SPEC_MAX_TTL, SocketOptions,
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_PIPES,
+    DEFAULT_MAX_PIPES_PER_PEER, DEFAULT_MAX_TLS_HANDSHAKES, DEFAULT_MAX_TTL, DEFAULT_RECONNECT_MAX,
+    DEFAULT_RECONNECT_MIN, DEFAULT_RESEND_TIME, DEFAULT_SURVEY_TIME, EndpointOptions, NNG_MAX_TTL,
+    SPEC_MAX_TTL, SocketOptions,
 };
 pub use pair::{POLYAMOROUS_ABSENT, Pair0Socket, Pair1Socket};
 pub use pipe::{
     DEFAULT_QUEUE_BYTES, DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, MAX_QUEUE_DEPTH,
     PipeId, Queue, QueueConfig, Sent,
 };
-pub use pipe::{Discarded, Pipe, PipeConfig};
+pub use pipe::{Discarded, Pipe, PipeConfig, Signals};
 pub use pipeline::{PullSocket, PushSocket};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
 pub use pubsub::{PubSocket, SubSocket};
@@ -173,7 +175,7 @@ pub use reqrep::{RepCtx, RepSocket, ReqCtx, ReqSocket};
 pub use session::SpSession;
 pub use socket::{Broadcast, SocketCore};
 pub use survey::{RespondentCtx, RespondentSocket, SurveyorCtx, SurveyorSocket};
-pub use transport::Stream;
+pub use transport::{Stream, TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
 
 pub use inproc::{INPROC_BUFFER_BYTES, Inproc, InprocBinding, InprocDial};
 #[cfg(unix)]

@@ -33,13 +33,14 @@
 //! dropped a subscribed message to make room for an unsubscribed one would
 //! be applying the policy to traffic the application never asked for.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use tokio::task::JoinHandle;
 use weida_sp::EndpointType;
 
 use crate::context::Context;
+use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::options::SocketOptions;
@@ -76,7 +77,10 @@ impl PubSocket {
     /// Fails with `NNG_ECLOSED` once the socket is closed.
     pub fn send(&self, body: impl Into<Vec<u8>>) -> Result<Broadcast> {
         self.core.ensure_open()?;
-        Ok(self.core.send_to_all(&Message::from_body(body.into())))
+        let body: Vec<u8> = body.into();
+        Ok(self
+            .core
+            .send_to_all_except(&Message::from_body(body), None))
     }
 }
 
@@ -158,9 +162,14 @@ impl SubSocket {
             discarded: AtomicU64::new(0),
             pump: std::sync::Mutex::new(None),
         });
-        let task = core
-            .exec()
-            .spawn(filter_loop(Arc::clone(&core), Arc::clone(&shared)));
+        // The pump holds the socket weakly, for the reason the resend clock
+        // of REQ does: a pump that owned it would keep a socket nobody can
+        // reach alive for as long as it ran.
+        let task = core.exec().spawn(filter_loop(
+            Arc::downgrade(&core),
+            Arc::downgrade(&shared),
+            core.engine().clone(),
+        ));
         *shared.pump.lock().expect("sub pump poisoned") = Some(task);
         Ok(SubSocket { core, shared })
     }
@@ -246,27 +255,34 @@ socket_endpoints!(SubSocket);
 /// This is the locus the sheet describes: the message has already crossed
 /// the link and been read before anything is tested, so the filter saves
 /// the application work and saves the network nothing (§4).
-async fn filter_loop(core: Arc<SocketCore>, shared: Arc<SubShared>) {
+async fn filter_loop(core: Weak<SocketCore>, shared: Weak<SubShared>, engine: Engine) {
     loop {
-        let Some((_, message)) = core.try_take_any() else {
-            if core.engine().is_closed() {
+        // Created before the look, so an arrival while the pump is taking
+        // what is there ends the wait instead of being missed by it.
+        let arrived = engine.signals().arrived();
+        {
+            let (Some(core), Some(shared)) = (core.upgrade(), shared.upgrade()) else {
+                return;
+            };
+            while let Some((_, message)) = core.try_take_any() {
+                let admits = shared
+                    .subscriptions
+                    .lock()
+                    .expect("subs poisoned")
+                    .admits(message.body());
+                if !admits {
+                    shared.discarded.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if shared.admitted.send(message).await.is_err() {
+                    return;
+                }
+            }
+            if engine.is_closed() {
                 shared.admitted.close();
                 return;
             }
-            core.wait_for_message().await;
-            continue;
-        };
-        let admits = shared
-            .subscriptions
-            .lock()
-            .expect("subs poisoned")
-            .admits(message.body());
-        if !admits {
-            shared.discarded.fetch_add(1, Ordering::Relaxed);
-            continue;
         }
-        if shared.admitted.send(message).await.is_err() {
-            return;
-        }
+        arrived.await;
     }
 }

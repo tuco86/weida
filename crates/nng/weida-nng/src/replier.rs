@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use weida_sp::{Backtrace, EndpointType, backtrace};
+use weida_sp::{EndpointType, backtrace};
 
 use crate::context::Context;
 use crate::error::{Error, Result};
@@ -48,15 +48,19 @@ impl std::fmt::Display for CtxId {
     }
 }
 
-/// The wire form of a request, a survey or their answer: the tag stack,
-/// then the payload.
-pub(crate) fn framed(stack: &Backtrace, payload: &[u8]) -> Message {
-    Message::from_parts(stack.encode(), payload.to_vec())
+/// The tag stack a REQ or SURVEYOR sends directly to its peer: one tag, the
+/// request or survey id with its terminal bit set [rfc-reqrep §5].
+pub(crate) fn direct_stack(id: u32) -> [u8; backtrace::TAG_LEN] {
+    ((id & backtrace::MAX_ID) | backtrace::TERMINAL).to_be_bytes()
 }
 
+/// What a context needs to answer the message it received.
 #[derive(Clone, Debug)]
 struct Answering {
-    stack: Backtrace,
+    /// The tag stack of the message being answered, kept as the header of a
+    /// message with no body: a reply is that header around the reply's
+    /// body, and the stack is never decoded again.
+    stack: Message,
     pipe: PipeId,
 }
 
@@ -74,6 +78,10 @@ pub struct Replier {
     next_ctx: AtomicU64,
     /// What a send without a receive is called, in this protocol's words.
     refusal: &'static str,
+    /// Messages dropped with their pipe kept: a tag stack deeper than this
+    /// socket's `NNG_OPT_MAXTTL`, or a payload over `NNG_OPT_RECVMAXSZ`
+    /// once the stack is taken off.
+    dropped: AtomicU64,
 }
 
 impl Replier {
@@ -90,12 +98,18 @@ impl Replier {
             contexts: Mutex::new(HashMap::new()),
             next_ctx: AtomicU64::new(1),
             refusal,
+            dropped: AtomicU64::new(0),
         }))
     }
 
     /// The socket underneath, for the endpoint surface.
     pub(crate) fn core(&self) -> &Arc<SocketCore> {
         &self.core
+    }
+
+    /// Messages dropped with their pipe kept: see [`Replier::dropped`].
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<CtxId, ReplierCtxState>> {
@@ -177,29 +191,63 @@ impl ReplierCtx {
     }
 
     async fn take(&self) -> Result<Message> {
-        let max_hops = self.shared().core.options().max_ttl;
+        let core = &self.shared().core;
+        let max_hops = core.options().max_ttl;
         loop {
-            let Some((pipe, message)) = self.shared().core.try_take_any() else {
-                self.shared().core.wait_for_message().await;
+            // Created before the look, so that a message arriving between
+            // the look and the await ends the wait instead of being missed
+            // by it. And the socket is checked on every turn: a close wakes
+            // this wait, and what it must find then is `NNG_ECLOSED`.
+            let arrived = core.message_signal();
+            core.ensure_open()?;
+            let Some((pipe, mut message)) = core.try_take_any() else {
+                arrived.await;
                 continue;
             };
-            let Ok((stack, payload)) = backtrace::decode(message.body(), max_hops) else {
-                // A stack with no terminator inside the local `MAXTTL`, or
-                // one that ends inside a tag, is malformed rather than
-                // merely deep: "if the reply is shorter than 32 bits, it is
-                // malformed and the endpoint MUST ignore it"
-                // [rfc-reqrep §5], and NNG closes the pipe on a truncated
-                // tag rather than reading the next message out of a stream
-                // it can no longer trust (§8). So the pipe goes and the
-                // loop looks at the others.
-                self.shared().core.engine().close_pipe(pipe);
-                continue;
+            let shape = match backtrace::measure(message.body(), max_hops) {
+                Ok(shape) => shape,
+                Err(error) if !error.is_violation() => {
+                    // A stack deeper than the local `MAXTTL` is a message
+                    // to drop and not a connection to end: "we can
+                    // legitimately receive messages with too many hops
+                    // from devices", and the pipe is very likely one a
+                    // device shares among all its clients. The peer is
+                    // told nothing, and the count is the only trace.
+                    self.shared().dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Err(_) => {
+                    // A stack that ends inside a tag is malformed rather
+                    // than merely deep: "if the reply is shorter than 32
+                    // bits, it is malformed and the endpoint MUST ignore
+                    // it" [rfc-reqrep §5], and NNG closes the pipe on a
+                    // truncated tag rather than reading the next message
+                    // out of a stream it can no longer trust (§8). So the
+                    // pipe goes and the loop looks at the others.
+                    core.engine().close_pipe(pipe);
+                    continue;
+                }
             };
-            let received = framed(&stack, payload);
+            if message.split_header_off_body(shape.len).is_err() {
+                core.engine().close_pipe(pipe);
+                continue;
+            }
+            // `NNG_OPT_RECVMAXSZ` bounds what the application receives: the
+            // transport admitted this message by its declared length with
+            // the stack in it, and the payload that is left is judged here.
+            // Dropped rather than ended, for the reason a deep stack is: a
+            // device forwarding it hands the pipe it shares among its
+            // clients to the backend, and one client's oversize message
+            // must not be able to end that.
+            if !core.payload_fits(pipe, message.len()) {
+                self.shared().dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let stack = Message::from_parts(message.header(), Vec::new());
             let mut contexts = self.shared().lock();
             let state = contexts.entry(self.id()).or_default();
             state.answering = Some(Answering { stack, pipe });
-            return Ok(received);
+            return Ok(message);
         }
     }
 
@@ -213,7 +261,10 @@ impl ReplierCtx {
     /// An answer whose originator has gone is discarded rather than
     /// reported: SP has no way to tell anybody, and the originator's own
     /// timer — a resend for REQ, a survey deadline for SURVEYOR — is what
-    /// recovers (§4, §6).
+    /// recovers (§4, §6). So is one the originator's connection cannot take:
+    /// the send never waits for the requester, because a requester that
+    /// stopped reading must not be able to hold every other client of the
+    /// socket behind it.
     pub async fn send(&self, body: impl Into<Vec<u8>>) -> Result<()> {
         let Some(answering) = self
             .shared()
@@ -223,7 +274,8 @@ impl ReplierCtx {
         else {
             return Err(Error::ESTATE(self.shared().refusal.into()));
         };
-        let reply = framed(&answering.stack, &body.into());
+        let body: Vec<u8> = body.into();
+        let reply = Message::from_parts(answering.stack.header(), body);
         match self.shared().core.send_to(answering.pipe, reply).await {
             Ok(_) => Ok(()),
             Err(Error::ECLOSED(_)) => Ok(()),

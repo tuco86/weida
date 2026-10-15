@@ -2,10 +2,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use weida_nng::{Context, ContextConfig, Error, PullSocket, PushSocket, SocketOptions};
+use weida_nng::{
+    Admission, Context, ContextConfig, Error, PipeEvent, PipeInfo, PullSocket, PushSocket,
+    SocketOptions,
+};
 use weida_sp::header::{EndpointType, HEADER_LEN, ProtocolHeader};
 use weida_sp::message;
 
@@ -412,4 +415,192 @@ async fn closing_a_socket_ends_the_receive_already_waiting_on_it() {
         .expect("the parked receive ended at the close")
         .expect("task");
     assert!(matches!(outcome.unwrap_err(), Error::ECLOSED(_)));
+}
+
+/// Bounds one await on a peer or on the socket, so that a stall fails the
+/// test rather than hanging it.
+async fn bounded<T>(step: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), step)
+        .await
+        .expect("the step finished within 10 s")
+}
+
+/// A PUSH peer driven by hand: connected, handshaken, and kept open.
+async fn push_peer(addr: &str) -> tokio::net::TcpStream {
+    let mut peer = bounded(tokio::net::TcpStream::connect(addr))
+        .await
+        .expect("connect");
+    bounded(peer.write_all(&ProtocolHeader::new(EndpointType::Push).encode()))
+        .await
+        .expect("our header");
+    let mut theirs = [0u8; HEADER_LEN];
+    bounded(peer.read_exact(&mut theirs))
+        .await
+        .expect("their header");
+    peer
+}
+
+/// Waits, bounded, until the socket holds no pipe.
+async fn until_no_pipes(pull: &PullSocket) {
+    bounded(async {
+        while pull.pipe_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+}
+
+/// Claim: the messages a pusher leaves in a socket when it disconnects are held
+/// under one pipe's octet ceiling in total, however many pushers come and go. A
+/// retiring pipe hands its queue to the socket, and a bound on that buffer that
+/// counts messages alone lets sixteen pushers, each sending a full queue and
+/// then leaving, pile up 128 MiB in a socket that nothing receives from.
+#[tokio::test]
+async fn reconnecting_peers_cannot_make_the_socket_hold_more_than_one_pipes_worth_of_octets() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let pull = PullSocket::new(&ctx).expect("pull");
+    let url = bounded(pull.listen("tcp://127.0.0.1:0"))
+        .await
+        .expect("listen")
+        .url()
+        .to_string();
+    let addr = url.trim_start_matches("tcp://").to_owned();
+
+    // Eight messages of one mebibyte fill one pipe's queue exactly, and one
+    // mebibyte is the default receive size, so each message is as large as the
+    // socket accepts.
+    let body = vec![7u8; 1024 * 1024];
+    let frame = message::encode(&body);
+    for _ in 0..16 {
+        let mut peer = push_peer(&addr).await;
+        for _ in 0..8 {
+            bounded(peer.write_all(&frame)).await.expect("a message");
+        }
+        bounded(peer.shutdown()).await.expect("close");
+        drop(peer);
+        until_no_pipes(&pull).await;
+    }
+
+    let mut held = 0usize;
+    let mut octets = 0usize;
+    while let Ok(received) = pull.try_recv() {
+        held += 1;
+        octets += received.len();
+    }
+    assert!(
+        held >= 1,
+        "nothing was held, so the octet bound was never exercised"
+    );
+    assert!(
+        octets <= 10 * 1024 * 1024,
+        "the socket holds {octets} octets of what disconnected pushers left, \
+         more than one pipe's ceiling and a message"
+    );
+}
+
+/// Claim: a peer the admission hook refuses delivers nothing, not even the
+/// message it sent in the same write as its header. The hook decides after the
+/// handshake, by which time the message can already be in the socket's buffers.
+/// If those bytes outlived the refusal, they could reach the application from a
+/// leftover buffer once the refused pipe has gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_the_hook_refused_delivers_nothing() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let pull = PullSocket::with_options(&ctx, options()).expect("pull");
+    // Slow enough that the message is on the wire while the decision is still
+    // pending. The sleep holds a worker thread, which is why this test runs on
+    // the multi-threaded runtime.
+    pull.notify(Arc::new(|event: PipeEvent, _info: &PipeInfo| match event {
+        PipeEvent::AddPre => {
+            std::thread::sleep(Duration::from_millis(300));
+            Admission::Reject("no".into())
+        }
+        PipeEvent::AddPost | PipeEvent::RemPost => Admission::Accept,
+    }));
+    let url = bounded(pull.listen("tcp://127.0.0.1:0"))
+        .await
+        .expect("listen")
+        .url()
+        .to_string();
+    let addr = url.trim_start_matches("tcp://").to_owned();
+
+    let mut peer = bounded(tokio::net::TcpStream::connect(&addr))
+        .await
+        .expect("connect");
+    let mut first = ProtocolHeader::new(EndpointType::Push).encode().to_vec();
+    first.extend_from_slice(&message::encode(b"sent by a peer that is refused"));
+    bounded(peer.write_all(&first))
+        .await
+        .expect("the header and the message");
+
+    // The refusal is a close. A reset ends the read just as an orderly close
+    // does, and either way the socket has let go of the connection.
+    let mut heard = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut heard))
+        .await
+        .expect("the refused peer is closed within 5 s");
+    drop(peer);
+    until_no_pipes(&pull).await;
+
+    let refused = pull.try_recv();
+    assert!(
+        matches!(refused, Err(Error::EAGAIN(_))),
+        "the message of a refused peer reached the application: {refused:?}"
+    );
+}
+
+/// Claim: a receive that starts when no pipe exists takes the pipe that arrives
+/// while it is looking, and returns without waiting out its timeout. The receive
+/// looks at the pipes it has and then waits for a change, so a pipe admitted
+/// between the look and the wait must end that wait. A wake-up lost in that
+/// window leaves the receive parked until `NNG_OPT_RECVTIMEO`, and the loop
+/// repeats the race enough times for a lost one to show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receive_never_misses_a_pipe_that_arrives_while_it_looks() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    for n in 0..200u32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let pull = PullSocket::with_options(&ctx, options()).expect("pull");
+            let url = pull
+                .listen("tcp://127.0.0.1:0")
+                .await
+                .expect("listen")
+                .url()
+                .to_string();
+            let addr = url.trim_start_matches("tcp://").to_owned();
+            let body = format!("{n}");
+
+            // The receive starts first, so that the pipe arrives while it looks.
+            let receiving = tokio::spawn({
+                let pull = pull.clone();
+                async move {
+                    let started = Instant::now();
+                    let outcome = pull.recv().await;
+                    (started.elapsed(), outcome)
+                }
+            });
+            let mut peer = tokio::net::TcpStream::connect(&addr)
+                .await
+                .expect("connect");
+            peer.write_all(&ProtocolHeader::new(EndpointType::Push).encode())
+                .await
+                .expect("our header");
+            let mut theirs = [0u8; HEADER_LEN];
+            peer.read_exact(&mut theirs).await.expect("their header");
+            peer.write_all(&message::encode(body.as_bytes()))
+                .await
+                .expect("the message");
+
+            let (elapsed, outcome) = receiving.await.expect("the receive task");
+            let received = outcome.expect("the receive took the pipe that arrived");
+            assert_eq!(received.body(), body.as_bytes(), "iteration {n}");
+            assert!(
+                elapsed < Duration::from_secs(4),
+                "iteration {n} woke after {elapsed:?}, not well inside its 5 s timeout"
+            );
+            pull.close();
+        })
+        .await
+        .expect("the iteration finished within 5 s");
+    }
 }

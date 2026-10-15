@@ -68,7 +68,8 @@ impl BusSocket {
     /// [`Broadcast`] says how many copies were queued and how many were
     /// dropped, and that is the whole of what a BUS sender can ever learn.
     pub fn send(&self, body: impl Into<Vec<u8>>) -> Result<Broadcast> {
-        self.broadcast(&Message::from_body(body.into()), None)
+        let body: Vec<u8> = body.into();
+        self.broadcast(&Message::from_body(body), None)
     }
 
     /// Sends `body` to every directly connected peer **except** `pipe`.
@@ -81,7 +82,8 @@ impl BusSocket {
     /// control and is not a loop detector, which is why that sentence is
     /// quoted here rather than summarised.
     pub fn send_excluding(&self, pipe: PipeId, body: impl Into<Vec<u8>>) -> Result<Broadcast> {
-        self.broadcast(&Message::from_body(body.into()), Some(pipe))
+        let body: Vec<u8> = body.into();
+        self.broadcast(&Message::from_body(body), Some(pipe))
     }
 
     /// Re-broadcasts a message received by [`BusSocket::recv`], excluding
@@ -99,22 +101,17 @@ impl BusSocket {
                     .into(),
             ));
         };
-        self.broadcast(&Message::from_body(received.body().to_vec()), Some(pipe))
+        // The body is shared with the received message, not copied: the
+        // header it carried is local metadata and is not re-sent.
+        self.broadcast(
+            &Message::from_body(received.body_bytes().clone()),
+            Some(pipe),
+        )
     }
 
     fn broadcast(&self, message: &Message, exclude: Option<PipeId>) -> Result<Broadcast> {
         self.core.ensure_open()?;
-        let mut broadcast = Broadcast::default();
-        for pipe in self.core.pipes() {
-            if exclude == Some(pipe.id()) {
-                continue;
-            }
-            match pipe.outgoing().offer(message.clone()) {
-                Ok(()) => broadcast.queued += 1,
-                Err(_) => broadcast.dropped += 1,
-            }
-        }
-        Ok(broadcast)
+        Ok(self.core.send_to_all_except(message, exclude))
     }
 
     /// Receives the next message from any directly connected peer.
@@ -138,9 +135,7 @@ socket_endpoints!(BusSocket);
 
 /// Puts the ingress pipe id in a received message's protocol header.
 fn with_ingress(pipe: PipeId, message: Message) -> Message {
-    let mut tagged = Message::from_parts(pipe.get().to_be_bytes().to_vec(), message.into_body());
-    tagged.body_mut().shrink_to_fit();
-    tagged
+    Message::from_parts(pipe.get().to_be_bytes(), message.into_body())
 }
 
 /// The pipe a message received by a BUS socket arrived on, or `None` for a

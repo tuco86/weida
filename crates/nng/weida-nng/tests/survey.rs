@@ -2,7 +2,12 @@
 
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use weida_nng::{Context, ContextConfig, Error, RespondentSocket, SocketOptions, SurveyorSocket};
+use weida_sp::backtrace::{self, DEFAULT_MAX_HOPS};
+use weida_sp::header::{EndpointType, HEADER_LEN, ProtocolHeader};
+use weida_sp::message;
 
 fn options(survey_time: Duration) -> SocketOptions {
     SocketOptions {
@@ -265,4 +270,199 @@ async fn the_forbidden_orders_are_estate() {
 
     let err = respondents[0].send(b"unasked".to_vec()).await.unwrap_err();
     assert!(matches!(err, Error::ESTATE(_)), "{err:?}");
+}
+
+/// Bounds one await on a peer or on the socket, so that a stall fails the
+/// test rather than hanging it.
+async fn bounded<T>(step: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), step)
+        .await
+        .expect("the step finished within 10 s")
+}
+
+/// A respondent driven by hand: a raw connection that handshakes as
+/// RESPONDENT and stays open for the surveyor to send to.
+async fn raw_respondent(addr: &str) -> TcpStream {
+    let mut peer = bounded(TcpStream::connect(addr)).await.expect("connect");
+    bounded(peer.write_all(&ProtocolHeader::new(EndpointType::Respondent).encode()))
+        .await
+        .expect("our header");
+    let mut theirs = [0u8; HEADER_LEN];
+    bounded(peer.read_exact(&mut theirs))
+        .await
+        .expect("their header");
+    peer
+}
+
+/// Reads the survey off the wire and answers it. The answer carries the
+/// survey's own stack, which is how a respondent tells the surveyor which
+/// survey it is answering.
+async fn answer_survey(peer: &mut TcpStream, payload: &[u8]) {
+    let mut size = [0u8; message::SIZE_LEN];
+    bounded(peer.read_exact(&mut size))
+        .await
+        .expect("the survey's size field");
+    let len = usize::try_from(u64::from_be_bytes(size)).expect("a survey that fits in memory");
+    let mut survey = vec![0u8; len];
+    bounded(peer.read_exact(&mut survey))
+        .await
+        .expect("the survey");
+    let (stack, _) = backtrace::decode(&survey, DEFAULT_MAX_HOPS).expect("the survey's stack");
+    let answer = stack.encode_message(payload);
+    bounded(peer.write_all(&message::encode(&answer)))
+        .await
+        .expect("the answer");
+}
+
+/// Waits, bounded, until the surveyor holds `respondents` pipes.
+async fn until_connected(surveyor: &SurveyorSocket, respondents: usize) {
+    bounded(async {
+        while surveyor.pipe_count() < respondents {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+/// Collects answers until the survey's deadline ends the wait, and returns how
+/// many were delivered. Any other end of the wait is a failure.
+async fn collect_answers(surveyor: &SurveyorSocket) -> usize {
+    let mut delivered = 0;
+    loop {
+        match bounded(surveyor.recv()).await {
+            Ok(_) => delivered += 1,
+            Err(Error::ETIMEDOUT(_)) => return delivered,
+            Err(other) => panic!("a collect ends at the survey's deadline, not with {other:?}"),
+        }
+    }
+}
+
+/// Drains the pipes in bulk, with `discarded_late()`, until the surveyor has
+/// counted `discarded` answers as refused. That count is reached only once the
+/// answers that cause it have all been filed, so the wait ends when every answer
+/// has reached the surveyor. It is bounded, so a surveyor that never reaches the
+/// count fails here.
+async fn drain_until_discarded(surveyor: &SurveyorSocket, discarded: u64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while surveyor.discarded_late() < discarded {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the surveyor counted {} answers as refused, not {discarded}",
+            surveyor.discarded_late()
+        )
+    });
+}
+
+/// Claim: a survey files at most `recv_depth` answers and counts the rest as
+/// discarded, however many respondents answer it. The bound applies to answers
+/// filed in bulk, while nothing takes them: `discarded_late()`, and a receive on
+/// a sibling context, file several answers waiting in the pipes before any of
+/// them is taken. A lone receive consumes each answer as it files it, so it never
+/// holds more than one; what waits for it sits in each pipe's own bounded queue.
+/// Without the bound, one bulk filing would hold an answer per connected
+/// respondent until the application takes them.
+#[tokio::test]
+async fn a_survey_keeps_only_as_many_answers_as_its_bound_allows() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let surveyor = SurveyorSocket::with_options(
+        &ctx,
+        SocketOptions {
+            recv_depth: Some(4),
+            ..options(Duration::from_secs(3))
+        },
+    )
+    .expect("surveyor");
+    let url = bounded(surveyor.listen("tcp://127.0.0.1:0"))
+        .await
+        .expect("listen")
+        .url()
+        .to_string();
+    let addr = url.trim_start_matches("tcp://").to_owned();
+
+    // Twelve respondents, each kept connected until the test ends, so that
+    // each one can answer and its answer stays in the socket.
+    let mut respondents = Vec::new();
+    for _ in 0..12 {
+        respondents.push(raw_respondent(&addr).await);
+    }
+    until_connected(&surveyor, respondents.len()).await;
+
+    bounded(surveyor.send(b"who is there".to_vec()))
+        .await
+        .expect("send");
+    for peer in &mut respondents {
+        answer_survey(peer, b"here").await;
+    }
+
+    // Eight of the twelve are past the depth. The wait ends once all twelve
+    // have reached the surveyor, and they are then filed in bulk.
+    drain_until_discarded(&surveyor, 8).await;
+    let delivered = collect_answers(&surveyor).await;
+    assert_eq!(
+        delivered, 4,
+        "a survey files its receive depth of answers and no more"
+    );
+    assert!(
+        surveyor.discarded_late() >= 8,
+        "the answers past the depth are discarded and counted: {}",
+        surveyor.discarded_late()
+    );
+}
+
+/// Claim: a survey's answers are bounded in octets as well as in count. It files
+/// at most one pipe's octet ceiling of answers, and an answer that would cross the
+/// ceiling is discarded and counted, except that the first answer is always kept
+/// whatever its size. As with the count, the bound applies to answers filed in
+/// bulk, while nothing takes them. A lone receive consumes each answer as it
+/// files it, and what waits for it sits in each pipe's own bounded queue. Without
+/// the octet bound, one bulk filing would hold every answer at its full size.
+#[tokio::test]
+async fn answers_are_bounded_in_octets_too() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let surveyor = SurveyorSocket::with_options(
+        &ctx,
+        SocketOptions {
+            recv_max_size: 4 * 1024 * 1024,
+            ..options(Duration::from_secs(5))
+        },
+    )
+    .expect("surveyor");
+    let url = bounded(surveyor.listen("tcp://127.0.0.1:0"))
+        .await
+        .expect("listen")
+        .url()
+        .to_string();
+    let addr = url.trim_start_matches("tcp://").to_owned();
+
+    let mut respondents = Vec::new();
+    for _ in 0..3 {
+        respondents.push(raw_respondent(&addr).await);
+    }
+    until_connected(&surveyor, respondents.len()).await;
+
+    bounded(surveyor.send(b"how large?".to_vec()))
+        .await
+        .expect("send");
+    let large = vec![9u8; 3 * 1024 * 1024];
+    for peer in &mut respondents {
+        answer_survey(peer, &large).await;
+    }
+
+    // Two answers of three mebibytes make six, which is under the eight
+    // mebibyte ceiling; the third would make nine, so it is the one refused.
+    drain_until_discarded(&surveyor, 1).await;
+    let delivered = collect_answers(&surveyor).await;
+    assert_eq!(
+        delivered, 2,
+        "two 3 MiB answers fit the 8 MiB ceiling and a third does not"
+    );
+    assert!(
+        surveyor.discarded_late() >= 1,
+        "the answer over the ceiling is discarded and counted: {}",
+        surveyor.discarded_late()
+    );
 }

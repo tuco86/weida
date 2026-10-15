@@ -30,20 +30,22 @@
 //! different pipe is a different pipe and is collected, because from here
 //! it is indistinguishable from a second respondent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-use weida_sp::{Backtrace, EndpointType, backtrace};
+use weida_sp::{EndpointType, backtrace};
 
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::options::SocketOptions;
-use crate::pipe::PipeId;
-use crate::replier::{CtxId, Replier, ReplierCtx, framed};
+use crate::pipe::{
+    DEFAULT_QUEUE_BYTES, DEFAULT_RECV_DEPTH, FullAction, PipeId, QueueConfig, crosses,
+};
+use crate::replier::{CtxId, Replier, ReplierCtx, direct_stack};
 use crate::socket::{SocketCore, socket_endpoints, within};
 
 /// Survey IDs, like request IDs, are 31 bits with the terminal bit set on
@@ -68,10 +70,14 @@ struct Survey {
     id: u32,
     /// When the collection stops. Set when the survey was **sent** (§4).
     deadline: Instant,
-    /// Answers collected so far, in arrival order.
-    answers: Vec<Message>,
+    /// Answers collected so far, in arrival order, and the octets they
+    /// occupy: both are bounded by [`SurveyorShared::answer_bound`], so a
+    /// respondent that reconnects under a fresh pipe id to answer again
+    /// cannot grow what a survey holds without limit.
+    answers: VecDeque<Message>,
+    answers_bytes: u64,
     /// Pipes that have already answered: "at most one response per
-    /// respondent" (§4).
+    /// respondent" (§4). At most as many entries as there are answers.
     answered: HashSet<PipeId>,
 }
 
@@ -84,6 +90,13 @@ struct SurveyorCtxState {
 struct SurveyorShared {
     core: Arc<SocketCore>,
     survey_time: Duration,
+    /// What one survey may hold of answers nobody has taken yet: the
+    /// receive depth NNG gives every context, and the octet ceiling of a
+    /// pipe's queue, with the same rule that an empty buffer accepts one
+    /// answer of any size. An answer past either is discarded and counted
+    /// with the late ones, which is where SP puts everything a surveyor
+    /// declines.
+    answer_bound: QueueConfig,
     contexts: Mutex<HashMap<CtxId, SurveyorCtxState>>,
     next_ctx: AtomicU64,
     /// Woken when an answer lands in some context's slot.
@@ -132,10 +145,16 @@ impl SurveyorSocket {
     /// A SURVEYOR socket with `options`.
     pub fn with_options(context: &Context, options: SocketOptions) -> Result<SurveyorSocket> {
         let survey_time = options.survey_time;
+        let answer_bound = QueueConfig {
+            depth: options.recv_depth.unwrap_or(DEFAULT_RECV_DEPTH).max(1),
+            max_bytes: DEFAULT_QUEUE_BYTES,
+            full: FullAction::Drop,
+        };
         let core = Arc::new(SocketCore::new(context, EndpointType::Surveyor, options)?);
         let shared = Arc::new(SurveyorShared {
             core: Arc::clone(&core),
             survey_time,
+            answer_bound,
             contexts: Mutex::new(HashMap::new()),
             next_ctx: AtomicU64::new(1),
             delivered: Notify::new(),
@@ -178,7 +197,10 @@ impl SurveyorSocket {
     }
 
     /// Responses thrown away because their survey had expired or was
-    /// replaced, or because the respondent had already answered.
+    /// replaced, because the respondent had already answered, or because
+    /// the survey already held as many answers as it may — the receive
+    /// depth, and the octet ceiling of a pipe's queue — that nobody had
+    /// taken yet.
     ///
     /// The only trace a discarded late response leaves: nothing is sent
     /// back and the respondent never learns it was too slow (§4, §6).
@@ -246,9 +268,9 @@ impl SurveyorCtx {
     /// cancels this context's previous one, whose late answers are then
     /// discarded (§4).
     pub async fn send(&self, body: impl Into<Vec<u8>>) -> Result<()> {
-        let payload = body.into();
         let id = next_survey_id();
-        let survey = framed(&Backtrace::direct(id), &payload);
+        let body: Vec<u8> = body.into();
+        let survey = Message::from_parts(direct_stack(id), body);
         // The deadline starts at the send, before the copies go out, which
         // is what "survey time starts when the survey is sent" means (§4).
         let deadline = Instant::now() + self.shared().survey_time;
@@ -258,11 +280,12 @@ impl SurveyorCtx {
             state.survey = Some(Survey {
                 id,
                 deadline,
-                answers: Vec::new(),
+                answers: VecDeque::new(),
+                answers_bytes: 0,
                 answered: HashSet::new(),
             });
         }
-        self.shared().core.send_to_all(&survey);
+        self.shared().core.send_to_all_except(&survey, None);
         Ok(())
     }
 
@@ -310,17 +333,21 @@ impl SurveyorCtx {
     }
 
     async fn collect(&self) -> Result<Message> {
+        let shared = self.shared();
         loop {
             {
-                let mut contexts = self.shared().lock();
+                let mut contexts = shared.lock();
                 let state = contexts.entry(self.id()).or_default();
                 let Some(survey) = state.survey.as_mut() else {
                     return Err(Error::ESTATE(
                         "this context's survey was replaced or closed".into(),
                     ));
                 };
-                if !survey.answers.is_empty() {
-                    return Ok(survey.answers.remove(0));
+                if let Some(answer) = survey.answers.pop_front() {
+                    survey.answers_bytes = survey
+                        .answers_bytes
+                        .saturating_sub(answer.wire_len() as u64);
+                    return Ok(answer);
                 }
             }
             // Whichever context is inside a receive drains the pipes for
@@ -329,19 +356,21 @@ impl SurveyorCtx {
             // wait has two wake-ups to race: a message on a pipe, and a
             // sibling filing an answer into *this* context's slot.
             //
-            // `notified()` registers the waiter when it is **polled**, so
-            // registering is `enable()` and not construction: a filing
-            // between the drain below and the select would otherwise wake
-            // nobody and this wait would run to the deadline.
-            let mut delivered = std::pin::pin!(self.shared().delivered.notified());
-            delivered.as_mut().enable();
-            if let Some((pipe, message)) = self.shared().core.try_take_any() {
-                route(self.shared(), pipe, message);
+            // Both are created before the look: a filing, or an arrival,
+            // between the drain below and the select ends the wait instead
+            // of being missed by it, which would run this to the deadline.
+            let delivered = shared.delivered.notified();
+            let arrived = shared.core.message_signal();
+            // A close wakes both, and what a receive must find then is
+            // `NNG_ECLOSED` and not the deadline.
+            shared.core.ensure_open()?;
+            if let Some((pipe, message)) = shared.core.try_take_any() {
+                route(shared, pipe, message);
                 continue;
             }
             tokio::select! {
                 () = delivered => {}
-                () = self.shared().core.wait_for_message() => {}
+                () = arrived => {}
             }
         }
     }
@@ -362,27 +391,49 @@ impl Drop for Collecting<'_> {
 
 /// Files a response under the context whose survey it answers, discarding
 /// it when the survey is gone, expired, or already answered by that pipe.
-fn route(shared: &Arc<SurveyorShared>, pipe: PipeId, message: Message) {
+fn route(shared: &Arc<SurveyorShared>, pipe: PipeId, mut message: Message) {
     let max_hops = shared.core.options().max_ttl;
-    let Ok((stack, payload)) = backtrace::decode(message.body(), max_hops) else {
+    let Ok(shape) = backtrace::measure(message.body(), max_hops) else {
         return;
     };
+    // An answer whose payload is over the limit of the endpoint it arrived
+    // on is discarded, as an oversize survey is at a respondent.
+    if !shared.core.payload_fits(pipe, message.len() - shape.len) {
+        shared.late.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let now = Instant::now();
     let mut contexts = shared.lock();
     for state in contexts.values_mut() {
         let Some(survey) = state.survey.as_mut() else {
             continue;
         };
-        if survey.id != stack.id {
+        if survey.id != shape.id {
             continue;
         }
-        if survey.deadline <= now || !survey.answered.insert(pipe) {
+        let size = message.wire_len() as u64;
+        let full = crosses(
+            shared.answer_bound,
+            0,
+            survey.answers.len(),
+            survey.answers_bytes,
+            size,
+        )
+        .is_some();
+        if survey.deadline <= now || survey.answered.contains(&pipe) || full {
             // Late, or a second answer from a respondent that already
-            // answered. Discarded with nothing sent back (§4).
+            // answered, or one more than the survey may hold. Discarded
+            // with nothing sent back (§4).
             shared.late.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        survey.answers.push(framed(&stack, payload));
+        // The stack is split off only for an answer that is kept.
+        if message.split_header_off_body(shape.len).is_err() {
+            return;
+        }
+        survey.answered.insert(pipe);
+        survey.answers_bytes = survey.answers_bytes.saturating_add(size);
+        survey.answers.push_back(message);
         drop(contexts);
         // The context this answer belongs to is usually not the one that
         // drained the pipe it arrived on, and nothing else will wake it:
@@ -449,6 +500,16 @@ impl RespondentSocket {
         self.implicit.clone()
     }
 
+    /// Surveys dropped with their pipe kept: a tag stack deeper than this
+    /// socket's `NNG_OPT_MAXTTL`, or a payload over `NNG_OPT_RECVMAXSZ`
+    /// once the stack is taken off.
+    ///
+    /// Both are messages to drop and not connections to end, and the sender
+    /// is told nothing, so this count is the only trace.
+    pub fn dropped(&self) -> u64 {
+        self.shared.dropped()
+    }
+
     /// Receives a survey on this socket's own context.
     pub async fn recv(&self) -> Result<Message> {
         self.implicit.recv().await
@@ -470,6 +531,7 @@ mod tests {
     use super::*;
 
     use crate::context::ContextConfig;
+    use weida_sp::Backtrace;
 
     fn options() -> SocketOptions {
         SocketOptions {

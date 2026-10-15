@@ -5,9 +5,10 @@
 //! application data is opaque to most protocols" (`docs/research/nanomsg-nng.md`
 //! §2), and "NNG delivers a message wholly or not at all; it does not expose
 //! partial-message delivery or streaming bodies" (§3). Both sentences are
-//! this type: two `Vec<u8>`, and no API anywhere that hands out half of one.
+//! this type: a header and a body kept apart, and no API anywhere that hands
+//! out half of one.
 //!
-//! **Why two buffers rather than one with an offset.** Every protocol that
+//! **Why two parts rather than one with an offset.** Every protocol that
 //! has a header builds it on one side and consumes it on the other: a REQ
 //! pushes a request ID, a device pushes its own peer ID in front of that, a
 //! PAIR v1 increments a hop count, a raw BUS reads the pipe a message came
@@ -17,13 +18,23 @@
 //! application never has to be re-sliced past a header it does not know
 //! about.
 //!
+//! **What is shared and what is not.** The body is a [`Bytes`]: cloning a
+//! message bumps a reference count and copies no octet, so a broadcast hands
+//! every peer the same allocation instead of one deep copy each, and moving a
+//! tag stack from a received body into the header is a pointer move. The
+//! header is a few dozen octets at most — a default tag stack is 36 — and
+//! lives inline in the message, so a request and its reply allocate their
+//! bodies and nothing else.
+//!
 //! **On the wire there is no split.** A message is a big-endian 64-bit octet
 //! count followed by exactly that many octets: header then body, with no
 //! type tag, no flags and no continuation bit (§3). [`Message::encode`]
-//! writes that, and [`decode`] reads it — refusing an over-large declaration
-//! from the size field alone, before a single body octet is allocated, which
-//! is the only place `NNG_OPT_RECVMAXSZ` can be enforced at all.
+//! writes that, and [`declared_len`] reads the count — refusing an
+//! over-large declaration from the size field alone, before a single body
+//! octet is allocated, which is the only place `NNG_OPT_RECVMAXSZ` can be
+//! enforced at all.
 
+use bytes::Bytes;
 use weida_sp::message;
 
 use crate::error::{Error, Result};
@@ -52,12 +63,82 @@ pub const DEFAULT_RECV_MAX_SIZE: u64 = 1024 * 1024;
 /// the allocation.
 pub const RECV_MAX_SIZE_UNLIMITED: u64 = 0;
 
+/// Header octets a [`Message`] keeps inline, without a heap block of their
+/// own.
+///
+/// A tag stack is four octets per tag and `NNG_OPT_MAXTTL` defaults to 8,
+/// so a request that crossed one device carries at most ten tags: forty
+/// octets. A longer header — a raised `MAXTTL` — is kept as a shared
+/// allocation instead of being refused.
+const INLINE_HEADER_BYTES: usize = 40;
+
+/// A message's protocol header.
+#[derive(Clone)]
+enum Header {
+    Inline {
+        len: u8,
+        octets: [u8; INLINE_HEADER_BYTES],
+    },
+    Shared(Bytes),
+}
+
+impl Header {
+    const EMPTY: Header = Header::Inline {
+        len: 0,
+        octets: [0; INLINE_HEADER_BYTES],
+    };
+
+    fn from_slice(octets: &[u8]) -> Header {
+        if octets.len() > INLINE_HEADER_BYTES {
+            return Header::Shared(Bytes::copy_from_slice(octets));
+        }
+        let mut inline = [0u8; INLINE_HEADER_BYTES];
+        inline[..octets.len()].copy_from_slice(octets);
+        Header::Inline {
+            len: octets.len() as u8,
+            octets: inline,
+        }
+    }
+
+    /// A header made of `octets` without copying them when they are too
+    /// long to be kept inline.
+    fn from_bytes(octets: Bytes) -> Header {
+        if octets.len() > INLINE_HEADER_BYTES {
+            Header::Shared(octets)
+        } else {
+            Header::from_slice(&octets)
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Header::Inline { len, octets } => &octets[..usize::from(*len)],
+            Header::Shared(octets) => octets,
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Header::Inline { len, octets } => Bytes::copy_from_slice(&octets[..usize::from(len)]),
+            Header::Shared(octets) => octets,
+        }
+    }
+}
+
+impl std::fmt::Debug for Header {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
 /// One SP message: the protocol header the protocols write and read, and the
 /// application body they do not look at.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Cloning is cheap and shares the body; see the module documentation.
+#[derive(Clone, Debug)]
 pub struct Message {
-    header: Vec<u8>,
-    body: Vec<u8>,
+    header: Header,
+    body: Bytes,
 }
 
 impl Message {
@@ -68,28 +149,33 @@ impl Message {
     /// routinely.
     pub const fn new() -> Message {
         Message {
-            header: Vec::new(),
-            body: Vec::new(),
+            header: Header::EMPTY,
+            body: Bytes::new(),
         }
     }
 
     /// A message carrying `body` and no protocol header.
-    pub fn from_body(body: impl Into<Vec<u8>>) -> Message {
+    ///
+    /// A `Vec<u8>` is taken over without a copy, and so is a [`Bytes`].
+    pub fn from_body(body: impl Into<Bytes>) -> Message {
         Message {
-            header: Vec::new(),
+            header: Header::EMPTY,
             body: body.into(),
         }
     }
 
     /// A message with both halves given.
-    pub fn from_parts(header: Vec<u8>, body: Vec<u8>) -> Message {
-        Message { header, body }
+    pub fn from_parts(header: impl AsRef<[u8]>, body: impl Into<Bytes>) -> Message {
+        Message {
+            header: Header::from_slice(header.as_ref()),
+            body: body.into(),
+        }
     }
 
     /// The protocol header: the tag stack, the hop count, the pipe ID —
     /// whatever this protocol puts in front of the body, or nothing.
     pub fn header(&self) -> &[u8] {
-        &self.header
+        self.header.as_slice()
     }
 
     /// The application body.
@@ -97,14 +183,10 @@ impl Message {
         &self.body
     }
 
-    /// The application body, for a caller building one in place.
-    pub fn body_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.body
-    }
-
-    /// The protocol header, for a protocol writing its own.
-    pub fn header_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.header
+    /// The application body as the shared allocation it is, for a caller
+    /// that wants to keep it past the message or hand it on without a copy.
+    pub const fn body_bytes(&self) -> &Bytes {
+        &self.body
     }
 
     /// Body octets. `nng_msg_len()`, which counts the body and not the
@@ -120,61 +202,61 @@ impl Message {
 
     /// Octets this message occupies on the wire, size field excluded.
     pub fn wire_len(&self) -> usize {
-        self.header.len() + self.body.len()
+        self.header().len() + self.body.len()
     }
 
     /// The body alone, consuming the message.
-    pub fn into_body(self) -> Vec<u8> {
+    pub fn into_body(self) -> Bytes {
         self.body
     }
 
     /// Both halves, consuming the message.
-    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
-        (self.header, self.body)
+    pub fn into_parts(self) -> (Bytes, Bytes) {
+        (self.header.into_bytes(), self.body)
+    }
+
+    /// Rewrites the header through a scratch copy: the four word edits below
+    /// are `nng_msg_header_*` for a caller, and no protocol of this library
+    /// takes this path per message, so they are written for clarity.
+    fn edit_header<T>(&mut self, edit: impl FnOnce(&mut Vec<u8>) -> T) -> T {
+        let mut octets = self.header().to_vec();
+        let out = edit(&mut octets);
+        self.header = Header::from_slice(&octets);
+        out
     }
 
     /// Appends a 32-bit word to the end of the header.
     /// `nng_msg_header_append_u32()`.
     pub fn append_header_u32(&mut self, word: u32) {
-        self.header.extend_from_slice(&word.to_be_bytes());
+        self.edit_header(|header| header.extend_from_slice(&word.to_be_bytes()));
     }
 
     /// Inserts a 32-bit word at the front of the header.
     /// `nng_msg_header_insert_u32()` — what a device does with its own peer
     /// ID on the way in (§4).
     pub fn insert_header_u32(&mut self, word: u32) {
-        self.header.splice(0..0, word.to_be_bytes());
+        self.edit_header(|header| {
+            let mut fronted = word.to_be_bytes().to_vec();
+            fronted.extend_from_slice(header);
+            *header = fronted;
+        });
     }
 
     /// Removes a 32-bit word from the front of the header.
     /// `nng_msg_header_trim_u32()` — what a device does when routing a reply
     /// back (§4). `None` when fewer than four octets remain.
     pub fn trim_header_u32(&mut self) -> Option<u32> {
-        if self.header.len() < 4 {
-            return None;
-        }
-        let word = u32::from_be_bytes([
-            self.header[0],
-            self.header[1],
-            self.header[2],
-            self.header[3],
-        ]);
-        self.header.drain(..4);
-        Some(word)
+        let head = self.header().first_chunk::<4>().copied()?;
+        self.edit_header(|header| header.drain(..4).for_each(drop));
+        Some(u32::from_be_bytes(head))
     }
 
     /// Removes a 32-bit word from the end of the header.
     /// `nng_msg_header_chop_u32()`.
     pub fn chop_header_u32(&mut self) -> Option<u32> {
-        let at = self.header.len().checked_sub(4)?;
-        let word = u32::from_be_bytes([
-            self.header[at],
-            self.header[at + 1],
-            self.header[at + 2],
-            self.header[at + 3],
-        ]);
-        self.header.truncate(at);
-        Some(word)
+        let tail = self.header().last_chunk::<4>().copied()?;
+        self.edit_header(|header| header.truncate(header.len() - 4));
+        Some(u32::from_be_bytes(tail))
     }
 
     /// Moves the first `len` octets of the body into the header.
@@ -186,6 +268,9 @@ impl Message {
     /// in each protocol means the header is always the protocol's and the
     /// body is always the application's, whichever socket type is holding
     /// the message.
+    ///
+    /// The body is not copied: the header octets are taken from its front
+    /// and the rest stays where it is.
     ///
     /// Fails with `NNG_EPROTO` when the body is shorter than `len`: a
     /// message whose declared protocol header runs off its own end is
@@ -200,8 +285,14 @@ impl Message {
                 .into(),
             ));
         }
-        self.header.extend_from_slice(&self.body[..len]);
-        self.body.drain(..len);
+        let moved = self.body.split_to(len);
+        self.header = if self.header().is_empty() {
+            Header::from_bytes(moved)
+        } else {
+            let mut joined = self.header().to_vec();
+            joined.extend_from_slice(&moved);
+            Header::from_slice(&joined)
+        };
         Ok(())
     }
 
@@ -210,7 +301,7 @@ impl Message {
     pub fn write_to(&self, out: &mut Vec<u8>) {
         out.reserve(message::SIZE_LEN + self.wire_len());
         message::encode_size(self.wire_len() as u64, out);
-        out.extend_from_slice(&self.header);
+        out.extend_from_slice(self.header());
         out.extend_from_slice(&self.body);
     }
 
@@ -222,38 +313,50 @@ impl Message {
     }
 }
 
-/// Decodes one whole message from the front of `input`.
+impl Default for Message {
+    fn default() -> Message {
+        Message::new()
+    }
+}
+
+impl PartialEq for Message {
+    fn eq(&self, other: &Message) -> bool {
+        self.header() == other.header() && self.body == other.body
+    }
+}
+
+impl Eq for Message {}
+
+/// Reads the size field of one message and judges it against
+/// `max_body_bytes`.
 ///
-/// Three outcomes, and the middle one is the reason this returns an
-/// `Option` rather than erroring on a short read:
+/// `Ok(length)` — how many octets follow, header and body together, since
+/// the wire does not tell them apart.
 ///
-/// * `Ok(Some((message, used)))` — a complete message, and how many octets
-///   it took. The header is empty: the wire carries one run of octets, and
-///   which of them belong to the protocol is a question only the protocol
-///   can answer ([`Message::split_header_off_body`]).
-/// * `Ok(None)` — not yet. Read more and call again; nothing was consumed
-///   and nothing was allocated. This is "wholly or not at all" (§3) as
-///   control flow: there is no way to obtain the first half of a message.
-/// * `Err(NNG_EMSGSIZE)` — the peer declared more than `max_body_bytes`.
-///   Judged **from the size field alone**, before the body is looked at, let
-///   alone reserved: SP grants no credit, a declaration may be 2^64-1 octets
-///   (§3), and this is the only point at which the allocation is still ours
-///   to refuse.
+/// `Err(NNG_EMSGSIZE)` — the peer declared more than `max_body_bytes`.
+/// Judged **from the size field alone**, before the body is looked at, let
+/// alone reserved: SP grants no credit, a declaration may be 2^64-1 octets
+/// (§3), and this is the only point at which the allocation is still ours
+/// to refuse.
 ///
 /// `max_body_bytes` of [`RECV_MAX_SIZE_UNLIMITED`] is NNG's "no limit".
-pub fn decode(input: &[u8], max_body_bytes: u64) -> Result<Option<(Message, usize)>> {
+pub fn declared_len(size_field: [u8; message::SIZE_LEN], max_body_bytes: u64) -> Result<usize> {
     let cap = if max_body_bytes == RECV_MAX_SIZE_UNLIMITED {
         u64::MAX
     } else {
         max_body_bytes
     };
-    match message::decode(input, cap) {
-        Ok((body, used)) => Ok(Some((Message::from_body(body.to_vec()), used))),
-        Err(weida_sp::MessageError::Incomplete) => Ok(None),
-        Err(err @ weida_sp::MessageError::BodyTooLarge { .. }) => {
-            Err(Error::EMSGSIZE(format!("{err} (NNG_OPT_RECVMAXSZ)").into()))
-        }
-    }
+    let too_large =
+        |err: weida_sp::MessageError| Error::EMSGSIZE(format!("{err} (NNG_OPT_RECVMAXSZ)").into());
+    let (declared, _) = message::decode_size(&size_field, cap).map_err(too_large)?;
+    // The cap has bounded `declared`; the narrowing can only fail on a
+    // 32-bit target, where a body that large could never be held anyway.
+    usize::try_from(declared).map_err(|_| {
+        too_large(weida_sp::MessageError::BodyTooLarge {
+            len: declared,
+            max: usize::MAX as u64,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -293,8 +396,7 @@ mod tests {
 
         // A header with fewer than four octets left yields nothing rather
         // than a truncated word.
-        let mut short = Message::new();
-        short.header_mut().extend_from_slice(&[1, 2, 3]);
+        let mut short = Message::from_parts([1, 2, 3], Vec::new());
         assert_eq!(short.trim_header_u32(), None);
         assert_eq!(short.chop_header_u32(), None);
         assert_eq!(short.header(), [1, 2, 3]);
@@ -316,67 +418,78 @@ mod tests {
         assert_eq!(short.body(), b"ab", "a refused split changes nothing");
     }
 
+    /// Claim: a header longer than the inline budget — a raised `MAXTTL`
+    /// makes one — is kept whole rather than refused or cut, and splitting
+    /// it off a body moves the same octets as splitting a short one.
+    #[test]
+    fn a_header_longer_than_the_inline_budget_is_kept_whole() {
+        let stack: Vec<u8> = (0..=u8::MAX).collect();
+        let mut wire = stack.clone();
+        wire.extend_from_slice(b"tail");
+        let mut msg = Message::from_body(wire);
+        msg.split_header_off_body(stack.len())
+            .expect("a long stack");
+        assert_eq!(msg.header(), stack);
+        assert_eq!(msg.body(), b"tail");
+        assert_eq!(msg.wire_len(), stack.len() + 4);
+
+        let direct = Message::from_parts(&stack, b"tail".to_vec());
+        assert_eq!(direct, msg);
+    }
+
+    /// Claim: a clone shares the body instead of copying it, which is what
+    /// makes a broadcast cost a reference count per peer and not a copy.
+    #[test]
+    fn a_clone_shares_the_body() {
+        let original = Message::from_parts([0, 0, 0, 1], vec![1u8; 1024]);
+        let copy = original.clone();
+        assert_eq!(original.body().as_ptr(), copy.body().as_ptr());
+        assert_eq!(original, copy);
+
+        // And splitting a header off a body moves a pointer, not octets.
+        let mut wire = Message::from_body(vec![7u8; 1024]);
+        let before = wire.body().as_ptr();
+        wire.split_header_off_body(4).expect("split");
+        assert_eq!(wire.body().as_ptr(), before.wrapping_add(4));
+    }
+
     /// Claim: the wire form is the 64-bit size followed by header then body,
-    /// and it round-trips through the decoder with the same octets.
+    /// and the size field reads back the same octet count.
     #[test]
     fn the_wire_form_is_a_size_and_one_run_of_octets() {
-        let msg = Message::from_parts(b"\x80\x00\x00\x05".to_vec(), b"ping".to_vec());
+        let msg = Message::from_parts(b"\x80\x00\x00\x05", b"ping".to_vec());
         let wire = msg.encode();
         assert_eq!(&wire[..8], &[0, 0, 0, 0, 0, 0, 0, 8]);
         assert_eq!(&wire[8..], b"\x80\x00\x00\x05ping");
 
-        let (decoded, used) = decode(&wire, DEFAULT_RECV_MAX_SIZE)
-            .expect("a legal message")
-            .expect("a complete one");
-        assert_eq!(used, wire.len());
-        // The decoder does not know where the protocol header ends; the
-        // protocol says so afterwards.
-        assert_eq!(decoded.body(), b"\x80\x00\x00\x05ping");
-        let mut decoded = decoded;
-        decoded.split_header_off_body(4).expect("the tag");
-        assert_eq!(decoded, msg);
+        let mut size_field = [0u8; 8];
+        size_field.copy_from_slice(&wire[..8]);
+        assert_eq!(
+            declared_len(size_field, DEFAULT_RECV_MAX_SIZE).expect("a legal size"),
+            8
+        );
 
         // An empty message is eight zero octets and nothing after them.
         assert_eq!(Message::new().encode(), [0u8; 8]);
     }
 
-    /// Claim: a message is delivered wholly or not at all. Every truncation
-    /// of a complete frame yields "not yet" rather than a partial message,
-    /// and only the complete frame produces one.
-    #[test]
-    fn a_partial_message_is_never_half_delivered() {
-        let wire = Message::from_body(b"hello".to_vec()).encode();
-        for cut in 0..wire.len() {
-            assert_eq!(
-                decode(&wire[..cut], DEFAULT_RECV_MAX_SIZE).expect("not an error"),
-                None,
-                "{cut} octets produced a message"
-            );
-        }
-        assert!(
-            decode(&wire, DEFAULT_RECV_MAX_SIZE)
-                .expect("legal")
-                .is_some()
-        );
-    }
-
     /// Claim: `RECVMAXSZ` is judged from the declared 64-bit length alone.
     /// Eight octets of `0xFF` declare 2^64-1 and nothing follows them; a
-    /// decoder that reserved before checking would die on this input, and
+    /// reader that reserved before checking would die on this input, and
     /// this one answers `NNG_EMSGSIZE` with both numbers.
     #[test]
     fn an_oversized_declaration_is_refused_before_anything_is_allocated() {
-        let hostile = [0xFFu8; 8];
-        let err = decode(&hostile, DEFAULT_RECV_MAX_SIZE).unwrap_err();
+        let err = declared_len([0xFF; 8], DEFAULT_RECV_MAX_SIZE).unwrap_err();
         assert!(matches!(err, Error::EMSGSIZE(_)), "{err:?}");
         assert!(err.cause().contains(&DEFAULT_RECV_MAX_SIZE.to_string()));
         assert!(err.cause().contains("NNG_OPT_RECVMAXSZ"));
 
         // Exactly at the cap is accepted; one over is not.
-        let body = vec![7u8; 64];
-        let wire = Message::from_body(body).encode();
-        assert!(decode(&wire, 64).expect("legal").is_some());
-        assert!(matches!(decode(&wire, 63), Err(Error::EMSGSIZE(_))));
+        assert_eq!(declared_len(64u64.to_be_bytes(), 64).expect("legal"), 64);
+        assert!(matches!(
+            declared_len(64u64.to_be_bytes(), 63),
+            Err(Error::EMSGSIZE(_))
+        ));
     }
 
     /// Claim: NNG's own "no limit" value is available and means what it says
@@ -384,17 +497,17 @@ mod tests {
     /// letting a ported program keep its configuration.
     #[test]
     fn nngs_unlimited_is_available_and_means_unlimited() {
-        let wire = Message::from_body(vec![0u8; 4096]).encode();
-        assert!(
-            decode(&wire, RECV_MAX_SIZE_UNLIMITED)
-                .expect("legal")
-                .is_some()
-        );
-        // And it really is the declaration being believed: a hostile
-        // declaration is not refused, it is merely incomplete.
         assert_eq!(
-            decode(&[0xFFu8; 8], RECV_MAX_SIZE_UNLIMITED).expect("legal"),
-            None
+            declared_len(4096u64.to_be_bytes(), RECV_MAX_SIZE_UNLIMITED).expect("legal"),
+            4096
         );
+        // Believed, not satisfied: a size no machine could hold is still
+        // refused as `NNG_EMSGSIZE` rather than narrowed.
+        if usize::BITS < 64 {
+            assert!(matches!(
+                declared_len([0xFF; 8], RECV_MAX_SIZE_UNLIMITED),
+                Err(Error::EMSGSIZE(_))
+            ));
+        }
     }
 }

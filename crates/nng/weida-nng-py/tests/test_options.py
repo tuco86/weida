@@ -60,6 +60,10 @@ def test_a_refused_option_says_why():
         {"recv_depth": weida_nng.MAX_QUEUE_DEPTH + 1},
         {"handshake_timeout": 0.0},
         {"max_addresses": 0},
+        {"max_pipes_per_peer": 0},
+        {"max_tls_handshakes": 0},
+        {"message_timeout": 0.0},
+        {"idle_timeout": 0.0},
     ],
 )
 def test_an_impossible_configuration_is_refused_at_configuration_time(kwargs):
@@ -71,6 +75,22 @@ def test_an_impossible_configuration_is_refused_at_configuration_time(kwargs):
 def test_a_negative_duration_is_not_a_duration():
     with pytest.raises(weida_nng.EINVAL):
         weida_nng.SocketOptions(recv_timeout=-1.0)
+
+
+def test_the_connection_bounds_default_to_the_librarys_own_and_are_settable():
+    defaults = weida_nng.SocketOptions()
+    assert defaults.max_pipes_per_peer == 256
+    assert defaults.message_timeout is None and defaults.idle_timeout is None
+
+    tuned = weida_nng.SocketOptions(
+        max_pipes_per_peer=8,
+        max_tls_handshakes=4,
+        message_timeout=2.5,
+        idle_timeout=30.0,
+    )
+    assert tuned.max_pipes_per_peer == 8
+    assert tuned.message_timeout == 2.5
+    assert tuned.idle_timeout == 30.0
 
 
 def test_a_buffer_a_protocol_does_not_have_is_refused_when_the_socket_opens():

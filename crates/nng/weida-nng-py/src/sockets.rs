@@ -143,7 +143,7 @@ macro_rules! python_socket {
                     socket
                         .recv()
                         .await
-                        .map(|message| crate::values::Body(message.into_body()))
+                        .map(crate::values::Body)
                         .map_err(errno_of)
                 })
             }

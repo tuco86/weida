@@ -14,8 +14,10 @@
 //! cannot is a hang (§6).
 
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
@@ -23,6 +25,81 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 #[cfg(unix)]
 use weida_core::LocalPrincipal;
+
+/// How long a TCP connection may carry nothing in either direction before
+/// the kernel starts probing it.
+///
+/// **NNG's `NNG_OPT_TCP_KEEPALIVE` is off by default and this is not**, for
+/// the reason SP gives a dead peer no other way to be found: SP has no
+/// heartbeat, and a PULL or REP socket may never write to a peer at all, so
+/// a peer that vanished without a FIN — a crash, a dropped NAT mapping —
+/// would hold its pipe slot for ever. The probes are TCP's own, invisible
+/// to a peer that is alive, and sixty seconds is far enough out that a
+/// quiet but healthy connection sends nothing.
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+
+/// The gap between keepalive probes, on the platforms that let it be set.
+/// Elsewhere the platform's own is used.
+pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// What a listener counts a connection against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PeerKey {
+    /// A remote host: its IPv4 address, or the `/64` an IPv6 address
+    /// belongs to, because an IPv6 host is given a whole `/64` and a count
+    /// per address would be a count per attacker-chosen suffix.
+    Host(IpAddr),
+    /// The user id the kernel attributed to an `ipc://` peer.
+    User(u32),
+}
+
+impl PeerKey {
+    /// The key of a peer at `ip`.
+    pub fn host(ip: IpAddr) -> PeerKey {
+        match ip.to_canonical() {
+            IpAddr::V4(v4) => PeerKey::Host(IpAddr::V4(v4)),
+            IpAddr::V6(v6) => {
+                let [a, b, c, d, ..] = v6.segments();
+                PeerKey::Host(IpAddr::V6(std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0)))
+            }
+        }
+    }
+}
+
+/// What every TCP connection of this crate is set up with, however it was
+/// made.
+///
+/// Nagle is disabled: SP's request-reply and survey patterns are
+/// round-trip shaped, and a 40-millisecond delay on a four-octet tag stack
+/// is the difference between a working benchmark and a mystery. Keepalive
+/// is enabled ([`TCP_KEEPALIVE_IDLE`]). A failure to set either is not
+/// fatal — the connection works, with less — so it is logged rather than
+/// thrown.
+pub(crate) fn tune_tcp(stream: &TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "could not disable Nagle on an SP connection");
+    }
+    let probes = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "windows",
+    ))]
+    let probes = probes.with_interval(TCP_KEEPALIVE_INTERVAL);
+    if let Err(error) = socket2::SockRef::from(stream).set_tcp_keepalive(&probes) {
+        tracing::debug!(%error, "could not enable keepalive on an SP connection");
+    }
+}
 
 /// One established connection's byte stream.
 #[derive(Debug)]
@@ -49,17 +126,9 @@ enum Inner {
 }
 
 impl Stream {
-    /// Wraps an established TCP connection.
-    ///
-    /// Nagle is disabled: SP's request-reply and survey patterns are
-    /// round-trip shaped, and a 40-millisecond delay on a four-octet tag
-    /// stack is the difference between a working benchmark and a mystery.
-    /// A failure to set it is not fatal — the connection works, slower — so
-    /// it is logged rather than thrown.
+    /// Wraps an established TCP connection, set up as [`tune_tcp`] does.
     pub fn tcp(stream: TcpStream) -> Stream {
-        if let Err(error) = stream.set_nodelay(true) {
-            tracing::debug!(%error, "could not disable Nagle on an SP connection");
-        }
+        tune_tcp(&stream);
         Stream(Inner::Tcp(stream))
     }
 
@@ -159,6 +228,25 @@ impl Stream {
                 .peer_addr()
                 .ok()
                 .and_then(|a| a.as_pathname().map(|p| p.display().to_string())),
+        }
+    }
+
+    /// What a listener counts this connection against: the host it came
+    /// from for a network transport, the user the kernel attributed it to
+    /// for `ipc`, and nothing for `inproc`, whose peers are this process's
+    /// own.
+    pub fn peer_key(&self) -> Option<PeerKey> {
+        match &self.0 {
+            Inner::Tcp(stream) => stream.peer_addr().ok().map(|a| PeerKey::host(a.ip())),
+            Inner::Tls { stream, .. } => stream
+                .get_ref()
+                .0
+                .peer_addr()
+                .ok()
+                .map(|a| PeerKey::host(a.ip())),
+            Inner::Inproc(_) => None,
+            #[cfg(unix)]
+            Inner::Unix { principal, .. } => Some(PeerKey::User(principal.uid)),
         }
     }
 }

@@ -182,6 +182,28 @@ fn fuzz_smoke_backtrace() {
 }
 
 #[test]
+fn fuzz_smoke_measure_agrees_with_decode() {
+    let mut rng = Rng::new(0xA11E);
+    const MAX_HOPS: usize = 4;
+    for _ in 0..ITERATIONS {
+        let input = rng.bytes(28);
+        match (
+            backtrace::measure(&input, MAX_HOPS),
+            backtrace::decode(&input, MAX_HOPS),
+        ) {
+            (Ok(shape), Ok((stack, payload))) => {
+                assert_eq!(shape.len, stack.encoded_len());
+                assert_eq!(shape.peers, stack.peers.len());
+                assert_eq!(shape.id, stack.id);
+                assert_eq!(input.len() - shape.len, payload.len());
+            }
+            (Err(measured), Err(decoded)) => assert_eq!(measured, decoded),
+            (measured, decoded) => panic!("{measured:?} against {decoded:?} on {input:02x?}"),
+        }
+    }
+}
+
+#[test]
 fn fuzz_smoke_backtrace_round_trips_whatever_it_accepts() {
     let mut rng = Rng::new(0x7AC5);
     for _ in 0..ITERATIONS / 10 {

@@ -116,6 +116,60 @@ impl Backtrace {
     }
 }
 
+/// Where a tag stack ends in a message body, found without collecting its
+/// peers.
+///
+/// What [`measure`] returns: enough for a caller that moves the stack
+/// between a body and a header, or pushes and pops one tag, to do it as a
+/// split of the same octets rather than a decode and a re-encode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Measured {
+    /// Octets the stack occupies, terminator included. The payload starts
+    /// here.
+    pub len: usize,
+    /// Peer IDs before the terminator.
+    pub peers: usize,
+    /// The request or survey ID, without its terminal bit. At most
+    /// [`MAX_ID`].
+    pub id: u32,
+}
+
+/// Finds the end of the tag stack at the front of `body`.
+///
+/// The same judgement as [`decode`] - `max_hops` bounds the peer IDs before
+/// the terminator, and nothing beyond `(max_hops + 1) * 4` octets is ever
+/// read - and the same two errors, but nothing is allocated for either
+/// outcome and no tag is copied.
+pub fn measure(body: &[u8], max_hops: usize) -> Result<Measured, TagError> {
+    let mut offset = 0usize;
+    let mut peers = 0usize;
+    loop {
+        let Some(tag) = body
+            .get(offset..)
+            .and_then(|rest| rest.get(..TAG_LEN))
+            .and_then(|tag| <[u8; TAG_LEN]>::try_from(tag).ok())
+        else {
+            return Err(TagError::Truncated);
+        };
+        let value = u32::from_be_bytes(tag);
+        offset += TAG_LEN;
+        if value & TERMINAL != 0 {
+            return Ok(Measured {
+                len: offset,
+                peers,
+                id: value & MAX_ID,
+            });
+        }
+        if peers >= max_hops {
+            return Err(TagError::NoTerminator {
+                hops: peers,
+                max_hops,
+            });
+        }
+        peers += 1;
+    }
+}
+
 /// Splits a message body into its tag stack and its payload.
 ///
 /// `max_hops` bounds the peer IDs *before* the terminator, which is the local
@@ -126,31 +180,22 @@ impl Backtrace {
 ///
 /// Nothing is allocated for a rejected stack, and the payload is borrowed.
 pub fn decode(body: &[u8], max_hops: usize) -> Result<(Backtrace, &[u8]), TagError> {
-    let mut peers: Vec<u32> = Vec::new();
-    let mut offset = 0usize;
-    loop {
-        let Some(tag) = body.get(offset..offset + TAG_LEN) else {
-            return Err(TagError::Truncated);
-        };
-        let value = u32::from_be_bytes([tag[0], tag[1], tag[2], tag[3]]);
-        offset += TAG_LEN;
-        if value & TERMINAL != 0 {
-            return Ok((
-                Backtrace {
-                    peers,
-                    id: value & MAX_ID,
-                },
-                &body[offset..],
-            ));
-        }
-        if peers.len() >= max_hops {
-            return Err(TagError::NoTerminator {
-                hops: peers.len(),
-                max_hops,
-            });
-        }
-        peers.push(value);
-    }
+    let shape = measure(body, max_hops)?;
+    let stack = body.get(..shape.len).unwrap_or_default();
+    let peers = stack
+        .as_chunks::<TAG_LEN>()
+        .0
+        .iter()
+        .take(shape.peers)
+        .map(|tag| u32::from_be_bytes(*tag))
+        .collect();
+    Ok((
+        Backtrace {
+            peers,
+            id: shape.id,
+        },
+        body.get(shape.len..).unwrap_or_default(),
+    ))
 }
 
 #[cfg(test)]
@@ -255,5 +300,46 @@ mod tests {
                 max_hops: DEFAULT_MAX_HOPS
             })
         );
+    }
+
+    /// Claim: `measure` judges a body exactly as `decode` does and reports
+    /// where the payload starts, so a caller can split the stack off by
+    /// length instead of decoding and re-encoding it.
+    #[test]
+    fn measure_agrees_with_decode_on_every_prefix_of_a_stack() {
+        let mut stack = Backtrace::direct(0x1234);
+        stack.push_peer(7);
+        stack.push_peer(11);
+        let body = stack.encode_message(b"payload");
+        for cut in 0..=body.len() {
+            let input = &body[..cut];
+            match (
+                measure(input, DEFAULT_MAX_HOPS),
+                decode(input, DEFAULT_MAX_HOPS),
+            ) {
+                (Ok(shape), Ok((back, payload))) => {
+                    assert_eq!(shape.len, stack.encoded_len());
+                    assert_eq!(shape.peers, back.peers.len());
+                    assert_eq!(shape.id, back.id);
+                    assert_eq!(&input[shape.len..], payload);
+                }
+                (Err(measured), Err(decoded)) => assert_eq!(measured, decoded),
+                (measured, decoded) => panic!("{cut}: {measured:?} against {decoded:?}"),
+            }
+        }
+    }
+
+    /// Claim: only a truncated tag finishes a connection. A stack that is
+    /// merely deeper than the local bound is a message NNG's REP drops with
+    /// the pipe kept, because devices legitimately forward deep stacks
+    /// [nng-src `rep.c`].
+    #[test]
+    fn a_stack_that_is_merely_too_deep_is_not_a_violation() {
+        let too_deep = TagError::NoTerminator {
+            hops: DEFAULT_MAX_HOPS,
+            max_hops: DEFAULT_MAX_HOPS,
+        };
+        assert!(!too_deep.is_violation());
+        assert!(TagError::Truncated.is_violation());
     }
 }

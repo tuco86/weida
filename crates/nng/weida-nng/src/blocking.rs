@@ -511,7 +511,7 @@ mod tests {
         let answering = std::thread::spawn(move || {
             let request = server.recv().expect("a request");
             server.send(b"pong".to_vec()).expect("the reply");
-            request.into_body()
+            request.into_body().to_vec()
         });
 
         let client = ReqSocket::with_options(&context, options).expect("req");

@@ -30,18 +30,43 @@
 //! **Every timer goes through `weida-runtime`'s `Exec`**: the reconnect
 //! backoff and the handshake deadline. Nothing here calls `tokio::time`.
 //!
+//! **A connection is set up under a budget, a slot and a handshake
+//! ceiling.** What a peer has to do before it is a pipe — answer the TCP
+//! connect, run the TLS handshake, send its 8-octet protocol header — is
+//! bounded at every step it could stall: each TCP connect attempt is under
+//! the handshake timeout, and the TLS handshake and the header share one.
+//! The pipe slot is reserved **before** the TLS handshake, so a connection
+//! over the pipe ceiling, or over one remote host's share of it
+//! ([`SocketOptions::max_pipes_per_peer`](crate::SocketOptions::max_pipes_per_peer)),
+//! is refused for the price of a lock; TLS handshakes run in the task of
+//! their own connection and not in the loop that accepts, so a peer that
+//! says nothing stops nobody else; and at most
+//! [`SocketOptions::max_tls_handshakes`](crate::SocketOptions::max_tls_handshakes)
+//! of them run at once.
+//!
+//! **A socket's pipes are one immutable set.** [`Engine::pipes`] is a
+//! reference count: the set is rebuilt when a pipe is admitted or retired,
+//! never edited, so every send and receive reads a consistent view without
+//! collecting one. What the pipes tell the socket — a message arrived,
+//! room appeared, the set changed — is [`Signals`](crate::Signals), one
+//! wake-up per socket and not one future per pipe.
+//!
 //! What this module does **not** do is speak SP. A connection is handed to a
 //! [`Session`], and the 8-octet header, the pairing check and the 64-bit
 //! framing are that session's
 //! ([0013](../../../docs/decisions/0013-competitor-libraries.md) §5.2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::futures::Notified;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use weida_runtime::Exec;
 use weida_sp::EndpointType;
@@ -49,10 +74,11 @@ use weida_sp::EndpointType;
 use crate::context::{Context, SocketSlot};
 use crate::endpoint::{Endpoint, TcpHost};
 use crate::error::{Cause, Error, Result};
-use crate::message::Message;
+use crate::message::{Message, RECV_MAX_SIZE_UNLIMITED};
 use crate::options::{EndpointOptions, SocketOptions};
-use crate::pipe::{Discarded, Pipe, PipeId};
-use crate::transport::Stream;
+use crate::pipe::{Discarded, Pipe, PipeId, Signals, crosses};
+use crate::tls;
+use crate::transport::{PeerKey, Stream, tune_tcp};
 
 /// What a [`Session`] returns: a future that ends when the connection does.
 pub type SessionFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -111,10 +137,19 @@ pub struct Connection {
     pub endpoint: Endpoint,
     /// What this socket speaks, which is what goes in its protocol header.
     pub protocol: EndpointType,
-    /// `NNG_OPT_RECVMAXSZ` for this connection.
+    /// The most octets one message may declare on this connection, header
+    /// and body together: `NNG_OPT_RECVMAXSZ` for this endpoint, with the
+    /// tag stack added for the protocols that carry one (see
+    /// [`SocketOptions::recv_max_size`]).
     pub recv_max_size: u64,
     /// Signalled once the peer's protocol header has been read and accepted.
     pub handshake: HandshakeGate,
+    /// The reactor, for the clocks a session keeps.
+    pub exec: Exec,
+    /// [`SocketOptions::message_timeout`].
+    pub message_timeout: Option<Duration>,
+    /// [`SocketOptions::idle_timeout`].
+    pub idle_timeout: Option<Duration>,
 }
 
 /// What drives one connection once its bytes flow: in this library, SP.
@@ -281,6 +316,38 @@ impl Listener {
     }
 }
 
+/// The pipes a socket may use, at one moment.
+///
+/// **Immutable.** A change of membership builds a new set instead of
+/// editing this one, so a reader holds a consistent view for as long as it
+/// likes and takes one for the price of a reference count — which is what
+/// every send and receive does, where it used to collect, clone and drop a
+/// vector of pipes. Ascending by pipe id, so a pipe is found by binary
+/// search and a round-robin cursor means the same thing on every look at
+/// one set.
+#[derive(Debug, Default)]
+pub struct PipeSet {
+    pipes: Vec<Pipe>,
+}
+
+impl PipeSet {
+    /// The pipe named `id`, if it is in this set.
+    pub fn get(&self, id: PipeId) -> Option<&Pipe> {
+        self.pipes
+            .binary_search_by_key(&id, Pipe::id)
+            .ok()
+            .and_then(|at| self.pipes.get(at))
+    }
+}
+
+impl Deref for PipeSet {
+    type Target = [Pipe];
+
+    fn deref(&self) -> &[Pipe] {
+        &self.pipes
+    }
+}
+
 struct PipeEntry {
     pipe: Pipe,
     info: PipeInfo,
@@ -291,6 +358,10 @@ struct PipeEntry {
     admitted: bool,
     dialer: Option<DialerId>,
     listener: Option<ListenerId>,
+    /// What this pipe counts against under
+    /// [`SocketOptions::max_pipes_per_peer`]: set for a connection a
+    /// listener accepted, from the moment its slot is reserved.
+    source: Option<PeerKey>,
 }
 
 /// One live dialer or listener: the task that runs it, which is what
@@ -302,11 +373,36 @@ struct EndpointEntry {
 
 struct EngineState {
     pipes: HashMap<PipeId, PipeEntry>,
+    /// Pipes per source, the numbers [`SocketOptions::max_pipes_per_peer`]
+    /// is judged against. An entry exists only while it is nonzero.
+    sources: HashMap<PeerKey, usize>,
     dialers: HashMap<DialerId, EndpointEntry>,
     listeners: HashMap<ListenerId, EndpointEntry>,
     next_pipe: u32,
     next_endpoint: u32,
     closed: bool,
+}
+
+impl EngineState {
+    /// Takes one pipe off `source`'s count.
+    fn release(&mut self, source: Option<PeerKey>) {
+        let Some(source) = source else { return };
+        if let Some(count) = self.sources.get_mut(&source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.sources.remove(&source);
+            }
+        }
+    }
+}
+
+/// The messages that arrived on pipes which have since been retired.
+#[derive(Default)]
+struct Leftovers {
+    messages: VecDeque<(PipeId, Message)>,
+    /// What the queued messages occupy, for the same ceiling a pipe's queue
+    /// has.
+    bytes: u64,
 }
 
 struct EngineInner {
@@ -316,9 +412,16 @@ struct EngineInner {
     session: Arc<dyn Session>,
     notify: Mutex<Option<PipeCallback>>,
     state: Mutex<EngineState>,
-    /// Woken whenever the admitted pipe set changes, so a socket waiting
-    /// for a peer does not poll.
+    /// The admitted pipes as one immutable set, replaced whenever the
+    /// membership changes. Readers take the lock for as long as it takes to
+    /// clone an `Arc`, and never touch `state`.
+    snapshot: RwLock<Arc<PipeSet>>,
+    /// Woken whenever the admitted pipe set changes, so a task waiting for
+    /// a peer does not poll.
     changed: Notify,
+    /// What this socket's pipes tell its receivers and senders as a set;
+    /// also woken when the pipe set changes.
+    signals: Arc<Signals>,
     /// Messages that arrived on a pipe which has since been retired.
     ///
     /// The socket's own receive buffer, in miniature and only for the one
@@ -326,7 +429,10 @@ struct EngineInner {
     /// [`Engine::store_arrived`], which is where the ceiling and the
     /// full-queue policy are, because the pipe it came from is gone by
     /// then and its bound went with it.
-    leftovers: Mutex<std::collections::VecDeque<(PipeId, Message)>>,
+    leftovers: Mutex<Leftovers>,
+    /// Whether `leftovers` holds anything, readable without its lock: every
+    /// receive asks, and almost every answer is no.
+    has_leftovers: AtomicBool,
     /// Holds this socket's slot under its context's ceiling for as long as
     /// the engine lives.
     slot: SocketSlot,
@@ -374,14 +480,18 @@ impl Engine {
                 notify: Mutex::new(None),
                 state: Mutex::new(EngineState {
                     pipes: HashMap::new(),
+                    sources: HashMap::new(),
                     dialers: HashMap::new(),
                     listeners: HashMap::new(),
                     next_pipe: 1,
                     next_endpoint: 1,
                     closed: false,
                 }),
+                snapshot: RwLock::new(Arc::new(PipeSet::default())),
                 changed: Notify::new(),
-                leftovers: Mutex::new(std::collections::VecDeque::new()),
+                signals: Arc::new(Signals::new()),
+                leftovers: Mutex::new(Leftovers::default()),
+                has_leftovers: AtomicBool::new(false),
                 slot,
                 inproc: Arc::clone(context.inproc()),
             }),
@@ -413,14 +523,20 @@ impl Engine {
         *self.inner.notify.lock().expect("notify poisoned") = Some(callback);
     }
 
-    /// Every pipe the socket may use right now.
-    pub fn pipes(&self) -> Vec<Pipe> {
-        self.lock()
-            .pipes
-            .values()
-            .filter(|entry| entry.admitted)
-            .map(|entry| entry.pipe.clone())
-            .collect()
+    /// Every pipe the socket may use right now, as one immutable set.
+    ///
+    /// A reference count, not a collection: see [`PipeSet`].
+    pub fn pipes(&self) -> Arc<PipeSet> {
+        Arc::clone(&self.inner.snapshot.read().expect("pipe set poisoned"))
+    }
+
+    /// What this socket's pipes tell its receivers and senders as a set.
+    ///
+    /// Fed by every pipe's queues and by every change of membership. The
+    /// rule for using it is the one in [`Signals`]: create the wait, then
+    /// look, then await.
+    pub fn signals(&self) -> &Signals {
+        &self.inner.signals
     }
 
     /// What the socket knows about each of its pipes, in id order.
@@ -436,14 +552,19 @@ impl Engine {
         infos
     }
 
-    /// Waits until the admitted pipe set changes.
+    /// A wait that ends when the admitted pipe set changes.
     ///
-    /// A socket with nothing to send to waits on this rather than polling:
+    /// A task with nothing to send to waits on this rather than polling:
     /// "with no eligible peer, the send waits or times out" (§4), and this
     /// is the wait.
-    pub async fn changed(&self) {
-        let notified = self.inner.changed.notified();
-        notified.await;
+    ///
+    /// **Not an `async fn`, and that is the point.** The wait exists from
+    /// the moment this returns, and sees every change from then on, so a
+    /// caller that creates it *before* it looks at [`Engine::pipes`] cannot
+    /// miss a pipe that arrives in between. An `async fn` would not exist
+    /// until first polled, which is after the look.
+    pub fn changed(&self) -> Notified<'_> {
+        self.inner.changed.notified()
     }
 
     /// Whether the socket has been closed.
@@ -461,7 +582,9 @@ impl Engine {
     /// same way as a refused connect, because the pipe never existed.
     ///
     /// Unlike NNG's, this wait costs no thread and is bounded by
-    /// [`SocketOptions::handshake_timeout`](crate::SocketOptions::handshake_timeout).
+    /// [`SocketOptions::handshake_timeout`](crate::SocketOptions::handshake_timeout)
+    /// — for each address it tries to connect to, and then for the TLS
+    /// handshake and the protocol header together.
     pub async fn dial(&self, endpoint: &Endpoint) -> Result<Dialer> {
         self.dial_with(endpoint, EndpointOptions::default()).await
     }
@@ -571,19 +694,12 @@ impl Engine {
         if let Some(entry) = entry {
             entry.task.abort();
         }
-        let owned: Vec<PipeId> = self
-            .lock()
-            .pipes
-            .values()
-            .filter(|entry| entry.dialer == Some(id))
-            .map(|entry| entry.info.id)
-            .collect();
         // Retired here rather than left to the task that was driving them:
         // aborting a dialer stops the very loop that would have reported
         // the removal, and a pipe nobody retires is a pipe that stays in
         // the socket's table for ever.
-        for pipe in owned {
-            self.retire(pipe);
+        for entry in self.remove_pipes(|entry| entry.dialer == Some(id)) {
+            self.finish(entry);
         }
     }
 
@@ -593,15 +709,8 @@ impl Engine {
         if let Some(entry) = entry {
             entry.task.abort();
         }
-        let owned: Vec<PipeId> = self
-            .lock()
-            .pipes
-            .values()
-            .filter(|entry| entry.listener == Some(id))
-            .map(|entry| entry.info.id)
-            .collect();
-        for pipe in owned {
-            self.retire(pipe);
+        for entry in self.remove_pipes(|entry| entry.listener == Some(id)) {
+            self.finish(entry);
         }
     }
 
@@ -617,15 +726,33 @@ impl Engine {
         }
     }
 
-    /// `nng_close()`: stop dialling and accepting, and destroy every pipe.
-    pub fn close(&self) {
-        let (dialers, listeners, pipes) = {
+    /// The socket's last handle was dropped: stop dialling and accepting at
+    /// once, and close each pipe after it has written what is already queued
+    /// for its peer, for at most [`DEFAULT_CLOSE_BUDGET`].
+    ///
+    /// A close the application asked for discards what is queued — NNG has
+    /// no linger, and [`Engine::close`] is that. A drop is not a decision
+    /// about the data: `send` returns once a message is queued, and a reply
+    /// sent just before its socket went out of scope would otherwise be lost
+    /// in the moment between the queue and the connection's writer. A socket
+    /// with nothing queued closes on the spot.
+    pub(crate) fn close_after_flush(&self) {
+        let waiting: Vec<Pipe> = self
+            .pipes()
+            .iter()
+            .filter(|pipe| !pipe.outgoing().is_empty())
+            .cloned()
+            .collect();
+        if waiting.is_empty() {
+            self.close();
+            return;
+        }
+        let (dialers, listeners) = {
             let mut state = self.lock();
             state.closed = true;
             (
                 state.dialers.drain().collect::<Vec<_>>(),
                 state.listeners.drain().collect::<Vec<_>>(),
-                state.pipes.keys().copied().collect::<Vec<PipeId>>(),
             )
         };
         for (_, entry) in dialers {
@@ -634,10 +761,43 @@ impl Engine {
         for (_, entry) in listeners {
             entry.task.abort();
         }
-        for pipe in pipes {
-            self.retire(pipe);
+        // Receivers parked on this socket find it closed now.
+        self.membership_changed();
+        let engine = self.clone();
+        self.inner.exec.spawn(async move {
+            let deadline = Instant::now() + crate::context::DEFAULT_CLOSE_BUDGET;
+            for pipe in &waiting {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let _ = engine.exec().within(left, pipe.outgoing().drained()).await;
+            }
+            engine.close();
+        });
+    }
+
+    /// `nng_close()`: stop dialling and accepting, and destroy every pipe.
+    pub fn close(&self) {
+        let (dialers, listeners, pipes) = {
+            let mut state = self.lock();
+            state.closed = true;
+            let pipes: Vec<PipeEntry> = state.pipes.drain().map(|(_, entry)| entry).collect();
+            state.sources.clear();
+            self.publish(&state);
+            (
+                state.dialers.drain().collect::<Vec<_>>(),
+                state.listeners.drain().collect::<Vec<_>>(),
+                pipes,
+            )
+        };
+        for (_, entry) in dialers {
+            entry.task.abort();
         }
-        self.inner.changed.notify_waiters();
+        for (_, entry) in listeners {
+            entry.task.abort();
+        }
+        for entry in pipes {
+            self.finish(entry);
+        }
+        self.membership_changed();
     }
 
     fn dialer_handle(&self, id: DialerId, url: Endpoint) -> Dialer {
@@ -682,27 +842,59 @@ impl Engine {
         Ok((id, rx))
     }
 
-    /// Reserves a pipe slot against the socket's ceiling.
+    /// Reserves a pipe slot against the socket's ceilings: the whole
+    /// socket's, and for a connection a listener accepted, the one remote
+    /// host's or local user's.
+    ///
+    /// Called before anything about the connection costs this side work —
+    /// before a TLS handshake in particular — so that a connection that is
+    /// going to be refused is refused for the price of a lock.
     fn reserve(
         &self,
         role: Role,
         endpoint: &Endpoint,
         dialer: Option<DialerId>,
         listener: Option<ListenerId>,
-        stream: &Stream,
+        facts: Facts,
+        recv_limit: u64,
     ) -> Result<(PipeId, Pipe)> {
+        let options = &self.inner.options;
         let mut state = self.lock();
         if state.closed {
             return Err(closed());
         }
-        let ceiling = self.inner.options.max_pipes;
+        let ceiling = options.max_pipes;
         if state.pipes.len() >= ceiling {
             return Err(Error::ENOFILES(
                 format!("this socket already holds its ceiling of {ceiling} pipes").into(),
             ));
         }
-        let id = PipeId::new(next(&mut state.next_pipe));
-        let pipe = Pipe::new(id, self.inner.options.pipe_config(self.inner.protocol));
+        let source = if role == Role::Listen {
+            facts.source
+        } else {
+            None
+        };
+        if let Some(key) = source {
+            let ceiling = options.max_pipes_per_peer;
+            if state.sources.get(&key).copied().unwrap_or(0) >= ceiling {
+                return Err(Error::ENOFILES(
+                    format!(
+                        "this socket already holds its ceiling of {ceiling} pipes from one peer"
+                    )
+                    .into(),
+                ));
+            }
+        }
+        let id = free_pipe_id(&mut state)?;
+        let pipe = Pipe::linked(
+            id,
+            options.pipe_config(self.inner.protocol),
+            &self.inner.signals,
+        )
+        .with_recv_limit(recv_limit);
+        if let Some(key) = source {
+            *state.sources.entry(key).or_insert(0) += 1;
+        }
         state.pipes.insert(
             id,
             PipeEntry {
@@ -712,17 +904,26 @@ impl Engine {
                     role,
                     endpoint: endpoint.clone(),
                     peer: None,
-                    local_addr: stream.local_addr(),
-                    remote_addr: stream.remote_addr(),
-                    credentials: stream.peer_credentials(),
-                    tls: stream.tls_peer(),
+                    local_addr: facts.local_addr,
+                    remote_addr: facts.remote_addr,
+                    credentials: facts.credentials,
+                    tls: facts.tls,
                 },
                 admitted: false,
                 dialer,
                 listener,
+                source,
             },
         );
         Ok((id, pipe))
+    }
+
+    /// Records what TLS established about the peer of a pipe that is still
+    /// handshaking, which is what the pipe-add-pre callback is then shown.
+    fn set_tls_peer(&self, id: PipeId, peer: &tls::TlsPeer) {
+        if let Some(entry) = self.lock().pipes.get_mut(&id) {
+            entry.info.tls = Some(peer.clone());
+        }
     }
 
     /// Runs the callback, if one is installed. Never under the state lock:
@@ -758,34 +959,101 @@ impl Engine {
                 Some(entry) => entry.admitted = true,
                 None => return Err(closed()),
             }
+            self.publish(&state);
         }
         self.fire(PipeEvent::AddPost, &info);
-        self.inner.changed.notify_waiters();
+        self.membership_changed();
         Ok(())
     }
 
     /// Removes a pipe and fires `REM_POST`, whether it was ever admitted or
     /// not.
     fn retire(&self, id: PipeId) {
-        let entry = self.lock().pipes.remove(&id);
-        if let Some(entry) = entry {
-            // What already arrived is not lost with the pipe. NNG keeps
-            // received messages in the socket's own receive buffer rather
-            // than in the pipe, so a peer that replies and then closes —
-            // which is what a REP socket answering its last request does —
-            // has its answer delivered. Only what was still queued *for*
-            // the peer goes, because that never left (§1).
-            let mut arrived = Vec::new();
+        let entry = {
+            let mut state = self.lock();
+            let Some(entry) = state.pipes.remove(&id) else {
+                return;
+            };
+            state.release(entry.source);
+            if entry.admitted {
+                self.publish(&state);
+            }
+            entry
+        };
+        self.finish(entry);
+    }
+
+    /// Takes every pipe `wanted` picks out of the table, with the
+    /// membership published once for all of them.
+    fn remove_pipes(&self, mut wanted: impl FnMut(&PipeEntry) -> bool) -> Vec<PipeEntry> {
+        let mut state = self.lock();
+        let ids: Vec<PipeId> = state
+            .pipes
+            .iter()
+            .filter(|(_, entry)| wanted(entry))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut removed = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entry) = state.pipes.remove(&id) {
+                state.release(entry.source);
+                removed.push(entry);
+            }
+        }
+        if removed.iter().any(|entry| entry.admitted) {
+            self.publish(&state);
+        }
+        removed
+    }
+
+    /// What happens to a pipe after it has left the table: what it had
+    /// already received is kept, its queues are destroyed, and the socket's
+    /// waiters are told.
+    fn finish(&self, entry: PipeEntry) {
+        // What already arrived is not lost with the pipe. NNG keeps
+        // received messages in the socket's own receive buffer rather
+        // than in the pipe, so a peer that replies and then closes —
+        // which is what a REP socket answering its last request does —
+        // has its answer delivered. Only what was still queued *for*
+        // the peer goes, because that never left (§1).
+        //
+        // Only for a pipe that was admitted. One that never was — refused
+        // by the pipe-add-pre callback, or too slow to finish its
+        // handshake — has nothing to deliver: the peer was refused, and a
+        // message it managed to queue in the moment between its header and
+        // the refusal is not to reach the application on its behalf.
+        let mut arrived = Vec::new();
+        if entry.admitted {
             while let Ok(message) = entry.pipe.incoming().try_recv() {
                 arrived.push(message);
             }
-            entry.pipe.close();
-            self.store_arrived(id, arrived);
-            if entry.admitted {
-                self.fire(PipeEvent::RemPost, &entry.info);
-                self.inner.changed.notify_waiters();
-            }
         }
+        entry.pipe.close();
+        self.store_arrived(entry.info.id, arrived);
+        if entry.admitted {
+            self.fire(PipeEvent::RemPost, &entry.info);
+            self.membership_changed();
+        }
+    }
+
+    /// Replaces the published set of pipes with the admitted ones in
+    /// `state`. Called with the state lock held, so that the set and the
+    /// table cannot disagree.
+    fn publish(&self, state: &EngineState) {
+        let mut pipes: Vec<Pipe> = state
+            .pipes
+            .values()
+            .filter(|entry| entry.admitted)
+            .map(|entry| entry.pipe.clone())
+            .collect();
+        pipes.sort_by_key(Pipe::id);
+        *self.inner.snapshot.write().expect("pipe set poisoned") = Arc::new(PipeSet { pipes });
+    }
+
+    /// Wakes everything that waits on the set of pipes.
+    fn membership_changed(&self) {
+        self.inner.changed.notify_waiters();
+        self.inner.signals.pipes_changed();
     }
 
     /// Puts what a retired pipe had already received into the socket's
@@ -799,46 +1067,59 @@ impl Engine {
     /// reconnects in a loop would grow it without limit
     /// (`docs/INVARIANTS.md`).
     ///
-    /// The bound is [`PipeConfig::incoming`]'s depth — one pipe's worth of
-    /// messages, not one per pipe — because this is the socket's receive
-    /// buffer and not a per-pipe queue, and at least one, because holding
-    /// the last answer is the whole reason the buffer exists.
+    /// The bound is [`PipeConfig::incoming`](crate::PipeConfig::incoming)'s
+    /// — one pipe's worth, in messages **and in octets**, not one per pipe
+    /// — because this is the socket's receive buffer and not a per-pipe
+    /// queue, and at least one message, because holding the last answer is
+    /// the whole reason the buffer exists. The octet ceiling is the one
+    /// that matters: a depth counts messages and a message may be as large
+    /// as `NNG_OPT_RECVMAXSZ`, so a count alone would let reconnecting
+    /// peers leave the socket holding depth × `RECVMAXSZ`.
     ///
     /// Full, and the policy is the socket's rather than the pipe's:
-    /// [`FullAction::receiving`] is `Block` for every protocol and blocking
-    /// is not available here — the pipe is gone and no reader can push back
-    /// on a peer that has left. So the choice is the one `SUB_PREFNEW`
-    /// makes at this same layer: the oldest goes for a SUB that prefers new
-    /// publications, and for everyone else the **newest is refused**,
-    /// because the oldest is the answer somebody is already waiting for.
+    /// [`FullAction::receiving`](crate::FullAction::receiving) is `Block`
+    /// for every protocol and blocking is not available here — the pipe is
+    /// gone and no reader can push back on a peer that has left. So the
+    /// choice is the one `SUB_PREFNEW` makes at this same layer: the oldest
+    /// goes for a SUB that prefers new publications, and for everyone else
+    /// the **newest is refused**, because the oldest is the answer somebody
+    /// is already waiting for.
     fn store_arrived(&self, id: PipeId, arrived: Vec<Message>) {
         if arrived.is_empty() {
             return;
         }
         let options = &self.inner.options;
-        let ceiling = options
-            .pipe_config(self.inner.protocol)
-            .incoming
-            .depth
-            .max(1);
+        let mut bound = options.pipe_config(self.inner.protocol).incoming;
+        bound.depth = bound.depth.max(1);
         let prefer_new = self.inner.protocol == EndpointType::Sub && options.sub_prefer_new;
         let mut refused = 0usize;
         let mut leftovers = self.inner.leftovers.lock().expect("leftovers poisoned");
         for message in arrived {
-            if leftovers.len() >= ceiling {
-                if prefer_new {
-                    leftovers.pop_front();
-                } else {
-                    refused += 1;
-                    continue;
-                }
+            let size = message.wire_len() as u64;
+            while prefer_new
+                && crosses(bound, 0, leftovers.messages.len(), leftovers.bytes, size).is_some()
+            {
+                let Some((_, oldest)) = leftovers.messages.pop_front() else {
+                    break;
+                };
+                leftovers.bytes = leftovers.bytes.saturating_sub(oldest.wire_len() as u64);
             }
-            leftovers.push_back((id, message));
+            if crosses(bound, 0, leftovers.messages.len(), leftovers.bytes, size).is_some() {
+                refused += 1;
+                continue;
+            }
+            leftovers.bytes = leftovers.bytes.saturating_add(size);
+            leftovers.messages.push_back((id, message));
         }
+        self.inner
+            .has_leftovers
+            .store(!leftovers.messages.is_empty(), Ordering::Release);
+        drop(leftovers);
         if refused > 0 {
             tracing::debug!(
                 refused,
-                ceiling,
+                depth = bound.depth,
+                max_bytes = bound.max_bytes,
                 "the socket's buffer is full of messages from pipes that have gone"
             );
         }
@@ -851,21 +1132,31 @@ impl Engine {
     /// that crossed the wire has arrived, and the peer closing afterwards
     /// does not un-arrive it.
     pub fn take_arrived(&self) -> Option<(PipeId, Message)> {
+        if !self.inner.has_leftovers.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut leftovers = self.inner.leftovers.lock().expect("leftovers poisoned");
+        let (id, message) = leftovers.messages.pop_front()?;
+        leftovers.bytes = leftovers.bytes.saturating_sub(message.wire_len() as u64);
         self.inner
-            .leftovers
-            .lock()
-            .expect("leftovers poisoned")
-            .pop_front()
+            .has_leftovers
+            .store(!leftovers.messages.is_empty(), Ordering::Release);
+        Some((id, message))
     }
 
     /// Whether any message is waiting from a pipe that has been retired.
     pub fn has_arrived(&self) -> bool {
-        !self
-            .inner
+        self.inner.has_leftovers.load(Ordering::Acquire)
+    }
+
+    /// Octets held for messages from pipes that have been retired: what
+    /// [`Engine::store_arrived`] bounds.
+    pub fn leftover_bytes(&self) -> u64 {
+        self.inner
             .leftovers
             .lock()
             .expect("leftovers poisoned")
-            .is_empty()
+            .bytes
     }
 
     fn lock(&self) -> MutexGuard<'_, EngineState> {
@@ -892,8 +1183,79 @@ fn next(counter: &mut u32) -> u32 {
     id
 }
 
+/// The next pipe id no live pipe holds.
+///
+/// The counter is 31 bits wide because the id travels in a tag stack, so it
+/// wraps, and after enough connections it revisits the ids of pipes that
+/// are still open. An id taken twice would make the table forget the first
+/// pipe while its session kept running. A free id is found within one more
+/// try than there are live pipes, which is why the search is bounded.
+fn free_pipe_id(state: &mut EngineState) -> Result<PipeId> {
+    for _ in 0..=state.pipes.len() {
+        let id = PipeId::new(next(&mut state.next_pipe));
+        if !state.pipes.contains_key(&id) {
+            return Ok(id);
+        }
+    }
+    Err(Error::ENOFILES("every pipe id is in use".into()))
+}
+
 fn closed() -> Error {
     Error::ECLOSED("this socket is closed".into())
+}
+
+/// What a connection reveals about itself before it is a pipe.
+struct Facts {
+    local_addr: Option<String>,
+    remote_addr: Option<String>,
+    credentials: Option<weida_core::LocalPrincipal>,
+    tls: Option<tls::TlsPeer>,
+    source: Option<PeerKey>,
+}
+
+/// A connection the transport has established and the engine has not yet
+/// turned into a pipe.
+enum Raw {
+    /// Everything the session needs is in hand: `tcp`, `ipc` and `inproc`.
+    Ready(Stream),
+    /// A TCP connection whose TLS handshake is still to run.
+    ///
+    /// Left to the engine because the handshake must run **after** the pipe
+    /// slot is reserved and **under** the handshake deadline, and off the
+    /// loop that accepts: a peer that connects and says nothing must hold
+    /// nothing but its slot, for no longer than the deadline, and must not
+    /// stop the next connection from being accepted.
+    Tls {
+        tcp: TcpStream,
+        handshake: tls::Handshake,
+        /// One of the listener's concurrent handshakes, released when this
+        /// one is over.
+        permit: Option<OwnedSemaphorePermit>,
+    },
+}
+
+impl Raw {
+    fn facts(&self) -> Facts {
+        match self {
+            Raw::Ready(stream) => Facts {
+                local_addr: stream.local_addr(),
+                remote_addr: stream.remote_addr(),
+                credentials: stream.peer_credentials(),
+                tls: stream.tls_peer(),
+                source: stream.peer_key(),
+            },
+            Raw::Tls { tcp, .. } => {
+                let peer = tcp.peer_addr().ok();
+                Facts {
+                    local_addr: tcp.local_addr().ok().map(|addr| addr.to_string()),
+                    remote_addr: peer.map(|addr| addr.to_string()),
+                    credentials: None,
+                    tls: None,
+                    source: peer.map(|addr| PeerKey::host(addr.ip())),
+                }
+            }
+        }
+    }
 }
 
 /// Dials one endpoint, and keeps redialling it after each pipe closes.
@@ -905,23 +1267,15 @@ async fn dialer_loop(
     retry_first: bool,
 ) {
     let mut attempt = 0u32;
+    // Built on the first TLS dial and kept for every redial: the
+    // configuration does not change, and parsing it is not free.
+    let mut tls: Option<tls::Connector> = None;
     loop {
         if ctx.engine.is_closed() {
             return;
         }
-        let outcome = match connect(&ctx.engine, &endpoint).await {
-            Ok(stream) => {
-                run_pipe(
-                    &ctx,
-                    stream,
-                    Role::Dial,
-                    &endpoint,
-                    Some(id),
-                    None,
-                    &mut first,
-                )
-                .await
-            }
+        let outcome = match connect(&ctx.engine, &endpoint, &mut tls).await {
+            Ok(raw) => run_pipe(&ctx, raw, Role::Dial, &endpoint, Some(id), None, &mut first).await,
             Err(error) => Err(error),
         };
         match outcome {
@@ -950,28 +1304,112 @@ async fn dialer_loop(
     }
 }
 
+/// The first pause after an accept error that is not about one connection.
+const ACCEPT_PAUSE_MIN: Duration = Duration::from_millis(10);
+
+/// The longest an accept loop rests between tries.
+const ACCEPT_PAUSE_MAX: Duration = Duration::from_secs(1);
+
+/// How long an accept loop rests after an error, so that a failure that
+/// does not clear — a process out of file descriptors — costs a sleep per
+/// try and not a spin on a core.
+///
+/// An error about **one connection** — it was aborted or reset between the
+/// kernel's accept and ours — is not a reason to rest: the next one is
+/// already waiting. Anything else is: `EMFILE` and `ENFILE` leave the
+/// pending connection queued, so an immediate retry fails the same way, as
+/// do the memory and buffer errors, and an error nobody classified is
+/// treated as the worst case rather than the best.
+struct AcceptPause {
+    delay: Duration,
+}
+
+impl AcceptPause {
+    fn new() -> AcceptPause {
+        AcceptPause {
+            delay: ACCEPT_PAUSE_MIN,
+        }
+    }
+
+    /// An accept succeeded: start from the shortest rest again.
+    fn reset(&mut self) {
+        self.delay = ACCEPT_PAUSE_MIN;
+    }
+
+    /// How long to rest after `error`, doubling up to [`ACCEPT_PAUSE_MAX`],
+    /// or `None` when the next connection is the answer.
+    fn after(&mut self, error: &Error) -> Option<Duration> {
+        if matches!(
+            error,
+            Error::ECONNABORTED(_) | Error::ECONNRESET(_) | Error::EINTR(_)
+        ) {
+            return None;
+        }
+        let rest = self.delay;
+        self.delay = self.delay.saturating_mul(2).min(ACCEPT_PAUSE_MAX);
+        Some(rest)
+    }
+}
+
+/// What an accept loop needs of a listening endpoint.
+///
+/// A trait only so that the loop's behaviour at a failing listener can be
+/// driven without exhausting a process's file descriptors; the one
+/// implementation that is not a test's is [`Bound`].
+trait Listen: Send + 'static {
+    /// The next connection.
+    fn accept(&mut self) -> Pin<Box<dyn Future<Output = Result<Raw>> + Send + '_>>;
+
+    /// Whether accepting will never succeed again, so the loop should stop
+    /// rather than rest and retry. Only the in-process namespace can say
+    /// so: a socket listener's accept error is about the moment, not about
+    /// the listener.
+    fn is_finished(&self) -> bool;
+}
+
 /// Accepts connections on one listening endpoint. There is no accept call in
 /// SP's API: a listener accepts automatically (§1).
-async fn accept_loop(ctx: TaskCtx, listener: Bound, id: ListenerId, endpoint: Endpoint) {
-    let mut listener = listener;
+async fn accept_loop<L: Listen>(ctx: TaskCtx, mut listener: L, id: ListenerId, endpoint: Endpoint) {
+    // The TLS handshakes this listener has in flight: each is a connection
+    // that has proved nothing and already costs asymmetric cryptography.
+    let handshakes = Arc::new(Semaphore::new(ctx.engine.inner.options.max_tls_handshakes));
+    let mut pause = AcceptPause::new();
     loop {
-        let accepted = match listener.accept().await {
-            Ok(stream) => stream,
+        let mut raw = match listener.accept().await {
+            Ok(raw) => {
+                pause.reset();
+                raw
+            }
             Err(error) => {
                 tracing::debug!(%endpoint, %error, "SP listener could not accept");
                 if listener.is_finished() {
                     return;
                 }
+                if let Some(rest) = pause.after(&error) {
+                    ctx.engine.exec().sleep(rest).await;
+                }
                 continue;
             }
         };
+        if let Raw::Tls { permit, .. } = &mut raw {
+            match Arc::clone(&handshakes).try_acquire_owned() {
+                Ok(held) => *permit = Some(held),
+                Err(_) => {
+                    // Shed, unhandshaken: the connection is dropped, which
+                    // is the only refusal SP has (§6), and the accept loop
+                    // is back at `accept` at once.
+                    tracing::debug!(%endpoint, "SP listener is at its TLS handshake ceiling");
+                    continue;
+                }
+            }
+        }
         let ctx = ctx.clone();
         let endpoint = endpoint.clone();
         ctx.engine.exec().clone().spawn(async move {
             let mut first = None;
             if let Err(error) = run_pipe(
                 &ctx,
-                accepted,
+                raw,
                 Role::Listen,
                 &endpoint,
                 None,
@@ -986,6 +1424,36 @@ async fn accept_loop(ctx: TaskCtx, listener: Bound, id: ListenerId, endpoint: En
     }
 }
 
+/// The most octets one message may declare on a connection, given the
+/// endpoint's `NNG_OPT_RECVMAXSZ`: the figure the transport closes the pipe
+/// at.
+///
+/// **The tag stack rides on top of the limit.** A REQ, REP, SURVEYOR or
+/// RESPONDENT message carries a tag stack in front of its payload, one tag
+/// per forwarding hop and one for the request id, and `NNG_OPT_MAXTTL`
+/// already bounds how long that stack may be. A device pushes one more tag
+/// onto every request it forwards, so a limit that counted the stack would
+/// admit a request at a device and then close the pipe that device shares
+/// with every one of its clients, when the same request arrived at the
+/// backend four octets longer than it left the client.
+///
+/// So the transport's figure leaves room for the longest stack — `4 ×
+/// (MAXTTL + 1)` octets — and the limit itself is applied to the payload
+/// once the stack is known ([`Pipe::admits_payload`]), where a message that
+/// is over it is dropped with its pipe kept: the transport can only say
+/// "this declaration is absurd", and the pipe belongs to somebody else when
+/// a device forwarded the message.
+fn wire_limit(recv_max_size: u64, protocol: EndpointType, max_ttl: usize) -> u64 {
+    let carries_stack = matches!(
+        protocol,
+        EndpointType::Req | EndpointType::Rep | EndpointType::Surveyor | EndpointType::Respondent
+    );
+    if recv_max_size == RECV_MAX_SIZE_UNLIMITED || !carries_stack {
+        return recv_max_size;
+    }
+    recv_max_size.saturating_add((weida_sp::backtrace::TAG_LEN as u64) * (max_ttl as u64 + 1))
+}
+
 /// Runs one connection from its first octet to its last.
 ///
 /// Returns `Ok(())` once a pipe that was admitted has closed, and an error
@@ -993,47 +1461,84 @@ async fn accept_loop(ctx: TaskCtx, listener: Bound, id: ListenerId, endpoint: En
 /// dial reports and what a listener logs.
 async fn run_pipe(
     ctx: &TaskCtx,
-    stream: Stream,
+    raw: Raw,
     role: Role,
     endpoint: &Endpoint,
     dialer: Option<DialerId>,
     listener: Option<ListenerId>,
     first: &mut Option<oneshot::Sender<Result<()>>>,
 ) -> Result<()> {
-    let (id, pipe) = ctx
-        .engine
-        .reserve(role, endpoint, dialer, listener, &stream)?;
+    let engine = &ctx.engine;
+    let options = &engine.inner.options;
+    // One budget for what the peer has to do before it is a pipe: the TLS
+    // handshake, if there is one, and then the protocol header.
+    let started = Instant::now();
+    let recv_limit = if endpoint.enforces_recv_max_size() {
+        ctx.endpoint_options
+            .recv_max_size
+            .unwrap_or(options.recv_max_size)
+    } else {
+        // "`inproc` accepts but deliberately ignores `RECVMAXSZ`, because
+        // peers share an address space" (§3). The option is taken and
+        // honoured on every other transport rather than refused here,
+        // which is NNG's own behaviour.
+        RECV_MAX_SIZE_UNLIMITED
+    };
+    // The slot first, before anything that costs this side work.
+    let (id, pipe) = engine.reserve(role, endpoint, dialer, listener, raw.facts(), recv_limit)?;
+    let stream = match raw {
+        Raw::Ready(stream) => stream,
+        Raw::Tls {
+            tcp,
+            handshake,
+            permit: _permit,
+        } => {
+            let handshake = engine
+                .exec()
+                .within(options.handshake_timeout, handshake.run(tcp))
+                .await;
+            match handshake {
+                Some(Ok((stream, peer))) => {
+                    engine.set_tls_peer(id, &peer);
+                    Stream::tls(stream, peer)
+                }
+                Some(Err(error)) => {
+                    engine.retire(id);
+                    return Err(error);
+                }
+                None => {
+                    engine.retire(id);
+                    return Err(Error::ETIMEDOUT(
+                        "the peer did not finish the TLS handshake in time".into(),
+                    ));
+                }
+            }
+        }
+    };
+
     let (done, signal) = oneshot::channel();
     let connection = Connection {
         stream,
         pipe,
         role,
         endpoint: endpoint.clone(),
-        protocol: ctx.engine.protocol(),
-        recv_max_size: if endpoint.enforces_recv_max_size() {
-            ctx.endpoint_options
-                .recv_max_size
-                .unwrap_or(ctx.engine.inner.options.recv_max_size)
-        } else {
-            // "`inproc` accepts but deliberately ignores `RECVMAXSZ`,
-            // because peers share an address space" (§3). The option is
-            // taken and honoured on every other transport rather than
-            // refused here, which is NNG's own behaviour.
-            crate::message::RECV_MAX_SIZE_UNLIMITED
-        },
+        protocol: engine.protocol(),
+        recv_max_size: wire_limit(recv_limit, engine.protocol(), options.max_ttl),
         handshake: HandshakeGate { done: Some(done) },
+        exec: engine.exec().clone(),
+        message_timeout: options.message_timeout,
+        idle_timeout: options.idle_timeout,
     };
-    let mut session = ctx.engine.inner.session.start(connection);
+    let mut session = engine.inner.session.start(connection);
 
-    let deadline = ctx
-        .engine
+    let deadline = engine
         .exec()
-        .sleep(ctx.engine.inner.options.handshake_timeout);
+        .sleep(options.handshake_timeout.saturating_sub(started.elapsed()));
     let peer = {
         tokio::pin!(deadline);
         tokio::select! {
             ended = &mut session => {
-                ctx.engine.retire(id);
+                engine.retire(id);
                 return match ended {
                     Ok(()) => Err(Error::ECONNRESET(
                         "the peer closed before its protocol header arrived".into(),
@@ -1044,14 +1549,14 @@ async fn run_pipe(
             handshook = signal => match handshook {
                 Ok(peer) => peer,
                 Err(_) => {
-                    ctx.engine.retire(id);
+                    engine.retire(id);
                     return Err(Error::EPROTO(
                         "the session ended the handshake without naming the peer".into(),
                     ));
                 }
             },
             () = &mut deadline => {
-                ctx.engine.retire(id);
+                engine.retire(id);
                 return Err(Error::ETIMEDOUT(
                     "the peer did not send its protocol header in time".into(),
                 ));
@@ -1059,8 +1564,8 @@ async fn run_pipe(
         }
     };
 
-    if let Err(error) = ctx.engine.admit(id, peer) {
-        ctx.engine.retire(id);
+    if let Err(error) = engine.admit(id, peer) {
+        engine.retire(id);
         return Err(error);
     }
     if let Some(tx) = first.take() {
@@ -1068,7 +1573,7 @@ async fn run_pipe(
     }
 
     let outcome = session.await;
-    ctx.engine.retire(id);
+    engine.retire(id);
     match outcome {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -1078,22 +1583,53 @@ async fn run_pipe(
     }
 }
 
+/// One TCP connection to `host:port`: the addresses it names, in order, each
+/// attempt under the handshake deadline.
+///
+/// The deadline is per attempt, and the resolver's answer is one more wait
+/// under it, because a peer that never answers a `SYN` is as much a stall
+/// as one that never answers a `ClientHello`, and the kernel's own bound on
+/// it is minutes.
+async fn tcp_connect(engine: &Engine, host: &TcpHost, port: u16) -> Result<TcpStream> {
+    let options = &engine.inner.options;
+    let exec = &engine.inner.exec;
+    let limit = options.handshake_timeout;
+    let resolving = addresses(exec, host, port, options.max_addresses);
+    let addresses = exec.within(limit, resolving).await.ok_or_else(|| {
+        Error::ETIMEDOUT("resolving the host took longer than the handshake timeout".into())
+    })??;
+    let mut last = Error::EADDRINVAL("no address to dial".into());
+    for addr in addresses {
+        match exec.within(limit, TcpStream::connect(addr)).await {
+            Some(Ok(stream)) => return Ok(stream),
+            Some(Err(error)) => last = Error::from(error),
+            None => {
+                last = Error::ETIMEDOUT(
+                    format!("connecting to {addr} took longer than the handshake timeout").into(),
+                );
+            }
+        }
+    }
+    Err(last)
+}
+
 /// One connect attempt against one endpoint.
-async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
+///
+/// For `tls+tcp` this is the TCP connection only: the TLS handshake is run
+/// by [`run_pipe`], under the same deadline as the protocol header.
+async fn connect(
+    engine: &Engine,
+    endpoint: &Endpoint,
+    connector: &mut Option<tls::Connector>,
+) -> Result<Raw> {
     let options = &engine.inner.options;
     match endpoint {
         Endpoint::Tcp { host, port } => {
-            let mut last = Error::EADDRINVAL("no address to dial".into());
-            for addr in addresses(&engine.inner.exec, host, *port, options.max_addresses).await? {
-                match TcpStream::connect(addr).await {
-                    Ok(stream) => return Ok(Stream::tcp(stream)),
-                    Err(error) => last = Error::from(error),
-                }
-            }
-            Err(last)
+            let stream = tcp_connect(engine, host, *port).await?;
+            Ok(Raw::Ready(Stream::tcp(stream)))
         }
         Endpoint::TlsTcp { host, port } => {
-            let Some(tls) = options.tls.as_ref() else {
+            let Some(config) = options.tls.as_ref() else {
                 return Err(Error::EINVAL(
                     "a tls+tcp endpoint needs SocketOptions::tls; a TLS transport with no \
                      configuration is a TCP transport with a longer name"
@@ -1105,7 +1641,7 @@ async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
             // what NNG validates (§1). An address carries no name, so an
             // endpoint that has neither is refused rather than dialled
             // with nothing to verify.
-            let name = match (tls.server_name.as_deref(), host) {
+            let name = match (config.server_name.as_deref(), host) {
                 (Some(name), _) => name.to_owned(),
                 (None, TcpHost::Name(name)) => name.clone(),
                 (None, other) => {
@@ -1119,17 +1655,22 @@ async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
                     ));
                 }
             };
-            let mut last = Error::EADDRINVAL("no address to dial".into());
-            for addr in addresses(&engine.inner.exec, host, *port, options.max_addresses).await? {
-                match TcpStream::connect(addr).await {
-                    Ok(stream) => {
-                        let (tls_stream, peer) = crate::tls::connect(tls, &name, stream).await?;
-                        return Ok(Stream::tls(tls_stream, peer));
-                    }
-                    Err(error) => last = Error::from(error),
-                }
+            if connector.is_none() {
+                *connector = Some(tls::Connector::new(config)?);
             }
-            Err(last)
+            let Some(connector) = connector.as_ref() else {
+                return Err(Error::EINVAL("the TLS client side is not built".into()));
+            };
+            // Judged before dialling: a name no certificate can carry is
+            // not worth a connection.
+            let handshake = tls::Handshake::connect(connector, &name)?;
+            let tcp = tcp_connect(engine, host, *port).await?;
+            tune_tcp(&tcp);
+            Ok(Raw::Tls {
+                tcp,
+                handshake,
+                permit: None,
+            })
         }
         Endpoint::Inproc(name) => {
             // NNG's inproc dialer retries rather than failing outright, so
@@ -1140,6 +1681,7 @@ async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
                 .inner
                 .inproc
                 .dial(name, engine.inner.slot.id())
+                .map(Raw::Ready)
                 .ok_or_else(|| {
                     Error::ECONNREFUSED(
                         format!("inproc://{name} was unbound again before the dial landed").into(),
@@ -1152,7 +1694,7 @@ async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
             // The kernel's answer is taken now, because now is when it is
             // about the process that connected.
             let principal = crate::ipc::credentials(&stream)?;
-            Ok(Stream::unix(stream, principal))
+            Ok(Raw::Ready(Stream::unix(stream, principal)))
         }
         #[cfg(not(unix))]
         Endpoint::Ipc(_) => Err(unsupported(endpoint)),
@@ -1164,7 +1706,10 @@ enum Bound {
     Tcp(TcpListener),
     Tls {
         listener: TcpListener,
-        config: Box<crate::tls::TlsConfig>,
+        /// Built once, when the listener was bound: every connection that
+        /// reaches it shares the parsed certificate chain and loaded key
+        /// instead of building its own before it has proved anything.
+        acceptor: tls::Acceptor,
     },
     Inproc(crate::inproc::InprocBinding),
     #[cfg(unix)]
@@ -1174,34 +1719,31 @@ enum Bound {
 impl Bound {
     /// The next connection, with its credentials where the transport has
     /// any.
-    async fn accept(&mut self) -> Result<Stream> {
+    async fn accept_one(&mut self) -> Result<Raw> {
         match self {
             Bound::Tcp(listener) => {
                 let (stream, _) = listener.accept().await.map_err(Error::from)?;
-                Ok(Stream::tcp(stream))
+                Ok(Raw::Ready(Stream::tcp(stream)))
             }
-            Bound::Tls { listener, config } => {
-                let (stream, _) = listener.accept().await.map_err(Error::from)?;
-                let (tls, peer) = crate::tls::accept(config, stream).await?;
-                Ok(Stream::tls(tls, peer))
+            Bound::Tls { listener, acceptor } => {
+                let (tcp, _) = listener.accept().await.map_err(Error::from)?;
+                tune_tcp(&tcp);
+                Ok(Raw::Tls {
+                    tcp,
+                    handshake: tls::Handshake::accept(acceptor),
+                    permit: None,
+                })
             }
             Bound::Inproc(binding) => match binding.accept().await {
-                Some(dial) => Ok(dial.stream),
+                Some(dial) => Ok(Raw::Ready(dial.stream)),
                 None => Err(Error::ECLOSED("the inproc name was released".into())),
             },
             #[cfg(unix)]
             Bound::Ipc(binding) => {
                 let (stream, principal) = binding.accept().await?;
-                Ok(Stream::unix(stream, principal))
+                Ok(Raw::Ready(Stream::unix(stream, principal)))
             }
         }
-    }
-
-    /// Whether accepting will never succeed again, so the loop should stop
-    /// rather than spin. Only the in-process namespace can say so: a
-    /// socket listener's accept error is per-connection.
-    const fn is_finished(&self) -> bool {
-        matches!(self, Bound::Inproc(_))
     }
 
     /// The endpoint actually bound, which for a wildcard port is the only
@@ -1227,32 +1769,21 @@ impl Bound {
     }
 }
 
+impl Listen for Bound {
+    fn accept(&mut self) -> Pin<Box<dyn Future<Output = Result<Raw>> + Send + '_>> {
+        Box::pin(self.accept_one())
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(self, Bound::Inproc(_))
+    }
+}
+
 /// Binds one endpoint.
 async fn bind(engine: &Engine, endpoint: &Endpoint) -> Result<Bound> {
     match endpoint {
         Endpoint::Tcp { host, port } => {
-            let addr = match host {
-                // A wildcard listens on every IPv4 interface, which is what
-                // `tcp://*:port` means to NNG. An IPv6 wildcard is written
-                // `tcp://[::]:port`.
-                TcpHost::Any => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), *port),
-                TcpHost::Ip(ip) => SocketAddr::new(*ip, *port),
-                TcpHost::Name(name) => {
-                    // A listener's host is an interface, and resolving one
-                    // is the resolver's job only for a literal; anything
-                    // else would bind an address this machine may not have.
-                    let ip: IpAddr = name.parse().map_err(|_| {
-                        Error::EADDRINVAL(
-                            format!(
-                                "cannot listen on {name:?}: a listening address must be an IP \
-                                 literal or *"
-                            )
-                            .into(),
-                        )
-                    })?;
-                    SocketAddr::new(ip, *port)
-                }
-            };
+            let addr = listen_addr(host, *port)?;
             TcpListener::bind(addr)
                 .await
                 .map(Bound::Tcp)
@@ -1266,29 +1797,12 @@ async fn bind(engine: &Engine, endpoint: &Endpoint) -> Result<Bound> {
             };
             // Refused here rather than at the first connection: a listener
             // that cannot present a certificate would accept connections
-            // and then fail every one of them.
-            config.validate(true)?;
-            let addr = match host {
-                TcpHost::Any => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), *port),
-                TcpHost::Ip(ip) => SocketAddr::new(*ip, *port),
-                TcpHost::Name(name) => {
-                    let ip: IpAddr = name.parse().map_err(|_| {
-                        Error::EADDRINVAL(
-                            format!(
-                                "cannot listen on {name:?}: a listening address must be an IP \
-                                 literal or *"
-                            )
-                            .into(),
-                        )
-                    })?;
-                    SocketAddr::new(ip, *port)
-                }
-            };
+            // and then fail every one of them. Built here too, once, for
+            // the same reason and so that no connection pays for it.
+            let acceptor = tls::Acceptor::new(config)?;
+            let addr = listen_addr(host, *port)?;
             let listener = TcpListener::bind(addr).await.map_err(Error::from)?;
-            Ok(Bound::Tls {
-                listener,
-                config: Box::new(config.clone()),
-            })
+            Ok(Bound::Tls { listener, acceptor })
         }
         Endpoint::Inproc(name) => engine.inner.inproc.bind(name).map(Bound::Inproc),
         #[cfg(unix)]
@@ -1296,6 +1810,32 @@ async fn bind(engine: &Engine, endpoint: &Endpoint) -> Result<Bound> {
         #[cfg(not(unix))]
         Endpoint::Ipc(_) => Err(unsupported(endpoint)),
     }
+}
+
+/// The socket address a listener binds for `host:port`.
+fn listen_addr(host: &TcpHost, port: u16) -> Result<SocketAddr> {
+    Ok(match host {
+        // A wildcard listens on every IPv4 interface, which is what
+        // `tcp://*:port` means to NNG. An IPv6 wildcard is written
+        // `tcp://[::]:port`.
+        TcpHost::Any => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        TcpHost::Ip(ip) => SocketAddr::new(*ip, port),
+        TcpHost::Name(name) => {
+            // A listener's host is an interface, and resolving one is the
+            // resolver's job only for a literal; anything else would bind
+            // an address this machine may not have.
+            let ip: IpAddr = name.parse().map_err(|_| {
+                Error::EADDRINVAL(
+                    format!(
+                        "cannot listen on {name:?}: a listening address must be an IP literal \
+                         or *"
+                    )
+                    .into(),
+                )
+            })?;
+            SocketAddr::new(ip, port)
+        }
+    })
 }
 
 async fn addresses(
@@ -1712,5 +2252,247 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// A connection's facts when there is nothing to say about it.
+    fn no_facts() -> Facts {
+        Facts {
+            local_addr: None,
+            remote_addr: None,
+            credentials: None,
+            tls: None,
+            source: None,
+        }
+    }
+
+    /// Claim: a pipe id that is in use is never handed out again, however
+    /// far the counter has run. The id is 31 bits wide, so after enough
+    /// connections the counter revisits the ids of pipes that are still
+    /// open; an id taken twice would make the table forget a live pipe
+    /// while its session kept running.
+    #[tokio::test]
+    async fn a_pipe_id_that_is_in_use_is_never_handed_out_again() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let seen = counter();
+        let engine = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+        let endpoint = Endpoint::parse("inproc://ids").unwrap();
+
+        let (first, _first_pipe) = engine
+            .reserve(Role::Listen, &endpoint, None, None, no_facts(), 0)
+            .expect("the first pipe");
+        // The counter is about to wrap past 2^31 and come round to the id
+        // of the pipe that is still open.
+        engine.lock().next_pipe = PipeId::MAX;
+        let mut held = Vec::new();
+        let mut ids = vec![first];
+        for _ in 0..4 {
+            let (id, pipe) = engine
+                .reserve(Role::Listen, &endpoint, None, None, no_facts(), 0)
+                .expect("a free id");
+            ids.push(id);
+            held.push(pipe);
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "an id was handed out twice: {ids:?}");
+        assert_eq!(
+            engine.lock().pipes.len(),
+            5,
+            "a live pipe was replaced in the table"
+        );
+    }
+
+    /// A listener whose accept fails with `error` `failures` times, then
+    /// waits for ever, counting every call.
+    struct Failing {
+        calls: Arc<AtomicUsize>,
+        error: fn() -> Error,
+        failures: usize,
+    }
+
+    impl Listen for Failing {
+        fn accept(&mut self) -> Pin<Box<dyn Future<Output = Result<Raw>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.failures == 0 {
+                return Box::pin(std::future::pending());
+            }
+            self.failures -= 1;
+            let error = (self.error)();
+            Box::pin(async move { Err(error) })
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+    }
+
+    /// Runs an accept loop over a [`Failing`] listener for `window` and
+    /// reports how many times it called `accept`.
+    async fn accept_calls(error: fn() -> Error, failures: usize, window: Duration) -> usize {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let seen = counter();
+        let engine = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = ctx.exec().spawn(accept_loop(
+            TaskCtx {
+                engine,
+                endpoint_options: EndpointOptions::default(),
+            },
+            Failing {
+                calls: Arc::clone(&calls),
+                error,
+                failures,
+            },
+            ListenerId(1),
+            Endpoint::parse("tcp://127.0.0.1:1").unwrap(),
+        ));
+        tokio::time::sleep(window).await;
+        task.abort();
+        calls.load(Ordering::SeqCst)
+    }
+
+    /// Claim: a listener whose accept keeps failing for a reason that does
+    /// not clear — a process out of file descriptors leaves the pending
+    /// connection queued, so an immediate retry fails the same way — rests
+    /// between tries instead of spinning on a core.
+    #[tokio::test]
+    async fn a_listener_that_cannot_accept_rests_between_tries() {
+        let calls = accept_calls(
+            || Error::ESYSERR("too many open files".into()),
+            usize::MAX,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            calls <= 20,
+            "{calls} accepts in 300 ms: the loop is not resting"
+        );
+        assert!(calls >= 2, "the loop retries after resting: {calls}");
+    }
+
+    /// Claim: an error about one connection — aborted or reset between the
+    /// kernel's accept and ours — is not a reason to rest: the next
+    /// connection is already waiting.
+    #[tokio::test]
+    async fn an_error_about_one_connection_does_not_slow_the_next() {
+        let calls = accept_calls(
+            || Error::ECONNABORTED("aborted".into()),
+            50,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(calls, 51, "fifty failures and then the call that waits");
+    }
+
+    /// Claim: one peer address cannot hold more pipes than its ceiling,
+    /// handshaking connections included, and another address is not
+    /// affected by it. Without the ceiling one host opens `max_pipes`
+    /// connections, completes the 8-octet handshake on each and holds them,
+    /// and every later peer is refused until it stops.
+    #[tokio::test]
+    async fn one_peer_address_cannot_hold_more_pipes_than_its_ceiling() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let seen = counter();
+        let server = engine(
+            &ctx,
+            EndpointType::Rep,
+            SocketOptions {
+                max_pipes_per_peer: 2,
+                handshake_timeout: Duration::from_secs(5),
+                ..SocketOptions::default()
+            },
+            &seen,
+        );
+        let listener = server
+            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+            .await
+            .expect("listen");
+        let addr = listener
+            .url()
+            .to_string()
+            .trim_start_matches("tcp://")
+            .to_owned();
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(
+                tokio::net::TcpStream::connect(&addr)
+                    .await
+                    .expect("connect"),
+            );
+        }
+        for _ in 0..200 {
+            if server.lock().pipes.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            server.lock().pipes.len(),
+            2,
+            "two silent peers hold two slots"
+        );
+
+        let mut third = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("connect");
+        let mut buffer = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buffer))
+            .await
+            .expect("the third connection from this host is closed rather than held")
+            .expect("read");
+        assert_eq!(read, 0, "nothing is sent to a refused connection");
+        assert_eq!(server.lock().pipes.len(), 2);
+
+        // The whole of 127.0.0.0/8 is this host on Linux, which makes a
+        // second source address available without any setup.
+        #[cfg(target_os = "linux")]
+        {
+            let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+            socket
+                .bind("127.0.0.2:0".parse().unwrap())
+                .expect("a second source address");
+            let _other = tokio::time::timeout(
+                Duration::from_secs(2),
+                socket.connect(addr.parse().unwrap()),
+            )
+            .await
+            .expect("connect")
+            .expect("connected");
+            for _ in 0..200 {
+                if server.lock().pipes.len() == 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                server.lock().pipes.len(),
+                3,
+                "another address is not held to the first one's ceiling"
+            );
+        }
+    }
+
+    /// Claim: a wait for the pipe set to change sees a change that happens
+    /// before the wait is first polled, because it exists from the moment
+    /// it is created. A caller that creates it before looking at the pipes
+    /// cannot miss the pipe that arrives in between, which is what an
+    /// `async fn` — created at first poll — could.
+    #[tokio::test]
+    async fn a_wait_made_before_the_pipe_set_changes_ends_with_the_change() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let seen = counter();
+        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+        let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
+        let listener = server
+            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+            .await
+            .expect("listen");
+
+        let wait = client.changed();
+        client.dial(listener.url()).await.expect("dial");
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .expect("the wait saw the pipe arrive although it was first polled afterwards");
     }
 }

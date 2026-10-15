@@ -28,6 +28,13 @@ weida-sp.workspace = true
 # Connection lifecycle logging: a reconnect loop that says nothing is a
 # reconnect loop nobody can debug.
 tracing.workspace = true
+# The one shared body: a message is a header and a `Bytes`, so a broadcast
+# hands every subscriber the same allocation and splitting a tag stack off a
+# received body is a pointer move rather than a copy.
+bytes.workspace = true
+# `SO_KEEPALIVE` with an idle time and an interval on every TCP connection,
+# so a peer that vanished without a FIN does not hold a pipe slot for ever.
+socket2.workspace = true
 # The `tls+tcp` transport, and the only cryptographic dependency this crate
 # has. `rustls` through `tokio-rustls` is a pure-Rust TLS implementation, so
 # `unsafe_code = "forbid"` below survives it and no OpenSSL is linked;

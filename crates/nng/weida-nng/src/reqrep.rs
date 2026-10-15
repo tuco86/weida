@@ -27,19 +27,21 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use weida_sp::{Backtrace, EndpointType, backtrace};
+use weida_sp::{EndpointType, backtrace};
 
 use crate::context::Context;
+use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::options::SocketOptions;
 use crate::pipe::PipeId;
-use crate::replier::{CtxId, Replier, ReplierCtx, framed};
+use crate::replier::{CtxId, Replier, ReplierCtx, direct_stack};
 use crate::socket::{SocketCore, socket_endpoints, within};
 
 /// How often the socket's resend clock looks at its contexts.
@@ -78,7 +80,7 @@ fn next_request_id() -> u32 {
 #[derive(Clone, Debug)]
 struct Outstanding {
     id: u32,
-    payload: Vec<u8>,
+    payload: Bytes,
     /// The pipe it went to last, so that the pipe's disappearance is a
     /// resend trigger (§4).
     pipe: Option<PipeId>,
@@ -103,7 +105,7 @@ struct ReqShared {
     /// Woken when a reply lands in somebody's slot.
     delivered: Notify,
     /// Woken when a deadline is armed, so the clock re-reads them.
-    rearmed: Notify,
+    rearmed: Arc<Notify>,
     resend: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -164,10 +166,16 @@ impl ReqSocket {
             contexts: Mutex::new(HashMap::new()),
             next_ctx: AtomicU64::new(1),
             delivered: Notify::new(),
-            rearmed: Notify::new(),
+            rearmed: Arc::new(Notify::new()),
             resend: Mutex::new(None),
         });
-        let task = core.exec().spawn(resend_loop(Arc::clone(&shared)));
+        // The clock holds the socket's state weakly: a clock that owned it
+        // would keep a socket nobody can reach alive for as long as it ran.
+        let task = core.exec().spawn(resend_loop(
+            Arc::downgrade(&shared),
+            core.engine().clone(),
+            Arc::clone(&shared.rearmed),
+        ));
         *shared.resend.lock().expect("resend poisoned") = Some(task);
         let implicit = ReqCtx::open(&shared);
         Ok(ReqSocket {
@@ -262,12 +270,12 @@ impl ReqCtx {
     /// causes a late old reply to be discarded. It does not withdraw the
     /// earlier request from a replier" (§4).
     pub async fn send(&self, body: impl Into<Vec<u8>>) -> Result<()> {
-        let payload = body.into();
+        let payload = Bytes::from(body.into());
         let id = next_request_id();
         let pipe = self
             .shared()
             .core
-            .send_round_robin(framed(&Backtrace::direct(id), &payload))
+            .send_round_robin(request(id, payload.clone()))
             .await?;
         {
             let mut contexts = self.shared().lock();
@@ -315,9 +323,10 @@ impl ReqCtx {
     }
 
     async fn wait_for_reply(&self) -> Result<Message> {
+        let shared = self.shared();
         loop {
             {
-                let mut contexts = self.shared().lock();
+                let mut contexts = shared.lock();
                 let state = contexts.entry(self.id()).or_default();
                 if let Some(reply) = state.reply.take() {
                     state.outstanding = None;
@@ -328,20 +337,24 @@ impl ReqCtx {
             // context is inside a receive drains the pipes and files each
             // reply under the request ID it carries.
             //
-            // `notified()` registers the waiter when it is **polled**, so
-            // registering is `enable()` and not construction: a sibling
-            // filing our reply between the drain below and the park would
-            // otherwise wake nobody, and this wait would run to the resend
-            // or the receive timeout with the reply already in our slot.
-            let mut delivered = std::pin::pin!(self.shared().delivered.notified());
-            delivered.as_mut().enable();
-            if let Some((_, message)) = self.shared().core.try_take_any() {
-                route(self.shared(), message);
+            // Both waits are created before the look. A `Notified` sees
+            // every wake-up since it was created, so a sibling filing our
+            // reply, or a reply landing on a pipe, between the drain below
+            // and the park ends the wait instead of being missed by it —
+            // with the reply already in our slot this wait would otherwise
+            // run to the resend or the receive timeout.
+            let delivered = shared.delivered.notified();
+            let arrived = shared.core.message_signal();
+            // And the socket is checked on every turn: a close wakes both
+            // waits, and what a receive must find then is `NNG_ECLOSED`.
+            shared.core.ensure_open()?;
+            if let Some((pipe, message)) = shared.core.try_take_any() {
+                route(shared, pipe, message);
                 continue;
             }
             tokio::select! {
                 () = delivered => {}
-                () = self.shared().core.wait_for_message() => {}
+                () = arrived => {}
             }
         }
     }
@@ -365,22 +378,31 @@ impl Drop for Receiving<'_> {
 /// Files an arrived reply under the context whose request ID it carries,
 /// and discards it when no context is waiting for that ID — which is what a
 /// cancelled request's late reply is (§4).
-fn route(shared: &Arc<ReqShared>, message: Message) {
+fn route(shared: &Arc<ReqShared>, pipe: PipeId, mut message: Message) {
     let max_hops = shared.core.options().max_ttl;
-    let Ok((stack, payload)) = backtrace::decode(message.body(), max_hops) else {
+    let Ok(shape) = backtrace::measure(message.body(), max_hops) else {
         // "If the reply is shorter than 32 bits, it is malformed and the
         // endpoint MUST ignore it" [rfc-reqrep §5].
         return;
     };
-    let reply = framed(&stack, payload);
+    // A reply whose payload is over the limit of the endpoint it arrived
+    // on is dropped, as an oversize request is at a replier.
+    if !shared.core.payload_fits(pipe, message.len() - shape.len) {
+        return;
+    }
     let mut contexts = shared.lock();
     for state in contexts.values_mut() {
         if state
             .outstanding
             .as_ref()
-            .is_some_and(|outstanding| outstanding.id == stack.id)
+            .is_some_and(|outstanding| outstanding.id == shape.id)
         {
-            state.reply = Some(reply);
+            // The stack is split off only now that somebody is waiting for
+            // the reply: one nobody is waiting for is dropped untouched.
+            if message.split_header_off_body(shape.len).is_err() {
+                return;
+            }
+            state.reply = Some(message);
             drop(contexts);
             shared.delivered.notify_waiters();
             return;
@@ -395,19 +417,28 @@ fn route(shared: &Arc<ReqShared>, message: Message) {
 /// context arming a deadline or by the pipe set changing. A resend time
 /// shorter than the granularity is therefore honoured rather than rounded
 /// up to it.
-async fn resend_loop(shared: Arc<ReqShared>) {
+async fn resend_loop(shared: Weak<ReqShared>, engine: Engine, rearmed: Arc<Notify>) {
     loop {
-        let rearmed = shared.rearmed.notified();
-        let changed = shared.core.engine().changed();
-        let tick = shared.core.exec().sleep(next_wake(&shared));
+        // Created before the clock reads its deadlines, so a deadline armed
+        // or a pipe that arrives while it reads ends the wait.
+        let rearm = rearmed.notified();
+        let changed = engine.changed();
+        let wake = match shared.upgrade() {
+            Some(shared) => next_wake(&shared),
+            None => return,
+        };
+        let tick = engine.exec().sleep(wake);
         tokio::select! {
-            () = rearmed => {}
+            () = rearm => {}
             () = changed => {}
             () = tick => {}
         }
-        if shared.core.engine().is_closed() {
+        if engine.is_closed() {
             return;
         }
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
         resend_due(&shared);
     }
 }
@@ -427,10 +458,16 @@ fn next_wake(shared: &Arc<ReqShared>) -> Duration {
         .min(RESEND_GRANULARITY)
 }
 
+/// A request on the wire: its id with the terminal bit set, then the
+/// payload, which is shared with the context that may have to send it again.
+fn request(id: u32, payload: Bytes) -> Message {
+    Message::from_parts(direct_stack(id), payload)
+}
+
 fn resend_due(shared: &Arc<ReqShared>) {
     let now = Instant::now();
-    let live: Vec<PipeId> = shared.core.pipes().iter().map(|pipe| pipe.id()).collect();
-    let due: Vec<(CtxId, u32, Vec<u8>)> = {
+    let pipes = shared.core.pipes();
+    let due: Vec<(CtxId, u32, Bytes)> = {
         let contexts = shared.lock();
         contexts
             .iter()
@@ -440,8 +477,10 @@ fn resend_due(shared: &Arc<ReqShared>) {
                 // Three: it has no peer at all and one is available now
                 // (§4).
                 let timer = outstanding.deadline <= now;
-                let peer_gone = outstanding.pipe.is_none_or(|pipe| !live.contains(&pipe));
-                (timer || (peer_gone && !live.is_empty()))
+                let peer_gone = outstanding
+                    .pipe
+                    .is_none_or(|pipe| pipes.get(pipe).is_none());
+                (timer || (peer_gone && !pipes.is_empty()))
                     .then(|| (*id, outstanding.id, outstanding.payload.clone()))
             })
             .collect()
@@ -449,9 +488,7 @@ fn resend_due(shared: &Arc<ReqShared>) {
     for (ctx, id, payload) in due {
         // Round-robin again, so a resend after a disconnect reaches a
         // different replier — which is what makes the third trigger useful.
-        let sent = shared
-            .core
-            .offer_round_robin(framed(&Backtrace::direct(id), &payload));
+        let sent = shared.core.offer_round_robin(request(id, payload));
         let mut contexts = shared.lock();
         let Some(state) = contexts.get_mut(&ctx) else {
             continue;
@@ -530,6 +567,18 @@ impl RepSocket {
         self.implicit.clone()
     }
 
+    /// Requests dropped with their pipe kept: a tag stack deeper than this
+    /// socket's `NNG_OPT_MAXTTL`, or a payload over `NNG_OPT_RECVMAXSZ`
+    /// once the stack is taken off.
+    ///
+    /// Both are messages to drop and not connections to end — devices
+    /// legitimately forward deep stacks, and the pipe a device shares among
+    /// all its clients is not one client's to close — and the sender is told
+    /// nothing, so this count is the only trace.
+    pub fn dropped(&self) -> u64 {
+        self.shared.dropped()
+    }
+
     /// Receives a request on this socket's own context.
     pub async fn recv(&self) -> Result<Message> {
         self.implicit.recv().await
@@ -548,6 +597,7 @@ mod tests {
     use super::*;
 
     use crate::context::ContextConfig;
+    use weida_sp::Backtrace;
 
     /// A reply as it comes off a pipe: the tag stack is in the body, where
     /// [`route`] looks for it, and not yet split into a header.
@@ -568,7 +618,7 @@ mod tests {
         let state = contexts.entry(ctx.id()).or_default();
         state.outstanding = Some(Outstanding {
             id,
-            payload: Vec::new(),
+            payload: Bytes::new(),
             pipe: None,
             deadline: Instant::now() + Duration::from_secs(60),
         });
@@ -603,9 +653,55 @@ mod tests {
             "nobody has replied yet"
         );
 
-        route(&socket.shared, arrived(7, b"mine"));
+        route(&socket.shared, PipeId::new(1), arrived(7, b"mine"));
 
         let reply = waiting.await.expect("the reply the sibling filed");
         assert_eq!(reply.body(), b"mine");
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    use crate::context::ContextConfig;
+
+    /// Claim: a reply sent just before its socket goes out of scope still
+    /// reaches the requester. `send` returns once the reply is queued, and a
+    /// close that discarded the queue would lose it in the moment before
+    /// the connection's writer takes it; closing on the last drop must let
+    /// what is queued be written first.
+    #[tokio::test]
+    async fn a_reply_sent_just_before_the_replier_is_dropped_is_delivered() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let options = SocketOptions {
+            recv_timeout: Some(Duration::from_secs(5)),
+            send_timeout: Some(Duration::from_secs(5)),
+            ..SocketOptions::default()
+        };
+        for round in 0..30 {
+            let rep = RepSocket::with_options(&ctx, options.clone()).expect("rep");
+            let url = rep
+                .listen("tcp://127.0.0.1:0")
+                .await
+                .expect("listen")
+                .url()
+                .to_string();
+            let serving = tokio::spawn(async move {
+                let request = rep.recv().await.expect("a request");
+                rep.send(request.body().to_vec()).await.expect("the reply");
+                // `rep` goes out of scope here, with the reply queued.
+            });
+            let req = ReqSocket::with_options(&ctx, options.clone()).expect("req");
+            req.dial(&url).await.expect("dial");
+            let body = format!("round {round}").into_bytes();
+            req.send(body.clone()).await.expect("send");
+            let reply = req
+                .recv()
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: the reply was lost: {error}"));
+            assert_eq!(reply.body(), &body[..]);
+            serving.await.expect("task");
+        }
     }
 }

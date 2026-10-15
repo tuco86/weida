@@ -1,9 +1,12 @@
 //! What a socket is configured with, honoured or refused where it is set.
 //!
-//! Every field is an NNG option under NNG's own name, except the three this
+//! Every field is an NNG option under NNG's own name, except the ones this
 //! library adds because SP bounds nothing and something must
 //! (`docs/INVARIANTS.md`): [`SocketOptions::max_pipes`],
-//! [`SocketOptions::handshake_timeout`] and
+//! [`SocketOptions::max_pipes_per_peer`],
+//! [`SocketOptions::max_tls_handshakes`],
+//! [`SocketOptions::handshake_timeout`],
+//! [`SocketOptions::message_timeout`], [`SocketOptions::idle_timeout`] and
 //! [`SocketOptions::max_addresses`]. Each of those says in its own
 //! documentation that it is ours and why NNG has nothing to compare it to.
 //!
@@ -68,6 +71,36 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// number; this one is ours and is settable.
 pub const DEFAULT_MAX_ADDRESSES: usize = 8;
 
+/// Pipes one remote host — or one local user, on `ipc` — may hold on one
+/// listener's socket at once, by default.
+///
+/// **NNG has no such option**, and without it one host can open
+/// [`DEFAULT_MAX_PIPES`] connections, send the 8-octet handshake on each and
+/// hold them: a handshaken pipe is never timed again unless
+/// [`SocketOptions::idle_timeout`] is set, so every later peer would be
+/// refused at the ceiling for as long as that host cares to keep them. A
+/// quarter of the ceiling leaves most of the socket to everybody else and
+/// is far above what one honest host opens; a pool of hundreds of workers
+/// behind one address, or a proxy in front of many clients, raises it.
+///
+/// Counted by IPv4 address or IPv6 `/64` — an IPv6 host is given a whole
+/// `/64`, so a count per address would be a count per attacker-chosen
+/// suffix. A connection still handshaking counts, and `inproc` peers, which
+/// are this process's own, do not. It bounds what a listener **accepts**: a
+/// dialled pipe goes where the application sent it.
+pub const DEFAULT_MAX_PIPES_PER_PEER: usize = 256;
+
+/// TLS handshakes one listener runs at the same time, by default.
+///
+/// **NNG has no such option.** A handshake costs the listener asymmetric
+/// cryptography and a few tens of kilobytes before the peer has proved
+/// anything, [`SocketOptions::handshake_timeout`] bounds how long one may
+/// last, and this bounds how many may: a flood of `ClientHello`s is
+/// answered with at most this much work in flight. At the ceiling an
+/// accepted connection is closed at once, unhandshaken, and a dialler
+/// retries after its reconnect delay.
+pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
+
 /// Default `NNG_OPT_REQ_RESENDTIME`: NNG's own one minute.
 pub const DEFAULT_RESEND_TIME: Duration = Duration::from_secs(60);
 
@@ -93,6 +126,17 @@ pub struct SocketOptions {
     /// `NNG_OPT_RECVMAXSZ`: the largest message this socket accepts from a
     /// peer, judged from the declared length before anything is allocated.
     /// [`crate::RECV_MAX_SIZE_UNLIMITED`] is NNG's "no limit".
+    ///
+    /// **For REQ, REP, SURVEYOR and RESPONDENT the tag stack is not
+    /// counted.** The limit bounds the payload the application receives; the
+    /// stack in front of it — four octets per tag, at most `NNG_OPT_MAXTTL`
+    /// plus one tags — is the protocol's own, and rides on top. NNG counts
+    /// it, and a device that pushes one tag per request it forwards then
+    /// hands the backend a message four octets longer than the one it
+    /// admitted, so a request at the limit would close the pipe the device
+    /// shares among all its clients. Here a message whose payload is over
+    /// the limit is dropped and its pipe kept, and the transport closes a
+    /// pipe at `4 × (max_ttl + 1)` octets above the limit.
     pub recv_max_size: u64,
     /// `NNG_OPT_SENDBUF`: outgoing queue depth per pipe, in messages,
     /// `0..=`[`crate::MAX_QUEUE_DEPTH`]. Zero is a rendezvous, not "no
@@ -101,11 +145,18 @@ pub struct SocketOptions {
     /// `None` is the protocol's own default
     /// ([`PipeConfig::default_send_depth`](crate::PipeConfig::default_send_depth)):
     /// zero for the protocols that wait at a full queue, which is PUSH's
-    /// documented value (§5), and a real depth for the ones that discard,
-    /// because discarding at depth zero would discard nearly everything.
+    /// documented value (§5), and a real depth for the ones that discard —
+    /// BUS, PUB, SURVEYOR, and REP and RESPONDENT, whose reply must not wait
+    /// for the one peer it is addressed to — because discarding at depth
+    /// zero would discard nearly everything.
+    ///
+    /// Refused on a protocol with no send operation (PULL, SUB).
     pub send_depth: Option<usize>,
     /// `NNG_OPT_RECVBUF`: incoming queue depth per pipe, in messages.
     /// `None` is [`crate::DEFAULT_RECV_DEPTH`].
+    ///
+    /// Refused on a protocol with no receive operation (PUSH, PUB), whose
+    /// pipes discard what a peer writes to them and have no queue to size.
     pub recv_depth: Option<usize>,
     /// `NNG_OPT_SENDTIMEO`: how long a send waits before `NNG_ETIMEDOUT`.
     /// `None` is NNG's `NNG_DURATION_INFINITE`, which is its default.
@@ -128,6 +179,37 @@ pub struct SocketOptions {
     /// Addresses one hostname may resolve to. Also ours
     /// ([`DEFAULT_MAX_ADDRESSES`]).
     pub max_addresses: usize,
+    /// Pipes one remote host (or one local user, on `ipc`) may hold on one
+    /// listener's socket at once. Ours: see [`DEFAULT_MAX_PIPES_PER_PEER`].
+    pub max_pipes_per_peer: usize,
+    /// TLS handshakes one listener runs at once. Ours: see
+    /// [`DEFAULT_MAX_TLS_HANDSHAKES`].
+    pub max_tls_handshakes: usize,
+    /// How long one message may take to cross a connection once its first
+    /// octet has moved, in each direction. Ours.
+    ///
+    /// An incoming message that is not whole this long after its first octet
+    /// arrived closes the pipe, and so does an outgoing one the peer has not
+    /// taken — written and flushed to the kernel — this long after the write
+    /// began. It is the failure of a peer that declares a message and
+    /// trickles it, holding a pipe slot and every octet it sent, or that
+    /// stops reading and parks the writer: a pipe whose connection is merely
+    /// quiet is not touched.
+    ///
+    /// `None` waits for ever, which is NNG's behaviour and the default,
+    /// because the right number depends on `recv_max_size` and on the link:
+    /// a default that suited a megabyte would cut a gigabyte off in the
+    /// middle.
+    pub message_timeout: Option<Duration>,
+    /// How long a pipe may go with no octet moving in either direction
+    /// before it is closed. Ours.
+    ///
+    /// `None` is the default: SP has no heartbeat, and a pipe between a
+    /// PUB and a SUB that publish rarely is idle without being dead, so
+    /// closing idle pipes is a decision for a deployment that heartbeats.
+    /// Dead peers, which have no octets to move, are found by TCP keepalive
+    /// instead ([`crate::transport::TCP_KEEPALIVE_IDLE`]).
+    pub idle_timeout: Option<Duration>,
     /// `NNG_OPT_SUB_PREFNEW`: what a SUB socket does when its queue of
     /// admitted publications is full.
     ///
@@ -208,6 +290,10 @@ impl Default for SocketOptions {
             survey_time: DEFAULT_SURVEY_TIME,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_addresses: DEFAULT_MAX_ADDRESSES,
+            max_pipes_per_peer: DEFAULT_MAX_PIPES_PER_PEER,
+            max_tls_handshakes: DEFAULT_MAX_TLS_HANDSHAKES,
+            message_timeout: None,
+            idle_timeout: None,
             tls: None,
             sub_prefer_new: true,
             resend_time: DEFAULT_RESEND_TIME,
@@ -250,6 +336,34 @@ impl SocketOptions {
                     .into(),
             ));
         }
+        if self.max_pipes_per_peer == 0 {
+            return Err(crate::Error::EINVAL(
+                "SocketOptions::max_pipes_per_peer must be at least 1; a socket that admits no \
+                 peer cannot communicate"
+                    .into(),
+            ));
+        }
+        if self.max_tls_handshakes == 0 {
+            return Err(crate::Error::EINVAL(
+                "SocketOptions::max_tls_handshakes must be at least 1; a listener that runs no \
+                 handshake accepts no TLS connection"
+                    .into(),
+            ));
+        }
+        for (name, timeout) in [
+            ("message_timeout", self.message_timeout),
+            ("idle_timeout", self.idle_timeout),
+        ] {
+            if timeout.is_some_and(|limit| limit.is_zero()) {
+                return Err(crate::Error::EINVAL(
+                    format!(
+                        "SocketOptions::{name} must be nonzero; zero would close every pipe \
+                         before a message could cross it"
+                    )
+                    .into(),
+                ));
+            }
+        }
         if !self.reconnect_max.is_zero() && self.reconnect_max < self.reconnect_min {
             return Err(crate::Error::EINVAL(
                 format!(
@@ -288,9 +402,11 @@ impl SocketOptions {
         let row = protocol(endpoint);
         if self.send_depth.is_some() {
             row.require_buffers("NNG_OPT_SENDBUF")?;
+            row.require_direction("NNG_OPT_SENDBUF", row.can_send, "send")?;
         }
         if self.recv_depth.is_some() {
             row.require_buffers("NNG_OPT_RECVBUF")?;
+            row.require_direction("NNG_OPT_RECVBUF", row.can_recv, "receive")?;
         }
         Ok(())
     }
@@ -302,7 +418,11 @@ impl SocketOptions {
         if let Some(depth) = self.send_depth {
             config.outgoing.depth = depth;
         }
-        if let Some(depth) = self.recv_depth {
+        // A protocol with no receive operation has no incoming queue to
+        // size: it discards what arrives, whatever depth was asked for.
+        if let Some(depth) = self.recv_depth
+            && PipeConfig::receives(endpoint)
+        {
             config.incoming.depth = depth;
         }
         config
@@ -464,5 +584,79 @@ mod tests {
             defaults.pipe_config(EndpointType::Pub).outgoing.depth,
             crate::pipe::DEFAULT_BROADCAST_SEND_DEPTH
         );
+    }
+
+    /// Claim: the connection bounds this library adds are refused at zero,
+    /// where they are set, and "no limit" is spelled `None` and not zero: a
+    /// zero would close every pipe before a message could cross it.
+    #[test]
+    fn the_connection_bounds_are_refused_at_zero() {
+        let cases: [(SocketOptions, &str); 4] = [
+            (
+                SocketOptions {
+                    max_pipes_per_peer: 0,
+                    ..SocketOptions::default()
+                },
+                "max_pipes_per_peer",
+            ),
+            (
+                SocketOptions {
+                    max_tls_handshakes: 0,
+                    ..SocketOptions::default()
+                },
+                "max_tls_handshakes",
+            ),
+            (
+                SocketOptions {
+                    message_timeout: Some(Duration::ZERO),
+                    ..SocketOptions::default()
+                },
+                "message_timeout",
+            ),
+            (
+                SocketOptions {
+                    idle_timeout: Some(Duration::ZERO),
+                    ..SocketOptions::default()
+                },
+                "idle_timeout",
+            ),
+        ];
+        for (options, named) in cases {
+            let err = options.validate().unwrap_err();
+            assert!(matches!(err, crate::Error::EINVAL(_)), "{err:?}");
+            assert!(err.cause().contains(named), "{err} does not name {named}");
+        }
+        let defaults = SocketOptions::default();
+        assert!(defaults.validate().is_ok());
+        assert_eq!(defaults.message_timeout, None);
+        assert_eq!(defaults.idle_timeout, None);
+    }
+
+    /// Claim: a queue depth for a direction the protocol has no operation
+    /// in is refused by name, and the direction it does have is not. A
+    /// receive depth on a PUSH would size a queue that discards everything,
+    /// and a send depth on a PULL one nothing writes to.
+    #[test]
+    fn a_depth_for_a_direction_the_protocol_lacks_is_refused() {
+        let receive = SocketOptions {
+            recv_depth: Some(4),
+            ..SocketOptions::default()
+        };
+        let send = SocketOptions {
+            send_depth: Some(4),
+            ..SocketOptions::default()
+        };
+        for protocol in [EndpointType::Push, EndpointType::Pub] {
+            let err = receive.validate_for(protocol).unwrap_err();
+            assert!(matches!(err, crate::Error::ENOTSUP(_)), "{err:?}");
+            assert!(err.cause().contains("NNG_OPT_RECVBUF"), "{err}");
+            assert!(send.validate_for(protocol).is_ok(), "{protocol:?}");
+        }
+        for protocol in [EndpointType::Pull, EndpointType::Sub] {
+            let err = send.validate_for(protocol).unwrap_err();
+            assert!(matches!(err, crate::Error::ENOTSUP(_)), "{err:?}");
+            assert!(err.cause().contains("NNG_OPT_SENDBUF"), "{err}");
+            assert!(receive.validate_for(protocol).is_ok(), "{protocol:?}");
+        }
     }
 }

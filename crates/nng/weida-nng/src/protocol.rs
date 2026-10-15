@@ -115,6 +115,27 @@ impl Protocol {
             .into(),
         ))
     }
+
+    /// Refuses a queue depth for a direction this protocol has no
+    /// operation in, naming the option and the protocol.
+    ///
+    /// A PUSH has no receive operation, so `NNG_OPT_RECVBUF` on it would
+    /// size a queue that discards everything it is given; a PULL has no
+    /// send, so `NNG_OPT_SENDBUF` on it would size a queue nothing writes
+    /// to. Refused rather than accepted and ignored, which is the rule
+    /// every option here follows.
+    pub fn require_direction(&self, option: &str, has: bool, direction: &str) -> Result<()> {
+        if has {
+            return Ok(());
+        }
+        Err(Error::ENOTSUP(
+            format!(
+                "{} has no {direction} operation, so {option} has nothing to bound",
+                self.name
+            )
+            .into(),
+        ))
+    }
 }
 
 /// Every SP protocol, once, in the order `weida_sp::EndpointType` lists
@@ -355,6 +376,23 @@ mod tests {
         assert_eq!(
             protocol(EndpointType::Sub).full_when_receiving(),
             FullAction::Block
+        );
+    }
+
+    /// Claim: a queue depth for a direction the protocol has no operation
+    /// in is refused by name, and the direction it does have is not.
+    #[test]
+    fn a_depth_for_a_direction_the_protocol_lacks_is_refused() {
+        let push = protocol(EndpointType::Push);
+        let err = push
+            .require_direction("NNG_OPT_RECVBUF", push.can_recv, "receive")
+            .unwrap_err();
+        assert!(matches!(err, Error::ENOTSUP(_)), "{err:?}");
+        assert!(err.cause().contains("NNG_OPT_RECVBUF"));
+        assert!(err.cause().contains("push0"));
+        assert!(
+            push.require_direction("NNG_OPT_SENDBUF", push.can_send, "send")
+                .is_ok()
         );
     }
 }

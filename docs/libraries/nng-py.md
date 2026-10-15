@@ -84,7 +84,7 @@ listen on each scheme (§11).
 | `tcp://` | `tcp://` | present — `test_a_request_reaches_a_replier_and_the_reply_comes_back[tcp]`, and every interop test of §8 |
 | `ipc://` | `ipc://` | present on Unix — `[ipc]` of the same parametrized test |
 | `inproc://` | `inproc://` | present, and **context-scoped** rather than process-global, which is the `Context` object of §2 — `[inproc]` |
-| `tls+tcp://`, configured by `pynng.TLSConfig(mode, ...)` and `sock.tls_config` | — | **refused**, and this is the first of the binding's two named absences. The library *has* the transport — TLS 1.2 and 1.3 through `tokio-rustls`, the four auth modes, CA and certificate/key material, the peer's verified state ([`nng.md`](nng.md) §3, §5) — and takes it as `SocketOptions::tls: Option<TlsConfig>` (`crates/nng/weida-nng/src/options.rs:161`). **This surface has no certificate API**: `weida_nng.SocketOptions` has fifteen keywords and none of them is `tls` (`src/options.rs:49-66`). A `tls+tcp://` URL therefore reaches `engine.rs:1096-1101` and fails with `EINVAL` — "a tls+tcp endpoint needs `SocketOptions::tls`; a TLS transport with no configuration is a TCP transport with a longer name". Asserted by `tests/test_options.py::test_a_tls_endpoint_is_refused_because_this_binding_configures_none`. What is missing: a Python spelling of "these roots, this certificate and key, this server name, this auth mode" |
+| `tls+tcp://`, configured by `pynng.TLSConfig(mode, ...)` and `sock.tls_config` | — | **refused**, and this is the first of the binding's two named absences. The library *has* the transport — TLS 1.2 and 1.3 through `tokio-rustls`, the four auth modes, CA and certificate/key material, the peer's verified state ([`nng.md`](nng.md) §3, §5) — and takes it as `SocketOptions::tls: Option<TlsConfig>` (`crates/nng/weida-nng/src/options.rs`). **This surface has no certificate API**: `weida_nng.SocketOptions` has nineteen keywords and none of them is `tls` (`src/options.rs:49-70`). A `tls+tcp://` URL therefore reaches `engine.rs` and fails with `EINVAL` — "a tls+tcp endpoint needs `SocketOptions::tls`; a TLS transport with no configuration is a TCP transport with a longer name". Asserted by `tests/test_options.py::test_a_tls_endpoint_is_refused_because_this_binding_configures_none`. What is missing: a Python spelling of "these roots, this certificate and key, this server name, this auth mode" |
 | `ws://`, `wss://` — both accepted a listen in pynng's bundled build | — | refused with a reason by the library: the WebSocket mapping needs an HTTP server ([`nng.md`](nng.md) §3). From Python the refusal is `ENOTSUP` naming the transport — `test_an_unknown_transport_is_refused_with_what_this_library_speaks` |
 | `abstract://` — accepted a listen in pynng's bundled build | — | refused with a reason: the Linux abstract `AF_UNIX` namespace has no filesystem permissions, so the one authorization `ipc://` offers is gone ([`nng.md`](nng.md) §3) |
 | `udp://` — **`NotSupported` in pynng's bundled build too**, measured | — | refused with a reason: SP's UDP mapping has no pipe and every pattern here is written on one ([`nng.md`](nng.md) §3) |
@@ -110,31 +110,33 @@ Two surfaces, answering two questions, and both are the library's own table rath
 retyped copy.
 
 - **`weida_nng.OPTIONS` and `weida_nng.option(name)`** are all **50 rows** of `nng_options(5)`
-  as `weida-nng`'s `optiontable.rs` answers them — **33 honoured, 17 refused** (§11 gives the
+  as `weida-nng`'s `optiontable.rs` answers them — **34 honoured, 16 refused** (§11 gives the
   commands). Each row is an `NngOption` with `name`, `scope`, `honoured`, `note` and
   `refusal`; a refused row always carries the reason and an honoured one never does, which a
   test walks over the whole table (`tests/test_options.py::test_the_option_table_answers_for_every_name_it_carries`).
   A name NNG does not have answers `None`.
-- **`weida_nng.SocketOptions(**kwargs)`** is what a socket is opened with: **fifteen keyword
-  arguments** (`src/options.rs:49-66`), frozen, validated at construction.
+- **`weida_nng.SocketOptions(**kwargs)`** is what a socket is opened with: **nineteen keyword
+  arguments** (`src/options.rs:49-70`), frozen, validated at construction.
 
 The refusal vocabulary a Python caller sees is the library's errno classes, not a string:
 
 | What is wrong | What is raised | Evidence |
 | --- | --- | --- |
-| A value no configuration can hold — `max_ttl` 0 or 256, a depth past `MAX_QUEUE_DEPTH`, `max_pipes` 0, `handshake_timeout` 0, `max_addresses` 0, a negative duration | `EINVAL` at the `SocketOptions(...)` call | `test_an_impossible_configuration_is_refused_at_configuration_time` (7 parametrized rows), `test_a_negative_duration_is_not_a_duration` |
+| A value no configuration can hold — `max_ttl` 0 or 256, a depth past `MAX_QUEUE_DEPTH`, `max_pipes` 0, `max_pipes_per_peer` 0, `max_tls_handshakes` 0, `handshake_timeout`, `message_timeout` or `idle_timeout` 0, `max_addresses` 0, a negative duration | `EINVAL` at the `SocketOptions(...)` call | `test_an_impossible_configuration_is_refused_at_configuration_time` (11 parametrized rows), `test_a_negative_duration_is_not_a_duration` |
 | An option this protocol does not have — a `send_depth` on REQ | `ENOTSUP` **naming `NNG_OPT_SENDBUF`**, at the socket constructor | `test_a_buffer_a_protocol_does_not_have_is_refused_when_the_socket_opens` |
 | A subscription on a socket with no subscriptions | `ENOTSUP` **naming `NNG_OPT_SUB_SUBSCRIBE`**, at the socket constructor (`subscriptions.rs`) | `test_a_subscription_on_a_socket_without_subscriptions_is_refused_by_name` |
 | A transport the library does not implement | `ENOTSUP` naming what it does speak | `test_an_unknown_transport_is_refused_with_what_this_library_speaks` |
 | A `tls+tcp://` endpoint | `EINVAL` naming the missing configuration | §3 |
 
-Twelve of the fifteen keywords are NNG options under NNG's own semantics — `recv_max_size`
+Twelve of the nineteen keywords are NNG options under NNG's own semantics — `recv_max_size`
 (`NNG_OPT_RECVMAXSZ`), `send_depth` (`SENDBUF`), `recv_depth` (`RECVBUF`), `send_timeout`
 (`SENDTIMEO`), `recv_timeout` (`RECVTIMEO`), `reconnect_min`/`reconnect_max`
 (`RECONNMINT`/`RECONNMAXT`), `max_ttl` (`MAXTTL`), `resend_time` (`REQ_RESENDTIME`),
 `survey_time` (`SURVEYOR_SURVEYTIME`), `sub_prefer_new` (`SUB_PREFNEW`), `subscribe`
-(`SUB_SUBSCRIBE`). The other three — `max_pipes`, `max_addresses`, `handshake_timeout` — are
-bounds NNG has no option for (§9.8).
+(`SUB_SUBSCRIBE`). The other seven — `max_pipes`, `max_pipes_per_peer`, `max_tls_handshakes`,
+`max_addresses`, `handshake_timeout`, `message_timeout`, `idle_timeout` — are bounds NNG has no
+option for (§9.8); the three timeouts follow the same rule as `send_timeout`: seconds as floats,
+and `None` for no limit.
 
 Differences from pynng's option surface:
 
@@ -142,12 +144,12 @@ Differences from pynng's option surface:
 | --- | --- | --- |
 | Where | descriptor properties on a live socket: `sock.recv_timeout = 500`, or keywords on the constructor | one frozen `SocketOptions` object passed to the constructor. An option that cannot be delivered fails before the socket exists |
 | Durations | **milliseconds**, as integers | **seconds**, as floats, with `None` for `NNG_DURATION_INFINITE`. NNG's default is to wait forever, which is why every test helper sets both timeouts |
-| Reading back | every option is a readable property | ten of the fifteen have getters (`recv_max_size`, `send_depth`, `recv_depth`, `send_timeout`, `recv_timeout`, `max_ttl`, `survey_time`, `resend_time`, `sub_prefer_new`, `max_pipes`, `src/options.rs:142-201`). `reconnect_min`, `reconnect_max`, `handshake_timeout`, `max_addresses` and `subscribe` have none: absent, and what is missing is a getter per field |
+| Reading back | every option is a readable property | thirteen of the nineteen have getters (`recv_max_size`, `send_depth`, `recv_depth`, `send_timeout`, `recv_timeout`, `max_ttl`, `survey_time`, `resend_time`, `sub_prefer_new`, `max_pipes`, `max_pipes_per_peer`, `message_timeout`, `idle_timeout`, `src/options.rs`). `reconnect_min`, `reconnect_max`, `handshake_timeout`, `max_addresses`, `max_tls_handshakes` and `subscribe` have none: absent, and what is missing is a getter per field |
 | Per-endpoint options | `dialer`/`listener` objects carry their own | absent: `dial` and `listen` take a URL and answer a URL. The library allows `NNG_OPT_RECVMAXSZ` per endpoint ([`nng.md`](nng.md) §5); Python cannot reach it |
 | `sock.name` (`NNG_OPT_SOCKNAME`) | present | refused by the library — absent, with `tracing` spans carrying the endpoint and pipe id instead ([`nng.md`](nng.md) §5) |
 | `sock.recv_fd`, `sock.send_fd` | present, for `select`/`poll` | refused by the library — replaced by a weida-runtime construct: readiness here is a future, and a caller awaits instead ([`nng.md`](nng.md) §5) |
 | `sock.tcp_nodelay` | settable | honoured as **always on**: SP's patterns are round-trip shaped ([`nng.md`](nng.md) §5) |
-| `sock.tcp_keepalive` | settable | refused — absent, with the reason that SP discovers a dead peer by the write that fails |
+| `sock.tcp_keepalive` | settable | honoured as **always on**: SP has no heartbeat, so the kernel's probes are how a dead peer is found ([`nng.md`](nng.md) §5) |
 | `sock.tls_config` | present | absent (§3, §4) |
 | Module constants to compare a configuration against | — | present, and pynng has none: `DEFAULT_MAX_SOCKETS`, `DEFAULT_MAX_PIPES`, `DEFAULT_RECV_MAX_SIZE`, `MAX_QUEUE_DEPTH`, `NNG_MAX_TTL`, `SPEC_MAX_TTL`, `NNG_MAXADDRLEN`, `DEFAULT_CLOSE_BUDGET`, `DEFAULT_SURVEY_TIME`, `DEFAULT_RESEND_TIME`, all taken from the library (`lib.rs:125-143`) and asserted by `test_the_defaults_are_the_librarys_own_numbers` |
 
@@ -312,8 +314,8 @@ Every count in this document, with the command that produces it:
 | Three context classes (§2) | `grep -c '^python_context!($' crates/nng/weida-nng-py/src/contexts.rs` and `grep -c '^sync_context!($' crates/nng/weida-nng-py/src/sync.rs` | 3 and 3 |
 | 23 exception classes (§9.7) | `grep -cE '^    E[A-Z]*,$' crates/nng/weida-nng-py/src/errors.rs` | 23 |
 | 31 pynng exception classes (§9.7) | `grep -c '^class [A-Za-z]*(NNGException):' .venv/lib/python3.13/site-packages/pynng/exceptions.py` | 31 |
-| Fifteen option keywords (§5) | `grep -cE '^        [a-z_]*=None,$' crates/nng/weida-nng-py/src/options.rs` | 15 |
-| 50 option rows, 33 honoured, 17 refused (§5) | `grep -c 'name: "NNG_OPT_' crates/nng/weida-nng/src/optiontable.rs`, then the same file with `'        disposition: Disposition::Honoured'` and `'        disposition: Disposition::Refused'` | 50, 33, 17 |
+| Nineteen option keywords (§5) | `grep -cE '^        [a-z_]*=None,$' crates/nng/weida-nng-py/src/options.rs` | 19 |
+| 50 option rows, 34 honoured, 16 refused (§5) | `grep -c 'name: "NNG_OPT_' crates/nng/weida-nng/src/optiontable.rs`, then the same file with `'        disposition: Disposition::Honoured'` and `'        disposition: Disposition::Refused'` | 50, 34, 16 |
 | `package.sh` and `smoke.py` present (§10) | `glob 'crates/**/package.sh; crates/**/smoke.py'` | every binding has both, each `package.sh` a wrapper over `crates/py/package.sh` |
 | pynng's transports (§3) | a listen attempt per scheme through `.venv/bin/python` against `pynng.Pull0` | `ws`, `wss`, `tls+tcp`, `inproc`, `ipc`, `abstract` accepted; `udp` raised `NotSupported` |
 | NNG's protocol names (§2) | `protocol_name` read from each of pynng's eleven classes | `pair` for `Pair0`, where this binding answers `pair0`; the other ten agree |

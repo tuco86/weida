@@ -21,19 +21,17 @@
 //! what an expired `NNG_OPT_SENDTIMEO` or `NNG_OPT_RECVTIMEO` reports (§5,
 //! §8). [`within`] is the one place that mapping is made.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
+use tokio::sync::futures::Notified;
 use weida_runtime::Exec;
 use weida_sp::EndpointType;
 
 use crate::context::Context;
 use crate::endpoint::Endpoint;
-use crate::engine::{Dialer, Engine, Listener};
+use crate::engine::{Dialer, Engine, Listener, PipeSet};
 use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::options::SocketOptions;
@@ -41,6 +39,15 @@ use crate::pipe::{Pipe, PipeId, Sent};
 use crate::session::SpSession;
 
 /// The half of a socket that is the same for every protocol.
+///
+/// **Dropping the last handle closes the socket**, after the messages
+/// already queued for each peer have been written. `nng_close()` is
+/// explicit in C because C has nothing else to say when a handle is
+/// forgotten; here a socket nobody can reach any more has no reason to keep
+/// its listener bound, its pipes open and its slot in the context's ceiling.
+/// Everything this crate runs in the background holds the engine and not
+/// this, so this is dropped when the application lets go of it. An explicit
+/// [`SocketCore::close`] discards what is queued, as `nng_close()` does.
 #[derive(Debug)]
 pub struct SocketCore {
     engine: Engine,
@@ -50,6 +57,12 @@ pub struct SocketCore {
     /// peer at the same moment; the worst a race costs is two messages to
     /// one peer, which is within "round-robin among available peers" (§4).
     cursor: AtomicUsize,
+}
+
+impl Drop for SocketCore {
+    fn drop(&mut self) {
+        self.engine.close_after_flush();
+    }
 }
 
 impl SocketCore {
@@ -135,14 +148,48 @@ impl SocketCore {
         self.engine.close();
     }
 
-    /// Every pipe this socket may use right now.
-    pub fn pipes(&self) -> Vec<Pipe> {
+    /// Every pipe this socket may use right now, as one immutable set that
+    /// costs a reference count to take.
+    pub fn pipes(&self) -> Arc<PipeSet> {
         self.engine.pipes()
     }
 
     /// One named pipe, if it still exists.
     pub fn pipe(&self, id: PipeId) -> Option<Pipe> {
-        self.engine.pipes().into_iter().find(|pipe| pipe.id() == id)
+        self.engine.pipes().get(id).cloned()
+    }
+
+    /// Whether a payload of `len` octets that arrived on `pipe` is within
+    /// the payload limit of the endpoint that made it.
+    ///
+    /// For a protocol that takes a header off the message: the transport
+    /// admits a message by its declared length with the header in it, and
+    /// this is the judgement of what is left. A pipe that has since been
+    /// retired judges nothing — what arrived on it was admitted by the
+    /// transport, and its limit went with it.
+    pub fn payload_fits(&self, pipe: PipeId, len: usize) -> bool {
+        self.engine
+            .pipes()
+            .get(pipe)
+            .is_none_or(|pipe| pipe.admits_payload(len))
+    }
+
+    /// A wait that ends when a message may be waiting on some pipe, or the
+    /// pipes change.
+    ///
+    /// **Create it before looking** — before [`SocketCore::try_take_any`] —
+    /// and await it only if the look found nothing: it sees every arrival
+    /// since it was created, so a message that lands between the look and
+    /// the await ends the wait instead of being missed by it.
+    pub fn message_signal(&self) -> Notified<'_> {
+        self.engine.signals().arrived()
+    }
+
+    /// A wait that ends when some pipe may have room, or the pipes change.
+    /// Created before looking, for the reason [`SocketCore::message_signal`]
+    /// gives.
+    pub fn room_signal(&self) -> Notified<'_> {
+        self.engine.signals().room()
     }
 
     /// Hands `message` to the next pipe that can accept it **now**,
@@ -209,30 +256,42 @@ impl SocketCore {
         within(&self.exec, limit, async {
             let mut message = message;
             loop {
+                // Created before the offer: room that appears after the
+                // offer found none and before the await ends the wait.
+                let room = self.room_signal();
                 self.ensure_open()?;
                 match self.offer_round_robin(message) {
                     Ok(id) => return Ok(id),
                     Err(returned) => message = returned,
                 }
-                wait_for_room(&self.engine, &self.pipes()).await;
+                room.await;
             }
         })
         .await
     }
 
-    /// Offers `message` to **every** pipe, which is what a broadcast is:
-    /// PUB "offers every subscriber connection a copy without testing
-    /// subscription prefixes first" and BUS "considers every directly
-    /// connected pipe" (§4).
+    /// Offers `message` to **every** pipe except `exclude`, which is what a
+    /// broadcast is: PUB "offers every subscriber connection a copy without
+    /// testing subscription prefixes first" and BUS "considers every
+    /// directly connected pipe" (§4), the latter minus the pipe a message
+    /// arrived on when it is re-broadcast.
     ///
     /// Never waits and never fails: a peer that cannot take its copy loses
     /// it, "while the originating send succeeds without blocking" (§4). The
     /// count returned is how many copies were queued, which is the only
     /// trace a dropped copy leaves.
-    pub fn send_to_all(&self, message: &Message) -> Broadcast {
+    ///
+    /// A copy is a reference count: every pipe is handed the same body, and
+    /// a pipe that refuses costs a lock and no allocation, so a subscriber
+    /// that stopped reading costs the publisher nothing it would not spend
+    /// on one that is keeping up.
+    pub fn send_to_all_except(&self, message: &Message, exclude: Option<PipeId>) -> Broadcast {
         let mut broadcast = Broadcast::default();
-        for pipe in self.pipes() {
-            match pipe.outgoing().try_send(message.clone()) {
+        for pipe in self.pipes().iter() {
+            if exclude == Some(pipe.id()) {
+                continue;
+            }
+            match pipe.outgoing().offer(message.clone()) {
                 Ok(()) => broadcast.queued += 1,
                 Err(_) => broadcast.dropped += 1,
             }
@@ -240,11 +299,13 @@ impl SocketCore {
         broadcast
     }
 
-    /// Sends to one named pipe: a REP's requester, a raw BUS's ingress
-    /// exclusion, a PAIR v1 peer.
+    /// Sends to one named pipe: a REP's requester, a PAIR v1 peer.
     ///
     /// Reports `NNG_ECLOSED` when that pipe is gone, which is what a
-    /// protocol with a reply to deliver turns into a discard.
+    /// protocol with a reply to deliver turns into a discard. For a
+    /// protocol that drops at a full queue — REP and RESPONDENT among them
+    /// — the answer to a pipe that cannot take the message is
+    /// [`Sent::Dropped`] and not a wait.
     pub async fn send_to(&self, id: PipeId, message: Message) -> Result<Sent> {
         let Some(pipe) = self.pipe(id) else {
             return Err(Error::ECLOSED(
@@ -257,23 +318,32 @@ impl SocketCore {
         .await
     }
 
-    /// Takes the next message from any pipe, fair-queued.
+    /// Takes the next message from any pipe, fair-queued, waiting under
+    /// `NNG_OPT_RECVTIMEO`.
     ///
     /// "PULL accepts incoming messages; simultaneously ready peers have no
     /// defined order" (§4). The cursor advances past whoever was served, so
     /// one busy peer cannot starve the others.
     pub async fn recv_any(&self) -> Result<(PipeId, Message)> {
         let limit = self.options().recv_timeout;
-        within(&self.exec, limit, async {
-            loop {
-                self.ensure_open()?;
-                if let Some(taken) = self.try_take_any() {
-                    return Ok(taken);
-                }
-                wait_for_message(&self.engine, &self.pipes()).await;
+        within(&self.exec, limit, self.recv_any_untimed()).await
+    }
+
+    /// [`SocketCore::recv_any`] without the timeout, for a caller that puts
+    /// one timeout around a loop of receives: a receive that is called again
+    /// after each message it drops would otherwise restart its clock every
+    /// time, and never expire while the peer keeps sending.
+    pub async fn recv_any_untimed(&self) -> Result<(PipeId, Message)> {
+        loop {
+            // Created before the look, so that an arrival between the look
+            // and the await ends the wait.
+            let arrived = self.message_signal();
+            self.ensure_open()?;
+            if let Some(taken) = self.try_take_any() {
+                return Ok(taken);
             }
-        })
-        .await
+            arrived.await;
+        }
     }
 
     /// The non-blocking form: `NNG_EAGAIN` when nothing is queued.
@@ -289,6 +359,9 @@ impl SocketCore {
     /// first: it crossed the wire before the peer closed, and the close
     /// does not un-arrive it (see
     /// [`Engine::take_arrived`](crate::Engine::take_arrived)).
+    ///
+    /// Allocates nothing: the pipes are one shared set and a pipe with
+    /// nothing queued is passed with a load.
     pub fn try_take_any(&self) -> Option<(PipeId, Message)> {
         if let Some(arrived) = self.engine.take_arrived() {
             return Some(arrived);
@@ -301,22 +374,15 @@ impl SocketCore {
         for offset in 0..pipes.len() {
             let index = (start.wrapping_add(offset)) % pipes.len();
             let pipe = &pipes[index];
+            if !pipe.incoming().has_messages() {
+                continue;
+            }
             if let Ok(message) = pipe.incoming().try_recv() {
                 self.cursor.store(index.wrapping_add(1), Ordering::Relaxed);
                 return Some((pipe.id(), message));
             }
         }
         None
-    }
-
-    /// Waits until some pipe has a message, or the pipe set changes.
-    pub async fn wait_for_message(&self) {
-        wait_for_message(&self.engine, &self.pipes()).await;
-    }
-
-    /// Waits until some pipe has room, or the pipe set changes.
-    pub async fn wait_for_room(&self) {
-        wait_for_room(&self.engine, &self.pipes()).await;
     }
 }
 
@@ -446,73 +512,6 @@ pub async fn within<T>(
 /// of that wait immediately.
 fn nowhere_to_send() -> Error {
     Error::ETIMEDOUT("no peer can accept a message right now".into())
-}
-
-/// Waits for room on any of `pipes`, or for the pipe set to change.
-///
-/// A pipe whose queues are already closed is **skipped**, and that is
-/// load-bearing rather than tidy: a closed queue's wait returns at once —
-/// it has to, so that a parked sender is released when its peer goes — so
-/// waiting on one between the close and the engine's retire would spin
-/// this loop hot instead of parking it. The retire is what removes the
-/// pipe, and `engine.changed()` is what wakes this when it does.
-async fn wait_for_room(engine: &Engine, pipes: &[Pipe]) {
-    let waits: Vec<_> = pipes
-        .iter()
-        .filter(|pipe| !pipe.outgoing().is_closed())
-        .map(|pipe| pipe.outgoing().wait_for_room())
-        .collect();
-    first_of(waits, engine.changed()).await;
-}
-
-/// Waits for a message on any of `pipes`, or for the pipe set to change.
-///
-/// Closed pipes are skipped, for the reason [`wait_for_room`] gives.
-async fn wait_for_message(engine: &Engine, pipes: &[Pipe]) {
-    let waits: Vec<_> = pipes
-        .iter()
-        .filter(|pipe| !pipe.incoming().is_closed())
-        .map(|pipe| pipe.incoming().wait_for_message())
-        .collect();
-    first_of(waits, engine.changed()).await;
-}
-
-/// Resolves as soon as the first of `many` — or `one` — does.
-///
-/// `tokio::select!` cannot take a set whose size is a pipe count, and
-/// pulling in a combinator crate for twenty lines is worse than the twenty
-/// lines. Every future here is one `Notify` wait, so polling them all on
-/// each wake costs a pipe-count pass and no allocation beyond the vector.
-async fn first_of<A: Future<Output = ()>, B: Future<Output = ()>>(many: Vec<A>, one: B) {
-    FirstOf {
-        many: many.into_iter().map(Box::pin).collect(),
-        one: Box::pin(one),
-    }
-    .await
-}
-
-struct FirstOf<A, B> {
-    many: Vec<Pin<Box<A>>>,
-    one: Pin<Box<B>>,
-}
-
-impl<A: Future<Output = ()>, B: Future<Output = ()>> Future for FirstOf<A, B> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
-        // `Self` is `Unpin` — every field is a `Pin<Box<_>>` — so the
-        // projection needs no `unsafe`, which this crate forbids anyway.
-        let this = self.get_mut();
-        if this.one.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
-        }
-        for future in &mut this.many {
-            if future.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-        }
-        Poll::Pending
-    }
 }
 
 /// A shared socket core, which is what every socket type holds: NNG's

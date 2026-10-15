@@ -303,10 +303,12 @@ pub const OPTIONS: &[OptionRow] = &[
     OptionRow {
         name: "NNG_OPT_TCP_KEEPALIVE",
         scope: Scope::Transport,
-        disposition: Disposition::Refused(Refusal::Absent),
-        note: "TCP keepalive would detect a dead peer without traffic; SP's own answer is the \
-               dialer's reconnect, and a keepalive interval a caller cannot also set on the \
-               listener would be half a feature",
+        disposition: Disposition::Honoured("always on"),
+        note: "every TCP connection, accepted or dialled, is probed after sixty seconds of \
+               silence and every fifteen after that, because SP has no heartbeat and a PULL or \
+               REP socket may never write to a peer, so one that vanished without a FIN would \
+               hold its pipe slot for ever; NNG's own default is off, and no option turns this \
+               one off",
     },
     OptionRow {
         name: "NNG_OPT_TCP_BOUND_PORT",
@@ -449,14 +451,14 @@ pub const OPTIONS: &[OptionRow] = &[
         name: "NNG_OPT_ZT_PING_TIME",
         scope: Scope::Transport,
         disposition: Disposition::Refused(Refusal::ExperimentalUpstream),
-        note: "as NNG_OPT_ZT_HOME; it is also the only liveness probing anywhere in SP, which \
-               is why no other transport here has one",
+        note: "as NNG_OPT_ZT_HOME; ZeroTier's own ping is the only liveness probing an SP \
+               transport defines for itself, and TCP's is the kernel's (NNG_OPT_TCP_KEEPALIVE)",
     },
     OptionRow {
         name: "NNG_OPT_ZT_PING_TRIES",
         scope: Scope::Transport,
         disposition: Disposition::Refused(Refusal::ExperimentalUpstream),
-        note: "as NNG_OPT_ZT_PING_TIME: the only liveness probing anywhere in SP, and absent",
+        note: "as NNG_OPT_ZT_PING_TIME: ZeroTier's own liveness probing, and absent with it",
     },
     OptionRow {
         name: "NNG_OPT_ZT_MTU",

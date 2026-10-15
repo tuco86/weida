@@ -3,14 +3,18 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use weida_nng::Broadcast;
+use weida_nng::{Broadcast, Message};
 
 /// A message body on its way to Python.
 ///
 /// A bare `Vec<u8>` would arrive as a list of integers, which is what PyO3
 /// does with a vector of anything. A payload is `bytes` in both languages,
 /// so the conversion is named here once and every `recv` returns it.
-pub struct Body(pub Vec<u8>);
+///
+/// It holds the message rather than a copy of its body: the body is a
+/// shared allocation on the Rust side, and the one copy this conversion
+/// makes is into the `bytes` object Python owns.
+pub struct Body(pub Message);
 
 impl<'py> IntoPyObject<'py> for Body {
     type Target = PyBytes;
@@ -18,7 +22,7 @@ impl<'py> IntoPyObject<'py> for Body {
     type Error = std::convert::Infallible;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        Ok(PyBytes::new(py, &self.0))
+        Ok(PyBytes::new(py, self.0.body()))
     }
 }
 

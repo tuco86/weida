@@ -56,9 +56,11 @@
 //! table, so no socket type re-decides it at each send.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 use weida_sp::EndpointType;
 
 use crate::error::{Error, Result};
@@ -153,28 +155,54 @@ impl FullAction {
     /// zero-depth send path blocks until it can queue/hand off, unless the
     /// socket send timeout yields `NNG_ETIMEDOUT`" (§5), and BUS, PUB and
     /// SURVEYOR are the three that broadcast best-effort instead (§4).
+    ///
+    /// **REP and RESPONDENT drop as well, for a different reason.** Their
+    /// send is addressed to one pipe — the requester's — and a send that
+    /// waited for that pipe would let one requester that stopped reading
+    /// hold every other client of the socket hostage: the context that
+    /// answers it parks behind that requester's full TCP window, and so
+    /// does every worker the socket has once they have all been given
+    /// requests by it. A reply the pipe cannot take is therefore
+    /// discarded and the send succeeds, which is what the requester's own
+    /// timer — a resend for REQ, a deadline for SURVEYOR — already recovers
+    /// from (§4, §6). The depth that makes this usable is
+    /// [`DEFAULT_BROADCAST_SEND_DEPTH`], for the argument given there.
     pub const fn sending(protocol: EndpointType) -> FullAction {
         match protocol {
-            EndpointType::Bus | EndpointType::Pub | EndpointType::Surveyor => FullAction::Drop,
+            EndpointType::Bus
+            | EndpointType::Pub
+            | EndpointType::Surveyor
+            | EndpointType::Rep
+            | EndpointType::Respondent => FullAction::Drop,
             _ => FullAction::Block,
         }
     }
 
-    /// What every protocol does at a full **incoming** queue: it stops
-    /// reading the connection.
+    /// What `protocol` does at a full **incoming** queue: it stops reading
+    /// the connection.
     ///
-    /// [`FullAction::Block`] for all of them, and not because nothing else
-    /// is specified — SUB has two documented policies (§4) — but because
-    /// its policies belong one layer up. A SUB filters by prefix, and a
-    /// queue that dropped a subscribed message to make room for an
-    /// unsubscribed one would be applying `SUB_PREFNEW` to traffic the
-    /// application never asked for. So the pipe's queue is plain
+    /// [`FullAction::Block`] for every protocol that receives, and not
+    /// because nothing else is specified — SUB has two documented policies
+    /// (§4) — but because its policies belong one layer up. A SUB filters
+    /// by prefix, and a queue that dropped a subscribed message to make room
+    /// for an unsubscribed one would be applying `SUB_PREFNEW` to traffic
+    /// the application never asked for. So the pipe's queue is plain
     /// backpressure, which is the only signal SP has — it grants no credit
     /// on the wire (§12/P12), so not reading is the whole of it — and
     /// `SUB_PREFNEW` applies to the queue of *admitted* publications on
     /// the socket, which is where NNG's receive buffer is too.
-    pub const fn receiving(_protocol: EndpointType) -> FullAction {
-        FullAction::Block
+    ///
+    /// **PUB and PUSH have no receive operation**, so there is nobody to
+    /// push back for and nothing to queue: what a peer writes to them is
+    /// read and discarded as it arrives, as NNG's `pub0` and `push0` do with
+    /// whatever reaches them. A queue that held it would hold up to its
+    /// whole ceiling of octets nobody will ever take, for as long as the
+    /// connection lives.
+    pub const fn receiving(protocol: EndpointType) -> FullAction {
+        match protocol {
+            EndpointType::Pub | EndpointType::Push => FullAction::Drop,
+            _ => FullAction::Block,
+        }
     }
 }
 
@@ -258,6 +286,65 @@ pub enum Sent {
     Dropped,
 }
 
+/// What a socket's pipes tell the socket as a whole.
+///
+/// A socket waits on its pipes as a set: a receive wants whichever pipe has
+/// a message first, a send whichever has room first. One wake-up per socket
+/// answers both, where waiting on every pipe separately would cost a future
+/// per pipe on every wait. Each queue of a pipe made with [`Pipe::linked`]
+/// feeds the one that concerns it — an incoming queue the *arrived* signal
+/// when a message goes in, an outgoing queue the *room* signal when a
+/// message comes out or a taker parks — and the engine feeds both when the
+/// set of pipes itself changes, because a waiter's view of the set is then
+/// out of date.
+///
+/// **Create the wait before looking**, in either case. A [`Notified`] sees
+/// every wake-up since it was *created*, not since it was first polled, so
+/// one made before the look cannot miss a message or a slot that appears
+/// between the look and the await.
+#[derive(Debug, Default)]
+pub struct Signals {
+    arrived: Notify,
+    room: Notify,
+}
+
+impl Signals {
+    /// A pair of signals nobody has fed yet.
+    pub fn new() -> Signals {
+        Signals::default()
+    }
+
+    /// Ends when a message may be waiting on some pipe's incoming queue, or
+    /// the set of pipes changed.
+    pub fn arrived(&self) -> Notified<'_> {
+        self.arrived.notified()
+    }
+
+    /// Ends when some pipe's outgoing queue may have room, or the set of
+    /// pipes changed.
+    pub fn room(&self) -> Notified<'_> {
+        self.room.notified()
+    }
+
+    /// Wakes every waiter of both signals: the set of pipes changed, or the
+    /// socket closed.
+    pub fn pipes_changed(&self) {
+        self.arrived.notify_waiters();
+        self.room.notify_waiters();
+    }
+}
+
+/// Which of a socket's signals a queue feeds, if any.
+#[derive(Debug, Default)]
+enum Link {
+    #[default]
+    None,
+    /// An incoming queue: a message going in is an arrival.
+    Incoming(Arc<Signals>),
+    /// An outgoing queue: a message coming out is room.
+    Outgoing(Arc<Signals>),
+}
+
 /// One direction of one pipe: a bounded queue of whole messages.
 pub struct Queue {
     config: QueueConfig,
@@ -267,6 +354,10 @@ pub struct Queue {
     room: Notify,
     /// Woken when a message goes in.
     ready: Notify,
+    /// Messages queued, mirrored outside the lock so that a scan over many
+    /// pipes passes an empty one with a load and not a lock.
+    queued: AtomicUsize,
+    link: Link,
 }
 
 struct QueueState {
@@ -285,8 +376,12 @@ struct QueueState {
 }
 
 impl Queue {
-    /// An empty queue under `config`.
+    /// An empty queue under `config`, feeding no socket-wide signal.
     pub fn new(config: QueueConfig) -> Queue {
+        Queue::with_link(config, Link::None)
+    }
+
+    fn with_link(config: QueueConfig, link: Link) -> Queue {
         Queue {
             config,
             state: Mutex::new(QueueState {
@@ -298,6 +393,8 @@ impl Queue {
             }),
             room: Notify::new(),
             ready: Notify::new(),
+            queued: AtomicUsize::new(0),
+            link,
         }
     }
 
@@ -314,6 +411,16 @@ impl Queue {
     /// Whether the queue holds nothing.
     pub fn is_empty(&self) -> bool {
         self.lock().messages.is_empty()
+    }
+
+    /// Whether a message was queued when this was last updated, without
+    /// taking the queue's lock.
+    ///
+    /// A hint for a scan over many queues: a `false` may lag a push that
+    /// is happening at this moment, which the push's own wake-up covers, and
+    /// a `true` may lag a take, which the take itself then finds out.
+    pub fn has_messages(&self) -> bool {
+        self.queued.load(Ordering::Acquire) != 0
     }
 
     /// Octets the queued messages occupy — what
@@ -347,35 +454,25 @@ impl Queue {
         !state.closed && self.full(&state, 1).is_none()
     }
 
-    /// Waits until [`Queue::has_room`] would be true, or the pipe is
-    /// destroyed.
-    pub async fn wait_for_room(&self) {
+    /// Waits until nothing is queued, or the queue is destroyed.
+    ///
+    /// What a socket whose last handle was dropped waits on before it closes
+    /// a pipe: a message queued for the peer is the application's, and the
+    /// connection's writer may not have reached it yet. A message the writer
+    /// has taken is no longer queued, and is finished however the pipe is
+    /// closed behind it.
+    pub async fn drained(&self) {
         loop {
-            let mut room = std::pin::pin!(self.room.notified());
-            // `notified()` registers the waiter when it is **polled**, so
-            // registering is `enable()` and not construction: without it,
-            // room freed between the check below and the await wakes nobody
-            // and this wait never ends.
-            room.as_mut().enable();
-            if self.has_room() || self.is_closed() {
-                return;
-            }
-            room.await;
-        }
-    }
-
-    /// Waits until a message is queued, or the pipe is destroyed.
-    pub async fn wait_for_message(&self) {
-        loop {
-            let mut ready = std::pin::pin!(self.ready.notified());
-            ready.as_mut().enable();
+            // Created before the look, so a take between the look and the
+            // await ends the wait.
+            let freed = self.room.notified();
             {
                 let state = self.lock();
-                if !state.messages.is_empty() || state.closed {
+                if state.messages.is_empty() || state.closed {
                     return;
                 }
             }
-            ready.await;
+            freed.await;
         }
     }
 
@@ -398,7 +495,7 @@ impl Queue {
                 if self.full(&state, size).is_none() {
                     self.push(&mut state, message, size);
                     drop(state);
-                    self.ready.notify_waiters();
+                    self.pushed();
                     return Ok(Sent::Queued);
                 }
                 match self.config.full {
@@ -415,7 +512,7 @@ impl Queue {
                         // message at a time.
                         let mut discarded = 0;
                         while self.full(&state, size).is_some() {
-                            if Queue::pop(&mut state).is_none() {
+                            if self.pop(&mut state).is_none() {
                                 break;
                             }
                             discarded += 1;
@@ -426,8 +523,8 @@ impl Queue {
                             // its place.
                             self.push(&mut state, message, size);
                             drop(state);
-                            self.ready.notify_waiters();
-                            self.room.notify_waiters();
+                            self.pushed();
+                            self.freed();
                             return Ok(Sent::Queued);
                         }
                         // Nothing to discard — a depth-zero queue with no
@@ -475,6 +572,10 @@ impl Queue {
     /// swallowed the message on that race would lose it. A closed queue
     /// hands it back too, so a caller rotating over pipes skips a dead one
     /// and keeps its message.
+    ///
+    /// Builds no error and copies nothing: a refusal is the message itself
+    /// coming back, which is what lets a broadcast try every pipe at the
+    /// price of a lock each.
     pub fn offer(&self, message: Message) -> std::result::Result<(), Message> {
         let mut state = self.lock();
         let size = message.wire_len() as u64;
@@ -483,7 +584,7 @@ impl Queue {
         }
         self.push(&mut state, message, size);
         drop(state);
-        self.ready.notify_waiters();
+        self.pushed();
         Ok(())
     }
 
@@ -497,9 +598,9 @@ impl Queue {
             ready.as_mut().enable();
             {
                 let mut state = self.lock();
-                if let Some(message) = Queue::pop(&mut state) {
+                if let Some(message) = self.pop(&mut state) {
                     drop(state);
-                    self.room.notify_waiters();
+                    self.freed();
                     return Ok(message);
                 }
                 if state.closed {
@@ -507,7 +608,7 @@ impl Queue {
                 }
                 state.waiting += 1;
             }
-            self.room.notify_waiters();
+            self.freed();
             let parked = Parked(self);
             ready.await;
             drop(parked);
@@ -517,10 +618,10 @@ impl Queue {
     /// Takes the next message if one is queued.
     pub fn try_recv(&self) -> Result<Message> {
         let mut state = self.lock();
-        match Queue::pop(&mut state) {
+        match self.pop(&mut state) {
             Some(message) => {
                 drop(state);
-                self.room.notify_waiters();
+                self.freed();
                 Ok(message)
             }
             None if state.closed => Err(gone()),
@@ -543,10 +644,11 @@ impl Queue {
             let discarded = state.messages.len();
             state.messages.clear();
             state.bytes = 0;
+            self.queued.store(0, Ordering::Release);
             discarded
         };
-        self.room.notify_waiters();
-        self.ready.notify_waiters();
+        self.freed();
+        self.pushed();
         discarded
     }
 
@@ -556,22 +658,13 @@ impl Queue {
     /// than the ceiling is queued rather than waited for forever (module
     /// documentation).
     fn full(&self, state: &QueueState, size: u64) -> Option<Full> {
-        if self.config.depth == 0 {
-            // A rendezvous: room exists only while somebody is waiting for a
-            // message, and only for as many messages as there are waiters.
-            if state.waiting <= state.messages.len() {
-                return Some(Full::Depth);
-            }
-        } else if state.messages.len() >= self.config.depth {
-            return Some(Full::Depth);
-        }
-        if self.config.max_bytes != 0
-            && !state.messages.is_empty()
-            && state.bytes.saturating_add(size) > self.config.max_bytes
-        {
-            return Some(Full::Bytes);
-        }
-        None
+        crosses(
+            self.config,
+            state.waiting,
+            state.messages.len(),
+            state.bytes,
+            size,
+        )
     }
 
     /// What a refusal of a message of `size` says, naming the bound it met.
@@ -601,12 +694,32 @@ impl Queue {
     fn push(&self, state: &mut QueueState, message: Message, size: u64) {
         state.bytes = state.bytes.saturating_add(size);
         state.messages.push_back(message);
+        self.queued.store(state.messages.len(), Ordering::Release);
     }
 
-    fn pop(state: &mut QueueState) -> Option<Message> {
+    fn pop(&self, state: &mut QueueState) -> Option<Message> {
         let message = state.messages.pop_front()?;
         state.bytes = state.bytes.saturating_sub(message.wire_len() as u64);
+        self.queued.store(state.messages.len(), Ordering::Release);
         Some(message)
+    }
+
+    /// A message went in: wake whoever waits on this queue, and the socket's
+    /// receivers if this is a pipe's incoming queue.
+    fn pushed(&self) {
+        self.ready.notify_waiters();
+        if let Link::Incoming(signals) = &self.link {
+            signals.arrived.notify_waiters();
+        }
+    }
+
+    /// Room appeared: wake whoever waits on this queue, and the socket's
+    /// senders if this is a pipe's outgoing queue.
+    fn freed(&self) {
+        self.room.notify_waiters();
+        if let Link::Outgoing(signals) = &self.link {
+            signals.room.notify_waiters();
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, QueueState> {
@@ -616,12 +729,42 @@ impl Queue {
 
 /// Which of a queue's two bounds a message met.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Full {
+pub(crate) enum Full {
     /// [`QueueConfig::depth`]: the message count, or a rendezvous with
     /// nobody waiting.
     Depth,
     /// [`QueueConfig::max_bytes`]: the octet ceiling.
     Bytes,
+}
+
+/// Which bound a message of `size` octets would cross in a queue under
+/// `config` that holds `len` messages and `bytes` octets with `waiting`
+/// takers parked on it.
+///
+/// One rule for every place that keeps messages under the two bounds: the
+/// pipe's queues, and the socket's buffer of what retired pipes had already
+/// received. A depth of zero is a rendezvous — room exists only while
+/// somebody is waiting for a message, and only for as many messages as
+/// there are waiters — and the octet ceiling is skipped for an empty queue
+/// so that a message above it is queued rather than waited for for ever.
+pub(crate) fn crosses(
+    config: QueueConfig,
+    waiting: usize,
+    len: usize,
+    bytes: u64,
+    size: u64,
+) -> Option<Full> {
+    if config.depth == 0 {
+        if waiting <= len {
+            return Some(Full::Depth);
+        }
+    } else if len >= config.depth {
+        return Some(Full::Depth);
+    }
+    if config.max_bytes != 0 && len != 0 && bytes.saturating_add(size) > config.max_bytes {
+        return Some(Full::Bytes);
+    }
+    None
 }
 
 /// How both directions of one pipe are bounded.
@@ -646,11 +789,22 @@ impl PipeConfig {
                 full: sending,
             },
             incoming: QueueConfig {
-                depth: DEFAULT_RECV_DEPTH,
+                depth: if PipeConfig::receives(protocol) {
+                    DEFAULT_RECV_DEPTH
+                } else {
+                    0
+                },
                 max_bytes: DEFAULT_QUEUE_BYTES,
                 full: FullAction::receiving(protocol),
             },
         }
+    }
+
+    /// Whether `protocol` has a receive operation, and so a use for an
+    /// incoming queue. PUB and PUSH do not: their queue holds nothing and
+    /// discards what a peer writes to them ([`FullAction::receiving`]).
+    pub const fn receives(protocol: EndpointType) -> bool {
+        !matches!(protocol, EndpointType::Pub | EndpointType::Push)
     }
 
     /// `NNG_OPT_SENDBUF`'s default for `protocol`: zero where a full queue
@@ -681,23 +835,64 @@ impl PipeConfig {
 #[derive(Clone, Debug)]
 pub struct Pipe {
     id: PipeId,
-    outgoing: std::sync::Arc<Queue>,
-    incoming: std::sync::Arc<Queue>,
+    outgoing: Arc<Queue>,
+    incoming: Arc<Queue>,
+    /// `NNG_OPT_RECVMAXSZ` of the endpoint that made this pipe, which is
+    /// what a protocol that takes a header off a message judges the rest
+    /// against. Zero is "no limit".
+    recv_limit: u64,
 }
 
 impl Pipe {
-    /// A pipe with both queues empty.
+    /// A pipe with both queues empty, feeding no socket-wide signal and
+    /// with no payload limit.
     pub fn new(id: PipeId, config: PipeConfig) -> Pipe {
         Pipe {
             id,
-            outgoing: std::sync::Arc::new(Queue::new(config.outgoing)),
-            incoming: std::sync::Arc::new(Queue::new(config.incoming)),
+            outgoing: Arc::new(Queue::new(config.outgoing)),
+            incoming: Arc::new(Queue::new(config.incoming)),
+            recv_limit: 0,
         }
+    }
+
+    /// A pipe whose queues feed `signals`: arrivals on the incoming side,
+    /// room on the outgoing one.
+    pub fn linked(id: PipeId, config: PipeConfig, signals: &Arc<Signals>) -> Pipe {
+        Pipe {
+            id,
+            outgoing: Arc::new(Queue::with_link(
+                config.outgoing,
+                Link::Outgoing(Arc::clone(signals)),
+            )),
+            incoming: Arc::new(Queue::with_link(
+                config.incoming,
+                Link::Incoming(Arc::clone(signals)),
+            )),
+            recv_limit: 0,
+        }
+    }
+
+    /// This pipe with `limit` as the payload limit its endpoint set, in
+    /// octets, where zero is no limit.
+    pub fn with_recv_limit(mut self, limit: u64) -> Pipe {
+        self.recv_limit = limit;
+        self
     }
 
     /// This pipe's id within its socket.
     pub const fn id(&self) -> PipeId {
         self.id
+    }
+
+    /// Whether a payload of `len` octets is within what this pipe's
+    /// endpoint admits.
+    ///
+    /// The transport judges a message by its declared length, header and
+    /// body together, before it knows where one ends; a protocol that takes
+    /// a header off the message — a tag stack — judges the payload that is
+    /// left with this, which is `NNG_OPT_RECVMAXSZ` exactly.
+    pub fn admits_payload(&self, len: usize) -> bool {
+        self.recv_limit == 0 || len as u64 <= self.recv_limit
     }
 
     /// Messages on their way to the peer.
@@ -792,9 +987,11 @@ mod tests {
     }
 
     /// Claim: the per-protocol table is the sheet's sentence — PUSH and PAIR
-    /// block, BUS and PUB and SURVEYOR drop — and an incoming queue always
-    /// blocks, because `SUB_PREFNEW` applies to the admitted publications
-    /// on the socket rather than to everything that arrived.
+    /// block, BUS and PUB and SURVEYOR drop — plus the two repliers, whose
+    /// reply is addressed to one pipe and must not wait for it; and an
+    /// incoming queue blocks, because `SUB_PREFNEW` applies to the admitted
+    /// publications on the socket rather than to everything that arrived —
+    /// except on the two protocols with no receive operation, which discard.
     #[test]
     fn the_full_queue_action_is_the_protocols_own() {
         assert_eq!(FullAction::sending(EndpointType::Push), FullAction::Block);
@@ -807,8 +1004,114 @@ mod tests {
             FullAction::sending(EndpointType::Surveyor),
             FullAction::Drop
         );
+        assert_eq!(FullAction::sending(EndpointType::Rep), FullAction::Drop);
+        assert_eq!(
+            FullAction::sending(EndpointType::Respondent),
+            FullAction::Drop
+        );
         assert_eq!(FullAction::receiving(EndpointType::Sub), FullAction::Block);
         assert_eq!(FullAction::receiving(EndpointType::Pull), FullAction::Block);
+        assert_eq!(FullAction::receiving(EndpointType::Rep), FullAction::Block);
+        assert_eq!(FullAction::receiving(EndpointType::Pub), FullAction::Drop);
+        assert_eq!(FullAction::receiving(EndpointType::Push), FullAction::Drop);
+    }
+
+    /// Claim: a reply queue drops when it is full instead of making its
+    /// sender wait. A queue under REP's configuration that is full accepts
+    /// the next message as a discard and the sender goes on, which is what
+    /// keeps one requester that stopped reading from parking a replier.
+    #[test]
+    fn a_reply_queue_that_is_full_drops_instead_of_waiting() {
+        let config = PipeConfig::of(EndpointType::Rep);
+        assert_eq!(config.outgoing.full, FullAction::Drop);
+        assert!(
+            config.outgoing.depth > 0,
+            "a depth of zero would drop every reply while the writer is busy"
+        );
+        let queue = Queue::new(QueueConfig {
+            depth: 1,
+            ..config.outgoing
+        });
+        futures::executor::block_on(async {
+            assert_eq!(queue.send(msg(1)).await.expect("room"), Sent::Queued);
+            let second = futures::poll!(std::pin::pin!(queue.send(msg(2))));
+            assert_eq!(
+                second,
+                std::task::Poll::Ready(Ok(Sent::Dropped)),
+                "a full reply queue must not make the sender wait"
+            );
+        });
+    }
+
+    /// Claim: a PUB or PUSH pipe holds nothing a peer writes to it. The
+    /// incoming queue of a protocol with no receive operation discards on
+    /// arrival, so a peer that streams data at it fills no memory.
+    #[test]
+    fn a_protocol_with_no_receive_operation_discards_what_arrives() {
+        for protocol in [EndpointType::Pub, EndpointType::Push] {
+            let config = PipeConfig::of(protocol);
+            assert!(!PipeConfig::receives(protocol));
+            let pipe = Pipe::new(PipeId::new(1), config);
+            futures::executor::block_on(async {
+                for _ in 0..20 {
+                    let sent = pipe
+                        .incoming()
+                        .send(Message::from_body(vec![0u8; 1024 * 1024]))
+                        .await
+                        .expect("accepted as a discard");
+                    assert_eq!(sent, Sent::Dropped, "{protocol:?}");
+                }
+            });
+            assert_eq!(pipe.incoming().queued_bytes(), 0, "{protocol:?}");
+            assert!(pipe.incoming().is_empty(), "{protocol:?}");
+            assert_eq!(pipe.incoming().dropped(), 20, "{protocol:?}");
+        }
+        assert!(PipeConfig::receives(EndpointType::Rep));
+        assert!(PipeConfig::of(EndpointType::Pull).incoming.depth > 0);
+    }
+
+    /// Claim: a wait created before a message goes in — on any pipe of a
+    /// socket — ends when it does, and so does one for room, with the wait
+    /// made *before* the look; the lost wake-up this rules out is a receive
+    /// that parks on a snapshot taken a moment before a pipe delivered.
+    #[test]
+    fn a_pipe_feeds_its_sockets_signals() {
+        let signals = Arc::new(Signals::new());
+        let config = PipeConfig::of(EndpointType::Pull);
+        let quiet = Pipe::linked(PipeId::new(1), config, &signals);
+        let busy = Pipe::linked(PipeId::new(2), config, &signals);
+        futures::executor::block_on(async {
+            let mut arrived = std::pin::pin!(signals.arrived());
+            assert!(
+                futures::poll!(arrived.as_mut()).is_pending(),
+                "nothing has arrived"
+            );
+            busy.incoming().send(msg(1)).await.expect("queued");
+            assert!(
+                futures::poll!(arrived.as_mut()).is_ready(),
+                "a message on any pipe ends the wait for one"
+            );
+            assert!(!quiet.incoming().has_messages());
+            assert!(busy.incoming().has_messages());
+
+            let mut room = std::pin::pin!(signals.room());
+            assert!(futures::poll!(room.as_mut()).is_pending());
+            busy.outgoing().close();
+            assert!(
+                futures::poll!(room.as_mut()).is_ready(),
+                "a pipe going away is a reason to look again"
+            );
+        });
+
+        // A wait created before the message is ended by it even if it is
+        // first polled afterwards, which is what `notified()` promises and
+        // what a snapshot-then-wait caller relies on.
+        futures::executor::block_on(async {
+            let early = signals.arrived();
+            quiet.incoming().send(msg(2)).await.expect("queued");
+            let mut early = std::pin::pin!(early);
+            assert!(futures::poll!(early.as_mut()).is_ready());
+        });
     }
 
     /// Claim: a depth-zero queue is a rendezvous and not an unbounded one.

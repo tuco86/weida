@@ -84,7 +84,7 @@ pub enum AuthMode {
 /// library that read files would have to decide what a relative path means
 /// and when to re-read it; a caller that has a path calls
 /// [`std::fs::read`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct TlsConfig {
     /// How hard to insist on the peer's certificate.
     pub auth_mode: AuthMode,
@@ -109,6 +109,42 @@ pub struct TlsConfig {
     /// in which case there is nothing in it to validate and this is the
     /// only way to say what to expect.
     pub server_name: Option<String>,
+}
+
+/// Prints a configuration without the secret half of it.
+///
+/// The key is configuration going in and nothing a log line or a failed
+/// `assert_eq!` should ever carry: it is "write-only, like NNG's", and a
+/// derived `Debug` would print the whole PEM as a list of numbers. The
+/// certificate chain and the CA are public material, so their size is
+/// shown and their content is not — enough to see that a configuration is
+/// the one that was meant.
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn size(pem: &Option<Vec<u8>>) -> String {
+            match pem {
+                Some(pem) => format!("Some(<{} octets>)", pem.len()),
+                None => "None".to_owned(),
+            }
+        }
+        f.debug_struct("TlsConfig")
+            .field("auth_mode", &self.auth_mode)
+            .field("ca_pem", &format_args!("{}", size(&self.ca_pem)))
+            .field("cert_pem", &format_args!("{}", size(&self.cert_pem)))
+            .field(
+                "key_pem",
+                &format_args!(
+                    "{}",
+                    if self.key_pem.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .field("server_name", &self.server_name)
+            .finish()
+    }
 }
 
 impl TlsConfig {
@@ -321,41 +357,121 @@ fn common_name(subject_der: &[u8]) -> Option<String> {
     None
 }
 
-/// Dials `stream` as a TLS client, checking the peer against
-/// `server_name`.
-pub async fn connect(
-    config: &TlsConfig,
-    server_name: &str,
-    stream: TcpStream,
-) -> Result<(TlsStream<TcpStream>, TlsPeer)> {
-    config.validate(false)?;
-    let name = ServerName::try_from(server_name.to_owned()).map_err(|_| {
-        Error::EADDRINVAL(format!("{server_name:?} is not a name a certificate can carry").into())
-    })?;
-    let connector = TlsConnector::from(config.client()?);
-    let tls = connector
-        .connect(name, stream)
-        .await
-        .map_err(peer_auth_error)?;
-    let verified = config.auth_mode != AuthMode::None;
-    let peer = TlsPeer::of(tls.get_ref().1.peer_certificates(), verified);
-    Ok((TlsStream::Client(tls), peer))
+/// The server side of a configuration, built once.
+///
+/// Parsing the PEM, loading the key and building the client verifier is
+/// work for the moment a listener binds, not for every connection that
+/// reaches it: a stranger chooses how many of those there are, and each
+/// would otherwise pay for it before it has proved anything. Cloning shares
+/// the built configuration.
+#[derive(Clone)]
+pub struct Acceptor {
+    acceptor: TlsAcceptor,
+    auth_mode: AuthMode,
 }
 
-/// Accepts `stream` as a TLS server.
-pub async fn accept(
-    config: &TlsConfig,
-    stream: TcpStream,
-) -> Result<(TlsStream<TcpStream>, TlsPeer)> {
-    config.validate(true)?;
-    let acceptor = TlsAcceptor::from(config.server()?);
-    let tls = acceptor.accept(stream).await.map_err(peer_auth_error)?;
-    let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
-    // Under `Optional` a client that presented nothing is unverified; under
-    // `Required` it could not have got this far without validating.
-    let verified = config.auth_mode != AuthMode::None && certificates.is_some();
-    let peer = TlsPeer::of(certificates.as_deref(), verified);
-    Ok((TlsStream::Server(tls), peer))
+impl Acceptor {
+    /// Validates `config` for a listener and builds its server side.
+    pub fn new(config: &TlsConfig) -> Result<Acceptor> {
+        config.validate(true)?;
+        Ok(Acceptor {
+            acceptor: TlsAcceptor::from(config.server()?),
+            auth_mode: config.auth_mode,
+        })
+    }
+}
+
+/// The client side of a configuration, built once for as many connections
+/// as a dialler makes.
+#[derive(Clone)]
+pub struct Connector {
+    connector: TlsConnector,
+    auth_mode: AuthMode,
+}
+
+impl Connector {
+    /// Validates `config` for a dialler and builds its client side.
+    pub fn new(config: &TlsConfig) -> Result<Connector> {
+        config.validate(false)?;
+        Ok(Connector {
+            connector: TlsConnector::from(config.client()?),
+            auth_mode: config.auth_mode,
+        })
+    }
+}
+
+/// A TLS handshake that is still to run on an established TCP connection.
+///
+/// Separate from the connection because the engine runs it **after** it has
+/// reserved the pipe slot and **under** the handshake deadline: a peer that
+/// connects and says nothing must hold nothing but that slot, and for no
+/// longer than the deadline, and a refused connection must cost the
+/// listener no cryptography.
+pub enum Handshake {
+    /// This side listens: it answers the peer's `ClientHello`.
+    Accept(Acceptor),
+    /// This side dialled: it checks the peer against `name`.
+    Connect {
+        /// The client side to run.
+        connector: Connector,
+        /// The name the peer's certificate is checked against.
+        name: ServerName<'static>,
+    },
+}
+
+impl Handshake {
+    /// The handshake of a listener's connection.
+    pub fn accept(acceptor: &Acceptor) -> Handshake {
+        Handshake::Accept(acceptor.clone())
+    }
+
+    /// The handshake of a dialled connection, checking the peer against
+    /// `server_name`. `NNG_EADDRINVAL` when that is not a name a
+    /// certificate can carry, which is judged before anything is dialled.
+    pub fn connect(connector: &Connector, server_name: &str) -> Result<Handshake> {
+        let name = ServerName::try_from(server_name.to_owned()).map_err(|_| {
+            Error::EADDRINVAL(
+                format!("{server_name:?} is not a name a certificate can carry").into(),
+            )
+        })?;
+        Ok(Handshake::Connect {
+            connector: connector.clone(),
+            name,
+        })
+    }
+
+    /// Runs the handshake on `stream`.
+    ///
+    /// Unbounded by itself: the caller races it against the handshake
+    /// deadline, which is what ends a peer that never answers.
+    pub async fn run(self, stream: TcpStream) -> Result<(TlsStream<TcpStream>, TlsPeer)> {
+        match self {
+            Handshake::Accept(side) => {
+                let tls = side
+                    .acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(peer_auth_error)?;
+                let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+                // Under `Optional` a client that presented nothing is
+                // unverified; under `Required` it could not have got this
+                // far without validating.
+                let verified = side.auth_mode != AuthMode::None && certificates.is_some();
+                let peer = TlsPeer::of(certificates.as_deref(), verified);
+                Ok((TlsStream::Server(tls), peer))
+            }
+            Handshake::Connect { connector, name } => {
+                let tls = connector
+                    .connector
+                    .connect(name, stream)
+                    .await
+                    .map_err(peer_auth_error)?;
+                let verified = connector.auth_mode != AuthMode::None;
+                let peer = TlsPeer::of(tls.get_ref().1.peer_certificates(), verified);
+                Ok((TlsStream::Client(tls), peer))
+            }
+        }
+    }
 }
 
 /// A failed TLS handshake is `NNG_EPEERAUTH` where it is about the peer's
@@ -493,5 +609,31 @@ mod tests {
         assert_eq!(common_name(&subject), Some("peer.test".to_owned()));
         assert_eq!(common_name(&[]), None);
         assert_eq!(common_name(&[0x30, 0x03, 0x55, 0x04, 0x03]), None);
+    }
+
+    /// Claim: no printout of a configuration, or of the options that carry
+    /// one, contains a byte of the private key. The key is write-only, and a
+    /// derived `Debug` printed it whole — as a list of numbers, which is why
+    /// the check is for the key's text and for its decimal rendering both.
+    #[test]
+    fn a_configuration_never_prints_its_private_key() {
+        let secret = b"SECRET-KEY-MATERIAL".to_vec();
+        let config = TlsConfig {
+            key_pem: Some(secret.clone()),
+            cert_pem: Some(b"-----BEGIN CERTIFICATE-----".to_vec()),
+            ..TlsConfig::default()
+        };
+        let options = crate::SocketOptions {
+            tls: Some(config.clone()),
+            ..crate::SocketOptions::default()
+        };
+        let decimal = format!("{secret:?}");
+        for shown in [format!("{config:?}"), format!("{options:?}")] {
+            assert!(!shown.contains("SECRET"), "{shown}");
+            assert!(!shown.contains(&decimal[1..decimal.len() - 1]), "{shown}");
+            assert!(shown.contains("redacted"), "{shown}");
+        }
+        let keyless = format!("{:?}", TlsConfig::default());
+        assert!(keyless.contains("key_pem: None"), "{keyless}");
     }
 }

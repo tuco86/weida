@@ -18,10 +18,11 @@
 //! SP has no error frame and no code to carry, so closing is the only remedy
 //! it defines [rfc-tcp §2]. `TagError` is the interesting case - a malformed
 //! tag stack makes the *message* unusable, and NNG's REP drops the message
-//! there but keeps the pipe when the count is merely too high, while it does
-//! close the pipe on a truncated tag [nng-src `rep.c`]. Both answers are
-//! expressible here, and which one the adapter uses is the adapter's, not the
-//! codec's.
+//! but keeps the pipe when the stack is merely too deep, because devices
+//! legitimately forward deep stacks, while it does close the pipe on a
+//! truncated tag [nng-src `rep.c`]. `is_violation` is exactly that split:
+//! only [`TagError::Truncated`] is a violation, and what the adapter does
+//! with the survivable two is the adapter's, not the codec's.
 
 use std::fmt;
 
@@ -132,10 +133,13 @@ pub enum TagError {
     /// than one tag. "If the reply is shorter than 32 bits, it is malformed
     /// and the endpoint MUST ignore it" [rfc-reqrep §5].
     Truncated,
-    /// The stack ran past `max_hops` tags without a terminator, or the body
-    /// ended before one appeared. The terminator is the tag with its most
-    /// significant bit set [rfc-reqrep §5]; the bound is the local `MAXTTL`
-    /// [nanomsg-nng §11].
+    /// The stack ran past `max_hops` tags without a terminator. The
+    /// terminator is the tag with its most significant bit set
+    /// [rfc-reqrep §5]; the bound is the local `MAXTTL` [nanomsg-nng §11].
+    /// **Not** a connection violation: a device pushes its own peer ID onto
+    /// the stack it forwards, so a stack at the bound arrives one tag deeper
+    /// at the next hop, and NNG drops such a message and keeps the pipe
+    /// [nng-src `rep.c`].
     NoTerminator {
         /// How many tags were read before giving up.
         hops: usize,
@@ -157,11 +161,13 @@ pub enum TagError {
 impl TagError {
     /// True if the error is fatal for the connection.
     ///
-    /// [`TagError::TooManyHops`] is not: the message is dropped and the pipe
-    /// survives, which is NNG's own behaviour and the one place in this codec
-    /// where a rejected input is not a rejected connection [nng-src `rep.c`].
+    /// Only [`TagError::Truncated`] is: a body that ends inside a tag cannot
+    /// be trusted, and NNG closes the pipe on it [nng-src `rep.c`].
+    /// [`TagError::NoTerminator`] and [`TagError::TooManyHops`] are not: the
+    /// message is dropped and the pipe survives, which is NNG's own behaviour
+    /// for a stack or count that devices legitimately push past the bound.
     pub const fn is_violation(self) -> bool {
-        !matches!(self, TagError::TooManyHops { .. })
+        matches!(self, TagError::Truncated)
     }
 }
 

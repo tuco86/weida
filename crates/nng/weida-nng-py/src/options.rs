@@ -58,6 +58,10 @@ impl PySocketOptions {
         max_pipes=None,
         handshake_timeout=None,
         max_addresses=None,
+        max_pipes_per_peer=None,
+        max_tls_handshakes=None,
+        message_timeout=None,
+        idle_timeout=None,
         sub_prefer_new=None,
         resend_time=None,
         max_ttl=None,
@@ -77,6 +81,10 @@ impl PySocketOptions {
         max_pipes: Option<usize>,
         handshake_timeout: Option<f64>,
         max_addresses: Option<usize>,
+        max_pipes_per_peer: Option<usize>,
+        max_tls_handshakes: Option<usize>,
+        message_timeout: Option<f64>,
+        idle_timeout: Option<f64>,
         sub_prefer_new: Option<bool>,
         resend_time: Option<f64>,
         max_ttl: Option<usize>,
@@ -116,6 +124,24 @@ impl PySocketOptions {
         )?;
         if let Some(addresses) = max_addresses {
             options.max_addresses = addresses;
+        }
+        if let Some(peers) = max_pipes_per_peer {
+            options.max_pipes_per_peer = peers;
+        }
+        if let Some(handshakes) = max_tls_handshakes {
+            options.max_tls_handshakes = handshakes;
+        }
+        if let Some(seconds) = message_timeout {
+            options.message_timeout = Some(errors::raise(
+                py,
+                seconds_to_duration("message_timeout", seconds),
+            )?);
+        }
+        if let Some(seconds) = idle_timeout {
+            options.idle_timeout = Some(errors::raise(
+                py,
+                seconds_to_duration("idle_timeout", seconds),
+            )?);
         }
         if let Some(prefer_new) = sub_prefer_new {
             options.sub_prefer_new = prefer_new;
@@ -198,6 +224,27 @@ impl PySocketOptions {
     #[getter]
     fn max_pipes(&self) -> usize {
         self.options.max_pipes
+    }
+
+    /// Pipes one remote host (or one local user, on `ipc`) may hold on one
+    /// listener's socket — a bound SP does not have and this library adds.
+    #[getter]
+    fn max_pipes_per_peer(&self) -> usize {
+        self.options.max_pipes_per_peer
+    }
+
+    /// How long one message may take to cross a connection, in seconds, or
+    /// `None` for no limit — a bound SP does not have and this library adds.
+    #[getter]
+    fn message_timeout(&self) -> Option<f64> {
+        self.options.message_timeout.map(|t| t.as_secs_f64())
+    }
+
+    /// How long a pipe may go with no octet moving in either direction, in
+    /// seconds, or `None` for no limit.
+    #[getter]
+    fn idle_timeout(&self) -> Option<f64> {
+        self.options.idle_timeout.map(|t| t.as_secs_f64())
     }
 
     fn __repr__(&self) -> String {
