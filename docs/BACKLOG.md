@@ -17,7 +17,7 @@ kind: code | size: 90 | status: done 44728e2 | needs: [B-341]
 acceptance: [0040](decisions/0040-swarm-pattern.md) §4.4: `Gather`/`Swarm`, `Runtime::swarm`, `Swarm::fetch`, `FetchOptions`, `Piece`, `Fetch` (`next`, `list`, `delivered`, abort on drop), `claim` with endgame (unit-tested); integration tests over QUIC loopback: a blob gathered from two seeders holding different halves, a corrupting seeder and a lying list dropped while the blob completes, a resumed fetch asks for no piece the caller holds, a seeder that connects mid-fetch joins it, no usable seeder is `NotConnected`, a silent seeder does not hold up the last piece, a one-piece blob needs no LIST and an empty one no seeder, a dropped fetch asks nothing more, and a seeder that is still fetching serves what it has.
 
 ### B-343 — 0040 into the normative documents
-kind: spec | size: 45 | status: ready | needs: [B-342]
+kind: spec | size: 45 | status: in_progress 2026-10-17T07:23Z | needs: [B-342]
 acceptance: [0040](decisions/0040-swarm-pattern.md) §4.5: PATTERNS §6.5 SWARM (pattern table, wire table, failure table naming each test) and a §7 row; INVARIANTS bounds (`MAX_PENDING_ASKS`, the 47-byte ask, `max_inflight` × piece size, `MAX_PIECES`, `SEED_STALL` + length / `MIN_RATE`); ARCHITECTURE §7 `Listener::seeder`, `Runtime::swarm`, `Fetch`, feature `swarm`; GUARANTEES §6 row; STATUS §1 and §4; requirements/griasdi-swarm.md answered.
 
 ### B-338 — The owner's decisions on the hardening deviations
