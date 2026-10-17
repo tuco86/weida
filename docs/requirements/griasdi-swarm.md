@@ -3,6 +3,27 @@
 Written by the griasdi side against weida `1339b3b` (0.1.0-alpha.8-dev);
 griasdi pins `=0.1.0-alpha.7` (root `Cargo.toml`, `weida`, `weida-raft`).
 
+**Answered by [decisions/0040](../decisions/0040-swarm-pattern.md) (accepted; shipped in
+B-340 to B-342).** The owner took the **pattern, not the system**: weida gets a SWARM pattern
+behind the off-by-default feature `swarm`, and storage and discovery stay the application's.
+Shipped: (a) the piece tree, as `BlobId`, `PieceSize`, `Blob`, `PieceList`, `TreeHasher` and
+`Bits`, with the root equal to `blake3::hash` of the bytes so griasdi's existing roots stay
+valid; (b) in its pattern form, `Listener::seeder`, whose `Seeder::accept` hands each decoded
+ask to the application as a `SeedRequest` that it answers from its own storage; (c) in its
+pattern form, `Runtime::swarm` and `Swarm::fetch`, whose `Fetch` asks every connected seeder
+at once, claims pieces at random with an endgame, bounds each ask by stall plus length at a
+minimum rate, drops a seeder that fails, stalls or sends a wrong piece, yields only verified
+pieces, and takes `max_peers` as the cap on concurrent sources. Not taken, each with its
+reason from 0040 §6: the **store** (`BlobStore`, the on-disk layout, `ingest`, resume), because
+the application keeps the bytes, the bit map and the list wherever it likes and passes `have`
+and the list back to resume; the **tracker and announcer** of (d), because discovery is
+Req/Rep plus `IncomingMeta::peer` and `Swarm::connect` during a fetch is the seam; the **seed**
+concept and `Seeder::admit`/`retire`, because every connected seeder is asked HAVE and a full
+holder simply answers full bits, while admission is the application's decision on each
+`SeedRequest`; **per-connection TLS**, because a `Swarm` has one `ClientTls`, so the
+application dials anonymously or uses one `Swarm` per identity; and **(e)**, following
+`weida_raft::Consensus::leader()`, because mapping a `NodeId` to a URL is the application's.
+
 ## Why griasdi asks
 
 griasdi ships every push to `main`. Today the CI signs one combined manifest

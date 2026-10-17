@@ -713,14 +713,16 @@ the datagrams itself, at most 1200 bytes each.
 
 ---
 
-## 6. PAIR, SURVEY, BUS and RADIO/DISH
+## 6. PAIR, SURVEY, BUS, RADIO/DISH and SWARM
 
 PAIR, SURVEY and BUS complete the nanomsg set ([ARCHITECTURE.md](ARCHITECTURE.md) §6b maps
 them), and RADIO/DISH is the pattern ZeroMQ names for lossy fan-out. The first three add **no
 wire vocabulary**: a `Paired` talks to a bare `Peer` and `Acceptor` on the same path, a
 `Respondent`'s route is byte-for-byte a replier's, a `BusMember`'s is a puller's. RADIO/DISH
-adds two keys, DATA `13` and SUBSCRIBE `2` (§6.4). Router/Dealer are emergent (§2); connecting
-publishers and binding pushers are deferred.
+adds two keys, DATA `13` and SUBSCRIBE `2` (§6.4). SWARM is no ZeroMQ pattern: it fetches one
+verified blob from many holders, sits behind the off-by-default feature `swarm`, rides the
+request route like SURVEY and adds nothing to [PROTOCOL.md](PROTOCOL.md) (§6.5).
+Router/Dealer are emergent (§2); connecting publishers and binding pushers are deferred.
 
 ### 6.1 PAIR
 
@@ -917,6 +919,94 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 `installing_an_admission_screens_joins_already_recorded`
 (`crates/weida/tests/radio.rs`).*
 
+### 6.5 SWARM
+
+Many sources, one verified blob ([decisions/0040](decisions/0040-swarm-pattern.md)). A blob is
+named by the BLAKE3 hash of its bytes and cut into pieces of a power-of-two size (1 KiB to
+16 MiB, `PieceSize`); the pieces' hashes, a `PieceList`, merge to that root, so every piece
+checks against the name alone and arrives in any order from any holder. `Listener::seeder`
+binds the holder's side and `Runtime::swarm` dials the fetcher's: `Swarm::fetch` asks **every
+connected seeder** what it holds (HAVE), then asks each for pieces the others are not already
+sending, and yields a `Piece` only after it verified. Both types need the cargo feature
+`swarm`, which links `blake3`.
+
+The pattern owns the transport and the check and nothing else. **The application owns storage**
+(a `Seeder` answers from whatever the application keeps; a `Fetch` hands the pieces over and
+remembers none), **admission** (every ask reaches the application as a `SeedRequest` carrying
+`meta()` and `connection()`, and it answers or `decline`s) and **discovery** (which peers to
+`connect`, which `Blob`s exist; connecting a seeder while a fetch runs is how a new holder
+joins it). Connections run one way: a `Swarm` dials and asks, a `Seeder` binds and answers, and
+nothing is fetched back over a connection the peer opened. A swarm path is its own connection
+beside any other path to the same peer, so bulk pieces do not share flow-control windows with
+a voice connection ([decisions/0002](decisions/0002-control-and-bulk-separation.md)).
+
+| | `Swarm` | `Seeder` |
+| --- | --- | --- |
+| Compatible peer | `Seeder`, or a `Replier` that speaks the wire below | `Swarm`, or a `Requester` that sends the wire below |
+| Direction | connects, and **accumulates** peers on purpose | binds |
+| Send/receive pattern | `connect` per seeder, then `fetch(blob, have, options)` and `Fetch::next` until `None` | `accept` → `SeedRequest` → `answer_list` / `answer_have` / `answer_piece`, or `decline`, or drop for `NO_REPLY` |
+| Incoming routing | the reply of the exchange that asked; a verified piece is yielded once, the first copy to verify | fair, bounded queue per path (`endpoint_queue`), read and decoded before the application sees it |
+| Outgoing routing | **one exchange per ask, on the connection of the seeder it targets** — not Req/Rep's round-robin pick; pieces are claimed per seeder from what its HAVE says it holds | the exchange that asked |
+| Action with no peer | `Error::NotConnected` from `Fetch::next`, immediately for a swarm that never connected; connecting a seeder and calling `next` again resumes | `accept` waits |
+| Transport | one exchange per ask on `Route::Request`, the route a replier uses; the reply is the raw answer, of a length the asker knows in advance | the same |
+| Ordering | none: pieces arrive in any order, and `Piece::index` says which | — |
+| Delivery signal | a `Piece` the fetch verified against the root. Nothing weaker is yielded | the answer's `Delivery`, a transport receipt (§1.2) |
+| Backpressure | `max_inflight` asks in all and `per_peer` per seeder, then the seeder's `max_concurrent_bidi_streams` on `open` (§1.4) | at most `MAX_PENDING_ASKS` (64) asks read or waiting; one more is dropped unread |
+| Cancellation | drop the `Fetch`: every ask in flight is aborted and nothing more is asked | drop the `SeedRequest`: ERROR `NO_REPLY`, as for a request (§2) |
+
+Three rules a caller can get wrong. **Verification is the fetch's, not the seeder's**:
+`answer_piece` checks the length and not the bytes; the fetch checks every piece and drops a
+seeder that sends a wrong one, so a bad piece never reaches the application's storage through a
+fetch. **A `Blob` of one piece has no list and an empty one has no
+pieces**: the first is checked against the root directly, the second yields `None` at once,
+with no seeder. And **a fetch asks only for what the caller lacks**: `have` says which pieces
+are already stored, `Fetch::delivered` is the running map, and `Fetch::list` hands out the
+verified list so a resumed fetch skips LIST.
+
+The ask, one exchange, big-endian ([decisions/0040](decisions/0040-swarm-pattern.md) §4.2):
+
+| offset | field |
+| --- | --- |
+| 0 | `u8` version = 1 |
+| 1 | `u8` ask: 1 = LIST, 2 = HAVE, 3 = PIECE |
+| 2 | `u8` piece log2 (10..=24) |
+| 3 | `[u8; 32]` root |
+| 35 | `u64` size |
+| 43 | `u32` index (PIECE only) |
+
+LIST and HAVE are 43 bytes, PIECE 47. The reply is raw bytes of an exact length: LIST
+`count × 32` (the chaining values), HAVE `ceil(count / 8)` (bit `i` is byte `i / 8`, mask
+`1 << (i % 8)`, padding bits zero), PIECE the piece's span (the last piece is short). A body of
+another length, another version, an unknown ask, a piece size out of range, a `Blob` that
+`Blob::new` refuses, size 0, LIST for a blob of at most one piece, or PIECE past the end is
+refused with `Rejected` before the application sees it.
+
+Failure modes, from the fetching side unless the row says otherwise:
+
+| Event | Result | Pinned by |
+| --- | --- | --- |
+| A seeder sends a piece that does not verify | the seeder is dropped **for this fetch**; its other asks are aborted and given back, and the blob completes from the rest | *`a_seeder_that_sends_a_wrong_piece_is_dropped_and_the_blob_completes`* |
+| A seeder sends a list that does not merge to the root | the same; no PIECE is asked of it | *`a_list_that_does_not_hash_to_the_root_drops_the_seeder`* |
+| A seeder declines (`decline`), drops the ask (`NoReply`) or answers a length other than the known one | the same: the fetch reads an error or a short reply, and does not retry the seeder | no test of its own: one path with the two rows above (`fault` in `swarm/gather.rs`) |
+| A seeder takes an ask and never answers | its ask expires after `stall` + length / `min_rate`, the seeder is dropped and the piece is asked elsewhere, so the last piece is not held up | *`a_silent_seeder_does_not_hold_up_the_last_piece`* |
+| The connection to a seeder is lost mid-ask (`ConnectionLost`, `Indeterminate`) | the seeder **keeps its place**, its pieces are given back and a redial brings it back; a lost ask is asked again, because an ask only reads | no test of its own |
+| No ask in flight and no seeder left that has not failed this fetch | `Err(Error::NotConnected)` from `next`; connecting a seeder and calling `next` again resumes | *`a_fetch_without_a_usable_seeder_is_not_connected`* |
+| A seeder joins during the fetch | it is asked HAVE at the next `next`, and takes pieces | *`a_seeder_that_connects_during_a_fetch_joins_it`* |
+| The `Fetch` is dropped | every ask in flight is aborted and nothing more is asked | *`a_dropped_fetch_asks_nothing_more`* |
+| An ask body is malformed (seeder's side; the asker reads `Error::Rejected`) | refused before `accept`; the application never sees it | *`a_malformed_ask_is_refused_before_accept`* |
+| The application answers with the wrong kind or shape (seeder's side) | the asker reads an error and **no bytes**, and `answer_*` returns `Error::Protocol` | *`an_answer_of_the_wrong_length_is_refused_and_reported`* |
+| More than `MAX_PENDING_ASKS` asks wait (seeder's side) | the surplus ask is dropped unread; its asker reads `Error::NoReply` and the fetch drops that seeder | no test of its own |
+
+A seeder that is still fetching serves what it has: it feeds the pieces its `Fetch` yields into
+the storage its `Seeder` answers from, answers HAVE with the bits it holds so far, and a seeder
+with nothing to give is asked HAVE again every `have_refresh` (5 s), which is how a node that is
+still filling serves another
+(*`a_seeder_that_is_still_fetching_serves_what_it_has`*). The other tests of the fetch are
+*`a_blob_is_gathered_from_seeders_holding_different_halves`*,
+*`a_fetch_asks_only_for_pieces_the_caller_lacks`* and
+*`a_blob_of_one_piece_needs_no_list_and_an_empty_blob_no_seeder`*
+(`crates/weida/tests/swarm.rs`, run with `cargo test -p weida --features swarm`).
+
 ---
 
 ## 7. Choosing
@@ -937,3 +1027,4 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 | how far the far end got, not merely whether it finished | cursors, via `OutgoingTransfer::cursors` | a whole-message verdict tells an interrupted sender nothing; an absolute offset tells it a number (§1.11) |
 | voice, or any unit worthless once late, to one peer | a datagram flow | never sent late, never waits, loses its oldest at a bound, and says what it lost (§5) |
 | a live feed to many, where a laggard should lose the old unit rather than the new one | RADIO/DISH | supersession and per-dish expiry reset what is late, a layered unit loses its upper layers first, and a joiner starts at the next segment (§6.4) |
+| one blob from many holders, each piece checked against the blob's name | SWARM (feature `swarm`) | a fetch asks every connected seeder at once, claims each missing piece from one holder, and yields it only after it verified against the BLAKE3 root; storage and discovery stay the application's (§6.5) |

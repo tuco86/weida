@@ -81,6 +81,16 @@ adds wire vocabulary — DATA keys `13` and `14` for the segment and its layer, 
 and `3` for the dish's latency budget and layer cap, and the FLOW frame kind — while PAIR,
 SURVEY and BUS add none.
 
+**A blob from many holders is a pattern, not a system.** SWARM ([decisions/0040](decisions/0040-swarm-pattern.md))
+is behind the off-by-default feature `swarm`. `Listener::seeder` binds the holder's side and
+answers each ask from the application's own storage; `Runtime::swarm` dials every seeder it is
+given, and `Swarm::fetch` takes one content-addressed blob from all of them at once, checking
+each piece against the BLAKE3 root before it yields it. The root is the plain `blake3::hash`
+of the bytes, so the pieces come in any order from any holder and a lying seeder is dropped
+for that fetch while the blob completes. It adds **no wire vocabulary** (one exchange per ask
+on the request route, like SURVEY), and it keeps no store and no tracker: the application
+stores the pieces it is handed and decides who to connect to.
+
 **A small message is mostly payload.** A trace context is propagated and never minted
 ([0028](decisions/0028-trace-propagation-is-the-callers.md)), so a 64-byte push is twelve bytes
 of framing and weida is in ZMTP's and SP's class on small messages
@@ -152,6 +162,11 @@ Behind them sit the phases of [IMPLEMENTATION.md](IMPLEMENTATION.md) §1 that ar
 persistence, consensus-backed clustering, the Web binding, and the language bindings after
 Python, whose order is Node, Erlang, C, Java
 ([0030](decisions/0030-which-runtimes-and-in-which-order.md)).
+
+What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
+announcer, a blob store, one identity per connection and following a Raft leader stay out of
+weida ([0040](decisions/0040-swarm-pattern.md) §6), and mirrors of SWARM in `weida::blocking`
+and Python are filed when a caller needs them.
 
 ## 5. What needs a human
 
