@@ -9,7 +9,7 @@ kind: code | size: 90 | status: done ad5eb84 | needs: []
 acceptance: [0040](decisions/0040-swarm-pattern.md) §4.1: feature `swarm` on `weida` linking `blake3`; `crates/weida/src/swarm/tree.rs` with `MAX_PIECES`, `BlobId` (hex `Display`/`FromStr`), `PieceSize` (1 KiB..16 MiB), `Blob` (`count`, `span`), `PieceList` (`of`, `parse`, `to_bytes`, `check`), `TreeHasher`, `Bits`; unit tests: the root equals `blake3::hash` for twelve sizes around piece boundaries, a changed list byte is refused, `check` refuses a flipped bit, a piece in another slot and a wrong length, `Bits` refuses padding bits, `Blob::new` refuses `MAX_PIECES + 1`; LOOP §6 lists the feature run.
 
 ### B-341 — SWARM seeder: Listener::seeder, the ask wire, SeedRequest
-kind: code | size: 90 | status: in_progress 2026-10-17T07:10Z | needs: [B-340]
+kind: code | size: 90 | status: done 0f12031 | needs: [B-340]
 acceptance: [0040](decisions/0040-swarm-pattern.md) §4.2-§4.3: `swarm/wire.rs` with the 43/47-byte ask and its refusals (table-driven unit test); `Seed`/`Seeder` on `Route::Request`, `Listener::seeder`, `Seeder::accept`, `SeedRequest` with `answer_list`/`answer_have`/`answer_piece`/`decline`; `MAX_PENDING_ASKS` 64, ask body under `header_timeout_ms`, answer under `SEED_STALL` + length / `MIN_RATE`; tests: a malformed ask is refused before `accept` and a hand-built HAVE reaches it; an answer of the wrong length is refused and reported as `Error::Protocol`.
 
 ### B-342 — SWARM fetch: Runtime::swarm, Fetch over every seeder
