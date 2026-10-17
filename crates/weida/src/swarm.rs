@@ -10,9 +10,30 @@
 //! [`PieceList`] (the piece hashes, checked against [`Blob::root`]),
 //! [`TreeHasher`] (builds that list in one pass over the bytes) and [`Bits`]
 //! (which pieces someone holds).
+//!
+//! The bound side is a [`crate::Seeder`]: it hands each [`Ask`] to the
+//! application as a [`SeedRequest`], which the application answers from its
+//! own storage. One exchange per ask, on the request route a replier uses,
+//! so SWARM adds no frame to the protocol.
 
+mod seed;
 mod tree;
+mod wire;
 
+pub use seed::{MAX_PENDING_ASKS, MIN_RATE, SEED_STALL, SeedRequest, SeedState};
 pub use tree::{
     Bits, Blob, BlobId, MAX_PIECES, ParseBlobIdError, PieceList, PieceSize, TreeHasher,
 };
+
+/// What a swarm asks a seeder about one [`Blob`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// The piece list, answered with [`SeedRequest::answer_list`]. Never
+    /// asked for a blob of at most one piece, which has no list.
+    List,
+    /// Which pieces the seeder can serve now, answered with
+    /// [`SeedRequest::answer_have`].
+    Have,
+    /// The bytes of one piece, answered with [`SeedRequest::answer_piece`].
+    Piece(u32),
+}

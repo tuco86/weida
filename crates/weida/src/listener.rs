@@ -690,6 +690,26 @@ impl Listener {
         Ok(Endpoint::from_state(RespondState::new(path, rx)))
     }
 
+    /// Registers a SWARM seeder for `path`
+    /// ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
+    ///
+    /// An ask is an exchange, so the route is a replier's, byte for byte.
+    /// What a seeder adds is above it: each ask's body is read under
+    /// `Limits::header_timeout_ms` and decoded before the application sees
+    /// it, at most [`crate::MAX_PENDING_ASKS`] at once, and an answer is
+    /// checked for shape before it is sent.
+    #[cfg(feature = "swarm")]
+    pub fn seeder(&self, path: &str) -> Result<crate::Seeder, Error> {
+        validate_endpoint_path(path)?;
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
+        self.inner.namespace.register(path, Route::Request(tx))?;
+        Ok(Endpoint::from_state(crate::swarm::SeedState::new(
+            path,
+            rx,
+            &self.inner.runtime,
+        )))
+    }
+
     /// Registers a bus member on `path` that dials the others on `tls`'s
     /// terms.
     ///

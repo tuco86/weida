@@ -32,6 +32,8 @@ mod reqrep;
 mod stats;
 mod streams;
 mod survey;
+#[cfg(feature = "swarm")]
+mod swarm;
 mod tls_trust;
 mod transports;
 mod unsafe_guard;

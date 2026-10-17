@@ -68,6 +68,10 @@ pub enum Bus {}
 pub enum Cast {}
 /// The receiving side of RADIO/DISH.
 pub enum Tune {}
+/// The bound side of SWARM: answers asks about blobs from the application's
+/// storage ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
+#[cfg(feature = "swarm")]
+pub enum Seed {}
 
 impl sealed::Sealed for Req {}
 impl Pattern for Req {
@@ -129,6 +133,13 @@ impl Pattern for Tune {
     type State = crate::radio::DishState;
 }
 
+#[cfg(feature = "swarm")]
+impl sealed::Sealed for Seed {}
+#[cfg(feature = "swarm")]
+impl Pattern for Seed {
+    type State = crate::swarm::SeedState;
+}
+
 /// A typed messaging endpoint.
 pub struct Endpoint<P: Pattern> {
     state: P::State,
@@ -167,6 +178,10 @@ pub type Radio = Endpoint<Cast>;
 /// The receiving half of RADIO/DISH: connects, joins topics, and receives
 /// the newest segment of each.
 pub type Dish = Endpoint<Tune>;
+/// The bound half of SWARM: hands each ask about a blob to the application,
+/// which answers it from its own storage.
+#[cfg(feature = "swarm")]
+pub type Seeder = Endpoint<Seed>;
 
 /// State of a requester.
 pub struct ReqState {
