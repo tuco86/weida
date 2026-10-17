@@ -29,8 +29,7 @@ const SHORT: usize = 43;
 /// The longest ask, PIECE: the cap a seeder reads an ask body under.
 pub(crate) const MAX_ASK_BYTES: usize = 47;
 
-/// Encodes `ask` for `blob`. Only the tests ask until the fetch side exists.
-#[cfg(test)]
+/// Encodes `ask` for `blob`.
 pub(crate) fn encode(blob: &Blob, ask: Ask) -> Vec<u8> {
     let mut out = Vec::with_capacity(MAX_ASK_BYTES);
     out.push(VERSION);

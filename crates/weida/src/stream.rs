@@ -271,6 +271,37 @@ impl PeerShared {
             .collect()
     }
 
+    /// Every live connection with the URL it was dialled as: what a pattern
+    /// that tracks each peer by its address needs, the same filter as
+    /// [`PeerShared::live_peers`].
+    #[cfg(feature = "swarm")]
+    pub(crate) fn live_slots(&self) -> Vec<(Arc<str>, ConnHandle, Arc<str>)> {
+        self.slots
+            .lock()
+            .expect("peer list poisoned")
+            .iter()
+            .filter_map(|slot| match &slot.state {
+                SlotState::Live(conn) if conn.conn.close_reason().is_none() => Some((
+                    Arc::clone(&slot.url),
+                    ConnHandle::clone(conn),
+                    Arc::clone(&slot.path),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether some address `skip` does not name is live or being
+    /// redialled: whether waiting can still bring a connection.
+    #[cfg(feature = "swarm")]
+    pub(crate) fn has_slot_besides(&self, skip: impl Fn(&str) -> bool) -> bool {
+        self.slots
+            .lock()
+            .expect("peer list poisoned")
+            .iter()
+            .any(|slot| !skip(&slot.url) && !matches!(slot.state, SlotState::Gone(_)))
+    }
+
     fn set_state(&self, id: u64, state: SlotState) {
         let mut slots = self.slots.lock().expect("peer list poisoned");
         if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
@@ -709,6 +740,14 @@ impl Peer {
     /// and the write.
     pub(crate) fn live_peers(&self) -> Vec<(ConnHandle, Arc<str>)> {
         self.shared.live_peers()
+    }
+
+    /// A handle on this peer's state that does not keep it alive, for a
+    /// value that outlives a borrow of the endpoint but must not outlive the
+    /// endpoint.
+    #[cfg(feature = "swarm")]
+    pub(crate) fn downgrade(&self) -> Weak<PeerShared> {
+        Arc::downgrade(&self.shared)
     }
 }
 

@@ -96,7 +96,7 @@ pub use endpoint::{
     Survey, SurveyRun, Surveyor, Tune,
 };
 #[cfg(feature = "swarm")]
-pub use endpoint::{Seed, Seeder};
+pub use endpoint::{Gather, Seed, Seeder, Swarm};
 pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow};
 pub use handoff::Handoff;
 pub use identity::{
@@ -118,8 +118,8 @@ pub use stats::{ConnectionStats, PathStats, RemoteStats, TransportStats, UdpCoun
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 #[cfg(feature = "swarm")]
 pub use swarm::{
-    Ask, Bits, Blob, BlobId, MAX_PENDING_ASKS, MAX_PIECES, MIN_RATE, ParseBlobIdError, PieceList,
-    PieceSize, SEED_STALL, SeedRequest, TreeHasher,
+    Ask, Bits, Blob, BlobId, Fetch, FetchOptions, MAX_PENDING_ASKS, MAX_PIECES, MIN_RATE,
+    ParseBlobIdError, Piece, PieceList, PieceSize, SEED_STALL, SeedRequest, TreeHasher,
 };
 pub use transfer::{
     ConnectionId, Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer,

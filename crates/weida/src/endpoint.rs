@@ -72,6 +72,9 @@ pub enum Tune {}
 /// storage ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
 #[cfg(feature = "swarm")]
 pub enum Seed {}
+/// The dialling side of SWARM: gathers one blob from every connected seeder.
+#[cfg(feature = "swarm")]
+pub enum Gather {}
 
 impl sealed::Sealed for Req {}
 impl Pattern for Req {
@@ -140,6 +143,13 @@ impl Pattern for Seed {
     type State = crate::swarm::SeedState;
 }
 
+#[cfg(feature = "swarm")]
+impl sealed::Sealed for Gather {}
+#[cfg(feature = "swarm")]
+impl Pattern for Gather {
+    type State = crate::swarm::GatherState;
+}
+
 /// A typed messaging endpoint.
 pub struct Endpoint<P: Pattern> {
     state: P::State,
@@ -182,6 +192,10 @@ pub type Dish = Endpoint<Tune>;
 /// which answers it from its own storage.
 #[cfg(feature = "swarm")]
 pub type Seeder = Endpoint<Seed>;
+/// The dialling half of SWARM: connects to seeders and fetches a blob from
+/// all of them at once, verifying every piece against the root.
+#[cfg(feature = "swarm")]
+pub type Swarm = Endpoint<Gather>;
 
 /// State of a requester.
 pub struct ReqState {

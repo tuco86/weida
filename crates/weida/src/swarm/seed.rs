@@ -148,7 +148,7 @@ impl crate::Seeder {
     }
 }
 
-/// One ask a swarm sent to this seeder: LIST, HAVE or PIECE of
+/// One ask a [`crate::Swarm`] sent to this seeder: LIST, HAVE or PIECE of
 /// one [`Blob`].
 ///
 /// Answer it with the method that matches [`SeedRequest::ask`], or

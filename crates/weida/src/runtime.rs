@@ -363,6 +363,19 @@ impl Runtime {
         ))
     }
 
+    /// Creates a SWARM fetcher that dials seeders on `tls`'s terms
+    /// ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
+    ///
+    /// Like a surveyor, a swarm uses **every** seeder it connected to: one
+    /// [`crate::Fetch`] takes pieces from all of them at once.
+    #[cfg(feature = "swarm")]
+    pub fn swarm(&self, tls: impl Into<ClientTls>) -> crate::Swarm {
+        Endpoint::from_state(crate::swarm::GatherState::new(
+            Arc::clone(&self.inner),
+            Arc::new(tls.into()),
+        ))
+    }
+
     /// Closes every binding and pooled connection, then waits — for at most
     /// [`RuntimeConfig::shutdown_timeout`] — for the sockets to go idle, so
     /// peers see a clean `SHUTDOWN` rather than a timeout.

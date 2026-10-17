@@ -14,12 +14,16 @@
 //! The bound side is a [`crate::Seeder`]: it hands each [`Ask`] to the
 //! application as a [`SeedRequest`], which the application answers from its
 //! own storage. One exchange per ask, on the request route a replier uses,
-//! so SWARM adds no frame to the protocol.
+//! so SWARM adds no frame to the protocol. The dialling side is a
+//! [`crate::Swarm`]: its [`Fetch`] asks every connected seeder at once and
+//! yields each [`Piece`] once it verifies against the root.
 
+mod gather;
 mod seed;
 mod tree;
 mod wire;
 
+pub use gather::{Fetch, FetchOptions, GatherState, Piece};
 pub use seed::{MAX_PENDING_ASKS, MIN_RATE, SEED_STALL, SeedRequest, SeedState};
 pub use tree::{
     Bits, Blob, BlobId, MAX_PIECES, ParseBlobIdError, PieceList, PieceSize, TreeHasher,
