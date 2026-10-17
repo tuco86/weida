@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-340 — SWARM piece tree: BlobId, PieceList, Bits, feature swarm
-kind: code | size: 90 | status: in_progress 2026-10-17T07:05Z | needs: []
+kind: code | size: 90 | status: done ad5eb84 | needs: []
 acceptance: [0040](decisions/0040-swarm-pattern.md) §4.1: feature `swarm` on `weida` linking `blake3`; `crates/weida/src/swarm/tree.rs` with `MAX_PIECES`, `BlobId` (hex `Display`/`FromStr`), `PieceSize` (1 KiB..16 MiB), `Blob` (`count`, `span`), `PieceList` (`of`, `parse`, `to_bytes`, `check`), `TreeHasher`, `Bits`; unit tests: the root equals `blake3::hash` for twelve sizes around piece boundaries, a changed list byte is refused, `check` refuses a flipped bit, a piece in another slot and a wrong length, `Bits` refuses padding bits, `Blob::new` refuses `MAX_PIECES + 1`; LOOP §6 lists the feature run.
 
 ### B-341 — SWARM seeder: Listener::seeder, the ask wire, SeedRequest
