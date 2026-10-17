@@ -4,6 +4,22 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-340 — SWARM piece tree: BlobId, PieceList, Bits, feature swarm
+kind: code | size: 90 | status: ready | needs: []
+acceptance: [0040](decisions/0040-swarm-pattern.md) §4.1: feature `swarm` on `weida` linking `blake3`; `crates/weida/src/swarm/tree.rs` with `MAX_PIECES`, `BlobId` (hex `Display`/`FromStr`), `PieceSize` (1 KiB..16 MiB), `Blob` (`count`, `span`), `PieceList` (`of`, `parse`, `to_bytes`, `check`), `TreeHasher`, `Bits`; unit tests: the root equals `blake3::hash` for twelve sizes around piece boundaries, a changed list byte is refused, `check` refuses a flipped bit, a piece in another slot and a wrong length, `Bits` refuses padding bits, `Blob::new` refuses `MAX_PIECES + 1`; LOOP §6 lists the feature run.
+
+### B-341 — SWARM seeder: Listener::seeder, the ask wire, SeedRequest
+kind: code | size: 90 | status: ready | needs: [B-340]
+acceptance: [0040](decisions/0040-swarm-pattern.md) §4.2-§4.3: `swarm/wire.rs` with the 43/47-byte ask and its refusals (table-driven unit test); `Seed`/`Seeder` on `Route::Request`, `Listener::seeder`, `Seeder::accept`, `SeedRequest` with `answer_list`/`answer_have`/`answer_piece`/`decline`; `MAX_PENDING_ASKS` 64, ask body under `header_timeout_ms`, answer under `SEED_STALL` + length / `MIN_RATE`; tests: a malformed ask is refused before `accept` and a hand-built HAVE reaches it; an answer of the wrong length is refused and reported as `Error::Protocol`.
+
+### B-342 — SWARM fetch: Runtime::swarm, Fetch over every seeder
+kind: code | size: 90 | status: ready | needs: [B-341]
+acceptance: [0040](decisions/0040-swarm-pattern.md) §4.4: `Gather`/`Swarm`, `Runtime::swarm`, `Swarm::fetch`, `FetchOptions`, `Piece`, `Fetch` (`next`, `list`, `delivered`, abort on drop), `claim` with endgame (unit-tested); integration tests over QUIC loopback: a blob gathered from two seeders holding different halves, a corrupting seeder and a lying list dropped while the blob completes, a resumed fetch asks for no piece the caller holds, a seeder that connects mid-fetch joins it, no usable seeder is `NotConnected`, a silent seeder does not hold up the last piece, a one-piece blob needs no LIST and an empty one no seeder, a dropped fetch asks nothing more, and a seeder that is still fetching serves what it has.
+
+### B-343 — 0040 into the normative documents
+kind: spec | size: 45 | status: ready | needs: [B-342]
+acceptance: [0040](decisions/0040-swarm-pattern.md) §4.5: PATTERNS §6.5 SWARM (pattern table, wire table, failure table naming each test) and a §7 row; INVARIANTS bounds (`MAX_PENDING_ASKS`, the 47-byte ask, `max_inflight` × piece size, `MAX_PIECES`, `SEED_STALL` + length / `MIN_RATE`); ARCHITECTURE §7 `Listener::seeder`, `Runtime::swarm`, `Fetch`, feature `swarm`; GUARANTEES §6 row; STATUS §1 and §4; requirements/griasdi-swarm.md answered.
+
 ### B-338 — The owner's decisions on the hardening deviations
 kind: code | size: 45 | status: done c7fe805 | needs: [B-331, B-330]
 acceptance: weida-zmq's `ipc://` bind takes a live endpoint over as libzmq does, through `BoundUnixSocket::bind_replacing` (weida and weida-nng keep refusing a live listener); a broker consumer whose delivery stalls or fails at the transport has its connection closed with `LIMIT_EXCEEDED` through `weida::Consumer::close`, so its redial re-subscribes; the per-message overhead measured (about 1.7 KB while out for delivery, 136-240 B queued) and the constant left at 1024 by the owner.
