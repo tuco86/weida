@@ -20,6 +20,11 @@ generate = ["dep:rcgen"]
 # with no executor. Off by default, like every other library's in this
 # tree, because an application that has a reactor wants the async surface.
 blocking = ["dep:futures"]
+# `weida::Seeder` and `weida::Swarm`: many sources, one verified blob
+# (`docs/decisions/0040-swarm-pattern.md`). Off by default because it links
+# `blake3` for the piece tree, which an application that moves no
+# content-addressed blobs has no use for.
+swarm = ["dep:blake3"]
 
 [dependencies]
 weida-core.workspace = true
@@ -48,6 +53,8 @@ rcgen = { workspace = true, optional = true }
 # The blocking facade drives this crate's own futures on the calling thread
 # with `futures::executor::block_on`; the async surface needs none of it.
 futures = { workspace = true, optional = true }
+# The piece tree of SWARM: position-bound chaining values via `blake3::hazmat`.
+blake3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Tests, examples and benches generate throwaway identities even when a

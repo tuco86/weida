@@ -102,6 +102,11 @@ serde_json = "1"
 # Public roots for an OpenBao behind a public certificate, when no CA is
 # configured: the Mozilla set as rustls-pki-types, nothing platform-specific.
 webpki-roots = "1"
+# The piece tree of SWARM ([decisions/0040](docs/decisions/0040-swarm-pattern.md)
+# §4): `blake3::hazmat` gives the position-bound chaining values and the
+# subtree merge, so the root of a piece tree equals `blake3::hash` of the whole
+# blob. Linked only with the `swarm` feature of `weida`.
+blake3 = "1.8"
 
 # 0.11.12 is the first release that requires `quinn-proto` 0.11.18, whose
 # `PathStats` carries `min_rtt` ([decisions/0036](docs/decisions/0036-connection-statistics.md) §2.1).

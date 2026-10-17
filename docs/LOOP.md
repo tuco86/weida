@@ -129,6 +129,7 @@ therefore also runs, for each crate whose sources it touched:
 | crate | feature | commands |
 | --- | --- | --- |
 | `weida` | `blocking` | `clippy -p weida --features blocking --all-targets -- -D warnings`, `test -p weida --features blocking` |
+| `weida` | `swarm` | `clippy -p weida --features swarm --all-targets -- -D warnings`, `test -p weida --features swarm` |
 | `weida-zmq` | `blocking` | the same two with `-p weida-zmq` |
 | `weida-mqtt` | `blocking` | the same two with `-p weida-mqtt` |
 | `weida-nng` | `blocking` | the same two with `-p weida-nng` |

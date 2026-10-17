@@ -81,6 +81,9 @@ mod transfer;
 mod transport;
 #[cfg(unix)]
 mod unix;
+// SWARM: many sources, one verified blob (decisions/0040).
+#[cfg(feature = "swarm")]
+mod swarm;
 
 pub use config::{
     Alpn, ClientTls, ClientTrust, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust,
@@ -111,6 +114,10 @@ pub use runtime::Runtime;
 pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
 pub use stats::{ConnectionStats, PathStats, RemoteStats, TransportStats, UdpCounts};
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
+#[cfg(feature = "swarm")]
+pub use swarm::{
+    Bits, Blob, BlobId, MAX_PIECES, ParseBlobIdError, PieceList, PieceSize, TreeHasher,
+};
 pub use transfer::{
     ConnectionId, Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer,
     ReplyStream, TransferMeta, new_trace,
