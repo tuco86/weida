@@ -1147,7 +1147,20 @@ The surface of crate `weida`, grouped by layer.
 // error variants: Error::InvalidFingerprint(String), Error::Untrusted(Fingerprint)
 pub struct RuntimeConfig { pub limits: Limits,
     pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/,
-    pub worker_threads: usize /*1; Runtime::owned only*/ }                   // Default impl
+    pub worker_threads: usize /*1; Runtime::owned only*/,
+    pub network: Network /*OS UDP; SimNet with test-util*/ }                 // Default impl
+pub struct Network { .. }                                    // Default: the OS's UDP
+impl Network { pub fn sim(net: &SimNet) -> Network; }      // feature `test-util` (0042)
+pub struct SimNet { .. }                                     // feature `test-util`; Clone to share
+impl SimNet {                                               // real QUIC and TLS over memory
+    pub fn new() -> SimNet;
+    pub fn set_delay(&self, addr: SocketAddr, one_way: Duration);   // ZERO clears it
+    pub fn drop_next(&self, addr: SocketAddr, datagrams: u64);      // QUIC retransmits them
+    pub fn partition(&self, addr: SocketAddr);              // lost at idle_timeout (IdleTimeout)
+    pub fn heal(&self, addr: SocketAddr);
+    pub fn stats(&self) -> SimStats;
+}
+pub struct SimStats { pub delivered: u64, pub dropped: u64 }
 pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file
 pub struct Identity { pub cert_chain: Pem, pub key: Pem }   // who I am; Debug never prints the key
 impl Identity {

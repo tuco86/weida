@@ -95,6 +95,16 @@ caller that stops taking stops the sender. It adds **no wire vocabulary** (one e
 session on the request route, like SURVEY; version-1 asks still served), and it keeps no store
 and no tracker: the application stores the pieces it is handed and decides who to connect to.
 
+**Tests need no network.** `RuntimeConfig::network` picks where a runtime's QUIC sockets live:
+the operating system's UDP, or, behind the off-by-default feature `test-util`, a `SimNet`
+([decisions/0042](decisions/0042-simulated-network.md)): an in-memory UDP network that the
+unmodified QUIC and TLS stacks run over. Fixture code stays what it is over loopback
+(`bind_quic`, a pinned `weida://fp@127.0.0.1:port/..` URL), so identities, mTLS refusals,
+redials and their `PeerEvent`s are the real ones. Per-port delay, drop and partition faults
+stand in for a slow path, packet loss and an unannounced disconnect. Every wait weida measures
+is on the runtime's clock (`Exec::now`), so a test under `start_paused` spends paused minutes
+of idle timeout and backoff in milliseconds of wall time.
+
 **A small message is mostly payload.** A trace context is propagated and never minted
 ([0028](decisions/0028-trace-propagation-is-the-callers.md)), so a 64-byte push is twelve bytes
 of framing and weida is in ZMTP's and SP's class on small messages
