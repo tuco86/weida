@@ -830,6 +830,40 @@ impl IncomingTransfer {
         self.read_capped(max_bytes).await
     }
 
+    /// Appends exactly `n` bytes of the payload to `out`: one frame of a
+    /// stream that carries several (a SWARM session).
+    ///
+    /// `Ok(false)` when the payload ends before the first byte, which is a
+    /// clean end between frames; an end after some bytes is
+    /// [`Error::Protocol`]. Transport errors come through as they are, so a
+    /// caller still tells [`Error::ConnectionLost`] from a refusal.
+    #[cfg(feature = "swarm")]
+    pub(crate) async fn read_exact_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        n: usize,
+    ) -> Result<bool, Error> {
+        out.reserve(n);
+        let mut got = 0;
+        while got < n {
+            match self.stream.read_into(out, n - got).await {
+                Ok(Some(read)) => got += read,
+                Ok(None) => {
+                    self.done = true;
+                    if got == 0 {
+                        return Ok(false);
+                    }
+                    return Err(Error::Protocol("payload ended inside a swarm frame".into()));
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// The metadata, shared: a handle that outlives a borrow of the transfer
     /// (the dispatcher reads its path while it hands the transfer over).
     pub(crate) fn meta_arc(&self) -> Arc<IncomingMeta> {

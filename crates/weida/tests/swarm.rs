@@ -10,7 +10,7 @@ use std::time::Duration;
 use common::Server;
 use weida::{
     Ask, Bits, Blob, BlobId, Error, Fetch, FetchOptions, PieceList, PieceSize, Runtime,
-    RuntimeConfig, SeedRequest, TransferMeta, Trust,
+    RuntimeConfig, SeedSession, TransferMeta, Trust,
 };
 
 /// Generous ceiling: every assertion below should settle well within it.
@@ -55,15 +55,20 @@ async fn a_malformed_ask_is_refused_before_accept() {
         async move { requester.request(&ask).await?.collect(64).await }
     };
     let answering = async {
-        let ask = seeder.accept().await.expect("the HAVE reaches the seeder");
+        let mut session = seeder.accept().await.expect("the HAVE reaches the seeder");
         assert_eq!(
-            ask.blob(),
+            session.blob(),
             Blob::new(root, 3000, PieceSize::MIN).expect("blob")
         );
-        assert_eq!(ask.ask(), Ask::Have);
+        assert_eq!(session.next().await.expect("an order"), Some(Ask::Have));
         let mut have = Bits::new(3);
         have.set(1, true);
-        ask.answer_have(&have).await.expect("answered");
+        session.answer_have(&have).await.expect("answered");
+        assert_eq!(
+            session.next().await.expect("the end"),
+            None,
+            "a version-1 ask is a session of one order"
+        );
     };
     let (answer, ()) = within(async { tokio::join!(asking, answering) }).await;
     assert_eq!(answer.expect("the bit map"), vec![0b010]);
@@ -86,10 +91,10 @@ async fn an_answer_of_the_wrong_length_is_refused_and_reported() {
     ask.extend_from_slice(&2u32.to_be_bytes());
     let asking = async move { requester.request(&ask).await?.collect(4096).await };
     let answering = async {
-        let ask = seeder.accept().await.expect("the PIECE reaches the seeder");
-        assert_eq!(ask.ask(), Ask::Piece(2));
+        let mut session = seeder.accept().await.expect("the PIECE reaches the seeder");
+        assert_eq!(session.next().await.expect("an order"), Some(Ask::Piece(2)));
         // Piece 2 of 3000 bytes in 1 KiB pieces is 952 bytes long.
-        let short = ask.answer_piece(&data[2048..2999]).await;
+        let short = session.answer_piece(&data[2048..2999]).await;
         assert!(
             matches!(short, Err(Error::Protocol(_))),
             "a short piece is the application's error: {short:?}"
@@ -174,81 +179,90 @@ async fn seed(data: Arc<Vec<u8>>, behavior: Behavior) -> TestSeeder {
     let held = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&asks);
     tokio::spawn(async move {
-        while let Ok(request) = seeder.accept().await {
-            recorded.lock().expect("asks").push(request.ask());
-            tokio::spawn(answer(
-                request,
+        while let Ok(session) = seeder.accept().await {
+            tokio::spawn(serve(
+                session,
                 Arc::clone(&data),
                 Arc::clone(&list),
                 behavior.clone(),
                 Arc::clone(&held),
+                Arc::clone(&recorded),
             ));
         }
     });
     TestSeeder { server, asks }
 }
 
-async fn answer(
-    request: SeedRequest,
+/// Admits a session once, by its blob, then answers its orders one by one
+/// as `behavior` says, recording each order as it is read.
+async fn serve(
+    mut session: SeedSession,
     data: Arc<Vec<u8>>,
     list: Arc<PieceList>,
     behavior: Behavior,
-    held: Arc<Mutex<Vec<SeedRequest>>>,
+    held: Arc<Mutex<Vec<SeedSession>>>,
+    asks: Arc<Mutex<Vec<Ask>>>,
 ) {
     let blob = list.blob();
-    if request.blob() != blob {
-        request.decline().await;
+    if session.blob() != blob {
+        session.decline().await;
         return;
     }
-    match (behavior, request.ask()) {
-        (Behavior::Slow(delay), _) => {
-            tokio::time::sleep(delay).await;
-            honest(request, &data, &list).await;
-        }
-        (Behavior::Holds(have), Ask::Have) => {
-            let _ = request.answer_have(&have).await;
-        }
-        (Behavior::Holds(have), Ask::Piece(index)) if !have.get(index) => request.decline().await,
-        (Behavior::CorruptPieces, Ask::Piece(index)) => {
-            let mut bytes = data[span(&blob, index)].to_vec();
-            bytes[0] ^= 1;
-            let _ = request.answer_piece(&bytes).await;
-        }
-        (Behavior::SilentPieces, Ask::Piece(_)) => held.lock().expect("held").push(request),
-        (Behavior::Relay(relay), ask) => {
-            let (list, have, piece) = {
-                let relay = relay.lock().expect("relay");
-                let piece = match ask {
-                    Ask::Piece(index) if relay.have.get(index) => {
-                        Some(relay.data[span(&blob, index)].to_vec())
-                    }
-                    _ => None,
-                };
-                (relay.list.clone(), relay.have.clone(), piece)
-            };
-            match (ask, list, piece) {
-                (Ask::List, Some(list), _) => {
-                    let _ = request.answer_list(&list).await;
-                }
-                (Ask::Have, _, _) => {
-                    let _ = request.answer_have(&have).await;
-                }
-                (Ask::Piece(_), _, Some(piece)) => {
-                    let _ = request.answer_piece(&piece).await;
-                }
-                _ => request.decline().await,
+    while let Ok(Some(ask)) = session.next().await {
+        asks.lock().expect("asks").push(ask);
+        match (&behavior, ask) {
+            (Behavior::Slow(delay), _) => {
+                tokio::time::sleep(*delay).await;
+                honest(&mut session, ask, &data, &list).await;
             }
+            (Behavior::Holds(have), Ask::Have) => {
+                let _ = session.answer_have(have).await;
+            }
+            (Behavior::Holds(have), Ask::Piece(index)) if !have.get(index) => {
+                session.decline().await;
+                return;
+            }
+            (Behavior::CorruptPieces, Ask::Piece(index)) => {
+                let mut bytes = data[span(&blob, index)].to_vec();
+                bytes[0] ^= 1;
+                let _ = session.answer_piece(&bytes).await;
+            }
+            (Behavior::SilentPieces, Ask::Piece(_)) => {
+                held.lock().expect("held").push(session);
+                return;
+            }
+            (Behavior::Relay(relay), ask) => {
+                let (list, have, piece) = {
+                    let relay = relay.lock().expect("relay");
+                    let piece = match ask {
+                        Ask::Piece(index) if relay.have.get(index) => {
+                            Some(relay.data[span(&blob, index)].to_vec())
+                        }
+                        _ => None,
+                    };
+                    (relay.list.clone(), relay.have.clone(), piece)
+                };
+                let _ = match (ask, list, piece) {
+                    (Ask::List, Some(list), _) => session.answer_list(&list).await,
+                    (Ask::Have, _, _) => session.answer_have(&have).await,
+                    (Ask::Piece(_), _, Some(piece)) => session.answer_piece(&piece).await,
+                    _ => {
+                        session.decline().await;
+                        return;
+                    }
+                };
+            }
+            _ => honest(&mut session, ask, &data, &list).await,
         }
-        _ => honest(request, &data, &list).await,
     }
 }
 
-async fn honest(request: SeedRequest, data: &[u8], list: &PieceList) {
+async fn honest(session: &mut SeedSession, ask: Ask, data: &[u8], list: &PieceList) {
     let blob = list.blob();
-    let _ = match request.ask() {
-        Ask::List => request.answer_list(list).await,
-        Ask::Have => request.answer_have(&Bits::full(blob.count())).await,
-        Ask::Piece(index) => request.answer_piece(&data[span(&blob, index)]).await,
+    let _ = match ask {
+        Ask::List => session.answer_list(list).await,
+        Ask::Have => session.answer_have(&Bits::full(blob.count())).await,
+        Ask::Piece(index) => session.answer_piece(&data[span(&blob, index)]).await,
     };
 }
 
@@ -264,7 +278,7 @@ async fn lying_list_seeder(data: Arc<Vec<u8>>) -> TestSeeder {
     let recorded = Arc::clone(&asks);
     tokio::spawn(async move {
         while let Ok(mut request) = replier.accept().await {
-            let Ok(body) = request.body().read_capped(64).await else {
+            let Ok(body) = request.body().read_capped(47).await else {
                 continue;
             };
             let (ask, answer) = match body[1] {

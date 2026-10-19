@@ -691,13 +691,15 @@ impl Listener {
     }
 
     /// Registers a SWARM seeder for `path`
-    /// ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
+    /// ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md),
+    /// [decisions/0041](../../../docs/decisions/0041-swarm-sessions.md)).
     ///
-    /// An ask is an exchange, so the route is a replier's, byte for byte.
-    /// What a seeder adds is above it: each ask's body is read under
-    /// `Limits::header_timeout_ms` and decoded before the application sees
-    /// it, at most [`crate::MAX_PENDING_ASKS`] at once, and an answer is
-    /// checked for shape before it is sent.
+    /// A session, and a version-1 ask, is an exchange, so the route is a
+    /// replier's, byte for byte. What a seeder adds is above it: each
+    /// session's open (or ask) is read under `Limits::header_timeout_ms` and
+    /// decoded before the application sees it, at most
+    /// [`crate::MAX_PENDING_SESSIONS`] at once, and every answer is checked
+    /// for shape before it is sent.
     #[cfg(feature = "swarm")]
     pub fn seeder(&self, path: &str) -> Result<crate::Seeder, Error> {
         validate_endpoint_path(path)?;

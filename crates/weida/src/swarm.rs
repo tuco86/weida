@@ -11,12 +11,14 @@
 //! [`TreeHasher`] (builds that list in one pass over the bytes) and [`Bits`]
 //! (which pieces someone holds).
 //!
-//! The bound side is a [`crate::Seeder`]: it hands each [`Ask`] to the
-//! application as a [`SeedRequest`], which the application answers from its
-//! own storage. One exchange per ask, on the request route a replier uses,
-//! so SWARM adds no frame to the protocol. The dialling side is a
-//! [`crate::Swarm`]: its [`Fetch`] asks every connected seeder at once and
-//! yields each [`Piece`] once it verifies against the root.
+//! The bound side is a [`crate::Seeder`]: it hands each fetch's session to
+//! the application as a [`SeedSession`], whose orders the application answers
+//! one at a time from its own storage. One exchange per (fetch, seeder) on the
+//! request route a replier uses, so SWARM adds no frame to the protocol
+//! (`docs/decisions/0041-swarm-sessions.md`). The dialling side is a
+//! [`crate::Swarm`]: its [`Fetch`] keeps orders queued at every connected
+//! seeder at once, as many as each seeder's rate needs, and yields each
+//! [`Piece`] once it verifies against the root.
 
 mod gather;
 mod seed;
@@ -24,7 +26,7 @@ mod tree;
 mod wire;
 
 pub use gather::{Fetch, FetchOptions, GatherState, Piece};
-pub use seed::{MAX_PENDING_ASKS, MIN_RATE, SEED_STALL, SeedRequest, SeedState};
+pub use seed::{MAX_PENDING_SESSIONS, MIN_RATE, SEED_STALL, SeedSession, SeedState};
 pub use tree::{
     Bits, Blob, BlobId, MAX_PIECES, ParseBlobIdError, PieceList, PieceSize, TreeHasher,
 };
@@ -32,12 +34,12 @@ pub use tree::{
 /// What a swarm asks a seeder about one [`Blob`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
-    /// The piece list, answered with [`SeedRequest::answer_list`]. Never
+    /// The piece list, answered with [`SeedSession::answer_list`]. Never
     /// asked for a blob of at most one piece, which has no list.
     List,
     /// Which pieces the seeder can serve now, answered with
-    /// [`SeedRequest::answer_have`].
+    /// [`SeedSession::answer_have`].
     Have,
-    /// The bytes of one piece, answered with [`SeedRequest::answer_piece`].
+    /// The bytes of one piece, answered with [`SeedSession::answer_piece`].
     Piece(u32),
 }
