@@ -34,8 +34,8 @@ pub(crate) struct RemoteSlot {
 }
 
 impl RemoteSlot {
-    /// The peer's latest record as weida's type, aged from its arrival.
-    pub(crate) fn latest(&self) -> Option<RemoteStats> {
+    /// The peer's latest record as weida's type, aged from its arrival to `now`.
+    pub(crate) fn latest(&self, now: Instant) -> Option<RemoteStats> {
         let latest = *self.latest.lock().unwrap_or_else(PoisonError::into_inner);
         latest.map(|(record, arrived)| RemoteStats {
             rtt: Duration::from_micros(record.rtt_us),
@@ -54,13 +54,12 @@ impl RemoteSlot {
                 datagrams: record.rx_datagrams,
                 bytes: record.rx_bytes,
             },
-            age: arrived.elapsed(),
+            age: now.saturating_duration_since(arrived),
         })
     }
 
-    fn store(&self, record: PathRecord) {
-        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((record, Instant::now()));
+    fn store(&self, record: PathRecord, now: Instant) {
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some((record, now));
     }
 }
 
@@ -144,7 +143,7 @@ pub(crate) async fn receive_reports(ctx: &ConnHandle, mut stream: RecvHalf) -> R
                     newest = Some(record);
                 }
                 if let Some(record) = newest {
-                    ctx.remote.store(record);
+                    ctx.remote.store(record, ctx.exec.now());
                 }
                 pending.drain(..at);
             }

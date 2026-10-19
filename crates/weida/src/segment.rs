@@ -497,7 +497,7 @@ struct CopySpec {
 
 impl CopySpec {
     fn expired(&self) -> bool {
-        self.deadline.is_some_and(|d| Instant::now() >= d)
+        self.deadline.is_some_and(|d| self.conn.exec.now() >= d)
     }
 
     /// Counts one drop on the topic, and on the dish's record when there
@@ -647,9 +647,9 @@ pub(crate) fn open_segment(
     terms: &SegmentTerms,
     targets: Vec<CopyTarget>,
 ) -> Segment {
-    let opened = Instant::now();
     let mut copies = Vec::with_capacity(targets.len());
     for target in targets {
+        let opened = target.conn.exec.now();
         let ctl = Arc::new(CopyCtl::new(terms.follows_upstream));
         topics.track(&topic, &ctl);
         // Expiry is the smaller of the sender's and the receiver's budget,
@@ -930,7 +930,7 @@ async fn expiry(spec: &CopySpec) {
         Some(deadline) => {
             spec.conn
                 .exec
-                .sleep(deadline.saturating_duration_since(Instant::now()))
+                .sleep(deadline.saturating_duration_since(spec.conn.exec.now()))
                 .await;
         }
         None => std::future::pending().await,

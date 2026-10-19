@@ -264,12 +264,15 @@ impl PeerShared {
             })
             .collect();
         live.into_iter()
-            .map(|(url, redials, conn)| crate::ConnectionStats {
-                url,
-                age: conn.established.elapsed(),
-                redials,
-                transport: conn.conn.transport_stats(),
-                remote: conn.remote.latest(),
+            .map(|(url, redials, conn)| {
+                let now = conn.exec.now();
+                crate::ConnectionStats {
+                    url,
+                    age: now.saturating_duration_since(conn.established),
+                    redials,
+                    transport: conn.conn.transport_stats(),
+                    remote: conn.remote.latest(now),
+                }
             })
             .collect()
     }
@@ -800,15 +803,18 @@ async fn watch_slot(
     address: Address,
     mut conn: ConnHandle,
 ) {
-    let policy: ReconnectPolicy = match weak.upgrade() {
-        Some(shared) => shared.runtime.config.reconnect.clone(),
+    let (policy, exec): (ReconnectPolicy, crate::runtime::Exec) = match weak.upgrade() {
+        Some(shared) => (
+            shared.runtime.config.reconnect.clone(),
+            shared.runtime.exec.clone(),
+        ),
         None => return,
     };
     let proved = conn.peer.clone();
     // Redial attempts since the last connection that stayed up, carried across
     // losses; see below for what "stayed up" means.
     let mut attempt = 0u32;
-    let mut up_since = std::time::Instant::now();
+    let mut up_since = exec.now();
     loop {
         let reason = tokio::select! {
             reason = conn.conn.closed() => reason,
@@ -837,7 +843,7 @@ async fn watch_slot(
         // and closes, or a crash loop — and the schedule goes on from where
         // it stopped, so such a peer sees redials slow down instead of a
         // fresh handshake every `initial` for as long as it keeps doing it.
-        if up_since.elapsed() >= policy.max {
+        if exec.now().saturating_duration_since(up_since) >= policy.max {
             attempt = 0;
         }
         conn = loop {
@@ -926,7 +932,7 @@ async fn watch_slot(
                 }
             }
         };
-        up_since = std::time::Instant::now();
+        up_since = exec.now();
         let Some(shared) = weak.upgrade() else { return };
         shared.redialled(id, ConnHandle::clone(&conn));
         shared.emit(PeerEvent::Connected {

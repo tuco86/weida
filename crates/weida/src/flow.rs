@@ -411,7 +411,7 @@ impl FlowTable {
     }
 
     /// Routes one received QUIC datagram to its flow, or into the early ring.
-    fn deliver(&self, datagram: Bytes) {
+    fn deliver(&self, datagram: Bytes, now: Instant) {
         let Some((id, offset)) = split_flow_datagram(&datagram) else {
             self.count_unknown(1);
             return;
@@ -432,14 +432,14 @@ impl FlowTable {
         // Still holding the table: a FLOW header registering `id` now takes
         // the same two locks in the same order, so a datagram lands either
         // in the flow or in the ring it adopts from, never between them.
-        let dropped = lock(&self.early).push(Instant::now(), id, payload);
+        let dropped = lock(&self.early).push(now, id, payload);
         drop(inbound);
         self.count_unknown(dropped);
     }
 
     /// Registers inbound flow `id` and hands it the datagrams that arrived
     /// before its header, oldest first.
-    fn register(&self, id: u64) -> Result<Arc<Inbound>, Refused> {
+    fn register(&self, id: u64, now: Instant) -> Result<Arc<Inbound>, Refused> {
         let mut inbound = lock(&self.inbound);
         if inbound.contains_key(&id) {
             return Err(Refused::Duplicate);
@@ -448,7 +448,7 @@ impl FlowTable {
             return Err(Refused::Full);
         }
         let flow = Arc::new(Inbound::new(self.limits.flow_queue_bytes));
-        let (early, evicted) = lock(&self.early).adopt(Instant::now(), id);
+        let (early, evicted) = lock(&self.early).adopt(now, id);
         for datagram in early {
             flow.push(datagram);
         }
@@ -963,7 +963,7 @@ impl fmt::Debug for IncomingFlow {
 /// Reads this connection's QUIC datagrams into their flows until it closes.
 pub(crate) async fn datagram_reader(ctx: ConnHandle) {
     while let Ok(datagram) = ctx.conn.read_datagram().await {
-        ctx.flows.deliver(datagram);
+        ctx.flows.deliver(datagram, ctx.exec.now());
     }
 }
 
@@ -987,7 +987,7 @@ pub(crate) async fn handle_flow(
         stream.stop(refusal.stop);
         return Ok(());
     }
-    let inbound = match ctx.flows.register(header.flow) {
+    let inbound = match ctx.flows.register(header.flow, ctx.exec.now()) {
         Ok(inbound) => inbound,
         Err(Refused::Full) => {
             stream.stop(codes::LIMIT_EXCEEDED);

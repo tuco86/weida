@@ -167,7 +167,7 @@ impl ConnCtx {
             shared,
             flows: crate::flow::FlowTable::new(&limits),
             agreed: agreed_rx,
-            established: std::time::Instant::now(),
+            established: exec.now(),
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
             segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
             remote: crate::report::RemoteSlot::default(),
@@ -1296,7 +1296,10 @@ async fn dispatch_data(
     // neither the application nor the gap detector ever sees the message
     // twice. A dedup window saves the application, not the bandwidth — the
     // bytes crossed the wire before anything could know they were a repeat.
-    if ctx.dedup.is_duplicate(producer, path, topic, sequence) {
+    if ctx
+        .dedup
+        .is_duplicate(producer, path, topic, sequence, ctx.exec.now())
+    {
         ctx.shared.duplicates.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(path, sequence = ?sequence, "duplicate suppressed");
         // Read to EOF rather than dropped: dropping the stream would reset

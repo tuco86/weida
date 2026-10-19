@@ -92,6 +92,7 @@ impl DedupWindow {
         path: &str,
         topic: Option<&str>,
         sequence: Option<u64>,
+        now: Instant,
     ) -> bool {
         let Some(window) = self.window else {
             return false;
@@ -102,7 +103,6 @@ impl DedupWindow {
         };
         let scope = Probe::new(path, topic);
         let key = Key { producer, sequence };
-        let now = Instant::now();
         let mut state = self.state.lock().expect("dedup window poisoned");
         state.expire(now);
         if state.deadline_of(&scope, key).is_some() {
@@ -186,7 +186,7 @@ mod tests {
         for level in [Deduplication::None, Deduplication::Durable] {
             let window = DedupWindow::new(level, Some(60_000), 4096);
             for seq in 0..1000 {
-                assert!(!window.is_duplicate(None, "/md", None, Some(seq % 4)));
+                assert!(!window.is_duplicate(None, "/md", None, Some(seq % 4), Instant::now()));
             }
             assert!(
                 !window.allocated(),
@@ -195,7 +195,7 @@ mod tests {
         }
         // `Bounded` without a window is the same: the wire cannot express it.
         let window = DedupWindow::new(Deduplication::Bounded, None, 4096);
-        assert!(!window.is_duplicate(None, "/md", None, Some(1)));
+        assert!(!window.is_duplicate(None, "/md", None, Some(1), Instant::now()));
         assert!(!window.allocated());
     }
 
@@ -204,7 +204,7 @@ mod tests {
         // Nothing on the wire names it, so there is nothing to compare.
         let window = DedupWindow::new(Deduplication::Bounded, Some(60_000), 4096);
         for _ in 0..10 {
-            assert!(!window.is_duplicate(None, "/md", None, None));
+            assert!(!window.is_duplicate(None, "/md", None, None, Instant::now()));
         }
         assert_eq!(window.tracked(), 0);
     }
@@ -212,27 +212,27 @@ mod tests {
     #[test]
     fn a_repeat_inside_the_window_is_suppressed() {
         let window = DedupWindow::new(Deduplication::Bounded, Some(60_000), 4096);
-        assert!(!window.is_duplicate(None, "/md", None, Some(1)));
-        assert!(window.is_duplicate(None, "/md", None, Some(1)));
-        assert!(window.is_duplicate(None, "/md", None, Some(1)));
+        assert!(!window.is_duplicate(None, "/md", None, Some(1), Instant::now()));
+        assert!(window.is_duplicate(None, "/md", None, Some(1), Instant::now()));
+        assert!(window.is_duplicate(None, "/md", None, Some(1), Instant::now()));
         // A different number, scope or producer is a different message.
-        assert!(!window.is_duplicate(None, "/md", None, Some(2)));
-        assert!(!window.is_duplicate(None, "/other", None, Some(1)));
-        assert!(!window.is_duplicate(Some(DIGEST), "/md", None, Some(1)));
-        assert!(window.is_duplicate(Some(DIGEST), "/md", None, Some(1)));
+        assert!(!window.is_duplicate(None, "/md", None, Some(2), Instant::now()));
+        assert!(!window.is_duplicate(None, "/other", None, Some(1), Instant::now()));
+        assert!(!window.is_duplicate(Some(DIGEST), "/md", None, Some(1), Instant::now()));
+        assert!(window.is_duplicate(Some(DIGEST), "/md", None, Some(1), Instant::now()));
     }
 
     #[test]
     fn a_topic_is_a_scope_of_its_own() {
         let window = DedupWindow::new(Deduplication::Bounded, Some(60_000), 4096);
-        assert!(!window.is_duplicate(None, "/a", None, Some(1)));
+        assert!(!window.is_duplicate(None, "/a", None, Some(1), Instant::now()));
         // The same number on the same path under a topic is another message,
         // and so is the same topic on another path, and the empty topic.
-        assert!(!window.is_duplicate(None, "/a", Some("t"), Some(1)));
-        assert!(!window.is_duplicate(None, "/b", Some("t"), Some(1)));
-        assert!(!window.is_duplicate(None, "/a", Some(""), Some(1)));
-        assert!(window.is_duplicate(None, "/a", Some("t"), Some(1)));
-        assert!(window.is_duplicate(None, "/a", None, Some(1)));
+        assert!(!window.is_duplicate(None, "/a", Some("t"), Some(1), Instant::now()));
+        assert!(!window.is_duplicate(None, "/b", Some("t"), Some(1), Instant::now()));
+        assert!(!window.is_duplicate(None, "/a", Some(""), Some(1), Instant::now()));
+        assert!(window.is_duplicate(None, "/a", Some("t"), Some(1), Instant::now()));
+        assert!(window.is_duplicate(None, "/a", None, Some(1), Instant::now()));
         assert_eq!(window.tracked(), 4);
     }
 
@@ -241,8 +241,8 @@ mod tests {
         // The smallest interval that demonstrates it: a zero-length window
         // has expired by the time the second call takes the lock.
         let window = DedupWindow::new(Deduplication::Bounded, Some(0), 4096);
-        assert!(!window.is_duplicate(None, "/md", None, Some(1)));
-        assert!(!window.is_duplicate(None, "/md", None, Some(1)));
+        assert!(!window.is_duplicate(None, "/md", None, Some(1), Instant::now()));
+        assert!(!window.is_duplicate(None, "/md", None, Some(1), Instant::now()));
         assert_eq!(window.tracked(), 1, "the table does not grow with repeats");
     }
 
@@ -250,7 +250,7 @@ mod tests {
     fn the_table_stops_growing_at_its_count_cap() {
         let window = DedupWindow::new(Deduplication::Bounded, Some(60_000), 8);
         for seq in 0..1000 {
-            assert!(!window.is_duplicate(None, "/md", None, Some(seq)));
+            assert!(!window.is_duplicate(None, "/md", None, Some(seq), Instant::now()));
         }
         assert_eq!(
             window.tracked(),
@@ -259,8 +259,8 @@ mod tests {
         );
         // The oldest entries are gone, so an old identity is accepted again:
         // the count bound costs suppression, not memory.
-        assert!(!window.is_duplicate(None, "/md", None, Some(0)));
+        assert!(!window.is_duplicate(None, "/md", None, Some(0), Instant::now()));
         // The newest are still remembered.
-        assert!(window.is_duplicate(None, "/md", None, Some(999)));
+        assert!(window.is_duplicate(None, "/md", None, Some(999), Instant::now()));
     }
 }

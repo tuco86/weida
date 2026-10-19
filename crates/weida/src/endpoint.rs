@@ -1150,7 +1150,7 @@ impl Surveyor {
 
         let exec = self.state.peer.exec().clone();
         let late = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let expires = Instant::now() + deadline;
+        let expires = exec.now() + deadline;
         // One slot per respondent: every answer has somewhere to go, so a
         // reply is never late merely because the caller is slow to read.
         let (tx, rx) = mpsc::channel(targets.len().max(1));
@@ -1165,7 +1165,7 @@ impl Surveyor {
             // that accepts an exchange and stops reading would hold a
             // 100 ms survey open forever and every respondent after it
             // would never be asked at all.
-            let remaining = expires.saturating_duration_since(Instant::now());
+            let remaining = expires.saturating_duration_since(exec.now());
             let asked = exec.within(remaining, ask(&conn, &path, &meta, body)).await;
             let Some(asked) = asked else {
                 tracing::debug!(%path, "the survey deadline passed before this respondent was asked");
@@ -1184,12 +1184,13 @@ impl Surveyor {
             respondents += 1;
             let tx = tx.clone();
             let late = Arc::clone(&late);
+            let collector_exec = exec.clone();
             collecting.push(exec.spawn(async move {
                 let answer = reply.recv().await;
                 // Counted rather than delivered, and counted **here** so the
                 // number means "after the deadline" whatever the caller does
                 // with its handle (`docs/GUARANTEES.md` §6).
-                if Instant::now() >= expires || tx.send(answer).await.is_err() {
+                if collector_exec.now() >= expires || tx.send(answer).await.is_err() {
                     late.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }));
@@ -1267,7 +1268,7 @@ impl SurveyRun {
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
         }
-        let remaining = self.expires.saturating_duration_since(Instant::now());
+        let remaining = self.expires.saturating_duration_since(self.exec.now());
         match self.exec.within(remaining, self.rx.recv()).await {
             // The deadline. Anything that landed while this call was waiting
             // is counted here: its collector already succeeded in handing it

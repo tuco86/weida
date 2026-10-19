@@ -495,7 +495,8 @@ impl Reporter {
             // worth it, however small the advance.
             (None, _) | (_, None) => true,
             (Some(emitted), Some(at)) => {
-                entry.latest.saturating_sub(emitted) >= self.bytes || at.elapsed() >= self.interval
+                entry.latest.saturating_sub(emitted) >= self.bytes
+                    || self.conn.exec.now().saturating_duration_since(at) >= self.interval
             }
         }
     }
@@ -538,7 +539,7 @@ impl Reporter {
         }
         if let Some(entry) = self.pending[slot].as_mut() {
             entry.emitted = Some(offset);
-            entry.at = Some(Instant::now());
+            entry.at = Some(self.conn.exec.now());
         }
     }
 

@@ -28,6 +28,8 @@ weida-winpipe.workspace = true
 # Drives the owned-reactor test from an executor that is not tokio, which is
 # the capability `Exec::owned` exists for.
 futures.workspace = true
+# `start_paused` for the test that `Exec::now` follows a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -104,6 +104,16 @@ impl Exec {
         tokio::time::sleep(duration)
     }
 
+    /// The runtime's clock: what `sleep` and `within` count against.
+    ///
+    /// Under a paused Tokio clock (`tokio::time::pause`, `start_paused`) this is the paused time,
+    /// so a deadline or backoff measured with it ends when the timers say it does. Elsewhere it is
+    /// `std::time::Instant::now()`.
+    pub fn now(&self) -> std::time::Instant {
+        let _guard = self.handle.enter();
+        tokio::time::Instant::now().into_std()
+    }
+
     /// Awaits `future`, giving up after `limit`.
     ///
     /// `None` means the future had not finished; it is dropped, so whatever
@@ -227,5 +237,16 @@ mod tests {
             exec.within(Duration::from_secs(30), async { 3 }).await,
             Some(3)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn now_reads_the_runtime_clock() {
+        let exec = Exec::current().expect("ambient runtime");
+        let (before, real) = (exec.now(), std::time::Instant::now());
+        exec.sleep(Duration::from_secs(3600)).await;
+        let advanced = exec.now() - before;
+        assert!(advanced >= Duration::from_secs(3600), "{advanced:?}");
+        assert!(advanced < Duration::from_secs(3601), "{advanced:?}");
+        assert!(real.elapsed() < Duration::from_secs(1));
     }
 }

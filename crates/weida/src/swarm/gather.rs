@@ -368,7 +368,7 @@ impl Fetch {
             };
             let sleep = refresh.map(|at| {
                 self.exec
-                    .sleep(at.saturating_duration_since(Instant::now()))
+                    .sleep(at.saturating_duration_since(self.exec.now()))
             });
             let sleep = async move {
                 match sleep {
@@ -445,7 +445,7 @@ impl Fetch {
     /// Writes every order there is credit for: into its seeder's session,
     /// opened at its first order, or as a version-1 ask.
     fn dispatch_planned(&mut self) {
-        let planned = self.scheduler.plan(Instant::now(), &mut rand::rng());
+        let planned = self.scheduler.plan(self.exec.now(), &mut rand::rng());
         for (id, url, ask) in planned {
             let Some(view) = self.views.get_mut(&url) else {
                 self.scheduler.finish(id, None);
@@ -514,7 +514,7 @@ impl Fetch {
                     }
                     Ok(Answer::Have(have)) => {
                         self.scheduler.finish(order, None);
-                        self.scheduler.set_have(&url, have, Instant::now());
+                        self.scheduler.set_have(&url, have, self.exec.now());
                         None
                     }
                     Ok(Answer::Piece(bytes)) => {
@@ -650,7 +650,7 @@ fn spawn_ask(
             .send(Event::Answer {
                 order: id,
                 result,
-                at: Instant::now(),
+                at: task_exec.now(),
             })
             .await;
     })
@@ -787,7 +787,7 @@ async fn run_session(
     // most the seeder's credit plus one failure.
     let (written, written_rx) = mpsc::channel(context.per_peer + 1);
     let writer = async {
-        write_orders(request, context.blob, orders, written).await;
+        write_orders(request, context.blob, orders, written, &context.exec).await;
         std::future::pending::<()>().await;
     };
     tokio::select! {
@@ -803,6 +803,7 @@ async fn write_orders(
     blob: Blob,
     mut orders: mpsc::Receiver<SessionOrder>,
     written: mpsc::Sender<Written>,
+    exec: &Exec,
 ) {
     if let Err(e) = request.write_all(&wire::encode_open(&blob)).await {
         let _ = written.send(Written::Failed(e)).await;
@@ -810,7 +811,7 @@ async fn write_orders(
     }
     while let Some(order) = orders.recv().await {
         let bytes = wire::encode_order(order.ask);
-        let at = Instant::now();
+        let at = exec.now();
         if written.send(Written::Order { order, at }).await.is_err() {
             return;
         }
@@ -857,7 +858,7 @@ async fn read_answers(
         let answer = context
             .exec
             .within(
-                due.saturating_duration_since(Instant::now()),
+                due.saturating_duration_since(context.exec.now()),
                 read_answer(context.blob, &mut reply, &mut body, &order, len),
             )
             .await
@@ -867,10 +868,10 @@ async fn read_answers(
             .send(Event::Answer {
                 order: order.id,
                 result: Ok(answer),
-                at: Instant::now(),
+                at: context.exec.now(),
             })
             .await;
-        previous = Some(Instant::now());
+        previous = Some(context.exec.now());
     }
     Ok(())
 }

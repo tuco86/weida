@@ -611,7 +611,9 @@ impl Radio {
                         } => match flow.send(body.clone()) {
                             Ok(()) => {
                                 handed += 1;
-                                if since.elapsed() >= FLOW_SETTLE {
+                                if port.conn.exec.now().saturating_duration_since(*since)
+                                    >= FLOW_SETTLE
+                                {
                                     *backoff = FLOW_BACKOFF_START;
                                 }
                                 None
@@ -630,13 +632,13 @@ impl Radio {
                             Err(_) => {
                                 record(&hub.drops, &port.drops, &topic, DropCause::SubscriberQueue);
                                 Some(FlowSlot::Refused {
-                                    until: Instant::now() + *backoff,
+                                    until: port.conn.exec.now() + *backoff,
                                     backoff: doubled(*backoff),
                                 })
                             }
                         },
                         FlowSlot::Refused { until, backoff } => {
-                            if Instant::now() < *until {
+                            if port.conn.exec.now() < *until {
                                 record(&hub.drops, &port.drops, &topic, DropCause::SubscriberQueue);
                                 None
                             } else {
@@ -771,7 +773,7 @@ async fn open_datagram_flow(
             }
             *slot = FlowSlot::Open {
                 flow,
-                since: Instant::now(),
+                since: port.conn.exec.now(),
                 backoff,
             };
         }
@@ -784,7 +786,7 @@ async fn open_datagram_flow(
                 record(&drops, &port.drops, &topic, cause);
             }
             *slot = FlowSlot::Refused {
-                until: Instant::now() + backoff,
+                until: port.conn.exec.now() + backoff,
                 backoff: doubled(backoff),
             };
         }
