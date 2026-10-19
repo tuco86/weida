@@ -4,6 +4,18 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-348 — weida reads its clocks through Exec::now
+kind: code | size: 60 | status: ready | needs: []
+acceptance: [0042](decisions/0042-simulated-network.md) §4.1: `Exec::now` with the paused-clock test `now_reads_the_runtime_clock`; every clock read in `crates/weida/src` that gates a wait goes through it; `git grep -n 'Instant::now()\|\.elapsed()' -- crates/weida/src` lists only the exempt sites (`identity.rs`, the listener's log throttle, `transfer.rs` `expire_at`, `swarm/seed.rs`) and lines inside `#[cfg(test)]` modules; the full gate passes.
+
+### B-349 — test-util: SimNet, a simulated network under real QUIC
+kind: code | size: 90 | status: ready | needs: [B-348]
+acceptance: [0042](decisions/0042-simulated-network.md) §4.2: `RuntimeConfig::network` and `Network`; feature `test-util` with `SimNet`/`SimStats`; three unit tests in `sim.rs` (addressing and the v4-mapped source, partition and drop count, a port taken until released); eight integration tests in `tests/sim.rs` (pinned client identity, mTLS and pin refusal, close and rebind events, partition and heal, delay, drop, the redial schedule restarting under a paused clock, an address free again after close and shutdown); the LOOP §6 `test-util` row; the full gate and `cargo doc -p weida --no-default-features` pass.
+
+### B-350 — 0042 into the normative documents, zeughaus proposal
+kind: spec | size: 45 | status: ready | needs: [B-349]
+acceptance: [0042](decisions/0042-simulated-network.md) §4.3: ARCHITECTURE §7 `RuntimeConfig::network`, `Network`, `SimNet`, `SimStats`; the INVARIANTS row for `INBOX_DATAGRAMS`; STATUS §1 "Tests need no network"; `git grep -n 'bind_client_endpoint' -- crates docs` empty; `PROPOSAL-weida-test-doubles.md` in zeughaus's checkout.
+
 ### B-344 — SWARM session wire and the seeder's SeedSession
 kind: code | size: 90 | status: done b3982d7 | needs: []
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.1-§4.2: `swarm/wire.rs` with the 48-byte open, 5-byte order and 9-byte answer head and their refusals (round trips and one refusal table); `IncomingTransfer::read_exact_into`; `SeedSession` (`next`, `answer_*`, `decline`) replacing `SeedRequest`, `MAX_PENDING_SESSIONS` 64, version-1 asks still served; every swarm integration test green on sessions; `grep -rn 'SeedRequest\|MAX_PENDING_ASKS' crates/` empty.
