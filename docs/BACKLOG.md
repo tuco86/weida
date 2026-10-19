@@ -9,7 +9,7 @@ kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
 
 ### B-352 — sim.rs's direct tokio clock named; no sleep in a unit test
-kind: code | size: 30 | status: ready | needs: [B-351]
+kind: code | size: 30 | status: in_progress 2026-10-19T18:43Z | needs: [B-351]
 acceptance: ARCHITECTURE §5 and the `weida` manifest comment name `crates/weida/src/sim.rs` (feature `test-util`) as the one module that reads tokio's clock and arms tokio timers directly; 0042 §4.2 and the `sim.rs` module doc state the test rule (reading the clock is fine in a unit test, a test that waits on a timer is an integration test, also on a paused clock); `now_reads_the_runtime_clock` advances the paused clock instead of sleeping; zeughaus's `PROPOSAL-weida-test-doubles.md` keeps timer-waiting tests in `mod io`; full gate green.
 
 ### B-353 — docs.rs documents every feature of weida
