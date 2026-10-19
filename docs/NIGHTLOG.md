@@ -195,6 +195,16 @@ with bulk on a separate path: **81.6 / 91.7 ms** under CUBIC, **6.7 / 47.7 ms** 
 cleared the pre-set 30 % bar on separate paths, so 0034 §6 now names it for a bulk profile
 sharing a bottleneck with media; the default stays `Cubic`. Recorded in IMPLEMENTATION.md §4.
 
+**B-346 — one SWARM fetch from one seeder.**
+`cargo test -p weida --features swarm --release --test swarm_large -- --ignored --nocapture`
+(two runs, 256 MiB in 1 MiB pieces through `delay_proxy` at 13 ms each way, `per_peer` 16,
+`max_inflight` 32): a normal download of the same bytes on the same path **45.8 / 44.8 MB/s**,
+the session fetch **50.8 / 55.3 MB/s** (1.11x / 1.23x), peak RSS 82.3 / 78.9 MiB.
+`cargo bench -p weida --features swarm --bench swarm -- --warm-up-time 1 --measurement-time 3`
+(64 MiB, plain loopback): **683 MiB/s** (662-701). griasdi's per-ask fetch was 4-10 MB/s
+against 53.7 MB/s HTTPS on a 27 ms path; a session now matches a normal download there. Recorded
+in IMPLEMENTATION.md §4.18.
+
 ## Chronology
 
 2026-09-11T00:00Z | — | seeded | loop, backlog B-001..B-018 and this log created | next B-001
@@ -517,3 +527,4 @@ sharing a bottleneck with media; the default stays `Cubic`. Recorded in IMPLEMEN
 2026-10-17T07:24Z | B-343 | done 4ab7434 | 0040 in the normative documents: PATTERNS §6.5 SWARM (pattern, wire and failure tables, each failure row naming its test or saying it has none) and a §7 row; six INVARIANTS bounds; ARCHITECTURE L1 paragraph, API sketch and type list; GUARANTEES §6 row (content integrity against the root, not a hop receipt); STATUS §1 and §4; requirements/griasdi-swarm.md answered. SWARM complete: B-340..B-343 | next B-337
 2026-10-19T13:38Z | B-344 | done b3982d7 | SWARM session wire (0041 §4.1): 48-byte open (version 2, padded one byte past the 47-byte v1 ask so a v1 seeder refuses it at once), 5-byte order, 9-byte answer head, refusal tables; `IncomingTransfer::read_exact_into`; `SeedSession` (`next` reads one order per call with no timeout, `answer_*` framed under `SEED_STALL` + (9 + len) / `MIN_RATE`, `decline` a DECLINE frame) replaces `SeedRequest`, `MAX_PENDING_SESSIONS` 64, version-1 asks still served as one-order sessions; the swarm test seeders run on sessions. Gate green: fmt, clippy (workspace, no-default, swarm, four blocking), workspace tests 0 failed, swarm 172+319, four blocking runs, ten doc runs (first clippy-swarm run caught a large enum variant) | next B-345
 2026-10-19T13:48Z | B-345 | done 0cbb69f | SWARM fetch over sessions (0041 §4.3): `swarm/schedule.rs` `Scheduler` with no I/O (credit W = `per_peer` held from order until the caller takes the piece; depth `MIN_DEPTH` 2, +1 per piece in slow start, then `QUEUE_TIME` 3 s x last second's rate / piece, slow start ends at <= 5000 B/s gain: libtorrent's `update_desired_queue_size`), `claim` and its 5 tests moved; `Fetch` opens one session per seeder at its first order (writer and in-order reader in one task, head-of-line deadline `stall + (9 + len) / min_rate`), falls back to version-1 asks on `Rejected` before any head; swarm dials raise the receive windows to 32/64 MiB (`Peer::with_limits`, limits through `ClientPool::connect`); defaults `per_peer` 8, `max_inflight` 32; `Fetch::in_flight`. New tests: `an_order_is_written_only_when_a_piece_is_taken`, `the_depth_grows_in_slow_start_then_follows_the_rate`, `a_caller_that_stops_taking_pieces_stops_the_seeder` (10 orders after 6 taken at W 4, none in 300 ms, the 11th after one more take), `a_seeder_that_speaks_only_version_1_still_serves_a_fetch`; swarm tests stable over 8 runs. Gate green: workspace tests 0 failed, swarm 174+321, four blocking runs, ten doc runs | next B-346
+2026-10-19T13:55Z | B-346 | done 0cadb35 | SWARM throughput (0041 §4.4): `tests/swarm_large.rs` (ignored, own process) fetches 256 MiB in 1 MiB pieces from one seeder through `delay_proxy` at 13 ms each way against a normal download of the same bytes on the same path: download 45.8 / 44.8 MB/s, swarm 50.8 / 55.3 MB/s (1.11x / 1.23x, bar 0.7x), peak RSS 82.3 / 78.9 MiB (bar 128); `benches/swarm.rs` 64 MiB on loopback 683 MiB/s (662-701). Both proxied figures sit at the same ceiling, the forwarder's, not the session's (not measured on its own). IMPLEMENTATION §4.18 and Numbers. Gate green: workspace tests 0 failed, swarm 174+321 (+1 ignored), four blocking runs, ten doc runs | next B-347

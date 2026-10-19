@@ -13,7 +13,7 @@ kind: code | size: 90 | status: done 0cbb69f | needs: [B-344]
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.3: `swarm/schedule.rs` (`Scheduler`, `MIN_DEPTH`, `QUEUE_TIME`, `SLOW_START_GAIN`, `claim` moved) with unit tests `an_order_is_written_only_when_a_piece_is_taken` and `the_depth_grows_in_slow_start_then_follows_the_rate`; `Fetch` over one session per seeder with the version-1 fallback; swarm dials with 32/64 MiB receive windows; `FetchOptions` defaults 8/32; `Fetch::in_flight`; integration tests `a_caller_that_stops_taking_pieces_stops_the_seeder` and `a_seeder_that_speaks_only_version_1_still_serves_a_fetch`; clippy `-p weida --no-default-features` clean.
 
 ### B-346 — SWARM throughput: 256 MiB session fetch and a bench
-kind: measure | size: 60 | status: in_progress 2026-10-19T13:49Z | needs: [B-345]
+kind: measure | size: 60 | status: done 0cadb35 | needs: [B-345]
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.4: `benches/swarm.rs` prints MiB/s for 64 MiB from one seeder; `tests/swarm_large.rs` (ignored) fetches 256 MiB through a 27 ms delay proxy at ≥ 0.7 × one 256 MiB reply on the same path with peak RSS < 128 MiB; both figures and the bench in IMPLEMENTATION verified results and the NIGHTLOG.
 
 ### B-347 — 0041 into the normative documents, griasdi proposal
