@@ -13,7 +13,7 @@ kind: code | size: 90 | status: done 63584c3 | needs: [B-348]
 acceptance: [0042](decisions/0042-simulated-network.md) §4.2: `RuntimeConfig::network` and `Network`; feature `test-util` with `SimNet`/`SimStats`; three unit tests in `sim.rs` (addressing and the v4-mapped source, partition and drop count, a port taken until released); eight integration tests in `tests/sim.rs` (pinned client identity, mTLS and pin refusal, close and rebind events, partition and heal, delay, drop, the redial schedule restarting under a paused clock, an address free again after close and shutdown); the LOOP §6 `test-util` row; the full gate and `cargo doc -p weida --no-default-features` pass.
 
 ### B-350 — 0042 into the normative documents, zeughaus proposal
-kind: spec | size: 45 | status: in_progress 2026-10-19T14:59Z | needs: [B-349]
+kind: spec | size: 45 | status: done f67a627 | needs: [B-349]
 acceptance: [0042](decisions/0042-simulated-network.md) §4.3: ARCHITECTURE §7 `RuntimeConfig::network`, `Network`, `SimNet`, `SimStats`; the INVARIANTS row for `INBOX_DATAGRAMS`; STATUS §1 "Tests need no network"; `git grep -n 'bind_client_endpoint' -- crates docs` empty; `PROPOSAL-weida-test-doubles.md` in zeughaus's checkout.
 
 ### B-344 — SWARM session wire and the seeder's SeedSession
