@@ -97,8 +97,9 @@ non-zero index on DECLINE, LIST or HAVE, or a non-zero length on DECLINE.
 
 `Seeder::accept() -> Result<SeedSession, Error>` replaces `SeedRequest`. A version-1 ask arrives
 as a session of one order. `MAX_PENDING_ASKS` becomes `MAX_PENDING_SESSIONS` (64): sessions read
-or waiting for `accept`, the surplus dropped. The open, or the version-1 ask, is read under
-`header_timeout_ms`.
+or waiting for `accept`; the surplus waits for a place in the route's queue and on its stream
+(amended by B-351: dropping it read to the fetch as a version-1 or a failed seeder). The open, or
+the version-1 ask, is read under `header_timeout_ms`.
 
 | Method | Meaning |
 | --- | --- |

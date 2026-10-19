@@ -18,7 +18,9 @@ use crate::transfer::{
 
 /// Sessions a seeder holds at once, from the first byte of their body until
 /// the application takes them in [`crate::Seeder::accept`]; a version-1 ask
-/// counts as one. One more is dropped unread.
+/// counts as one. One more waits for a place: its request stays in the
+/// route's queue (`RuntimeConfig::endpoint_queue`) and, past that, on its
+/// stream, as a replier's request does.
 pub const MAX_PENDING_SESSIONS: usize = 64;
 
 /// The fixed part of an answer's deadline: the write of an answer of `n`
@@ -72,9 +74,10 @@ impl SeedState {
     }
 }
 
-/// Moves every request off the route into its own reading task, at most
-/// [`MAX_PENDING_SESSIONS`] at once. Ends with the seeder, which releases
-/// the route.
+/// Moves every request off the route into its own reading task once a place
+/// is free, so at most [`MAX_PENDING_SESSIONS`] are read or wait for `accept`
+/// while the rest wait in the route's queue. Ends with the seeder, which
+/// releases the route.
 async fn read_sessions(
     mut route: mpsc::Receiver<IncomingRequest>,
     out: mpsc::Sender<Pending>,
@@ -83,18 +86,24 @@ async fn read_sessions(
 ) {
     let places = Arc::new(Semaphore::new(MAX_PENDING_SESSIONS));
     loop {
+        // A place first: while every place is held, the next request stays in
+        // the route's queue and, past that, on its stream, as a replier's does.
+        // Dropping it instead would read to its fetch as a version-1 seeder
+        // (`Rejected`) or a failed one (`NoReply`).
+        let place = tokio::select! {
+            () = out.closed() => return,
+            place = Arc::clone(&places).acquire_owned() => match place {
+                Ok(place) => place,
+                // Never closed; a closed semaphore would mean no more sessions.
+                Err(_) => return,
+            },
+        };
         let request = tokio::select! {
             () = out.closed() => return,
             request = route.recv() => match request {
                 Some(request) => request,
                 None => return,
             },
-        };
-        let Ok(place) = Arc::clone(&places).try_acquire_owned() else {
-            tracing::debug!(
-                "a seeder has {MAX_PENDING_SESSIONS} sessions pending; one more is dropped"
-            );
-            continue;
         };
         exec.spawn(open_session(
             request,

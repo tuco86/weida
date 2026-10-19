@@ -457,6 +457,66 @@ async fn a_seeder_that_speaks_only_version_1_still_serves_a_fetch() {
     );
 }
 
+/// Claim: a seeder whose `MAX_PENDING_SESSIONS` places are all taken makes the
+/// next session wait instead of dropping it, so every fetch is served over a
+/// session of its own: none is read as a version-1 seeder and none fails.
+#[tokio::test]
+async fn a_busy_seeder_makes_a_session_wait_rather_than_drop_it() {
+    const FETCHES: usize = weida::MAX_PENDING_SESSIONS + 16;
+    let data = blob_bytes(LEN);
+    let list = Arc::new(PieceList::of(&data, PieceSize::MIN).expect("list"));
+    let blob = list.blob();
+    let server = Server::start().await;
+    let seeder = server.listener.seeder("/swarm").expect("seeder");
+    let (open, opened) = tokio::sync::oneshot::channel::<()>();
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&sessions);
+    let (served_data, served_list) = (Arc::clone(&data), Arc::clone(&list));
+    tokio::spawn(async move {
+        let _ = opened.await;
+        while let Ok(session) = seeder.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(serve(
+                session,
+                Arc::clone(&served_data),
+                Arc::clone(&served_list),
+                Behavior::Honest,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ));
+        }
+    });
+    let client = swarm_runtime();
+    let swarm = client.swarm(Trust::by_address());
+    within(swarm.connect(&server.pinned_url("/swarm")))
+        .await
+        .expect("connect");
+    let mut fetches = tokio::task::JoinSet::new();
+    for _ in 0..FETCHES {
+        let mut fetch = swarm.fetch(blob, Bits::new(blob.count()), FetchOptions::default());
+        fetches.spawn(async move {
+            let mut out = vec![0; LEN];
+            gather(&mut fetch, &mut out).await;
+            out
+        });
+    }
+    // A detection window, not a wait for correctness: it lets every session
+    // reach the seeder before the application accepts any. On a slow machine
+    // fewer sessions queue up and the test gets weaker; it never fails wrongly.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    open.send(()).expect("the application task waits");
+    while let Some(out) = fetches.join_next().await {
+        assert_eq!(BlobId::of(&out.expect("a fetch completed")), blob.root());
+    }
+    assert_eq!(
+        sessions.load(Ordering::Relaxed),
+        FETCHES,
+        "one session per fetch: none was dropped into version-1 asks"
+    );
+    drop(swarm);
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_caller_that_stops_taking_pieces_stops_the_seeder() {
     let data = blob_bytes(LEN);
