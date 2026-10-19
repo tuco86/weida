@@ -17,7 +17,7 @@ kind: measure | size: 60 | status: done 0cadb35 | needs: [B-345]
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.4: `benches/swarm.rs` prints MiB/s for 64 MiB from one seeder; `tests/swarm_large.rs` (ignored) fetches 256 MiB through a 27 ms delay proxy at ≥ 0.7 × one 256 MiB reply on the same path with peak RSS < 128 MiB; both figures and the bench in IMPLEMENTATION verified results and the NIGHTLOG.
 
 ### B-347 — 0041 into the normative documents, griasdi proposal
-kind: spec | size: 45 | status: in_progress 2026-10-19T13:56Z | needs: [B-346]
+kind: spec | size: 45 | status: done 2e3a187 | needs: [B-346]
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.5: PATTERNS §6.5, INVARIANTS, ARCHITECTURE §7, STATUS §1/§4, requirements/griasdi-swarm.md on sessions; `grep -rn 'SeedRequest\|MAX_PENDING_ASKS' docs crates` only in 0040, BACKLOG and NIGHTLOG history; `PROPOSAL-weida-swarm-sessions.md` in griasdi's checkout.
 
 ### B-340 — SWARM piece tree: BlobId, PieceList, Bits, feature swarm
