@@ -25,6 +25,7 @@ use crate::endpoint::{
 };
 use crate::handoff::{self, Handoff, HandoverSocket};
 use crate::inproc;
+use crate::network::{AddrLease, BoundSocket};
 use crate::pubsub::SubRegistry;
 use crate::runtime::{Exec, RuntimeInner, Shared};
 use crate::stream::{Acceptor, Incoming};
@@ -368,7 +369,12 @@ impl Listener {
         tls: impl Into<ServerTls>,
     ) -> Result<Binding, Error> {
         let server_config = tls::server_config(&tls.into(), &self.inner.runtime.config.limits)?;
-        let socket = std::net::UdpSocket::bind(addr).map_err(Error::Io)?;
+        let socket = self
+            .inner
+            .runtime
+            .config
+            .network
+            .bind_server(addr, &self.inner.runtime.exec)?;
         self.serve_quic(socket, server_config)
     }
 
@@ -381,6 +387,8 @@ impl Listener {
     ///
     /// The socket is taken as it is: weida neither binds it nor sets options
     /// on it, and [`Binding::local_addr`] reports the address it is bound to.
+    /// The socket is an OS socket, so a binding made here is never on a
+    /// simulated network.
     ///
     /// A predecessor that called `hand_over` no longer reads the socket, so
     /// the successor may serve it at once; it calls [`Binding::take_over`]
@@ -391,28 +399,31 @@ impl Listener {
         tls: impl Into<ServerTls>,
     ) -> Result<Binding, Error> {
         let server_config = tls::server_config(&tls.into(), &self.inner.runtime.config.limits)?;
-        self.serve_quic(socket, server_config)
+        self.serve_quic(
+            BoundSocket::os(socket, &self.inner.runtime.exec)?,
+            server_config,
+        )
     }
 
     /// Serves this Listener's endpoints over QUIC on `socket`.
     fn serve_quic(
         &self,
-        socket: std::net::UdpSocket,
+        socket: BoundSocket,
         server_config: quinn::ServerConfig,
     ) -> Result<Binding, Error> {
         let exec = self.inner.runtime.exec.clone();
-        // The duplicate a handover passes on; the endpoint gets the original.
-        let handed = socket.try_clone().map_err(Error::Io)?;
+        let BoundSocket {
+            inner,
+            runtime,
+            handed,
+            lease,
+        } = socket;
 
-        // Inside the runtime context: `quinn` registers the socket with the
-        // reactor as it is constructed, and the calling thread may have none.
+        // Inside the runtime context: `quinn` spawns the endpoint's driver
+        // as it is constructed, and the calling thread may have no reactor.
         let (endpoint, socket) = {
             let _guard = exec.enter();
-            let runtime = quinn::default_runtime()
-                .ok_or_else(|| Error::Runtime("no async runtime for the QUIC endpoint".into()))?;
-            let socket = Arc::new(HandoverSocket::new(
-                runtime.wrap_udp_socket(socket).map_err(Error::Io)?,
-            ));
+            let socket = Arc::new(HandoverSocket::new(inner));
             let endpoint = quinn::Endpoint::new_with_abstract_socket(
                 quinn::EndpointConfig::default(),
                 Some(server_config),
@@ -423,7 +434,9 @@ impl Listener {
             (endpoint, socket)
         };
         let local_addr = endpoint.local_addr().map_err(Error::Io)?;
-        self.inner.runtime.track_endpoint(endpoint.clone());
+        self.inner
+            .runtime
+            .track_endpoint(endpoint.clone(), lease.clone());
 
         let peers = Arc::new(PeerConns::default());
         let open = Arc::new(OpenConns::default());
@@ -441,6 +454,7 @@ impl Listener {
             peers,
             socket,
             handed,
+            lease,
             open,
             close_timeout: self.inner.runtime.config.shutdown_timeout,
             exec,
@@ -748,8 +762,11 @@ pub struct Binding {
     peers: Arc<PeerConns>,
     /// The decorator under the endpoint, which `hand_over` makes hold.
     socket: Arc<HandoverSocket>,
-    /// A duplicate of the bound socket, for the successor.
-    handed: std::net::UdpSocket,
+    /// A duplicate of the bound socket, for the successor; `None` on a
+    /// simulated network.
+    handed: Option<std::net::UdpSocket>,
+    /// Frees a simulated address once the binding closed.
+    lease: AddrLease,
     open: Arc<OpenConns>,
     exec: Exec,
     close_timeout: Duration,
@@ -786,6 +803,7 @@ impl Binding {
                 "timeout reached before the binding's socket went idle"
             );
         }
+        self.lease.release();
     }
 
     /// Hands this binding's socket over to a successor process, which tells
@@ -811,7 +829,15 @@ impl Binding {
     /// successor never calls `take_over`, or a datagram is lost, a client
     /// notices through [`Limits::idle_timeout`] and redials on its normal
     /// schedule.
-    pub async fn hand_over(self) -> Handoff {
+    ///
+    /// # Panics
+    ///
+    /// On a binding on a simulated network, which has no OS socket to hand
+    /// over.
+    pub async fn hand_over(mut self) -> Handoff {
+        let handed = self.handed.take().expect(
+            "Binding::hand_over needs an OS socket; a binding on a simulated network has none",
+        );
         self.socket.hold();
         let pending: Vec<quinn::Connection> = self
             .open
@@ -851,7 +877,7 @@ impl Binding {
             "binding handed over"
         );
         Handoff {
-            socket: self.handed,
+            socket: handed,
             local_addr: self.local_addr,
             held,
         }

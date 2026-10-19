@@ -64,6 +64,7 @@ mod handoff;
 mod identity;
 mod inproc;
 mod listener;
+mod network;
 mod ordering;
 #[cfg(windows)]
 mod pipe;
@@ -74,6 +75,9 @@ mod reconnect;
 mod report;
 mod runtime;
 mod segment;
+// A simulated UDP network under real QUIC, for tests (decisions/0042).
+#[cfg(feature = "test-util")]
+mod sim;
 mod stats;
 mod stream;
 mod tls;
@@ -108,12 +112,15 @@ pub use listener::PipeBinding;
 #[cfg(unix)]
 pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
+pub use network::Network;
 pub use ordering::Gap;
 pub use pubsub::{DishDrops, FanOut, TopicDrops};
 pub use radio::{Join, JoinTerms, Received};
 pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 pub use runtime::Runtime;
 pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
+#[cfg(feature = "test-util")]
+pub use sim::{SimNet, SimStats};
 pub use stats::{ConnectionStats, PathStats, RemoteStats, TransportStats, UdpCounts};
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 #[cfg(feature = "swarm")]

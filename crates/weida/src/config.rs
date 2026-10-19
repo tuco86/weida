@@ -16,6 +16,7 @@ use weida_runtime::SharedResolver;
 use zeroize::Zeroizing;
 
 use crate::identity::{IdentitySource, TrustSource};
+use crate::network::Network;
 use crate::reconnect::{OutboxFull, ReconnectPolicy};
 
 /// Whether a dialled authority may name a **set** of nodes.
@@ -150,6 +151,14 @@ pub struct RuntimeConfig {
     /// and [`weida_runtime::SystemResolver`] caps how many such lookups are
     /// outstanding at once.
     pub resolver: SharedResolver,
+    /// Where this runtime's QUIC sockets live: the operating system's UDP (the default) or, with
+    /// the cargo feature `test-util`, a `SimNet` shared by the runtimes of one test. Local
+    /// transports (`weida+inproc`, `+unix`, `+pipe`) are not affected.
+    ///
+    /// With `test-util`, `Network::sim(&net)` puts this runtime on `net`: give every runtime of
+    /// one test the same `SimNet`
+    /// ([decisions/0042](../../../docs/decisions/0042-simulated-network.md)).
+    pub network: Network,
     /// How long a dial waits on one resolved address before trying the next.
     ///
     /// Only the addresses *before* the last one are bounded by it: a name
@@ -244,6 +253,7 @@ impl Default for RuntimeConfig {
             connect_attempt_timeout: Duration::from_millis(250),
             discovery: Discovery::default(),
             resolver: SharedResolver::default(),
+            network: Network::default(),
             reconnect: ReconnectPolicy::default(),
             send_timeout: None,
             outbox_messages: 1000,

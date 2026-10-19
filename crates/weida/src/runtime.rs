@@ -32,6 +32,7 @@ use crate::endpoint::{
     SurveyState, Surveyor,
 };
 use crate::listener::Listener;
+use crate::network::AddrLease;
 use crate::pool::ClientPool;
 use crate::stream::Peer;
 use crate::transport::Link;
@@ -63,17 +64,18 @@ pub(crate) struct RuntimeInner {
     /// Present only for a runtime created by [`Runtime::owned`]; dropped with
     /// the last handle.
     _owned: Option<OwnedReactor>,
-    /// Every QUIC endpoint this runtime owns, for shutdown.
-    endpoints: Mutex<Vec<quinn::Endpoint>>,
+    /// Every QUIC endpoint this runtime owns, for shutdown, with the lease on
+    /// its address.
+    endpoints: Mutex<Vec<(quinn::Endpoint, AddrLease)>>,
     pub(crate) shared: Arc<Shared>,
 }
 
 impl RuntimeInner {
-    pub(crate) fn track_endpoint(&self, endpoint: quinn::Endpoint) {
+    pub(crate) fn track_endpoint(&self, endpoint: quinn::Endpoint, lease: AddrLease) {
         self.endpoints
             .lock()
             .expect("endpoint list poisoned")
-            .push(endpoint);
+            .push((endpoint, lease));
     }
 
     /// Dials, or reuses a pooled connection to, `path` on `host:port` on
@@ -450,7 +452,7 @@ impl Runtime {
     /// Closes every binding and pooled connection and waits, for whatever is
     /// left of `budget`, for the sockets to go idle.
     async fn close(self, budget: CloseBudget) {
-        let endpoints: Vec<quinn::Endpoint> = self
+        let (endpoints, leases): (Vec<quinn::Endpoint>, Vec<AddrLease>) = self
             .inner
             .endpoints
             .lock()
@@ -489,6 +491,11 @@ impl Runtime {
                 timeout_ms = remaining.as_millis(),
                 "timeout reached before the sockets went idle"
             ),
+        }
+        // The simulated addresses are free once their sockets went idle or
+        // the budget ran out, as an OS frees a closed socket's port.
+        for lease in &leases {
+            lease.release();
         }
     }
 

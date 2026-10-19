@@ -22,7 +22,6 @@
 //! authority reach two different servers.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use quinn::VarInt;
@@ -155,7 +154,7 @@ impl ClientPool {
             let endpoint = match &state.endpoint {
                 Some(endpoint) => endpoint.clone(),
                 None => {
-                    let endpoint = bind_client_endpoint(exec)?;
+                    let endpoint = config.network.bind_client(exec)?;
                     state.endpoint = Some(endpoint.clone());
                     endpoint
                 }
@@ -335,22 +334,6 @@ impl PoolState {
     }
 }
 
-/// Binds the shared client socket, preferring dual-stack IPv6.
-///
-/// Inside the runtime context: `quinn` registers the socket with the reactor
-/// as it is constructed, and the caller's thread may have none.
-fn bind_client_endpoint(exec: &Exec) -> Result<quinn::Endpoint, Error> {
-    let _guard = exec.enter();
-    let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
-    match quinn::Endpoint::client(v6) {
-        Ok(endpoint) => Ok(endpoint),
-        Err(e) => {
-            tracing::debug!(error = %e, "IPv6 client socket unavailable; falling back to IPv4");
-            quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).map_err(Error::Io)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,12 +365,5 @@ mod tests {
             message.contains("jobs.example") && message.contains("Discovery::Single"),
             "the refusal names the host and the reason: {message}"
         );
-    }
-
-    #[tokio::test]
-    async fn the_client_socket_binds() {
-        let exec = Exec::current().expect("ambient runtime");
-        let endpoint = bind_client_endpoint(&exec).unwrap();
-        assert_ne!(endpoint.local_addr().unwrap().port(), 0);
     }
 }

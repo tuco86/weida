@@ -25,6 +25,11 @@ blocking = ["dep:futures"]
 # `blake3` for the piece tree, which an application that moves no
 # content-addressed blobs has no use for.
 swarm = ["dep:blake3"]
+# `weida::SimNet`: a simulated UDP network that real QUIC and TLS run over, for
+# tests with no sockets and under a paused clock
+# (`docs/decisions/0042-simulated-network.md`). Off by default, because
+# production has the OS's network.
+test-util = []
 
 [dependencies]
 weida-core.workspace = true
@@ -61,8 +66,9 @@ blake3 = { workspace = true, optional = true }
 # downstream build turns the feature off.
 weida = { path = ".", features = ["generate"] }
 tracing-subscriber.workspace = true
-# Examples stream stdin/stdout; the library itself needs no stdio.
-tokio = { workspace = true, features = ["io-std"] }
+# Examples stream stdin/stdout; the library itself needs no stdio. `test-util`
+# for `start_paused` in the tests of a simulated network.
+tokio = { workspace = true, features = ["io-std", "test-util"] }
 criterion.workspace = true
 futures.workspace = true
 # Tests build device chains signed by a user key (decisions/0035).
