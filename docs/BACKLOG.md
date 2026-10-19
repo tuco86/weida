@@ -4,6 +4,22 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-351 — A busy seeder makes a session wait instead of dropping it
+kind: code | size: 45 | status: ready | needs: []
+acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
+
+### B-352 — sim.rs's direct tokio clock named; no sleep in a unit test
+kind: code | size: 30 | status: ready | needs: [B-351]
+acceptance: ARCHITECTURE §5 and the `weida` manifest comment name `crates/weida/src/sim.rs` (feature `test-util`) as the one module that reads tokio's clock and arms tokio timers directly; 0042 §4.2 and the `sim.rs` module doc state the test rule (reading the clock is fine in a unit test, a test that waits on a timer is an integration test, also on a paused clock); `now_reads_the_runtime_clock` advances the paused clock instead of sleeping; zeughaus's `PROPOSAL-weida-test-doubles.md` keeps timer-waiting tests in `mod io`; full gate green.
+
+### B-353 — docs.rs documents every feature of weida
+kind: code | size: 30 | status: ready | needs: []
+acceptance: `crates/weida/Cargo.toml` has `[package.metadata.docs.rs] all-features = true`, so docs.rs shows `weida::Swarm`, `weida::blocking` and `weida::SimNet`; `cargo doc -p weida --all-features --no-deps` with `RUSTDOCFLAGS="-D warnings"` green. Not in 0.1.0-alpha.8, by the owner's choice.
+
+### B-354 — SWARM claims in time independent of the blob's piece count
+kind: code | size: 90 | status: ready | needs: []
+acceptance: `swarm/schedule.rs` keeps the missing pieces not yet in flight as an index, so one `claim` no longer walks every piece (today a fetch costs O(pieces²), slow near `MAX_PIECES`); the endgame and uniform choice keep their unit tests; a unit test plans every order of a 2^20-piece blob within 1 s in a debug build. Not in 0.1.0-alpha.8, by the owner's choice.
+
 ### B-348 — weida reads its clocks through Exec::now
 kind: code | size: 60 | status: done 9fe0693 | needs: []
 acceptance: [0042](decisions/0042-simulated-network.md) §4.1: `Exec::now` with the paused-clock test `now_reads_the_runtime_clock`; every clock read in `crates/weida/src` that gates a wait goes through it; `git grep -n 'Instant::now()\|\.elapsed()' -- crates/weida/src` lists only the exempt sites (`identity.rs`, the listener's log throttle, `transfer.rs` `expire_at`, `swarm/seed.rs`) and lines inside `#[cfg(test)]` modules; the full gate passes.
