@@ -1,6 +1,6 @@
 # 0040 — SWARM: many sources, one verified blob
 
-- **Status:** accepted
+- **Status:** accepted; §4.2-§4.4 amended by [0041](0041-swarm-sessions.md)
 - **Date:** 2026-10-17
 - **Items:** B-340, B-341, B-342, B-343
 - **Related:** [requirements/griasdi-swarm.md](../requirements/griasdi-swarm.md),

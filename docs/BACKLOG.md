@@ -4,6 +4,22 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-344 — SWARM session wire and the seeder's SeedSession
+kind: code | size: 90 | status: ready | needs: []
+acceptance: [0041](decisions/0041-swarm-sessions.md) §4.1-§4.2: `swarm/wire.rs` with the 48-byte open, 5-byte order and 9-byte answer head and their refusals (round trips and one refusal table); `IncomingTransfer::read_exact_into`; `SeedSession` (`next`, `answer_*`, `decline`) replacing `SeedRequest`, `MAX_PENDING_SESSIONS` 64, version-1 asks still served; every swarm integration test green on sessions; `grep -rn 'SeedRequest\|MAX_PENDING_ASKS' crates/` empty.
+
+### B-345 — SWARM fetch over sessions, scheduled by queue time
+kind: code | size: 90 | status: ready | needs: [B-344]
+acceptance: [0041](decisions/0041-swarm-sessions.md) §4.3: `swarm/schedule.rs` (`Scheduler`, `MIN_DEPTH`, `QUEUE_TIME`, `SLOW_START_GAIN`, `claim` moved) with unit tests `an_order_is_written_only_when_a_piece_is_taken` and `the_depth_grows_in_slow_start_then_follows_the_rate`; `Fetch` over one session per seeder with the version-1 fallback; swarm dials with 32/64 MiB receive windows; `FetchOptions` defaults 8/32; `Fetch::in_flight`; integration tests `a_caller_that_stops_taking_pieces_stops_the_seeder` and `a_seeder_that_speaks_only_version_1_still_serves_a_fetch`; clippy `-p weida --no-default-features` clean.
+
+### B-346 — SWARM throughput: 256 MiB session fetch and a bench
+kind: measure | size: 60 | status: ready | needs: [B-345]
+acceptance: [0041](decisions/0041-swarm-sessions.md) §4.4: `benches/swarm.rs` prints MiB/s for 64 MiB from one seeder; `tests/swarm_large.rs` (ignored) fetches 256 MiB through a 27 ms delay proxy at ≥ 0.7 × one 256 MiB reply on the same path with peak RSS < 128 MiB; both figures and the bench in IMPLEMENTATION verified results and the NIGHTLOG.
+
+### B-347 — 0041 into the normative documents, griasdi proposal
+kind: spec | size: 45 | status: ready | needs: [B-346]
+acceptance: [0041](decisions/0041-swarm-sessions.md) §4.5: PATTERNS §6.5, INVARIANTS, ARCHITECTURE §7, STATUS §1/§4, requirements/griasdi-swarm.md on sessions; `grep -rn 'SeedRequest\|MAX_PENDING_ASKS' docs crates` only in 0040, BACKLOG and NIGHTLOG history; `PROPOSAL-weida-swarm-sessions.md` in griasdi's checkout.
+
 ### B-340 — SWARM piece tree: BlobId, PieceList, Bits, feature swarm
 kind: code | size: 90 | status: done ad5eb84 | needs: []
 acceptance: [0040](decisions/0040-swarm-pattern.md) §4.1: feature `swarm` on `weida` linking `blake3`; `crates/weida/src/swarm/tree.rs` with `MAX_PIECES`, `BlobId` (hex `Display`/`FromStr`), `PieceSize` (1 KiB..16 MiB), `Blob` (`count`, `span`), `PieceList` (`of`, `parse`, `to_bytes`, `check`), `TreeHasher`, `Bits`; unit tests: the root equals `blake3::hash` for twelve sizes around piece boundaries, a changed list byte is refused, `check` refuses a flipped bit, a piece in another slot and a wrong length, `Bits` refuses padding bits, `Blob::new` refuses `MAX_PIECES + 1`; LOOP §6 lists the feature run.
