@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-348 — weida reads its clocks through Exec::now
-kind: code | size: 60 | status: ready | needs: []
+kind: code | size: 60 | status: in_progress 2026-10-19T14:30Z | needs: []
 acceptance: [0042](decisions/0042-simulated-network.md) §4.1: `Exec::now` with the paused-clock test `now_reads_the_runtime_clock`; every clock read in `crates/weida/src` that gates a wait goes through it; `git grep -n 'Instant::now()\|\.elapsed()' -- crates/weida/src` lists only the exempt sites (`identity.rs`, the listener's log throttle, `transfer.rs` `expire_at`, `swarm/seed.rs`) and lines inside `#[cfg(test)]` modules; the full gate passes.
 
 ### B-349 — test-util: SimNet, a simulated network under real QUIC
