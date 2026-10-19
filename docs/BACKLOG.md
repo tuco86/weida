@@ -9,7 +9,7 @@ kind: code | size: 60 | status: done 9fe0693 | needs: []
 acceptance: [0042](decisions/0042-simulated-network.md) §4.1: `Exec::now` with the paused-clock test `now_reads_the_runtime_clock`; every clock read in `crates/weida/src` that gates a wait goes through it; `git grep -n 'Instant::now()\|\.elapsed()' -- crates/weida/src` lists only the exempt sites (`identity.rs`, the listener's log throttle, `transfer.rs` `expire_at`, `swarm/seed.rs`) and lines inside `#[cfg(test)]` modules; the full gate passes.
 
 ### B-349 — test-util: SimNet, a simulated network under real QUIC
-kind: code | size: 90 | status: in_progress 2026-10-19T14:38Z | needs: [B-348]
+kind: code | size: 90 | status: done 63584c3 | needs: [B-348]
 acceptance: [0042](decisions/0042-simulated-network.md) §4.2: `RuntimeConfig::network` and `Network`; feature `test-util` with `SimNet`/`SimStats`; three unit tests in `sim.rs` (addressing and the v4-mapped source, partition and drop count, a port taken until released); eight integration tests in `tests/sim.rs` (pinned client identity, mTLS and pin refusal, close and rebind events, partition and heal, delay, drop, the redial schedule restarting under a paused clock, an address free again after close and shutdown); the LOOP §6 `test-util` row; the full gate and `cargo doc -p weida --no-default-features` pass.
 
 ### B-350 — 0042 into the normative documents, zeughaus proposal
