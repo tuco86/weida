@@ -9,7 +9,7 @@ kind: code | size: 90 | status: done b3982d7 | needs: []
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.1-§4.2: `swarm/wire.rs` with the 48-byte open, 5-byte order and 9-byte answer head and their refusals (round trips and one refusal table); `IncomingTransfer::read_exact_into`; `SeedSession` (`next`, `answer_*`, `decline`) replacing `SeedRequest`, `MAX_PENDING_SESSIONS` 64, version-1 asks still served; every swarm integration test green on sessions; `grep -rn 'SeedRequest\|MAX_PENDING_ASKS' crates/` empty.
 
 ### B-345 — SWARM fetch over sessions, scheduled by queue time
-kind: code | size: 90 | status: in_progress 2026-10-19T13:39Z | needs: [B-344]
+kind: code | size: 90 | status: done 0cbb69f | needs: [B-344]
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.3: `swarm/schedule.rs` (`Scheduler`, `MIN_DEPTH`, `QUEUE_TIME`, `SLOW_START_GAIN`, `claim` moved) with unit tests `an_order_is_written_only_when_a_piece_is_taken` and `the_depth_grows_in_slow_start_then_follows_the_rate`; `Fetch` over one session per seeder with the version-1 fallback; swarm dials with 32/64 MiB receive windows; `FetchOptions` defaults 8/32; `Fetch::in_flight`; integration tests `a_caller_that_stops_taking_pieces_stops_the_seeder` and `a_seeder_that_speaks_only_version_1_still_serves_a_fetch`; clippy `-p weida --no-default-features` clean.
 
 ### B-346 — SWARM throughput: 256 MiB session fetch and a bench
