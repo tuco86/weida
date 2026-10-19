@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use quinn::VarInt;
 use tokio::sync::Mutex;
-use weida_core::{EndpointAddr, Error, Fingerprint};
+use weida_core::{EndpointAddr, Error, Fingerprint, Limits};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, Discovery, RuntimeConfig};
@@ -99,9 +99,15 @@ impl ClientPool {
     /// completed the HELLO exchange, so callers never have to think about
     /// negotiation, and the peer it proved has been checked against the
     /// identity this peer proved on its other connections.
+    ///
+    /// A new connection is dialled with `limits`: the runtime's, or a
+    /// swarm's with larger receive windows. They are not part of the key,
+    /// because only a swarm dials a seeder's path, so one key is always
+    /// dialled with the same limits.
     pub(crate) async fn connect(
         &self,
         config: &RuntimeConfig,
+        limits: &Limits,
         exec: &Exec,
         addr: &EndpointAddr,
         tls: &Arc<ClientTls>,
@@ -157,7 +163,7 @@ impl ClientPool {
             (endpoint, state.peer_identity(&peer))
         };
 
-        let (client_config, refused) = tls::client_config(tls, expected, &config.limits)?;
+        let (client_config, refused) = tls::client_config(tls, expected, limits)?;
 
         let addrs = config
             .resolver
@@ -280,7 +286,7 @@ impl ClientPool {
         // listener's namespace — a client serves nothing on its own account.
         let handle = ConnCtx::spawn(
             Link::Quic(QuicLink::new(conn)),
-            config.limits,
+            *limits,
             Arc::new(Namespace::new()),
             None,
             exec.clone(),

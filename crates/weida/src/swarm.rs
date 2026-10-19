@@ -21,6 +21,7 @@
 //! [`Piece`] once it verifies against the root.
 
 mod gather;
+mod schedule;
 mod seed;
 mod tree;
 mod wire;

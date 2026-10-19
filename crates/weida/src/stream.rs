@@ -22,7 +22,7 @@ use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, watch};
-use weida_core::{Address, Error, LossCause, PeerIdentity};
+use weida_core::{Address, Error, Limits, LossCause, PeerIdentity};
 use weida_protocol::header::limits::MAX_TOPIC_BYTES;
 
 use crate::config::ClientTls;
@@ -101,6 +101,9 @@ struct Outbox {
 pub(crate) struct PeerShared {
     runtime: Arc<RuntimeInner>,
     tls: Arc<ClientTls>,
+    /// What a QUIC connection of this peer is dialled with: the runtime's
+    /// limits, or a swarm's with larger receive windows.
+    limits: Limits,
     slots: std::sync::Mutex<Vec<Slot>>,
     cursor: AtomicUsize,
     next_slot: AtomicU64,
@@ -357,7 +360,7 @@ impl PeerShared {
                     }
                     _ => addr,
                 };
-                let conn = self.runtime.connect(addr, &self.tls).await?;
+                let conn = self.runtime.connect(addr, &self.tls, &self.limits).await?;
                 (conn, path)
             }
             Address::Inproc(addr) => {
@@ -427,13 +430,35 @@ impl Peer {
         tls: Arc<ClientTls>,
         attach: Option<Arc<dyn Attach>>,
     ) -> Peer {
+        let limits = runtime.config.limits;
+        Peer::build(runtime, tls, attach, limits)
+    }
+
+    /// A peer whose QUIC connections are dialled with `limits` instead of
+    /// the runtime's: a swarm's, whose receive windows carry a seeder's
+    /// pipelined answers (quinn fixes them per connection at dial).
+    #[cfg(feature = "swarm")]
+    pub(crate) fn with_limits(
+        runtime: Arc<RuntimeInner>,
+        tls: Arc<ClientTls>,
+        limits: Limits,
+    ) -> Peer {
+        Peer::build(runtime, tls, None, limits)
+    }
+
+    fn build(
+        runtime: Arc<RuntimeInner>,
+        tls: Arc<ClientTls>,
+        attach: Option<Arc<dyn Attach>>,
+        limits: Limits,
+    ) -> Peer {
         let (events, _) = broadcast::channel(EVENT_QUEUE);
         let (alive, _) = watch::channel(());
-        let limits = runtime.config.limits;
         Peer {
             shared: Arc::new(PeerShared {
                 runtime,
                 tls,
+                limits,
                 slots: std::sync::Mutex::new(Vec::new()),
                 cursor: AtomicUsize::new(0),
                 next_slot: AtomicU64::new(0),

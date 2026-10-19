@@ -68,8 +68,9 @@ pub enum Bus {}
 pub enum Cast {}
 /// The receiving side of RADIO/DISH.
 pub enum Tune {}
-/// The bound side of SWARM: answers asks about blobs from the application's
-/// storage ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
+/// The bound side of SWARM: answers each fetch's orders about a blob from the
+/// application's storage ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md),
+/// [decisions/0041](../../../docs/decisions/0041-swarm-sessions.md)).
 #[cfg(feature = "swarm")]
 pub enum Seed {}
 /// The dialling side of SWARM: gathers one blob from every connected seeder.
@@ -188,8 +189,8 @@ pub type Radio = Endpoint<Cast>;
 /// The receiving half of RADIO/DISH: connects, joins topics, and receives
 /// the newest segment of each.
 pub type Dish = Endpoint<Tune>;
-/// The bound half of SWARM: hands each ask about a blob to the application,
-/// which answers it from its own storage.
+/// The bound half of SWARM: hands each fetch's session about a blob to the
+/// application, which answers its orders from its own storage.
 #[cfg(feature = "swarm")]
 pub type Seeder = Endpoint<Seed>;
 /// The dialling half of SWARM: connects to seeders and fetches a blob from

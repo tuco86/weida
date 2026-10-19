@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use quinn::VarInt;
-use weida_core::{EndpointAddr, Error};
+use weida_core::{EndpointAddr, Error, Limits};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
@@ -82,12 +82,17 @@ impl RuntimeInner {
     /// The path is part of the pool key: one connection per dialled endpoint
     /// path, so two paths on one peer cannot stall each other
     /// ([decisions/0002](../../../docs/decisions/0002-control-and-bulk-separation.md) §6.2).
+    /// A new connection takes `limits`, which are the runtime's except for a
+    /// swarm's larger receive windows; see [`ClientPool::connect`].
     pub(crate) async fn connect(
         &self,
         addr: &EndpointAddr,
         tls: &Arc<ClientTls>,
+        limits: &Limits,
     ) -> Result<ConnHandle, Error> {
-        self.pool.connect(&self.config, &self.exec, addr, tls).await
+        self.pool
+            .connect(&self.config, limits, &self.exec, addr, tls)
+            .await
     }
 
     /// Dials an in-process bus, with no pool and no TLS.
@@ -364,10 +369,14 @@ impl Runtime {
     }
 
     /// Creates a SWARM fetcher that dials seeders on `tls`'s terms
-    /// ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
+    /// ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md),
+    /// [decisions/0041](../../../docs/decisions/0041-swarm-sessions.md)).
     ///
     /// Like a surveyor, a swarm uses **every** seeder it connected to: one
-    /// [`crate::Fetch`] takes pieces from all of them at once.
+    /// [`crate::Fetch`] takes pieces from all of them at once. Its QUIC
+    /// connections are dialled with this runtime's limits, the receive
+    /// windows raised to at least 32 MiB per stream and 64 MiB per
+    /// connection, so one seeder's pipelined answers can fill a fast path.
     #[cfg(feature = "swarm")]
     pub fn swarm(&self, tls: impl Into<ClientTls>) -> crate::Swarm {
         Endpoint::from_state(crate::swarm::GatherState::new(

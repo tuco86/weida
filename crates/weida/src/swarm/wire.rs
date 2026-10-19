@@ -27,10 +27,6 @@ use super::{Ask, Blob, BlobId, PieceSize};
 pub(crate) const VERSION_1: u8 = 1;
 /// The version of a session open.
 pub(crate) const VERSION_2: u8 = 2;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the fetch reads sessions from B-345")
-)]
 const DECLINE: u8 = 0;
 const LIST: u8 = 1;
 const HAVE: u8 = 2;
@@ -130,10 +126,6 @@ pub(crate) const ORDER_BYTES: usize = 5;
 pub(crate) const FRAME_HEAD_BYTES: usize = 9;
 
 /// Encodes the open of a session about `blob`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the fetch opens sessions from B-345")
-)]
 pub(crate) fn encode_open(blob: &Blob) -> [u8; OPEN_BYTES] {
     let mut out = [0; OPEN_BYTES];
     out[0] = VERSION_2;
@@ -168,7 +160,6 @@ fn kind_and_index(ask: Ask) -> (u8, u32) {
 }
 
 /// Encodes one order.
-#[cfg_attr(not(test), expect(dead_code, reason = "the fetch orders from B-345"))]
 pub(crate) fn encode_order(ask: Ask) -> [u8; ORDER_BYTES] {
     let (kind, index) = kind_and_index(ask);
     let mut out = [0; ORDER_BYTES];
@@ -214,10 +205,6 @@ pub(crate) fn encode_head(head: Head) -> [u8; FRAME_HEAD_BYTES] {
 /// Decodes an answer head, refusing an unknown kind, an index on DECLINE,
 /// LIST or HAVE, and a length on DECLINE. Whether the head answers the order
 /// it should is the reader's to check.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the fetch reads sessions from B-345")
-)]
 pub(crate) fn decode_head(bytes: &[u8; FRAME_HEAD_BYTES]) -> Option<Head> {
     let index = u32::from_be_bytes(bytes[1..5].try_into().ok()?);
     let len = u32::from_be_bytes(bytes[5..].try_into().ok()?);

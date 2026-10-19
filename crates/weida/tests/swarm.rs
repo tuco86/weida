@@ -1,15 +1,18 @@
-//! SWARM: a seeder answers asks from the application's storage, and a swarm
-//! gathers one blob from every seeder at once, verifying each piece against
-//! the root ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md)).
+//! SWARM: a seeder answers a session's orders from the application's
+//! storage, and a swarm gathers one blob from every seeder at once, verifying
+//! each piece against the root
+//! ([decisions/0040](../../../docs/decisions/0040-swarm-pattern.md),
+//! [decisions/0041](../../../docs/decisions/0041-swarm-sessions.md)).
 
 use crate::common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::Server;
 use weida::{
-    Ask, Bits, Blob, BlobId, Error, Fetch, FetchOptions, PieceList, PieceSize, Runtime,
+    Ask, Bits, Blob, BlobId, Error, ErrorCode, Fetch, FetchOptions, PieceList, PieceSize, Runtime,
     RuntimeConfig, SeedSession, TransferMeta, Trust,
 };
 
@@ -266,23 +269,38 @@ async fn honest(session: &mut SeedSession, ask: Ask, data: &[u8], list: &PieceLi
     };
 }
 
-/// A seeder that sends a piece list of the right length that does not hash
-/// to the root, and is honest otherwise. Built on a plain replier, because a
-/// [`weida::Seeder`] cannot be made to send a list of another blob.
-async fn lying_list_seeder(data: Arc<Vec<u8>>) -> TestSeeder {
+/// A seeder of the version-1 wire only, as 0040 shipped it, on a plain
+/// replier: an ask is read under the 47-byte cap, so a session open (48
+/// bytes) overflows it and is refused with `Rejected`, as a real version-1
+/// seeder does. With `lie_about_list` its piece list has the right length
+/// and does not hash to the root, which a [`weida::Seeder`] cannot be made
+/// to send. Returns the seeder and how many session opens it refused.
+async fn version1_seeder(
+    data: Arc<Vec<u8>>,
+    lie_about_list: bool,
+) -> (TestSeeder, Arc<AtomicUsize>) {
     let server = Server::start().await;
     let replier = server.listener.replier("/swarm").expect("replier");
     let asks = Arc::new(Mutex::new(Vec::new()));
+    let refused = Arc::new(AtomicUsize::new(0));
     let list = PieceList::of(&data, PieceSize::MIN).expect("list");
     let blob = list.blob();
     let recorded = Arc::clone(&asks);
+    let opens = Arc::clone(&refused);
     tokio::spawn(async move {
         while let Ok(mut request) = replier.accept().await {
-            let Ok(body) = request.body().read_capped(47).await else {
-                continue;
+            let body = match request.body().read_capped(47).await {
+                Ok(body) => body,
+                Err(Error::LimitExceeded) => {
+                    opens.fetch_add(1, Ordering::Relaxed);
+                    request.refuse(ErrorCode::Rejected).await;
+                    continue;
+                }
+                Err(_) => continue,
             };
             let (ask, answer) = match body[1] {
-                1 => (Ask::List, vec![0x5a; blob.count() as usize * 32]),
+                1 if lie_about_list => (Ask::List, vec![0x5a; blob.count() as usize * 32]),
+                1 => (Ask::List, list.to_bytes()),
                 2 => (Ask::Have, Bits::full(blob.count()).as_bytes().to_vec()),
                 _ => {
                     let index = u32::from_be_bytes(body[43..47].try_into().expect("index"));
@@ -297,7 +315,7 @@ async fn lying_list_seeder(data: Arc<Vec<u8>>) -> TestSeeder {
             let _ = reply.finish();
         }
     });
-    TestSeeder { server, asks }
+    (TestSeeder { server, asks }, refused)
 }
 
 fn swarm_runtime() -> Runtime {
@@ -386,7 +404,7 @@ async fn a_seeder_that_sends_a_wrong_piece_is_dropped_and_the_blob_completes() {
 async fn a_list_that_does_not_hash_to_the_root_drops_the_seeder() {
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
-    let a = lying_list_seeder(Arc::clone(&data)).await;
+    let (a, _) = version1_seeder(Arc::clone(&data), true).await;
     let b = seed(Arc::clone(&data), Behavior::Honest).await;
     let client = swarm_runtime();
     let swarm = client.swarm(Trust::by_address());
@@ -408,6 +426,89 @@ async fn a_list_that_does_not_hash_to_the_root_drops_the_seeder() {
     assert_eq!(BlobId::of(&out), blob.root());
     assert_eq!(fetch.list().map(PieceList::blob), Some(blob));
     assert!(a.pieces_asked().is_empty(), "a liar is asked no piece");
+}
+
+#[tokio::test]
+async fn a_seeder_that_speaks_only_version_1_still_serves_a_fetch() {
+    let data = blob_bytes(LEN);
+    let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
+    let (a, refused) = version1_seeder(Arc::clone(&data), false).await;
+    let client = swarm_runtime();
+    let swarm = client.swarm(Trust::by_address());
+    within(swarm.connect(&a.url())).await.expect("connect a");
+
+    let mut fetch = swarm.fetch(blob, Bits::new(18), FetchOptions::default());
+    let mut out = vec![0; LEN];
+    let mut indices = gather(&mut fetch, &mut out).await;
+    indices.sort_unstable();
+    assert_eq!(indices, (0..18).collect::<Vec<_>>());
+    assert_eq!(BlobId::of(&out), blob.root());
+    assert!(
+        refused.load(Ordering::Relaxed) >= 1,
+        "the fetch tried a session first"
+    );
+    let mut asked = a.pieces_asked();
+    asked.sort_unstable();
+    asked.dedup();
+    assert_eq!(
+        asked,
+        (0..18).collect::<Vec<_>>(),
+        "every piece came as a version-1 ask"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_that_stops_taking_pieces_stops_the_seeder() {
+    let data = blob_bytes(LEN);
+    let list = PieceList::of(&data, PieceSize::MIN).expect("list");
+    let blob = list.blob();
+    let a = seed(Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime();
+    let swarm = client.swarm(Trust::by_address());
+    within(swarm.connect(&a.url())).await.expect("connect a");
+
+    let options = FetchOptions {
+        list: Some(list),
+        per_peer: 4,
+        ..FetchOptions::default()
+    };
+    let mut fetch = swarm.fetch(blob, Bits::new(18), options);
+    for _ in 0..6 {
+        within(fetch.next())
+            .await
+            .expect("a piece")
+            .expect("verified");
+    }
+    // Slow start reached the credit of 4 within the first pieces, so six
+    // taken pieces are ten orders: each taken piece is one order more.
+    within(async {
+        while a.pieces_asked().len() < 10 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(a.pieces_asked().len(), 10, "{:?}", a.pieces_asked());
+    assert_eq!(fetch.in_flight().ones(), 4);
+
+    // The caller takes nothing: the seeder gets no more work.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        a.pieces_asked().len(),
+        10,
+        "an order arrived though no piece was taken"
+    );
+
+    within(fetch.next())
+        .await
+        .expect("a piece")
+        .expect("verified");
+    within(async {
+        while a.pieces_asked().len() < 11 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(a.pieces_asked().len(), 11);
 }
 
 #[tokio::test]
