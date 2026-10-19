@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-344 — SWARM session wire and the seeder's SeedSession
-kind: code | size: 90 | status: in_progress 2026-10-19T13:24Z | needs: []
+kind: code | size: 90 | status: done b3982d7 | needs: []
 acceptance: [0041](decisions/0041-swarm-sessions.md) §4.1-§4.2: `swarm/wire.rs` with the 48-byte open, 5-byte order and 9-byte answer head and their refusals (round trips and one refusal table); `IncomingTransfer::read_exact_into`; `SeedSession` (`next`, `answer_*`, `decline`) replacing `SeedRequest`, `MAX_PENDING_SESSIONS` 64, version-1 asks still served; every swarm integration test green on sessions; `grep -rn 'SeedRequest\|MAX_PENDING_ASKS' crates/` empty.
 
 ### B-345 — SWARM fetch over sessions, scheduled by queue time
