@@ -81,15 +81,19 @@ adds wire vocabulary — DATA keys `13` and `14` for the segment and its layer, 
 and `3` for the dish's latency budget and layer cap, and the FLOW frame kind — while PAIR,
 SURVEY and BUS add none.
 
-**A blob from many holders is a pattern, not a system.** SWARM ([decisions/0040](decisions/0040-swarm-pattern.md))
-is behind the off-by-default feature `swarm`. `Listener::seeder` binds the holder's side and
-answers each ask from the application's own storage; `Runtime::swarm` dials every seeder it is
-given, and `Swarm::fetch` takes one content-addressed blob from all of them at once, checking
-each piece against the BLAKE3 root before it yields it. The root is the plain `blake3::hash`
-of the bytes, so the pieces come in any order from any holder and a lying seeder is dropped
-for that fetch while the blob completes. It adds **no wire vocabulary** (one exchange per ask
-on the request route, like SURVEY), and it keeps no store and no tracker: the application
-stores the pieces it is handed and decides who to connect to.
+**A blob from many holders is a pattern, not a system.** SWARM ([decisions/0040](decisions/0040-swarm-pattern.md),
+[decisions/0041](decisions/0041-swarm-sessions.md)) is behind the off-by-default feature
+`swarm`. `Listener::seeder` binds the holder's side and hands each fetch's session to the
+application, which admits it once and answers its orders from its own storage; `Runtime::swarm`
+dials every seeder it is given, and `Swarm::fetch` takes one content-addressed blob from all of
+them at once, checking each piece against the BLAKE3 root before it yields it. The root is the
+plain `blake3::hash` of the bytes, so the pieces come in any order from any holder and a lying
+seeder is dropped for that fetch while the blob completes. One session per seeder carries
+pipelined orders, as deep as libtorrent sizes them and capped by a credit that the caller's
+taking of pieces releases, so one fetch from one seeder runs like a normal download and a
+caller that stops taking stops the sender. It adds **no wire vocabulary** (one exchange per
+session on the request route, like SURVEY; version-1 asks still served), and it keeps no store
+and no tracker: the application stores the pieces it is handed and decides who to connect to.
 
 **A small message is mostly payload.** A trace context is propagated and never minted
 ([0028](decisions/0028-trace-propagation-is-the-callers.md)), so a 64-byte push is twelve bytes
@@ -133,6 +137,7 @@ environment and the full results are in [IMPLEMENTATION.md](IMPLEMENTATION.md) �
 | Parking a drain receipt on drop | a runtime-wide queue −3 %, per-connection inside noise | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.6 | per-connection parking; the claim is one uncontended lock and a push, not "free" |
 | Dedup key allocation | ~10 ns; the candidate restructuring measures the same | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.12 | key left alone, with the number beside it |
 | Local transports against QUIC | Req/Rep 1 KiB 13 µs inproc, 51 µs unix, 58 µs QUIC; Push 1 KiB 24 µs unix against 8 µs QUIC | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.13 | a local `open` waits for a slot, and 0010 §4.2's "the connection is the stream" is priced: free at 1 MiB, the whole cost at 1 KiB |
+| One SWARM fetch from one seeder, 26 ms RTT | session 50.8-55.3 MB/s against 44.8-45.8 MB/s for a plain download on the same path; 683 MiB/s on loopback | [IMPLEMENTATION.md](IMPLEMENTATION.md) §4.18 | one session of pipelined orders per seeder replaces one exchange per ask (0041), which griasdi measured at 4-10 MB/s |
 
 ![Latency by transport](status/transport-latency.svg)
 
@@ -166,7 +171,8 @@ Python, whose order is Node, Erlang, C, Java
 What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
 announcer, a blob store, one identity per connection and following a Raft leader stay out of
 weida ([0040](decisions/0040-swarm-pattern.md) §6), and mirrors of SWARM in `weida::blocking`
-and Python are filed when a caller needs them.
+and Python are filed when a caller needs them. griasdi moves its seeder onto sessions on its
+side (`PROPOSAL-weida-swarm-sessions.md` in its checkout).
 
 ## 5. What needs a human
 

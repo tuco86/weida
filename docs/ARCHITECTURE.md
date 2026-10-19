@@ -123,11 +123,13 @@ DEALER/ROUTER are emergent rather than types of their own (§6a). A pattern cont
 selection policy, a queue and vocabulary — never a delivery guarantee, because there is no
 layer beneath L0 from which it could get one. One L1 pattern is not from the family: **SWARM**
 (`Seeder` and `Swarm`, behind the off-by-default cargo feature `swarm`,
-[decisions/0040](decisions/0040-swarm-pattern.md)) fetches one BLAKE3-named blob from every
-connected holder at once. Its selection policy is a scheduler over per-connection exchanges,
-its vocabulary is the ask of [PATTERNS.md](PATTERNS.md) §6.5, and the one guarantee it states
-is content integrity against the root, which is a property of the bytes and not of a hop. It
-adds no frame to the protocol and keeps no storage and no tracker.
+[decisions/0040](decisions/0040-swarm-pattern.md), [decisions/0041](decisions/0041-swarm-sessions.md))
+fetches one BLAKE3-named blob from every connected holder at once. Its selection policy is a
+scheduler over one session of pipelined orders per seeder, with a credit per seeder that the
+caller's taking of pieces releases, so backpressure runs from the caller to the sender; its
+vocabulary is the session wire of [PATTERNS.md](PATTERNS.md) §6.5, and the one guarantee it
+states is content integrity against the root, which is a property of the bytes and not of a
+hop. It adds no frame to the protocol and keeps no storage and no tracker.
 
 ### L2 — broker semantics
 
@@ -1302,22 +1304,23 @@ impl Subscriber {
     pub async fn recv(&self) -> Result<IncomingTransfer, Error>;   // topic on IncomingMeta::topic
 }
 
-// ---- L1: SWARM, feature `swarm` [0040] -----------------------------------------------
+// ---- L1: SWARM, feature `swarm` [0040, 0041] -----------------------------------------
 pub enum Seed {}  pub enum Gather {}                         // markers
 pub type Seeder = Endpoint<Seed>;  pub type Swarm = Endpoint<Gather>;
 impl Listener { pub fn seeder(&self, path: &str) -> Result<Seeder, Error>; }  // the replier's route
-impl Runtime  { pub fn swarm(&self, tls: impl Into<ClientTls>) -> Swarm; }    // dials like a Surveyor
+impl Runtime  { pub fn swarm(&self, tls: impl Into<ClientTls>) -> Swarm; }    // dials like a Surveyor, receive windows >= 32/64 MiB
 impl Seeder { pub fn path(&self) -> &str;
-    pub async fn accept(&self) -> Result<SeedRequest, Error>; }    // decoded; NotConnected once closed
-pub struct SeedRequest;                                      // one ask: LIST, HAVE or PIECE of one Blob
-impl SeedRequest { pub fn blob(&self) -> Blob;  pub fn ask(&self) -> Ask;
+    pub async fn accept(&self) -> Result<SeedSession, Error>; }    // open decoded; NotConnected once closed
+pub struct SeedSession;                                      // one fetch's orders about one Blob; a version-1 ask is one order
+impl SeedSession { pub fn blob(&self) -> Blob;               // admit once, by blob and meta
     pub fn meta(&self) -> &IncomingMeta;  pub fn connection(&self) -> ConnectionId;
-    pub async fn answer_list(self, list: &PieceList) -> Result<Delivery, Error>;
-    pub async fn answer_have(self, have: &Bits) -> Result<Delivery, Error>;
-    pub async fn answer_piece(self, bytes: &[u8]) -> Result<Delivery, Error>; // length checked, bytes not
-    pub async fn decline(self); }                            // REJECTED; the fetch drops this seeder
+    pub async fn next(&mut self) -> Result<Option<Ask>, Error>; // reads one order, no timeout; None once the fetch finished
+    pub async fn answer_list(&mut self, list: &PieceList) -> Result<(), Error>;
+    pub async fn answer_have(&mut self, have: &Bits) -> Result<(), Error>;
+    pub async fn answer_piece(&mut self, bytes: &[u8]) -> Result<(), Error>; // length checked, bytes not
+    pub async fn decline(self); }                            // DECLINE (v1: REJECTED); the fetch drops this seeder
 pub enum Ask { List, Have, Piece(u32) }
-impl Swarm {                                                 // multi-peer: every connected seeder is asked
+impl Swarm {                                                 // multi-peer: one session per connected seeder
     pub async fn connect(&self, url: &str) -> Result<(), Error>;   // also during a fetch: it joins
     pub fn disconnect(&self, url: &str) -> bool;
     pub fn peer_count(&self) -> usize;
@@ -1325,18 +1328,19 @@ impl Swarm {                                                 // multi-peer: ever
     pub fn events(&self) -> PeerEvents;
     pub fn fetch(&self, blob: Blob, have: Bits, options: FetchOptions) -> Fetch; // panics on a mismatched `have` or `list`
 }
-pub struct Fetch;                                            // Send + 'static; drop aborts every ask
+pub struct Fetch;                                            // Send + 'static; drop aborts every session and ask
 impl Fetch { pub fn blob(&self) -> Blob;
     pub fn list(&self) -> Option<&PieceList>;                // persist it to resume without LIST
     pub fn delivered(&self) -> &Bits;
-    pub async fn next(&mut self) -> Option<Result<Piece, Error>>; } // cancel-safe; Err(NotConnected): no seeder left
+    pub fn in_flight(&self) -> Bits;                         // ordered, not yet taken
+    pub async fn next(&mut self) -> Option<Result<Piece, Error>>; } // cancel-safe; taking frees the order's credit
 pub struct Piece { pub index: u32, pub bytes: Bytes }        // verified against the root
 pub struct FetchOptions { pub list: Option<PieceList>, pub stall: Duration /*30s*/,
-    pub min_rate: u64 /*65536*/, pub per_peer: usize /*2*/, pub max_inflight: usize /*16*/,
+    pub min_rate: u64 /*65536*/, pub per_peer: usize /*8: the credit W*/, pub max_inflight: usize /*32*/,
     pub max_peers: usize /*MAX*/, pub have_refresh: Duration /*5s*/ }          // Default impl
 // the piece tree: BlobId (BLAKE3 root; Display/FromStr as hex), PieceSize (1 KiB..16 MiB, default 1 MiB),
 // Blob (root, size, piece size), PieceList, TreeHasher, Bits, MAX_PIECES (2^20)
-pub const MAX_PENDING_ASKS: usize = 64;  pub const SEED_STALL: Duration = Duration::from_secs(30);
+pub const MAX_PENDING_SESSIONS: usize = 64;  pub const SEED_STALL: Duration = Duration::from_secs(30);
 pub const MIN_RATE: u64 = 64 * 1024;
 
 // ---- transfer handles, shared by both layers ------------------------------------------
@@ -1434,12 +1438,14 @@ Type by type:
 - **`Replier`** — `Endpoint<Rep>`. `accept()` yields inbound exchanges from the endpoint
   queue.
 - **`Seeder`, `Swarm`, `Fetch`** — the SWARM pattern (feature `swarm`,
-  [decisions/0040](decisions/0040-swarm-pattern.md), [PATTERNS.md](PATTERNS.md) §6.5).
+  [decisions/0040](decisions/0040-swarm-pattern.md),
+  [decisions/0041](decisions/0041-swarm-sessions.md), [PATTERNS.md](PATTERNS.md) §6.5).
   `Listener::seeder` registers the route a replier does and hands the application each
-  well-formed ask as a `SeedRequest` to answer from its own storage; `Runtime::swarm` dials
-  seeders and `Swarm::fetch` returns a `Fetch` whose `next` yields each piece of a
-  content-addressed `Blob` once, verified against the BLAKE3 root, in any order. Storage,
-  admission and discovery are the application's.
+  fetch's session as a `SeedSession`, admitted once, whose orders it reads one at a time with
+  `next` and answers from its own storage; `Runtime::swarm` dials seeders and `Swarm::fetch`
+  returns a `Fetch` whose `next` yields each piece of a content-addressed `Blob` once,
+  verified against the BLAKE3 root, in any order, ordering the next piece of a seeder as the
+  caller takes one. Storage, admission and discovery are the application's.
 - **`TransferMeta`** — per-transfer outbound metadata: content type, advisory length, trace
   context. A `None` trace writes no `traceparent`: a context is propagated and never minted
   ([decisions/0028](decisions/0028-trace-propagation-is-the-callers.md)).

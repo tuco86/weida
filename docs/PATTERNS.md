@@ -921,49 +921,78 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 
 ### 6.5 SWARM
 
-Many sources, one verified blob ([decisions/0040](decisions/0040-swarm-pattern.md)). A blob is
-named by the BLAKE3 hash of its bytes and cut into pieces of a power-of-two size (1 KiB to
-16 MiB, `PieceSize`); the pieces' hashes, a `PieceList`, merge to that root, so every piece
-checks against the name alone and arrives in any order from any holder. `Listener::seeder`
-binds the holder's side and `Runtime::swarm` dials the fetcher's: `Swarm::fetch` asks **every
-connected seeder** what it holds (HAVE), then asks each for pieces the others are not already
-sending, and yields a `Piece` only after it verified. Both types need the cargo feature
-`swarm`, which links `blake3`.
+Many sources, one verified blob ([decisions/0040](decisions/0040-swarm-pattern.md),
+[decisions/0041](decisions/0041-swarm-sessions.md)). A blob is named by the BLAKE3 hash of its
+bytes and cut into pieces of a power-of-two size (1 KiB to 16 MiB, `PieceSize`); the pieces'
+hashes, a `PieceList`, merge to that root, so every piece checks against the name alone and
+arrives in any order from any holder. `Listener::seeder` binds the holder's side and
+`Runtime::swarm` dials the fetcher's: `Swarm::fetch` opens **one session per connected
+seeder**, asks each what it holds (HAVE), then orders from each pieces the others are not
+already sending, and yields a `Piece` only after it verified. Both types need the cargo feature
+`swarm`, which links `blake3`. From one seeder a fetch behaves like a normal download with its
+pieces in any order: the orders are pipelined as BitTorrent's are (BEP 3), so the seeder always
+has the next answer to send.
 
 The pattern owns the transport and the check and nothing else. **The application owns storage**
 (a `Seeder` answers from whatever the application keeps; a `Fetch` hands the pieces over and
-remembers none), **admission** (every ask reaches the application as a `SeedRequest` carrying
-`meta()` and `connection()`, and it answers or `decline`s) and **discovery** (which peers to
-`connect`, which `Blob`s exist; connecting a seeder while a fetch runs is how a new holder
-joins it). Connections run one way: a `Swarm` dials and asks, a `Seeder` binds and answers, and
-nothing is fetched back over a connection the peer opened. A swarm path is its own connection
-beside any other path to the same peer, so bulk pieces do not share flow-control windows with
-a voice connection ([decisions/0002](decisions/0002-control-and-bulk-separation.md)).
+remembers none), **admission** (every session reaches the application once as a `SeedSession`
+carrying `blob()`, `meta()` and `connection()`, and it serves or `decline`s it) and
+**discovery** (which peers to `connect`, which `Blob`s exist; connecting a seeder while a fetch
+runs is how a new holder joins it). Connections run one way: a `Swarm` dials and orders, a
+`Seeder` binds and answers, and nothing is fetched back over a connection the peer opened. A
+swarm path is its own connection beside any other path to the same peer, so bulk pieces do not
+share flow-control windows with a voice connection
+([decisions/0002](decisions/0002-control-and-bulk-separation.md)); a swarm dials it with
+receive windows of at least 32 MiB per stream and 64 MiB per connection, because quinn fixes
+them at dial.
 
 | | `Swarm` | `Seeder` |
 | --- | --- | --- |
-| Compatible peer | `Seeder`, or a `Replier` that speaks the wire below | `Swarm`, or a `Requester` that sends the wire below |
+| Compatible peer | `Seeder`, or a `Replier` that speaks the version-1 ask below | `Swarm`, or a `Requester` that sends either wire below |
 | Direction | connects, and **accumulates** peers on purpose | binds |
-| Send/receive pattern | `connect` per seeder, then `fetch(blob, have, options)` and `Fetch::next` until `None` | `accept` → `SeedRequest` → `answer_list` / `answer_have` / `answer_piece`, or `decline`, or drop for `NO_REPLY` |
-| Incoming routing | the reply of the exchange that asked; a verified piece is yielded once, the first copy to verify | fair, bounded queue per path (`endpoint_queue`), read and decoded before the application sees it |
-| Outgoing routing | **one exchange per ask, on the connection of the seeder it targets** — not Req/Rep's round-robin pick; pieces are claimed per seeder from what its HAVE says it holds | the exchange that asked |
+| Send/receive pattern | `connect` per seeder, then `fetch(blob, have, options)` and `Fetch::next` until `None` | `accept` → `SeedSession` → admit by `blob()` / `meta()` once → `next` → `answer_list` / `answer_have` / `answer_piece`, repeated until `next` is `None`; or `decline` |
+| Incoming routing | the session's reply, answers in the order of the orders; a verified piece is yielded once, the first copy to verify | fair, bounded queue per path (`endpoint_queue`), the open read and decoded before the application sees it |
+| Outgoing routing | **one session per (fetch, seeder), on the connection of the seeder it targets** — not Req/Rep's round-robin pick; pieces are claimed per seeder from what its HAVE says it holds | the session's reply |
 | Action with no peer | `Error::NotConnected` from `Fetch::next`, immediately for a swarm that never connected; connecting a seeder and calling `next` again resumes | `accept` waits |
-| Transport | one exchange per ask on `Route::Request`, the route a replier uses; the reply is the raw answer, of a length the asker knows in advance | the same |
+| Transport | one exchange per session on `Route::Request`, the route a replier uses; orders on the request body, framed answers on the reply body | the same |
 | Ordering | none: pieces arrive in any order, and `Piece::index` says which | — |
-| Delivery signal | a `Piece` the fetch verified against the root. Nothing weaker is yielded | the answer's `Delivery`, a transport receipt (§1.2) |
-| Backpressure | `max_inflight` asks in all and `per_peer` per seeder, then the seeder's `max_concurrent_bidi_streams` on `open` (§1.4) | at most `MAX_PENDING_ASKS` (64) asks read or waiting; one more is dropped unread |
-| Cancellation | drop the `Fetch`: every ask in flight is aborted and nothing more is asked | drop the `SeedRequest`: ERROR `NO_REPLY`, as for a request (§2) |
+| Delivery signal | a `Piece` the fetch verified against the root. Nothing weaker is yielded | none per answer: `answer_*` returns once its bytes are written into the stream |
+| Backpressure | a **credit of `per_peer` (W, default 8) orders per seeder**, each held from the moment it is written until the caller takes its piece from `next`; of those W the fetch uses a depth that follows the seeder's rate (two at first, one more per piece in slow start, then 3 s of the measured rate in pieces, libtorrent's queue time); `max_inflight` (32) orders over all seeders | the seeder reads an order only when the application calls `next`, with no timeout: a busy seeder simply calls it later, the orders wait in the stream and QUIC flow control holds the rest. At most `MAX_PENDING_SESSIONS` (64) sessions read or waiting for `accept`; one more is dropped unread |
+| Cancellation | drop the `Fetch`: every session and ask is aborted and nothing more is ordered. Once every piece is delivered, each session is finished instead, and its seeder's `next` returns `None` | drop the `SeedSession`: a reply not yet opened is ERROR `NO_REPLY`, an open one is reset |
+
+End-to-end, a caller that stops taking pieces stops the sender: no new order goes out, the
+seeder's `next` waits, it sends nothing, and what is in flight is at most W pieces per seeder
+and `max_inflight` pieces in all.
 
 Three rules a caller can get wrong. **Verification is the fetch's, not the seeder's**:
 `answer_piece` checks the length and not the bytes; the fetch checks every piece and drops a
 seeder that sends a wrong one, so a bad piece never reaches the application's storage through a
 fetch. **A `Blob` of one piece has no list and an empty one has no
 pieces**: the first is checked against the root directly, the second yields `None` at once,
-with no seeder. And **a fetch asks only for what the caller lacks**: `have` says which pieces
-are already stored, `Fetch::delivered` is the running map, and `Fetch::list` hands out the
+with no seeder. And **a fetch orders only what the caller lacks**: `have` says which pieces
+are already stored, `Fetch::delivered` is the running map, `Fetch::in_flight` the pieces
+ordered and not yet taken (a progress display's third state), and `Fetch::list` hands out the
 verified list so a resumed fetch skips LIST.
 
-The ask, one exchange, big-endian ([decisions/0040](decisions/0040-swarm-pattern.md) §4.2):
+The session, big-endian ([decisions/0041](decisions/0041-swarm-sessions.md) §4.1):
+
+| unit | bytes | layout |
+| --- | --- | --- |
+| open (start of the request body) | 48 | `u8` version = 2, `u8` piece log2 (10..=24), `[u8; 32]` root, `u64` size, 6 zero bytes |
+| order (request body, after the open) | 5 | `u8` 1 = LIST, 2 = HAVE, 3 = PIECE, `u32` index (0 for LIST and HAVE) |
+| answer head (reply body) | 9 | `u8` 0 = DECLINE, 1 = LIST, 2 = HAVE, 3 = PIECE, `u32` index (0 except PIECE), `u32` length (0 for DECLINE) |
+
+Each answer head is followed by exactly `length` bytes: LIST `count × 32` (the chaining
+values), HAVE `ceil(count / 8)` (bit `i` is byte `i / 8`, mask `1 << (i % 8)`, padding bits
+zero), PIECE the piece's span (the last piece is short). An open of another version, with
+non-zero padding, a piece size out of range, size 0 or a `Blob` that `Blob::new` refuses is
+refused with `Rejected` before the application sees it; an order of an unknown kind, with an
+index on LIST or HAVE, LIST for a blob of at most one piece, or PIECE past the end refuses the
+session. A DECLINE ends it.
+
+The version-1 ask ([decisions/0040](decisions/0040-swarm-pattern.md) §4.2) is still served,
+as a session of one order, and is what a fetch falls back to toward a seeder that refuses a
+session. One exchange per ask:
 
 | offset | field |
 | --- | --- |
@@ -974,28 +1003,28 @@ The ask, one exchange, big-endian ([decisions/0040](decisions/0040-swarm-pattern
 | 35 | `u64` size |
 | 43 | `u32` index (PIECE only) |
 
-LIST and HAVE are 43 bytes, PIECE 47. The reply is raw bytes of an exact length: LIST
-`count × 32` (the chaining values), HAVE `ceil(count / 8)` (bit `i` is byte `i / 8`, mask
-`1 << (i % 8)`, padding bits zero), PIECE the piece's span (the last piece is short). A body of
-another length, another version, an unknown ask, a piece size out of range, a `Blob` that
-`Blob::new` refuses, size 0, LIST for a blob of at most one piece, or PIECE past the end is
-refused with `Rejected` before the application sees it.
+LIST and HAVE are 43 bytes, PIECE 47; the reply is the raw answer of the same exact length. A
+version-1 seeder reads an ask under that 47-byte cap, so a 48-byte open overflows it at once and
+is refused with `Rejected`: that refusal before any answer head is how a fetch tells a
+version-1 seeder, and a session never refuses a well-formed open with `Rejected`.
 
 Failure modes, from the fetching side unless the row says otherwise:
 
 | Event | Result | Pinned by |
 | --- | --- | --- |
-| A seeder sends a piece that does not verify | the seeder is dropped **for this fetch**; its other asks are aborted and given back, and the blob completes from the rest | *`a_seeder_that_sends_a_wrong_piece_is_dropped_and_the_blob_completes`* |
+| A seeder sends a piece that does not verify | the seeder is dropped **for this fetch**; its session is aborted, its orders given back, and the blob completes from the rest | *`a_seeder_that_sends_a_wrong_piece_is_dropped_and_the_blob_completes`* |
 | A seeder sends a list that does not merge to the root | the same; no PIECE is asked of it | *`a_list_that_does_not_hash_to_the_root_drops_the_seeder`* |
-| A seeder declines (`decline`), drops the ask (`NoReply`) or answers a length other than the known one | the same: the fetch reads an error or a short reply, and does not retry the seeder | no test of its own: one path with the two rows above (`fault` in `swarm/gather.rs`) |
-| A seeder takes an ask and never answers | its ask expires after `stall` + length / `min_rate`, the seeder is dropped and the piece is asked elsewhere, so the last piece is not held up | *`a_silent_seeder_does_not_hold_up_the_last_piece`* |
-| The connection to a seeder is lost mid-ask (`ConnectionLost`, `Indeterminate`) | the seeder **keeps its place**, its pieces are given back and a redial brings it back; a lost ask is asked again, because an ask only reads | no test of its own |
-| No ask in flight and no seeder left that has not failed this fetch | `Err(Error::NotConnected)` from `next`; connecting a seeder and calling `next` again resumes | *`a_fetch_without_a_usable_seeder_is_not_connected`* |
+| A seeder declines (DECLINE), answers with a head that does not match the order, or a length other than the known one | the same: the fetch reads an error or a wrong head, and does not retry the seeder | no test of its own: one path with the two rows above (`read_answer` in `swarm/gather.rs`) |
+| A seeder takes an order and never answers | the answer at the head of the line is due `stall + (9 + len) / min_rate` after its order was written or the answer before it was read, whichever is later; past that the seeder is dropped and its pieces are ordered elsewhere, so the last piece is not held up | *`a_silent_seeder_does_not_hold_up_the_last_piece`* |
+| A seeder speaks only the version-1 ask | it refuses the session open with `Rejected`; the fetch asks it one exchange per ask from then on, under the same credit | *`a_seeder_that_speaks_only_version_1_still_serves_a_fetch`* |
+| The caller stops taking pieces | after W orders per seeder nothing more is ordered; one taken piece is one more order | *`a_caller_that_stops_taking_pieces_stops_the_seeder`* |
+| The connection to a seeder is lost mid-session (`ConnectionLost`, `Indeterminate`) | the seeder **keeps its place**, its orders are given back, and its next order opens a new session once a redial brings it back; an order only reads, so ordering again is safe | no test of its own |
+| No order in flight and no seeder left that has not failed this fetch | `Err(Error::NotConnected)` from `next`; connecting a seeder and calling `next` again resumes | *`a_fetch_without_a_usable_seeder_is_not_connected`* |
 | A seeder joins during the fetch | it is asked HAVE at the next `next`, and takes pieces | *`a_seeder_that_connects_during_a_fetch_joins_it`* |
-| The `Fetch` is dropped | every ask in flight is aborted and nothing more is asked | *`a_dropped_fetch_asks_nothing_more`* |
-| An ask body is malformed (seeder's side; the asker reads `Error::Rejected`) | refused before `accept`; the application never sees it | *`a_malformed_ask_is_refused_before_accept`* |
-| The application answers with the wrong kind or shape (seeder's side) | the asker reads an error and **no bytes**, and `answer_*` returns `Error::Protocol` | *`an_answer_of_the_wrong_length_is_refused_and_reported`* |
-| More than `MAX_PENDING_ASKS` asks wait (seeder's side) | the surplus ask is dropped unread; its asker reads `Error::NoReply` and the fetch drops that seeder | no test of its own |
+| The `Fetch` is dropped | every session and ask is aborted and nothing more is ordered | *`a_dropped_fetch_asks_nothing_more`* |
+| A session open or an ask body is malformed (seeder's side; the fetching side reads `Error::Rejected`) | refused before `accept`; the application never sees it | *`a_malformed_ask_is_refused_before_accept`* |
+| The application answers with the wrong kind or shape (seeder's side) | the session is refused (a version-1 asker reads an error and **no bytes**), and `answer_*` returns `Error::Protocol` | *`an_answer_of_the_wrong_length_is_refused_and_reported`* |
+| More than `MAX_PENDING_SESSIONS` sessions wait (seeder's side) | the surplus is dropped unread; its fetch reads `Error::NoReply` and drops that seeder, or reads the stopped request as `Rejected` and asks it per exchange | no test of its own |
 
 A seeder that is still fetching serves what it has: it feeds the pieces its `Fetch` yields into
 the storage its `Seeder` answers from, answers HAVE with the bits it holds so far, and a seeder
@@ -1005,7 +1034,10 @@ still filling serves another
 *`a_blob_is_gathered_from_seeders_holding_different_halves`*,
 *`a_fetch_asks_only_for_pieces_the_caller_lacks`* and
 *`a_blob_of_one_piece_needs_no_list_and_an_empty_blob_no_seeder`*
-(`crates/weida/tests/swarm.rs`, run with `cargo test -p weida --features swarm`).
+(`crates/weida/tests/swarm.rs`, run with `cargo test -p weida --features swarm`); the scheduler's
+credit and depth are unit-tested in `crates/weida/src/swarm/schedule.rs`, and
+`crates/weida/tests/swarm_large.rs` (ignored) measures 256 MiB from one seeder against a
+normal download on the same 27 ms path.
 
 ---
 
@@ -1027,4 +1059,4 @@ still filling serves another
 | how far the far end got, not merely whether it finished | cursors, via `OutgoingTransfer::cursors` | a whole-message verdict tells an interrupted sender nothing; an absolute offset tells it a number (§1.11) |
 | voice, or any unit worthless once late, to one peer | a datagram flow | never sent late, never waits, loses its oldest at a bound, and says what it lost (§5) |
 | a live feed to many, where a laggard should lose the old unit rather than the new one | RADIO/DISH | supersession and per-dish expiry reset what is late, a layered unit loses its upper layers first, and a joiner starts at the next segment (§6.4) |
-| one blob from many holders, each piece checked against the blob's name | SWARM (feature `swarm`) | a fetch asks every connected seeder at once, claims each missing piece from one holder, and yields it only after it verified against the BLAKE3 root; storage and discovery stay the application's (§6.5) |
+| one blob from many holders, each piece checked against the blob's name | SWARM (feature `swarm`) | a fetch keeps one session of pipelined orders with every connected seeder, claims each missing piece from one holder, and yields it only after it verified against the BLAKE3 root; a caller that stops taking pieces stops the seeders; storage and discovery stay the application's (§6.5) |
