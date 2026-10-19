@@ -1174,6 +1174,32 @@ a bulk profile, and a profile is chosen, not inherited. One named limit: loopbac
 userspace shaper is not a residential uplink — the shaper's timer granularity is a
 millisecond, and nothing here models cross traffic or a real modem's buffer.
 
+### 4.18 One SWARM fetch from one seeder
+
+What [0041](decisions/0041-swarm-sessions.md) §4.4 asks for: whether a fetch over one session
+keeps up with a normal download. griasdi measured 4-10 MB/s for one fetch over the per-ask wire
+of 0040 against 53.7 MB/s for HTTPS on the same 27 ms path. The ignored test sends 256 MiB in
+1 MiB pieces through `delay_proxy` (13 ms each way) twice: once as one streamed reply read by a
+requester with the swarm's receive windows (32 MiB stream, 64 MiB connection), once as a fetch
+with `per_peer` 16, `max_inflight` 32 and no list given; the seeder generates each piece when it
+is ordered and the caller only counts bytes. The bench is the same fetch of 64 MiB on plain
+loopback, the connection dialled once outside the measurement. AMD Ryzen 7 5800X, Linux
+7.2.11, rustc 1.99.1, release profile.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| 256 MiB, 26 ms RTT, two runs | `cargo test -p weida --features swarm --release --test swarm_large -- --ignored --nocapture` | download **45.8 / 44.8 MB/s**, swarm **50.8 / 55.3 MB/s** (1.11x / 1.23x); peak RSS 82.3 / 78.9 MiB |
+| 64 MiB, loopback | `cargo bench -p weida --features swarm --bench swarm -- --warm-up-time 1 --measurement-time 3` | **683 MiB/s** (662-701), 93.8 ms per fetch |
+
+**One fetch now runs at the rate of a normal download on the same path, and above it**: the
+session keeps the seeder's next answer queued, so the connection is never application-limited
+between answers. Both figures on the proxied path sit near 45-55 MB/s, the plain stream
+included, so the ceiling there is the path as built (a userspace forwarder that sleeps per
+packet; not measured on its own) rather than the session: on plain loopback the same fetch
+moves 683 MiB/s. Peak RSS stays under a third of the payload, so
+nothing buffers the blob. One named limit: the proxy neither loses nor reorders, so this says
+nothing about a fetch under loss; griasdi's measurement against its server is the field check.
+
 ---
 
 ## 5. Decisions

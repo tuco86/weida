@@ -98,6 +98,12 @@ harness = false
 name = "fanout"
 harness = false
 
+# One seeder, one fetch of 64 MiB through a session (decisions/0041 §4.4).
+[[bench]]
+name = "swarm"
+harness = false
+required-features = ["swarm"]
+
 [lints]
 workspace = true
 
@@ -110,3 +116,10 @@ path = "tests/main.rs"
 [[test]]
 name = "large"
 path = "tests/large.rs"
+
+# Its own process, for the same reason: one SWARM fetch of 256 MiB through a
+# 27 ms path against a normal download on it (decisions/0041 §4.4).
+[[test]]
+name = "swarm_large"
+path = "tests/swarm_large.rs"
+required-features = ["swarm"]
