@@ -708,6 +708,13 @@ grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src   # no call o
 grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/runtime/src # only exec.rs calls them
 ```
 
+One module is exempt, and the first grep lists it: `crates/weida/src/sim.rs`, the simulated
+network behind the off-by-default feature `test-util`
+([decisions/0042](decisions/0042-simulated-network.md)). It reads tokio's clock and arms tokio
+timers for delayed datagrams directly. `quinn` polls a simulated socket only from its endpoint
+and connection drivers, which run on the runtime, so the requirement the rule protects against,
+a reactor on the caller's thread, never arises there.
+
 The two accept loops, the connection actor, the HELLO deadline and the per-subscriber writer
 all take their `Exec` from the `ConnCtx` they already hold. Three consequences worth
 stating:

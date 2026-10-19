@@ -22,7 +22,10 @@
 //!
 //! **Time.** Nothing here sleeps on its own: a delayed datagram is released by a Tokio timer, and
 //! QUIC's own timers are Tokio's, so a test under `#[tokio::test(start_paused = true)]` spends
-//! paused time, not wall time, on delays, idle timeouts and redial backoff.
+//! paused time, not wall time, on delays, idle timeouts and redial backoff. Reading the clock
+//! costs nothing and is fine in a unit test. A test that waits on a timer (a delay, an idle
+//! timeout, a redial backoff) sleeps, if only on a paused clock, and belongs to the integration
+//! tier.
 //!
 //! **Bound.** A socket's receive buffer holds [`INBOX_DATAGRAMS`] datagrams; one arriving at a
 //! full buffer is dropped and counted, as UDP drops past its receive buffer.

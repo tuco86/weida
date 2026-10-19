@@ -37,7 +37,8 @@ weida-protocol.workspace = true
 # The reactor, the resolver and the local-transport OS hygiene. Nothing in
 # `weida` calls `tokio::spawn`, `tokio::time` or `lookup_host`: it all goes
 # through this crate's `Exec`
-# (`docs/decisions/0013-competitor-libraries.md` §4.2).
+# (`docs/decisions/0013-competitor-libraries.md` §4.2). The one exception,
+# `src/sim.rs` behind `test-util`, is named in `docs/ARCHITECTURE.md` §5.
 weida-runtime.workspace = true
 quinn.workspace = true
 # For its version floor only; see the workspace entry.

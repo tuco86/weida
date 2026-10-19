@@ -124,7 +124,9 @@ impl SimNet {
 - **Bounds.** A socket's receive buffer holds `INBOX_DATAGRAMS` (4096) datagrams; a datagram
   arriving at a full buffer is dropped, as UDP drops past its receive buffer.
 - **Time.** A simulated socket never sleeps on its own: delayed datagrams are released by a
-  Tokio timer, so a delay costs paused time, not wall time.
+  Tokio timer, so a delay costs paused time, not wall time. Reading the clock costs nothing and
+  is fine in a unit test. A test that waits on a timer (a delay, an idle timeout, a redial
+  backoff) sleeps, if only on a paused clock, and belongs to the integration tier.
 - `Listener::bind_quic_socket` takes an OS socket, so a binding made there is never simulated.
   `Binding::hand_over` needs an OS socket and panics on a simulated binding.
 

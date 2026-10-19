@@ -243,7 +243,7 @@ mod tests {
     async fn now_reads_the_runtime_clock() {
         let exec = Exec::current().expect("ambient runtime");
         let (before, real) = (exec.now(), std::time::Instant::now());
-        exec.sleep(Duration::from_secs(3600)).await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
         let advanced = exec.now() - before;
         assert!(advanced >= Duration::from_secs(3600), "{advanced:?}");
         assert!(advanced < Duration::from_secs(3601), "{advanced:?}");
