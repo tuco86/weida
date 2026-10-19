@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
-kind: code | size: 45 | status: ready | needs: []
+kind: code | size: 45 | status: in_progress 2026-10-19T18:37Z | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
 
 ### B-352 — sim.rs's direct tokio clock named; no sleep in a unit test
