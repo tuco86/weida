@@ -867,4 +867,78 @@ async fn an_inproc_bus_that_is_rebound_is_redialled() {
     client.shutdown().await;
 }
 
+/// Waits until `count()` reads `want`, polling: a bus member reports no
+/// events, only its peer count.
+async fn peer_count_reaches(count: impl Fn() -> usize, want: usize) {
+    within(async {
+        while count() != want {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+/// Claim: a bus member whose joined member restarts on the same address
+/// reaches it again once the redial is back, as every other dialling
+/// pattern does, rather than counting it as a peer it never sends to.
+#[tokio::test(start_paused = true)]
+async fn a_bus_member_reaches_a_member_that_restarted() {
+    let net = SimNet::new();
+    let certs = Certs::generate();
+    let first = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
+    let addr = first.addr;
+    let joined = first
+        .listener
+        .bus("/bus", certs.client_tls())
+        .expect("bus member");
+
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..client_config()
+    })
+    .expect("client runtime");
+    let member = client
+        .listener()
+        .bus("/bus", certs.client_tls())
+        .expect("bus member");
+    within(member.connect(&first.url("/bus")))
+        .await
+        .expect("join");
+    assert_eq!(within(member.send(b"before")).await.expect("send"), 1);
+    let inbound = within(joined.recv()).await.expect("recv");
+    assert_eq!(
+        within(inbound.collect(64)).await.expect("collect"),
+        b"before"
+    );
+
+    drop(joined);
+    first.stop().await;
+    peer_count_reaches(|| member.peer_count(), 0).await;
+
+    let second = Server::start(Network::sim(&net), &certs, addr).await;
+    let joined = second
+        .listener
+        .bus("/bus", certs.client_tls())
+        .expect("bus member");
+    peer_count_reaches(|| member.peer_count(), 1).await;
+
+    assert_eq!(
+        within(member.send(b"after")).await.expect("send"),
+        1,
+        "the redialled member is reached again"
+    );
+    let inbound = within(joined.recv()).await.expect("recv");
+    assert_eq!(
+        within(inbound.collect(64)).await.expect("collect"),
+        b"after"
+    );
+
+    client.shutdown().await;
+}
+
 // --- restart handoff --------------------------------------------------------

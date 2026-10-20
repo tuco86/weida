@@ -1358,16 +1358,15 @@ pub struct BusState {
     peer: Peer,
     path: Arc<str>,
     queue: Mutex<mpsc::Receiver<IncomingTransfer>>,
-    /// One writer per joined member, so a member that stops reading stalls
-    /// **its own** queue rather than the sender's task. This is Pub/Sub's
-    /// shape for the same reason: a fan-out that can be blocked by one slow
-    /// peer is not a fan-out (`docs/GUARANTEES.md` §6).
-    writers: std::sync::Mutex<Vec<BusWriter>>,
+    /// One writer per joined member's connection, so a member that stops
+    /// reading stalls **its own** queue rather than the sender's task. This
+    /// is Pub/Sub's shape for the same reason: a fan-out that can be blocked
+    /// by one slow peer is not a fan-out (`docs/GUARANTEES.md` §6). Shared
+    /// with [`BusAttach`], which starts a writer on every connection.
+    writers: Arc<std::sync::Mutex<Vec<BusWriter>>>,
     /// Copies that never reached a member, by the same rule Pub/Sub uses:
     /// best effort per peer, counted rather than retried.
     dropped: Arc<std::sync::atomic::AtomicU64>,
-    /// Messages one member's writer may hold.
-    depth: usize,
     /// Bytes one member's writer may hold, `Limits::subscriber_buffer_bytes`.
     ///
     /// The message count alone bounds nothing: a bus send costs
@@ -1376,6 +1375,48 @@ pub struct BusState {
     /// dimension Pub/Sub already charges per subscriber, for the identical
     /// fan-out (`docs/INVARIANTS.md`).
     budget: usize,
+}
+
+/// What a bus member does on every connection it gets, first dial and
+/// redial alike: start that connection's writer. A writer is bound to one
+/// connection and ends with it, so a member that comes back is reached
+/// through the writer its redial starts (0031 §4.6).
+struct BusAttach {
+    writers: Arc<std::sync::Mutex<Vec<BusWriter>>>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Messages one member's writer may hold.
+    depth: usize,
+    budget: usize,
+}
+
+impl Attach for BusAttach {
+    fn attach<'a>(
+        &'a self,
+        conn: &'a ConnHandle,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let (tx, rx) = mpsc::channel(self.depth);
+            let budget = Arc::new(Semaphore::new(self.budget));
+            conn.exec.spawn(bus_writer(
+                ConnHandle::clone(conn),
+                Arc::from(path),
+                rx,
+                Arc::clone(&budget),
+                Arc::clone(&self.dropped),
+            ));
+            self.writers
+                .lock()
+                .expect("bus writers poisoned")
+                .push(BusWriter { tx, budget });
+            Ok(())
+        })
+    }
+
+    /// A member claims no route and subscribes to nothing, so there is
+    /// nothing to withdraw: its writer ends with the connection or the
+    /// member, whichever goes first.
+    fn detach(&self, _conn: &ConnHandle, _path: &Arc<str>) {}
 }
 
 /// One joined member's writer queue.
@@ -1406,13 +1447,20 @@ impl BusState {
         depth: usize,
         budget: usize,
     ) -> BusState {
+        let writers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let attach = BusAttach {
+            writers: Arc::clone(&writers),
+            dropped: Arc::clone(&dropped),
+            depth,
+            budget,
+        };
         BusState {
-            peer: Peer::new(runtime, tls),
+            peer: Peer::with_attach(runtime, tls, Some(Arc::new(attach))),
             path: Arc::from(path),
             queue: Mutex::new(queue),
-            writers: std::sync::Mutex::new(Vec::new()),
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            depth,
+            writers,
+            dropped,
             budget,
         }
     }
@@ -1430,25 +1478,11 @@ impl BusMember {
     /// there is no membership protocol, no election and nothing to
     /// synchronize, which is what keeps a bus a fan-out rather than a group.
     ///
-    /// One writer task per member is started here, which is what makes a
-    /// slow member cost its own copies rather than the sender's time.
+    /// One writer task per member connection is started, here and on every
+    /// redial, which is what makes a slow member cost its own copies rather
+    /// than the sender's time.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
-        let (conn, path) = self.state.peer.dial(url).await?;
-        let (tx, rx) = mpsc::channel(self.state.depth);
-        let budget = Arc::new(Semaphore::new(self.state.budget));
-        conn.exec.spawn(bus_writer(
-            conn.clone(),
-            path,
-            rx,
-            Arc::clone(&budget),
-            Arc::clone(&self.state.dropped),
-        ));
-        self.state
-            .writers
-            .lock()
-            .expect("bus writers poisoned")
-            .push(BusWriter { tx, budget });
-        Ok(())
+        self.state.peer.connect(url).await
     }
 
     /// Number of members this one has joined.
