@@ -945,6 +945,17 @@ impl Attach for DishAttach {
             Ok(())
         })
     }
+
+    fn detach(&self, conn: &ConnHandle, path: &Arc<str>) {
+        conn.namespace.unregister(path);
+        let joins: Vec<String> = lock(&self.joins).keys().cloned().collect();
+        for filter in joins {
+            conn.notify(Ctl::SendUnsubscribe {
+                path: Arc::clone(path),
+                filter,
+            });
+        }
+    }
 }
 
 fn millis(age: Duration) -> u64 {
@@ -1076,15 +1087,6 @@ impl Drop for DishState {
     fn drop(&mut self) {
         // Best effort, through the connection actor for the same reason a
         // subscriber's drop is: a destructor may run with no reactor.
-        let joins: Vec<String> = lock(&self.joins).keys().cloned().collect();
-        for (conn, path) in self.peer.live_peers() {
-            conn.namespace.unregister(&path);
-            for filter in &joins {
-                conn.notify(Ctl::SendUnsubscribe {
-                    path: Arc::clone(&path),
-                    filter: filter.clone(),
-                });
-            }
-        }
+        self.peer.detach_live();
     }
 }

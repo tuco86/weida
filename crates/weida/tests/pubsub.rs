@@ -725,6 +725,36 @@ async fn a_second_subscriber_on_one_connection_collides() {
     client.shutdown().await;
 }
 
+/// `disconnect` forgets an address, so the subscriber must be able to dial it
+/// again on the same pooled connection, and the publisher must stop sending
+/// it copies once it is forgotten.
+#[tokio::test]
+async fn a_subscriber_can_dial_an_address_it_disconnected_again() {
+    let server = Server::start().await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    let client = server.client_runtime();
+    let sub = client.subscriber(server.trust());
+    let url = server.url("/md");
+    within(sub.connect(&url)).await.expect("connect");
+    within(sub.subscribe("")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    assert!(sub.disconnect(&url), "the address was known");
+    await_filters(&publisher, 0).await;
+
+    within(sub.connect(&url))
+        .await
+        .expect("a forgotten address can be dialled again");
+    await_filters(&publisher, 1).await;
+    publisher.publish("px.eur", &b"again"[..]).expect("publish");
+    let (topic, body) = recv_one(&sub).await;
+    assert_eq!(topic, "px.eur");
+    assert_eq!(body, b"again");
+
+    client.shutdown().await;
+}
+
 /// Detect mode over a real Pub/Sub drop: the subscriber that lost a message
 /// to its byte budget sees the gap on the next one it receives.
 ///

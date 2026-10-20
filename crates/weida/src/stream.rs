@@ -51,6 +51,16 @@ pub(crate) trait Attach: Send + Sync {
         conn: &'a ConnHandle,
         path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+
+    /// Undoes [`Attach::attach`] on a connection that stays open: the
+    /// endpoint forgot the address or went away, but the pooled connection
+    /// may serve others. Releases the route and withdraws what was sent, so
+    /// the peer stops sending and a later dial can claim the path again.
+    ///
+    /// Synchronous and best effort: it runs in `disconnect` and in drops,
+    /// which may run with no reactor, so frames go through the connection
+    /// actor's non-blocking `notify`.
+    fn detach(&self, conn: &ConnHandle, path: &Arc<str>);
 }
 
 /// Where one dialled address currently stands.
@@ -506,23 +516,44 @@ impl Peer {
     ///
     /// The connection itself is pooled and may be serving another endpoint,
     /// so it is not closed here; an idle one goes when the pool reaps it.
-    /// Returns whether the address was known.
+    /// What this endpoint holds on it is released: a subscriber's route and
+    /// subscriptions, so the peer stops sending and the address can be
+    /// dialled again. Returns whether the address was known.
     pub fn disconnect(&self, url: &str) -> bool {
         let mut slots = self.shared.slots.lock().expect("peer list poisoned");
         let before = slots.len();
+        let mut released = Vec::new();
         slots.retain(|slot| {
             let keep = &*slot.url != url;
             if !keep {
                 slot.stop.notify_one();
+                if let SlotState::Live(conn) = &slot.state {
+                    released.push((ConnHandle::clone(conn), Arc::clone(&slot.path)));
+                }
             }
             keep
         });
         let removed = slots.len() != before;
         drop(slots);
+        if let Some(attach) = &self.shared.attach {
+            for (conn, path) in &released {
+                attach.detach(conn, path);
+            }
+        }
         if removed {
             self.shared.changed.notify_waiters();
         }
         removed
+    }
+
+    /// Undoes the pattern's attachment on every live connection, for the
+    /// endpoint's drop.
+    pub(crate) fn detach_live(&self) {
+        if let Some(attach) = &self.shared.attach {
+            for (conn, path) in self.shared.live_peers() {
+                attach.detach(&conn, &path);
+            }
+        }
     }
 
     /// Number of peers whose connection is open.

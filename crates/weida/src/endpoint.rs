@@ -606,6 +606,23 @@ impl Attach for SubAttach {
             Ok(())
         })
     }
+
+    fn detach(&self, conn: &ConnHandle, path: &Arc<str>) {
+        conn.namespace.unregister(path);
+        let filters: Vec<String> = self
+            .filters
+            .lock()
+            .expect("filter set poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        for filter in filters {
+            conn.notify(Ctl::SendUnsubscribe {
+                path: Arc::clone(path),
+                filter,
+            });
+        }
+    }
 }
 
 /// State of a subscriber.
@@ -831,29 +848,10 @@ pub(crate) async fn send_subscription(
 impl Drop for SubState {
     fn drop(&mut self) {
         // Best effort: tell each peer we are gone and release the path so the
-        // next subscriber on this pooled connection can claim it.
-        //
-        // The frames go through the connection actor with a non-blocking
-        // `notify`, not `tokio::spawn`: a destructor may run on a thread with
-        // no reactor, and panicking there aborts the process instead of
-        // unwinding. The publisher drops the subscription anyway once the
-        // connection closes, so a lost notification costs nothing.
-        let filters: Vec<String> = self
-            .filters
-            .lock()
-            .expect("filter set poisoned")
-            .iter()
-            .cloned()
-            .collect();
-        for (conn, path) in self.peer.live_peers() {
-            conn.namespace.unregister(&path);
-            for filter in &filters {
-                conn.notify(Ctl::SendUnsubscribe {
-                    path: Arc::clone(&path),
-                    filter: filter.clone(),
-                });
-            }
-        }
+        // next subscriber on this pooled connection can claim it. The
+        // publisher drops the subscription anyway once the connection
+        // closes, so a lost notification costs nothing.
+        self.peer.detach_live();
     }
 }
 
@@ -909,6 +907,10 @@ impl Attach for PairAttach {
             }
             Ok(())
         })
+    }
+
+    fn detach(&self, conn: &ConnHandle, path: &Arc<str>) {
+        conn.namespace.unregister(path);
     }
 }
 
@@ -1062,11 +1064,8 @@ impl Drop for PairState {
     /// there and fails with `LimitExceeded`. This is what
     /// [`SubState::drop`] does for a subscription, for the same reason.
     fn drop(&mut self) {
-        let Some(peer) = self.peer.as_ref() else {
-            return;
-        };
-        for (conn, path) in peer.live_peers() {
-            conn.namespace.unregister(&path);
+        if let Some(peer) = self.peer.as_ref() {
+            peer.detach_live();
         }
     }
 }
