@@ -1243,33 +1243,39 @@ mod tests {
         }
     }
 
-    /// The scan agrees, after every step of long random histories, with the
-    /// plain definition: the first message in line that some ready,
-    /// not-refusing subscription selects, and a subscription that may take
-    /// it. It also never answers `None` while such a message exists, which is
-    /// what a mark that moved too far would break.
-    #[test]
-    fn the_scan_finds_exactly_what_a_plain_walk_of_the_line_would() {
-        let (mut deliveries, mut refusals) = (0, 0);
-        for seed in 1..=40u64 {
-            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let mut world = World::new(seed);
-            for step in 0..600 {
-                world.step = step;
-                world.act(&mut rng);
-                world.pump();
-                assert_eq!(
-                    world.table.len(),
-                    world.believed.len(),
-                    "seed {seed} step {step}: the table and the test disagree on who is subscribed"
-                );
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// The scan agrees, after every step of long random histories, with the
+        /// plain definition: the first message in line that some ready,
+        /// not-refusing subscription selects, and a subscription that may take
+        /// it. It also never answers `None` while such a message exists, which is
+        /// what a mark that moved too far would break.
+        #[test]
+        fn the_scan_finds_exactly_what_a_plain_walk_of_the_line_would() {
+            let (mut deliveries, mut refusals) = (0, 0);
+            for seed in 1..=40u64 {
+                let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let mut world = World::new(seed);
+                for step in 0..600 {
+                    world.step = step;
+                    world.act(&mut rng);
+                    world.pump();
+                    assert_eq!(
+                        world.table.len(),
+                        world.believed.len(),
+                        "seed {seed} step {step}: the table and the test disagree on who is subscribed"
+                    );
+                }
+                deliveries += world.deliveries;
+                refusals += world.refusals;
             }
-            deliveries += world.deliveries;
-            refusals += world.refusals;
+            // The histories have to exercise what the scan decides, or agreeing
+            // with the plain walk proves nothing.
+            assert!(deliveries > 3_000, "only {deliveries} deliveries were made");
+            assert!(refusals > 200, "only {refusals} deliveries were refused");
         }
-        // The histories have to exercise what the scan decides, or agreeing
-        // with the plain walk proves nothing.
-        assert!(deliveries > 3_000, "only {deliveries} deliveries were made");
-        assert!(refusals > 200, "only {refusals} deliveries were refused");
     }
 }

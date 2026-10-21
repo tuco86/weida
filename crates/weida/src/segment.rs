@@ -1341,18 +1341,24 @@ mod tests {
 
     const RACE_BUDGET: usize = 64;
 
-    /// Whatever the schedule, the budget is whole and nothing is counted as
-    /// queued once every chunk is written. Several rounds, each on threads of
-    /// its own, because where the two land decides how often the writer's
-    /// release falls inside the sender's window.
-    #[test]
-    fn a_writer_that_releases_at_once_never_strands_budget() {
-        for round in 0..10 {
-            let (counted, available) = std::thread::spawn(|| race_round(200_000))
-                .join()
-                .expect("the sender thread");
-            assert_eq!(counted, 0, "round {round}: bytes still counted as queued");
-            assert_eq!(available, RACE_BUDGET, "round {round}: budget stranded");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Whatever the schedule, the budget is whole and nothing is counted as
+        /// queued once every chunk is written. Several rounds, each on threads of
+        /// its own, because where the two land decides how often the writer's
+        /// release falls inside the sender's window.
+        #[test]
+        fn a_writer_that_releases_at_once_never_strands_budget() {
+            for round in 0..10 {
+                let (counted, available) = std::thread::spawn(|| race_round(200_000))
+                    .join()
+                    .expect("the sender thread");
+                assert_eq!(counted, 0, "round {round}: bytes still counted as queued");
+                assert_eq!(available, RACE_BUDGET, "round {round}: budget stranded");
+            }
         }
     }
 }
