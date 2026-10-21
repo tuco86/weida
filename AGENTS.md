@@ -1,5 +1,24 @@
 # Agent notes for weida
 
+## Tests
+
+A test that touches the filesystem, an OS socket, a process, the environment
+or a running clock is an integration (io) test. `SimNet`, the in-process
+transports (`weida+inproc`, `inproc://`) and a paused Tokio clock
+(`#[tokio::test(start_paused = true)]`) are unit-tier; a unit test runs well
+under a second.
+
+Layout (`.config/nextest.toml` selects by module path): in a source file, io
+tests live in a `mod io { use super::*; .. }` nested in the test module; in a
+`tests/main.rs` binary, an io file is `tests/io/<file>.rs`, declared inside
+one `mod io { .. }` block of `tests/main.rs`.
+
+Before a push: `cargo nextest run -p <crate>` for each crate the change
+touches (the unit tier), plus the feature rows of docs/LOOP.md §6 for those
+crates. The pipelines run the rest: a push to `main` runs the unit tier and
+the doctests on four platforms, the nightly cron and a `v*` tag both tiers.
+Never run `--profile integration` or `--profile ci` locally.
+
 ## Version cycle
 
 The tree carries `0.1.0-alpha.N` only in the release commit and its tag. Every

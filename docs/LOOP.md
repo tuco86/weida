@@ -114,12 +114,17 @@ removal. Keep the file ordered by priority, ready items first.
 
 ## 6. The gate
 
-Before any commit that touches Rust, all four, in this order, each with `timeout: 900`:
-`cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings` (and again
-`-p weida --no-default-features --all-targets`); `cargo test --workspace --no-fail-fast`;
-`cargo clean --doc` followed by `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
-Docs-only commits run none.
+Before any commit that touches Rust, in this order: `cargo fmt --all --check`;
+`cargo clippy --workspace --all-targets -- -D warnings` (and again
+`-p weida --no-default-features --all-targets`); `cargo nextest run -p <crate> --no-fail-fast`
+for every crate the commit touches (the unit tier of `.config/nextest.toml`); the doc step
+below. Docs-only commits run none.
 Keep the failures block of the test output; a count without names is not a gate result.
+
+The integration tier and every platform run in the CI after the push (`.zeughaus-ci/`): a
+push to `main` runs the unit tier and the doctests on linux-amd64, linux-arm64, darwin-arm64
+and windows-amd64, the nightly cron and a `v*` tag both tiers. Never run
+`cargo test --workspace`, `--profile integration` or `--profile ci` locally.
 
 **`--workspace` is not the whole workspace.** It builds every crate in its *default*
 configuration, so code behind a default-off feature is compiled by none of the four commands
@@ -128,14 +133,12 @@ therefore also runs, for each crate whose sources it touched:
 
 | crate | feature | commands |
 | --- | --- | --- |
-| `weida` | `blocking` | `clippy -p weida --features blocking --all-targets -- -D warnings`, `test -p weida --features blocking` |
-| `weida` | `swarm` | `clippy -p weida --features swarm --all-targets -- -D warnings`, `test -p weida --features swarm` |
-| `weida` | `test-util` | `clippy -p weida --features test-util --all-targets -- -D warnings`, `test -p weida --features test-util` |
+| `weida` | `blocking` | `clippy -p weida --features blocking --all-targets -- -D warnings`, `nextest run -p weida --features blocking` |
+| `weida` | `swarm` | `clippy -p weida --features swarm --all-targets -- -D warnings`, `nextest run -p weida --features swarm` |
 | `weida-zmq` | `blocking` | the same two with `-p weida-zmq` |
 | `weida-mqtt` | `blocking` | the same two with `-p weida-mqtt` |
 | `weida-nng` | `blocking` | the same two with `-p weida-nng` |
 
-All four, run together, cost **66 s** warm and cover **909 tests** (369, 245, 152, 143).
 A commit that touches the core (`weida`, `weida-protocol`, `weida-runtime`, `weida-core`) runs
 all four, because every facade sits on it.
 
