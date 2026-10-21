@@ -1047,11 +1047,6 @@ impl IncomingRequest {
         // `IncomingTransfer::drop` stops the half only when the payload has
         // not already ended, so a completed request is left alone.
         drop(self.body.take());
-        let mut send = self
-            .reply
-            .send
-            .take()
-            .expect("the send half is taken exactly once, by this method");
 
         let meta = match (meta.trace, self.meta.trace) {
             (None, Some(inherited)) => meta.with_trace(inherited),
@@ -1061,9 +1056,20 @@ impl IncomingRequest {
         // addresses nothing. A reply may order its own report, and that is
         // how the **reply** direction is reported: the responder allocates
         // from its own id space and the requester reports on it.
+        //
+        // Built and checked while the half is still in `ReplyHalf`: a head
+        // that cannot be sent fails here, and the half's drop then tells the
+        // requester that no reply is coming instead of ending the stream
+        // empty.
         let (header, trace, cursors) =
             outgoing_header(&self.reply.conn, None, &meta, self.meta.tracestate.clone())?;
-        write_data_head(&self.reply.conn, &mut send, &header).await?;
+        let head = DataHead::new(&self.reply.conn, &header)?;
+        let mut send = self
+            .reply
+            .send
+            .take()
+            .expect("the send half is taken exactly once, by this method");
+        head.write(&mut send).await?;
         Ok(OutgoingTransfer::new(
             send,
             trace,
@@ -1173,16 +1179,6 @@ impl DataHead {
     pub(crate) async fn write(self, stream: &mut SendHalf) -> Result<(), Error> {
         stream.write_all(&self.buf[self.start..]).await
     }
-}
-
-/// Writes a checked DATA frame head on a stream that already exists (a reply
-/// half): the head is checked against the peer's `max_header_bytes` first.
-pub(crate) async fn write_data_head(
-    conn: &ConnHandle,
-    stream: &mut SendHalf,
-    header: &DataHeader,
-) -> Result<(), Error> {
-    DataHead::new(conn, header)?.write(stream).await
 }
 
 /// The reply half of an exchange the requester is waiting on.

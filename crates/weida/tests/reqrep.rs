@@ -540,6 +540,46 @@ async fn dropping_a_request_without_replying_reports_no_reply() {
     client.shutdown().await;
 }
 
+/// A reply that fails before its head is written is a reply that never
+/// comes: the requester learns `NoReply`, as it does for a dropped request,
+/// rather than a reply stream that ends with nothing in it.
+#[tokio::test]
+async fn a_reply_refused_before_its_head_reports_no_reply() {
+    let server = Server::start().await;
+    let replier = server.listener.replier("/strict").expect("replier");
+    let handler = tokio::spawn(async move {
+        let mut request = replier.accept().await.expect("accept");
+        let _ = request.body().read_capped(1024).await;
+        let unreadable = TransferMeta::default().with_content_type("c".repeat(4096));
+        request.reply(unreadable).await.err()
+    });
+
+    let client = server.client_runtime();
+    let requester = client.requester(server.trust());
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        requester.connect(&server.url("/strict")),
+    )
+    .await
+    .expect("in time")
+    .expect("connect");
+
+    let err = tokio::time::timeout(Duration::from_secs(10), requester.request(b"please"))
+        .await
+        .expect("in time")
+        .expect_err("the reply never came");
+    assert!(
+        matches!(err, Error::NoReply),
+        "expected NoReply, got {err:?}"
+    );
+    assert!(
+        matches!(handler.await.expect("handler"), Some(Error::LimitExceeded)),
+        "the replier learned why its reply failed"
+    );
+
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn concurrent_exchanges_do_not_interfere() {
     // Each exchange is its own bidirectional stream, so there is nothing to
