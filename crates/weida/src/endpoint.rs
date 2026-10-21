@@ -1247,46 +1247,76 @@ impl SurveyRun {
     /// `max_bytes` caps the reply this call reads; nothing is buffered before
     /// the caller states a cap. A respondent that refused or died is one
     /// `Some(Err(_))` among the answers and ends nothing: the other
-    /// respondents are independent exchanges.
+    /// respondents are independent exchanges. An answer whose body is still
+    /// arriving at the deadline is late like one whose head is.
     pub async fn next(&mut self, max_bytes: usize) -> Option<Result<Vec<u8>, Error>> {
-        if self.done {
-            return None;
-        }
-        // An answer already in hand is an answer. `within` selects without
-        // bias, so at `remaining == 0` — a caller that reads after its own
-        // deadline, which is the ordinary case — the deadline branch and a
-        // ready `recv` are both ready and the choice is a coin flip. Taking
-        // the buffer first is what keeps an answer that arrived in time from
-        // being lost to that flip, silently and without being counted.
-        match self.rx.try_recv() {
-            Ok(Ok(transfer)) => return Some(transfer.collect(max_bytes).await),
-            Ok(Err(e)) => return Some(Err(e)),
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                self.done = true;
+        loop {
+            if self.done {
                 return None;
             }
-            Err(mpsc::error::TryRecvError::Empty) => {}
-        }
-        let remaining = self.expires.saturating_duration_since(self.exec.now());
-        match self.exec.within(remaining, self.rx.recv()).await {
-            // The deadline. Anything that landed while this call was waiting
-            // is counted here: its collector already succeeded in handing it
-            // over, so it cannot count itself, and a dropped answer that
-            // nothing counts is the one outcome `late` exists to prevent.
-            None => {
-                self.done = true;
-                while self.rx.try_recv().is_ok() {
-                    self.late.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // An answer already in hand is an answer. `within` selects without
+            // bias, so at `remaining == 0` — a caller that reads after its own
+            // deadline, which is the ordinary case — the deadline branch and a
+            // ready `recv` are both ready and the choice is a coin flip. Taking
+            // the buffer first is what keeps an answer that arrived in time from
+            // being lost to that flip, silently and without being counted.
+            let transfer = match self.rx.try_recv() {
+                Ok(Ok(transfer)) => transfer,
+                Ok(Err(e)) => return Some(Err(e)),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.done = true;
+                    return None;
                 }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    let remaining = self.expires.saturating_duration_since(self.exec.now());
+                    match self.exec.within(remaining, self.rx.recv()).await {
+                        // The deadline. Anything that landed while this call
+                        // was waiting is counted here: its collector already
+                        // succeeded in handing it over, so it cannot count
+                        // itself, and a dropped answer that nothing counts is
+                        // the one outcome `late` exists to prevent.
+                        None => {
+                            self.done = true;
+                            while self.rx.try_recv().is_ok() {
+                                self.late.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            return None;
+                        }
+                        // Every respondent has answered or failed.
+                        Some(None) => {
+                            self.done = true;
+                            return None;
+                        }
+                        Some(Some(Ok(transfer))) => transfer,
+                        Some(Some(Err(e))) => return Some(Err(e)),
+                    }
+                }
+            };
+            if let Some(body) = self.collect_in_time(transfer, max_bytes).await {
+                return Some(body);
+            }
+        }
+    }
+
+    /// Reads one answer's body, bounded by the survey's deadline: a
+    /// respondent that sends its head and stops writing would otherwise hold
+    /// the caller past it. The body is polled first, so one already in hand
+    /// is read whatever the clock says; one the deadline cuts off is late,
+    /// counted, and `None`.
+    async fn collect_in_time(
+        &mut self,
+        transfer: IncomingTransfer,
+        max_bytes: usize,
+    ) -> Option<Result<Vec<u8>, Error>> {
+        let remaining = self.expires.saturating_duration_since(self.exec.now());
+        let deadline = self.exec.sleep(remaining);
+        tokio::select! {
+            biased;
+            body = transfer.collect(max_bytes) => Some(body),
+            () = deadline => {
+                self.late.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 None
             }
-            // Every respondent has answered or failed.
-            Some(None) => {
-                self.done = true;
-                None
-            }
-            Some(Some(Ok(transfer))) => Some(transfer.collect(max_bytes).await),
-            Some(Some(Err(e))) => Some(Err(e)),
         }
     }
 

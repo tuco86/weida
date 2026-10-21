@@ -146,6 +146,47 @@ async fn a_late_reply_is_counted_and_not_delivered() {
     client.shutdown().await;
 }
 
+/// The deadline bounds the whole answer, not only its head: a respondent
+/// that starts a reply in time and then stops writing cannot hold `next`
+/// past the deadline. Its answer is late, and counted as such.
+#[tokio::test(start_paused = true)]
+async fn a_reply_that_stalls_after_its_head_cannot_hold_the_survey_open() {
+    let server = Server::start().await;
+    let respondent = server.listener.respondent("/poll").expect("respondent");
+    let (stalled_tx, stalled_rx) = tokio::sync::oneshot::channel();
+    let stalling = tokio::spawn(async move {
+        let mut request = respondent.accept().await.expect("accept");
+        let _ = request.body().read_capped(1024).await;
+        let mut reply = request
+            .reply(TransferMeta::default())
+            .await
+            .expect("reply head");
+        reply.write_all(b"half an ans").await.expect("write");
+        // Neither the rest nor a FIN: held until the test is done.
+        let _ = stalled_rx.await;
+        drop(reply);
+    });
+
+    let client = server.client_runtime();
+    let surveyor = client.surveyor(server.trust());
+    within(surveyor.connect(&server.url("/poll")))
+        .await
+        .expect("connect");
+
+    let mut run = within(surveyor.survey(b"quick", Duration::from_millis(200)))
+        .await
+        .expect("survey");
+    let next = tokio::time::timeout(Duration::from_secs(3), run.next(1024))
+        .await
+        .expect("the deadline bounds a stalled answer");
+    assert!(next.is_none(), "an unfinished answer is late: {next:?}");
+    assert_eq!(run.late(), 1, "the stalled answer is counted");
+
+    stalled_tx.send(()).expect("respondent alive");
+    stalling.await.expect("respondent");
+    client.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_answer_that_arrived_in_time_survives_a_caller_that_reads_late() {
     // The deadline bounds **waiting**, not what already arrived: a caller
