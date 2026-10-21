@@ -960,6 +960,16 @@ async fn handle_stream(
     agreed_tx: &watch::Sender<Option<Agreed>>,
     mut stream: RecvHalf,
 ) -> Result<(), Error> {
+    // A parked reverse connection waits here for the peer's first byte, with
+    // no header slot and no deadline: until the peer writes, it is a stream
+    // the peer has not opened yet, not one whose frame head is late.
+    let opened = tokio::select! {
+        opened = stream.opened() => opened?,
+        reason = ctx.conn.closed() => return Err(reason),
+    };
+    if !opened {
+        return Ok(());
+    }
     let preamble = match read_preamble_within(ctx, &mut stream).await {
         Ok(preamble) => preamble,
         Err(Error::Protocol(reason)) => return violation(ctx, &reason),

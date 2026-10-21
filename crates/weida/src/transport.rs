@@ -561,6 +561,21 @@ impl RecvHalf {
         }
     }
 
+    /// Waits until the peer has opened this stream. Every stream but a
+    /// parked reverse connection is open once it is accepted; a parked one
+    /// is a connection held for a stream the peer has not opened yet, and
+    /// opens with the peer's first byte [0012 §4.4]. `false` is a parked
+    /// connection the peer closed without using.
+    pub(crate) async fn opened(&mut self) -> Result<bool, Error> {
+        match self {
+            #[cfg(unix)]
+            RecvHalf::Unix(r) => r.opened().await,
+            #[cfg(windows)]
+            RecvHalf::Pipe(r) => r.opened().await,
+            _ => Ok(true),
+        }
+    }
+
     /// Appends what is available to `out`, at most `max` bytes; `None` at
     /// the end of the payload.
     ///

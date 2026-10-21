@@ -1111,6 +1111,9 @@ pub(crate) struct LocalRecv<S: Stream> {
     /// wants a replacement once the peer has spent it [0012 §4.4].
     deficit: Option<Arc<Deficit>>,
     spent: bool,
+    /// The first byte of a parked connection, read by
+    /// [`LocalRecv::opened`] and handed out by the next read.
+    first: Option<u8>,
     /// Set on the accepting side's control read half: what it is handed to
     /// when it is dropped, instead of being refused.
     watch: Option<ControlWatch<S>>,
@@ -1126,6 +1129,7 @@ impl<S: Stream> LocalRecv<S> {
             },
             deficit: None,
             spent: false,
+            first: None,
             watch: None,
         }
     }
@@ -1155,7 +1159,31 @@ impl<S: Stream> LocalRecv<S> {
         }
     }
 
+    /// Waits until the peer opens this stream: at once for every stream but
+    /// a parked reverse connection, which is opened by the peer's first
+    /// byte, however long the peer has nothing to send. `false` is a parked
+    /// connection the peer closed without using.
+    pub(crate) async fn opened(&mut self) -> Result<bool, Error> {
+        if self.deficit.is_none() || self.spent {
+            return Ok(true);
+        }
+        let mut byte = [0u8; 1];
+        match self.read(&mut byte).await? {
+            Some(_) => {
+                self.first = Some(byte[0]);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub(crate) async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error> {
+        if let Some(slot) = buf.first_mut()
+            && let Some(byte) = self.first.take()
+        {
+            *slot = byte;
+            return Ok(Some(1));
+        }
         let Some(io) = self.io.as_mut() else {
             return Ok(None);
         };

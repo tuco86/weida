@@ -623,3 +623,47 @@ async fn push_pull_waits_for_a_slot_over_pipe() {
     push_pull_waits_for_a_slot(&h).await;
     h.shutdown().await;
 }
+
+/// A parked reverse connection waits for the publisher's next copy, however
+/// long that takes: it is not a stream whose frame head is late. A
+/// subscriber idle for longer than its header deadline still receives the
+/// next copy.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_unix_subscriber_idle_past_the_header_deadline_still_receives() {
+    let h = Harness::start(Transport::Unix).await;
+    let publisher = h.listener.publisher("/md").expect("publisher");
+    let mut config = weida::RuntimeConfig::default();
+    config.limits.header_timeout_ms = 300;
+    let client = h.client_with(config);
+    let subscriber = client.subscriber(h.trust());
+    within(subscriber.connect(&h.url("/md")))
+        .await
+        .expect("connect");
+    within(subscriber.subscribe("px.#"))
+        .await
+        .expect("subscribe");
+    within(async {
+        while publisher.filter_count() < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    // Three header deadlines with nothing to send.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+    assert_eq!(
+        publisher.publish("px.eur", &b"price"[..]).expect("publish"),
+        1
+    );
+    let copy = tokio::time::timeout(std::time::Duration::from_secs(2), subscriber.recv())
+        .await
+        .expect("the copy arrives")
+        .expect("recv");
+    assert_eq!(copy.meta().topic.as_deref(), Some("px.eur"));
+    assert_eq!(publisher.dropped(), 0, "nothing was lost");
+
+    client.shutdown().await;
+    h.shutdown().await;
+}
