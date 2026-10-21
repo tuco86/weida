@@ -30,3 +30,23 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 [[profile.ci.overrides]]
 filter = '(package(weida-zmq) | package(weida-nng)) and test(/^io::(thread_rule|directions)::/)'
 slow-timeout = { period = "180s", terminate-after = 1 }
+
+# 50 rounds of a TCP connect and close: 10.1 s on linux-amd64 and 10.5 s on
+# windows-amd64, measured.
+[[profile.integration.overrides]]
+filter = 'package(weida-nats) and test(=io::driver::close_returns_only_once_the_state_says_closed)'
+slow-timeout = { period = "40s", terminate-after = 1 }
+
+[[profile.ci.overrides]]
+filter = 'package(weida-nats) and test(=io::driver::close_returns_only_once_the_state_says_closed)'
+slow-timeout = { period = "40s", terminate-after = 1 }
+
+# 63 nodes, 62 of which never answer, on a multi-threaded runtime: 8.5 s on
+# linux-amd64 and 15.3 s on windows-amd64, measured.
+[[profile.integration.overrides]]
+filter = 'package(weida-raft) and test(=io::two_adds_racing_for_the_last_place_cannot_both_have_it)'
+slow-timeout = { period = "50s", terminate-after = 1 }
+
+[[profile.ci.overrides]]
+filter = 'package(weida-raft) and test(=io::two_adds_racing_for_the_last_place_cannot_both_have_it)'
+slow-timeout = { period = "50s", terminate-after = 1 }

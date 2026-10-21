@@ -434,8 +434,10 @@ mod tests {
         assert_eq!(err.errno(), "EINVAL");
         assert!(err.cause().contains("113"), "{err}");
 
-        // The libzmq number and the kernel's own budget agree: 113 is
-        // sun_path minus the terminator plus "ipc://".
+        // The libzmq number and the kernel's own budget agree where sun_path
+        // has 108 bytes: 113 is that minus the terminator plus "ipc://".
+        // macOS has 104, so there the kernel's budget is the smaller one.
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             MAX_IPC_ENDPOINT_BYTES - IPC_SCHEME.len(),
             weida_core::MAX_SOCKET_PATH_BYTES,

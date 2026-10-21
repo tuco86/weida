@@ -1,12 +1,14 @@
 //! The tests of `tests/local_transports.rs` that need the network, a process or real time.
 
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use weida_nng::{Admission, PipeEvent, PipeInfo};
-use weida_nng::{
-    Context, ContextConfig, Error, PullSocket, PushSocket, RepSocket, ReqSocket, SocketOptions,
-};
+
+#[cfg(unix)]
+use weida_nng::{Admission, Error, PipeEvent, PipeInfo, RepSocket, ReqSocket};
+use weida_nng::{Context, ContextConfig, PullSocket, PushSocket, SocketOptions};
 
 use crate::local_transports::*;
 
