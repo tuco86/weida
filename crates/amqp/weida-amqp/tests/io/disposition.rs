@@ -7,7 +7,7 @@
 //! "what may I conclude now?", and a client that reported frames instead of
 //! conclusions would leave the application to guess.
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 use std::time::Duration;

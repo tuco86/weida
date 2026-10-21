@@ -836,104 +836,6 @@ mod tests {
         (Wire::new(Stream::Plain(client)), server)
     }
 
-    #[tokio::test]
-    async fn a_frame_split_across_reads_is_reassembled() {
-        let (mut wire, mut server) = wired().await;
-        let mut whole = Vec::new();
-        frame::write(&mut whole, FrameKind::Amqp, 7, 512, |body| {
-            body.extend_from_slice(b"performative");
-            Ok(())
-        })
-        .unwrap();
-        let (first, second) = whole.split_at(5);
-        server.write_all(first).await.unwrap();
-        server.flush().await.unwrap();
-        let first = first.to_vec();
-        let second = second.to_vec();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            server.write_all(&second).await.unwrap();
-            server.flush().await.unwrap();
-            // Hold the socket open so the reader does not see EOF.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        });
-        let frame = wire.read_frame().await.expect("a frame");
-        assert_eq!(frame.header.channel, 7);
-        assert_eq!(frame.body, b"performative");
-        assert_eq!(first.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn two_frames_in_one_segment_are_read_one_at_a_time() {
-        let (mut wire, mut server) = wired().await;
-        let mut both = Vec::new();
-        for channel in [1u16, 2] {
-            frame::write(&mut both, FrameKind::Amqp, channel, 512, |body| {
-                body.push(channel as u8);
-                Ok(())
-            })
-            .unwrap();
-        }
-        server.write_all(&both).await.unwrap();
-        server.flush().await.unwrap();
-        let keep = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            drop(server);
-        });
-        for channel in [1u16, 2] {
-            let frame = wire.read_frame().await.expect("a frame");
-            assert_eq!(frame.header.channel, channel);
-            assert_eq!(frame.body, &[channel as u8]);
-        }
-        keep.abort();
-    }
-
-    #[tokio::test]
-    async fn the_pre_negotiation_ceiling_is_in_force_before_open() {
-        let (mut wire, mut server) = wired().await;
-        assert_eq!(
-            wire.max_frame_size(),
-            weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE
-        );
-        // Eight octets claiming four gigabytes. The refusal comes from the
-        // header alone: no body is sent at all, and the test would hang
-        // rather than fail if the reader waited for one.
-        server
-            .write_all(&[0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x00, 0x00])
-            .await
-            .unwrap();
-        server.flush().await.unwrap();
-        let error = wire.read_frame().await.expect_err("refused");
-        assert!(
-            matches!(
-                error,
-                Error::Decode(weida_amqp_codec::DecodeError::FrameTooLarge { max: 512, .. })
-            ),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_ceiling_only_ever_grows() {
-        let (mut wire, _server) = wired().await;
-        wire.negotiated(128 * 1024);
-        assert_eq!(wire.max_frame_size(), 128 * 1024);
-        wire.negotiated(16);
-        assert_eq!(
-            wire.max_frame_size(),
-            128 * 1024,
-            "a forgotten or a smaller negotiation leaves the stricter bound"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_closed_transport_is_reported_as_end_of_file() {
-        let (mut wire, server) = wired().await;
-        drop(server);
-        let error = wire.read_frame().await.expect_err("the peer is gone");
-        assert!(matches!(error, Error::Io(_)), "{error}");
-    }
-
     /// What the application queued does not count as answers to the peer:
     /// 300 KiB of its frames congest the outbox and leave reading alone, which
     /// is what lets two peers that both stream bulk go on reading each other.
@@ -1005,71 +907,168 @@ mod tests {
         (listener, held, addr)
     }
 
-    /// Several addresses that swallow packets share the one budget, instead
-    /// of each being given the whole of it: three of them under a 600 ms
-    /// budget end in about 600 ms, not in 1.8 s.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn addresses_that_swallow_packets_share_one_budget() {
-        let exec = Exec::current().expect("a runtime");
-        let (_l1, _h1, first) = blackhole().await;
-        let (_l2, _h2, second) = blackhole().await;
-        let (_l3, _h3, third) = blackhole().await;
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let budget = Budget::start(Duration::from_millis(600));
-        let started = Instant::now();
-        let error = dial(&exec, &[first, second, third], &budget)
-            .await
-            .expect_err("nothing answers");
-        let took = started.elapsed();
+        #[tokio::test]
+        async fn a_frame_split_across_reads_is_reassembled() {
+            let (mut wire, mut server) = wired().await;
+            let mut whole = Vec::new();
+            frame::write(&mut whole, FrameKind::Amqp, 7, 512, |body| {
+                body.extend_from_slice(b"performative");
+                Ok(())
+            })
+            .unwrap();
+            let (first, second) = whole.split_at(5);
+            server.write_all(first).await.unwrap();
+            server.flush().await.unwrap();
+            let first = first.to_vec();
+            let second = second.to_vec();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                server.write_all(&second).await.unwrap();
+                server.flush().await.unwrap();
+                // Hold the socket open so the reader does not see EOF.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            });
+            let frame = wire.read_frame().await.expect("a frame");
+            assert_eq!(frame.header.channel, 7);
+            assert_eq!(frame.body, b"performative");
+            assert_eq!(first.len(), 5);
+        }
+        #[tokio::test]
+        async fn two_frames_in_one_segment_are_read_one_at_a_time() {
+            let (mut wire, mut server) = wired().await;
+            let mut both = Vec::new();
+            for channel in [1u16, 2] {
+                frame::write(&mut both, FrameKind::Amqp, channel, 512, |body| {
+                    body.push(channel as u8);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            server.write_all(&both).await.unwrap();
+            server.flush().await.unwrap();
+            let keep = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                drop(server);
+            });
+            for channel in [1u16, 2] {
+                let frame = wire.read_frame().await.expect("a frame");
+                assert_eq!(frame.header.channel, channel);
+                assert_eq!(frame.body, &[channel as u8]);
+            }
+            keep.abort();
+        }
+        #[tokio::test]
+        async fn the_pre_negotiation_ceiling_is_in_force_before_open() {
+            let (mut wire, mut server) = wired().await;
+            assert_eq!(
+                wire.max_frame_size(),
+                weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE
+            );
+            // Eight octets claiming four gigabytes. The refusal comes from the
+            // header alone: no body is sent at all, and the test would hang
+            // rather than fail if the reader waited for one.
+            server
+                .write_all(&[0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x00, 0x00])
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            let error = wire.read_frame().await.expect_err("refused");
+            assert!(
+                matches!(
+                    error,
+                    Error::Decode(weida_amqp_codec::DecodeError::FrameTooLarge { max: 512, .. })
+                ),
+                "{error}"
+            );
+        }
+        #[tokio::test]
+        async fn the_ceiling_only_ever_grows() {
+            let (mut wire, _server) = wired().await;
+            wire.negotiated(128 * 1024);
+            assert_eq!(wire.max_frame_size(), 128 * 1024);
+            wire.negotiated(16);
+            assert_eq!(
+                wire.max_frame_size(),
+                128 * 1024,
+                "a forgotten or a smaller negotiation leaves the stricter bound"
+            );
+        }
+        #[tokio::test]
+        async fn a_closed_transport_is_reported_as_end_of_file() {
+            let (mut wire, server) = wired().await;
+            drop(server);
+            let error = wire.read_frame().await.expect_err("the peer is gone");
+            assert!(matches!(error, Error::Io(_)), "{error}");
+        }
+        /// Several addresses that swallow packets share the one budget, instead
+        /// of each being given the whole of it: three of them under a 600 ms
+        /// budget end in about 600 ms, not in 1.8 s.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn addresses_that_swallow_packets_share_one_budget() {
+            let exec = Exec::current().expect("a runtime");
+            let (_l1, _h1, first) = blackhole().await;
+            let (_l2, _h2, second) = blackhole().await;
+            let (_l3, _h3, third) = blackhole().await;
 
-        assert!(matches!(error, Error::HandshakeTimeout { .. }), "{error}");
-        assert!(
-            took < Duration::from_millis(1200),
-            "three addresses took {took:?} out of a 600 ms budget"
-        );
-    }
+            let budget = Budget::start(Duration::from_millis(600));
+            let started = Instant::now();
+            let error = dial(&exec, &[first, second, third], &budget)
+                .await
+                .expect_err("nothing answers");
+            let took = started.elapsed();
 
-    /// An address that swallows packets leaves the next one time to answer:
-    /// it is given half of what is left and not all of it.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_black_hole_leaves_the_next_address_time_to_answer() {
-        let exec = Exec::current().expect("a runtime");
-        let (_hole, _held, dead) = blackhole().await;
-        let live = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bound");
-        let live_addr = live.local_addr().expect("an address");
+            assert!(matches!(error, Error::HandshakeTimeout { .. }), "{error}");
+            assert!(
+                took < Duration::from_millis(1200),
+                "three addresses took {took:?} out of a 600 ms budget"
+            );
+        }
+        /// An address that swallows packets leaves the next one time to answer:
+        /// it is given half of what is left and not all of it.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_black_hole_leaves_the_next_address_time_to_answer() {
+            let exec = Exec::current().expect("a runtime");
+            let (_hole, _held, dead) = blackhole().await;
+            let live = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bound");
+            let live_addr = live.local_addr().expect("an address");
 
-        let budget = Budget::start(Duration::from_secs(2));
-        let stream = dial(&exec, &[dead, live_addr], &budget)
-            .await
-            .expect("the second address answers");
-        assert!(matches!(stream, Stream::Plain(_)));
-    }
-
-    /// A resolver that never answers does not hold the caller past the
-    /// budget, and the failure says what was being waited for.
-    #[tokio::test]
-    async fn a_lookup_that_never_answers_ends_inside_the_budget() {
-        let exec = Exec::current().expect("a runtime");
-        let silent =
-            std::future::pending::<std::result::Result<Vec<SocketAddr>, weida_core::Error>>();
-        let budget = Budget::start(Duration::from_millis(200));
-        let started = Instant::now();
-        let error = connect_to(&exec, &budget, silent)
-            .await
-            .expect_err("it never answers");
-        assert!(
-            matches!(
-                error,
-                Error::HandshakeTimeout {
-                    step: "the name lookup"
-                }
-            ),
-            "{error}"
-        );
-        assert!(started.elapsed() < Duration::from_secs(2));
+            let budget = Budget::start(Duration::from_secs(2));
+            let stream = dial(&exec, &[dead, live_addr], &budget)
+                .await
+                .expect("the second address answers");
+            assert!(matches!(stream, Stream::Plain(_)));
+        }
+        /// A resolver that never answers does not hold the caller past the
+        /// budget, and the failure says what was being waited for.
+        #[tokio::test]
+        async fn a_lookup_that_never_answers_ends_inside_the_budget() {
+            let exec = Exec::current().expect("a runtime");
+            let silent =
+                std::future::pending::<std::result::Result<Vec<SocketAddr>, weida_core::Error>>();
+            let budget = Budget::start(Duration::from_millis(200));
+            let started = Instant::now();
+            let error = connect_to(&exec, &budget, silent)
+                .await
+                .expect_err("it never answers");
+            assert!(
+                matches!(
+                    error,
+                    Error::HandshakeTimeout {
+                        step: "the name lookup"
+                    }
+                ),
+                "{error}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
     }
 }

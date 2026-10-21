@@ -42,54 +42,60 @@ impl Server {
     }
 }
 
-#[tokio::test]
-async fn a_silent_peer_does_not_keep_the_socket_open_after_the_idle_expiry() {
-    let exec = Exec::current().unwrap();
-    let (listener, port) = scripted().await;
-    let baseline = open_descriptors();
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    use super::*;
 
-    let (release, released) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        let mut server = accept(&listener).await;
-        server.handshake().await;
-        // Silent from here on: the socket stays open and unread until the
-        // test releases it.
-        let _ = released.await;
-        drop(server);
-    });
+    #[tokio::test]
+    async fn a_silent_peer_does_not_keep_the_socket_open_after_the_idle_expiry() {
+        let exec = Exec::current().unwrap();
+        let (listener, port) = scripted().await;
+        let baseline = open_descriptors();
 
-    let mut options = options();
-    options.idle_time_out = Some(Duration::from_millis(200));
-    let connection = timeout(
-        DEADLINE,
-        Connection::connect(&exec, "127.0.0.1", port, options),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+        let (release, released) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut server = accept(&listener).await;
+            server.handshake().await;
+            // Silent from here on: the socket stays open and unread until the
+            // test releases it.
+            let _ = released.await;
+            drop(server);
+        });
 
-    let state = timeout(DEADLINE, connection.closed()).await.unwrap();
-    match &state {
-        State::Failed(text) => assert!(text.contains("idle threshold"), "{text}"),
-        other => panic!("expected Failed on idle expiry, got {other:?}"),
-    }
+        let mut options = options();
+        options.idle_time_out = Some(Duration::from_millis(200));
+        let connection = timeout(
+            DEADLINE,
+            Connection::connect(&exec, "127.0.0.1", port, options),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
-    release.send(()).unwrap();
-    timeout(DEADLINE, server).await.unwrap().unwrap();
-
-    // The connection handle is still alive here: what must be gone is the
-    // driver's transport, not the caller's handle.
-    let started = Instant::now();
-    loop {
-        if open_descriptors() <= baseline {
-            break;
+        let state = timeout(DEADLINE, connection.closed()).await.unwrap();
+        match &state {
+            State::Failed(text) => assert!(text.contains("idle threshold"), "{text}"),
+            other => panic!("expected Failed on idle expiry, got {other:?}"),
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "descriptors did not return to {baseline}: {} open",
-            open_descriptors()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        release.send(()).unwrap();
+        timeout(DEADLINE, server).await.unwrap().unwrap();
+
+        // The connection handle is still alive here: what must be gone is the
+        // driver's transport, not the caller's handle.
+        let started = Instant::now();
+        loop {
+            if open_descriptors() <= baseline {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "descriptors did not return to {baseline}: {} open",
+                open_descriptors()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(connection);
     }
-    drop(connection);
 }

@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(next(&mut receiver).await, None);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_waiting_reader_is_woken_by_a_push() {
         let (sender, mut receiver) = channel::<Item>(BOUND);
         let reader = tokio::spawn(async move { next(&mut receiver).await });

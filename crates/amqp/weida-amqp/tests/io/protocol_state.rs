@@ -8,7 +8,7 @@
 //! whose body does not decode, is answered with a `close` before the transport
 //! is dropped. A keep-alive is a valid frame and keeps the connection open.
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 use std::time::Duration;

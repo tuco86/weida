@@ -7,7 +7,7 @@
 //! ended with an error, is illegal state. Every one of these must leave the
 //! client's tables as they were.
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 use support::{DEADLINE, Server, accept, options, scripted};

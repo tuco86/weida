@@ -8,7 +8,7 @@
 //! sends one frame, and a multi-frame message spends the window once per
 //! frame while spending link credit once in total.
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 use std::time::Duration;

@@ -11,14 +11,21 @@
 )]
 
 mod cancel_and_retention;
-mod credit_enforcement;
-mod disposition;
 mod handshake;
-mod hostile_attach;
-mod interop_fe2o3;
-mod interop_rabbitmq;
-mod link;
-mod protocol_state;
-mod session;
-mod stalled_peer;
-mod transfer;
+
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    mod cancel_and_retention;
+    mod credit_enforcement;
+    mod disposition;
+    mod handshake;
+    mod hostile_attach;
+    mod interop_fe2o3;
+    mod interop_rabbitmq;
+    mod link;
+    mod protocol_state;
+    mod session;
+    mod stalled_peer;
+    mod transfer;
+}

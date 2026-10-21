@@ -2,7 +2,7 @@
 //! the steal, and the two conditions the specification names for a wrong
 //! handle.
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 use std::time::Duration;

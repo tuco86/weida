@@ -6,7 +6,7 @@
 //! that stops reading fails the connection by the stall clock, not by the
 //! idle timer, and `close` is bounded while the peer is stalled (4).
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 use std::time::Duration;

@@ -45,7 +45,8 @@ tokio-rustls = { workspace = true, optional = true }
 # A certificate for the TLS tests. The trust anchors are the caller's
 # everywhere else; here the test is the caller.
 rcgen.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+# `test-util`: `start_paused` for the tests that wait on a timer.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "test-util"] }
 # The interop peer that always runs. `fe2o3-amqp` is a pure-Rust AMQP 1.0
 # implementation with an `acceptor` module, so it is a *foreign* peer that
 # needs no broker installed and no C toolchain — nothing here is `#[ignore]`d
