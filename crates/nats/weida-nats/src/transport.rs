@@ -1108,7 +1108,7 @@ mod tests {
 
     /// A socket that takes nothing leaves the step pending rather than
     /// failing or spinning, which is what lets the driver put a clock on it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_stuck_socket_leaves_the_step_pending() {
         let (near, _far) = tokio::io::duplex(8);
         let mut writer = OpWriter::over(near);
@@ -1145,71 +1145,75 @@ mod tests {
         (listener, held, addr)
     }
 
-    /// Several addresses that swallow packets share the one budget, instead
-    /// of each being given the whole of it: three of them under a 600 ms
-    /// budget end in about 600 ms, not in 1.8 s.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn addresses_that_swallow_packets_share_one_budget() {
-        let exec = Exec::current().expect("a runtime");
-        let (_l1, _h1, first) = blackhole().await;
-        let (_l2, _h2, second) = blackhole().await;
-        let (_l3, _h3, third) = blackhole().await;
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let budget = Budget::start(Duration::from_millis(600));
-        let started = Instant::now();
-        let error = dial(&exec, &[first, second, third], &budget)
-            .await
-            .expect_err("nothing answers");
-        let took = started.elapsed();
+        /// Several addresses that swallow packets share the one budget, instead
+        /// of each being given the whole of it: three of them under a 600 ms
+        /// budget end in about 600 ms, not in 1.8 s.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn addresses_that_swallow_packets_share_one_budget() {
+            let exec = Exec::current().expect("a runtime");
+            let (_l1, _h1, first) = blackhole().await;
+            let (_l2, _h2, second) = blackhole().await;
+            let (_l3, _h3, third) = blackhole().await;
 
-        assert!(matches!(error, Error::HandshakeTimeout { .. }), "{error}");
-        assert!(
-            took < Duration::from_millis(1200),
-            "three addresses took {took:?} out of a 600 ms budget"
-        );
-    }
+            let budget = Budget::start(Duration::from_millis(600));
+            let started = Instant::now();
+            let error = dial(&exec, &[first, second, third], &budget)
+                .await
+                .expect_err("nothing answers");
+            let took = started.elapsed();
 
-    /// An address that swallows packets leaves the next one time to answer:
-    /// it is given half of what is left and not all of it.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_black_hole_leaves_the_next_address_time_to_answer() {
-        let exec = Exec::current().expect("a runtime");
-        let (_hole, _held, dead) = blackhole().await;
-        let live = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bound");
-        let live_addr = live.local_addr().expect("an address");
+            assert!(matches!(error, Error::HandshakeTimeout { .. }), "{error}");
+            assert!(
+                took < Duration::from_millis(1200),
+                "three addresses took {took:?} out of a 600 ms budget"
+            );
+        }
+        /// An address that swallows packets leaves the next one time to answer:
+        /// it is given half of what is left and not all of it.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_black_hole_leaves_the_next_address_time_to_answer() {
+            let exec = Exec::current().expect("a runtime");
+            let (_hole, _held, dead) = blackhole().await;
+            let live = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bound");
+            let live_addr = live.local_addr().expect("an address");
 
-        let budget = Budget::start(Duration::from_secs(2));
-        let stream = dial(&exec, &[dead, live_addr], &budget)
-            .await
-            .expect("the second address answers");
-        assert!(matches!(stream, Stream::Plain(_)));
-    }
-
-    /// A resolver that never answers does not hold the caller past the
-    /// budget, and the failure says what was being waited for.
-    #[tokio::test]
-    async fn a_lookup_that_never_answers_ends_inside_the_budget() {
-        let exec = Exec::current().expect("a runtime");
-        let silent =
-            std::future::pending::<std::result::Result<Vec<SocketAddr>, weida_core::Error>>();
-        let budget = Budget::start(Duration::from_millis(200));
-        let started = Instant::now();
-        let error = connect_to(&exec, &budget, silent)
-            .await
-            .expect_err("it never answers");
-        assert!(
-            matches!(
-                error,
-                Error::HandshakeTimeout {
-                    step: "the name lookup"
-                }
-            ),
-            "{error}"
-        );
-        assert!(started.elapsed() < Duration::from_secs(2));
+            let budget = Budget::start(Duration::from_secs(2));
+            let stream = dial(&exec, &[dead, live_addr], &budget)
+                .await
+                .expect("the second address answers");
+            assert!(matches!(stream, Stream::Plain(_)));
+        }
+        /// A resolver that never answers does not hold the caller past the
+        /// budget, and the failure says what was being waited for.
+        #[tokio::test]
+        async fn a_lookup_that_never_answers_ends_inside_the_budget() {
+            let exec = Exec::current().expect("a runtime");
+            let silent =
+                std::future::pending::<std::result::Result<Vec<SocketAddr>, weida_core::Error>>();
+            let budget = Budget::start(Duration::from_millis(200));
+            let started = Instant::now();
+            let error = connect_to(&exec, &budget, silent)
+                .await
+                .expect_err("it never answers");
+            assert!(
+                matches!(
+                    error,
+                    Error::HandshakeTimeout {
+                        step: "the name lookup"
+                    }
+                ),
+                "{error}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
     }
 }

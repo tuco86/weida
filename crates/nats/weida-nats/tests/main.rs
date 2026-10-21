@@ -4,9 +4,15 @@
 
 mod support;
 
-mod driver;
 mod handshake;
-mod interop_nats_server;
-mod refusals;
-mod request_reply;
-mod subscriptions;
+
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    mod driver;
+    mod handshake;
+    mod interop_nats_server;
+    mod refusals;
+    mod request_reply;
+    mod subscriptions;
+}

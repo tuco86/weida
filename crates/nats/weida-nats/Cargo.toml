@@ -51,6 +51,8 @@ tokio = { workspace = true, features = [
     "net",
     "time",
     "sync",
+    # `start_paused` for the tests that wait on a timer.
+    "test-util",
 ] }
 # The interop peer, on the far side of a real `nats-server`. It is a
 # **client**, not a server, so it is no substitute for the binary: two clients
