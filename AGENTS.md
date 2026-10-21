@@ -28,12 +28,19 @@ other commit carries the next number with `-dev`
 
 A release is two version commits, and it is not finished after the first one:
 
-1. `chore(release): 0.1.0-alpha.N` drops `-dev`, then tag `v0.1.0-alpha.N`
-   and publish.
+1. `chore(release): 0.1.0-alpha.N` drops `-dev`; tag it
+   `git tag -a v0.1.0-alpha.N -m "Release 0.1.0-alpha.N"` and push both
+   `git push origin main v0.1.0-alpha.N`. The tag's `release` pipeline builds
+   and tests both tiers on four platforms and its `publish` job publishes the
+   workspace to crates.io; wait for it with `ci_wait` (the tag's commit).
+   Never `cargo publish` by hand.
 2. `chore: begin 0.1.0-alpha.<N+1>-dev development cycle` follows directly,
    in the same session as the release, before any other commit. A docs
    commit that records the release (README "published" line) may sit
    between the two; nothing else may.
+
+A failed `publish` is rerun with `ci_rerun`; it skips what crates.io already
+has.
 
 Both commits touch the same places:
 

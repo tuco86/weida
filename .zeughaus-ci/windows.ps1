@@ -1,0 +1,50 @@
+# Dot-sourced by the Windows build and check jobs; no header, so not a job.
+# Sets `Run`, `Install-Nextest`, `$cache`, `$exclude` and CARGO_TARGET_DIR.
+$ErrorActionPreference = 'Stop'
+
+# Runs a native command and ends the script with its exit code when it fails.
+# Its stderr is shown, not turned into an error (Windows PowerShell 5.1 does
+# that to the stderr of native commands under 'Stop').
+function Run([string]$Command, [string[]]$Arguments = @()) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        & $Command @Arguments 2>&1 | ForEach-Object { Write-Host "$_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    $seconds = [int][Math]::Round($clock.Elapsed.TotalSeconds)
+    if ($code -ne 0) {
+        Write-Host "== $Command $($Arguments -join ' ') failed after $seconds s"
+        Write-Host "$Command $($Arguments -join ' ') failed with exit code $code"
+        exit $code
+    }
+    Write-Host "== $Command $($Arguments -join ' '): $seconds s"
+}
+
+$cache = Join-Path $env:CI_WORKSPACE '.ci-cache'
+$env:CARGO_TARGET_DIR = Join-Path $cache 'target'
+
+# cargo-nextest from its prebuilt release into `$cache\bin`, kept between runs
+# by the warm workspace; on PATH so `cargo nextest` finds it.
+function Install-Nextest {
+    $bin = Join-Path $cache 'bin'
+    if (-not (Test-Path (Join-Path $bin 'cargo-nextest.exe'))) {
+        New-Item -ItemType Directory -Force -Path $bin | Out-Null
+        $zip = Join-Path $env:TEMP "cargo-nextest-$PID.zip"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -UseBasicParsing -Uri 'https://get.nexte.st/0.9/windows' -OutFile $zip
+        Expand-Archive -Path $zip -DestinationPath $bin -Force
+        Remove-Item -LiteralPath $zip
+    }
+    $env:PATH = "$bin;$env:PATH"
+}
+
+# wohnzimmer has no Python; the bindings' test binaries link libpython.
+$exclude = @(
+    '--exclude', 'weida-py-core', '--exclude', 'weida-py', '--exclude', 'weida-zmq-py',
+    '--exclude', 'weida-nng-py', '--exclude', 'weida-mqtt-py', '--exclude', 'weida-amqp-py',
+    '--exclude', 'weida-nats-py'
+)

@@ -1,0 +1,17 @@
+# Release channels of weida. The first channel whose `on` matches an event
+# names the pipeline's channel: a push to main is `dev`, a nightly build
+# `nightly` and a tagged one `release`. The last two are `clean`: what they
+# check is built from empty workspaces, not from warm caches.
+[[channel]]
+name = "dev"
+on = ["push main"]
+
+[[channel]]
+name = "nightly"
+on = ["cron *"]
+clean = true
+
+[[channel]]
+name = "release"
+on = ["tag v*"]
+clean = true
