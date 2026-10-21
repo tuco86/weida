@@ -1,4 +1,5 @@
 /target
+/.ci-cache
 # The uv-managed virtualenv `crates/py/develop.sh` builds the
 # Python extension into. Nothing is ever installed into a system interpreter.
 /.venv

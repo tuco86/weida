@@ -64,8 +64,8 @@ blake3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Tests, examples and benches generate throwaway identities even when a
-# downstream build turns the feature off.
-weida = { path = ".", features = ["generate"] }
+# downstream build turns the feature off, and run on a `SimNet` (`test-util`).
+weida = { path = ".", features = ["generate", "test-util"] }
 tracing-subscriber.workspace = true
 # Examples stream stdin/stdout; the library itself needs no stdio. `test-util`
 # for `start_paused` in the tests of a simulated network.

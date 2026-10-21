@@ -29,7 +29,6 @@ mod reconnect;
 mod redial_storm;
 mod reorder;
 mod reqrep;
-#[cfg(feature = "test-util")]
 mod sim;
 mod stats;
 mod streams;

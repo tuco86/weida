@@ -21,8 +21,10 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# Tests mint a throwaway identity and drive producers over the loopback.
-weida = { workspace = true, features = ["generate"] }
+# Tests mint a throwaway identity and drive producers over a `SimNet` under a
+# paused clock.
+weida = { workspace = true, features = ["generate", "test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 
 [lints]

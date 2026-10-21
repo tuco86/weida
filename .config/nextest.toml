@@ -1,0 +1,32 @@
+# Test tiers (see AGENTS.md, "Tests"). A test that touches the filesystem, the
+# network, a process, the environment or real time lives in a module named
+# `io`; everything else is a unit test. A paused Tokio clock is not real time.
+nextest-version = { required = "0.9.115" }
+
+# Unit tier: `cargo nextest run`. No I/O, so a second per test is already slow.
+[profile.default]
+default-filter = 'not test(/(^|::)io::/)'
+slow-timeout = { period = "1s", terminate-after = 5 }
+global-timeout = "60s"
+
+# I/O tier: `cargo nextest run --profile integration`.
+[profile.integration]
+default-filter = 'test(/(^|::)io::/)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+global-timeout = "5m"
+
+# Both tiers, as the nightly and release checks run them.
+[profile.ci]
+default-filter = 'all()'
+slow-timeout = { period = "10s", terminate-after = 1 }
+global-timeout = "6m"
+
+# trybuild compiles its fixtures.
+[[profile.integration.overrides]]
+filter = '(package(weida-zmq) | package(weida-nng)) and test(/^io::(thread_rule|directions)::/)'
+slow-timeout = { period = "180s", terminate-after = 1 }
+
+# trybuild compiles its fixtures.
+[[profile.ci.overrides]]
+filter = '(package(weida-zmq) | package(weida-nng)) and test(/^io::(thread_rule|directions)::/)'
+slow-timeout = { period = "180s", terminate-after = 1 }
