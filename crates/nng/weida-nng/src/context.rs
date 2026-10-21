@@ -475,26 +475,32 @@ mod tests {
         assert!(separate.open_socket().is_ok());
     }
 
-    /// Claim: shutdown is bounded. A socket held past the budget does not
-    /// hang the close; it comes back as a count, and the context admits
-    /// nothing new afterwards.
-    #[test]
-    fn shutdown_is_bounded_and_reports_what_it_could_not_close() {
-        let ctx = Context::owned(ContextConfig {
-            close_budget: Duration::from_millis(20),
-            ..ContextConfig::default()
-        })
-        .expect("context");
-        let held = ctx.open_socket().expect("socket");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let report = futures::executor::block_on(ctx.clone().shutdown());
-        assert_eq!(report.outstanding(), 1);
-        assert!(ctx.is_closed());
-        assert!(matches!(ctx.open_socket(), Err(Error::ECLOSED(_))));
-        assert!(held.context_is_closed());
+        /// Claim: shutdown is bounded. A socket held past the budget does not
+        /// hang the close; it comes back as a count, and the context admits
+        /// nothing new afterwards.
+        #[test]
+        fn shutdown_is_bounded_and_reports_what_it_could_not_close() {
+            let ctx = Context::owned(ContextConfig {
+                close_budget: Duration::from_millis(20),
+                ..ContextConfig::default()
+            })
+            .expect("context");
+            let held = ctx.open_socket().expect("socket");
 
-        drop(held);
-        let report = futures::executor::block_on(ctx.shutdown());
-        assert_eq!(report.outstanding(), 0);
+            let report = futures::executor::block_on(ctx.clone().shutdown());
+            assert_eq!(report.outstanding(), 1);
+            assert!(ctx.is_closed());
+            assert!(matches!(ctx.open_socket(), Err(Error::ECLOSED(_))));
+            assert!(held.context_is_closed());
+
+            drop(held);
+            let report = futures::executor::block_on(ctx.shutdown());
+            assert_eq!(report.outstanding(), 0);
+        }
     }
 }

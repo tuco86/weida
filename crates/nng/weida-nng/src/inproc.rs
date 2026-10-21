@@ -231,7 +231,7 @@ mod tests {
 
     /// Claim: a dial that arrives before the bind waits for it rather than
     /// failing, which is what NNG's retrying dialer amounts to.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_dial_before_the_bind_waits() {
         let inproc = namespace();
         let waiting = {

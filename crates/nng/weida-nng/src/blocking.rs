@@ -491,60 +491,65 @@ impl SubSocket {
 mod tests {
     use super::*;
 
-    /// Claim: the whole of a REQ/REP exchange runs with no reactor in the
-    /// caller's thread and no `async` anywhere in the program.
-    #[test]
-    fn a_request_and_its_reply_need_no_executor() {
-        let context = BlockingContext::new().expect("context");
-        let options = SocketOptions {
-            recv_timeout: Some(std::time::Duration::from_secs(5)),
-            send_timeout: Some(std::time::Duration::from_secs(5)),
-            ..SocketOptions::default()
-        };
-        let server = RepSocket::with_options(&context, options.clone()).expect("rep");
-        let url = server
-            .listen("tcp://127.0.0.1:0")
-            .expect("listen")
-            .url()
-            .to_string();
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let answering = std::thread::spawn(move || {
-            let request = server.recv().expect("a request");
-            server.send(b"pong".to_vec()).expect("the reply");
-            request.into_body().to_vec()
-        });
+        /// Claim: the whole of a REQ/REP exchange runs with no reactor in the
+        /// caller's thread and no `async` anywhere in the program.
+        #[test]
+        fn a_request_and_its_reply_need_no_executor() {
+            let context = BlockingContext::new().expect("context");
+            let options = SocketOptions {
+                recv_timeout: Some(std::time::Duration::from_secs(5)),
+                send_timeout: Some(std::time::Duration::from_secs(5)),
+                ..SocketOptions::default()
+            };
+            let server = RepSocket::with_options(&context, options.clone()).expect("rep");
+            let url = server
+                .listen("tcp://127.0.0.1:0")
+                .expect("listen")
+                .url()
+                .to_string();
 
-        let client = ReqSocket::with_options(&context, options).expect("req");
-        client.dial(&url).expect("dial");
-        client.send(b"ping".to_vec()).expect("send");
-        assert_eq!(client.recv().expect("recv").body(), b"pong");
-        assert_eq!(answering.join().expect("thread"), b"ping");
-    }
+            let answering = std::thread::spawn(move || {
+                let request = server.recv().expect("a request");
+                server.send(b"pong".to_vec()).expect("the reply");
+                request.into_body().to_vec()
+            });
 
-    /// Claim: a stalled exchange is an error, not a hang. The timeouts are
-    /// the socket's own options, honoured by the asynchronous socket this
-    /// facade drives.
-    #[test]
-    fn a_stalled_exchange_times_out_rather_than_parking_the_thread() {
-        let context = BlockingContext::new().expect("context");
-        let options = SocketOptions {
-            recv_timeout: Some(std::time::Duration::from_millis(100)),
-            send_timeout: Some(std::time::Duration::from_millis(100)),
-            ..SocketOptions::default()
-        };
-        let puller = PullSocket::with_options(&context, options.clone()).expect("pull");
-        puller.listen("tcp://127.0.0.1:0").expect("listen");
+            let client = ReqSocket::with_options(&context, options).expect("req");
+            client.dial(&url).expect("dial");
+            client.send(b"ping".to_vec()).expect("send");
+            assert_eq!(client.recv().expect("recv").body(), b"pong");
+            assert_eq!(answering.join().expect("thread"), b"ping");
+        }
+        /// Claim: a stalled exchange is an error, not a hang. The timeouts are
+        /// the socket's own options, honoured by the asynchronous socket this
+        /// facade drives.
+        #[test]
+        fn a_stalled_exchange_times_out_rather_than_parking_the_thread() {
+            let context = BlockingContext::new().expect("context");
+            let options = SocketOptions {
+                recv_timeout: Some(std::time::Duration::from_millis(100)),
+                send_timeout: Some(std::time::Duration::from_millis(100)),
+                ..SocketOptions::default()
+            };
+            let puller = PullSocket::with_options(&context, options.clone()).expect("pull");
+            puller.listen("tcp://127.0.0.1:0").expect("listen");
 
-        let started = std::time::Instant::now();
-        let error = puller.recv().unwrap_err();
-        assert!(matches!(error, crate::Error::ETIMEDOUT(_)), "{error:?}");
+            let started = std::time::Instant::now();
+            let error = puller.recv().unwrap_err();
+            assert!(matches!(error, crate::Error::ETIMEDOUT(_)), "{error:?}");
 
-        let pusher = PushSocket::with_options(&context, options).expect("push");
-        let error = pusher.send(b"nowhere".to_vec()).unwrap_err();
-        assert!(matches!(error, crate::Error::ETIMEDOUT(_)), "{error:?}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "both returned at their own deadline"
-        );
+            let pusher = PushSocket::with_options(&context, options).expect("push");
+            let error = pusher.send(b"nowhere".to_vec()).unwrap_err();
+            assert!(matches!(error, crate::Error::ETIMEDOUT(_)), "{error:?}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "both returned at their own deadline"
+            );
+        }
     }
 }

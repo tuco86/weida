@@ -107,58 +107,6 @@ mod tests {
         path
     }
 
-    /// Claim: the bind sets `0600` explicitly rather than inheriting
-    /// whatever `umask` allowed, and removes the node when the binding
-    /// drops — the two halves of the hygiene a caller can see from
-    /// outside.
-    #[tokio::test]
-    async fn a_bound_endpoint_is_private_and_leaves_nothing_behind() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = temp_path("mode");
-        let binding = IpcBinding::bind(&path).expect("bind");
-        let mode = std::fs::metadata(&path)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "the mode is set after the bind, not inherited");
-        drop(binding);
-        assert!(
-            !path.exists(),
-            "the node is removed with the binding, so the next bind is not a stale-file race"
-        );
-    }
-
-    /// Claim: a path occupied by something that is not a socket is refused
-    /// rather than unlinked — removing it would delete a caller's data.
-    #[tokio::test]
-    async fn a_path_that_is_not_a_socket_is_refused() {
-        let path = temp_path("file");
-        std::fs::write(&path, b"not a socket").expect("write");
-        let err = IpcBinding::bind(&path).unwrap_err();
-        assert!(matches!(err, Error::EADDRINVAL(_)), "{err:?}");
-        assert!(path.exists(), "and it is still there");
-        std::fs::remove_file(&path).expect("cleanup");
-    }
-
-    /// Claim: the kernel's credentials reach the accepting side, and they
-    /// are this process's own when this process is the peer.
-    #[tokio::test]
-    async fn the_kernel_names_the_peer() {
-        let path = temp_path("creds");
-        let binding = IpcBinding::bind(&path).expect("bind");
-        let dialling = {
-            let path = path.clone();
-            tokio::spawn(async move { dial(&path).await })
-        };
-        let (_stream, principal) = binding.accept().await.expect("accept");
-        dialling.await.expect("task").expect("dial");
-
-        assert_eq!(principal.uid, unsafe_free_uid());
-        assert_eq!(principal.pid, Some(std::process::id()));
-    }
-
     /// This process's uid, without `unsafe`: the owner of a file it just
     /// created is itself.
     fn unsafe_free_uid() -> u32 {
@@ -168,5 +116,61 @@ mod tests {
         let uid = std::fs::metadata(&path).expect("metadata").uid();
         std::fs::remove_file(&path).expect("cleanup");
         uid
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Claim: the bind sets `0600` explicitly rather than inheriting
+        /// whatever `umask` allowed, and removes the node when the binding
+        /// drops — the two halves of the hygiene a caller can see from
+        /// outside.
+        #[tokio::test]
+        async fn a_bound_endpoint_is_private_and_leaves_nothing_behind() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = temp_path("mode");
+            let binding = IpcBinding::bind(&path).expect("bind");
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the mode is set after the bind, not inherited");
+            drop(binding);
+            assert!(
+                !path.exists(),
+                "the node is removed with the binding, so the next bind is not a stale-file race"
+            );
+        }
+        /// Claim: a path occupied by something that is not a socket is refused
+        /// rather than unlinked — removing it would delete a caller's data.
+        #[tokio::test]
+        async fn a_path_that_is_not_a_socket_is_refused() {
+            let path = temp_path("file");
+            std::fs::write(&path, b"not a socket").expect("write");
+            let err = IpcBinding::bind(&path).unwrap_err();
+            assert!(matches!(err, Error::EADDRINVAL(_)), "{err:?}");
+            assert!(path.exists(), "and it is still there");
+            std::fs::remove_file(&path).expect("cleanup");
+        }
+        /// Claim: the kernel's credentials reach the accepting side, and they
+        /// are this process's own when this process is the peer.
+        #[tokio::test]
+        async fn the_kernel_names_the_peer() {
+            let path = temp_path("creds");
+            let binding = IpcBinding::bind(&path).expect("bind");
+            let dialling = {
+                let path = path.clone();
+                tokio::spawn(async move { dial(&path).await })
+            };
+            let (_stream, principal) = binding.accept().await.expect("accept");
+            dialling.await.expect("task").expect("dial");
+
+            assert_eq!(principal.uid, unsafe_free_uid());
+            assert_eq!(principal.pid, Some(std::process::id()));
+        }
     }
 }

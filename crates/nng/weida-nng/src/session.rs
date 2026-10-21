@@ -415,214 +415,6 @@ mod tests {
         (stream, url)
     }
 
-    /// Claim: this side sends its eight octets **immediately** — before the
-    /// peer has said anything at all — and they are exactly the header the
-    /// codec's golden vectors pin for that protocol.
-    #[tokio::test]
-    async fn the_protocol_header_goes_out_before_anything_arrives() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        for (protocol, expected) in [
-            (EndpointType::Req, [0x00, 0x53, 0x50, 0, 0x00, 0x30, 0, 0]),
-            (EndpointType::Pub, [0x00, 0x53, 0x50, 0, 0x00, 0x20, 0, 0]),
-            (EndpointType::Bus, [0x00, 0x53, 0x50, 0, 0x00, 0x70, 0, 0]),
-        ] {
-            let engine = socket(&ctx, protocol);
-            let (mut peer, _) = raw_peer(&engine).await;
-
-            let mut theirs = [0u8; HEADER_LEN];
-            peer.read_exact(&mut theirs)
-                .await
-                .expect("the header arrives without us sending one");
-            assert_eq!(theirs, expected, "{protocol:?} put the wrong octets out");
-            engine.close();
-        }
-    }
-
-    /// Claim: a peer whose endpoint type may not pair with ours is
-    /// disconnected **before any traffic**, and the disconnection is the
-    /// whole error report — no reply, no reason code, nothing after the
-    /// eight octets we had already sent.
-    #[tokio::test]
-    async fn a_mispaired_peer_is_disconnected_and_told_nothing() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let engine = socket(&ctx, EndpointType::Req);
-        let (mut peer, _) = raw_peer(&engine).await;
-
-        let mut ours = [0u8; HEADER_LEN];
-        peer.read_exact(&mut ours).await.expect("their header");
-
-        // A PUSH where a REP belongs.
-        peer.write_all(&ProtocolHeader::new(EndpointType::Push).encode())
-            .await
-            .expect("write");
-
-        let mut after = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
-            .await
-            .expect("the connection is closed rather than left hanging")
-            .expect("read to end");
-        assert_eq!(read, 0, "a refusal sent {after:?} instead of nothing");
-        assert!(engine.pipes().is_empty(), "no pipe from a mispaired peer");
-    }
-
-    /// Claim: every rule the mapping states about the header closes the
-    /// connection, and closing is all that happens — bad magic, bad version
-    /// and a nonzero reserved field alike.
-    #[tokio::test]
-    async fn a_malformed_header_closes_the_connection_and_nothing_else() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let good = ProtocolHeader::new(EndpointType::Rep).encode();
-        let mut magic = good;
-        magic[2] = 0x51;
-        let mut version = good;
-        version[3] = 1;
-        let mut reserved = good;
-        reserved[7] = 1;
-
-        for bad in [magic, version, reserved] {
-            let engine = socket(&ctx, EndpointType::Req);
-            let (mut peer, _) = raw_peer(&engine).await;
-            let mut ours = [0u8; HEADER_LEN];
-            peer.read_exact(&mut ours).await.expect("their header");
-            peer.write_all(&bad).await.expect("write");
-
-            let mut after = Vec::new();
-            let read = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
-                .await
-                .expect("closed rather than hanging")
-                .expect("read to end");
-            assert_eq!(read, 0, "{bad:02x?} was answered with {after:02x?}");
-            assert!(engine.pipes().is_empty());
-            engine.close();
-        }
-    }
-
-    /// Claim: what a message looks like on the wire is the codec's 64-bit
-    /// framing and nothing else — a big-endian length and exactly that many
-    /// octets, with no tag, flag or continuation bit anywhere.
-    #[tokio::test]
-    async fn a_message_on_the_wire_is_a_length_and_a_body() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let engine = socket(&ctx, EndpointType::Bus);
-        let (mut peer, _) = raw_peer(&engine).await;
-
-        let mut ours = [0u8; HEADER_LEN];
-        peer.read_exact(&mut ours).await.expect("their header");
-        peer.write_all(&ProtocolHeader::new(EndpointType::Bus).encode())
-            .await
-            .expect("write");
-
-        // Wait for the pipe to be admitted, then send through it.
-        let pipe = loop {
-            if let Some(pipe) = engine.pipes().first().cloned() {
-                break pipe;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        pipe.outgoing()
-            .send(Message::from_body(b"hello".to_vec()))
-            .await
-            .expect("queued");
-
-        let mut wire = [0u8; 13];
-        peer.read_exact(&mut wire)
-            .await
-            .expect("the framed message");
-        assert_eq!(wire, *b"\x00\x00\x00\x00\x00\x00\x00\x05hello");
-
-        // And the other direction, including the empty message, which is
-        // eight zero octets and nothing after them.
-        peer.write_all(b"\x00\x00\x00\x00\x00\x00\x00\x03abc")
-            .await
-            .expect("write");
-        peer.write_all(&[0u8; 8]).await.expect("write empty");
-        let first = pipe.incoming().recv().await.expect("delivered");
-        assert_eq!(first.body(), b"abc");
-        assert!(first.header().is_empty(), "the session claims no header");
-        let second = pipe.incoming().recv().await.expect("delivered");
-        assert!(second.body().is_empty());
-    }
-
-    /// Claim: two sockets of this library exchange messages over the
-    /// engine's pipes, in both directions, with the framing above.
-    #[tokio::test]
-    async fn two_sockets_of_this_library_talk_to_each_other() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let server = socket(&ctx, EndpointType::Rep);
-        let client = socket(&ctx, EndpointType::Req);
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-        client.dial(listener.url()).await.expect("dial");
-
-        let out = client.pipes().first().cloned().expect("a pipe");
-        out.outgoing()
-            .send(Message::from_body(b"ping".to_vec()))
-            .await
-            .expect("queued");
-
-        let inbound = loop {
-            if let Some(pipe) = server.pipes().first().cloned() {
-                break pipe;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        let request = inbound.incoming().recv().await.expect("arrived");
-        assert_eq!(request.body(), b"ping");
-
-        inbound
-            .outgoing()
-            .send(Message::from_body(b"pong".to_vec()))
-            .await
-            .expect("queued");
-        let reply = out.incoming().recv().await.expect("arrived");
-        assert_eq!(reply.body(), b"pong");
-    }
-
-    /// Claim: `NNG_OPT_RECVMAXSZ` is enforced on the connection from the
-    /// declared length alone — a peer that declares 2^64-1 octets and sends
-    /// none of them loses its pipe rather than our memory.
-    #[tokio::test]
-    async fn an_oversized_declaration_ends_the_pipe_before_it_is_believed() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let engine = Engine::new(
-            &ctx,
-            EndpointType::Bus,
-            SocketOptions {
-                recv_max_size: 64,
-                handshake_timeout: Duration::from_millis(500),
-                ..SocketOptions::default()
-            },
-            SpSession::shared(),
-        )
-        .expect("engine");
-        let (mut peer, _) = raw_peer(&engine).await;
-        let mut ours = [0u8; HEADER_LEN];
-        peer.read_exact(&mut ours).await.expect("their header");
-        peer.write_all(&ProtocolHeader::new(EndpointType::Bus).encode())
-            .await
-            .expect("write");
-        while engine.pipes().is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        peer.write_all(&[0xFFu8; 8]).await.expect("a huge claim");
-        let mut after = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
-            .await
-            .expect("the pipe is closed rather than left waiting for 2^64 octets")
-            .expect("read to end");
-        assert_eq!(read, 0);
-        for _ in 0..200 {
-            if engine.pipes().is_empty() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("the pipe survived a declaration it could never satisfy");
-    }
-
     /// A socket of `protocol` under `options`, with a handshake deadline
     /// short enough for a test.
     fn socket_under(context: &Context, protocol: EndpointType, options: SocketOptions) -> Engine {
@@ -714,138 +506,345 @@ mod tests {
         }
     }
 
-    /// Claim: a message that is declared and then trickled closes the pipe
-    /// after `message_timeout`, and a connection that is merely quiet does
-    /// not. The first holds a pipe slot and every octet it sent for as long
-    /// as its peer likes; the second is what every PUB/SUB pipe between two
-    /// rare publications is.
-    #[tokio::test]
-    async fn a_message_that_trickles_closes_the_pipe_and_a_quiet_connection_does_not() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let timeout = Duration::from_millis(300);
-        let engine = socket_under(
-            &ctx,
-            EndpointType::Bus,
-            SocketOptions {
-                message_timeout: Some(timeout),
-                ..SocketOptions::default()
-            },
-        );
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let mut quiet = handshaken_peer(&engine, EndpointType::Bus).await;
-        tokio::time::sleep(timeout * 3).await;
-        assert_eq!(
-            engine.pipes().len(),
-            1,
-            "silence between messages is not slowness"
-        );
-        quiet
-            .write_all(&Message::from_body(b"still here".to_vec()).encode())
-            .await
-            .expect("write");
-        let pipe = engine.pipes().first().cloned().expect("pipe");
-        let message = tokio::time::timeout(Duration::from_secs(2), pipe.incoming().recv())
-            .await
-            .expect("delivered")
-            .expect("a message");
-        assert_eq!(message.body(), b"still here");
+        /// Claim: this side sends its eight octets **immediately** — before the
+        /// peer has said anything at all — and they are exactly the header the
+        /// codec's golden vectors pin for that protocol.
+        #[tokio::test]
+        async fn the_protocol_header_goes_out_before_anything_arrives() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            for (protocol, expected) in [
+                (EndpointType::Req, [0x00, 0x53, 0x50, 0, 0x00, 0x30, 0, 0]),
+                (EndpointType::Pub, [0x00, 0x53, 0x50, 0, 0x00, 0x20, 0, 0]),
+                (EndpointType::Bus, [0x00, 0x53, 0x50, 0, 0x00, 0x70, 0, 0]),
+            ] {
+                let engine = socket(&ctx, protocol);
+                let (mut peer, _) = raw_peer(&engine).await;
 
-        // A kilobyte declared, ten octets sent, then nothing.
-        let started = std::time::Instant::now();
-        quiet.write_all(&1024u64.to_be_bytes()).await.expect("size");
-        quiet.write_all(&[1u8; 10]).await.expect("a few octets");
-        let mut after = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(3), quiet.read_to_end(&mut after))
-            .await
-            .expect("the pipe is closed rather than held for a message that never finishes")
-            .expect("read to end");
-        assert_eq!(read, 0);
-        assert!(
-            started.elapsed() >= timeout / 2,
-            "closed after {:?}, before the deadline",
-            started.elapsed()
-        );
-    }
+                let mut theirs = [0u8; HEADER_LEN];
+                peer.read_exact(&mut theirs)
+                    .await
+                    .expect("the header arrives without us sending one");
+                assert_eq!(theirs, expected, "{protocol:?} put the wrong octets out");
+                engine.close();
+            }
+        }
+        /// Claim: a peer whose endpoint type may not pair with ours is
+        /// disconnected **before any traffic**, and the disconnection is the
+        /// whole error report — no reply, no reason code, nothing after the
+        /// eight octets we had already sent.
+        #[tokio::test]
+        async fn a_mispaired_peer_is_disconnected_and_told_nothing() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let engine = socket(&ctx, EndpointType::Req);
+            let (mut peer, _) = raw_peer(&engine).await;
 
-    /// Claim: a pipe with no octet moving in either direction is closed
-    /// after `idle_timeout`, and one that is only being written to is not —
-    /// a PUB's pipe carries nothing inbound for its whole life.
-    #[tokio::test]
-    async fn an_idle_pipe_is_closed_and_one_being_written_to_is_not() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let idle = Duration::from_millis(300);
-        let options = SocketOptions {
-            idle_timeout: Some(idle),
-            ..SocketOptions::default()
-        };
+            let mut ours = [0u8; HEADER_LEN];
+            peer.read_exact(&mut ours).await.expect("their header");
 
-        let engine = socket_under(&ctx, EndpointType::Bus, options.clone());
-        let mut silent = handshaken_peer(&engine, EndpointType::Bus).await;
-        let mut after = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(3), silent.read_to_end(&mut after))
-            .await
-            .expect("an idle pipe is closed")
-            .expect("read to end");
-        assert_eq!(read, 0);
+            // A PUSH where a REP belongs.
+            peer.write_all(&ProtocolHeader::new(EndpointType::Push).encode())
+                .await
+                .expect("write");
 
-        let engine = socket_under(&ctx, EndpointType::Bus, options);
-        let mut listening = handshaken_peer(&engine, EndpointType::Bus).await;
-        let pipe = engine.pipes().first().cloned().expect("pipe");
-        let drain = tokio::spawn(async move {
-            let mut scratch = [0u8; 256];
-            while matches!(listening.read(&mut scratch).await, Ok(n) if n > 0) {}
-        });
-        for _ in 0..12 {
+            let mut after = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
+                .await
+                .expect("the connection is closed rather than left hanging")
+                .expect("read to end");
+            assert_eq!(read, 0, "a refusal sent {after:?} instead of nothing");
+            assert!(engine.pipes().is_empty(), "no pipe from a mispaired peer");
+        }
+        /// Claim: every rule the mapping states about the header closes the
+        /// connection, and closing is all that happens — bad magic, bad version
+        /// and a nonzero reserved field alike.
+        #[tokio::test]
+        async fn a_malformed_header_closes_the_connection_and_nothing_else() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let good = ProtocolHeader::new(EndpointType::Rep).encode();
+            let mut magic = good;
+            magic[2] = 0x51;
+            let mut version = good;
+            version[3] = 1;
+            let mut reserved = good;
+            reserved[7] = 1;
+
+            for bad in [magic, version, reserved] {
+                let engine = socket(&ctx, EndpointType::Req);
+                let (mut peer, _) = raw_peer(&engine).await;
+                let mut ours = [0u8; HEADER_LEN];
+                peer.read_exact(&mut ours).await.expect("their header");
+                peer.write_all(&bad).await.expect("write");
+
+                let mut after = Vec::new();
+                let read =
+                    tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
+                        .await
+                        .expect("closed rather than hanging")
+                        .expect("read to end");
+                assert_eq!(read, 0, "{bad:02x?} was answered with {after:02x?}");
+                assert!(engine.pipes().is_empty());
+                engine.close();
+            }
+        }
+        /// Claim: what a message looks like on the wire is the codec's 64-bit
+        /// framing and nothing else — a big-endian length and exactly that many
+        /// octets, with no tag, flag or continuation bit anywhere.
+        #[tokio::test]
+        async fn a_message_on_the_wire_is_a_length_and_a_body() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let engine = socket(&ctx, EndpointType::Bus);
+            let (mut peer, _) = raw_peer(&engine).await;
+
+            let mut ours = [0u8; HEADER_LEN];
+            peer.read_exact(&mut ours).await.expect("their header");
+            peer.write_all(&ProtocolHeader::new(EndpointType::Bus).encode())
+                .await
+                .expect("write");
+
+            // Wait for the pipe to be admitted, then send through it.
+            let pipe = loop {
+                if let Some(pipe) = engine.pipes().first().cloned() {
+                    break pipe;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
             pipe.outgoing()
-                .send(Message::from_body(b"tick".to_vec()))
+                .send(Message::from_body(b"hello".to_vec()))
                 .await
                 .expect("queued");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(
-            engine.pipes().len(),
-            1,
-            "a pipe that is being written to is not idle"
-        );
-        drain.abort();
-    }
 
-    /// Claim: a protocol with no receive operation holds nothing a peer
-    /// writes to it. A SUB-typed peer that streams data at a PUB fills no
-    /// queue, and the socket keeps nothing of it once the peer has gone: the
-    /// octets are read and thrown away as they arrive.
-    #[tokio::test]
-    async fn a_protocol_with_no_receive_operation_discards_what_a_peer_writes_to_it() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let engine = socket(&ctx, EndpointType::Pub);
-        let mut peer = handshaken_peer(&engine, EndpointType::Sub).await;
-        let pipe = engine.pipes().first().cloned().expect("pipe");
-
-        let wire = Message::from_body(vec![1u8; 1024 * 1024]).encode();
-        for _ in 0..20 {
-            tokio::time::timeout(Duration::from_secs(5), peer.write_all(&wire))
+            let mut wire = [0u8; 13];
+            peer.read_exact(&mut wire)
                 .await
-                .expect("the PUB keeps reading")
-                .expect("write");
-        }
-        assert_eq!(
-            pipe.incoming().queued_bytes(),
-            0,
-            "nothing is queued for nobody"
-        );
-        assert!(pipe.incoming().is_empty());
+                .expect("the framed message");
+            assert_eq!(wire, *b"\x00\x00\x00\x00\x00\x00\x00\x05hello");
 
-        drop(peer);
-        for _ in 0..400 {
-            if engine.pipes().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // And the other direction, including the empty message, which is
+            // eight zero octets and nothing after them.
+            peer.write_all(b"\x00\x00\x00\x00\x00\x00\x00\x03abc")
+                .await
+                .expect("write");
+            peer.write_all(&[0u8; 8]).await.expect("write empty");
+            let first = pipe.incoming().recv().await.expect("delivered");
+            assert_eq!(first.body(), b"abc");
+            assert!(first.header().is_empty(), "the session claims no header");
+            let second = pipe.incoming().recv().await.expect("delivered");
+            assert!(second.body().is_empty());
         }
-        assert!(engine.pipes().is_empty(), "the pipe went with its peer");
-        assert!(
-            !engine.has_arrived(),
-            "nothing the peer wrote is left in the socket"
-        );
+        /// Claim: two sockets of this library exchange messages over the
+        /// engine's pipes, in both directions, with the framing above.
+        #[tokio::test]
+        async fn two_sockets_of_this_library_talk_to_each_other() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let server = socket(&ctx, EndpointType::Rep);
+            let client = socket(&ctx, EndpointType::Req);
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+            client.dial(listener.url()).await.expect("dial");
+
+            let out = client.pipes().first().cloned().expect("a pipe");
+            out.outgoing()
+                .send(Message::from_body(b"ping".to_vec()))
+                .await
+                .expect("queued");
+
+            let inbound = loop {
+                if let Some(pipe) = server.pipes().first().cloned() {
+                    break pipe;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            let request = inbound.incoming().recv().await.expect("arrived");
+            assert_eq!(request.body(), b"ping");
+
+            inbound
+                .outgoing()
+                .send(Message::from_body(b"pong".to_vec()))
+                .await
+                .expect("queued");
+            let reply = out.incoming().recv().await.expect("arrived");
+            assert_eq!(reply.body(), b"pong");
+        }
+        /// Claim: `NNG_OPT_RECVMAXSZ` is enforced on the connection from the
+        /// declared length alone — a peer that declares 2^64-1 octets and sends
+        /// none of them loses its pipe rather than our memory.
+        #[tokio::test]
+        async fn an_oversized_declaration_ends_the_pipe_before_it_is_believed() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let engine = Engine::new(
+                &ctx,
+                EndpointType::Bus,
+                SocketOptions {
+                    recv_max_size: 64,
+                    handshake_timeout: Duration::from_millis(500),
+                    ..SocketOptions::default()
+                },
+                SpSession::shared(),
+            )
+            .expect("engine");
+            let (mut peer, _) = raw_peer(&engine).await;
+            let mut ours = [0u8; HEADER_LEN];
+            peer.read_exact(&mut ours).await.expect("their header");
+            peer.write_all(&ProtocolHeader::new(EndpointType::Bus).encode())
+                .await
+                .expect("write");
+            while engine.pipes().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            peer.write_all(&[0xFFu8; 8]).await.expect("a huge claim");
+            let mut after = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
+                .await
+                .expect("the pipe is closed rather than left waiting for 2^64 octets")
+                .expect("read to end");
+            assert_eq!(read, 0);
+            for _ in 0..200 {
+                if engine.pipes().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("the pipe survived a declaration it could never satisfy");
+        }
+        /// Claim: a message that is declared and then trickled closes the pipe
+        /// after `message_timeout`, and a connection that is merely quiet does
+        /// not. The first holds a pipe slot and every octet it sent for as long
+        /// as its peer likes; the second is what every PUB/SUB pipe between two
+        /// rare publications is.
+        #[tokio::test]
+        async fn a_message_that_trickles_closes_the_pipe_and_a_quiet_connection_does_not() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let timeout = Duration::from_millis(300);
+            let engine = socket_under(
+                &ctx,
+                EndpointType::Bus,
+                SocketOptions {
+                    message_timeout: Some(timeout),
+                    ..SocketOptions::default()
+                },
+            );
+
+            let mut quiet = handshaken_peer(&engine, EndpointType::Bus).await;
+            tokio::time::sleep(timeout * 3).await;
+            assert_eq!(
+                engine.pipes().len(),
+                1,
+                "silence between messages is not slowness"
+            );
+            quiet
+                .write_all(&Message::from_body(b"still here".to_vec()).encode())
+                .await
+                .expect("write");
+            let pipe = engine.pipes().first().cloned().expect("pipe");
+            let message = tokio::time::timeout(Duration::from_secs(2), pipe.incoming().recv())
+                .await
+                .expect("delivered")
+                .expect("a message");
+            assert_eq!(message.body(), b"still here");
+
+            // A kilobyte declared, ten octets sent, then nothing.
+            let started = std::time::Instant::now();
+            quiet.write_all(&1024u64.to_be_bytes()).await.expect("size");
+            quiet.write_all(&[1u8; 10]).await.expect("a few octets");
+            let mut after = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(3), quiet.read_to_end(&mut after))
+                .await
+                .expect("the pipe is closed rather than held for a message that never finishes")
+                .expect("read to end");
+            assert_eq!(read, 0);
+            assert!(
+                started.elapsed() >= timeout / 2,
+                "closed after {:?}, before the deadline",
+                started.elapsed()
+            );
+        }
+        /// Claim: a pipe with no octet moving in either direction is closed
+        /// after `idle_timeout`, and one that is only being written to is not —
+        /// a PUB's pipe carries nothing inbound for its whole life.
+        #[tokio::test]
+        async fn an_idle_pipe_is_closed_and_one_being_written_to_is_not() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let idle = Duration::from_millis(300);
+            let options = SocketOptions {
+                idle_timeout: Some(idle),
+                ..SocketOptions::default()
+            };
+
+            let engine = socket_under(&ctx, EndpointType::Bus, options.clone());
+            let mut silent = handshaken_peer(&engine, EndpointType::Bus).await;
+            let mut after = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(3), silent.read_to_end(&mut after))
+                .await
+                .expect("an idle pipe is closed")
+                .expect("read to end");
+            assert_eq!(read, 0);
+
+            let engine = socket_under(&ctx, EndpointType::Bus, options);
+            let mut listening = handshaken_peer(&engine, EndpointType::Bus).await;
+            let pipe = engine.pipes().first().cloned().expect("pipe");
+            let drain = tokio::spawn(async move {
+                let mut scratch = [0u8; 256];
+                while matches!(listening.read(&mut scratch).await, Ok(n) if n > 0) {}
+            });
+            for _ in 0..12 {
+                pipe.outgoing()
+                    .send(Message::from_body(b"tick".to_vec()))
+                    .await
+                    .expect("queued");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                engine.pipes().len(),
+                1,
+                "a pipe that is being written to is not idle"
+            );
+            drain.abort();
+        }
+        /// Claim: a protocol with no receive operation holds nothing a peer
+        /// writes to it. A SUB-typed peer that streams data at a PUB fills no
+        /// queue, and the socket keeps nothing of it once the peer has gone: the
+        /// octets are read and thrown away as they arrive.
+        #[tokio::test]
+        async fn a_protocol_with_no_receive_operation_discards_what_a_peer_writes_to_it() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let engine = socket(&ctx, EndpointType::Pub);
+            let mut peer = handshaken_peer(&engine, EndpointType::Sub).await;
+            let pipe = engine.pipes().first().cloned().expect("pipe");
+
+            let wire = Message::from_body(vec![1u8; 1024 * 1024]).encode();
+            for _ in 0..20 {
+                tokio::time::timeout(Duration::from_secs(5), peer.write_all(&wire))
+                    .await
+                    .expect("the PUB keeps reading")
+                    .expect("write");
+            }
+            assert_eq!(
+                pipe.incoming().queued_bytes(),
+                0,
+                "nothing is queued for nobody"
+            );
+            assert!(pipe.incoming().is_empty());
+
+            drop(peer);
+            for _ in 0..400 {
+                if engine.pipes().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(engine.pipes().is_empty(), "the pipe went with its peer");
+            assert!(
+                !engine.has_arrived(),
+                "nothing the peer wrote is left in the socket"
+            );
+        }
     }
 }

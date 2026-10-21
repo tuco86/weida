@@ -1999,315 +1999,6 @@ mod tests {
         Arc::new(AtomicUsize::new(0))
     }
 
-    /// Claim: a listener accepts automatically, a dial creates one pipe per
-    /// connection on both sides, and the endpoint objects carry the URL
-    /// actually used — including the port behind a wildcard.
-    #[tokio::test]
-    async fn a_dial_and_a_listen_make_one_pipe_each() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
-        let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
-
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-        assert!(!listener.url().has_wildcard_port(), "the port is knowable");
-
-        let dialer = client.dial(listener.url()).await.expect("dial");
-        assert_eq!(dialer.url(), listener.url());
-
-        assert_eq!(client.pipes().len(), 1);
-        let infos = client.pipe_infos();
-        assert_eq!(infos[0].role, Role::Dial);
-        assert_eq!(infos[0].peer, Some(EndpointType::Rep));
-        assert!(infos[0].remote_addr.is_some());
-
-        // The server side is admitted too, once its own handshake finishes.
-        for _ in 0..100 {
-            if server.pipes().len() == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(server.pipes().len(), 1);
-        assert_eq!(server.pipe_infos()[0].role, Role::Listen);
-    }
-
-    /// Claim: the synchronous dial returns only once the peer's protocol
-    /// header has arrived — not when the TCP connection is established.
-    /// A listener that accepts and says nothing is the difference.
-    #[tokio::test]
-    async fn a_synchronous_dial_waits_for_the_peers_header() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a raw listener");
-        let port = silent.local_addr().unwrap().port();
-        let held = tokio::spawn(async move {
-            // Accept and never answer, which is what a peer stuck in its own
-            // dial looks like.
-            let (stream, _) = silent.accept().await.expect("accept");
-            std::future::pending::<()>().await;
-            drop(stream);
-        });
-
-        let seen = counter();
-        let client = engine(
-            &ctx,
-            EndpointType::Req,
-            SocketOptions {
-                handshake_timeout: Duration::from_millis(200),
-                ..SocketOptions::default()
-            },
-            &seen,
-        );
-        let url = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap();
-        let error = client.dial(&url).await.unwrap_err();
-        assert!(matches!(error, Error::ETIMEDOUT(_)), "{error:?}");
-        assert_eq!(seen.load(Ordering::SeqCst), 0, "no handshake completed");
-        assert!(client.pipes().is_empty(), "no pipe without a handshake");
-        held.abort();
-    }
-
-    /// Claim: a refused first synchronous dial is reported and starts no
-    /// retry — NNG's own rule — while the non-blocking form returns at once
-    /// and keeps trying until the peer appears.
-    #[tokio::test]
-    async fn the_two_dial_forms_differ_in_exactly_one_thing() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let client = engine(
-            &ctx,
-            EndpointType::Req,
-            SocketOptions {
-                reconnect_min: Duration::from_millis(5),
-                ..SocketOptions::default()
-            },
-            &seen,
-        );
-
-        // A port nobody is on. Bound and dropped, so it is free and refusing.
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a port");
-        let port = dead.local_addr().unwrap().port();
-        drop(dead);
-        let url = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap();
-
-        let error = client.dial(&url).await.unwrap_err();
-        assert!(
-            matches!(error, Error::ECONNREFUSED(_) | Error::EUNREACHABLE(_)),
-            "{error:?}"
-        );
-        assert!(
-            client.lock().dialers.is_empty(),
-            "a refused synchronous dial leaves no dialer behind"
-        );
-
-        // The non-blocking form returns before anything has connected, and
-        // the pipe appears once somebody listens on that address.
-        let dialer = client.dial_nonblocking(&url).expect("nonblocking dial");
-        assert!(client.pipes().is_empty());
-
-        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
-        server
-            .listen(&Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap())
-            .await
-            .expect("listen");
-        for _ in 0..200 {
-            if client.pipes().len() == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(client.pipes().len(), 1, "the retry found the peer");
-        dialer.close();
-    }
-
-    /// Claim: a dialer redials after its pipe closes, which is the rule that
-    /// applies to both dial forms once a pipe has existed.
-    #[tokio::test]
-    async fn a_dialer_redials_after_its_pipe_closes() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
-        let client = engine(
-            &ctx,
-            EndpointType::Req,
-            SocketOptions {
-                reconnect_min: Duration::from_millis(5),
-                ..SocketOptions::default()
-            },
-            &seen,
-        );
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-        client.dial(listener.url()).await.expect("dial");
-        let first = client.pipe_infos()[0].id;
-
-        client.close_pipe(first);
-        for _ in 0..200 {
-            let pipes = client.pipe_infos();
-            if pipes.len() == 1 && pipes[0].id != first {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("the dialer did not redial");
-    }
-
-    /// Claim: all three pipe events reach the callback in order, and the
-    /// callback's refusal at `ADD_PRE` keeps the pipe out of the socket —
-    /// which is the hook local authorization runs in (§10).
-    #[tokio::test]
-    async fn pipe_events_reach_the_callback_and_add_pre_can_refuse() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
-        let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
-
-        let events: Arc<Mutex<Vec<PipeEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&events);
-        client.notify(Arc::new(move |event, info: &PipeInfo| {
-            recorded.lock().unwrap().push(event);
-            assert_eq!(info.role, Role::Dial);
-            Admission::Accept
-        }));
-
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-        client.dial(listener.url()).await.expect("dial");
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec![PipeEvent::AddPre, PipeEvent::AddPost]
-        );
-
-        let id = client.pipe_infos()[0].id;
-        client.close_pipe(id);
-        for _ in 0..200 {
-            if events.lock().unwrap().contains(&PipeEvent::RemPost) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            events.lock().unwrap().first(),
-            Some(&PipeEvent::AddPre),
-            "the order is add-pre, add-post, remove-post"
-        );
-        assert!(events.lock().unwrap().contains(&PipeEvent::RemPost));
-
-        // A refusal keeps the pipe out, and the dial reports it.
-        let refusing = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
-        refusing.notify(Arc::new(|event, _: &PipeInfo| match event {
-            PipeEvent::AddPre => Admission::Reject("not on the allow-list".into()),
-            _ => Admission::Accept,
-        }));
-        let error = refusing.dial(listener.url()).await.unwrap_err();
-        assert!(matches!(error, Error::EPEERAUTH(_)), "{error:?}");
-        assert!(refusing.pipes().is_empty());
-    }
-
-    /// Claim: the pipe ceiling is real and is reported as `NNG_ENOFILES`,
-    /// and it counts a connection that has not handshaken — which is the
-    /// only kind an attacker opens.
-    #[tokio::test]
-    async fn the_pipe_ceiling_bounds_what_a_stranger_can_open() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-
-        let client = engine(
-            &ctx,
-            EndpointType::Req,
-            SocketOptions {
-                max_pipes: 1,
-                ..SocketOptions::default()
-            },
-            &seen,
-        );
-        client.dial(listener.url()).await.expect("the first pipe");
-        let error = client.dial(listener.url()).await.unwrap_err();
-        assert!(matches!(error, Error::ENOFILES(_)), "{error:?}");
-        assert!(error.cause().contains('1'));
-    }
-
-    /// Claim: closing a dialer closes the pipe it made, and closing the
-    /// socket closes everything — a dialer that kept redialling after
-    /// `nng_close()` would be a socket that cannot be shut down.
-    #[tokio::test]
-    async fn closing_an_endpoint_closes_what_it_created() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
-        let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-
-        let dialer = client.dial(listener.url()).await.expect("dial");
-        dialer.close();
-        for _ in 0..200 {
-            if client.pipes().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            client.pipes().is_empty(),
-            "the dialer took its pipe with it"
-        );
-
-        server.close();
-        assert!(server.is_closed());
-        assert!(server.pipes().is_empty());
-        let error = server.listen(listener.url()).await.unwrap_err();
-        assert!(matches!(error, Error::ECLOSED(_)), "{error:?}");
-    }
-
-    /// Claim: every transport an [`Endpoint`] parses is carried, and a
-    /// `tls+tcp` endpoint with no TLS configuration is refused **where it
-    /// is configured** rather than accepted and failed at the first
-    /// connection — a TLS transport with no configuration is a TCP
-    /// transport with a longer name.
-    #[tokio::test]
-    async fn a_tls_endpoint_without_a_configuration_is_refused() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let socket = engine(&ctx, EndpointType::Bus, SocketOptions::default(), &seen);
-        let error = socket
-            .listen(&Endpoint::parse("tls+tcp://127.0.0.1:0").unwrap())
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::EINVAL(_)), "{error:?}");
-        assert!(error.cause().contains("certificate"));
-
-        // And the transports that need no configuration are not refused.
-        assert!(
-            socket
-                .listen(&Endpoint::parse("inproc://orders").unwrap())
-                .await
-                .is_ok()
-        );
-        assert!(
-            socket
-                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-                .await
-                .is_ok()
-        );
-    }
-
     /// A connection's facts when there is nothing to say about it.
     fn no_facts() -> Facts {
         Facts {
@@ -2409,7 +2100,7 @@ mod tests {
     /// not clear — a process out of file descriptors leaves the pending
     /// connection queued, so an immediate retry fails the same way — rests
     /// between tries instead of spinning on a core.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_listener_that_cannot_accept_rests_between_tries() {
         let calls = accept_calls(
             || Error::ESYSERR("too many open files".into()),
@@ -2427,7 +2118,7 @@ mod tests {
     /// Claim: an error about one connection — aborted or reset between the
     /// kernel's accept and ours — is not a reason to rest: the next
     /// connection is already waiting.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_error_about_one_connection_does_not_slow_the_next() {
         let calls = accept_calls(
             || Error::ECONNABORTED("aborted".into()),
@@ -2438,181 +2129,486 @@ mod tests {
         assert_eq!(calls, 51, "fifty failures and then the call that waits");
     }
 
-    /// Claim: one peer address cannot hold more pipes than its ceiling,
-    /// handshaking connections included, and another address is not
-    /// affected by it. Without the ceiling one host opens `max_pipes`
-    /// connections, completes the 8-octet handshake on each and holds them,
-    /// and every later peer is refused until it stops.
-    #[tokio::test]
-    async fn one_peer_address_cannot_hold_more_pipes_than_its_ceiling() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let server = engine(
-            &ctx,
-            EndpointType::Rep,
-            SocketOptions {
-                max_pipes_per_peer: 2,
-                handshake_timeout: Duration::from_secs(5),
-                ..SocketOptions::default()
-            },
-            &seen,
-        );
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-        let addr = listener
-            .url()
-            .to_string()
-            .trim_start_matches("tcp://")
-            .to_owned();
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let mut held = Vec::new();
-        for _ in 0..2 {
-            held.push(
-                tokio::net::TcpStream::connect(&addr)
+        /// Claim: a listener accepts automatically, a dial creates one pipe per
+        /// connection on both sides, and the endpoint objects carry the URL
+        /// actually used — including the port behind a wildcard.
+        #[tokio::test]
+        async fn a_dial_and_a_listen_make_one_pipe_each() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+            let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
+
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+            assert!(!listener.url().has_wildcard_port(), "the port is knowable");
+
+            let dialer = client.dial(listener.url()).await.expect("dial");
+            assert_eq!(dialer.url(), listener.url());
+
+            assert_eq!(client.pipes().len(), 1);
+            let infos = client.pipe_infos();
+            assert_eq!(infos[0].role, Role::Dial);
+            assert_eq!(infos[0].peer, Some(EndpointType::Rep));
+            assert!(infos[0].remote_addr.is_some());
+
+            // The server side is admitted too, once its own handshake finishes.
+            for _ in 0..100 {
+                if server.pipes().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(server.pipes().len(), 1);
+            assert_eq!(server.pipe_infos()[0].role, Role::Listen);
+        }
+        /// Claim: the synchronous dial returns only once the peer's protocol
+        /// header has arrived — not when the TCP connection is established.
+        /// A listener that accepts and says nothing is the difference.
+        #[tokio::test]
+        async fn a_synchronous_dial_waits_for_the_peers_header() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a raw listener");
+            let port = silent.local_addr().unwrap().port();
+            let held = tokio::spawn(async move {
+                // Accept and never answer, which is what a peer stuck in its own
+                // dial looks like.
+                let (stream, _) = silent.accept().await.expect("accept");
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+
+            let seen = counter();
+            let client = engine(
+                &ctx,
+                EndpointType::Req,
+                SocketOptions {
+                    handshake_timeout: Duration::from_millis(200),
+                    ..SocketOptions::default()
+                },
+                &seen,
+            );
+            let url = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap();
+            let error = client.dial(&url).await.unwrap_err();
+            assert!(matches!(error, Error::ETIMEDOUT(_)), "{error:?}");
+            assert_eq!(seen.load(Ordering::SeqCst), 0, "no handshake completed");
+            assert!(client.pipes().is_empty(), "no pipe without a handshake");
+            held.abort();
+        }
+        /// Claim: a refused first synchronous dial is reported and starts no
+        /// retry — NNG's own rule — while the non-blocking form returns at once
+        /// and keeps trying until the peer appears.
+        #[tokio::test]
+        async fn the_two_dial_forms_differ_in_exactly_one_thing() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let client = engine(
+                &ctx,
+                EndpointType::Req,
+                SocketOptions {
+                    reconnect_min: Duration::from_millis(5),
+                    ..SocketOptions::default()
+                },
+                &seen,
+            );
+
+            // A port nobody is on. Bound and dropped, so it is free and refusing.
+            let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a port");
+            let port = dead.local_addr().unwrap().port();
+            drop(dead);
+            let url = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap();
+
+            let error = client.dial(&url).await.unwrap_err();
+            assert!(
+                matches!(error, Error::ECONNREFUSED(_) | Error::EUNREACHABLE(_)),
+                "{error:?}"
+            );
+            assert!(
+                client.lock().dialers.is_empty(),
+                "a refused synchronous dial leaves no dialer behind"
+            );
+
+            // The non-blocking form returns before anything has connected, and
+            // the pipe appears once somebody listens on that address.
+            let dialer = client.dial_nonblocking(&url).expect("nonblocking dial");
+            assert!(client.pipes().is_empty());
+
+            let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+            server
+                .listen(&Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap())
+                .await
+                .expect("listen");
+            for _ in 0..200 {
+                if client.pipes().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(client.pipes().len(), 1, "the retry found the peer");
+            dialer.close();
+        }
+        /// Claim: a dialer redials after its pipe closes, which is the rule that
+        /// applies to both dial forms once a pipe has existed.
+        #[tokio::test]
+        async fn a_dialer_redials_after_its_pipe_closes() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+            let client = engine(
+                &ctx,
+                EndpointType::Req,
+                SocketOptions {
+                    reconnect_min: Duration::from_millis(5),
+                    ..SocketOptions::default()
+                },
+                &seen,
+            );
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+            client.dial(listener.url()).await.expect("dial");
+            let first = client.pipe_infos()[0].id;
+
+            client.close_pipe(first);
+            for _ in 0..200 {
+                let pipes = client.pipe_infos();
+                if pipes.len() == 1 && pipes[0].id != first {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("the dialer did not redial");
+        }
+        /// Claim: all three pipe events reach the callback in order, and the
+        /// callback's refusal at `ADD_PRE` keeps the pipe out of the socket —
+        /// which is the hook local authorization runs in (§10).
+        #[tokio::test]
+        async fn pipe_events_reach_the_callback_and_add_pre_can_refuse() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+            let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
+
+            let events: Arc<Mutex<Vec<PipeEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&events);
+            client.notify(Arc::new(move |event, info: &PipeInfo| {
+                recorded.lock().unwrap().push(event);
+                assert_eq!(info.role, Role::Dial);
+                Admission::Accept
+            }));
+
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+            client.dial(listener.url()).await.expect("dial");
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![PipeEvent::AddPre, PipeEvent::AddPost]
+            );
+
+            let id = client.pipe_infos()[0].id;
+            client.close_pipe(id);
+            for _ in 0..200 {
+                if events.lock().unwrap().contains(&PipeEvent::RemPost) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                events.lock().unwrap().first(),
+                Some(&PipeEvent::AddPre),
+                "the order is add-pre, add-post, remove-post"
+            );
+            assert!(events.lock().unwrap().contains(&PipeEvent::RemPost));
+
+            // A refusal keeps the pipe out, and the dial reports it.
+            let refusing = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
+            refusing.notify(Arc::new(|event, _: &PipeInfo| match event {
+                PipeEvent::AddPre => Admission::Reject("not on the allow-list".into()),
+                _ => Admission::Accept,
+            }));
+            let error = refusing.dial(listener.url()).await.unwrap_err();
+            assert!(matches!(error, Error::EPEERAUTH(_)), "{error:?}");
+            assert!(refusing.pipes().is_empty());
+        }
+        /// Claim: the pipe ceiling is real and is reported as `NNG_ENOFILES`,
+        /// and it counts a connection that has not handshaken — which is the
+        /// only kind an attacker opens.
+        #[tokio::test]
+        async fn the_pipe_ceiling_bounds_what_a_stranger_can_open() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+
+            let client = engine(
+                &ctx,
+                EndpointType::Req,
+                SocketOptions {
+                    max_pipes: 1,
+                    ..SocketOptions::default()
+                },
+                &seen,
+            );
+            client.dial(listener.url()).await.expect("the first pipe");
+            let error = client.dial(listener.url()).await.unwrap_err();
+            assert!(matches!(error, Error::ENOFILES(_)), "{error:?}");
+            assert!(error.cause().contains('1'));
+        }
+        /// Claim: closing a dialer closes the pipe it made, and closing the
+        /// socket closes everything — a dialer that kept redialling after
+        /// `nng_close()` would be a socket that cannot be shut down.
+        #[tokio::test]
+        async fn closing_an_endpoint_closes_what_it_created() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+            let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+
+            let dialer = client.dial(listener.url()).await.expect("dial");
+            dialer.close();
+            for _ in 0..200 {
+                if client.pipes().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                client.pipes().is_empty(),
+                "the dialer took its pipe with it"
+            );
+
+            server.close();
+            assert!(server.is_closed());
+            assert!(server.pipes().is_empty());
+            let error = server.listen(listener.url()).await.unwrap_err();
+            assert!(matches!(error, Error::ECLOSED(_)), "{error:?}");
+        }
+        /// Claim: every transport an [`Endpoint`] parses is carried, and a
+        /// `tls+tcp` endpoint with no TLS configuration is refused **where it
+        /// is configured** rather than accepted and failed at the first
+        /// connection — a TLS transport with no configuration is a TCP
+        /// transport with a longer name.
+        #[tokio::test]
+        async fn a_tls_endpoint_without_a_configuration_is_refused() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let socket = engine(&ctx, EndpointType::Bus, SocketOptions::default(), &seen);
+            let error = socket
+                .listen(&Endpoint::parse("tls+tcp://127.0.0.1:0").unwrap())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::EINVAL(_)), "{error:?}");
+            assert!(error.cause().contains("certificate"));
+
+            // And the transports that need no configuration are not refused.
+            assert!(
+                socket
+                    .listen(&Endpoint::parse("inproc://orders").unwrap())
                     .await
-                    .expect("connect"),
+                    .is_ok()
+            );
+            assert!(
+                socket
+                    .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                    .await
+                    .is_ok()
             );
         }
-        for _ in 0..200 {
-            if server.lock().pipes.len() == 2 {
-                break;
+        /// Claim: one peer address cannot hold more pipes than its ceiling,
+        /// handshaking connections included, and another address is not
+        /// affected by it. Without the ceiling one host opens `max_pipes`
+        /// connections, completes the 8-octet handshake on each and holds them,
+        /// and every later peer is refused until it stops.
+        #[tokio::test]
+        async fn one_peer_address_cannot_hold_more_pipes_than_its_ceiling() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let server = engine(
+                &ctx,
+                EndpointType::Rep,
+                SocketOptions {
+                    max_pipes_per_peer: 2,
+                    handshake_timeout: Duration::from_secs(5),
+                    ..SocketOptions::default()
+                },
+                &seen,
+            );
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+            let addr = listener
+                .url()
+                .to_string()
+                .trim_start_matches("tcp://")
+                .to_owned();
+
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                held.push(
+                    tokio::net::TcpStream::connect(&addr)
+                        .await
+                        .expect("connect"),
+                );
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            server.lock().pipes.len(),
-            2,
-            "two silent peers hold two slots"
-        );
-
-        let mut third = tokio::net::TcpStream::connect(&addr)
-            .await
-            .expect("connect");
-        let mut buffer = [0u8; 16];
-        let read = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buffer))
-            .await
-            .expect("the third connection from this host is closed rather than held")
-            .expect("read");
-        assert_eq!(read, 0, "nothing is sent to a refused connection");
-        assert_eq!(server.lock().pipes.len(), 2);
-
-        // The whole of 127.0.0.0/8 is this host on Linux, which makes a
-        // second source address available without any setup.
-        #[cfg(target_os = "linux")]
-        {
-            let socket = tokio::net::TcpSocket::new_v4().expect("socket");
-            socket
-                .bind("127.0.0.2:0".parse().unwrap())
-                .expect("a second source address");
-            let _other = tokio::time::timeout(
-                Duration::from_secs(2),
-                socket.connect(addr.parse().unwrap()),
-            )
-            .await
-            .expect("connect")
-            .expect("connected");
             for _ in 0..200 {
-                if server.lock().pipes.len() == 3 {
+                if server.lock().pipes.len() == 2 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             assert_eq!(
                 server.lock().pipes.len(),
-                3,
-                "another address is not held to the first one's ceiling"
+                2,
+                "two silent peers hold two slots"
             );
-        }
-    }
 
-    /// Claim: a wait for the pipe set to change sees a change that happens
-    /// before the wait is first polled, because it exists from the moment
-    /// it is created. A caller that creates it before looking at the pipes
-    /// cannot miss the pipe that arrives in between, which is what an
-    /// `async fn` — created at first poll — could.
-    #[tokio::test]
-    async fn a_wait_made_before_the_pipe_set_changes_ends_with_the_change() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let seen = counter();
-        let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
-        let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
-        let listener = server
-            .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
-            .await
-            .expect("listen");
-
-        let wait = client.changed();
-        client.dial(listener.url()).await.expect("dial");
-        tokio::time::timeout(Duration::from_secs(2), wait)
-            .await
-            .expect("the wait saw the pipe arrive although it was first polled afterwards");
-    }
-
-    /// Claim: what a retired pipe left in the socket's buffer takes its turn
-    /// among the live pipes and is not served ahead of them. A peer that
-    /// connects, sends and goes as fast as the application receives would
-    /// otherwise keep that buffer full for ever, and a pipe that stays would
-    /// never be read.
-    #[tokio::test]
-    async fn what_a_retired_pipe_left_behind_takes_its_turn_among_the_live_pipes() {
-        async fn bounded<T>(step: impl Future<Output = T>) -> T {
-            tokio::time::timeout(Duration::from_secs(10), step)
+            let mut third = tokio::net::TcpStream::connect(&addr)
                 .await
-                .expect("the step finished within 10 s")
-        }
+                .expect("connect");
+            let mut buffer = [0u8; 16];
+            let read = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buffer))
+                .await
+                .expect("the third connection from this host is closed rather than held")
+                .expect("read");
+            assert_eq!(read, 0, "nothing is sent to a refused connection");
+            assert_eq!(server.lock().pipes.len(), 2);
 
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let core =
-            crate::socket::SocketCore::new(&ctx, EndpointType::Pull, SocketOptions::default())
-                .expect("pull");
-        let listener = bounded(core.listen("tcp://127.0.0.1:0"))
-            .await
-            .expect("listen");
-        let addr = listener.url().to_string();
-
-        // One peer that stays, with three messages waiting in its pipe.
-        let mut peer = bounded(tokio::net::TcpStream::connect(
-            addr.trim_start_matches("tcp://"),
-        ))
-        .await
-        .expect("connect");
-        bounded(peer.write_all(&weida_sp::ProtocolHeader::new(EndpointType::Push).encode()))
-            .await
-            .expect("our header");
-        let mut theirs = [0u8; weida_sp::HEADER_LEN];
-        bounded(peer.read_exact(&mut theirs))
-            .await
-            .expect("their header");
-        for n in 0..3 {
-            let message = weida_sp::message::encode(format!("live {n}").as_bytes());
-            bounded(peer.write_all(&message)).await.expect("a message");
-        }
-        bounded(async {
-            while !core
-                .pipes()
-                .first()
-                .is_some_and(|pipe| pipe.incoming().len() == 3)
+            // The whole of 127.0.0.0/8 is this host on Linux, which makes a
+            // second source address available without any setup.
+            #[cfg(target_os = "linux")]
             {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+                socket
+                    .bind("127.0.0.2:0".parse().unwrap())
+                    .expect("a second source address");
+                let _other = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    socket.connect(addr.parse().unwrap()),
+                )
+                .await
+                .expect("connect")
+                .expect("connected");
+                for _ in 0..200 {
+                    if server.lock().pipes.len() == 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(
+                    server.lock().pipes.len(),
+                    3,
+                    "another address is not held to the first one's ceiling"
+                );
             }
-        })
-        .await;
-
-        // And two messages from a pipe that has gone.
-        core.engine().store_arrived(
-            PipeId::new(500),
-            vec![
-                Message::from_body(b"gone 0".to_vec()),
-                Message::from_body(b"gone 1".to_vec()),
-            ],
-        );
-
-        let mut order = Vec::new();
-        while let Some((_, message)) = core.try_take_any() {
-            order.push(String::from_utf8(message.body().to_vec()).expect("utf8"));
         }
-        assert_eq!(order, ["live 0", "gone 0", "live 1", "gone 1", "live 2"]);
+        /// Claim: a wait for the pipe set to change sees a change that happens
+        /// before the wait is first polled, because it exists from the moment
+        /// it is created. A caller that creates it before looking at the pipes
+        /// cannot miss the pipe that arrives in between, which is what an
+        /// `async fn` — created at first poll — could.
+        #[tokio::test]
+        async fn a_wait_made_before_the_pipe_set_changes_ends_with_the_change() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let seen = counter();
+            let server = engine(&ctx, EndpointType::Rep, SocketOptions::default(), &seen);
+            let client = engine(&ctx, EndpointType::Req, SocketOptions::default(), &seen);
+            let listener = server
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
+                .await
+                .expect("listen");
+
+            let wait = client.changed();
+            client.dial(listener.url()).await.expect("dial");
+            tokio::time::timeout(Duration::from_secs(2), wait)
+                .await
+                .expect("the wait saw the pipe arrive although it was first polled afterwards");
+        }
+        /// Claim: what a retired pipe left in the socket's buffer takes its turn
+        /// among the live pipes and is not served ahead of them. A peer that
+        /// connects, sends and goes as fast as the application receives would
+        /// otherwise keep that buffer full for ever, and a pipe that stays would
+        /// never be read.
+        #[tokio::test]
+        async fn what_a_retired_pipe_left_behind_takes_its_turn_among_the_live_pipes() {
+            async fn bounded<T>(step: impl Future<Output = T>) -> T {
+                tokio::time::timeout(Duration::from_secs(10), step)
+                    .await
+                    .expect("the step finished within 10 s")
+            }
+
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let core =
+                crate::socket::SocketCore::new(&ctx, EndpointType::Pull, SocketOptions::default())
+                    .expect("pull");
+            let listener = bounded(core.listen("tcp://127.0.0.1:0"))
+                .await
+                .expect("listen");
+            let addr = listener.url().to_string();
+
+            // One peer that stays, with three messages waiting in its pipe.
+            let mut peer = bounded(tokio::net::TcpStream::connect(
+                addr.trim_start_matches("tcp://"),
+            ))
+            .await
+            .expect("connect");
+            bounded(peer.write_all(&weida_sp::ProtocolHeader::new(EndpointType::Push).encode()))
+                .await
+                .expect("our header");
+            let mut theirs = [0u8; weida_sp::HEADER_LEN];
+            bounded(peer.read_exact(&mut theirs))
+                .await
+                .expect("their header");
+            for n in 0..3 {
+                let message = weida_sp::message::encode(format!("live {n}").as_bytes());
+                bounded(peer.write_all(&message)).await.expect("a message");
+            }
+            bounded(async {
+                while !core
+                    .pipes()
+                    .first()
+                    .is_some_and(|pipe| pipe.incoming().len() == 3)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+
+            // And two messages from a pipe that has gone.
+            core.engine().store_arrived(
+                PipeId::new(500),
+                vec![
+                    Message::from_body(b"gone 0".to_vec()),
+                    Message::from_body(b"gone 1".to_vec()),
+                ],
+            );
+
+            let mut order = Vec::new();
+            while let Some((_, message)) = core.try_take_any() {
+                order.push(String::from_utf8(message.body().to_vec()).expect("utf8"));
+            }
+            assert_eq!(order, ["live 0", "gone 0", "live 1", "gone 1", "live 2"]);
+        }
     }
 }
