@@ -36,7 +36,7 @@ impl Harness {
 
 /// The temporal decoupling a queue exists for: the confirm arrives although
 /// nothing is consuming, and nothing ever will.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_confirm_arrives_with_no_consumer_registered() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.requester("/jobs").await;
@@ -67,7 +67,7 @@ async fn a_confirm_arrives_with_no_consumer_registered() {
 
 /// A confirm says `Accepted` and nothing stronger: the reply carries no
 /// durability claim, because there is no store behind it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_confirm_never_claims_more_than_memory() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.requester("/jobs").await;
@@ -84,7 +84,7 @@ async fn the_confirm_never_claims_more_than_memory() {
 
 /// At the byte bound the producer is refused — and the refusal is a message on
 /// a connection that stays usable, not a connection error.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_full_queue_refuses_and_the_connection_survives() {
     // Room for exactly one 64-byte message.
     let config = BrokerConfig {
@@ -122,7 +122,7 @@ async fn a_full_queue_refuses_and_the_connection_survives() {
 
 /// A payload larger than the whole queue is refused without being buffered
 /// first: the cap is what the read is bounded by.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_payload_larger_than_the_queue_is_refused() {
     let config = BrokerConfig {
         queue_bytes: PER_MESSAGE_OVERHEAD + 16,
@@ -145,7 +145,7 @@ async fn a_payload_larger_than_the_queue_is_refused() {
 /// No queue on the path: the runtime's own dispatch answers, because the
 /// broker never registered it. No declare frame exists, so this is the whole
 /// story for an unknown queue (0018 §4.5).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unregistered_path_is_an_unknown_endpoint() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.requester("/nowhere").await;
@@ -162,7 +162,7 @@ async fn an_unregistered_path_is_an_unknown_endpoint() {
 }
 
 /// A one-way transfer is admitted and confirmed by nothing at all.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_one_way_transfer_is_admitted_without_a_confirm() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.pusher("/jobs").await;
@@ -254,7 +254,7 @@ impl Harness {
 /// for the deadline. Past its share of the admissions a peer's streams are
 /// refused at once, and the permits it was refused for are still there for
 /// everybody else.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn one_peer_cannot_hold_every_admission_and_keeps_the_rest_waiting() {
     let harness = narrow().await;
     let hostile = harness.runtime.requester(harness.peer());
@@ -314,7 +314,7 @@ async fn one_peer_cannot_hold_every_admission_and_keeps_the_rest_waiting() {
 /// The same bound holds for one-way transfers, which have no reply half to
 /// refuse on: the stalled peer's streams hold its share and no more, and
 /// another peer's transfer is admitted.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn one_peer_holding_one_way_streams_open_does_not_stop_another_peer() {
     let harness = narrow().await;
     let hostile = harness.runtime.pusher(harness.peer());
@@ -359,7 +359,7 @@ async fn one_peer_holding_one_way_streams_open_does_not_stop_another_peer() {
 /// connections: one anonymous connection that holds its whole share is
 /// refused for more, and another anonymous connection is admitted. One bucket
 /// for every anonymous peer would let any one of them lock the rest out.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn anonymous_connections_do_not_share_one_share() {
     let harness = Harness::start(BrokerConfig {
         max_inflight_admissions: 4,
@@ -420,7 +420,8 @@ async fn anonymous_connections_do_not_share_one_share() {
 
     // Another anonymous connection — a runtime of its own, so a connection of
     // its own — is read and confirmed while the first holds its share.
-    let other_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let other_runtime =
+        Runtime::new(harness.client_config(RuntimeConfig::default())).expect("runtime");
     let other = other_runtime.requester(harness.client.clone());
     other.connect(&harness.url("/jobs")).await.expect("connect");
     tokio::time::timeout(PROMPTLY, other.request(b"through"))

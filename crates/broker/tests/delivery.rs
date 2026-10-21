@@ -31,7 +31,8 @@ impl Harness {
     /// queue are two processes in every real deployment, and this is the
     /// cheapest honest way to be two of them.
     async fn consumer(&self, path: &str, filter: &str) -> (Runtime, Subscriber) {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("consumer runtime");
+        let runtime =
+            Runtime::new(self.client_config(RuntimeConfig::default())).expect("consumer runtime");
         let subscriber = runtime.subscriber(self.client.clone());
         subscriber.subscribe(filter).await.expect("subscribe");
         subscriber.connect(&self.url(path)).await.expect("connect");
@@ -89,7 +90,7 @@ async fn nothing(consumer: &Subscriber) {
 }
 
 /// Initial credit is zero: subscribing is not consuming.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_consumer_receives_nothing_until_it_grants_credit() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -113,7 +114,7 @@ async fn a_consumer_receives_nothing_until_it_grants_credit() {
 
 /// A duplicated grant delivers nothing extra, and a stale lower one changes
 /// nothing: the limit is absolute and the broker keeps the highest it saw.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_duplicated_or_reordered_grant_changes_nothing() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -156,7 +157,7 @@ async fn a_duplicated_or_reordered_grant_changes_nothing() {
 
 /// Two consumers, one queue: the one with credit gets the messages, the one at
 /// its limit gets none, and each message goes to exactly one of them.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_consumer_at_its_limit_yields_to_one_with_credit() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -191,7 +192,7 @@ async fn a_consumer_at_its_limit_yields_to_one_with_credit() {
 /// monotone, so a grant that is not above the standing one changes nothing.
 /// What stops delivery here is the limit of 1 being spent; the restatement is
 /// in the test to prove it is the no-op it claims to be.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_spent_limit_stops_delivery_without_a_reset() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -233,13 +234,14 @@ async fn a_spent_limit_stops_delivery_without_a_reset() {
 /// is the first thing the queue sees. Nothing here waits for
 /// `consumer_count` to move, which is exactly what the other tests in this
 /// file do to keep this race out of their way.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_grant_that_overtakes_its_subscribe_is_kept_and_delivers() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
     harness.fill(&producer, 1).await;
 
-    let consumer_rt = Runtime::new(RuntimeConfig::default()).expect("consumer runtime");
+    let consumer_rt =
+        Runtime::new(harness.client_config(RuntimeConfig::default())).expect("consumer runtime");
     let consumer = consumer_rt.subscriber(harness.client.clone());
     let url = harness.url("/jobs");
     consumer.connect(&url).await.expect("connect");
@@ -265,7 +267,7 @@ async fn a_grant_that_overtakes_its_subscribe_is_kept_and_delivers() {
 }
 
 /// An UNSUBSCRIBE removes exactly that subscription, and the queue carries on.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unsubscribe_removes_the_consumer() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -285,7 +287,7 @@ async fn an_unsubscribe_removes_the_consumer() {
 /// A closed connection removes every subscription it held — including one it
 /// never withdrew, which is the case a publisher never has to handle and a
 /// queue does.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_closed_connection_removes_every_consumer_it_held() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let (consumer_rt, consumer) = harness.consumer("/jobs", "").await;
@@ -318,7 +320,7 @@ async fn await_consumer_count(harness: &Harness, want: usize) {
 /// A filter selects which messages a consumer may take, with the same grammar
 /// a subscriber uses — so a queue can be shared by topic without a second
 /// concept.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_filter_selects_which_messages_a_consumer_takes() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;

@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use weida::{Runtime, RuntimeConfig, Subscriber, TransferMeta};
 use weida_broker::BrokerConfig;
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{DEADLINE, Harness};
@@ -34,7 +34,8 @@ impl Harness {
     /// A consumer on a runtime of its own, subscribed with `filters` and
     /// holding `credit` on each.
     async fn consumer_of(&self, filters: &[String], credit: u64) -> (Runtime, Subscriber) {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("consumer runtime");
+        let runtime =
+            Runtime::new(self.client_config(RuntimeConfig::default())).expect("consumer runtime");
         let subscriber = runtime.subscriber(self.client.clone());
         for filter in filters {
             subscriber.subscribe(filter).await.expect("subscribe");
@@ -61,7 +62,7 @@ impl Harness {
 /// ready for something else: two hundred deliveries behind them still take a
 /// moment, not the quarter of a million filter matches per delivery that
 /// offering the backlog to every ready consumer after each write costs.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_backlog_nobody_wants_does_not_slow_the_deliveries_behind_it() {
     let harness = Harness::start(BrokerConfig {
         queue_bytes: 64 << 20,

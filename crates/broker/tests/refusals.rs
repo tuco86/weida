@@ -55,7 +55,7 @@ impl Harness {
         config: RuntimeConfig,
         credit: u64,
     ) -> (Runtime, Subscriber) {
-        let runtime = Runtime::new(config).expect("consumer runtime");
+        let runtime = Runtime::new(self.client_config(config)).expect("consumer runtime");
         let subscriber = runtime.subscriber(self.client.clone());
         subscriber.subscribe("").await.expect("subscribe");
         let before = self.broker.consumer_count(path).expect("queue");
@@ -105,7 +105,7 @@ async fn promptly(consumer: &Subscriber) -> String {
 /// consumer that could not stays connected and stays served, is not offered
 /// the message again, and is not charged credit for a delivery that never
 /// happened.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_message_a_consumer_will_not_read_goes_to_another_and_the_consumer_stays() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     // One unit of credit: the refusal must give it back, or the next message
@@ -161,7 +161,7 @@ async fn a_message_a_consumer_will_not_read_goes_to_another_and_the_consumer_sta
 /// A message every connection refuses is not kept for ever: after
 /// [`MAX_REFUSALS`] refusals the queue drops it, counts it, and releases what
 /// it was charged. The consumers that refused it are all still connected.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_message_nobody_will_read_is_dropped_and_counted() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let mut readers = Vec::new();

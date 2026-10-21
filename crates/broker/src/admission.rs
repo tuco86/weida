@@ -584,7 +584,6 @@ pub(crate) const MAX_REPORTS_IN_FLIGHT: usize = 256;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
 
     use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 
@@ -729,20 +728,20 @@ mod tests {
         assert_eq!(budget.asked.first(), Some(&9), "but it can make it smaller");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_producer_that_stops_is_given_up_on_at_the_deadline() {
         // The writer sends a prefix and keeps its end open: no FIN, no bytes.
         let (mut writer, mut reader) = duplex(1024);
         writer.write_all(b"half a mess").await.expect("prefix");
         let mut budget = Budget::new(1 << 20);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let outcome = read(&mut reader, Some(1 << 20), &mut budget).await;
         assert_eq!(outcome, Err(ReadFailed::Broken));
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(writer);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_producer_that_trickles_is_given_up_on_although_it_never_goes_idle() {
         let (mut writer, mut reader) = duplex(1024);
         let trickle = tokio::spawn(async move {
@@ -756,7 +755,7 @@ mod tests {
             }
         });
         let mut budget = Budget::new(1 << 20);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let outcome = read(&mut reader, None, &mut budget).await;
         assert_eq!(outcome, Err(ReadFailed::Broken));
         assert!(

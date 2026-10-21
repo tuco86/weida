@@ -1,11 +1,15 @@
-//! The loopback broker every integration test in this crate drives.
+//! The broker every test in this crate drives, on a simulated network
+//! (`SimNet`) that its clients share.
 //!
 //! Each test file is its own crate and adds the producers and consumers it
 //! needs in its own `impl Harness` block.
 
 use std::time::Duration;
 
-use weida::{Binding, ClientTls, Identity, Listener, Runtime, RuntimeConfig, ServerTls, Trust};
+use weida::{
+    Binding, ClientTls, Identity, Listener, Network, Runtime, RuntimeConfig, ServerTls, SimNet,
+    Trust,
+};
 use weida_broker::{Broker, BrokerConfig};
 
 /// Generous ceiling: every assertion settles in milliseconds.
@@ -27,6 +31,8 @@ pub struct Harness {
     pub broker: Broker,
     pub client: ClientTls,
     pub port: u16,
+    /// The simulated network the broker and every client of the test are on.
+    pub net: SimNet,
 }
 
 impl Harness {
@@ -43,7 +49,12 @@ impl Harness {
         config: BrokerConfig,
         shape: impl FnOnce(ServerTls) -> ServerTls,
     ) -> Harness {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let listener = runtime.listener();
         let identity = Identity::generate().expect("identity");
         let fingerprint = identity.fingerprint().expect("fingerprint");
@@ -65,6 +76,17 @@ impl Harness {
             broker,
             client: ClientTls::new(Trust::pin(fingerprint)),
             port,
+            net,
+        }
+    }
+
+    /// `config` on the broker's network: every client runtime is built from
+    /// it.
+    #[allow(dead_code)]
+    pub fn client_config(&self, config: RuntimeConfig) -> RuntimeConfig {
+        RuntimeConfig {
+            network: Network::sim(&self.net),
+            ..config
         }
     }
 

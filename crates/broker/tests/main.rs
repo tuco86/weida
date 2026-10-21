@@ -11,9 +11,15 @@
 )]
 
 mod admission;
-mod backlog;
 mod cursors;
 mod delivery;
 mod refusals;
 mod settlement;
 mod stalls;
+
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    mod backlog;
+    mod stalls;
+}

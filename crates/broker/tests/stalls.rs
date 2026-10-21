@@ -9,7 +9,7 @@
 //! stopped reading: `max_concurrent_uni_streams` and a one-deep endpoint queue
 //! are what `weida`'s own backpressure tests use for it.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::time::timeout;
 use weida::{
@@ -19,25 +19,25 @@ use weida::{
 use weida_broker::BrokerConfig;
 
 #[path = "common/mod.rs"]
-mod common;
+pub(crate) mod common;
 
 use common::{DEADLINE, Harness, SILENCE};
 
 /// What a healthy peer is promised while another one is stalled.
-const PROMPTLY: Duration = Duration::from_secs(2);
+pub(crate) const PROMPTLY: Duration = Duration::from_secs(2);
 
-async fn within<F: Future>(limit: Duration, f: F) -> F::Output {
+pub(crate) async fn within<F: Future>(limit: Duration, f: F) -> F::Output {
     timeout(limit, f).await.expect("timed out")
 }
 
 impl Harness {
-    async fn requester(&self, path: &str) -> Requester {
+    pub(crate) async fn requester(&self, path: &str) -> Requester {
         let requester = self.runtime.requester(self.client.clone());
         requester.connect(&self.url(path)).await.expect("connect");
         requester
     }
 
-    async fn pusher(&self, path: &str) -> Pusher {
+    pub(crate) async fn pusher(&self, path: &str) -> Pusher {
         let pusher = self.runtime.pusher(self.client.clone());
         pusher.connect(&self.url(path)).await.expect("connect");
         pusher
@@ -45,13 +45,13 @@ impl Harness {
 
     /// A consumer subscribed with `filters` on a runtime of its own, holding no
     /// credit yet.
-    async fn consumer(
+    pub(crate) async fn consumer(
         &self,
         path: &str,
         filters: &[&str],
         config: RuntimeConfig,
     ) -> (Runtime, Subscriber) {
-        let runtime = Runtime::new(config).expect("consumer runtime");
+        let runtime = Runtime::new(self.client_config(config)).expect("consumer runtime");
         let subscriber = runtime.subscriber(self.client.clone());
         for filter in filters {
             subscriber.subscribe(filter).await.expect("subscribe");
@@ -70,7 +70,7 @@ impl Harness {
     /// A consumer that stops reading after the broker has written it two
     /// messages: its runtime grants two streams and queues one transfer, and
     /// nothing here ever receives.
-    async fn stalled_consumer(&self, path: &str) -> (Runtime, Subscriber) {
+    pub(crate) async fn stalled_consumer(&self, path: &str) -> (Runtime, Subscriber) {
         let (runtime, subscriber) = self
             .consumer(
                 path,
@@ -90,7 +90,7 @@ impl Harness {
     }
 
     /// Waits until `reached` holds of the queue's counters.
-    async fn until(
+    pub(crate) async fn until(
         &self,
         path: &str,
         what: &str,
@@ -106,12 +106,12 @@ impl Harness {
     }
 }
 
-async fn body_of(transfer: IncomingTransfer) -> String {
+pub(crate) async fn body_of(transfer: IncomingTransfer) -> String {
     String::from_utf8(transfer.collect(1 << 20).await.expect("collect")).expect("utf-8")
 }
 
 /// One delivery, within [`PROMPTLY`].
-async fn promptly(consumer: &Subscriber) -> String {
+pub(crate) async fn promptly(consumer: &Subscriber) -> String {
     let transfer = within(PROMPTLY, consumer.recv()).await.expect("a delivery");
     body_of(transfer).await
 }
@@ -119,7 +119,7 @@ async fn promptly(consumer: &Subscriber) -> String {
 /// A producer that declares a megabyte, sends one byte and holds its stream
 /// open is a read that never ends. An ordinary producer beside it is still
 /// confirmed, and an ordinary consumer still receives.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_producer_that_stops_mid_message_does_not_stall_the_queue() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let stalled = harness.pusher("/jobs").await;
@@ -161,7 +161,7 @@ async fn a_producer_that_stops_mid_message_does_not_stall_the_queue() {
 /// A consumer that has credit and stops reading holds one write open. The
 /// producer is still confirmed, and a second consumer that arrives afterwards
 /// still receives.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_consumer_that_stops_reading_does_not_stall_the_queue() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let (_stalled_rt, _stalled) = harness.stalled_consumer("/jobs").await;
@@ -187,7 +187,7 @@ async fn a_consumer_that_stops_reading_does_not_stall_the_queue() {
 /// What a stall costs is bounded by the deadline. With a short one, the stopped
 /// producer's reservation is returned and a consumer that stopped reading is
 /// dropped, with everything it held back in the queue.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_peer_is_reclaimed_at_the_deadline() {
     let harness = Harness::start(BrokerConfig {
         io_timeout: Duration::from_millis(400),
@@ -241,7 +241,7 @@ async fn a_stalled_peer_is_reclaimed_at_the_deadline() {
 /// within the deadline plus a margin, a healthy consumer beside it keeps
 /// receiving throughout, and what the stalled one held is the healthy one's
 /// to take.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_consumer_that_stops_reading_has_its_connection_closed() {
     const IO_TIMEOUT: Duration = Duration::from_millis(400);
     /// What the close may take beyond the deadline: the broker's reaction and
@@ -268,7 +268,7 @@ async fn a_consumer_that_stops_reading_has_its_connection_closed() {
             .await
             .expect("confirmed");
     }
-    let stalled_since = Instant::now();
+    let stalled_since = tokio::time::Instant::now();
     healthy.grant("", 100).await.expect("grant");
 
     let lost = within(IO_TIMEOUT + MARGIN, async {
@@ -309,7 +309,7 @@ async fn a_consumer_that_stops_reading_has_its_connection_closed() {
 /// One connection's filters add up: eight messages and three matching
 /// filters of one consumer, which may hold three unsettled in all, leave the
 /// rest for the next consumer instead of pinning the queue.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn one_connection_cannot_pin_a_queue_through_its_filters() {
     let harness = Harness::start(BrokerConfig {
         max_unsettled: 2,
@@ -352,35 +352,4 @@ async fn one_connection_cannot_pin_a_queue_through_its_filters() {
     other.grant("", 10).await.expect("grant");
     let got = promptly(&other).await;
     assert!(got.starts_with("job-"), "{got}");
-}
-
-/// A consumer with credit left and a full set of unsettled deliveries is
-/// ineligible, and a queue behind it is not walked for every message that
-/// arrives. Eight thousand empty messages are admitted in a time the quadratic
-/// scan could not manage.
-#[tokio::test]
-async fn a_silent_consumer_does_not_make_admission_quadratic() {
-    const MESSAGES: usize = 8_000;
-    let harness = Harness::start(BrokerConfig {
-        queue_bytes: 64 << 20,
-        ..BrokerConfig::with_queues(["/jobs"])
-    })
-    .await;
-    let (_rt, silent) = harness
-        .consumer("/jobs", &[""], RuntimeConfig::default())
-        .await;
-    silent.grant("", 100_000).await.expect("grant");
-
-    let producer = harness.requester("/jobs").await;
-    within(Duration::from_secs(30), async {
-        for _ in 0..MESSAGES {
-            producer.request(b"").await.expect("admitted");
-        }
-    })
-    .await;
-    harness
-        .until("/jobs", "everything is held or out", |s| {
-            s.messages + s.unsettled == MESSAGES && s.unsettled == 256
-        })
-        .await;
 }

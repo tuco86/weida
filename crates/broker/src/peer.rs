@@ -86,16 +86,16 @@ mod tests {
 
     const IDLE: Duration = Duration::from_millis(200);
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_step_that_never_completes_is_cut_at_the_idle_window() {
         let pace = Pace::new(IDLE);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let outcome = pace.step(std::future::pending::<()>()).await;
         assert!(outcome.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn progress_moves_the_idle_deadline_out() {
         let mut pace = Pace::new(IDLE);
         for _ in 0..3 {
@@ -104,17 +104,17 @@ mod tests {
         }
         // 600 ms in, well past the first window, and a fast peer is still
         // inside its deadline.
-        assert!(pace.deadline() > Instant::now());
+        assert!(pace.deadline() > tokio::time::Instant::now());
         assert!(
             pace.step(async { 7 }).await.is_ok(),
             "a step that completes is not cut"
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_trickle_is_cut_although_it_never_goes_idle() {
         let mut pace = Pace::new(IDLE);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         loop {
             // One byte inside every window: never idle, never fast enough.
             let step = pace.step(tokio::time::sleep(IDLE / 4));

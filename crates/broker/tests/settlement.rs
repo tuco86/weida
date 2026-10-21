@@ -44,7 +44,8 @@ impl Harness {
     /// consumers of one queue are two processes in every real deployment.
     /// Dropping the returned runtime is how this file kills a consumer.
     async fn consumer(&self, path: &str, credit: u64) -> (Runtime, Subscriber) {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("consumer runtime");
+        let runtime =
+            Runtime::new(self.client_config(RuntimeConfig::default())).expect("consumer runtime");
         let subscriber = runtime.subscriber(self.client.clone());
         subscriber.subscribe("").await.expect("subscribe");
         subscriber.connect(&self.url(path)).await.expect("connect");
@@ -162,7 +163,7 @@ async fn nothing(consumer: &Subscriber) {
 
 /// A consumer that reports `Processed` ends the queue's responsibility: the
 /// message is gone and its bytes are back.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_reported_delivery_leaves_the_queue_and_frees_its_bytes() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -188,7 +189,7 @@ async fn a_reported_delivery_leaves_the_queue_and_frees_its_bytes() {
 /// message is not the message being processed, and deleting it then would
 /// lose it if the consumer failed before the end. Only an offset that covers
 /// the whole body settles.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn progress_through_a_body_does_not_settle_it() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -224,7 +225,7 @@ async fn progress_through_a_body_does_not_settle_it() {
 
 /// The claim settlement exists for: a consumer that dies without reporting
 /// gives the message back, and another consumer gets it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_delivery_nobody_reports_on_comes_back_for_somebody_else() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -261,7 +262,7 @@ async fn a_delivery_nobody_reports_on_comes_back_for_somebody_else() {
 /// `max_unsettled` is a per-subscription bound and it is live: a consumer that
 /// stops reporting stops being given messages, and one settlement lets the
 /// next one through.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_subscription_at_its_unsettled_bound_is_given_nothing_more() {
     let harness = Harness::start(BrokerConfig {
         max_unsettled: 2,
@@ -306,7 +307,7 @@ async fn a_subscription_at_its_unsettled_bound_is_given_nothing_more() {
 
 /// An unsettled delivery still costs the queue its budget, which is what makes
 /// the bound above a memory bound rather than a counter.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unsettled_delivery_still_counts_against_the_budget() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
@@ -361,7 +362,7 @@ async fn quiet_tasks() -> usize {
 /// consumer that unsubscribes with deliveries it never reported, and keeps
 /// its connection, must not leave one task per delivery behind for as long
 /// as the connection lives.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_delivery_the_queue_takes_back_stops_being_watched() {
     const DELIVERIES: usize = 48;
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;

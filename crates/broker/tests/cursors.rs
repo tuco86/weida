@@ -43,7 +43,7 @@ impl Harness {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_one_way_producer_that_orders_accepted_gets_it() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.pusher("/jobs").await;
@@ -71,7 +71,7 @@ async fn a_one_way_producer_that_orders_accepted_gets_it() {
     assert_eq!(stats.bytes, PER_MESSAGE_OVERHEAD + body.len());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_exchange_still_gets_the_key_8_confirm_and_no_cursor_stream() {
     // The reply half stays the application's answer: a producer that orders
     // nothing sees the confirm and no cursor stream.
@@ -86,7 +86,7 @@ async fn an_exchange_still_gets_the_key_8_confirm_and_no_cursor_stream() {
     assert!(reply.reporter().is_none());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refused_admission_reports_no_cursor() {
     // Room for exactly one 64-byte message, then the queue is at its bound.
     let config = BrokerConfig {
@@ -133,7 +133,7 @@ async fn a_refused_admission_reports_no_cursor() {
     assert_eq!(stats.messages, 1, "the second message was refused");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stored_order_is_not_reported_by_a_broker_with_no_store() {
     // The honest-absence rule: this broker holds messages in memory, so
     // `Stored` is a claim it must not make (`docs/GUARANTEES.md` §1). It
