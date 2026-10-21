@@ -527,9 +527,14 @@ mod tests {
     /// than the key proved in the handshake is refused before openraft sees
     /// it; the same message naming the proved key is answered. Run against
     /// an uninitialized node, which admits every key.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn an_rpc_claiming_another_sender_is_refused() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let consensus = start(&runtime, loopback()).await;
         let (x_id, requester) = stranger(&runtime, &consensus).await;
 
@@ -551,9 +556,14 @@ mod tests {
 
     /// Admission: once a node is in a group, a key outside it can neither
     /// unseat its leader with a high-term vote nor append as a leader.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn an_outsider_cannot_unseat_or_write_to_an_initialized_node() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let consensus = start(&runtime, loopback()).await;
         consensus.bootstrap().await.expect("bootstrap");
         leads(&consensus).await;
@@ -590,9 +600,14 @@ mod tests {
     /// A peer that claims a large envelope and sends none of it holds a
     /// handler only until the deadline, and over the cap the next request is
     /// refused at once.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_envelope_ends_at_its_deadline_and_the_cap_refuses_more() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let mut config = loopback();
         config.heartbeat_interval = Duration::from_millis(100);
         config.election_timeout_min = Duration::from_millis(300);
@@ -609,11 +624,11 @@ mod tests {
                 .write_all(&(1u32 << 20).to_be_bytes())
                 .await
                 .expect("the length prefix");
-            stalled.push((Instant::now(), transfer, reply));
+            stalled.push((tokio::time::Instant::now(), transfer, reply));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let sent = Instant::now();
+        let sent = tokio::time::Instant::now();
         assert!(
             matches!(
                 send(&requester, &vote_by(x_id)).await,
@@ -674,9 +689,14 @@ mod tests {
     /// Snapshot bodies are buffered up to `max_snapshot_bytes` each, so only
     /// two are held at once: a third, however it is sent, is refused before
     /// the engine or a buffer is involved.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn only_two_snapshot_bodies_are_buffered_at_once() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let consensus = start(&runtime, loopback()).await;
         let (x_id, requester) = stranger(&runtime, &consensus).await;
         let vote = Vote::new_committed(1, x_id);
@@ -685,7 +705,7 @@ mod tests {
         let second = open_snapshot(&requester, vote).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let third = send(
             &requester,
             &Rpc::Snapshot {
@@ -707,9 +727,14 @@ mod tests {
     /// A snapshot under a vote the engine would refuse is answered with the
     /// vote the node holds, before any of its body is read: the sender never
     /// sends one here, and the answer still comes.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_snapshot_under_a_stale_vote_is_answered_without_its_body() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let consensus = start(&runtime, loopback()).await;
         let (x_id, requester) = stranger(&runtime, &consensus).await;
 
@@ -749,9 +774,14 @@ mod tests {
     /// sent by a learner, is refused before the engine sees it. openraft
     /// follows a higher vote whoever sent it, so a learner that named itself
     /// would otherwise unseat the leader and commit entries as its own.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_learner_cannot_vote_or_lead() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let voter = start(&runtime, loopback()).await;
         voter.bootstrap().await.expect("bootstrap");
         leads(&voter).await;
@@ -831,8 +861,9 @@ mod tests {
     /// request is dropped instead of waiting. None of it touches what a
     /// member needs: the member's forwarded write is served beside them,
     /// from handler permits the outsider never held.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn stalled_outsider_refusals_do_not_keep_a_member_from_being_served() {
+        let net = weida::SimNet::new();
         fn quick() -> ConsensusConfig {
             let mut config = loopback();
             config.heartbeat_interval = Duration::from_millis(100);
@@ -841,7 +872,11 @@ mod tests {
             config.max_concurrent_rpcs = 2;
             config
         }
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let leader = start(&runtime, quick()).await;
         leader.bootstrap().await.expect("bootstrap");
         leads(&leader).await;
@@ -851,14 +886,18 @@ mod tests {
             .await
             .expect("add the member");
         let id = leader.id();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while member.leader() != Some(id) {
-            assert!(Instant::now() < deadline, "the member never saw the leader");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the member never saw the leader"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         // The outsider takes nothing it is sent beyond a few bytes.
         let outsider = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
             limits: Limits {
                 stream_receive_window: 1,
                 ..Limits::default()
@@ -880,7 +919,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The pool is spent: the next outsider is not queued behind it.
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let dropped = send(&requester, &vote_by(x_id)).await;
         assert!(
             matches!(dropped, Err(weida::Error::NoReply)),
@@ -981,110 +1020,116 @@ mod tests {
             .is_err()
     }
 
-    /// A peer that says "the leader is over there" is naming a node, and it
-    /// is not the authority on where that node lives: the follower resolves
-    /// the name through the membership its own group agreed on. A redirect
-    /// that names a listed node at another address is followed to the listed
-    /// address; one that names a node the follower does not list is not
-    /// followed at all, and nothing is sent to the address it wrote.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_redirect_is_followed_by_name_and_never_by_the_address_it_carries() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let follower = start(&runtime, loopback()).await;
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        // The leader the follower is told of is a script. It is made known to
-        // the follower the way a real leader is: an append that carries the
-        // membership naming it, sent under its own key.
-        let identity = Identity::generate().expect("identity of the leader");
-        let s_id = NodeId::from(identity.fingerprint().expect("fingerprint"));
-        let (trap_socket, trap_of_s) = trap(s_id).await;
-        let u_id = NodeId([0x55; 32]);
-        let (stray_socket, trap_of_u) = trap(u_id).await;
-        let redirect = |node: &Node| {
-            codec::encode_forward_outcome(&ForwardOutcome::ForwardToLeader(Some(node.clone())))
-        };
-        let answered = codec::encode_forward_outcome(&ForwardOutcome::Done(Done::Written(
-            Response(b"ok".to_vec()),
-        )));
-        let script = scripted(
-            &runtime,
-            identity.clone(),
-            vec![redirect(&trap_of_s), answered, redirect(&trap_of_u)],
-        )
-        .await;
+        /// A peer that says "the leader is over there" is naming a node, and it
+        /// is not the authority on where that node lives: the follower resolves
+        /// the name through the membership its own group agreed on. A redirect
+        /// that names a listed node at another address is followed to the listed
+        /// address; one that names a node the follower does not list is not
+        /// followed at all, and nothing is sent to the address it wrote.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_redirect_is_followed_by_name_and_never_by_the_address_it_carries() {
+            let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+            let follower = start(&runtime, loopback()).await;
 
-        let requester = runtime.requester(
-            ClientTls::new(Trust::by_address())
-                .with_identity(identity)
-                .with_alpn(Alpn::Raft),
-        );
-        requester
-            .connect(&follower.node().url)
-            .await
-            .expect("connect");
-        let first = LogId::new(CommittedLeaderId::new(1, s_id), 0);
-        let membership = Membership::new(
-            vec![BTreeSet::from([s_id])],
-            BTreeMap::from([
-                (s_id, script.node.clone()),
-                (follower.id(), follower.node().clone()),
-            ]),
-        );
-        let append = Rpc::AppendEntries(AppendEntriesRequest {
-            vote: Vote::new_committed(1, s_id),
-            prev_log_id: None,
-            entries: vec![Entry {
-                log_id: first,
-                payload: EntryPayload::Membership(membership),
-            }],
-            leader_commit: Some(first),
-        });
-        let reply = send(&requester, &append).await.expect("an append");
-        codec::decode_append_response(&reply).expect("an AppendEntriesResponse");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while follower.leader() != Some(s_id) {
-            assert!(
-                Instant::now() < deadline,
-                "the follower never saw its leader"
+            // The leader the follower is told of is a script. It is made known to
+            // the follower the way a real leader is: an append that carries the
+            // membership naming it, sent under its own key.
+            let identity = Identity::generate().expect("identity of the leader");
+            let s_id = NodeId::from(identity.fingerprint().expect("fingerprint"));
+            let (trap_socket, trap_of_s) = trap(s_id).await;
+            let u_id = NodeId([0x55; 32]);
+            let (stray_socket, trap_of_u) = trap(u_id).await;
+            let redirect = |node: &Node| {
+                codec::encode_forward_outcome(&ForwardOutcome::ForwardToLeader(Some(node.clone())))
+            };
+            let answered = codec::encode_forward_outcome(&ForwardOutcome::Done(Done::Written(
+                Response(b"ok".to_vec()),
+            )));
+            let script = scripted(
+                &runtime,
+                identity.clone(),
+                vec![redirect(&trap_of_s), answered, redirect(&trap_of_u)],
+            )
+            .await;
+
+            let requester = runtime.requester(
+                ClientTls::new(Trust::by_address())
+                    .with_identity(identity)
+                    .with_alpn(Alpn::Raft),
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            requester
+                .connect(&follower.node().url)
+                .await
+                .expect("connect");
+            let first = LogId::new(CommittedLeaderId::new(1, s_id), 0);
+            let membership = Membership::new(
+                vec![BTreeSet::from([s_id])],
+                BTreeMap::from([
+                    (s_id, script.node.clone()),
+                    (follower.id(), follower.node().clone()),
+                ]),
+            );
+            let append = Rpc::AppendEntries(AppendEntriesRequest {
+                vote: Vote::new_committed(1, s_id),
+                prev_log_id: None,
+                entries: vec![Entry {
+                    log_id: first,
+                    payload: EntryPayload::Membership(membership),
+                }],
+                leader_commit: Some(first),
+            });
+            let reply = send(&requester, &append).await.expect("an append");
+            codec::decode_append_response(&reply).expect("an AppendEntriesResponse");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while follower.leader() != Some(s_id) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the follower never saw its leader"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            // Told "the leader is S, at the trap", it asks S where the group
+            // lists it, and is answered there.
+            let written = tokio::time::timeout(
+                Duration::from_secs(10),
+                follower.write(Request(b"one".to_vec())),
+            )
+            .await
+            .expect("the write finished")
+            .expect("followed to S by its listed address");
+            assert_eq!(written.0, b"ok");
+            assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+            assert!(
+                untouched(&trap_socket).await,
+                "the written address was dialled"
+            );
+
+            // Told "the leader is U", which it does not list, it follows nothing.
+            let refused = tokio::time::timeout(
+                Duration::from_secs(10),
+                follower.write(Request(b"two".to_vec())),
+            )
+            .await
+            .expect("the write finished");
+            assert!(matches!(refused, Err(Error::NoLeader)), "{refused:?}");
+            assert_eq!(
+                script.requests.load(Ordering::SeqCst),
+                3,
+                "only the first hop of the second write was made"
+            );
+            assert!(
+                untouched(&stray_socket).await,
+                "a node nobody listed was dialled"
+            );
+
+            script.task.abort();
+            follower.shutdown().await;
         }
-
-        // Told "the leader is S, at the trap", it asks S where the group
-        // lists it, and is answered there.
-        let written = tokio::time::timeout(
-            Duration::from_secs(10),
-            follower.write(Request(b"one".to_vec())),
-        )
-        .await
-        .expect("the write finished")
-        .expect("followed to S by its listed address");
-        assert_eq!(written.0, b"ok");
-        assert_eq!(script.requests.load(Ordering::SeqCst), 2);
-        assert!(
-            untouched(&trap_socket).await,
-            "the written address was dialled"
-        );
-
-        // Told "the leader is U", which it does not list, it follows nothing.
-        let refused = tokio::time::timeout(
-            Duration::from_secs(10),
-            follower.write(Request(b"two".to_vec())),
-        )
-        .await
-        .expect("the write finished");
-        assert!(matches!(refused, Err(Error::NoLeader)), "{refused:?}");
-        assert_eq!(
-            script.requests.load(Ordering::SeqCst),
-            3,
-            "only the first hop of the second write was made"
-        );
-        assert!(
-            untouched(&stray_socket).await,
-            "a node nobody listed was dialled"
-        );
-
-        script.task.abort();
-        follower.shutdown().await;
     }
 }

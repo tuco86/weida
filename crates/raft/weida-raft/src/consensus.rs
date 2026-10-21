@@ -867,9 +867,14 @@ mod tests {
 
     /// `stopped` stays pending while the engine runs and fires with
     /// `Error::Raft` once a storage failure ends it.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_store_failure_stops_the_engine_and_stopped_fires() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let store = MemoryStore::default();
         let fail = Arc::new(AtomicBool::new(false));
         let log = FailingLog {
@@ -886,9 +891,9 @@ mod tests {
         .await
         .expect("start");
         consensus.bootstrap().await.expect("bootstrap");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while consensus.leader() != Some(consensus.id()) {
-            assert!(Instant::now() < deadline, "the node never led");
+            assert!(tokio::time::Instant::now() < deadline, "the node never led");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         consensus
@@ -978,10 +983,14 @@ mod tests {
     /// A learner of `leader`, added without the promotion `add_node` would
     /// make, that replicates, and is then stopped. The leader still counts it
     /// as replicating: what it knows is what the learner last matched.
-    async fn a_learner_that_replicated_and_left(leader: &Consensus) -> Gone {
+    async fn a_learner_that_replicated_and_left(net: &weida::SimNet, leader: &Consensus) -> Gone {
         let identity = Identity::generate().expect("identity");
         let store = MemoryStore::default();
-        let node_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let node_runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let node = Consensus::start(
             &node_runtime,
             identity.clone(),
@@ -1047,13 +1056,18 @@ mod tests {
     /// two learners that were replicating are gone — and the caller gives up;
     /// once they are back the change must end uniform without anybody asking
     /// again.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_change_of_voters_whose_caller_gave_up_still_ends_uniform() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let a = leader(&runtime).await;
 
-        let first = a_learner_that_replicated_and_left(&a).await;
-        let second = a_learner_that_replicated_and_left(&a).await;
+        let first = a_learner_that_replicated_and_left(&net, &a).await;
+        let second = a_learner_that_replicated_and_left(&net, &a).await;
 
         // A third node that never answers, so the call has something to add:
         // it promotes the two that are gone and waits for the first entry to
@@ -1071,12 +1085,16 @@ mod tests {
         assert_eq!(configs(&a).await, 2, "the joint configuration is appended");
 
         // They come back; nobody asks again.
-        let back_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let back_runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let back = comes_back(&first, &back_runtime).await;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while configs(&a).await != 1 {
             assert!(
-                Instant::now() < deadline,
+                tokio::time::Instant::now() < deadline,
                 "the change that its caller gave up on was never ended"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1094,11 +1112,16 @@ mod tests {
     /// The next membership change finds it and ends it first: here a
     /// removal of a node that is not a member, which changes nothing of its
     /// own.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn the_next_change_ends_a_joint_configuration_it_finds() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let a = leader(&runtime).await;
-        let gone = a_learner_that_replicated_and_left(&a).await;
+        let gone = a_learner_that_replicated_and_left(&net, &a).await;
 
         // The first entry of a change that makes the learner a voter; it
         // cannot commit with the learner away, and the caller leaves before
@@ -1117,7 +1140,11 @@ mod tests {
 
         // The learner is back and the first entry commits; nothing proposes
         // the second.
-        let back_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let back_runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let back = comes_back(&gone, &back_runtime).await;
         let joint = a.ops.raft.metrics().borrow().last_log_index;
         a.ops
@@ -1220,9 +1247,14 @@ mod tests {
     /// forwarder's cap, so its own caller is refused as a forwarded one is,
     /// where it used to return the answer to itself and fail the follower
     /// with an error that read as a transport failure.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn an_answer_a_forwarder_could_not_take_is_refused_on_every_node() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let node = |runtime: &Runtime| {
             let runtime = runtime.clone();
             async move {
@@ -1246,16 +1278,16 @@ mod tests {
         };
         let a = node(&runtime).await;
         a.bootstrap().await.expect("bootstrap");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while a.leader() != Some(a.id()) {
-            assert!(Instant::now() < deadline, "the node never led");
+            assert!(tokio::time::Instant::now() < deadline, "the node never led");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let b = node(&runtime).await;
         a.add_node(b.node().clone()).await.expect("add the learner");
         while b.leader() != Some(a.id()) {
             assert!(
-                Instant::now() < deadline,
+                tokio::time::Instant::now() < deadline,
                 "the learner never saw the leader"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;

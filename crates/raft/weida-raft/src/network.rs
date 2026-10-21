@@ -520,9 +520,14 @@ mod tests {
     /// its cap and refuse it, at every retry. It is refused where it is
     /// offered, before the peer is even dialled, as a failure openraft backs
     /// off from.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_snapshot_over_the_cap_is_not_streamed() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let mut config = loopback();
         config.max_snapshot_bytes = 1024;
         let (mut network, id, _metrics) = network(&runtime, config);
@@ -564,9 +569,14 @@ mod tests {
     /// the follower stops the request half as it gives it. A snapshot larger
     /// than the stream window is still being written then, so the answer is
     /// read while the write goes on, not after it.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_stale_vote_answer_reaches_a_leader_still_writing_the_body() {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let net = weida::SimNet::new();
+        let runtime = Runtime::new(RuntimeConfig {
+            network: weida::Network::sim(&net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let store = MemoryStore::default();
         let follower = Consensus::start(
             &runtime,
