@@ -1455,3 +1455,53 @@ async fn consumer_ids_are_never_reused_across_connections() {
         "a consumer id was handed out twice"
     );
 }
+
+/// A cursor is never load-bearing (`Reporter::report`), so a sender that
+/// orders a report and then grants no stream to carry it cannot hold the
+/// receiving application: its `report` and `finish` return, and the report
+/// is over, as it is for any other transport failure.
+#[tokio::test]
+async fn a_report_to_a_sender_that_grants_no_stream_does_not_hold_the_receiver() {
+    let limits = weida::Limits {
+        header_timeout_ms: 300,
+        ..weida::Limits::default()
+    };
+    let server = Server::start_os_with_config(RuntimeConfig {
+        limits,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+
+    // The server may open no unidirectional stream towards this peer.
+    let mut config = raw::client_config(&server.certs);
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    config.transport_config(Arc::new(transport));
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = bounded(
+        endpoint
+            .connect_with(config, server.addr, "127.0.0.1")
+            .expect("connect"),
+    )
+    .await
+    .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    let processed = weida::CursorLevel::Known(weida::Acknowledgement::Processed);
+    let header = DataHeader {
+        report_id: Some(1),
+        report: vec![processed],
+        ..DataHeader::addressed("/jobs")
+    };
+    let mut frame = encode_frame(FrameKind::Data, &header.encode());
+    frame.extend_from_slice(b"work");
+    raw::send_raw(&conn, &frame).await;
+
+    let transfer = bounded(puller.recv()).await.expect("recv");
+    let mut reporter = transfer.reporter().expect("the sender ordered a report");
+    bounded(reporter.report(processed, 4))
+        .await
+        .expect("a report never fails for a transport reason");
+    bounded(reporter.finish()).await.expect("finish");
+}

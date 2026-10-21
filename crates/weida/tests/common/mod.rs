@@ -623,6 +623,15 @@ pub mod raw {
 
     /// A client endpoint trusting `certs` and offering the weida ALPN.
     pub fn client_endpoint(certs: &Certs) -> quinn::Endpoint {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(client_config(certs));
+        endpoint
+    }
+
+    /// The configuration [`client_endpoint`] dials with, for a test that
+    /// changes its transport parameters and dials with `connect_with`.
+    pub fn client_config(certs: &Certs) -> quinn::ClientConfig {
         let mut roots = quinn::rustls::RootCertStore::empty();
         for cert in CertificateDer::pem_slice_iter(certs.cert.as_bytes()) {
             roots.add(cert.expect("parse cert")).expect("add root");
@@ -633,14 +642,9 @@ pub mod raw {
             .with_root_certificates(Arc::new(roots))
             .with_no_client_auth();
         crypto.alpn_protocols = vec![weida_protocol::ALPN.to_vec()];
-        let config = quinn::ClientConfig::new(Arc::new(
+        quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic crypto"),
-        ));
-
-        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
-            .expect("client endpoint");
-        endpoint.set_default_client_config(config);
-        endpoint
+        ))
     }
 
     /// A server configuration for one identity.

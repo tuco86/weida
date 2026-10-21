@@ -34,7 +34,7 @@ use weida_core::Error;
 use weida_protocol::header::MAX_CURSOR_RECORD_LEN;
 use weida_protocol::header::limits::MAX_REPORT_LEVELS;
 use weida_protocol::{
-    CursorHeader, CursorLevel, FrameKind, ReportMode, encode_cursor_record, encode_preamble,
+    CursorHeader, CursorLevel, FrameKind, ReportMode, codes, encode_cursor_record, encode_preamble,
 };
 
 use crate::conn::ConnHandle;
@@ -506,6 +506,11 @@ impl Reporter {
     /// Records what was written and when, which is what the granularity is
     /// measured against — and what makes a `finish` after a fresh record
     /// write nothing rather than a duplicate.
+    ///
+    /// The open and each write wait at most `header_timeout_ms`: the stream
+    /// credit and the flow control they wait on are the sender's to grant,
+    /// and a cursor is never load-bearing, so a sender that withholds them
+    /// ends the report rather than holding the application.
     async fn emit(&mut self, slot: usize, offset: u64) {
         if self.broken {
             return;
@@ -521,21 +526,44 @@ impl Reporter {
             tracing::debug!(error = %e, "a cursor level has no wire representation");
             return;
         }
+        let deadline = Duration::from_millis(self.conn.limits.header_timeout_ms);
         if self.stream.is_none() {
-            match self.open().await {
-                Ok(stream) => self.stream = Some(stream),
-                Err(e) => {
+            match self.conn.exec.within(deadline, self.open()).await {
+                Some(Ok(stream)) => self.stream = Some(stream),
+                Some(Err(e)) => {
                     tracing::debug!(error = %e, "failed to open a cursor stream");
+                    self.broken = true;
+                    return;
+                }
+                None => {
+                    tracing::debug!("the sender granted no cursor stream in time");
                     self.broken = true;
                     return;
                 }
             }
         }
         let stream = self.stream.as_mut().expect("opened just above");
-        if let Err(e) = stream.write_all(&record).await {
-            tracing::debug!(error = %e, "failed to write a cursor record");
-            self.broken = true;
-            return;
+        match self
+            .conn
+            .exec
+            .within(deadline, stream.write_all(&record))
+            .await
+        {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                tracing::debug!(error = %e, "failed to write a cursor record");
+                self.broken = true;
+                return;
+            }
+            None => {
+                // Part of the record may be queued: a reset, not a FIN, so
+                // the sender never reads a record cut short.
+                tracing::debug!("the sender took no cursor record in time");
+                stream.reset(codes::CANCELED);
+                self.stream = None;
+                self.broken = true;
+                return;
+            }
         }
         if let Some(entry) = self.pending[slot].as_mut() {
             entry.emitted = Some(offset);
