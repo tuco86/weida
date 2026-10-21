@@ -279,7 +279,7 @@ mod tests {
         producer.offer("next", 1).expect("the queue is empty again");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn space_completes_when_the_consumer_takes_enough() {
         let (producer, mut consumer) = channel(8, 100);
         producer.offer(1u8, 90).expect("room");
@@ -345,7 +345,7 @@ mod tests {
 
     /// `next` is dropped mid-wait routinely (a receive with a deadline), and
     /// must not lose what arrives afterwards.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_cancelled_next_loses_nothing() {
         let (producer, mut consumer) = channel(8, 100);
         assert!(

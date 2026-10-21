@@ -4,14 +4,22 @@
 
 mod harness;
 
-mod blocking;
 mod connection;
-mod hardening;
-mod interop_mqtt5;
-mod interop_rumqttd;
-mod qos;
 mod retain_will;
-mod session;
-mod shared_alias_reqrep;
-mod subscriptions;
 mod tls_auth;
+
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    mod blocking;
+    mod connection;
+    mod hardening;
+    mod interop_mqtt5;
+    mod interop_rumqttd;
+    mod qos;
+    mod retain_will;
+    mod session;
+    mod shared_alias_reqrep;
+    mod subscriptions;
+    mod tls_auth;
+}

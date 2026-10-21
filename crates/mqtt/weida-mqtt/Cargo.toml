@@ -49,6 +49,8 @@ futures = { workspace = true, optional = true }
 # Drives the owned-context tests from an executor that is not tokio, which is
 # what `Context::owned` exists for.
 futures.workspace = true
+# `start_paused` for the tests that wait on a timer.
+tokio = { workspace = true, features = ["test-util"] }
 # A certificate for the TLS tests. The trust anchors are the caller's
 # everywhere else; here the test is the caller.
 rcgen.workspace = true

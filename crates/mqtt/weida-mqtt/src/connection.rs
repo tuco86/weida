@@ -1041,147 +1041,6 @@ mod tests {
         ));
     }
 
-    /// Several packets in one read come out one at a time, in order, and each
-    /// is its own bytes: cutting one off the buffer leaves the rest where it
-    /// was.
-    #[tokio::test]
-    async fn packets_in_one_read_come_out_whole_and_in_order() {
-        let (mut reader, _writer, mut peer) = connected().await;
-        let mut wire = Vec::new();
-        for topic in ["a", "bb", "ccc"] {
-            wire.extend(encoded(&Packet::Publish(Publish {
-                topic,
-                payload: topic.as_bytes(),
-                ..Publish::default()
-            })));
-        }
-        wire.extend(encoded(&Packet::Pingresp));
-        peer.write_all(&wire).await.expect("writes");
-
-        for topic in ["a", "bb", "ccc"] {
-            let bytes = bounded(reader.next()).await.expect("a packet");
-            let (Packet::Publish(publish), used) =
-                Packet::decode(bytes, Limits::MAX_PACKET_SIZE).expect("decodes")
-            else {
-                panic!("a publish");
-            };
-            assert_eq!((publish.topic, publish.payload), (topic, topic.as_bytes()));
-            assert_eq!(used, bytes.len(), "the packet is exactly its own bytes");
-        }
-        let bytes = bounded(reader.next()).await.expect("the ping");
-        assert_eq!(bytes, [0xD0, 0x00]);
-    }
-
-    /// A declaration above the cap is refused from the fixed header, with
-    /// nothing reserved for it.
-    #[tokio::test]
-    async fn a_declaration_above_the_cap_is_refused_before_a_body_arrives() {
-        let (mut reader, _writer, mut peer) = connected().await;
-        reader.max_packet_size = 1024;
-        // PUBLISH declaring 268,435,455 bytes, and not one of them sent.
-        peer.write_all(&[0x30, 0xFF, 0xFF, 0xFF, 0x7F])
-            .await
-            .expect("writes");
-        let error = bounded(reader.next()).await.expect_err("refused");
-        assert!(matches!(error, Error::Protocol(_)), "{error}");
-        assert!(reader.buf.capacity() < 64 * 1024, "nothing was reserved");
-    }
-
-    /// One packet near the cap must not leave its allocation behind for the
-    /// life of the connection: a hostile peer can send one at will, and the
-    /// doubling that grew the buffer for it would otherwise be kept.
-    #[tokio::test]
-    async fn a_large_packet_does_not_pin_the_receive_buffer() {
-        let (mut reader, _writer, mut peer) = connected().await;
-        let big = vec![7u8; 1024 * 1024];
-        let mut wire = encoded(&Packet::Publish(Publish {
-            topic: "t",
-            payload: &big,
-            ..Publish::default()
-        }));
-        for _ in 0..10 {
-            wire.extend(encoded(&Packet::Pingresp));
-        }
-        let sender = tokio::spawn(async move { peer.write_all(&wire).await.map(|()| peer) });
-
-        {
-            let packet = bounded(reader.next()).await.expect("the large packet");
-            assert!(packet.len() > 1024 * 1024);
-        }
-        for _ in 0..10 {
-            bounded(reader.next()).await.expect("a ping");
-        }
-        assert!(
-            reader.buf.capacity() <= 64 * 1024,
-            "the buffer holds {} bytes after the large packet is gone",
-            reader.buf.capacity()
-        );
-        let _peer = bounded(sender).await.expect("task").expect("written");
-    }
-
-    /// The outbox is the same on a plain socket and on TLS: what `queue`
-    /// encodes, `step` delivers, in order, and the counters say so.
-    #[tokio::test]
-    async fn queued_packets_reach_the_peer_in_order_and_are_confirmed() {
-        let (_reader, mut writer, mut peer) = connected().await;
-        assert!(!writer.has_work());
-        let first = writer.queue(&Packet::Pingreq).expect("queues");
-        let second = writer.queue(&Packet::Pingreq).expect("queues");
-        assert_eq!((first, second), (2, 4));
-        assert!(writer.has_work());
-        assert_eq!(writer.confirmed(), 0, "nothing is written by queueing");
-
-        bounded(writer.drain()).await.expect("drains");
-        assert!(!writer.has_work());
-        assert_eq!(
-            (writer.queued(), writer.written(), writer.confirmed()),
-            (4, 4, 4)
-        );
-
-        let mut received = [0u8; 4];
-        bounded(peer.read_exact(&mut received))
-            .await
-            .expect("reads");
-        assert_eq!(received, [0xC0, 0x00, 0xC0, 0x00]);
-    }
-
-    /// A packet over the server's ceiling is refused without touching the
-    /// outbox, so the stream stays intact and the connection stays up: the
-    /// failure is the packet's and not the transport's.
-    #[tokio::test]
-    async fn a_packet_over_the_ceiling_leaves_the_outbox_alone() {
-        let (_reader, mut writer, mut peer) = connected().await;
-        writer.set_ceiling(64);
-        writer.queue(&Packet::Pingreq).expect("fits");
-
-        let big = vec![0u8; 200];
-        let error = writer
-            .queue(&Packet::Publish(Publish {
-                topic: "t",
-                payload: &big,
-                ..Publish::default()
-            }))
-            .expect_err("over the ceiling");
-        assert!(
-            matches!(
-                error,
-                Error::Encode(EncodeError::PacketTooLarge { max: 64, .. })
-            ),
-            "{error}"
-        );
-        assert_eq!(writer.queued(), 2, "only the ping is queued");
-
-        writer
-            .queue(&Packet::Pingreq)
-            .expect("and the next one fits");
-        bounded(writer.drain()).await.expect("drains");
-        let mut received = [0u8; 4];
-        bounded(peer.read_exact(&mut received))
-            .await
-            .expect("reads");
-        assert_eq!(received, [0xC0, 0x00, 0xC0, 0x00], "no half packet between");
-    }
-
     /// A connection whose socket buffers are a few kilobytes, so that a peer
     /// that does not read stalls a write of any real size at once and on any
     /// machine, whatever its TCP autotuning does.
@@ -1202,55 +1061,197 @@ mod tests {
         (Writer::new(write_half), accepted.expect("accepts").0)
     }
 
-    /// A peer that stops reading stops one `step`, and `step` is cancel-safe:
-    /// dropped mid-wait it loses nothing, and a later one carries on.
-    #[tokio::test]
-    async fn a_step_that_waits_for_the_peer_can_be_dropped_and_resumed() {
-        let (mut writer, peer) = stalling().await;
-        // Far more than the two socket buffers hold, so the write must wait.
-        let big = vec![1u8; 4 * 1024 * 1024];
-        let queued = writer
-            .queue(&Packet::Publish(Publish {
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Several packets in one read come out one at a time, in order, and each
+        /// is its own bytes: cutting one off the buffer leaves the rest where it
+        /// was.
+        #[tokio::test]
+        async fn packets_in_one_read_come_out_whole_and_in_order() {
+            let (mut reader, _writer, mut peer) = connected().await;
+            let mut wire = Vec::new();
+            for topic in ["a", "bb", "ccc"] {
+                wire.extend(encoded(&Packet::Publish(Publish {
+                    topic,
+                    payload: topic.as_bytes(),
+                    ..Publish::default()
+                })));
+            }
+            wire.extend(encoded(&Packet::Pingresp));
+            peer.write_all(&wire).await.expect("writes");
+
+            for topic in ["a", "bb", "ccc"] {
+                let bytes = bounded(reader.next()).await.expect("a packet");
+                let (Packet::Publish(publish), used) =
+                    Packet::decode(bytes, Limits::MAX_PACKET_SIZE).expect("decodes")
+                else {
+                    panic!("a publish");
+                };
+                assert_eq!((publish.topic, publish.payload), (topic, topic.as_bytes()));
+                assert_eq!(used, bytes.len(), "the packet is exactly its own bytes");
+            }
+            let bytes = bounded(reader.next()).await.expect("the ping");
+            assert_eq!(bytes, [0xD0, 0x00]);
+        }
+        /// A declaration above the cap is refused from the fixed header, with
+        /// nothing reserved for it.
+        #[tokio::test]
+        async fn a_declaration_above_the_cap_is_refused_before_a_body_arrives() {
+            let (mut reader, _writer, mut peer) = connected().await;
+            reader.max_packet_size = 1024;
+            // PUBLISH declaring 268,435,455 bytes, and not one of them sent.
+            peer.write_all(&[0x30, 0xFF, 0xFF, 0xFF, 0x7F])
+                .await
+                .expect("writes");
+            let error = bounded(reader.next()).await.expect_err("refused");
+            assert!(matches!(error, Error::Protocol(_)), "{error}");
+            assert!(reader.buf.capacity() < 64 * 1024, "nothing was reserved");
+        }
+        /// One packet near the cap must not leave its allocation behind for the
+        /// life of the connection: a hostile peer can send one at will, and the
+        /// doubling that grew the buffer for it would otherwise be kept.
+        #[tokio::test]
+        async fn a_large_packet_does_not_pin_the_receive_buffer() {
+            let (mut reader, _writer, mut peer) = connected().await;
+            let big = vec![7u8; 1024 * 1024];
+            let mut wire = encoded(&Packet::Publish(Publish {
                 topic: "t",
                 payload: &big,
                 ..Publish::default()
-            }))
-            .expect("queues");
-
-        // Steps until one has to wait; each that completes took some bytes.
-        let mut waited = false;
-        for _ in 0..1000 {
-            if tokio::time::timeout(Duration::from_millis(100), writer.step())
-                .await
-                .is_err()
-            {
-                waited = true;
-                break;
+            }));
+            for _ in 0..10 {
+                wire.extend(encoded(&Packet::Pingresp));
             }
-        }
-        assert!(
-            waited,
-            "the peer is not reading, so a step must come to wait"
-        );
-        assert!(writer.has_work());
-        assert!(writer.written() < queued, "not all of it went");
-        assert_eq!(writer.confirmed(), 0, "and none of it is confirmed");
+            let sender = tokio::spawn(async move { peer.write_all(&wire).await.map(|()| peer) });
 
-        // The peer starts reading, and the same writer finishes the packet.
-        let reader = tokio::spawn(async move {
-            let mut peer = peer;
-            let mut sink = vec![0u8; 1 << 20];
-            let mut total = 0u64;
-            while total < queued {
-                match peer.read(&mut sink).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => total += n as u64,
+            {
+                let packet = bounded(reader.next()).await.expect("the large packet");
+                assert!(packet.len() > 1024 * 1024);
+            }
+            for _ in 0..10 {
+                bounded(reader.next()).await.expect("a ping");
+            }
+            assert!(
+                reader.buf.capacity() <= 64 * 1024,
+                "the buffer holds {} bytes after the large packet is gone",
+                reader.buf.capacity()
+            );
+            let _peer = bounded(sender).await.expect("task").expect("written");
+        }
+        /// The outbox is the same on a plain socket and on TLS: what `queue`
+        /// encodes, `step` delivers, in order, and the counters say so.
+        #[tokio::test]
+        async fn queued_packets_reach_the_peer_in_order_and_are_confirmed() {
+            let (_reader, mut writer, mut peer) = connected().await;
+            assert!(!writer.has_work());
+            let first = writer.queue(&Packet::Pingreq).expect("queues");
+            let second = writer.queue(&Packet::Pingreq).expect("queues");
+            assert_eq!((first, second), (2, 4));
+            assert!(writer.has_work());
+            assert_eq!(writer.confirmed(), 0, "nothing is written by queueing");
+
+            bounded(writer.drain()).await.expect("drains");
+            assert!(!writer.has_work());
+            assert_eq!(
+                (writer.queued(), writer.written(), writer.confirmed()),
+                (4, 4, 4)
+            );
+
+            let mut received = [0u8; 4];
+            bounded(peer.read_exact(&mut received))
+                .await
+                .expect("reads");
+            assert_eq!(received, [0xC0, 0x00, 0xC0, 0x00]);
+        }
+        /// A packet over the server's ceiling is refused without touching the
+        /// outbox, so the stream stays intact and the connection stays up: the
+        /// failure is the packet's and not the transport's.
+        #[tokio::test]
+        async fn a_packet_over_the_ceiling_leaves_the_outbox_alone() {
+            let (_reader, mut writer, mut peer) = connected().await;
+            writer.set_ceiling(64);
+            writer.queue(&Packet::Pingreq).expect("fits");
+
+            let big = vec![0u8; 200];
+            let error = writer
+                .queue(&Packet::Publish(Publish {
+                    topic: "t",
+                    payload: &big,
+                    ..Publish::default()
+                }))
+                .expect_err("over the ceiling");
+            assert!(
+                matches!(
+                    error,
+                    Error::Encode(EncodeError::PacketTooLarge { max: 64, .. })
+                ),
+                "{error}"
+            );
+            assert_eq!(writer.queued(), 2, "only the ping is queued");
+
+            writer
+                .queue(&Packet::Pingreq)
+                .expect("and the next one fits");
+            bounded(writer.drain()).await.expect("drains");
+            let mut received = [0u8; 4];
+            bounded(peer.read_exact(&mut received))
+                .await
+                .expect("reads");
+            assert_eq!(received, [0xC0, 0x00, 0xC0, 0x00], "no half packet between");
+        }
+        /// A peer that stops reading stops one `step`, and `step` is cancel-safe:
+        /// dropped mid-wait it loses nothing, and a later one carries on.
+        #[tokio::test]
+        async fn a_step_that_waits_for_the_peer_can_be_dropped_and_resumed() {
+            let (mut writer, peer) = stalling().await;
+            // Far more than the two socket buffers hold, so the write must wait.
+            let big = vec![1u8; 4 * 1024 * 1024];
+            let queued = writer
+                .queue(&Packet::Publish(Publish {
+                    topic: "t",
+                    payload: &big,
+                    ..Publish::default()
+                }))
+                .expect("queues");
+
+            // Steps until one has to wait; each that completes took some bytes.
+            let mut waited = false;
+            for _ in 0..1000 {
+                if tokio::time::timeout(Duration::from_millis(100), writer.step())
+                    .await
+                    .is_err()
+                {
+                    waited = true;
+                    break;
                 }
             }
-            total
-        });
-        bounded(writer.drain()).await.expect("drains");
-        assert_eq!(writer.confirmed(), queued);
-        assert_eq!(bounded(reader).await.expect("task"), queued);
+            assert!(
+                waited,
+                "the peer is not reading, so a step must come to wait"
+            );
+            assert!(writer.has_work());
+            assert!(writer.written() < queued, "not all of it went");
+            assert_eq!(writer.confirmed(), 0, "and none of it is confirmed");
+
+            // The peer starts reading, and the same writer finishes the packet.
+            let reader = tokio::spawn(async move {
+                let mut peer = peer;
+                let mut sink = vec![0u8; 1 << 20];
+                let mut total = 0u64;
+                while total < queued {
+                    match peer.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => total += n as u64,
+                    }
+                }
+                total
+            });
+            bounded(writer.drain()).await.expect("drains");
+            assert_eq!(writer.confirmed(), queued);
+            assert_eq!(bounded(reader).await.expect("task"), queued);
+        }
     }
 }
