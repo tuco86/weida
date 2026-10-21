@@ -13,7 +13,8 @@
 use std::time::Duration;
 
 use weida::{
-    BusMember, Error, Identity, Limits, Listener, Runtime, RuntimeConfig, ServerTls, Trust,
+    BusMember, Error, Identity, Limits, Listener, Network, Runtime, RuntimeConfig, ServerTls,
+    SimNet, Trust,
 };
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
@@ -44,8 +45,14 @@ async fn members_with(n: usize, config: RuntimeConfig) -> Vec<Member> {
     let mut out = Vec::new();
     let mut fingerprints = Vec::new();
     let mut parts = Vec::new();
+    // One simulated network per bus: the members only dial each other.
+    let net = SimNet::new();
     for _ in 0..n {
-        let runtime = Runtime::new(config.clone()).expect("runtime");
+        let runtime = Runtime::new(RuntimeConfig {
+            network: Network::sim(&net),
+            ..config.clone()
+        })
+        .expect("runtime");
         let listener = runtime.listener();
         let identity = Identity::generate().expect("identity");
         let fingerprint = identity.fingerprint().expect("fingerprint");
@@ -124,7 +131,7 @@ async fn every_member_sees_every_other_members_message() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_sender_never_receives_its_own_message() {
     let bus = members(2).await;
     join_all(&bus).await;
@@ -145,7 +152,7 @@ async fn a_sender_never_receives_its_own_message() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dead_member_is_dropped_and_the_others_continue() {
     let mut bus = members(3).await;
     join_all(&bus).await;
@@ -156,8 +163,8 @@ async fn a_dead_member_is_dropped_and_the_others_continue() {
     leaving._runtime.shutdown().await;
 
     // The survivors notice by the peer count falling.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while bus[0].member.peer_count() > 1 && std::time::Instant::now() < deadline {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while bus[0].member.peer_count() > 1 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
@@ -180,8 +187,8 @@ async fn a_dead_member_is_dropped_and_the_others_continue() {
         "one live member, and at most one copy for the member that died: {reached}"
     );
     if reached == 2 {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while bus[0].member.dropped() == 0 && std::time::Instant::now() < deadline {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while bus[0].member.dropped() == 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(

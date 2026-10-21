@@ -142,10 +142,16 @@ impl AddrLease {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn the_client_socket_binds() {
-        let exec = Exec::current().expect("ambient runtime");
-        let endpoint = Network::default().bind_client(&exec).unwrap();
-        assert_ne!(endpoint.local_addr().unwrap().port(), 0);
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[tokio::test]
+        async fn the_client_socket_binds() {
+            let exec = Exec::current().expect("ambient runtime");
+            let endpoint = Network::default().bind_client(&exec).unwrap();
+            assert_ne!(endpoint.local_addr().unwrap().port(), 0);
+        }
     }
 }

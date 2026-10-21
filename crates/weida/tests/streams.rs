@@ -23,17 +23,20 @@ use common::{Certs, Server};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use weida::{Binding, Error, Limits, Listener, LossCause, Runtime, RuntimeConfig, TransferMeta};
+use weida::{
+    Binding, Error, Limits, Listener, LossCause, Network, Runtime, RuntimeConfig, SimNet,
+    TransferMeta,
+};
 
 /// Generous ceiling: everything that must settle settles in milliseconds.
-const DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 
 /// Window used to assert that a future does *not* resolve. Long enough that a
 /// loopback round trip and a Tokio wakeup have happened many times over, short
 /// enough to keep the suite fast.
-const STALL: Duration = Duration::from_millis(300);
+pub(crate) const STALL: Duration = Duration::from_millis(300);
 
-async fn within<F: Future>(f: F) -> F::Output {
+pub(crate) async fn within<F: Future>(f: F) -> F::Output {
     timeout(DEADLINE, f).await.expect("operation timed out")
 }
 
@@ -43,7 +46,7 @@ async fn within<F: Future>(f: F) -> F::Output {
 /// of several probes below: QUIC backpressure lands on `open`, on `write_all`
 /// or on the receipt, and the three are not interchangeable.
 #[derive(Debug, PartialEq, Eq)]
-enum Stage {
+pub(crate) enum Stage {
     Opened,
     Wrote,
     Delivered,
@@ -55,16 +58,20 @@ enum Stage {
 /// `common::Server` generates a fresh certificate per server and only takes
 /// `Limits`; a restart probe needs the *same* certificate on a new port, and
 /// an idle-timeout probe needs a server-side `idle_timeout`.
-struct ManualServer {
-    _runtime: Runtime,
-    listener: Listener,
-    binding: Binding,
-    addr: SocketAddr,
+pub(crate) struct ManualServer {
+    pub(crate) _runtime: Runtime,
+    pub(crate) listener: Listener,
+    pub(crate) binding: Binding,
+    pub(crate) addr: SocketAddr,
 }
 
 impl ManualServer {
-    async fn start(certs: &Certs, config: RuntimeConfig) -> ManualServer {
-        let runtime = Runtime::new(config).expect("runtime");
+    pub(crate) async fn start(net: &SimNet, certs: &Certs, config: RuntimeConfig) -> ManualServer {
+        let runtime = Runtime::new(RuntimeConfig {
+            network: Network::sim(net),
+            ..config
+        })
+        .expect("runtime");
         let listener = runtime.listener();
         let binding = listener
             .bind_quic(
@@ -82,7 +89,7 @@ impl ManualServer {
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("weida://127.0.0.1:{}{}", self.addr.port(), path)
     }
 }
@@ -138,7 +145,7 @@ async fn a_finished_transfer_needs_no_local_handle_to_arrive() {
 /// once it reads, the byte count at which the receipt appears is recorded and
 /// checked against the window bound. `pushpull::push_delivery_receipt` covers
 /// the converse (a payload inside the window resolves before any `recv`).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_receipt_beyond_the_window_implies_the_reader_consumed() {
     const WINDOW: usize = 64 * 1024;
     const TOTAL: usize = WINDOW * 5 / 2;
@@ -246,7 +253,7 @@ async fn a_receipt_beyond_the_window_implies_the_reader_consumed() {
 /// bytes is far below the eighth-of-a-window update threshold. Reading one
 /// eighth releases it. This is the boundary case behind the test above, and
 /// the reason payload sizing must leave the header room.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_payload_the_size_of_the_stream_window_waits_for_the_reader() {
     const WINDOW: usize = 64 * 1024;
 
@@ -307,7 +314,7 @@ async fn a_payload_the_size_of_the_stream_window_waits_for_the_reader() {
 /// until a write stalls, which must happen no later than the 256 KiB
 /// connection window being spent (8 x 32 KiB). Reading A's bytes releases
 /// connection credit and the stalled write completes.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_stream_does_not_block_its_siblings() {
     const STREAM_WINDOW: usize = 64 * 1024;
     const PAYLOAD: usize = 32 * 1024;
@@ -413,7 +420,7 @@ async fn a_stalled_stream_does_not_block_its_siblings() {
 /// write stalls, then sends on `/fast` from the same runtime and the same
 /// endpoint handle. Before one connection per path, that send would have been
 /// behind the very window the filler just spent.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_path_does_not_stall_another_path() {
     const STREAM_WINDOW: usize = 64 * 1024;
     const PAYLOAD: usize = 32 * 1024;
@@ -510,7 +517,7 @@ async fn a_stalled_path_does_not_stall_another_path() {
 /// runs in a task that reports each stage: no stage is reported within
 /// [`STALL`], and a failure would close the channel instead. Reading one
 /// transfer to EOF closes its stream and the third proceeds.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_stream_budget_is_backpressure_not_an_error() {
     let server = Server::start_with_config(RuntimeConfig {
         limits: Limits {
@@ -575,7 +582,7 @@ async fn the_stream_budget_is_backpressure_not_an_error() {
 ///
 /// Same shape as the test above with an eight-deep queue and the same budget of
 /// two: the third transfer still cannot open.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_deeper_endpoint_queue_does_not_raise_the_stream_budget() {
     let server = Server::start_with_config(RuntimeConfig {
         limits: Limits {
@@ -714,11 +721,13 @@ async fn cancel_discards_unread_bytes_and_keeps_read_ones() {
 /// reports it, exactly as before 0031.
 #[tokio::test]
 async fn a_server_that_goes_away_is_reported_as_connection_lost() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let first = ManualServer::start(&certs, RuntimeConfig::default()).await;
+    let first = ManualServer::start(&net, &certs, RuntimeConfig::default()).await;
     let puller = first.listener.puller("/jobs").expect("puller");
 
     let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
         reconnect: weida::ReconnectPolicy::never(),
         ..RuntimeConfig::default()
     })
@@ -761,7 +770,7 @@ async fn a_server_that_goes_away_is_reported_as_connection_lost() {
 
     // A new server, same identity, new port: a new address is a new slot,
     // and the dead one no longer counts.
-    let second = ManualServer::start(&certs, RuntimeConfig::default()).await;
+    let second = ManualServer::start(&net, &certs, RuntimeConfig::default()).await;
     let puller = second.listener.puller("/jobs").expect("puller");
     within(pusher.connect(&second.url("/jobs")))
         .await
@@ -789,10 +798,12 @@ async fn a_server_that_goes_away_is_reported_as_connection_lost() {
 /// the default 10 s keep-alive. One exchange succeeds, then the connection is
 /// left silent for 1.5 s (the single deliberate sleep in this file: the
 /// phenomenon *is* elapsed time), and the next request fails.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn idle_timeout_reports_loss_within_the_window() {
+    let net = SimNet::new();
     let certs = Certs::generate();
     let server = ManualServer::start(
+        &net,
         &certs,
         RuntimeConfig {
             limits: Limits {
@@ -818,7 +829,11 @@ async fn idle_timeout_reports_loss_within_the_window() {
         }
     });
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
     assert!(
         client.config().limits.keep_alive > Duration::from_millis(500),
         "the client's keep-alive must be too slow to save this connection"
@@ -884,7 +899,7 @@ async fn idle_timeout_reports_loss_within_the_window() {
 /// awaiting a reply; the number that completes is recorded, the next one is
 /// shown to block rather than error, and accepting a single request unblocks
 /// it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replier_that_stops_accepting_stalls_requesters_after_the_queue_fills() {
     const BUDGET: usize = 2;
 
@@ -960,20 +975,20 @@ async fn a_replier_that_stops_accepting_stalls_requesters_after_the_queue_fills(
 // --- 9. reordering across streams, and what a reorder buffer costs --------
 
 /// What one arrival order cost an application that wants dispatch order back.
-struct Reorder {
+pub(crate) struct Reorder {
     /// Payload sequence numbers in the order their transfers completed.
-    arrivals: Vec<u64>,
+    pub(crate) arrivals: Vec<u64>,
     /// Arrivals that did not land at their dispatch position.
-    out_of_order: usize,
+    pub(crate) out_of_order: usize,
     /// Most transfers an application-side reorder buffer held at once.
-    peak_held: usize,
+    pub(crate) peak_held: usize,
     /// Dispatch position at which the arrival order first diverges, if it does.
-    first_divergence: Option<usize>,
+    pub(crate) first_divergence: Option<usize>,
 }
 
 /// How the reverse-order FINs are released.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Finish {
+pub(crate) enum Finish {
     /// All FINs queued back to back, which is what an application does.
     Batched,
     /// Each FIN awaited to its transport receipt before the next is queued, so
@@ -997,7 +1012,7 @@ enum Finish {
 /// — arrivals out of dispatch position, and the peak the buffer held — are
 /// recorded in `docs/IMPLEMENTATION.md`, because QUIC promises no ordering
 /// across streams and a test that pinned one would pin an accident.
-async fn reorder_probe(n: usize, finish: Finish) -> Reorder {
+pub(crate) async fn reorder_probe(n: usize, finish: Finish) -> Reorder {
     let server = Server::start_with_config(RuntimeConfig {
         endpoint_queue: n + 1,
         ..RuntimeConfig::default()
@@ -1122,51 +1137,3 @@ async fn reverse_order_completion_measures_the_reorder_buffer() {
 }
 
 // --- expiry ----------------------------------------------------------------
-
-/// Claim: a transfer given a deadline is reset with `CANCELED` when its bytes
-/// are not acknowledged by then (0034 §4.3). The sender's blocked write fails
-/// with `Expired`, the reader sees `Canceled` rather than EOF, and the runtime
-/// counts the expiry apart from a cancel.
-///
-/// The reader holds its transfer unread, so a 64 KiB stream window stalls a
-/// 1 MiB write long before the deadline.
-#[tokio::test]
-async fn a_transfer_past_its_deadline_is_reset() {
-    let server = Server::start_with(Limits {
-        stream_receive_window: 64 * 1024,
-        ..Limits::default()
-    })
-    .await;
-    let acceptor = server.listener.acceptor("/slow").expect("acceptor");
-    let client = server.client_runtime();
-    let peer = client.peer(server.trust());
-    within(peer.connect(&server.url("/slow")))
-        .await
-        .expect("connect");
-
-    let mut transfer = within(peer.open(TransferMeta::default()))
-        .await
-        .expect("open");
-    let started = std::time::Instant::now();
-    transfer.expire_at(started + Duration::from_millis(300));
-    let held = match within(acceptor.accept()).await.expect("accept") {
-        weida::Incoming::Stream(held) => held,
-        other => panic!("expected a stream, got {other:?}"),
-    };
-
-    let failed = within(transfer.write_all(&vec![0x5a; 1 << 20]))
-        .await
-        .expect_err("the window stalls the write past its deadline");
-    let took = started.elapsed();
-    assert!(matches!(failed, Error::Expired), "{failed:?}");
-    assert!(
-        took >= Duration::from_millis(300) && took < Duration::from_secs(3),
-        "expired after {took:?}"
-    );
-    assert!(!failed.is_definite_failure());
-
-    let read = within(held.collect(2 << 20)).await;
-    assert!(matches!(read, Err(Error::Canceled)), "{read:?}");
-    assert_eq!(client.expired_transfers(), 1);
-    client.shutdown().await;
-}

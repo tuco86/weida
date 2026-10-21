@@ -99,7 +99,7 @@ fn is_refused(error: &quinn::ConnectionError) -> bool {
 /// then closed, and the binding spent no handshake on it.
 #[tokio::test]
 async fn a_binding_at_its_connection_limit_refuses_before_the_handshake() {
-    let server = Server::start_with_config(RuntimeConfig {
+    let server = Server::start_os_with_config(RuntimeConfig {
         max_connections: 1,
         ..RuntimeConfig::default()
     })
@@ -145,7 +145,7 @@ async fn a_binding_at_its_connection_limit_refuses_before_the_handshake() {
 /// Initial is refused before any TLS state is built for it.
 #[tokio::test]
 async fn handshakes_in_progress_are_capped() {
-    let server = Server::start_with_config(RuntimeConfig {
+    let server = Server::start_os_with_config(RuntimeConfig {
         max_handshakes: 2,
         // Retry off, so that the two Initials below are accepted and held.
         retry_above_handshakes: usize::MAX,
@@ -189,7 +189,7 @@ async fn handshakes_in_progress_are_capped() {
 /// receive at the address it wrote completes the handshake all the same.
 #[tokio::test]
 async fn above_the_threshold_an_unvalidated_initial_gets_a_retry() {
-    let server = Server::start_with_config(RuntimeConfig {
+    let server = Server::start_os_with_config(RuntimeConfig {
         retry_above_handshakes: 0,
         ..RuntimeConfig::default()
     })
@@ -214,7 +214,7 @@ async fn above_the_threshold_an_unvalidated_initial_gets_a_retry() {
 /// Initial at once, so a quiet binding adds no round trip.
 #[tokio::test]
 async fn a_quiet_binding_accepts_an_initial_without_a_retry() {
-    let server = Server::start().await;
+    let server = Server::start_os().await;
     let relay = relay(server.addr, false).await;
     let endpoint = raw::client_endpoint(&server.certs);
 
@@ -236,7 +236,7 @@ async fn a_quiet_binding_accepts_an_initial_without_a_retry() {
 /// closed ones as it admits are waiting.
 #[tokio::test]
 async fn a_closed_consumer_waiting_to_be_announced_does_not_hold_a_place() {
-    let server = Server::start_with_config(RuntimeConfig {
+    let server = Server::start_os_with_config(RuntimeConfig {
         max_connections: 2,
         endpoint_queue: 1,
         ..RuntimeConfig::default()

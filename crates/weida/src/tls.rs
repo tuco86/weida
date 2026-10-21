@@ -831,27 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_tls_files_are_reported_as_tls_errors() {
-        let err = server_config(
-            &ServerTls::new(Identity::from_pem_files(
-                "/nonexistent/cert.pem",
-                "/nonexistent/key.pem",
-            )),
-            &Limits::default(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Tls(_)), "{err:?}");
-
-        let err = client_config(
-            &ClientTls::new(Trust::anchor_file("/nonexistent/ca.pem")),
-            None,
-            &Limits::default(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Tls(_)), "{err:?}");
-    }
-
-    #[test]
     fn empty_trust_is_rejected_unless_the_address_names_a_peer() {
         let err = client_config(
             &ClientTls::new(Trust::by_address()),
@@ -982,5 +961,32 @@ mod tests {
         pem_block(&mut out, "TEST", &[0u8; 48]);
         let body: Vec<&str> = out.lines().collect();
         assert_eq!(body[1].len(), 64, "lines wrap at 64 columns");
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn missing_tls_files_are_reported_as_tls_errors() {
+            let err = server_config(
+                &ServerTls::new(Identity::from_pem_files(
+                    "/nonexistent/cert.pem",
+                    "/nonexistent/key.pem",
+                )),
+                &Limits::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Tls(_)), "{err:?}");
+
+            let err = client_config(
+                &ClientTls::new(Trust::anchor_file("/nonexistent/ca.pem")),
+                None,
+                &Limits::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        }
     }
 }

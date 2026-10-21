@@ -55,7 +55,7 @@ async fn dialled(server: &Server, client: &Runtime, path: &str) -> weida::Peer {
     peer
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_flow_carries_datagrams_to_an_acceptor() {
     let server = Server::start_with(flows()).await;
     let acceptor = server.listener.acceptor("/v").expect("acceptor");
@@ -93,7 +93,7 @@ async fn a_flow_carries_datagrams_to_an_acceptor() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_flow_to_an_unregistered_path_is_refused() {
     let server = Server::start_with(flows()).await;
     let _acceptor = server.listener.acceptor("/v").expect("acceptor");
@@ -116,7 +116,7 @@ async fn a_flow_to_an_unregistered_path_is_refused() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_flow_loses_its_oldest_and_its_sibling_keeps_receiving() {
     let server = Server::start_with(Limits {
         flow_queue_bytes: 2_000,
@@ -178,7 +178,7 @@ async fn a_stalled_flow_loses_its_oldest_and_its_sibling_keeps_receiving() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_runtime_without_datagrams_cannot_open_a_flow() {
     let server = Server::start_with(flows()).await;
     let acceptor = server.listener.acceptor("/v").expect("acceptor");

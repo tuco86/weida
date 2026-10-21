@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use common::Server;
 use weida::{
-    Ask, Bits, Blob, BlobId, Error, ErrorCode, Fetch, FetchOptions, PieceList, PieceSize, Runtime,
-    RuntimeConfig, SeedSession, TransferMeta, Trust,
+    Ask, Bits, Blob, BlobId, Error, ErrorCode, Fetch, FetchOptions, Network, PieceList, PieceSize,
+    Runtime, RuntimeConfig, SeedSession, SimNet, TransferMeta, Trust,
 };
 
 /// Generous ceiling: every assertion below should settle well within it.
@@ -174,8 +174,8 @@ fn span(blob: &Blob, index: u32) -> std::ops::Range<usize> {
     span.start as usize..span.end as usize
 }
 
-async fn seed(data: Arc<Vec<u8>>, behavior: Behavior) -> TestSeeder {
-    let server = Server::start().await;
+async fn seed(net: &SimNet, data: Arc<Vec<u8>>, behavior: Behavior) -> TestSeeder {
+    let server = Server::start_on(net, RuntimeConfig::default()).await;
     let seeder = server.listener.seeder("/swarm").expect("seeder");
     let asks = Arc::new(Mutex::new(Vec::new()));
     let list = Arc::new(PieceList::of(&data, PieceSize::MIN).expect("list"));
@@ -276,10 +276,11 @@ async fn honest(session: &mut SeedSession, ask: Ask, data: &[u8], list: &PieceLi
 /// and does not hash to the root, which a [`weida::Seeder`] cannot be made
 /// to send. Returns the seeder and how many session opens it refused.
 async fn version1_seeder(
+    net: &SimNet,
     data: Arc<Vec<u8>>,
     lie_about_list: bool,
 ) -> (TestSeeder, Arc<AtomicUsize>) {
-    let server = Server::start().await;
+    let server = Server::start_on(net, RuntimeConfig::default()).await;
     let replier = server.listener.replier("/swarm").expect("replier");
     let asks = Arc::new(Mutex::new(Vec::new()));
     let refused = Arc::new(AtomicUsize::new(0));
@@ -318,8 +319,12 @@ async fn version1_seeder(
     (TestSeeder { server, asks }, refused)
 }
 
-fn swarm_runtime() -> Runtime {
-    Runtime::new(RuntimeConfig::default()).expect("client runtime")
+fn swarm_runtime(net: &SimNet) -> Runtime {
+    Runtime::new(RuntimeConfig {
+        network: Network::sim(net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime")
 }
 
 /// Pulls pieces until the fetch ends, writing each into `out`; returns the
@@ -348,12 +353,23 @@ const LEN: usize = 17 * 1024 + 100;
 
 #[tokio::test]
 async fn a_blob_is_gathered_from_seeders_holding_different_halves() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
     assert_eq!(blob.count(), 18);
-    let a = seed(Arc::clone(&data), Behavior::Holds(alternate(18, true))).await;
-    let b = seed(Arc::clone(&data), Behavior::Holds(alternate(18, false))).await;
-    let client = swarm_runtime();
+    let a = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Holds(alternate(18, true)),
+    )
+    .await;
+    let b = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Holds(alternate(18, false)),
+    )
+    .await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
     within(swarm.connect(&b.url())).await.expect("connect b");
@@ -378,11 +394,12 @@ async fn a_blob_is_gathered_from_seeders_holding_different_halves() {
 
 #[tokio::test]
 async fn a_seeder_that_sends_a_wrong_piece_is_dropped_and_the_blob_completes() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
-    let a = seed(Arc::clone(&data), Behavior::CorruptPieces).await;
-    let b = seed(Arc::clone(&data), Behavior::Honest).await;
-    let client = swarm_runtime();
+    let a = seed(&net, Arc::clone(&data), Behavior::CorruptPieces).await;
+    let b = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
     within(swarm.connect(&b.url())).await.expect("connect b");
@@ -402,11 +419,12 @@ async fn a_seeder_that_sends_a_wrong_piece_is_dropped_and_the_blob_completes() {
 
 #[tokio::test]
 async fn a_list_that_does_not_hash_to_the_root_drops_the_seeder() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
-    let (a, _) = version1_seeder(Arc::clone(&data), true).await;
-    let b = seed(Arc::clone(&data), Behavior::Honest).await;
-    let client = swarm_runtime();
+    let (a, _) = version1_seeder(&net, Arc::clone(&data), true).await;
+    let b = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     // The liar alone first, so the list is asked of it.
     within(swarm.connect(&a.url())).await.expect("connect a");
@@ -430,10 +448,11 @@ async fn a_list_that_does_not_hash_to_the_root_drops_the_seeder() {
 
 #[tokio::test]
 async fn a_seeder_that_speaks_only_version_1_still_serves_a_fetch() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
-    let (a, refused) = version1_seeder(Arc::clone(&data), false).await;
-    let client = swarm_runtime();
+    let (a, refused) = version1_seeder(&net, Arc::clone(&data), false).await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
 
@@ -460,13 +479,14 @@ async fn a_seeder_that_speaks_only_version_1_still_serves_a_fetch() {
 /// Claim: a seeder whose `MAX_PENDING_SESSIONS` places are all taken makes the
 /// next session wait instead of dropping it, so every fetch is served over a
 /// session of its own: none is read as a version-1 seeder and none fails.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_busy_seeder_makes_a_session_wait_rather_than_drop_it() {
+    let net = SimNet::new();
     const FETCHES: usize = weida::MAX_PENDING_SESSIONS + 16;
     let data = blob_bytes(LEN);
     let list = Arc::new(PieceList::of(&data, PieceSize::MIN).expect("list"));
     let blob = list.blob();
-    let server = Server::start().await;
+    let server = Server::start_on(&net, RuntimeConfig::default()).await;
     let seeder = server.listener.seeder("/swarm").expect("seeder");
     let (open, opened) = tokio::sync::oneshot::channel::<()>();
     let sessions = Arc::new(AtomicUsize::new(0));
@@ -486,7 +506,7 @@ async fn a_busy_seeder_makes_a_session_wait_rather_than_drop_it() {
             ));
         }
     });
-    let client = swarm_runtime();
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&server.pinned_url("/swarm")))
         .await
@@ -517,13 +537,14 @@ async fn a_busy_seeder_makes_a_session_wait_rather_than_drop_it() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_caller_that_stops_taking_pieces_stops_the_seeder() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let list = PieceList::of(&data, PieceSize::MIN).expect("list");
     let blob = list.blob();
-    let a = seed(Arc::clone(&data), Behavior::Honest).await;
-    let client = swarm_runtime();
+    let a = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
 
@@ -573,11 +594,12 @@ async fn a_caller_that_stops_taking_pieces_stops_the_seeder() {
 
 #[tokio::test]
 async fn a_fetch_asks_only_for_pieces_the_caller_lacks() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let list = PieceList::of(&data, PieceSize::MIN).expect("list");
     let blob = list.blob();
-    let a = seed(Arc::clone(&data), Behavior::Honest).await;
-    let client = swarm_runtime();
+    let a = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
 
@@ -611,13 +633,24 @@ async fn a_fetch_asks_only_for_pieces_the_caller_lacks() {
     assert!(!a.asks()[before..].contains(&Ask::List));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_seeder_that_connects_during_a_fetch_joins_it() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
-    let a = seed(Arc::clone(&data), Behavior::Holds(alternate(18, true))).await;
-    let b = seed(Arc::clone(&data), Behavior::Holds(alternate(18, false))).await;
-    let client = swarm_runtime();
+    let a = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Holds(alternate(18, true)),
+    )
+    .await;
+    let b = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Holds(alternate(18, false)),
+    )
+    .await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
 
@@ -645,9 +678,10 @@ async fn a_seeder_that_connects_during_a_fetch_joins_it() {
 
 #[tokio::test]
 async fn a_fetch_without_a_usable_seeder_is_not_connected() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
-    let client = swarm_runtime();
+    let client = swarm_runtime(&net);
 
     let lonely = client.swarm(Trust::by_address());
     let mut fetch = lonely.fetch(blob, Bits::new(18), FetchOptions::default());
@@ -656,7 +690,7 @@ async fn a_fetch_without_a_usable_seeder_is_not_connected() {
         Some(Err(Error::NotConnected))
     ));
 
-    let a = seed(Arc::clone(&data), Behavior::CorruptPieces).await;
+    let a = seed(&net, Arc::clone(&data), Behavior::CorruptPieces).await;
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
     let mut fetch = swarm.fetch(blob, Bits::new(18), FetchOptions::default());
@@ -667,13 +701,14 @@ async fn a_fetch_without_a_usable_seeder_is_not_connected() {
     assert_eq!(fetch.delivered().ones(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_silent_seeder_does_not_hold_up_the_last_piece() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
-    let a = seed(Arc::clone(&data), Behavior::SilentPieces).await;
-    let b = seed(Arc::clone(&data), Behavior::Honest).await;
-    let client = swarm_runtime();
+    let a = seed(&net, Arc::clone(&data), Behavior::SilentPieces).await;
+    let b = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
     within(swarm.connect(&b.url())).await.expect("connect b");
@@ -682,7 +717,7 @@ async fn a_silent_seeder_does_not_hold_up_the_last_piece() {
         stall: Duration::from_millis(200),
         ..FetchOptions::default()
     };
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut fetch = swarm.fetch(blob, Bits::new(18), options);
     let mut out = vec![0; LEN];
     gather(&mut fetch, &mut out).await;
@@ -697,10 +732,11 @@ async fn a_silent_seeder_does_not_hold_up_the_last_piece() {
 
 #[tokio::test]
 async fn a_blob_of_one_piece_needs_no_list_and_an_empty_blob_no_seeder() {
+    let net = SimNet::new();
     let data = blob_bytes(500);
     let blob = Blob::new(BlobId::of(&data), 500, PieceSize::MIN).expect("blob");
-    let a = seed(Arc::clone(&data), Behavior::Honest).await;
-    let client = swarm_runtime();
+    let a = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&a.url())).await.expect("connect a");
     let mut fetch = swarm.fetch(blob, Bits::new(1), FetchOptions::default());
@@ -718,16 +754,18 @@ async fn a_blob_of_one_piece_needs_no_list_and_an_empty_blob_no_seeder() {
     assert!(within(fetch.next()).await.is_none());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dropped_fetch_asks_nothing_more() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
     let b = seed(
+        &net,
         Arc::clone(&data),
         Behavior::Slow(Duration::from_millis(100)),
     )
     .await;
-    let client = swarm_runtime();
+    let client = swarm_runtime(&net);
     let swarm = client.swarm(Trust::by_address());
     within(swarm.connect(&b.url())).await.expect("connect b");
 
@@ -750,21 +788,27 @@ async fn a_dropped_fetch_asks_nothing_more() {
     assert!(b.pieces_asked().len() < 18, "{:?}", b.pieces_asked());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_seeder_that_is_still_fetching_serves_what_it_has() {
+    let net = SimNet::new();
     let data = blob_bytes(LEN);
     let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
     // A holds everything and answers slowly, so B fills up over time.
-    let a = seed(Arc::clone(&data), Behavior::Slow(Duration::from_millis(50))).await;
+    let a = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Slow(Duration::from_millis(50)),
+    )
+    .await;
     let relay = Arc::new(Mutex::new(Relay {
         list: None,
         have: Bits::new(18),
         data: vec![0; LEN],
     }));
-    let b = seed(Arc::clone(&data), Behavior::Relay(Arc::clone(&relay))).await;
+    let b = seed(&net, Arc::clone(&data), Behavior::Relay(Arc::clone(&relay))).await;
 
     // B fetches from A and feeds its own seeder.
-    let b_client = swarm_runtime();
+    let b_client = swarm_runtime(&net);
     let b_swarm = b_client.swarm(Trust::by_address());
     within(b_swarm.connect(&a.url()))
         .await
@@ -797,7 +841,7 @@ async fn a_seeder_that_is_still_fetching_serves_what_it_has() {
     );
 
     // C knows only B.
-    let c_client = swarm_runtime();
+    let c_client = swarm_runtime(&net);
     let c_swarm = c_client.swarm(Trust::by_address());
     within(c_swarm.connect(&b.url()))
         .await

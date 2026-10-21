@@ -167,7 +167,7 @@ async fn a_second_connection_is_refused_and_the_first_keeps_working() {
     second_client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_peer_that_goes_away_leaves_the_endpoint_claimable() {
     // The claim is on a connection, not on eternity. A peer process that
     // restarts, or a connection that went past the idle timeout, must be

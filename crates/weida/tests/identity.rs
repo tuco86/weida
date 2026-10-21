@@ -14,13 +14,13 @@ use std::time::Duration;
 
 use common::{Certs, Server};
 use weida::{
-    ClientTls, ClientTrust, Error, Fingerprint, Identity, PeerIdentity, Runtime, RuntimeConfig,
-    ServerTls, Trust,
+    ClientTls, ClientTrust, Error, Fingerprint, Identity, Network, PeerIdentity, Runtime,
+    RuntimeConfig, ServerTls, SimNet, Trust,
 };
 
-const DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
-async fn within<F: Future>(f: F) -> F::Output {
+pub(crate) async fn within<F: Future>(f: F) -> F::Output {
     tokio::time::timeout(DEADLINE, f)
         .await
         .expect("operation timed out")
@@ -28,7 +28,7 @@ async fn within<F: Future>(f: F) -> F::Output {
 
 /// Spawns an echo replier and returns nothing; the handler runs until the
 /// listener goes away.
-fn spawn_echo(replier: weida::Replier) {
+pub(crate) fn spawn_echo(replier: weida::Replier) {
     tokio::spawn(async move {
         while let Ok(mut request) = replier.accept().await {
             let body = request.body().read_capped(1024).await.expect("body");
@@ -42,7 +42,7 @@ fn spawn_echo(replier: weida::Replier) {
     });
 }
 
-async fn roundtrip(requester: &weida::Requester) -> Vec<u8> {
+pub(crate) async fn roundtrip(requester: &weida::Requester) -> Vec<u8> {
     let reply = within(requester.request(b"ping")).await.expect("request");
     within(reply.collect(64)).await.expect("collect")
 }
@@ -88,7 +88,7 @@ async fn a_wrong_pin_in_the_address_is_refused_with_what_answered() {
     client.shutdown().await;
 }
 
-fn err_is_definite(e: &Error) -> bool {
+pub(crate) fn err_is_definite(e: &Error) -> bool {
     e.is_definite_failure()
 }
 
@@ -143,17 +143,17 @@ async fn a_pinned_trust_accepts_the_key_and_only_the_key() {
 
 #[tokio::test]
 async fn pins_and_anchors_compose() {
+    let net = SimNet::new();
     // One endpoint, two servers: one reachable through its anchor, the other
     // through its pin. Neither term alone would cover both.
-    let anchored = Server::start().await;
-    let pinned = Server::start().await;
+    let anchored = Server::start_on(&net, RuntimeConfig::default()).await;
+    let pinned = Server::start_on(&net, RuntimeConfig::default()).await;
     spawn_echo(anchored.listener.replier("/echo").expect("replier"));
     spawn_echo(pinned.listener.replier("/echo").expect("replier"));
 
     let client = anchored.client_runtime();
-    let requester = client.requester(
-        Trust::anchor_file(&anchored.certs.cert_pem).and_pin(pinned.certs.fingerprint()),
-    );
+    let requester = client
+        .requester(Trust::anchor(anchored.certs.cert.clone()).and_pin(pinned.certs.fingerprint()));
     within(requester.connect(&anchored.url("/echo")))
         .await
         .expect("anchored");
@@ -170,6 +170,7 @@ async fn pins_and_anchors_compose() {
 
 #[tokio::test]
 async fn an_anchor_checks_the_name_and_a_pin_does_not() {
+    let net = SimNet::new();
     // A certificate trusted as an anchor is verified the way a CA-issued one
     // is: the host dialled must be among its names. This identity names only
     // `localhost`, and the dial goes to `127.0.0.1`, so the anchor path
@@ -179,7 +180,11 @@ async fn an_anchor_checks_the_name_and_a_pin_does_not() {
     let fingerprint = identity.fingerprint().expect("fingerprint");
     let cert_pem = identity.certificate_pem().expect("cert");
 
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let runtime = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
     let listener = runtime.listener();
     let binding = listener
         .bind_quic("127.0.0.1:0".parse().expect("loopback"), identity)
@@ -188,7 +193,11 @@ async fn an_anchor_checks_the_name_and_a_pin_does_not() {
     spawn_echo(listener.replier("/echo").expect("replier"));
     let url = format!("weida://127.0.0.1:{}/echo", binding.local_addr().port());
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client");
     let anchored = client.requester(Trust::anchor(cert_pem.clone()));
     match within(anchored.connect(&url)).await.unwrap_err() {
         Error::Untrusted(presented) => assert_eq!(presented, fingerprint),
@@ -210,11 +219,16 @@ async fn an_anchor_checks_the_name_and_a_pin_does_not() {
 
 #[tokio::test]
 async fn a_binding_that_requires_clients_learns_who_they_are() {
+    let net = SimNet::new();
     let identity = Identity::generate().expect("identity");
     let client_identity = Identity::generate().expect("client identity");
     let client_fp = client_identity.fingerprint().expect("fingerprint");
 
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let runtime = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
     let listener = runtime.listener();
     let binding = listener
         .bind_quic(
@@ -243,7 +257,11 @@ async fn a_binding_that_requires_clients_learns_who_they_are() {
     });
 
     // Anonymous: the handshake fails, and the failure is a TLS outcome.
-    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client");
     let anonymous = client.requester(Trust::by_address());
     let err = within(anonymous.connect(&url)).await.unwrap_err();
     assert!(matches!(err, Error::Tls(_)), "{err:?}");
@@ -279,7 +297,7 @@ async fn a_binding_that_requires_clients_learns_who_they_are() {
 /// A griasdi-shaped device identity: a device key certified by a user key,
 /// presented as the two-certificate chain `[device, user]`. Returns the
 /// identity, the device key's fingerprint and the chain's DER, leaf first.
-fn device_chain() -> (Identity, Fingerprint, Vec<Vec<u8>>) {
+pub(crate) fn device_chain() -> (Identity, Fingerprint, Vec<Vec<u8>>) {
     let user_key = rcgen::KeyPair::generate().expect("user key");
     let user_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("user params");
     let user_cert = user_params.self_signed(&user_key).expect("user cert");
@@ -304,8 +322,13 @@ fn device_chain() -> (Identity, Fingerprint, Vec<Vec<u8>>) {
 /// as its own fingerprint (0035 §4.5, the requirement's open question 1).
 #[tokio::test]
 async fn a_binding_that_requires_any_key_proves_it_and_judges_nothing() {
+    let net = SimNet::new();
     let identity = Identity::generate().expect("identity");
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let runtime = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
     let listener = runtime.listener();
     let binding = listener
         .bind_quic(
@@ -339,7 +362,11 @@ async fn a_binding_that_requires_any_key_proves_it_and_judges_nothing() {
         }
     });
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client");
 
     // Anonymous: refused in the handshake, as under a trust.
     let anonymous = client.requester(Trust::by_address());
@@ -382,7 +409,7 @@ async fn a_binding_that_requires_any_key_proves_it_and_judges_nothing() {
 }
 
 /// The next `Lost` on `events`, skipping the `Connected` that came first.
-async fn lost(events: &mut weida::PeerEvents) -> weida::LossCause {
+pub(crate) async fn lost(events: &mut weida::PeerEvents) -> weida::LossCause {
     within(async {
         loop {
             match events.recv().await.expect("event stream open") {
@@ -402,8 +429,13 @@ async fn lost(events: &mut weida::PeerEvents) -> weida::LossCause {
 /// connection.
 #[tokio::test]
 async fn disconnect_closes_every_connection_of_one_peer_and_no_other() {
+    let net = SimNet::new();
     let identity = Identity::generate().expect("identity");
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let runtime = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
     let listener = runtime.listener();
     let binding = listener
         .bind_quic(
@@ -422,7 +454,11 @@ async fn disconnect_closes_every_connection_of_one_peer_and_no_other() {
     spawn_echo(listener.replier("/a").expect("replier a"));
     spawn_echo(listener.replier("/b").expect("replier b"));
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client");
     let a_id = Identity::generate().expect("a");
     let a_fp = a_id.fingerprint().expect("fingerprint a");
     let a_tls = ClientTls::new(Trust::by_address()).with_identity(a_id);
@@ -543,70 +579,6 @@ async fn connections_are_not_shared_across_different_terms() {
     client.shutdown().await;
 }
 
-/// Claim: the connections of one peer are bound together by the proved
-/// fingerprint, and by nothing else
-/// ([0008](../../../docs/decisions/0008-session-identity.md) §4.2). One
-/// connection per dialled path means a second path is a second connection to
-/// the *same* peer, so a second server answering on that authority is refused,
-/// carrying the fingerprint that answered rather than a bare failure.
-///
-/// The setup is the load-balancer case, and it needs a raw server because two
-/// `quinn` endpoints cannot share a port: one socket, whose identity is
-/// swapped between the two handshakes. The client trusts both keys, so nothing
-/// but the binding rule can refuse the second dial.
-#[tokio::test]
-async fn a_second_path_that_answers_with_another_identity_is_refused() {
-    let first = Certs::generate();
-    let second = Certs::generate();
-    let first_fp = first.fingerprint();
-    let second_fp = second.fingerprint();
-
-    let (endpoint, addr) = common::raw::server_endpoint(&first);
-    let swap = common::raw::server_config(&second);
-    tokio::spawn(async move {
-        // First handshake: identity one. The identity is swapped *before* the
-        // HELLO that lets the client's `connect` return, so the second dial
-        // cannot race ahead of the swap.
-        let incoming = endpoint.accept().await.expect("first connection");
-        let held = incoming.await.expect("first handshake");
-        endpoint.set_server_config(Some(swap));
-        common::raw::send_hello(&held).await;
-
-        // Second handshake: identity two. It never needs a HELLO — the pool
-        // refuses it on identity, before negotiation begins.
-        if let Some(incoming) = endpoint.accept().await {
-            let _ = incoming.await;
-        }
-        // Hold the first connection open: the binding rule compares against
-        // this peer's *live* connections.
-        held.closed().await;
-    });
-
-    let client = Runtime::new(RuntimeConfig::default()).expect("client");
-    let pusher = client.pusher(ClientTls::new(Trust::pin(first_fp).and_pin(second_fp)));
-
-    let base = format!("weida://127.0.0.1:{}", addr.port());
-    within(pusher.connect(&format!("{base}/a")))
-        .await
-        .expect("the first path connects");
-
-    let err = within(pusher.connect(&format!("{base}/b")))
-        .await
-        .expect_err("a different peer on the same authority must be refused");
-    match err {
-        Error::Untrusted(fp) => assert_eq!(
-            fp, second_fp,
-            "the refusal names who answered, so an operator can pin it"
-        ),
-        other => panic!("expected Untrusted, got {other:?}"),
-    }
-    // The path that was already connected is untouched by its neighbour's
-    // refusal: one connection per path means one failure per path.
-    assert_eq!(pusher.peer_count(), 1);
-
-    client.shutdown().await;
-}
-
 /// Claim: `max_connections_per_peer` bounds what one peer can hold, counted by
 /// the identity it proved, and one connection per dialled path is exactly why
 /// it is needed — the dialling side chooses the path count
@@ -617,6 +589,7 @@ async fn a_second_path_that_answers_with_another_identity_is_refused() {
 /// as one peer.
 #[tokio::test]
 async fn a_peer_cannot_hold_more_connections_than_its_ceiling() {
+    let net = SimNet::new();
     const CEILING: usize = 3;
 
     let identity = Identity::generate().expect("identity");
@@ -625,6 +598,7 @@ async fn a_peer_cannot_hold_more_connections_than_its_ceiling() {
     let client_fp = client_identity.fingerprint().expect("client fingerprint");
 
     let runtime = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
         max_connections_per_peer: CEILING,
         ..RuntimeConfig::default()
     })
@@ -647,7 +621,11 @@ async fn a_peer_cannot_hold_more_connections_than_its_ceiling() {
         .map(|i| listener.puller(&format!("/p{i}")).expect("puller"))
         .collect();
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client");
     let pusher =
         client.pusher(ClientTls::new(Trust::pin(fingerprint)).with_identity(client_identity));
 

@@ -14,9 +14,9 @@ use common::Server;
 use weida::{Error, GuaranteeSet, Limits, OrderingMode, Publisher, RuntimeConfig, Subscriber};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
-const DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 
-async fn within<F: Future>(f: F) -> F::Output {
+pub(crate) async fn within<F: Future>(f: F) -> F::Output {
     tokio::time::timeout(DEADLINE, f)
         .await
         .expect("operation timed out")
@@ -27,7 +27,7 @@ async fn within<F: Future>(f: F) -> F::Output {
 /// Registry updates happen in the frame-processing task, so a subscribe is
 /// visible a moment after `subscribe()` returns. Polling the publisher's own
 /// counter is exact; a sleep would only be a guess.
-async fn await_filters(publisher: &Publisher, count: usize) {
+pub(crate) async fn await_filters(publisher: &Publisher, count: usize) {
     within(async {
         while publisher.filter_count() != count {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -37,7 +37,7 @@ async fn await_filters(publisher: &Publisher, count: usize) {
 }
 
 /// Receives one message and returns `(topic, payload)`.
-async fn recv_one(sub: &Subscriber) -> (String, Vec<u8>) {
+pub(crate) async fn recv_one(sub: &Subscriber) -> (String, Vec<u8>) {
     let transfer = within(sub.recv()).await.expect("recv");
     let topic = transfer
         .meta()
@@ -52,7 +52,7 @@ async fn recv_one(sub: &Subscriber) -> (String, Vec<u8>) {
 
 /// The segmented grammar over a real connection: one-segment `*`, trailing
 /// `#`, and the boundary a byte prefix could not see.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn subscribe_filters_topics_by_segment() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
@@ -136,7 +136,7 @@ async fn subscribe_filters_topics_by_segment() {
 }
 
 /// A published topic is data, not a pattern: its `*` is an ordinary byte.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_topic_containing_a_wildcard_byte_is_literal() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
@@ -179,7 +179,7 @@ async fn an_illegal_filter_is_refused_before_it_reaches_the_wire() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn empty_filter_receives_all() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
@@ -202,7 +202,7 @@ async fn empty_filter_receives_all() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn two_subscribers_both_receive() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
@@ -236,7 +236,7 @@ async fn two_subscribers_both_receive() {
     client_b.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unsubscribe_stops_delivery() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
@@ -270,7 +270,7 @@ async fn unsubscribe_stops_delivery() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn late_publisher_receives_early_subscription() {
     let server = Server::start().await;
     // No publisher yet: the path is not registered at all.
@@ -296,7 +296,7 @@ async fn late_publisher_receives_early_subscription() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slow_subscriber_drops_not_blocks() {
     const MSG: usize = 32 * 1024;
     const COUNT: usize = 100;
@@ -394,7 +394,7 @@ async fn slow_subscriber_drops_not_blocks() {
 /// Both directions are asserted on the same subscriber, because the claim is
 /// the difference between the two calls and not either one alone: `publish`
 /// carries no context, `publish_with_trace` carries exactly the caller's.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sub_meta_carries_topic_and_the_trace_the_publisher_propagated() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
@@ -446,7 +446,7 @@ async fn a_payload_larger_than_the_budget_is_refused() {
 
 /// The payload `publish` refuses is an ordinary streamed publish, and
 /// two subscribers both get all of it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_streamed_publish_carries_a_payload_no_publish_could_take() {
     const BUDGET: usize = 64 * 1024;
     const CHUNK: usize = 16 * 1024;
@@ -520,7 +520,7 @@ async fn a_streamed_publish_carries_a_payload_no_publish_could_take() {
 /// The drop is per subscriber, not per publish. One subscriber that
 /// never reads loses the streamed transfer; the other gets every byte, and
 /// the publisher never waits for the one that stalled.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_streamed_publish_drops_the_subscriber_that_stalls_and_keeps_the_other() {
     const BUDGET: usize = 64 * 1024;
     const CHUNK: usize = 16 * 1024;
@@ -600,7 +600,7 @@ async fn a_streamed_publish_drops_the_subscriber_that_stalls_and_keeps_the_other
 /// where a later chunk supersedes an earlier one. A subscriber that is not
 /// keeping up loses the transfer at the budget rather than slowing the
 /// publisher by even a bounded wait.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_streamed_publish_that_never_waits_drops_at_the_budget() {
     const BUDGET: usize = 64 * 1024;
     const CHUNK: usize = 16 * 1024;
@@ -731,7 +731,7 @@ async fn a_second_subscriber_on_one_connection_collides() {
 /// This is the capability [decision 0001](../../docs/decisions/0001-sequence-field.md)
 /// §7.2 required: before the sequence field, a drop was silent on the wire
 /// and only the publisher counted it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dropped_fan_out_copy_shows_up_as_a_gap() {
     const MSG: usize = 32 * 1024;
 
@@ -833,7 +833,7 @@ async fn a_dropped_fan_out_copy_shows_up_as_a_gap() {
 /// happens — the copies behind it are held, waiting for numbers that will
 /// never arrive — and the bound is what makes it observable. At the cap the
 /// oldest held copy is released out of order and carries the gap.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for() {
     const MSG: usize = 32 * 1024;
     const HOLD: usize = 2;
@@ -944,7 +944,7 @@ async fn a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for() {
 /// A receiver that drops a message unread — the header read, the body not —
 /// stops that one transfer with `STOP_SENDING`. The subscription is the
 /// connection's, not the message's: the next message must still arrive.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_subscriber_that_refuses_one_message_keeps_its_subscription() {
     // Larger than the 1 MiB stream window, so the publisher is still writing
     // when the refusal reaches it.
@@ -990,7 +990,7 @@ async fn a_subscriber_that_refuses_one_message_keeps_its_subscription() {
 /// A topic a subscriber's decoder refuses is refused at the publisher, with
 /// nothing written: the decoder's answer would be to close the connection,
 /// and the connection is every subscription on it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_topic_above_the_cap_is_refused_and_no_connection_is_closed() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
@@ -1028,7 +1028,7 @@ async fn a_topic_above_the_cap_is_refused_and_no_connection_is_closed() {
 /// Two publishers of one listener that use one topic string are two
 /// producers: a subscriber of one must see its own numbers, dense, and no
 /// gap for the other's messages.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn two_publishers_of_one_topic_number_it_separately() {
     let detect = GuaranteeSet {
         ordering: OrderingMode::PerProducerDetect,
@@ -1078,7 +1078,7 @@ async fn two_publishers_of_one_topic_number_it_separately() {
 /// Subscribers that stall are waited for together: the bound of
 /// `write_within` is for the call, so eight stalled subscribers cost one
 /// bound and not eight.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stalled_subscribers_are_waited_for_together() {
     const BUDGET: usize = 64 * 1024;
     const CHUNK: usize = 16 * 1024;
@@ -1114,7 +1114,7 @@ async fn stalled_subscribers_are_waited_for_together() {
 
     let mut fan = publisher.open("px.eur");
     assert_eq!(fan.subscribers(), SUBSCRIBERS);
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let chunk = vec![0x5au8; CHUNK];
     within(async {
         while fan.subscribers() > 0 {
@@ -1145,62 +1145,9 @@ async fn stalled_subscribers_are_waited_for_together() {
     }
 }
 
-/// A streamed publish may be driven from any executor: its bounded wait is
-/// timed on the runtime of the subscribers' connections, and creating a
-/// timer on the caller's thread would panic on one that has no reactor.
-#[tokio::test]
-async fn a_streamed_publish_can_be_driven_without_a_reactor() {
-    const BUDGET: usize = 64 * 1024;
-    const CHUNK: usize = 16 * 1024;
-
-    let server = Server::start_with(Limits {
-        subscriber_buffer_bytes: BUDGET,
-        ..Limits::default()
-    })
-    .await;
-    let publisher = server.listener.publisher("/md").expect("publisher");
-    // Never reads, so the budget fills and the wait is a real one.
-    let client = server.client_runtime_with(Limits {
-        connection_receive_window: 128 * 1024,
-        stream_receive_window: 64 * 1024,
-        ..Limits::default()
-    });
-    let sub = client.subscriber(server.trust());
-    within(sub.connect(&server.url("/md")))
-        .await
-        .expect("connect");
-    within(sub.subscribe("")).await.expect("subscribe");
-    await_filters(&publisher, 1).await;
-
-    let mut fan = publisher.open("px.eur");
-    let (done, outcome) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        // A plain thread: no Tokio runtime is entered on it.
-        let chunk = vec![0x5au8; CHUNK];
-        let remaining = futures::executor::block_on(async {
-            let mut remaining = fan.subscribers();
-            while remaining > 0 {
-                remaining = fan
-                    .write_within(chunk.clone(), Duration::from_millis(100))
-                    .await
-                    .expect("write");
-            }
-            remaining
-        });
-        let _ = done.send(remaining);
-    });
-    assert_eq!(
-        within(outcome).await.expect("the thread did not panic"),
-        0,
-        "the subscriber that never reads loses the transfer"
-    );
-
-    client.shutdown().await;
-}
-
 /// A chunk no budget can ever hold is refused at once, instead of every
 /// copy waiting for room that cannot exist and then being aborted.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_chunk_above_the_budget_is_refused_without_waiting() {
     const BUDGET: usize = 64 * 1024;
 
@@ -1219,7 +1166,7 @@ async fn a_chunk_above_the_budget_is_refused_without_waiting() {
     await_filters(&publisher, 1).await;
 
     let mut fan = publisher.open("px.eur");
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     assert!(matches!(
         fan.write_within(vec![0u8; BUDGET + 1], Duration::from_secs(5))
             .await,

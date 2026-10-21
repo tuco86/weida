@@ -562,7 +562,11 @@ mod tests {
     #[test]
     fn an_owned_runtime_needs_no_ambient_reactor() {
         assert!(Handle::try_current().is_err());
-        let rt = Runtime::owned(RuntimeConfig::default()).expect("owned runtime");
+        let rt = Runtime::owned(RuntimeConfig {
+            network: crate::Network::sim(&crate::SimNet::new()),
+            ..RuntimeConfig::default()
+        })
+        .expect("owned runtime");
         let listener = rt.listener();
         futures::executor::block_on(async {
             let binding = listener
@@ -600,167 +604,6 @@ mod tests {
         rt.shutdown().await;
     }
 
-    /// Claim: a hostname whose first address is unreachable still connects,
-    /// because the dialling path tries the rest.
-    ///
-    /// This is the debt entry that said "use the IP literal until address
-    /// selection learns to try more than one". On a host where `localhost`
-    /// resolves to `::1` before `127.0.0.1` — the common Linux ordering, and
-    /// this machine's — a server bound to `127.0.0.1` was simply unreachable
-    /// by name. The address is pinned so trust does not depend on the name: a
-    /// pin consults no hostname.
-    #[tokio::test]
-    async fn a_hostname_whose_first_address_is_unreachable_still_connects() {
-        let identity = Identity::generate().expect("identity");
-        let fingerprint = identity.fingerprint().expect("fingerprint");
-
-        let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
-        let listener = server.listener();
-        let binding = listener
-            .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
-            .await
-            .expect("bind");
-        let _puller = listener.puller("/sink").expect("puller");
-        let url = format!(
-            "weida://{fingerprint}@localhost:{}/sink",
-            binding.local_addr().port()
-        );
-
-        let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
-        let pusher = client.pusher(Trust::by_address());
-        pusher.connect(&url).await.expect("connect by name");
-        assert_eq!(pusher.peer_count(), 1);
-
-        client.shutdown().await;
-        server.shutdown().await;
-    }
-
-    /// Claim: `shutdown`'s wait for idle sockets is bounded by
-    /// `shutdown_timeout`, so process exit never waits on somebody else's
-    /// network.
-    ///
-    /// The peer is made unreachable the hard way: the server runtime is
-    /// dropped without being shut down, which closes its socket and sends
-    /// nothing, so the client's `CONNECTION_CLOSE` is answered by silence and
-    /// the close runs out its draining period — about three times the path's
-    /// probe timeout, ~96 ms on loopback and longer as round-trip time and
-    /// loss grow.
-    ///
-    /// The assertion is **relative**, and measured in the same run: the same
-    /// shutdown with a 1 ms cap must be at least twice as fast as one with a
-    /// cap far beyond the draining period. An absolute millisecond bound would
-    /// pin this machine; an unbounded wait — the defect this defends against —
-    /// makes the two times equal and fails it.
-    #[tokio::test]
-    async fn the_wait_for_idle_sockets_is_bounded() {
-        async fn shutdown_with(cap: Duration) -> Duration {
-            let identity = Identity::generate().expect("identity");
-            let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
-
-            let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
-            let listener = server.listener();
-            let binding = listener
-                .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
-                .await
-                .expect("bind");
-            let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
-            let puller = listener.puller("/sink").expect("puller");
-
-            let client = Runtime::new(RuntimeConfig {
-                shutdown_timeout: cap,
-                ..RuntimeConfig::default()
-            })
-            .expect("client runtime");
-            let pusher = client.pusher(trust);
-            pusher.connect(&url).await.expect("connect");
-
-            // The peer stops existing without saying so.
-            drop(pusher);
-            drop(puller);
-            drop(binding);
-            drop(listener);
-            drop(server);
-
-            let start = std::time::Instant::now();
-            client.shutdown().await;
-            start.elapsed()
-        }
-
-        let capped = shutdown_with(Duration::from_millis(1)).await;
-        let uncapped = shutdown_with(Duration::from_secs(10)).await;
-        assert!(
-            capped * 2 < uncapped,
-            "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
-        );
-    }
-
-    /// Claim: `Binding::close` waits for its socket to go idle for at most
-    /// `shutdown_timeout`, so closing one binding is not held up by its
-    /// connections' closing periods.
-    ///
-    /// The client stays connected and answers the close, but the binding's
-    /// side of the connection still runs out QUIC's closing period, about
-    /// three times the path's probe timeout. The assertion is relative for
-    /// the reason `the_wait_for_idle_sockets_is_bounded` gives.
-    #[tokio::test]
-    async fn a_binding_close_is_bounded_by_the_shutdown_timeout() {
-        async fn close_with(cap: Duration) -> Duration {
-            let identity = Identity::generate().expect("identity");
-            let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
-
-            let server = Runtime::new(RuntimeConfig {
-                shutdown_timeout: cap,
-                ..RuntimeConfig::default()
-            })
-            .expect("server runtime");
-            let listener = server.listener();
-            let binding = listener
-                .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
-                .await
-                .expect("bind");
-            let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
-            let puller = listener.puller("/sink").expect("puller");
-
-            let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
-            let pusher = client.pusher(trust);
-            pusher.connect(&url).await.expect("connect");
-
-            let start = std::time::Instant::now();
-            binding.close().await;
-            let elapsed = start.elapsed();
-
-            drop(pusher);
-            drop(puller);
-            drop(binding);
-            drop(listener);
-            client.shutdown().await;
-            server.shutdown().await;
-            elapsed
-        }
-
-        let capped = close_with(Duration::from_millis(1)).await;
-        let uncapped = close_with(Duration::from_secs(10)).await;
-        assert!(
-            capped * 2 < uncapped,
-            "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_binding_with_unreadable_tls_material_fails_before_serving() {
-        let rt = Runtime::new(RuntimeConfig::default()).unwrap();
-        // Creating the namespace needs no credentials at all.
-        let listener = rt.listener();
-        let err = listener
-            .bind_quic(
-                "127.0.0.1:0".parse().unwrap(),
-                Identity::from_pem_files("/nonexistent/c.pem", "/nonexistent/k.pem"),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Tls(_)), "{err:?}");
-    }
-
     #[tokio::test]
     async fn opening_without_a_peer_fails_with_not_connected() {
         let rt = Runtime::new(RuntimeConfig::default()).unwrap();
@@ -772,7 +615,7 @@ mod tests {
         assert!(matches!(err, Error::NotConnected), "{err:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn connecting_without_trust_fails_unless_the_address_names_the_peer() {
         // Short idle timeout: the second dial goes to a port nobody answers
         // on, and QUIC gives up only when the handshake idles out.
@@ -781,6 +624,7 @@ mod tests {
                 idle_timeout: std::time::Duration::from_millis(200),
                 ..Limits::default()
             },
+            network: crate::Network::sim(&crate::SimNet::new()),
             ..RuntimeConfig::default()
         })
         .unwrap();
@@ -811,5 +655,169 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Claim: a hostname whose first address is unreachable still connects,
+        /// because the dialling path tries the rest.
+        ///
+        /// This is the debt entry that said "use the IP literal until address
+        /// selection learns to try more than one". On a host where `localhost`
+        /// resolves to `::1` before `127.0.0.1` — the common Linux ordering, and
+        /// this machine's — a server bound to `127.0.0.1` was simply unreachable
+        /// by name. The address is pinned so trust does not depend on the name: a
+        /// pin consults no hostname.
+        #[tokio::test]
+        async fn a_hostname_whose_first_address_is_unreachable_still_connects() {
+            let identity = Identity::generate().expect("identity");
+            let fingerprint = identity.fingerprint().expect("fingerprint");
+
+            let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
+            let listener = server.listener();
+            let binding = listener
+                .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+                .await
+                .expect("bind");
+            let _puller = listener.puller("/sink").expect("puller");
+            let url = format!(
+                "weida://{fingerprint}@localhost:{}/sink",
+                binding.local_addr().port()
+            );
+
+            let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+            let pusher = client.pusher(Trust::by_address());
+            pusher.connect(&url).await.expect("connect by name");
+            assert_eq!(pusher.peer_count(), 1);
+
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+        /// Claim: `shutdown`'s wait for idle sockets is bounded by
+        /// `shutdown_timeout`, so process exit never waits on somebody else's
+        /// network.
+        ///
+        /// The peer is made unreachable the hard way: the server runtime is
+        /// dropped without being shut down, which closes its socket and sends
+        /// nothing, so the client's `CONNECTION_CLOSE` is answered by silence and
+        /// the close runs out its draining period — about three times the path's
+        /// probe timeout, ~96 ms on loopback and longer as round-trip time and
+        /// loss grow.
+        ///
+        /// The assertion is **relative**, and measured in the same run: the same
+        /// shutdown with a 1 ms cap must be at least twice as fast as one with a
+        /// cap far beyond the draining period. An absolute millisecond bound would
+        /// pin this machine; an unbounded wait — the defect this defends against —
+        /// makes the two times equal and fails it.
+        #[tokio::test]
+        async fn the_wait_for_idle_sockets_is_bounded() {
+            async fn shutdown_with(cap: Duration) -> Duration {
+                let identity = Identity::generate().expect("identity");
+                let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
+
+                let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
+                let listener = server.listener();
+                let binding = listener
+                    .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+                    .await
+                    .expect("bind");
+                let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
+                let puller = listener.puller("/sink").expect("puller");
+
+                let client = Runtime::new(RuntimeConfig {
+                    shutdown_timeout: cap,
+                    ..RuntimeConfig::default()
+                })
+                .expect("client runtime");
+                let pusher = client.pusher(trust);
+                pusher.connect(&url).await.expect("connect");
+
+                // The peer stops existing without saying so.
+                drop(pusher);
+                drop(puller);
+                drop(binding);
+                drop(listener);
+                drop(server);
+
+                let start = std::time::Instant::now();
+                client.shutdown().await;
+                start.elapsed()
+            }
+
+            let capped = shutdown_with(Duration::from_millis(1)).await;
+            let uncapped = shutdown_with(Duration::from_secs(10)).await;
+            assert!(
+                capped * 2 < uncapped,
+                "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
+            );
+        }
+        /// Claim: `Binding::close` waits for its socket to go idle for at most
+        /// `shutdown_timeout`, so closing one binding is not held up by its
+        /// connections' closing periods.
+        ///
+        /// The client stays connected and answers the close, but the binding's
+        /// side of the connection still runs out QUIC's closing period, about
+        /// three times the path's probe timeout. The assertion is relative for
+        /// the reason `the_wait_for_idle_sockets_is_bounded` gives.
+        #[tokio::test]
+        async fn a_binding_close_is_bounded_by_the_shutdown_timeout() {
+            async fn close_with(cap: Duration) -> Duration {
+                let identity = Identity::generate().expect("identity");
+                let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
+
+                let server = Runtime::new(RuntimeConfig {
+                    shutdown_timeout: cap,
+                    ..RuntimeConfig::default()
+                })
+                .expect("server runtime");
+                let listener = server.listener();
+                let binding = listener
+                    .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+                    .await
+                    .expect("bind");
+                let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
+                let puller = listener.puller("/sink").expect("puller");
+
+                let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+                let pusher = client.pusher(trust);
+                pusher.connect(&url).await.expect("connect");
+
+                let start = std::time::Instant::now();
+                binding.close().await;
+                let elapsed = start.elapsed();
+
+                drop(pusher);
+                drop(puller);
+                drop(binding);
+                drop(listener);
+                client.shutdown().await;
+                server.shutdown().await;
+                elapsed
+            }
+
+            let capped = close_with(Duration::from_millis(1)).await;
+            let uncapped = close_with(Duration::from_secs(10)).await;
+            assert!(
+                capped * 2 < uncapped,
+                "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
+            );
+        }
+        #[tokio::test]
+        async fn a_binding_with_unreadable_tls_material_fails_before_serving() {
+            let rt = Runtime::new(RuntimeConfig::default()).unwrap();
+            // Creating the namespace needs no credentials at all.
+            let listener = rt.listener();
+            let err = listener
+                .bind_quic(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Identity::from_pem_files("/nonexistent/c.pem", "/nonexistent/k.pem"),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        }
     }
 }

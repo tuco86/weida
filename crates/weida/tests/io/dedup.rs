@@ -52,7 +52,7 @@ async fn send_numbered(conn: &quinn::Connection, path: &str, sequence: u64, body
 
 #[tokio::test]
 async fn a_replay_inside_the_window_is_suppressed_and_counted() {
-    let server = Server::start_with_config(RuntimeConfig {
+    let server = Server::start_os_with_config(RuntimeConfig {
         guarantees: bounded(),
         ..RuntimeConfig::default()
     })
@@ -103,7 +103,7 @@ async fn a_replay_inside_the_window_is_suppressed_and_counted() {
 
 #[tokio::test]
 async fn an_identity_replayed_after_the_window_is_delivered() {
-    let server = Server::start_with_config(RuntimeConfig {
+    let server = Server::start_os_with_config(RuntimeConfig {
         guarantees: bounded(),
         ..RuntimeConfig::default()
     })
@@ -150,7 +150,7 @@ async fn an_identity_replayed_after_the_window_is_delivered() {
 async fn nothing_is_suppressed_without_the_negotiated_level() {
     // The default `core` set: the same replay is delivered twice, because no
     // deduplication was negotiated and none is applied.
-    let server = Server::start().await;
+    let server = Server::start_os().await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
     let endpoint = raw::client_endpoint(&server.certs);

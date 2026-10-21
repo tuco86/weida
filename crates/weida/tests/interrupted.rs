@@ -18,21 +18,22 @@ use std::time::Duration;
 use common::Server;
 use tokio::io::AsyncReadExt;
 use weida::{
-    Acknowledgement, CursorLevel, Error, Limits, RuntimeConfig, TransferMeta, TransferMeta as Meta,
+    Acknowledgement, CursorLevel, Error, Limits, RuntimeConfig, SimNet, TransferMeta,
+    TransferMeta as Meta,
 };
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
-const DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 
-async fn within<F: Future>(f: F) -> F::Output {
+pub(crate) async fn within<F: Future>(f: F) -> F::Output {
     tokio::time::timeout(DEADLINE, f)
         .await
         .expect("operation timed out")
 }
 
-const STORED: CursorLevel = CursorLevel::Known(Acknowledgement::Stored);
+pub(crate) const STORED: CursorLevel = CursorLevel::Known(Acknowledgement::Stored);
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_transfer_interrupted_before_fin_is_connection_lost_for_the_sender() {
     let server = Server::start().await;
     let puller = server.listener.puller("/jobs").expect("puller");
@@ -140,10 +141,11 @@ async fn a_reader_never_sees_an_interrupted_stream_as_complete() {
 
 #[tokio::test]
 async fn a_reqrep_requester_can_reissue_after_an_indeterminate_outcome() {
+    let net = SimNet::new();
     // Req/Rep's answer is **reschedule**, and it is available because the
     // requester learns the outcome: a reply half is what makes re-issuing a
     // decision rather than a guess.
-    let server = Server::start().await;
+    let server = Server::start_on(&net, RuntimeConfig::default()).await;
     let replier = server.listener.replier("/t").expect("replier");
 
     let (taken_tx, taken_rx) = tokio::sync::oneshot::channel();
@@ -182,7 +184,7 @@ async fn a_reqrep_requester_can_reissue_after_an_indeterminate_outcome() {
 
     // Rescheduling is an ordinary new exchange on a fresh peer. weida
     // remembers nothing and re-opens nothing: the sender decides.
-    let second = Server::start().await;
+    let second = Server::start_on(&net, RuntimeConfig::default()).await;
     let replier = second.listener.replier("/t").expect("replier");
     let answering = tokio::spawn(async move {
         let mut request = replier.accept().await.expect("accept");
@@ -241,7 +243,7 @@ async fn a_push_producer_is_the_only_side_that_can_reschedule() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_pubsub_copy_lost_to_a_dead_subscriber_is_counted_not_retried() {
     // Pub/Sub's answer is **cancel**: a copy is per subscriber and best
     // effort, so a copy that cannot be taken is counted and the publisher
@@ -261,8 +263,8 @@ async fn a_pubsub_copy_lost_to_a_dead_subscriber_is_counted_not_retried() {
     within(subscriber.subscribe("")).await.expect("subscribe");
 
     // Wait for the subscription to register.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while publisher.subscriber_count() == 0 && std::time::Instant::now() < deadline {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while publisher.subscriber_count() == 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(publisher.subscriber_count(), 1);
@@ -313,7 +315,7 @@ async fn a_pubsub_copy_lost_to_a_dead_subscriber_is_counted_not_retried() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_cursor_reported_before_the_break_survives_the_break() {
     // The whole value of a cursor over a verdict: a whole-message verdict
     // tells an interrupted sender **nothing**, while a cursor tells it a
@@ -357,64 +359,4 @@ async fn a_cursor_reported_before_the_break_survives_the_break() {
     assert_eq!(within(cursors.changed()).await, None);
 
     client.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_bound_side_observes_a_dead_dialler_within_the_idle_timeout() {
-    // A reliable work chain needs bounded detection, and the knobs already
-    // exist: `keep_alive` from the dialling side only, `idle_timeout` both
-    // ways. Shortened here exactly as `runtime.rs`'s own test does, because
-    // the defaults (10 s and 30 s) are too long for a test and the **bound**
-    // is what is under test, not the number.
-    let limits = Limits {
-        keep_alive: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(300),
-        ..Limits::default()
-    };
-    let server = Server::start_with(limits).await;
-    let paired = server.listener.pair("/link").expect("bound pair");
-    let url = server.url("/link");
-
-    // The dialler gets its **own** reactor, which is the only way a test can
-    // make a peer stop answering rather than close politely: dropping the
-    // runtime stops the threads that drive the connection, so no FIN and no
-    // close frame ever reaches the bound side. Anything gentler than this
-    // tests an orderly close, which the idle timeout is not for.
-    let client = weida::Runtime::owned(RuntimeConfig {
-        limits,
-        worker_threads: 1,
-        ..RuntimeConfig::default()
-    })
-    .expect("owned runtime");
-    let dialling = client.pair(server.trust());
-    within(dialling.connect(&url)).await.expect("connect");
-    within(dialling.send(b"alive")).await.expect("send");
-    let inbound = within(paired.recv()).await.expect("recv");
-    assert_eq!(
-        within(inbound.collect(64)).await.expect("collect"),
-        b"alive"
-    );
-
-    // The dialler vanishes.
-    drop(dialling);
-    drop(client);
-
-    // The bound side notices **within the timeout** rather than eventually,
-    // which is the property a work chain depends on: a generous ten times the
-    // idle timeout, so the assertion is about the bound and not about the
-    // scheduler.
-    let err = tokio::time::timeout(limits.idle_timeout * 10, async {
-        loop {
-            match paired.send(b"still there?").await {
-                Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
-                Err(e) => return e,
-            }
-        }
-    })
-    .await
-    .expect("the bound side observes the death inside ten idle timeouts");
-    assert!(
-        matches!(err, Error::ConnectionLost(_) | Error::NotConnected),
-        "a dead dialler surfaces as a lost connection: {err:?}"
-    );
 }

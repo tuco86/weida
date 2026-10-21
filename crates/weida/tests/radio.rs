@@ -20,13 +20,14 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
     ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, Identity, Incoming,
-    JoinTerms, Limits, PeerIdentity, Radio, Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
+    JoinTerms, Limits, Network, PeerIdentity, Radio, Received, Runtime, RuntimeConfig,
+    SegmentTerms, SimNet, Trust,
 };
 
 /// Generous ceiling: every assertion below should settle well inside it.
-const DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
-async fn within<F: Future>(f: F) -> F::Output {
+pub(crate) async fn within<F: Future>(f: F) -> F::Output {
     tokio::time::timeout(DEADLINE, f)
         .await
         .expect("operation timed out")
@@ -34,14 +35,19 @@ async fn within<F: Future>(f: F) -> F::Output {
 
 /// A client runtime whose streams stall after 64 KiB unread: a dish on it
 /// that never reads leaves a large segment unacknowledged.
-fn stalling(server: &Server) -> Runtime {
+pub(crate) fn stalling(server: &Server) -> Runtime {
     server.client_runtime_with(Limits {
         stream_receive_window: 64 * 1024,
         ..Limits::default()
     })
 }
 
-async fn joined(server: &Server, runtime: &Runtime, filter: &str, terms: JoinTerms) -> Dish {
+pub(crate) async fn joined(
+    server: &Server,
+    runtime: &Runtime,
+    filter: &str,
+    terms: JoinTerms,
+) -> Dish {
     let dish = runtime.dish(server.trust());
     within(dish.join(filter, terms)).await.expect("join");
     within(dish.connect(&server.url("/r")))
@@ -52,7 +58,7 @@ async fn joined(server: &Server, runtime: &Runtime, filter: &str, terms: JoinTer
 
 /// Waits until the radio holds `n` dishes: a join is a SUBSCRIBE, and the
 /// radio learns it when that stream is dispatched.
-async fn dishes(radio: &Radio, n: usize) {
+pub(crate) async fn dishes(radio: &Radio, n: usize) {
     within(async {
         while radio.dish_count() < n {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -61,14 +67,14 @@ async fn dishes(radio: &Radio, n: usize) {
     .await;
 }
 
-fn segment_of(received: Received) -> weida::IncomingTransfer {
+pub(crate) fn segment_of(received: Received) -> weida::IncomingTransfer {
     match received {
         Received::Segment(transfer) => transfer,
         other => panic!("expected a stream segment, got {other:?}"),
     }
 }
 
-fn send(radio: &Radio, topic: &str, chunks: usize, chunk: usize) {
+pub(crate) fn send(radio: &Radio, topic: &str, chunks: usize, chunk: usize) {
     let mut segment = radio
         .segment(topic, SegmentTerms::default())
         .expect("segment");
@@ -78,7 +84,7 @@ fn send(radio: &Radio, topic: &str, chunks: usize, chunk: usize) {
     segment.finish();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -129,81 +135,7 @@ async fn a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one() {
     stalled_rt.shutdown().await;
 }
 
-#[tokio::test]
-async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
-    // Frames of a 30 fps video, ten to a segment, the next segment opening
-    // one frame interval after the previous one's last frame: the dish reads
-    // everything at once, but its acknowledgement of a finished segment is a
-    // round trip away when the successor opens.
-    const SEGMENTS: usize = 6;
-    const FRAMES: usize = 10;
-    let server = Server::start().await;
-    let radio = server.listener.radio("/r").expect("radio");
-    let front = common::delay_proxy(server.addr, Duration::from_millis(100)).await;
-    let runtime = server.client_runtime();
-    let dish = runtime.dish(server.trust());
-    within(dish.join("v", JoinTerms::default()))
-        .await
-        .expect("join");
-    within(dish.connect(&format!("weida://127.0.0.1:{}/r", front.port())))
-        .await
-        .expect("connect");
-    dishes(&radio, 1).await;
-
-    let reader = tokio::spawn(async move {
-        let mut seen = Vec::new();
-        for _ in 0..SEGMENTS {
-            let mut transfer = segment_of(within(dish.recv()).await.expect("recv"));
-            let number = transfer.meta().segment.expect("a segment number");
-            let mut frames = 0;
-            let whole = loop {
-                let mut len = [0u8; 4];
-                match within(transfer.read_exact(&mut len)).await {
-                    Ok(_) => {}
-                    Err(e) => break e.kind() == std::io::ErrorKind::UnexpectedEof,
-                }
-                let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
-                if within(transfer.read_exact(&mut body)).await.is_err() {
-                    break false;
-                }
-                frames += 1;
-            };
-            seen.push((number, frames, whole));
-        }
-        seen
-    });
-
-    let mut tick = tokio::time::interval(Duration::from_millis(1000 / 30));
-    for _ in 0..SEGMENTS {
-        tick.tick().await;
-        let mut segment = radio
-            .segment("v", SegmentTerms::default())
-            .expect("segment");
-        for f in 0..FRAMES {
-            if f > 0 {
-                tick.tick().await;
-            }
-            let size: usize = if f == 0 { 60_000 } else { 5_000 };
-            let mut frame = (size as u32).to_le_bytes().to_vec();
-            frame.resize(4 + size, 0x5a);
-            segment.write(frame).expect("write");
-        }
-        segment.finish();
-    }
-    let seen = within(reader).await.expect("reader");
-    for (number, frames, whole) in &seen {
-        assert!(
-            *whole && *frames == FRAMES,
-            "segment {number}: {seen:?} {:?}",
-            radio.dropped_on("v")
-        );
-    }
-    let superseded = radio.dropped_on("v").map_or(0, |d| d.superseded);
-    assert_eq!(superseded, 0);
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_segment_finished_right_before_its_successor_still_arrives_whole() {
     // A GOP ends where the next keyframe begins: the successor opens the
     // moment the segment is finished, while its last chunks and its FIN are
@@ -234,7 +166,7 @@ async fn a_segment_finished_right_before_its_successor_still_arrives_whole() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_segment_whose_finish_found_a_full_queue_is_cut_at_once() {
     // The copy's queue is full when the segment finishes, so its FIN is
     // never queued: the copy loses the segment there and then, before it
@@ -268,7 +200,7 @@ async fn a_segment_whose_finish_found_a_full_queue_is_cut_at_once() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_segment_following_upstream_keeps_its_copy_while_its_successor_opens() {
     // A relay opens segment n+1 the moment its upstream does, while the rest
     // of segment n is still arriving from upstream.
@@ -306,7 +238,7 @@ async fn a_segment_following_upstream_keeps_its_copy_while_its_successor_opens()
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_segment_following_upstream_still_resets_a_stalled_dish() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -333,7 +265,7 @@ async fn a_segment_following_upstream_still_resets_a_stalled_dish() {
 
 // --- segments from a dialling peer ---------------------------------------------
 
-fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {
+pub(crate) fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {
     match incoming {
         Incoming::Stream(transfer) => transfer,
         other => panic!("expected a stream, got {other:?}"),
@@ -368,7 +300,7 @@ async fn a_peer_segment_reaches_an_acceptor_with_its_number() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_peer_segment_supersedes_the_previous_one_on_its_topic() {
     let server = Server::start_with(Limits {
         stream_receive_window: 64 * 1024,
@@ -452,7 +384,7 @@ async fn two_peers_on_one_connection_number_one_sequence() {
 // --- layers ---------------------------------------------------------------------
 
 /// A server whose radio gives each dish 256 KiB of unwritten chunks.
-async fn small_budget() -> Server {
+pub(crate) async fn small_budget() -> Server {
     Server::start_with(Limits {
         subscriber_buffer_bytes: 256 * 1024,
         ..Limits::default()
@@ -463,7 +395,7 @@ async fn small_budget() -> Server {
 /// Every segment the dish receives until it is quiet for 300 ms, each read
 /// to its end: `(layer, Ok(body))` for a whole layer, `(layer, Err)` for one
 /// that was reset.
-async fn layers_heard(dish: &Dish) -> Vec<(u8, Result<Vec<u8>, Error>)> {
+pub(crate) async fn layers_heard(dish: &Dish) -> Vec<(u8, Result<Vec<u8>, Error>)> {
     let mut heard = Vec::new();
     while let Ok(Ok(received)) = tokio::time::timeout(Duration::from_millis(300), dish.recv()).await
     {
@@ -475,7 +407,7 @@ async fn layers_heard(dish: &Dish) -> Vec<(u8, Result<Vec<u8>, Error>)> {
     heard
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut() {
     let server = small_budget().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -518,7 +450,7 @@ async fn a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cu
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dish_capped_at_layer_zero_is_never_sent_layer_one() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -547,7 +479,7 @@ async fn a_dish_capped_at_layer_zero_is_never_sent_layer_one() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_layer_cut_also_cuts_every_higher_layer_of_that_segment() {
     let server = small_budget().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -590,62 +522,6 @@ async fn a_layer_cut_also_cuts_every_higher_layer_of_that_segment() {
 }
 
 #[tokio::test]
-async fn a_receiver_delivers_each_layer_of_a_segment_once() {
-    use common::raw;
-    use weida::codes;
-    use weida_protocol::{DataHeader, FrameKind, encode_frame};
-
-    let server = Server::start().await;
-    let acceptor = server.listener.acceptor("/up").expect("acceptor");
-    let endpoint = raw::client_endpoint(&server.certs);
-    let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
-        .await
-        .expect("handshake");
-    raw::send_hello(&conn).await;
-
-    async fn send(conn: &quinn::Connection, segment: u64, layer: u8) -> quinn::SendStream {
-        let header = DataHeader {
-            topic: Some("t".into()),
-            segment: Some(segment),
-            layer: (layer > 0).then_some(layer),
-            ..DataHeader::addressed("/up")
-        };
-        let mut stream = conn.open_uni().await.expect("open uni");
-        stream
-            .write_all(&encode_frame(FrameKind::Data, &header.encode()))
-            .await
-            .expect("write header");
-        stream.write_all(b"body").await.expect("write body");
-        stream
-    }
-    let canceled = Ok(Some(
-        quinn::VarInt::from_u64(codes::CANCELED).expect("varint"),
-    ));
-
-    // Each layer of segment 5 once, then layer 1 again and segment 4.
-    let mut fresh = Vec::new();
-    for layer in [0, 1] {
-        let mut stream = send(&conn, 5, layer).await;
-        stream.finish().expect("finish");
-        let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
-        fresh.push((transfer.meta().segment, transfer.meta().layer));
-        fresh.sort_unstable();
-        drop(stream);
-    }
-    assert_eq!(fresh, vec![(Some(5), Some(0)), (Some(5), Some(1))]);
-    for (segment, layer) in [(5, 1), (4, 0), (5, 0)] {
-        let stale = send(&conn, segment, layer).await;
-        assert_eq!(within(stale.stopped()).await, canceled, "{segment}/{layer}");
-    }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), acceptor.accept())
-            .await
-            .is_err(),
-        "a stale layer reached the acceptor"
-    );
-}
-
-#[tokio::test]
 async fn a_peer_segment_carries_its_layers_to_the_acceptor() {
     let server = Server::start().await;
     let acceptor = server.listener.acceptor("/up").expect("acceptor");
@@ -678,7 +554,7 @@ async fn a_peer_segment_carries_its_layers_to_the_acceptor() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_empty_segment_arrives_as_an_empty_layer_zero() {
     // A radio segment to a dish.
     let server = Server::start().await;
@@ -728,13 +604,16 @@ async fn an_empty_segment_arrives_as_an_empty_layer_zero() {
 
 // --- freshness per connection ---------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let first = common::Restartable::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let first =
+        common::Restartable::start(&net, &certs, "127.0.0.1:0".parse().expect("loopback")).await;
     let addr = first.addr;
     let radio = first.listener.radio("/r").expect("radio");
     let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
         reconnect: weida::ReconnectPolicy {
             initial: Duration::from_millis(5),
             max: Duration::from_millis(50),
@@ -763,7 +642,7 @@ async fn a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero() {
 
     drop(radio);
     first.stop().await;
-    let second = common::Restartable::start(&certs, addr).await;
+    let second = common::Restartable::start(&net, &certs, addr).await;
     let radio = second.listener.radio("/r").expect("radio");
     // The redial sends the join again.
     dishes(&radio, 1).await;
@@ -774,58 +653,7 @@ async fn a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero() {
     client.shutdown().await;
 }
 
-#[tokio::test]
-async fn an_acceptor_refuses_a_segment_older_than_one_it_delivered() {
-    use common::raw;
-    use weida::codes;
-    use weida_protocol::{DataHeader, FrameKind, encode_frame};
-
-    let server = Server::start().await;
-    let acceptor = server.listener.acceptor("/up").expect("acceptor");
-    let endpoint = raw::client_endpoint(&server.certs);
-    let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
-        .await
-        .expect("handshake");
-    raw::send_hello(&conn).await;
-
-    // The stream stays open: a finished one that the transport acknowledged
-    // whole reports no STOP_SENDING.
-    async fn send(conn: &quinn::Connection, segment: u64) -> quinn::SendStream {
-        let header = DataHeader {
-            topic: Some("t".into()),
-            segment: Some(segment),
-            ..DataHeader::addressed("/up")
-        };
-        let mut stream = conn.open_uni().await.expect("open uni");
-        stream
-            .write_all(&encode_frame(FrameKind::Data, &header.encode()))
-            .await
-            .expect("write header");
-        stream.write_all(b"body").await.expect("write body");
-        stream
-    }
-
-    let mut newest = send(&conn, 5).await;
-    newest.finish().expect("finish");
-    let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
-    assert_eq!(transfer.meta().segment, Some(5));
-
-    let stale = send(&conn, 3).await;
-    assert_eq!(
-        within(stale.stopped()).await,
-        Ok(Some(
-            quinn::VarInt::from_u64(codes::CANCELED).expect("varint")
-        ))
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), acceptor.accept())
-            .await
-            .is_err(),
-        "a stale segment reached the acceptor"
-    );
-}
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_segment_supersedes_only_its_own_topic() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -854,7 +682,7 @@ async fn a_segment_supersedes_only_its_own_topic() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_joiner_receives_the_next_segment_and_nothing_earlier() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -879,7 +707,7 @@ async fn a_joiner_receives_the_next_segment_and_nothing_earlier() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dish_max_age_expires_its_copy() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -923,7 +751,7 @@ async fn a_dish_max_age_expires_its_copy() {
 
 // --- datagram segments ---------------------------------------------------------
 
-fn with_datagrams() -> Limits {
+pub(crate) fn with_datagrams() -> Limits {
     Limits {
         datagram_receive_bytes: DEFAULT_DATAGRAM_RECEIVE_BYTES,
         ..Limits::default()
@@ -931,7 +759,7 @@ fn with_datagrams() -> Limits {
 }
 
 /// Collects datagram segments until `count` arrived or the dish stays quiet.
-async fn datagrams(dish: &Dish, count: usize) -> Vec<(u64, usize)> {
+pub(crate) async fn datagrams(dish: &Dish, count: usize) -> Vec<(u64, usize)> {
     let mut seen = Vec::new();
     while seen.len() < count {
         match tokio::time::timeout(Duration::from_millis(500), dish.recv()).await {
@@ -951,7 +779,7 @@ async fn datagrams(dish: &Dish, count: usize) -> Vec<(u64, usize)> {
     seen
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_datagram_segment_reaches_every_joined_dish() {
     let server = Server::start_with(with_datagrams()).await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -979,7 +807,7 @@ async fn a_datagram_segment_reaches_every_joined_dish() {
     second_rt.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dish_without_datagrams_is_a_named_drop() {
     let server = Server::start_with(with_datagrams()).await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -999,7 +827,7 @@ async fn a_dish_without_datagrams_is_a_named_drop() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_datagram_larger_than_the_dish_carries_is_counted_too_large() {
     let server = Server::start_with(with_datagrams()).await;
     let radio = server.listener.radio("/r").expect("radio");
@@ -1031,7 +859,7 @@ async fn a_datagram_larger_than_the_dish_carries_is_counted_too_large() {
 /// counts the FLOW streams the radio opens toward it; the first `refuse` of
 /// them are stopped with STOP_SENDING and the rest are kept open. The endpoint
 /// and the connection are returned, and must stay alive for the flows.
-async fn raw_dish(
+pub(crate) async fn raw_dish(
     server: &Server,
     refuse: usize,
 ) -> (quinn::Endpoint, quinn::Connection, Arc<AtomicUsize>) {
@@ -1071,68 +899,26 @@ async fn raw_dish(
     (endpoint, conn, opened)
 }
 
-#[tokio::test]
-async fn a_dish_that_refuses_every_flow_costs_a_few_opens_not_one_per_datagram() {
-    let server = Server::start_with(with_datagrams()).await;
-    let radio = server.listener.radio("/r").expect("radio");
-    let (_endpoint, conn, opened) = raw_dish(&server, usize::MAX).await;
-    dishes(&radio, 1).await;
-
-    // A datagram a millisecond, so each refusal arrives between two sends:
-    // without a backoff every send would open a flow of its own.
-    within(async {
-        for _ in 0..1000 {
-            radio.datagram("voice", vec![0x33; 150]).expect("send");
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await;
-    let flows = opened.load(Ordering::SeqCst);
-    assert!(flows <= 8, "{flows} flows opened for 1000 datagrams");
-    let drops = radio.dropped_on("voice").expect("drops on voice");
-    assert!(drops.subscriber_queue >= 900, "{drops:?}");
-    conn.close(0u32.into(), b"done");
-}
-
-#[tokio::test]
-async fn a_refused_flow_is_opened_again_after_its_backoff_and_takes_datagrams() {
-    let server = Server::start_with(with_datagrams()).await;
-    let radio = server.listener.radio("/r").expect("radio");
-    let (_endpoint, conn, opened) = raw_dish(&server, 1).await;
-    dishes(&radio, 1).await;
-
-    // The first flow is refused. Until its backoff is over the datagrams are
-    // dropped; then a second flow opens, which the dish keeps, and takes one.
-    within(async {
-        loop {
-            let handed = radio.datagram("voice", vec![0x33; 150]).expect("send");
-            if handed == 1 && opened.load(Ordering::SeqCst) >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    conn.close(0u32.into(), b"done");
-}
-
 // --- admission and eviction ------------------------------------------------------
 
 /// A server whose binding requires any proved key, so every dish is a peer
 /// with a fingerprint ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)).
-struct Keyed {
-    listener: weida::Listener,
-    url: String,
-    _binding: weida::Binding,
-    _runtime: Runtime,
-    _certs: Certs,
+pub(crate) struct Keyed {
+    pub(crate) listener: weida::Listener,
+    pub(crate) url: String,
+    pub(crate) _binding: weida::Binding,
+    pub(crate) _runtime: Runtime,
+    pub(crate) _certs: Certs,
+    pub(crate) net: SimNet,
 }
 
 impl Keyed {
-    async fn start(limits: Limits) -> Keyed {
+    pub(crate) async fn start(limits: Limits) -> Keyed {
         let certs = Certs::generate();
+        let net = SimNet::new();
         let runtime = Runtime::new(RuntimeConfig {
             limits,
+            network: Network::sim(&net),
             ..RuntimeConfig::default()
         })
         .expect("runtime");
@@ -1155,11 +941,12 @@ impl Keyed {
             _binding: binding,
             _runtime: runtime,
             _certs: certs,
+            net,
         }
     }
 
     /// A dish presenting a fresh key, joined to `filter`; and that key.
-    async fn dish(&self, runtime: &Runtime, filter: &str) -> (Dish, PeerIdentity) {
+    pub(crate) async fn dish(&self, runtime: &Runtime, filter: &str) -> (Dish, PeerIdentity) {
         let id = Identity::generate().expect("identity");
         let peer = PeerIdentity::Key(id.fingerprint().expect("fingerprint"));
         let dish = runtime.dish(ClientTls::new(Trust::by_address()).with_identity(id));
@@ -1172,13 +959,13 @@ impl Keyed {
 }
 
 /// Whether `dish` receives a segment within half a second.
-async fn hears(dish: &Dish) -> bool {
+pub(crate) async fn hears(dish: &Dish) -> bool {
     tokio::time::timeout(Duration::from_millis(500), dish.recv())
         .await
         .is_ok()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn admission_refuses_a_join_silently_and_records_nothing() {
     let server = Keyed::start(Limits::default()).await;
     let (asked_tx, mut asked) = mpsc::unbounded_channel();
@@ -1190,7 +977,7 @@ async fn admission_refuses_a_join_silently_and_records_nothing() {
             let _ = asked_tx.send((join.peer.cloned(), join.filter.to_owned()));
             join.filter == "room.a"
         });
-    let runtime = server_client();
+    let runtime = server_client(&server);
 
     let (refused, refused_peer) = server.dish(&runtime, "#").await;
     assert_eq!(
@@ -1213,7 +1000,7 @@ async fn admission_refuses_a_join_silently_and_records_nothing() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn evict_withdraws_a_join_and_frees_its_subscription_slot() {
     // One subscription per connection: a second join after the eviction
     // fits only if the eviction released the first one's slot, and closes
@@ -1224,7 +1011,7 @@ async fn evict_withdraws_a_join_and_frees_its_subscription_slot() {
     })
     .await;
     let radio = server.listener.radio("/r").expect("radio");
-    let runtime = server_client();
+    let runtime = server_client(&server);
     let (dish, peer) = server.dish(&runtime, "room.a").await;
     dishes(&radio, 1).await;
 
@@ -1253,11 +1040,11 @@ async fn evict_withdraws_a_join_and_frees_its_subscription_slot() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn installing_an_admission_screens_joins_already_recorded() {
     let server = Keyed::start(Limits::default()).await;
     let radio = server.listener.radio("/r").expect("radio");
-    let runtime = server_client();
+    let runtime = server_client(&server);
     let (kept, kept_peer) = server.dish(&runtime, "room.a").await;
     let (screened, _) = server.dish(&runtime, "room.a").await;
     dishes(&radio, 2).await;
@@ -1272,13 +1059,17 @@ async fn installing_an_admission_screens_joins_already_recorded() {
     runtime.shutdown().await;
 }
 
-fn server_client() -> Runtime {
-    Runtime::new(RuntimeConfig::default()).expect("client runtime")
+pub(crate) fn server_client(server: &Keyed) -> Runtime {
+    Runtime::new(RuntimeConfig {
+        network: Network::sim(&server.net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime")
 }
 
 // --- per-dish drops ---------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dish_drops_names_the_dish_that_lost_and_forgets_it_when_it_leaves() {
     const CHUNK: usize = 16 * 1024;
     let server = Keyed::start(Limits {
@@ -1287,13 +1078,14 @@ async fn dish_drops_names_the_dish_that_lost_and_forgets_it_when_it_leaves() {
     })
     .await;
     let radio = server.listener.radio("/r").expect("radio");
-    let reading_rt = server_client();
+    let reading_rt = server_client(&server);
     let (reading, reading_peer) = server.dish(&reading_rt, "v").await;
     let stalled_rt = Runtime::new(RuntimeConfig {
         limits: Limits {
             stream_receive_window: 64 * 1024,
             ..Limits::default()
         },
+        network: Network::sim(&server.net),
         ..RuntimeConfig::default()
     })
     .expect("stalled runtime");
@@ -1371,7 +1163,11 @@ async fn dish_drops_names_the_dish_that_lost_and_forgets_it_when_it_leaves() {
 
 /// A dish on its own runtime, joined to each `(filter, terms)` and connected
 /// to `/r` of `server`.
-async fn dish_joined_to(server: &Server, runtime: &Runtime, joins: &[(&str, JoinTerms)]) -> Dish {
+pub(crate) async fn dish_joined_to(
+    server: &Server,
+    runtime: &Runtime,
+    joins: &[(&str, JoinTerms)],
+) -> Dish {
     let dish = runtime.dish(server.trust());
     for (filter, terms) in joins {
         within(dish.join(filter, terms.clone()))
@@ -1384,7 +1180,7 @@ async fn dish_joined_to(server: &Server, runtime: &Runtime, joins: &[(&str, Join
     dish
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dish_holding_filters_it_misses_is_reached_once_per_segment() {
     // Each dish holds 40 filters that never match `v`, and `v` itself: its
     // matching filters are one delivery, so each segment arrives once.
@@ -1425,7 +1221,7 @@ async fn a_dish_holding_filters_it_misses_is_reached_once_per_segment() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn filters_of_one_dish_combine_their_layer_caps_by_the_largest() {
     // The matching filters of one dish combine: the largest cap applies, and
     // a matching filter without a cap lifts it.

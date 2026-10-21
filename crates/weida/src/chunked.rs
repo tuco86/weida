@@ -848,7 +848,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_drain_releases_its_reader() {
         let exec = exec();
         let (mut tx, rx) = tokio::io::duplex(WIRE_CAP);
@@ -875,7 +875,7 @@ mod tests {
         drop(tx);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_payload_still_flowing_drains_to_its_fin() {
         const PIECES: usize = 20;
         const PIECE: usize = 100;
@@ -959,34 +959,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_drain_lets_go_of_what_counts_the_connection_after_the_handle() {
-        let exec = exec();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let (mut tx, rx) = tokio::io::duplex(WIRE_CAP);
-        // A payload that promises ten bytes, delivers three and goes quiet.
-        tx.write_all(&[CHUNK_DATA, 10, 0, 0, 0, 1, 2, 3])
-            .await
-            .expect("write");
-        let reader = ChunkReader::new(
-            Traced {
-                inner: rx,
-                _dropped: Dropped::new("handle", &log),
-            },
-            exec.clone(),
-        );
-        reader.drain_within(Duration::from_millis(50), Dropped::new("hold", &log));
-        assert!(
-            log.lock().expect("log").is_empty(),
-            "the drain owns both until it ends"
-        );
-        exec.within(WAIT, logged(&log, 2))
-            .await
-            .expect("the drain gave up on the stalled peer");
-        assert_eq!(*log.lock().expect("log"), ["handle", "hold"]);
-        drop(tx);
-    }
-
-    #[tokio::test]
     async fn an_end_marker_finished_on_a_task_holds_what_counts_the_connection() {
         let exec = exec();
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -1007,5 +979,39 @@ mod tests {
             .await
             .expect("the task finished the marker and let go");
         assert_eq!(taken.lock().expect("sink").len(), 9);
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_drain_lets_go_of_what_counts_the_connection_after_the_handle() {
+            let exec = exec();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let (mut tx, rx) = tokio::io::duplex(WIRE_CAP);
+            // A payload that promises ten bytes, delivers three and goes quiet.
+            tx.write_all(&[CHUNK_DATA, 10, 0, 0, 0, 1, 2, 3])
+                .await
+                .expect("write");
+            let reader = ChunkReader::new(
+                Traced {
+                    inner: rx,
+                    _dropped: Dropped::new("handle", &log),
+                },
+                exec.clone(),
+            );
+            reader.drain_within(Duration::from_millis(50), Dropped::new("hold", &log));
+            assert!(
+                log.lock().expect("log").is_empty(),
+                "the drain owns both until it ends"
+            );
+            exec.within(WAIT, logged(&log, 2))
+                .await
+                .expect("the drain gave up on the stalled peer");
+            assert_eq!(*log.lock().expect("log"), ["handle", "hold"]);
+            drop(tx);
+        }
     }
 }

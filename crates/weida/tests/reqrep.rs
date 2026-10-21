@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{Certs, Server, Xorshift};
 use tokio::io::AsyncReadExt;
-use weida::{Error, TraceContext, TransferMeta};
+use weida::{Error, RuntimeConfig, SimNet, TraceContext, TransferMeta};
 
 /// Serves one request with an uppercasing echo handler.
 ///
@@ -597,17 +597,22 @@ async fn concurrent_exchanges_do_not_interfere() {
 
 #[tokio::test]
 async fn multi_peer_requests_round_robin() {
-    let a = Server::start().await;
-    let b = Server::start().await;
+    let net = SimNet::new();
+    let a = Server::start_on(&net, RuntimeConfig::default()).await;
+    let b = Server::start_on(&net, RuntimeConfig::default()).await;
     let handler_a = spawn_uppercase_handler(a.listener.replier("/rr").expect("replier")).await;
     let handler_b = spawn_uppercase_handler(b.listener.replier("/rr").expect("replier")).await;
 
     // One requester trusting both servers: trust is a property of the dialling
     // endpoint, so two peers under different CAs need one endpoint, not two
     // runtimes.
-    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("client runtime");
+    let client = weida::Runtime::new(weida::RuntimeConfig {
+        network: weida::Network::sim(&net),
+        ..weida::RuntimeConfig::default()
+    })
+    .expect("client runtime");
     let requester = client
-        .requester(weida::Trust::anchor_file(&a.certs.cert_pem).and_anchor_file(&b.certs.cert_pem));
+        .requester(weida::Trust::anchor(a.certs.cert.clone()).and_anchor(b.certs.cert.clone()));
     requester.connect(&a.url("/rr")).await.expect("connect a");
     requester.connect(&b.url("/rr")).await.expect("connect b");
     assert_eq!(requester.peer_count(), 2);

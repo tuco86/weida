@@ -2023,7 +2023,7 @@ mod tests {
     /// subscribers that had room and not for the rest. Finishing the transfer
     /// would hand the short ones a FIN after a hole, which they would take
     /// for a whole payload.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_write_dropped_while_it_waited_leaves_nothing_to_finish() {
         let registry = registry(Limits {
             subscriber_buffer_bytes: 8192,

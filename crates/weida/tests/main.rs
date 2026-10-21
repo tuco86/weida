@@ -4,29 +4,22 @@
 
 mod common;
 
-mod accept_limits;
 mod alpn;
 mod blocking;
 mod bus;
-mod cli;
 mod cursors;
-mod dedup;
 mod drain;
 mod flows;
 mod foreign_executor;
 mod guide;
-mod hostile;
 mod identity;
-mod identity_source;
 mod interrupted;
-mod local_hostile;
 mod pair;
 mod pubsub;
 mod pushpull;
 mod radio;
 mod raw_streams;
 mod reconnect;
-mod redial_storm;
 mod reorder;
 mod reqrep;
 mod sim;
@@ -35,6 +28,32 @@ mod streams;
 mod survey;
 #[cfg(feature = "swarm")]
 mod swarm;
-mod tls_trust;
 mod transports;
-mod unsafe_guard;
+
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    mod accept_limits;
+    mod blocking;
+    mod cli;
+    mod cursors;
+    mod dedup;
+    mod drain;
+    mod guide;
+    mod hostile;
+    mod identity;
+    mod identity_source;
+    mod interrupted;
+    mod local_hostile;
+    mod pubsub;
+    mod radio;
+    mod raw_streams;
+    mod reconnect;
+    mod redial_storm;
+    mod reorder;
+    mod stats;
+    mod streams;
+    mod tls_trust;
+    mod transports;
+    mod unsafe_guard;
+}

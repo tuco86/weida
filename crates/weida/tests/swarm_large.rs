@@ -68,116 +68,122 @@ fn mb_per_s(bytes: u64, elapsed: Duration) -> f64 {
     bytes as f64 / 1e6 / elapsed.as_secs_f64()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "moves 512 MiB through a 27 ms path; run with --release -- --ignored --nocapture"]
-async fn a_session_fetch_keeps_up_with_a_normal_download() {
-    let list = Arc::new(piece_list());
-    let blob = list.blob();
-    let server = Server::start().await;
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    use super::*;
 
-    let seeder = server.listener.seeder("/swarm").expect("seeder");
-    tokio::spawn(async move {
-        while let Ok(mut session) = seeder.accept().await {
-            let list = Arc::clone(&list);
-            tokio::spawn(async move {
-                if session.blob() != list.blob() {
-                    session.decline().await;
-                    return;
-                }
-                while let Ok(Some(ask)) = session.next().await {
-                    let answered = match ask {
-                        Ask::List => session.answer_list(&list).await,
-                        Ask::Have => session.answer_have(&Bits::full(COUNT)).await,
-                        Ask::Piece(index) => session.answer_piece(&piece(index)).await,
-                    };
-                    if answered.is_err() {
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "moves 512 MiB through a 27 ms path; run with --release -- --ignored --nocapture"]
+    async fn a_session_fetch_keeps_up_with_a_normal_download() {
+        let list = Arc::new(piece_list());
+        let blob = list.blob();
+        let server = Server::start().await;
+
+        let seeder = server.listener.seeder("/swarm").expect("seeder");
+        tokio::spawn(async move {
+            while let Ok(mut session) = seeder.accept().await {
+                let list = Arc::clone(&list);
+                tokio::spawn(async move {
+                    if session.blob() != list.blob() {
+                        session.decline().await;
                         return;
                     }
-                }
-            });
-        }
-    });
-
-    let replier = server.listener.replier("/download").expect("replier");
-    tokio::spawn(async move {
-        while let Ok(request) = replier.accept().await {
-            let Ok(mut reply) = request
-                .reply(TransferMeta::default().with_content_len(TOTAL))
-                .await
-            else {
-                continue;
-            };
-            for index in 0..COUNT {
-                if reply.write_all(&piece(index)).await.is_err() {
-                    break;
-                }
+                    while let Ok(Some(ask)) = session.next().await {
+                        let answered = match ask {
+                            Ask::List => session.answer_list(&list).await,
+                            Ask::Have => session.answer_have(&Bits::full(COUNT)).await,
+                            Ask::Piece(index) => session.answer_piece(&piece(index)).await,
+                        };
+                        if answered.is_err() {
+                            return;
+                        }
+                    }
+                });
             }
-            let _ = reply.finish();
+        });
+
+        let replier = server.listener.replier("/download").expect("replier");
+        tokio::spawn(async move {
+            while let Ok(request) = replier.accept().await {
+                let Ok(mut reply) = request
+                    .reply(TransferMeta::default().with_content_len(TOTAL))
+                    .await
+                else {
+                    continue;
+                };
+                for index in 0..COUNT {
+                    if reply.write_all(&piece(index)).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = reply.finish();
+            }
+        });
+
+        let front = common::delay_proxy(server.addr, ONE_WAY).await;
+        let url = |path: &str| format!("weida://127.0.0.1:{}{path}", front.port());
+
+        // The normal download, with the windows a swarm dials with.
+        let download_client = server.client_runtime_with(Limits {
+            stream_receive_window: 32 << 20,
+            connection_receive_window: 64 << 20,
+            ..Limits::default()
+        });
+        let requester = download_client.requester(server.trust());
+        requester.connect(&url("/download")).await.expect("connect");
+        let started = Instant::now();
+        let mut body = requester.request(b"").await.expect("the download");
+        let mut chunk = vec![0; PIECE];
+        let mut downloaded = 0u64;
+        loop {
+            let n = body.read(&mut chunk).await.expect("read the download");
+            if n == 0 {
+                break;
+            }
+            downloaded += n as u64;
         }
-    });
+        let baseline = mb_per_s(downloaded, started.elapsed());
+        assert_eq!(downloaded, TOTAL);
 
-    let front = common::delay_proxy(server.addr, ONE_WAY).await;
-    let url = |path: &str| format!("weida://127.0.0.1:{}{path}", front.port());
-
-    // The normal download, with the windows a swarm dials with.
-    let download_client = server.client_runtime_with(Limits {
-        stream_receive_window: 32 << 20,
-        connection_receive_window: 64 << 20,
-        ..Limits::default()
-    });
-    let requester = download_client.requester(server.trust());
-    requester.connect(&url("/download")).await.expect("connect");
-    let started = Instant::now();
-    let mut body = requester.request(b"").await.expect("the download");
-    let mut chunk = vec![0; PIECE];
-    let mut downloaded = 0u64;
-    loop {
-        let n = body.read(&mut chunk).await.expect("read the download");
-        if n == 0 {
-            break;
+        // The swarm fetch, on the runtime's default limits: it raises its own
+        // windows. No list given, so LIST is ordered too.
+        let swarm_client = server.client_runtime();
+        let swarm = swarm_client.swarm(server.trust());
+        swarm.connect(&url("/swarm")).await.expect("connect");
+        let options = FetchOptions {
+            per_peer: 16,
+            max_inflight: 32,
+            ..FetchOptions::default()
+        };
+        let started = Instant::now();
+        let mut fetch = swarm.fetch(blob, Bits::new(COUNT), options);
+        let mut fetched = 0u64;
+        while let Some(piece) = fetch.next().await {
+            fetched += piece.expect("a verified piece").bytes.len() as u64;
         }
-        downloaded += n as u64;
-    }
-    let baseline = mb_per_s(downloaded, started.elapsed());
-    assert_eq!(downloaded, TOTAL);
+        let swarm_rate = mb_per_s(fetched, started.elapsed());
 
-    // The swarm fetch, on the runtime's default limits: it raises its own
-    // windows. No list given, so LIST is ordered too.
-    let swarm_client = server.client_runtime();
-    let swarm = swarm_client.swarm(server.trust());
-    swarm.connect(&url("/swarm")).await.expect("connect");
-    let options = FetchOptions {
-        per_peer: 16,
-        max_inflight: 32,
-        ..FetchOptions::default()
-    };
-    let started = Instant::now();
-    let mut fetch = swarm.fetch(blob, Bits::new(COUNT), options);
-    let mut fetched = 0u64;
-    while let Some(piece) = fetch.next().await {
-        fetched += piece.expect("a verified piece").bytes.len() as u64;
-    }
-    let swarm_rate = mb_per_s(fetched, started.elapsed());
-
-    eprintln!(
-        "256 MiB over {} ms RTT: download {baseline:.1} MB/s, swarm {swarm_rate:.1} MB/s ({:.2}x)",
-        2 * ONE_WAY.as_millis(),
-        swarm_rate / baseline
-    );
-    assert!(fetch.delivered().all());
-    assert_eq!(fetched, TOTAL);
-    assert!(
-        swarm_rate >= 0.7 * baseline,
-        "the swarm fetched at {swarm_rate:.1} MB/s, below 0.7 of the download's {baseline:.1} MB/s"
-    );
-    match peak_rss() {
-        Some(rss) => {
-            eprintln!("peak_rss={:.1} MiB", rss as f64 / f64::from(1 << 20));
-            assert!(
-                rss < RSS_LIMIT,
-                "peak RSS {rss} bytes over {RSS_LIMIT}: something held the blob"
-            );
+        eprintln!(
+            "256 MiB over {} ms RTT: download {baseline:.1} MB/s, swarm {swarm_rate:.1} MB/s ({:.2}x)",
+            2 * ONE_WAY.as_millis(),
+            swarm_rate / baseline
+        );
+        assert!(fetch.delivered().all());
+        assert_eq!(fetched, TOTAL);
+        assert!(
+            swarm_rate >= 0.7 * baseline,
+            "the swarm fetched at {swarm_rate:.1} MB/s, below 0.7 of the download's {baseline:.1} MB/s"
+        );
+        match peak_rss() {
+            Some(rss) => {
+                eprintln!("peak_rss={:.1} MiB", rss as f64 / f64::from(1 << 20));
+                assert!(
+                    rss < RSS_LIMIT,
+                    "peak RSS {rss} bytes over {RSS_LIMIT}: something held the blob"
+                );
+            }
+            None => eprintln!("peak_rss unavailable on this platform"),
         }
-        None => eprintln!("peak_rss unavailable on this platform"),
     }
 }

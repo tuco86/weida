@@ -8,12 +8,19 @@ use std::time::Duration;
 
 use common::Certs;
 use tokio::io::AsyncReadExt;
-use weida::{Alpn, Binding, ClientTls, Listener, Runtime, RuntimeConfig, TransferMeta, Trust};
+use weida::{
+    Alpn, Binding, ClientTls, Listener, Network, Runtime, RuntimeConfig, SimNet, TransferMeta,
+    Trust,
+};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
-async fn bind(certs: &Certs, alpn: Alpn) -> (Runtime, Listener, Binding) {
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+async fn bind(net: &SimNet, certs: &Certs, alpn: Alpn) -> (Runtime, Listener, Binding) {
+    let runtime = Runtime::new(RuntimeConfig {
+        network: Network::sim(net),
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
     let listener = runtime.listener();
     let binding = listener
         .bind_quic(
@@ -54,14 +61,19 @@ fn spawn_echo(listener: &Listener) {
     });
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_raft_binding_refuses_an_application_dial() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let (_runtime, listener, binding) = bind(&certs, Alpn::Raft).await;
+    let (_runtime, listener, binding) = bind(&net, &certs, Alpn::Raft).await;
     spawn_echo(&listener);
     let url = pinned_url(&certs, &binding);
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
     let plain = client.requester(ClientTls::new(Trust::by_address()));
     let refused = tokio::time::timeout(DEADLINE, plain.connect(&url))
         .await
@@ -81,14 +93,19 @@ async fn a_raft_binding_refuses_an_application_dial() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_application_binding_refuses_a_raft_dial() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let (_runtime, listener, binding) = bind(&certs, Alpn::Weida).await;
+    let (_runtime, listener, binding) = bind(&net, &certs, Alpn::Weida).await;
     spawn_echo(&listener);
     let url = pinned_url(&certs, &binding);
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
     let raft = client.requester(ClientTls::new(Trust::by_address()).with_alpn(Alpn::Raft));
     let refused = tokio::time::timeout(DEADLINE, raft.connect(&url))
         .await

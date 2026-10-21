@@ -14,7 +14,7 @@ use std::time::Duration;
 use common::Certs;
 use futures::future::{Either, select};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
-use weida::{Runtime, RuntimeConfig, TransferMeta};
+use weida::{Network, Runtime, RuntimeConfig, SimNet, TransferMeta};
 
 /// The same ceiling the tokio suites give `within()`; enforced by a watchdog
 /// thread here, because a timer would need the reactor this test refuses to
@@ -41,13 +41,18 @@ fn within<F: Future>(body: F) -> F::Output {
 
 #[test]
 fn a_req_rep_round_trip_runs_without_a_tokio_executor() {
+    let net = SimNet::new();
     assert!(
         tokio::runtime::Handle::try_current().is_err(),
         "this test must run with no ambient tokio runtime"
     );
 
     let certs = Certs::generate();
-    let runtime = Runtime::owned(RuntimeConfig::default()).expect("owned runtime");
+    let runtime = Runtime::owned(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("owned runtime");
     let listener = runtime.listener();
     let replier = listener.replier("/transform").expect("replier");
 
@@ -116,13 +121,18 @@ fn a_req_rep_round_trip_runs_without_a_tokio_executor() {
 
 #[test]
 fn a_push_pull_transfer_runs_without_a_tokio_executor() {
+    let net = SimNet::new();
     assert!(
         tokio::runtime::Handle::try_current().is_err(),
         "this test must run with no ambient tokio runtime"
     );
 
     let certs = Certs::generate();
-    let runtime = Runtime::owned(RuntimeConfig::default()).expect("owned runtime");
+    let runtime = Runtime::owned(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("owned runtime");
     let listener = runtime.listener();
     let puller = listener.puller("/jobs").expect("puller");
 
@@ -173,13 +183,18 @@ fn a_push_pull_transfer_runs_without_a_tokio_executor() {
 
 #[test]
 fn a_pub_sub_fan_out_runs_without_a_tokio_executor() {
+    let net = SimNet::new();
     assert!(
         tokio::runtime::Handle::try_current().is_err(),
         "this test must run with no ambient tokio runtime"
     );
 
     let certs = Certs::generate();
-    let runtime = Runtime::owned(RuntimeConfig::default()).expect("owned runtime");
+    let runtime = Runtime::owned(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("owned runtime");
     let listener = runtime.listener();
     let publisher = listener.publisher("/md").expect("publisher");
 

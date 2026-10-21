@@ -18,19 +18,19 @@ use common::Certs;
 use tokio::time::timeout;
 use weida::{
     Acceptor, Binding, DEFAULT_DATAGRAM_RECEIVE_BYTES, Error, FlowMeta, GiveUp, Incoming,
-    IncomingFlow, Limits, Listener, LossCause, OutboxFull, PeerEvent, PeerEvents, Puller,
-    ReconnectPolicy, Runtime, RuntimeConfig,
+    IncomingFlow, Limits, Listener, LossCause, Network, OutboxFull, PeerEvent, PeerEvents, Puller,
+    ReconnectPolicy, Runtime, RuntimeConfig, SimNet,
 };
 
-const DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 
-async fn within<F: Future>(f: F) -> F::Output {
+pub(crate) async fn within<F: Future>(f: F) -> F::Output {
     timeout(DEADLINE, f).await.expect("operation timed out")
 }
 
 /// A client configuration whose redial is fast enough to test and still
 /// jittered: the default shape at a hundredth of the default numbers.
-fn client_config() -> RuntimeConfig {
+pub(crate) fn client_config() -> RuntimeConfig {
     RuntimeConfig {
         reconnect: ReconnectPolicy {
             initial: Duration::from_millis(5),
@@ -43,16 +43,20 @@ fn client_config() -> RuntimeConfig {
 
 /// A QUIC server that can be stopped and started again on the same port
 /// with the same, or a different, identity.
-struct Server {
-    _runtime: Runtime,
-    listener: Listener,
-    binding: Binding,
-    addr: SocketAddr,
+pub(crate) struct Server {
+    pub(crate) _runtime: Runtime,
+    pub(crate) listener: Listener,
+    pub(crate) binding: Binding,
+    pub(crate) addr: SocketAddr,
 }
 
 impl Server {
-    async fn start(certs: &Certs, addr: SocketAddr) -> Server {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    pub(crate) async fn start(network: Network, certs: &Certs, addr: SocketAddr) -> Server {
+        let runtime = Runtime::new(RuntimeConfig {
+            network,
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let listener = runtime.listener();
         // A restart re-binds the port the old server just released; the OS
         // may still be handing it back, so the bind is retried briefly.
@@ -74,20 +78,20 @@ impl Server {
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("weida://127.0.0.1:{}{}", self.addr.port(), path)
     }
 
     /// Closes the binding and lets the address go, the way a process exit
     /// would.
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         self.binding.close().await;
     }
 }
 
 /// The next event that is not `Retrying`: the transitions a test asserts
 /// on are the ones that change the slot's state.
-async fn next_transition(events: &mut PeerEvents) -> PeerEvent {
+pub(crate) async fn next_transition(events: &mut PeerEvents) -> PeerEvent {
     within(async {
         loop {
             match events.recv().await.expect("event stream open") {
@@ -100,7 +104,7 @@ async fn next_transition(events: &mut PeerEvents) -> PeerEvent {
 }
 
 /// Reads one body off a puller.
-async fn pulled(puller: &Puller) -> Vec<u8> {
+pub(crate) async fn pulled(puller: &Puller) -> Vec<u8> {
     let inbound = within(puller.recv()).await.expect("recv");
     within(inbound.collect(64 * 1024)).await.expect("collect")
 }
@@ -114,14 +118,24 @@ async fn pulled(puller: &Puller) -> Vec<u8> {
 /// The body sent during the outage arrives after it — that is the outbox —
 /// and the body that was written before the restart is **not**
 /// delivered twice: the puller sees exactly the bodies in order.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_pusher_delivers_again_after_the_server_restarts() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let first = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let first = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let addr = first.addr;
     let puller = first.listener.puller("/jobs").expect("puller");
 
-    let client = Runtime::new(client_config()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..client_config()
+    })
+    .expect("client runtime");
     let pusher = client.pusher(certs.client_tls());
     let mut events = pusher.events();
     within(pusher.connect(&first.url("/jobs")))
@@ -158,7 +172,7 @@ async fn a_pusher_delivers_again_after_the_server_restarts() {
         .await
         .expect("send during outage");
 
-    let second = Server::start(&certs, addr).await;
+    let second = Server::start(Network::sim(&net), &certs, addr).await;
     let puller = second.listener.puller("/jobs").expect("puller");
     let connected = next_transition(&mut events).await;
     assert!(
@@ -179,11 +193,18 @@ async fn a_pusher_delivers_again_after_the_server_restarts() {
 /// is reported, nothing redials, and the next send fails with the cause.
 #[tokio::test]
 async fn the_never_policy_reports_the_loss_and_stops() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let server = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let server = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
     let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
         reconnect: ReconnectPolicy::never(),
         ..RuntimeConfig::default()
     })
@@ -233,14 +254,24 @@ async fn the_never_policy_reports_the_loss_and_stops() {
 /// key** is not this peer. The redial pins the key the slot proved first,
 /// the handshake refuses the newcomer, and the slot reports
 /// `GaveUp { PeerChanged }` rather than going live with a stranger.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replacement_server_with_a_new_key_is_not_a_reconnect() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let first = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let first = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let addr = first.addr;
     let puller = first.listener.puller("/jobs").expect("puller");
 
-    let client = Runtime::new(client_config()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..client_config()
+    })
+    .expect("client runtime");
     // Both keys are trusted, so nothing but the slot's own pin can tell the
     // newcomer from the peer that answered first.
     let other = Certs::generate();
@@ -266,7 +297,7 @@ async fn a_replacement_server_with_a_new_key_is_not_a_reconnect() {
     ));
 
     let other = Certs::generate();
-    let second = Server::start(&other, addr).await;
+    let second = Server::start(Network::sim(&net), &other, addr).await;
     let _puller = second.listener.puller("/jobs").expect("puller");
     let gave_up = next_transition(&mut events).await;
     match gave_up {
@@ -293,10 +324,15 @@ async fn a_replacement_server_with_a_new_key_is_not_a_reconnect() {
 /// Claim: an `open` during the outage does not fail — it waits for the
 /// redial and completes on the new connection. `NotConnected` is only what
 /// an endpoint that never connected reports.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn open_waits_for_the_redial_and_a_never_connected_endpoint_does_not() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let client = Runtime::new(client_config()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..client_config()
+    })
+    .expect("client runtime");
     let pusher = client.pusher(certs.client_tls());
     let err = pusher
         .open(Default::default())
@@ -304,7 +340,12 @@ async fn open_waits_for_the_redial_and_a_never_connected_endpoint_does_not() {
         .expect_err("never connected");
     assert!(matches!(err, Error::NotConnected), "got {err:?}");
 
-    let first = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let first = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let addr = first.addr;
     let puller = first.listener.puller("/jobs").expect("puller");
     let mut events = pusher.events();
@@ -335,7 +376,7 @@ async fn open_waits_for_the_redial_and_a_never_connected_endpoint_does_not() {
     tokio::task::yield_now().await;
     assert!(!opened.is_finished(), "the open waits rather than failing");
 
-    let second = Server::start(&certs, addr).await;
+    let second = Server::start(Network::sim(&net), &certs, addr).await;
     let puller = second.listener.puller("/jobs").expect("puller");
     within(opened).await.expect("join").expect("open completed");
     assert_eq!(pulled(&puller).await, b"waited");
@@ -346,13 +387,20 @@ async fn open_waits_for_the_redial_and_a_never_connected_endpoint_does_not() {
 
 /// Claim: `send_timeout` bounds the wait, and the error it produces is the
 /// loss that was being waited out, not a new outcome.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn send_timeout_bounds_the_wait_with_the_loss_cause() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let server = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let server = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
     let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
         send_timeout: Some(Duration::from_millis(50)),
         ..client_config()
     })
@@ -389,14 +437,24 @@ async fn send_timeout_bounds_the_wait_with_the_loss_cause() {
 /// Claim: a subscriber whose publisher restarts receives the next publish
 /// with no application call, and a filter subscribed *during* the outage
 /// is present after it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_subscriber_is_resubscribed_on_the_redialled_connection() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let first = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let first = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let addr = first.addr;
     let publisher = first.listener.publisher("/ticks").expect("publisher");
 
-    let client = Runtime::new(client_config()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..client_config()
+    })
+    .expect("client runtime");
     let subscriber = client.subscriber(certs.client_tls());
     let mut events = subscriber.events();
     within(subscriber.subscribe("a"))
@@ -432,7 +490,7 @@ async fn a_subscriber_is_resubscribed_on_the_redialled_connection() {
         .await
         .expect("subscribe b during the outage");
 
-    let second = Server::start(&certs, addr).await;
+    let second = Server::start(Network::sim(&net), &certs, addr).await;
     let publisher = second.listener.publisher("/ticks").expect("publisher");
     assert!(matches!(
         next_transition(&mut events).await,
@@ -459,7 +517,7 @@ async fn a_subscriber_is_resubscribed_on_the_redialled_connection() {
 
 // --- flows across a redial ---------------------------------------------------
 
-fn with_flows(config: RuntimeConfig) -> RuntimeConfig {
+pub(crate) fn with_flows(config: RuntimeConfig) -> RuntimeConfig {
     RuntimeConfig {
         limits: Limits {
             datagram_receive_bytes: DEFAULT_DATAGRAM_RECEIVE_BYTES,
@@ -472,8 +530,16 @@ fn with_flows(config: RuntimeConfig) -> RuntimeConfig {
 /// A server with flows on and an acceptor on `/v` registered **before** the
 /// port is bound, so a flow re-registered the moment the redial lands finds
 /// its path.
-async fn flow_server(certs: &Certs, addr: SocketAddr) -> (Server, Acceptor) {
-    let runtime = Runtime::new(with_flows(RuntimeConfig::default())).expect("runtime");
+pub(crate) async fn flow_server(
+    net: &SimNet,
+    certs: &Certs,
+    addr: SocketAddr,
+) -> (Server, Acceptor) {
+    let runtime = Runtime::new(with_flows(RuntimeConfig {
+        network: Network::sim(net),
+        ..RuntimeConfig::default()
+    }))
+    .expect("runtime");
     let listener = runtime.listener();
     let acceptor = listener.acceptor("/v").expect("acceptor");
     let binding = within(async {
@@ -496,7 +562,7 @@ async fn flow_server(certs: &Certs, addr: SocketAddr) -> (Server, Acceptor) {
 }
 
 /// Sends on `flow` every 10 ms until `incoming` receives one datagram.
-async fn until_one_arrives(flow: &weida::Flow, incoming: &IncomingFlow) {
+pub(crate) async fn until_one_arrives(flow: &weida::Flow, incoming: &IncomingFlow) {
     within(async {
         loop {
             flow.send(&b"frame"[..]).expect("send");
@@ -510,7 +576,7 @@ async fn until_one_arrives(flow: &weida::Flow, incoming: &IncomingFlow) {
     .await;
 }
 
-async fn accepted_flow(acceptor: &Acceptor) -> IncomingFlow {
+pub(crate) async fn accepted_flow(acceptor: &Acceptor) -> IncomingFlow {
     match within(acceptor.accept()).await.expect("accept") {
         Incoming::Flow(flow) => flow,
         other => panic!("expected a flow, got {other:?}"),
@@ -521,13 +587,19 @@ async fn accepted_flow(acceptor: &Acceptor) -> IncomingFlow {
 /// redialled connection (0034 §4.10). Every send during the outage returns
 /// `Ok`, is dropped, and is counted `not_live`; after the redial a new FLOW
 /// arrives at the restarted server and carries what is sent next.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_flow_is_reopened_after_the_server_restarts() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let (first, acceptor) = flow_server(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let (first, acceptor) =
+        flow_server(&net, &certs, "127.0.0.1:0".parse().expect("loopback")).await;
     let addr = first.addr;
 
-    let client = Runtime::new(with_flows(client_config())).expect("client runtime");
+    let client = Runtime::new(with_flows(RuntimeConfig {
+        network: Network::sim(&net),
+        ..client_config()
+    }))
+    .expect("client runtime");
     let peer = client.peer(certs.client_tls());
     let mut events = peer.events();
     within(peer.connect(&first.url("/v")))
@@ -556,7 +628,7 @@ async fn a_flow_is_reopened_after_the_server_restarts() {
     }
     assert_eq!(flow.stats().not_live, before + 20);
 
-    let (_second, acceptor) = flow_server(&certs, addr).await;
+    let (_second, acceptor) = flow_server(&net, &certs, addr).await;
     assert!(matches!(
         next_transition(&mut events).await,
         PeerEvent::Connected { .. }
@@ -572,14 +644,24 @@ async fn a_flow_is_reopened_after_the_server_restarts() {
 
 /// Claim: bodies sent during an outage arrive after it, in order, and the
 /// runtime discards nothing under the bound.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_outbox_delivers_in_order_after_the_redial() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let first = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let first = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let addr = first.addr;
     let puller = first.listener.puller("/jobs").expect("puller");
 
-    let client = Runtime::new(client_config()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..client_config()
+    })
+    .expect("client runtime");
     let pusher = client.pusher(certs.client_tls());
     let mut events = pusher.events();
     within(pusher.connect(&first.url("/jobs")))
@@ -602,7 +684,7 @@ async fn the_outbox_delivers_in_order_after_the_redial() {
             .expect("send during outage");
     }
 
-    let second = Server::start(&certs, addr).await;
+    let second = Server::start(Network::sim(&net), &certs, addr).await;
     let puller = second.listener.puller("/jobs").expect("puller");
     for i in 0..100u32 {
         assert_eq!(pulled(&puller).await, format!("m{i}").as_bytes());
@@ -615,20 +697,28 @@ async fn the_outbox_delivers_in_order_after_the_redial() {
 /// Claim: at the message bound a `Block` sender waits — until the drain
 /// begins — and a `Drop` sender discards and counts. A body larger than the
 /// byte bound is refused at the call.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_outbox_bound_blocks_or_drops_as_configured() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let first = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let first = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
     let addr = first.addr;
     let puller = first.listener.puller("/jobs").expect("puller");
 
     let blocking = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
         outbox_messages: 3,
         outbox_bytes: 1024,
         ..client_config()
     })
     .expect("client runtime");
     let dropping = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
         outbox_messages: 3,
         outbox_bytes: 1024,
         outbox_full: OutboxFull::Drop,
@@ -687,7 +777,7 @@ async fn the_outbox_bound_blocks_or_drops_as_configured() {
     tokio::task::yield_now().await;
     assert!(!fourth.is_finished(), "the fourth send blocks at the bound");
 
-    let second = Server::start(&certs, addr).await;
+    let second = Server::start(Network::sim(&net), &certs, addr).await;
     let puller = second.listener.puller("/jobs").expect("puller");
     within(fourth)
         .await
@@ -777,358 +867,4 @@ async fn an_inproc_bus_that_is_rebound_is_redialled() {
     client.shutdown().await;
 }
 
-/// Claim: an `AF_UNIX` server that is shut down and bound again on the same
-/// socket path is redialled under the same policy as QUIC, with the same
-/// events. One difference is the transport's, not the redial's: a socket
-/// peer has no idle timeout and nothing on the control connection after
-/// the HELLOs, so the loss is learned at the **next open**, which is the
-/// send during the outage here (`docs/PATTERNS.md` §1.10). The body is
-/// still the runtime's from that call.
-#[cfg(unix)]
-#[tokio::test]
-async fn a_unix_socket_that_is_rebound_is_redialled() {
-    let dir = std::env::temp_dir().join(format!("weida-rc-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("socket directory");
-    let path = dir.join("s");
-    let encoded: String = path
-        .to_str()
-        .expect("utf-8 socket path")
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (b as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect();
-    let url = format!("weida+unix://{encoded}/jobs");
-
-    let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
-    let listener = server.listener();
-    let binding = listener.bind_unix(&path).expect("bind unix");
-    let puller = listener.puller("/jobs").expect("puller");
-
-    let client = Runtime::new(client_config()).expect("client runtime");
-    let pusher = client.pusher(weida::Trust::by_address());
-    let mut events = pusher.events();
-    within(pusher.connect(&url)).await.expect("connect");
-    assert!(matches!(
-        next_transition(&mut events).await,
-        PeerEvent::Connected { .. }
-    ));
-    within(pusher.send(b"before")).await.expect("send");
-    assert_eq!(pulled(&puller).await, b"before");
-
-    drop(puller);
-    drop(binding);
-    drop(listener);
-    server.shutdown().await;
-    within(pusher.send(b"during"))
-        .await
-        .expect("send during outage");
-    assert!(matches!(
-        next_transition(&mut events).await,
-        PeerEvent::Lost { .. }
-    ));
-
-    let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
-    let listener = server.listener();
-    let binding = listener.bind_unix(&path).expect("rebind unix");
-    let puller = listener.puller("/jobs").expect("puller");
-    assert!(matches!(
-        next_transition(&mut events).await,
-        PeerEvent::Connected { .. }
-    ));
-    assert_eq!(pulled(&puller).await, b"during");
-    drop(binding);
-
-    client.shutdown().await;
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 // --- restart handoff --------------------------------------------------------
-
-/// Claim: a binding handed over tells its clients nothing until the
-/// successor serves, and then each client reconnects exactly once and at
-/// once. The dialler reports `Lost { PeerRestarting }`, a first `Retrying`
-/// with no delay, even under `stop_on_peer_closed`, and the very next event
-/// is `Connected`: the redial was not refused, so no backoff followed.
-/// `hand_over` returns as soon as the closes are held, well inside its
-/// bound.
-///
-/// The socket is handed over the way `SCM_RIGHTS` would hand it: the
-/// duplicate descriptor in the `Handoff`. The old runtime stays alive until
-/// the end, so the successor's delivery also shows that a held socket is no
-/// longer read.
-#[tokio::test]
-async fn a_handed_over_binding_tells_its_clients_once_the_successor_serves() {
-    const HANDOVER_TIMEOUT: Duration = Duration::from_secs(10);
-    let certs = Certs::generate();
-    let old = Runtime::new(RuntimeConfig {
-        shutdown_timeout: HANDOVER_TIMEOUT,
-        ..RuntimeConfig::default()
-    })
-    .expect("old runtime");
-    let old_listener = old.listener();
-    let old_binding = within(
-        old_listener.bind_quic("127.0.0.1:0".parse().expect("loopback"), certs.server_tls()),
-    )
-    .await
-    .expect("bind");
-    let addr = old_binding.local_addr();
-    let puller = old_listener.puller("/jobs").expect("puller");
-
-    let client = Runtime::new(RuntimeConfig {
-        reconnect: ReconnectPolicy {
-            initial: Duration::from_millis(200),
-            max: Duration::from_millis(200),
-            jitter: false,
-            stop_on_peer_closed: true,
-            ..ReconnectPolicy::default()
-        },
-        ..RuntimeConfig::default()
-    })
-    .expect("client runtime");
-    let pusher = client.pusher(certs.client_tls());
-    let mut events = pusher.events();
-    within(pusher.connect(&format!("weida://127.0.0.1:{}/jobs", addr.port())))
-        .await
-        .expect("connect");
-    assert!(matches!(
-        next_transition(&mut events).await,
-        PeerEvent::Connected { .. }
-    ));
-    within(pusher.send(b"before")).await.expect("send before");
-    assert_eq!(pulled(&puller).await, b"before");
-
-    drop(puller);
-    let started = std::time::Instant::now();
-    let handoff = within(old_binding.hand_over()).await;
-    assert!(
-        started.elapsed() < HANDOVER_TIMEOUT / 2,
-        "hand_over returns once the closes are held, not at its timeout"
-    );
-    assert!(
-        handoff.held() >= 1,
-        "the pusher's close is held, got {handoff:?}"
-    );
-    assert_eq!(handoff.local_addr(), addr);
-    let (socket, held) = handoff.into_parts();
-    assert!(
-        timeout(Duration::from_millis(300), events.recv())
-            .await
-            .is_err(),
-        "the client is told nothing before the successor serves"
-    );
-
-    let new = Runtime::new(RuntimeConfig::default()).expect("new runtime");
-    let new_listener = new.listener();
-    let puller = new_listener.puller("/jobs").expect("puller");
-    let new_binding = within(new_listener.bind_quic_socket(socket, certs.server_tls()))
-        .await
-        .expect("serve the handed socket");
-    assert_eq!(new_binding.local_addr(), addr);
-    let sent = within(new_binding.take_over(&held))
-        .await
-        .expect("take over");
-    assert!(sent >= 1, "the held close is sent, got {sent}");
-
-    let lost = within(events.recv()).await.expect("event stream open");
-    assert!(
-        matches!(
-            lost,
-            PeerEvent::Lost {
-                cause: LossCause::PeerRestarting,
-                ..
-            }
-        ),
-        "a handover is reported as a restart, got {lost:?}"
-    );
-    let retrying = within(events.recv()).await.expect("event stream open");
-    let PeerEvent::Retrying { attempt, delay, .. } = retrying else {
-        panic!("a restart is redialled, got {retrying:?}");
-    };
-    assert_eq!(attempt, 1);
-    assert_eq!(delay, Duration::ZERO, "the first redial does not wait");
-    let connected = within(events.recv()).await.expect("event stream open");
-    assert!(
-        matches!(connected, PeerEvent::Connected { .. }),
-        "the first redial is accepted, so one reconnect and no backoff, got {connected:?}"
-    );
-    within(pusher.send(b"after")).await.expect("send after");
-    assert_eq!(pulled(&puller).await, b"after");
-
-    client.shutdown().await;
-    within(old.shutdown()).await;
-}
-
-/// Claim: a handover reaches the operation, not only the event stream.
-/// Under `ReconnectPolicy::never()` nothing redials a restart either, and
-/// the next send fails with `ConnectionLost(PeerRestarting)`, which a caller
-/// tells apart from a plain shutdown's `PeerClosed`.
-#[tokio::test]
-async fn a_send_after_a_handover_names_the_restart() {
-    let certs = Certs::generate();
-    let server = Server::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
-    let puller = server.listener.puller("/jobs").expect("puller");
-
-    let client = Runtime::new(RuntimeConfig {
-        reconnect: ReconnectPolicy::never(),
-        ..RuntimeConfig::default()
-    })
-    .expect("client runtime");
-    let pusher = client.pusher(certs.client_tls());
-    let mut events = pusher.events();
-    within(pusher.connect(&server.url("/jobs")))
-        .await
-        .expect("connect");
-    assert!(matches!(
-        next_transition(&mut events).await,
-        PeerEvent::Connected { .. }
-    ));
-    within(pusher.send(b"before")).await.expect("send");
-    assert_eq!(pulled(&puller).await, b"before");
-
-    drop(puller);
-    let Server {
-        _runtime, binding, ..
-    } = server;
-    let (socket, held) = within(binding.hand_over()).await.into_parts();
-    let successor = Runtime::new(RuntimeConfig::default()).expect("successor runtime");
-    let successor_listener = successor.listener();
-    let successor_binding = within(successor_listener.bind_quic_socket(socket, certs.server_tls()))
-        .await
-        .expect("serve the handed socket");
-    within(successor_binding.take_over(&held))
-        .await
-        .expect("take over");
-
-    let lost = next_transition(&mut events).await;
-    assert!(
-        matches!(
-            lost,
-            PeerEvent::Lost {
-                cause: LossCause::PeerRestarting,
-                ..
-            }
-        ),
-        "a handover is reported as a restart, got {lost:?}"
-    );
-    let gave_up = next_transition(&mut events).await;
-    assert!(
-        matches!(
-            gave_up,
-            PeerEvent::GaveUp {
-                why: GiveUp::Policy { attempts: 0 },
-                ..
-            }
-        ),
-        "no attempt is made, got {gave_up:?}"
-    );
-    let err = within(pusher.send(b"orphan"))
-        .await
-        .expect_err("a given-up peer fails the send");
-    assert!(
-        matches!(err, Error::ConnectionLost(LossCause::PeerRestarting)),
-        "the restart survives as the cause, got {err:?}"
-    );
-
-    client.shutdown().await;
-}
-
-/// Claim: a handoff is taken over only by a binding on the address it was
-/// made for, and bytes that are not a handoff are refused as such.
-#[tokio::test]
-async fn a_handoff_is_refused_where_it_does_not_belong() {
-    let certs = Certs::generate();
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-    let listener = runtime.listener();
-    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-    let first = within(listener.bind_quic(loopback, certs.server_tls()))
-        .await
-        .expect("first binding");
-    let second = within(listener.bind_quic(loopback, certs.server_tls()))
-        .await
-        .expect("second binding");
-
-    let handoff = within(first.hand_over()).await;
-    assert_eq!(handoff.held(), 0, "no connection, nothing held");
-    let (_, held) = handoff.into_parts();
-
-    match within(second.take_over(&held)).await {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
-        other => panic!("another address's handoff is refused, got {other:?}"),
-    }
-    match within(second.take_over(b"garbage")).await {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}"),
-        other => panic!("garbage is refused, got {other:?}"),
-    }
-}
-
-/// Claim: a successor sends only what a handover can have held. The bytes
-/// come from outside this process, so a destination no client has and more
-/// datagrams than a handover holds are refused before anything is sent.
-#[tokio::test]
-async fn a_handoff_is_bounded_by_what_a_handover_holds() {
-    fn put_addr(out: &mut Vec<u8>, addr: SocketAddr) {
-        let std::net::IpAddr::V4(ip) = addr.ip() else {
-            panic!("the test names IPv4 addresses");
-        };
-        out.push(4);
-        out.extend_from_slice(&ip.octets());
-        out.extend_from_slice(&addr.port().to_be_bytes());
-    }
-
-    let certs = Certs::generate();
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-    let listener = runtime.listener();
-    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-    let binding = within(listener.bind_quic(loopback, certs.server_tls()))
-        .await
-        .expect("binding");
-    let local = binding.local_addr();
-
-    // The documented byte format: magic, version, the binding's address, a
-    // count, and per datagram its destination, a tag for its source address
-    // and its length-prefixed bytes.
-    let blob = |entries: &[(SocketAddr, Vec<u8>)]| {
-        let mut out = b"WDHO".to_vec();
-        out.push(1);
-        put_addr(&mut out, local);
-        out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-        for (destination, contents) in entries {
-            put_addr(&mut out, *destination);
-            out.push(0);
-            out.extend_from_slice(&(contents.len() as u16).to_be_bytes());
-            out.extend_from_slice(contents);
-        }
-        out
-    };
-    let refused = |outcome: Result<usize, Error>, what: &str| match outcome {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}"),
-        other => panic!("{what} is refused as invalid data, got {other:?}"),
-    };
-
-    // The discard port of the loopback: a client address nobody answers on.
-    let client: SocketAddr = "127.0.0.1:9".parse().expect("client");
-    let packet = vec![0x40, 1, 2, 3];
-    let sent = within(binding.take_over(&blob(&[(client, packet.clone())])))
-        .await
-        .expect("what a handover holds is sent");
-    assert_eq!(sent, 1);
-
-    let multicast: SocketAddr = "224.0.0.251:5353".parse().expect("multicast");
-    refused(
-        within(binding.take_over(&blob(&[(multicast, packet.clone())]))).await,
-        "a multicast destination",
-    );
-    refused(
-        within(binding.take_over(&blob(&[(client, vec![0x40; 65_000])]))).await,
-        "a datagram larger than any packet this process sends",
-    );
-    let flood: Vec<(SocketAddr, Vec<u8>)> = (0..100_000).map(|_| (client, vec![0x40])).collect();
-    refused(
-        within(binding.take_over(&blob(&flood))).await,
-        "far more datagrams than a handover holds",
-    );
-}

@@ -61,7 +61,7 @@ impl ClientKey {
 /// keeps the tickets the binding issues, so a reconnect presents one.
 fn client_config(server: &Certs, client: Option<&ClientKey>, resume: bool) -> quinn::ClientConfig {
     let mut roots = quinn::rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(&server.cert_pem).expect("read server certificate") {
+    for cert in CertificateDer::pem_slice_iter(server.cert.as_bytes()) {
         roots
             .add(cert.expect("parse server certificate"))
             .expect("add root");
@@ -273,6 +273,8 @@ async fn a_trust_that_cannot_be_rebuilt_is_reported_once_per_generation() {
 async fn an_identity_rustls_cannot_serve_is_reported_once_per_generation() {
     let server = Certs::generate();
     let other = Certs::generate();
+    let server_files = server.files();
+    let other_files = other.files();
     let source = IdentitySource::external(server.identity()).expect("identity");
 
     let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
@@ -292,7 +294,10 @@ async fn an_identity_rustls_cannot_serve_is_reported_once_per_generation() {
     // A certificate of one key with the other key: it parses, so the update
     // is accepted, but rustls cannot pair them.
     source
-        .update(Identity::from_pem_files(&other.cert_pem, &server.key_pem))
+        .update(Identity::from_pem_files(
+            &other_files.cert_pem,
+            &server_files.key_pem,
+        ))
         .expect("the material parses");
 
     let held = connect_held(&endpoint, &config, addr, 20).await;

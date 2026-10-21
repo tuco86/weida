@@ -11,7 +11,7 @@ use crate::common;
 use std::time::Duration;
 
 use common::Server;
-use weida::{Error, ErrorCode, TransferMeta};
+use weida::{Error, ErrorCode, SimNet, TransferMeta};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -40,11 +40,16 @@ fn answer_with(respondent: weida::Respondent, body: &'static [u8]) -> tokio::tas
 
 #[tokio::test]
 async fn every_respondent_answers_within_the_deadline() {
+    let net = SimNet::new();
     // Two *distinct* respondents behind one identity, so one surveyor with
     // one set of trust anchors reaches both: this is the fan-out the pattern
     // exists for, and Req/Rep's round-robin would have asked exactly one.
     let certs = common::Certs::generate();
-    let server = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
+    let server = weida::Runtime::new(weida::RuntimeConfig {
+        network: weida::Network::sim(&net),
+        ..weida::RuntimeConfig::default()
+    })
+    .expect("runtime");
     let mut answering = Vec::new();
     let mut urls = Vec::new();
     let mut bindings = Vec::new();
@@ -66,7 +71,11 @@ async fn every_respondent_answers_within_the_deadline() {
         bindings.push((listener, binding));
     }
 
-    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("client runtime");
+    let client = weida::Runtime::new(weida::RuntimeConfig {
+        network: weida::Network::sim(&net),
+        ..weida::RuntimeConfig::default()
+    })
+    .expect("client runtime");
     let surveyor = client.surveyor(certs.client_tls());
     for url in &urls {
         within(surveyor.connect(url)).await.expect("connect");
@@ -95,7 +104,7 @@ async fn every_respondent_answers_within_the_deadline() {
     server.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_late_reply_is_counted_and_not_delivered() {
     let server = Server::start().await;
     let respondent = server.listener.respondent("/poll").expect("respondent");
@@ -137,7 +146,7 @@ async fn a_late_reply_is_counted_and_not_delivered() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_answer_that_arrived_in_time_survives_a_caller_that_reads_late() {
     // The deadline bounds **waiting**, not what already arrived: a caller
     // that surveys, does other work past its own deadline and then drains
@@ -181,7 +190,7 @@ async fn an_answer_that_arrived_in_time_survives_a_caller_that_reads_late() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_respondent_that_never_reads_cannot_hold_the_survey_open() {
     // The deadline is the **survey's**, not just the collection's. Asking is
     // two awaits the peer controls — the exchange's stream budget and its

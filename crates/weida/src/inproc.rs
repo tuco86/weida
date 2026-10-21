@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(recv.read(&mut buf).await.expect("read"), None, "the FIN");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_stream_budget_makes_an_open_wait_for_a_slot() {
         let (a, b) = LocalConn::pair(2, 1024);
         let _one = a.open_uni().await.expect("first");

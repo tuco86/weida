@@ -1,5 +1,7 @@
 //! Shared harness for the integration tests: a real QUIC server and client on
-//! loopback, with a freshly generated self-signed certificate.
+//! a simulated network (`SimNet`), with a freshly generated self-signed
+//! certificate held in memory. `Server::start_os` puts a server on the OS
+//! network for the tests whose peer is a raw `quinn` endpoint or a UDP proxy.
 //!
 //! No test hooks exist in the library. Everything below drives the public API
 //! or, for the hostile-peer suite, speaks the wire protocol directly.
@@ -19,20 +21,51 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use weida::{
-    Binding, ClientTls, Fingerprint, Identity, Limits, Listener, Runtime, RuntimeConfig, ServerTls,
-    Trust,
+    Binding, ClientTls, Fingerprint, Identity, Limits, Listener, Network, Runtime, RuntimeConfig,
+    ServerTls, SimNet, Trust,
 };
 
-/// A generated certificate on disk, removed when dropped.
+/// A generated certificate and its key, as PEM in memory.
 pub struct Certs {
-    pub dir: PathBuf,
-    pub cert_pem: PathBuf,
-    pub key_pem: PathBuf,
+    pub cert: String,
+    pub key: String,
 }
 
 impl Certs {
     /// Generates a certificate valid for `localhost`, `127.0.0.1` and `::1`.
     pub fn generate() -> Certs {
+        let generated = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+        ])
+        .expect("generate certificate");
+        Certs {
+            cert: generated.cert.pem(),
+            key: generated.signing_key.serialize_pem(),
+        }
+    }
+
+    pub fn identity(&self) -> Identity {
+        Identity::from_pem(self.cert.clone(), self.key.clone())
+    }
+
+    pub fn server_tls(&self) -> ServerTls {
+        ServerTls::new(self.identity())
+    }
+
+    /// Trusts this certificate as an anchor: the name-checked CA path.
+    pub fn client_tls(&self) -> ClientTls {
+        ClientTls::new(Trust::anchor(self.cert.clone()))
+    }
+
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.identity().fingerprint().expect("fingerprint")
+    }
+
+    /// The certificate and key written to a private temp directory, for the
+    /// tests that load identity or trust from files.
+    pub fn files(&self) -> CertFiles {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -54,17 +87,10 @@ impl Certs {
                 .expect("restrict temp dir");
         }
 
-        let generated = rcgen::generate_simple_self_signed(vec![
-            "localhost".to_owned(),
-            "127.0.0.1".to_owned(),
-            "::1".to_owned(),
-        ])
-        .expect("generate certificate");
-
         let cert_pem = dir.join("cert.pem");
         let key_pem = dir.join("key.pem");
-        std::fs::write(&cert_pem, generated.cert.pem()).expect("write cert");
-        std::fs::write(&key_pem, generated.signing_key.serialize_pem()).expect("write key");
+        std::fs::write(&cert_pem, &self.cert).expect("write cert");
+        std::fs::write(&key_pem, &self.key).expect("write key");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -72,32 +98,22 @@ impl Certs {
                 .expect("restrict key");
         }
 
-        Certs {
+        CertFiles {
             dir,
             cert_pem,
             key_pem,
         }
     }
-
-    pub fn identity(&self) -> Identity {
-        Identity::from_pem_files(&self.cert_pem, &self.key_pem)
-    }
-
-    pub fn server_tls(&self) -> ServerTls {
-        ServerTls::new(self.identity())
-    }
-
-    /// Trusts this certificate as an anchor: the name-checked CA path.
-    pub fn client_tls(&self) -> ClientTls {
-        ClientTls::new(Trust::anchor_file(&self.cert_pem))
-    }
-
-    pub fn fingerprint(&self) -> Fingerprint {
-        self.identity().fingerprint().expect("fingerprint")
-    }
 }
 
-impl Drop for Certs {
+/// [`Certs`] on disk, removed when dropped.
+pub struct CertFiles {
+    pub dir: PathBuf,
+    pub cert_pem: PathBuf,
+    pub key_pem: PathBuf,
+}
+
+impl Drop for CertFiles {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -110,10 +126,12 @@ pub struct Server {
     pub binding: Binding,
     pub addr: SocketAddr,
     pub certs: Certs,
+    /// The simulated network the server is on; `None` on the OS network.
+    pub net: Option<SimNet>,
 }
 
 impl Server {
-    /// Starts a server on an ephemeral loopback port with default limits.
+    /// Starts a server on a fresh `SimNet` with default limits.
     pub async fn start() -> Server {
         Server::start_with(Limits::default()).await
     }
@@ -130,6 +148,34 @@ impl Server {
     /// Starts a server with a whole runtime configuration, for the tests that
     /// need more than limits — a guarantee set, for instance.
     pub async fn start_with_config(config: RuntimeConfig) -> Server {
+        Server::start_on(&SimNet::new(), config).await
+    }
+
+    /// Starts a server on `net`, which the other servers and clients of the
+    /// test share.
+    pub async fn start_on(net: &SimNet, config: RuntimeConfig) -> Server {
+        Server::bind(
+            RuntimeConfig {
+                network: Network::sim(net),
+                ..config
+            },
+            Some(net.clone()),
+        )
+        .await
+    }
+
+    /// Starts a server on the OS network with default limits, for a test whose
+    /// peer is a raw `quinn` endpoint, [`delay_proxy`] or another OS socket.
+    pub async fn start_os() -> Server {
+        Server::start_os_with_config(RuntimeConfig::default()).await
+    }
+
+    /// [`Server::start_os`] with a whole runtime configuration.
+    pub async fn start_os_with_config(config: RuntimeConfig) -> Server {
+        Server::bind(config, None).await
+    }
+
+    async fn bind(config: RuntimeConfig, net: Option<SimNet>) -> Server {
         let certs = Certs::generate();
         let runtime = Runtime::new(config).expect("runtime");
         let listener = runtime.listener();
@@ -147,6 +193,15 @@ impl Server {
             binding,
             addr,
             certs,
+            net,
+        }
+    }
+
+    /// The network a client of this server dials on.
+    pub fn network(&self) -> Network {
+        match &self.net {
+            Some(net) => Network::sim(net),
+            None => Network::default(),
         }
     }
 
@@ -178,9 +233,13 @@ impl Server {
         })
     }
 
-    /// A client runtime with a whole configuration.
+    /// A client runtime with a whole configuration, on the server's network.
     pub fn client_runtime_with_config(&self, config: RuntimeConfig) -> Runtime {
-        Runtime::new(config).expect("client runtime")
+        Runtime::new(RuntimeConfig {
+            network: self.network(),
+            ..config
+        })
+        .expect("client runtime")
     }
 
     /// Trust anchors for this server, to hand to a dialling endpoint.
@@ -264,7 +323,7 @@ pub async fn delay_proxy(server: SocketAddr, one_way: Duration) -> SocketAddr {
 /// Which transport a parametrized test runs over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
-    /// Native QUIC on loopback, with TLS and a generated identity.
+    /// Native QUIC with TLS and a generated identity, on a `SimNet`.
     Quic,
     /// In process: `weida+inproc://<bus>/<path>`, no socket, no TLS
     /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)).
@@ -291,6 +350,8 @@ pub struct Harness {
     pub runtime: Runtime,
     pub listener: Listener,
     quic: Option<(Binding, Certs)>,
+    /// The simulated network of a QUIC harness.
+    net: Option<SimNet>,
     local: Option<weida::LocalBinding>,
     #[cfg(unix)]
     unix: Option<(weida::UnixBinding, std::path::PathBuf)>,
@@ -303,7 +364,21 @@ impl Harness {
         Harness::start_with(transport, RuntimeConfig::default()).await
     }
 
+    /// A harness; a QUIC one on a fresh `SimNet`.
     pub async fn start_with(transport: Transport, config: RuntimeConfig) -> Harness {
+        Harness::start_on(&SimNet::new(), transport, config).await
+    }
+
+    /// A harness whose QUIC binding is on `net`, which other harnesses of the
+    /// test may share.
+    pub async fn start_on(net: &SimNet, transport: Transport, config: RuntimeConfig) -> Harness {
+        let config = match transport {
+            Transport::Quic => RuntimeConfig {
+                network: Network::sim(net),
+                ..config
+            },
+            _ => config,
+        };
         let runtime = Runtime::new(config).expect("runtime");
         let listener = runtime.listener();
         match transport {
@@ -321,6 +396,7 @@ impl Harness {
                     runtime,
                     listener,
                     quic: Some((binding, certs)),
+                    net: Some(net.clone()),
                     local: None,
                     #[cfg(unix)]
                     unix: None,
@@ -341,6 +417,7 @@ impl Harness {
                     runtime,
                     listener,
                     quic: None,
+                    net: None,
                     local: Some(binding),
                     #[cfg(unix)]
                     unix: None,
@@ -369,6 +446,7 @@ impl Harness {
                     runtime,
                     listener,
                     quic: None,
+                    net: None,
                     local: None,
                     unix: Some((binding, path)),
                 }
@@ -387,6 +465,7 @@ impl Harness {
                     runtime,
                     listener,
                     quic: None,
+                    net: None,
                     local: None,
                     pipe: Some(binding),
                 }
@@ -450,9 +529,14 @@ impl Harness {
         self.client_with(RuntimeConfig::default())
     }
 
-    /// A client runtime with a whole configuration.
+    /// A client runtime with a whole configuration: on the harness's `SimNet`
+    /// for QUIC, on the default network otherwise.
     pub fn client_with(&self, config: RuntimeConfig) -> Runtime {
-        Runtime::new(config).expect("client runtime")
+        let network = match &self.net {
+            Some(net) => Network::sim(net),
+            None => Network::default(),
+        };
+        Runtime::new(RuntimeConfig { network, ..config }).expect("client runtime")
     }
 
     /// Shuts the server down, closing its connections on either transport.
@@ -484,11 +568,15 @@ pub struct Restartable {
 }
 
 impl Restartable {
-    pub async fn start(certs: &Certs, addr: SocketAddr) -> Restartable {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    pub async fn start(net: &SimNet, certs: &Certs, addr: SocketAddr) -> Restartable {
+        let runtime = Runtime::new(RuntimeConfig {
+            network: Network::sim(net),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
         let listener = runtime.listener();
-        // A restart re-binds the port the old server just released; the OS
-        // may still be handing it back, so the bind is retried briefly.
+        // A restart re-binds the port the old server just released; on a
+        // `SimNet` it is free at once, so the retry is a guard.
         let binding = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match listener.bind_quic(addr, certs.server_tls()).await {
@@ -536,7 +624,7 @@ pub mod raw {
     /// A client endpoint trusting `certs` and offering the weida ALPN.
     pub fn client_endpoint(certs: &Certs) -> quinn::Endpoint {
         let mut roots = quinn::rustls::RootCertStore::empty();
-        for cert in CertificateDer::pem_file_iter(&certs.cert_pem).expect("read cert") {
+        for cert in CertificateDer::pem_slice_iter(certs.cert.as_bytes()) {
             roots.add(cert.expect("parse cert")).expect("add root");
         }
         let mut crypto = quinn::rustls::ClientConfig::builder_with_provider(provider())
@@ -562,11 +650,11 @@ pub mod raw {
     /// authority answering with two different peers, since two `quinn`
     /// endpoints cannot share a port.
     pub fn server_config(certs: &Certs) -> quinn::ServerConfig {
-        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&certs.cert_pem)
-            .expect("read cert")
-            .collect::<Result<_, _>>()
-            .expect("parse cert");
-        let key = PrivateKeyDer::from_pem_file(&certs.key_pem).expect("read key");
+        let chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(certs.cert.as_bytes())
+                .collect::<Result<_, _>>()
+                .expect("parse cert");
+        let key = PrivateKeyDer::from_pem_slice(certs.key.as_bytes()).expect("read key");
         let mut crypto = quinn::rustls::ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&quinn::rustls::version::TLS13])
             .expect("tls 1.3")
