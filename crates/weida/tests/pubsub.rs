@@ -859,6 +859,49 @@ async fn a_dropped_fan_out_copy_shows_up_as_a_gap() {
     client.shutdown().await;
 }
 
+/// A queue's delivery is a one-way transfer like a publisher's copy, so on a
+/// connection that negotiated per-producer ordering it carries a number as
+/// every other one-way transfer does, and a subscriber in detect mode can
+/// see what a queue lost.
+#[tokio::test]
+async fn a_queue_delivery_is_numbered_like_every_one_way_transfer() {
+    let detect = GuaranteeSet {
+        ordering: OrderingMode::PerProducerDetect,
+        ..GuaranteeSet::CORE
+    };
+    let config = RuntimeConfig {
+        guarantees: detect,
+        ..RuntimeConfig::default()
+    };
+    let server = Server::start_with_config(config.clone()).await;
+    let acceptor = server.listener.acceptor("/q").expect("acceptor");
+
+    let client = server.client_runtime_with_config(config);
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/q")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("jobs.#")).await.expect("subscribe");
+    let consumer = match within(acceptor.accept()).await.expect("accept") {
+        weida::Incoming::Subscribed(consumer) => consumer,
+        other => panic!("expected the subscription, got {other:?}"),
+    };
+
+    for expected in 0..2u64 {
+        within(consumer.deliver(weida::TransferMeta::default().with_topic("jobs.a"), b"job"))
+            .await
+            .expect("deliver");
+        let transfer = within(sub.recv()).await.expect("recv");
+        assert_eq!(
+            transfer.meta().sequence,
+            Some(expected),
+            "a delivery is numbered on its connection"
+        );
+    }
+
+    client.shutdown().await;
+}
+
 /// Reassemble mode over the same drop: the hole is not reported when it
 /// happens — the copies behind it are held, waiting for numbers that will
 /// never arrive — and the bound is what makes it observable. At the cap the

@@ -1306,20 +1306,10 @@ impl Consumer {
     /// travels in `meta`, so a delivery carries the label the producer gave
     /// the message rather than one this hop invents.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
-        // Header first, like every sibling open: building it can fail, and
-        // on a grouped local transport `open_uni` is a whole OS connect plus
-        // a token preamble, so opening first pays for a connection and a
-        // stream slot that an error the code already knew about then resets.
-        let (header, trace, cursors) = outgoing_header(&self.conn, Some(&self.path), &meta, None)?;
-        let head = crate::transfer::DataHead::new(&self.conn, &header)?;
-        let mut send = self.conn.open_uni().await?;
-        head.write(&mut send).await?;
-        Ok(OutgoingTransfer::new(
-            send,
-            trace,
-            ConnHandle::clone(&self.conn),
-            cursors,
-        ))
+        // The one one-way open every pattern shares, so a delivery is checked
+        // before a stream is paid for and numbered under `PerProducer` like
+        // any other one-way transfer on its connection.
+        open_transfer_on(&self.conn, &self.path, &meta).await
     }
 
     /// Delivers `body` as one whole transfer.
