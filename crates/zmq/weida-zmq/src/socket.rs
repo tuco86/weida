@@ -727,27 +727,6 @@ mod tests {
         assert_eq!(moved, SocketType::Req);
     }
 
-    /// Claim: `within` turns an expired wait into `EAGAIN`, which is the
-    /// errno `ZMQ_SNDTIMEO`/`ZMQ_RCVTIMEO` report.
-    #[tokio::test]
-    async fn an_expired_timeout_is_eagain() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let core = SocketCore::new(&ctx, SocketType::Rep, SocketOptions::default()).expect("core");
-        let err = within(
-            core.exec(),
-            Some(Duration::from_millis(5)),
-            std::future::pending::<Result<()>>(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.errno(), "EAGAIN", "{err}");
-
-        // And a bound that does not expire is transparent.
-        within(core.exec(), Some(Duration::from_secs(30)), async { Ok(()) })
-            .await
-            .expect("inside the bound");
-    }
-
     // The waits of a socket, against the window between a wait's look and its
     // sleep. A peer arrives, or room appears, at exactly that instant — which
     // is inside one poll, so only a second thread landing there ever hits it
@@ -759,145 +738,171 @@ mod tests {
     // the first message of a brand-new one. All three tests below report that
     // sleeper when the order is reversed.
 
-    /// Claim: a peer that arrives, with a message already queued, in the
-    /// instant between a receive's look and its sleep still wakes that
-    /// receive. The peer was not in the snapshot the look took, so the
-    /// per-queue waits of the snapshot could not have covered it.
-    #[tokio::test]
-    async fn a_peer_arriving_in_the_window_wakes_a_receive() {
-        let core = SocketCore::new(&context(), SocketType::Pull, dials_once()).expect("core");
-        let engine = core.engine().clone();
-        arm_window(move || {
-            let peer = engine.connect(&nowhere()).expect("connect");
-            engine
-                .pipe_of(peer)
-                .expect("a pipe")
-                .incoming()
-                .try_send(Multipart::single("hello"))
-                .expect("queued");
-        });
-        let (_, message) = poll_through_the_window(core.recv_fair())
-            .expect("a peer arriving in the window must wake the receive")
-            .expect("the receive");
-        assert_eq!(message, Multipart::single("hello"));
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    /// Claim: the same window for a blocked send with no peer to send to: a
-    /// peer that arrives between the look and the sleep ends the wait and
-    /// takes the message — "SHALL block on sending… when it has no connected
-    /// peers" is a wait that must end when one appears.
-    #[tokio::test]
-    async fn a_peer_arriving_in_the_window_wakes_a_blocked_send() {
-        let core = SocketCore::new(&context(), SocketType::Push, dials_once()).expect("core");
-        let engine = core.engine().clone();
-        arm_window(move || {
-            engine.connect(&nowhere()).expect("connect");
-        });
-        let delivered = poll_through_the_window(core.send_round_robin(Multipart::single("work")))
-            .expect("a peer arriving in the window must wake the send")
-            .expect("the send");
-        assert_eq!(delivered.sent, Sent::Queued);
-        assert!(delivered.peer.is_some());
-    }
-
-    /// Claim: the same window for a send whose only peer has a full queue:
-    /// room freed in the instant between the look and the sleep ends the
-    /// wait. The queue rings the socket's bell when its session takes a
-    /// message, which is what has to reach a sender that has not yet slept.
-    #[tokio::test]
-    async fn room_freed_in_the_window_wakes_a_blocked_send() {
-        let options = SocketOptions {
-            pipe: PipeConfig {
-                outgoing: QueueConfig {
-                    hwm: 1,
-                    ..PipeConfig::default().outgoing
-                },
-                ..PipeConfig::default()
-            },
-            ..dials_once()
-        };
-        let core = SocketCore::new(&context(), SocketType::Push, options).expect("core");
-        let peer = core.engine().connect(&nowhere()).expect("connect");
-        let pipe = core.pipe_of(peer).expect("a pipe");
-        core.try_send_round_robin(Multipart::single("fills the queue"))
-            .expect("room for one");
-
-        arm_window(move || {
-            pipe.outgoing()
-                .try_recv()
-                .expect("the session takes the message");
-        });
-        let delivered = poll_through_the_window(core.send_round_robin(Multipart::single("waits")))
-            .expect("room freed in the window must wake the send")
-            .expect("the send");
-        assert_eq!(delivered.peer, Some(peer));
-    }
-
-    /// Claim: **a blocking send waits for room for its own size.** A message
-    /// the queue cannot take yet is waited for, not refused with `EAGAIN` and
-    /// lost — on a socket whose documentation says it blocks and never
-    /// discards. Judging "room" by one byte and then sending the message's
-    /// real size is the shape that gets this wrong. Here the queue holds three
-    /// one-kilobyte messages under a ceiling that fits exactly three; the send
-    /// of a large message stays blocked while the room freed is too small for
-    /// it, ends when there is room for it, and the message arrives.
-    #[tokio::test]
-    async fn a_blocking_send_waits_for_room_for_its_own_size() {
-        let small = Multipart::single(vec![b'x'; 1000]);
-        let large = Multipart::single(vec![b'y'; 2500]);
-        let each = Queue::charge(&small);
-        let options = SocketOptions {
-            pipe: PipeConfig {
-                outgoing: QueueConfig {
-                    hwm: 0,
-                    max_bytes: 3 * each,
-                    mute: MuteAction::Block,
-                },
-                ..PipeConfig::default()
-            },
-            ..dials_once()
-        };
-        let core = SocketCore::new(&context(), SocketType::Push, options).expect("core");
-        let peer = core.engine().connect(&nowhere()).expect("connect");
-        for _ in 0..3 {
-            core.try_send_round_robin(small.clone()).expect("it fits");
-        }
-
-        let shared = core.shared.clone();
-        let message = large.clone();
-        let sending = tokio::spawn(async move { shared.send_round_robin(message).await });
-        // Margin: 100 ms for a send that must *not* complete. The phenomenon
-        // is the absence of an event, so the interval only has to exceed the
-        // time a send takes to refuse outright, which is microseconds.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !sending.is_finished(),
-            "the send must wait for room, not fail with EAGAIN"
-        );
-
-        // The session takes two messages: room for a small one, not yet for
-        // this one, so the send stays where it is.
-        let pipe = core.pipe_of(peer).expect("a pipe");
-        for _ in 0..2 {
-            pipe.outgoing().try_recv().expect("queued");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !sending.is_finished(),
-            "room for a small message is not room for a large one"
-        );
-
-        pipe.outgoing().try_recv().expect("queued");
-        let delivered = tokio::time::timeout(Duration::from_secs(10), sending)
+        /// Claim: `within` turns an expired wait into `EAGAIN`, which is the
+        /// errno `ZMQ_SNDTIMEO`/`ZMQ_RCVTIMEO` report.
+        #[tokio::test]
+        async fn an_expired_timeout_is_eagain() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let core =
+                SocketCore::new(&ctx, SocketType::Rep, SocketOptions::default()).expect("core");
+            let err = within(
+                core.exec(),
+                Some(Duration::from_millis(5)),
+                std::future::pending::<Result<()>>(),
+            )
             .await
-            .expect("the send ended once there was room for it")
-            .expect("the task")
-            .expect("the send");
-        assert_eq!(delivered.peer, Some(peer));
-        assert_eq!(
-            pipe.outgoing().try_recv().expect("the large one arrived"),
-            large,
-            "and it was not lost on the way"
-        );
+            .unwrap_err();
+            assert_eq!(err.errno(), "EAGAIN", "{err}");
+
+            // And a bound that does not expire is transparent.
+            within(core.exec(), Some(Duration::from_secs(30)), async { Ok(()) })
+                .await
+                .expect("inside the bound");
+        }
+        /// Claim: a peer that arrives, with a message already queued, in the
+        /// instant between a receive's look and its sleep still wakes that
+        /// receive. The peer was not in the snapshot the look took, so the
+        /// per-queue waits of the snapshot could not have covered it.
+        #[tokio::test]
+        async fn a_peer_arriving_in_the_window_wakes_a_receive() {
+            let core = SocketCore::new(&context(), SocketType::Pull, dials_once()).expect("core");
+            let engine = core.engine().clone();
+            arm_window(move || {
+                let peer = engine.connect(&nowhere()).expect("connect");
+                engine
+                    .pipe_of(peer)
+                    .expect("a pipe")
+                    .incoming()
+                    .try_send(Multipart::single("hello"))
+                    .expect("queued");
+            });
+            let (_, message) = poll_through_the_window(core.recv_fair())
+                .expect("a peer arriving in the window must wake the receive")
+                .expect("the receive");
+            assert_eq!(message, Multipart::single("hello"));
+        }
+        /// Claim: the same window for a blocked send with no peer to send to: a
+        /// peer that arrives between the look and the sleep ends the wait and
+        /// takes the message — "SHALL block on sending… when it has no connected
+        /// peers" is a wait that must end when one appears.
+        #[tokio::test]
+        async fn a_peer_arriving_in_the_window_wakes_a_blocked_send() {
+            let core = SocketCore::new(&context(), SocketType::Push, dials_once()).expect("core");
+            let engine = core.engine().clone();
+            arm_window(move || {
+                engine.connect(&nowhere()).expect("connect");
+            });
+            let delivered =
+                poll_through_the_window(core.send_round_robin(Multipart::single("work")))
+                    .expect("a peer arriving in the window must wake the send")
+                    .expect("the send");
+            assert_eq!(delivered.sent, Sent::Queued);
+            assert!(delivered.peer.is_some());
+        }
+        /// Claim: the same window for a send whose only peer has a full queue:
+        /// room freed in the instant between the look and the sleep ends the
+        /// wait. The queue rings the socket's bell when its session takes a
+        /// message, which is what has to reach a sender that has not yet slept.
+        #[tokio::test]
+        async fn room_freed_in_the_window_wakes_a_blocked_send() {
+            let options = SocketOptions {
+                pipe: PipeConfig {
+                    outgoing: QueueConfig {
+                        hwm: 1,
+                        ..PipeConfig::default().outgoing
+                    },
+                    ..PipeConfig::default()
+                },
+                ..dials_once()
+            };
+            let core = SocketCore::new(&context(), SocketType::Push, options).expect("core");
+            let peer = core.engine().connect(&nowhere()).expect("connect");
+            let pipe = core.pipe_of(peer).expect("a pipe");
+            core.try_send_round_robin(Multipart::single("fills the queue"))
+                .expect("room for one");
+
+            arm_window(move || {
+                pipe.outgoing()
+                    .try_recv()
+                    .expect("the session takes the message");
+            });
+            let delivered =
+                poll_through_the_window(core.send_round_robin(Multipart::single("waits")))
+                    .expect("room freed in the window must wake the send")
+                    .expect("the send");
+            assert_eq!(delivered.peer, Some(peer));
+        }
+        /// Claim: **a blocking send waits for room for its own size.** A message
+        /// the queue cannot take yet is waited for, not refused with `EAGAIN` and
+        /// lost — on a socket whose documentation says it blocks and never
+        /// discards. Judging "room" by one byte and then sending the message's
+        /// real size is the shape that gets this wrong. Here the queue holds three
+        /// one-kilobyte messages under a ceiling that fits exactly three; the send
+        /// of a large message stays blocked while the room freed is too small for
+        /// it, ends when there is room for it, and the message arrives.
+        #[tokio::test]
+        async fn a_blocking_send_waits_for_room_for_its_own_size() {
+            let small = Multipart::single(vec![b'x'; 1000]);
+            let large = Multipart::single(vec![b'y'; 2500]);
+            let each = Queue::charge(&small);
+            let options = SocketOptions {
+                pipe: PipeConfig {
+                    outgoing: QueueConfig {
+                        hwm: 0,
+                        max_bytes: 3 * each,
+                        mute: MuteAction::Block,
+                    },
+                    ..PipeConfig::default()
+                },
+                ..dials_once()
+            };
+            let core = SocketCore::new(&context(), SocketType::Push, options).expect("core");
+            let peer = core.engine().connect(&nowhere()).expect("connect");
+            for _ in 0..3 {
+                core.try_send_round_robin(small.clone()).expect("it fits");
+            }
+
+            let shared = core.shared.clone();
+            let message = large.clone();
+            let sending = tokio::spawn(async move { shared.send_round_robin(message).await });
+            // Margin: 100 ms for a send that must *not* complete. The phenomenon
+            // is the absence of an event, so the interval only has to exceed the
+            // time a send takes to refuse outright, which is microseconds.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !sending.is_finished(),
+                "the send must wait for room, not fail with EAGAIN"
+            );
+
+            // The session takes two messages: room for a small one, not yet for
+            // this one, so the send stays where it is.
+            let pipe = core.pipe_of(peer).expect("a pipe");
+            for _ in 0..2 {
+                pipe.outgoing().try_recv().expect("queued");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !sending.is_finished(),
+                "room for a small message is not room for a large one"
+            );
+
+            pipe.outgoing().try_recv().expect("queued");
+            let delivered = tokio::time::timeout(Duration::from_secs(10), sending)
+                .await
+                .expect("the send ended once there was room for it")
+                .expect("the task")
+                .expect("the send");
+            assert_eq!(delivered.peer, Some(peer));
+            assert_eq!(
+                pipe.outgoing().try_recv().expect("the large one arrived"),
+                large,
+                "and it was not lost on the way"
+            );
+        }
     }
 }

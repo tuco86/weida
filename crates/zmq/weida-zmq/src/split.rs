@@ -1490,213 +1490,6 @@ mod tests {
         owed
     }
 
-    /// Claim: **a prefix is handed to a forwarding device for its first
-    /// holder and its cancel for its last**, however many subscribers hold it
-    /// in between. What the device forwards is then one subscription for the
-    /// prefix, which is what an upstream that keeps a set of connections per
-    /// prefix can hold, and the first subscriber to leave does not cancel it
-    /// for the rest.
-    #[tokio::test]
-    async fn a_prefix_is_handed_over_for_its_first_holder_and_cancelled_with_its_last() {
-        let (core, mut events) = a_device_end(SocketOptions::default());
-        let (first, _) = a_peer(&core, 9);
-        let (second, _) = a_peer(&core, 19);
-
-        assert!(events.admit(&core, first, &subscribe(b"news")));
-        assert!(
-            !events.admit(&core, second, &subscribe(b"news")),
-            "the second holder of a prefix adds nothing to forward"
-        );
-        assert!(
-            !events.admit(&core, first, &cancel(b"news")),
-            "one of two holders letting go cancels nothing"
-        );
-        assert!(
-            events.admit(&core, second, &cancel(b"news")),
-            "the last holder letting go cancels it"
-        );
-        assert!(
-            !events.admit(&core, second, &cancel(b"news")),
-            "a cancel for a prefix nobody holds is not passed on"
-        );
-        assert!(
-            events.admit(&core, second, &Multipart::single("hello")),
-            "a message that is no subscription passes untouched"
-        );
-        assert!(events.held.is_empty(), "nobody holds anything any more");
-    }
-
-    /// Claim: **a subscriber that leaves cancels only what nobody else holds.**
-    /// A prefix it shared stays forwarded for the one that is left, and is
-    /// cancelled when that one goes too.
-    #[tokio::test]
-    async fn a_departed_subscriber_cancels_only_what_nobody_else_holds() {
-        let (core, mut events) = a_device_end(SocketOptions::default());
-        let (first, first_at) = a_peer(&core, 9);
-        let (second, second_at) = a_peer(&core, 19);
-        assert!(events.admit(&core, first, &subscribe(b"a")));
-        assert!(events.admit(&core, first, &subscribe(b"shared")));
-        assert!(!events.admit(&core, second, &subscribe(b"shared")));
-        assert!(events.admit(&core, second, &subscribe(b"b")));
-
-        core.engine().disconnect(&first_at).expect("disconnect");
-        events.reconcile(&core);
-        assert_eq!(
-            departures(&mut events),
-            [b"\x00a".to_vec()],
-            "the prefix only the first held"
-        );
-
-        core.engine().disconnect(&second_at).expect("disconnect");
-        events.reconcile(&core);
-        assert_eq!(
-            departures(&mut events),
-            [b"\x00b".to_vec(), b"\x00shared".to_vec()],
-            "and the second one's, shared prefix included now that it is the last"
-        );
-        assert!(events.departed.is_empty() && events.held.is_empty());
-    }
-
-    /// Claim: **no subscriber has more than its share of the table
-    /// forwarded**: the prefixes past it are not handed over, the subscriber
-    /// is told why with an `ERROR`, once however much more it asks for, and a
-    /// cancel for what was refused is not passed on. Another subscriber is
-    /// not held to what the first one asked for.
-    #[tokio::test]
-    async fn a_subscriber_over_its_share_is_told_once_and_not_forwarded() {
-        let (core, mut events) = a_device_end(SocketOptions {
-            max_subscriptions: 64,
-            ..SocketOptions::default()
-        });
-        let share = crate::upstream::upstream_share(64);
-        let (greedy, greedy_at) = a_peer(&core, 9);
-        let (honest, _) = a_peer(&core, 19);
-
-        for index in 0..share {
-            let prefix = format!("junk-{index}");
-            assert!(
-                events.admit(&core, greedy, &subscribe(prefix.as_bytes())),
-                "{prefix} is within the share"
-            );
-        }
-        for extra in ["one-too-many", "and-another", "and-a-third"] {
-            assert!(
-                !events.admit(&core, greedy, &subscribe(extra.as_bytes())),
-                "{extra} is past the share"
-            );
-        }
-        assert!(
-            !events.admit(&core, greedy, &cancel(b"one-too-many")),
-            "nothing was forwarded for it, so there is nothing to cancel"
-        );
-        assert_eq!(
-            events.held[&greedy].len(),
-            share,
-            "the refused are not kept"
-        );
-
-        let pipe = core.pipe_of(greedy).expect("the subscriber's pipe");
-        let reason = tokio::time::timeout(Duration::from_secs(10), pipe.refusal())
-            .await
-            .expect("the subscriber was told");
-        assert!(reason.contains("share"), "{reason}");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), pipe.refusal())
-                .await
-                .is_err(),
-            "and told once, not for every subscription it went on to send"
-        );
-
-        assert!(
-            events.admit(&core, honest, &subscribe(b"news")),
-            "another subscriber has its own share"
-        );
-
-        core.engine().disconnect(&greedy_at).expect("disconnect");
-        events.reconcile(&core);
-        assert!(
-            events.told.is_empty(),
-            "a subscriber that left is forgotten"
-        );
-        assert_eq!(departures(&mut events).len(), share);
-    }
-
-    /// Claim: **the table upstream is not overfilled by many subscribers each
-    /// within its share.** A prefix that would be new there is refused to
-    /// whoever asks once it is full, and one that is in it already is still
-    /// welcome, because it takes no room.
-    #[tokio::test]
-    async fn a_full_upstream_table_refuses_a_new_prefix_and_not_a_held_one() {
-        // A table of 16 gives each subscriber 8.
-        let (core, mut events) = a_device_end(SocketOptions {
-            max_subscriptions: 16,
-            ..SocketOptions::default()
-        });
-        let [(first, _), (second, _), (third, _)] =
-            [a_peer(&core, 9), a_peer(&core, 19), a_peer(&core, 29)];
-        for (peer, name) in [(first, "a"), (second, "b")] {
-            for index in 0..8 {
-                let prefix = format!("{name}-{index}");
-                assert!(events.admit(&core, peer, &subscribe(prefix.as_bytes())));
-            }
-        }
-
-        assert!(
-            !events.admit(&core, third, &subscribe(b"new")),
-            "the table is full of other prefixes"
-        );
-        assert!(
-            !events.admit(&core, third, &subscribe(b"a-0")),
-            "a held prefix is nothing to forward, but it is the third holder's now"
-        );
-        assert_eq!(events.held[&third].len(), 1);
-        assert!(
-            events.admit(&core, first, &cancel(b"a-1")),
-            "a prefix cancelled makes room again"
-        );
-        assert!(events.admit(&core, third, &subscribe(b"new")));
-    }
-
-    /// Claim: **a repeat is no second holder, and the cancel that follows ends
-    /// the holding**, under `ZMQ_XPUB_VERBOSE`, which hands over every
-    /// subscribe and only the cancel that emptied the peer's own table. A
-    /// record that counted the repeats would owe the upstream a cancel for a
-    /// prefix the peer has already let go of.
-    #[tokio::test]
-    async fn under_verbose_a_repeat_is_no_second_holder() {
-        let (core, mut events) = a_device_end(SocketOptions {
-            xpub_verbose: true,
-            ..SocketOptions::default()
-        });
-        let (peer, _) = a_peer(&core, 9);
-        assert!(events.admit(&core, peer, &subscribe(b"a")));
-        assert!(!events.admit(&core, peer, &subscribe(b"a")), "a repeat");
-        assert!(
-            events.admit(&core, peer, &cancel(b"a")),
-            "the cancel that emptied the peer's table ends its holding"
-        );
-        assert!(events.held.is_empty());
-    }
-
-    /// Claim: **under `ZMQ_XPUB_VERBOSER`, which hands over every cancel, each
-    /// one takes one off the count**, and a cancel for a prefix the peer never
-    /// held is not passed on, so it cannot cancel what another subscriber
-    /// holds.
-    #[tokio::test]
-    async fn under_verboser_every_cancel_takes_one_off() {
-        let (core, mut events) = a_device_end(SocketOptions {
-            xpub_verboser: true,
-            ..SocketOptions::default()
-        });
-        let (peer, _) = a_peer(&core, 9);
-        let (other, _) = a_peer(&core, 19);
-        assert!(events.admit(&core, peer, &subscribe(b"a")));
-        assert!(!events.admit(&core, peer, &subscribe(b"a")));
-        assert!(!events.admit(&core, other, &cancel(b"a")), "never held it");
-        assert!(!events.admit(&core, peer, &cancel(b"a")), "one is left");
-        assert!(events.admit(&core, peer, &cancel(b"a")), "and now none");
-    }
-
     /// Claim: a `ZMQ_XPUB_MANUAL` socket is not made a forwarding device's end:
     /// what it reports are requests for the application to grant, and a
     /// request refused for a share would be one the application never saw.
@@ -1717,78 +1510,284 @@ mod tests {
         core.engine().connect(&nowhere).expect("connect");
     }
 
-    /// Claim: **an XPUB looks for departed peers only when the peer set has
-    /// changed.** A receive that finds the set as it was costs one atomic
-    /// load; a pass over every peer's record on every receive is a cost per
-    /// message that a stranger multiplies by connecting. Shown with a record
-    /// for a peer the engine does not have: it is left alone until the set
-    /// changes, and then noticed.
-    #[tokio::test]
-    async fn a_receive_looks_for_departures_only_when_the_peer_set_changed() {
-        let core = xpub(SocketOptions {
-            reconnect_ivl: None,
-            ..SocketOptions::default()
-        });
-        let mut events = XPubEvents::default();
-        events.reconcile(&core);
-        events
-            .held
-            .entry(PeerId::detached())
-            .or_default()
-            .insert(b"a".to_vec(), 1);
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        events.reconcile(&core);
-        assert!(
-            events.departed.is_empty(),
-            "the peer set has not changed, so nobody was looked for"
-        );
+        /// Claim: **a prefix is handed to a forwarding device for its first
+        /// holder and its cancel for its last**, however many subscribers hold it
+        /// in between. What the device forwards is then one subscription for the
+        /// prefix, which is what an upstream that keeps a set of connections per
+        /// prefix can hold, and the first subscriber to leave does not cancel it
+        /// for the rest.
+        #[tokio::test]
+        async fn a_prefix_is_handed_over_for_its_first_holder_and_cancelled_with_its_last() {
+            let (core, mut events) = a_device_end(SocketOptions::default());
+            let (first, _) = a_peer(&core, 9);
+            let (second, _) = a_peer(&core, 19);
 
-        a_peer_arrives(&core);
-        events.reconcile(&core);
-        assert_eq!(
-            events.departed.len(),
-            1,
-            "the set changed, and the peer is gone"
-        );
-    }
+            assert!(events.admit(&core, first, &subscribe(b"news")));
+            assert!(
+                !events.admit(&core, second, &subscribe(b"news")),
+                "the second holder of a prefix adds nothing to forward"
+            );
+            assert!(
+                !events.admit(&core, first, &cancel(b"news")),
+                "one of two holders letting go cancels nothing"
+            );
+            assert!(
+                events.admit(&core, second, &cancel(b"news")),
+                "the last holder letting go cancels it"
+            );
+            assert!(
+                !events.admit(&core, second, &cancel(b"news")),
+                "a cancel for a prefix nobody holds is not passed on"
+            );
+            assert!(
+                events.admit(&core, second, &Multipart::single("hello")),
+                "a message that is no subscription passes untouched"
+            );
+            assert!(events.held.is_empty(), "nobody holds anything any more");
+        }
+        /// Claim: **a subscriber that leaves cancels only what nobody else holds.**
+        /// A prefix it shared stays forwarded for the one that is left, and is
+        /// cancelled when that one goes too.
+        #[tokio::test]
+        async fn a_departed_subscriber_cancels_only_what_nobody_else_holds() {
+            let (core, mut events) = a_device_end(SocketOptions::default());
+            let (first, first_at) = a_peer(&core, 9);
+            let (second, second_at) = a_peer(&core, 19);
+            assert!(events.admit(&core, first, &subscribe(b"a")));
+            assert!(events.admit(&core, first, &subscribe(b"shared")));
+            assert!(!events.admit(&core, second, &subscribe(b"shared")));
+            assert!(events.admit(&core, second, &subscribe(b"b")));
 
-    /// Claim: **a ROUTER reconciles its routing table only when the peer set
-    /// has changed**, for the same reason: re-reading every peer on every
-    /// message is a cost a stranger multiplies by connecting. Shown with an
-    /// entry for a peer the engine does not have.
-    #[tokio::test]
-    async fn a_router_reconciles_only_when_the_peer_set_changed() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let core = SocketCore::new(
-            &ctx,
-            SocketType::Router,
-            SocketOptions {
+            core.engine().disconnect(&first_at).expect("disconnect");
+            events.reconcile(&core);
+            assert_eq!(
+                departures(&mut events),
+                [b"\x00a".to_vec()],
+                "the prefix only the first held"
+            );
+
+            core.engine().disconnect(&second_at).expect("disconnect");
+            events.reconcile(&core);
+            assert_eq!(
+                departures(&mut events),
+                [b"\x00b".to_vec(), b"\x00shared".to_vec()],
+                "and the second one's, shared prefix included now that it is the last"
+            );
+            assert!(events.departed.is_empty() && events.held.is_empty());
+        }
+        /// Claim: **no subscriber has more than its share of the table
+        /// forwarded**: the prefixes past it are not handed over, the subscriber
+        /// is told why with an `ERROR`, once however much more it asks for, and a
+        /// cancel for what was refused is not passed on. Another subscriber is
+        /// not held to what the first one asked for.
+        #[tokio::test]
+        async fn a_subscriber_over_its_share_is_told_once_and_not_forwarded() {
+            let (core, mut events) = a_device_end(SocketOptions {
+                max_subscriptions: 64,
+                ..SocketOptions::default()
+            });
+            let share = crate::upstream::upstream_share(64);
+            let (greedy, greedy_at) = a_peer(&core, 9);
+            let (honest, _) = a_peer(&core, 19);
+
+            for index in 0..share {
+                let prefix = format!("junk-{index}");
+                assert!(
+                    events.admit(&core, greedy, &subscribe(prefix.as_bytes())),
+                    "{prefix} is within the share"
+                );
+            }
+            for extra in ["one-too-many", "and-another", "and-a-third"] {
+                assert!(
+                    !events.admit(&core, greedy, &subscribe(extra.as_bytes())),
+                    "{extra} is past the share"
+                );
+            }
+            assert!(
+                !events.admit(&core, greedy, &cancel(b"one-too-many")),
+                "nothing was forwarded for it, so there is nothing to cancel"
+            );
+            assert_eq!(
+                events.held[&greedy].len(),
+                share,
+                "the refused are not kept"
+            );
+
+            let pipe = core.pipe_of(greedy).expect("the subscriber's pipe");
+            let reason = tokio::time::timeout(Duration::from_secs(10), pipe.refusal())
+                .await
+                .expect("the subscriber was told");
+            assert!(reason.contains("share"), "{reason}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), pipe.refusal())
+                    .await
+                    .is_err(),
+                "and told once, not for every subscription it went on to send"
+            );
+
+            assert!(
+                events.admit(&core, honest, &subscribe(b"news")),
+                "another subscriber has its own share"
+            );
+
+            core.engine().disconnect(&greedy_at).expect("disconnect");
+            events.reconcile(&core);
+            assert!(
+                events.told.is_empty(),
+                "a subscriber that left is forgotten"
+            );
+            assert_eq!(departures(&mut events).len(), share);
+        }
+        /// Claim: **the table upstream is not overfilled by many subscribers each
+        /// within its share.** A prefix that would be new there is refused to
+        /// whoever asks once it is full, and one that is in it already is still
+        /// welcome, because it takes no room.
+        #[tokio::test]
+        async fn a_full_upstream_table_refuses_a_new_prefix_and_not_a_held_one() {
+            // A table of 16 gives each subscriber 8.
+            let (core, mut events) = a_device_end(SocketOptions {
+                max_subscriptions: 16,
+                ..SocketOptions::default()
+            });
+            let [(first, _), (second, _), (third, _)] =
+                [a_peer(&core, 9), a_peer(&core, 19), a_peer(&core, 29)];
+            for (peer, name) in [(first, "a"), (second, "b")] {
+                for index in 0..8 {
+                    let prefix = format!("{name}-{index}");
+                    assert!(events.admit(&core, peer, &subscribe(prefix.as_bytes())));
+                }
+            }
+
+            assert!(
+                !events.admit(&core, third, &subscribe(b"new")),
+                "the table is full of other prefixes"
+            );
+            assert!(
+                !events.admit(&core, third, &subscribe(b"a-0")),
+                "a held prefix is nothing to forward, but it is the third holder's now"
+            );
+            assert_eq!(events.held[&third].len(), 1);
+            assert!(
+                events.admit(&core, first, &cancel(b"a-1")),
+                "a prefix cancelled makes room again"
+            );
+            assert!(events.admit(&core, third, &subscribe(b"new")));
+        }
+        /// Claim: **a repeat is no second holder, and the cancel that follows ends
+        /// the holding**, under `ZMQ_XPUB_VERBOSE`, which hands over every
+        /// subscribe and only the cancel that emptied the peer's own table. A
+        /// record that counted the repeats would owe the upstream a cancel for a
+        /// prefix the peer has already let go of.
+        #[tokio::test]
+        async fn under_verbose_a_repeat_is_no_second_holder() {
+            let (core, mut events) = a_device_end(SocketOptions {
+                xpub_verbose: true,
+                ..SocketOptions::default()
+            });
+            let (peer, _) = a_peer(&core, 9);
+            assert!(events.admit(&core, peer, &subscribe(b"a")));
+            assert!(!events.admit(&core, peer, &subscribe(b"a")), "a repeat");
+            assert!(
+                events.admit(&core, peer, &cancel(b"a")),
+                "the cancel that emptied the peer's table ends its holding"
+            );
+            assert!(events.held.is_empty());
+        }
+        /// Claim: **under `ZMQ_XPUB_VERBOSER`, which hands over every cancel, each
+        /// one takes one off the count**, and a cancel for a prefix the peer never
+        /// held is not passed on, so it cannot cancel what another subscriber
+        /// holds.
+        #[tokio::test]
+        async fn under_verboser_every_cancel_takes_one_off() {
+            let (core, mut events) = a_device_end(SocketOptions {
+                xpub_verboser: true,
+                ..SocketOptions::default()
+            });
+            let (peer, _) = a_peer(&core, 9);
+            let (other, _) = a_peer(&core, 19);
+            assert!(events.admit(&core, peer, &subscribe(b"a")));
+            assert!(!events.admit(&core, peer, &subscribe(b"a")));
+            assert!(!events.admit(&core, other, &cancel(b"a")), "never held it");
+            assert!(!events.admit(&core, peer, &cancel(b"a")), "one is left");
+            assert!(events.admit(&core, peer, &cancel(b"a")), "and now none");
+        }
+        /// Claim: **an XPUB looks for departed peers only when the peer set has
+        /// changed.** A receive that finds the set as it was costs one atomic
+        /// load; a pass over every peer's record on every receive is a cost per
+        /// message that a stranger multiplies by connecting. Shown with a record
+        /// for a peer the engine does not have: it is left alone until the set
+        /// changes, and then noticed.
+        #[tokio::test]
+        async fn a_receive_looks_for_departures_only_when_the_peer_set_changed() {
+            let core = xpub(SocketOptions {
                 reconnect_ivl: None,
                 ..SocketOptions::default()
-            },
-        )
-        .expect("core");
-        let mut routing = Routing::new();
-        routing.learn_peers(&core);
+            });
+            let mut events = XPubEvents::default();
+            events.reconcile(&core);
+            events
+                .held
+                .entry(PeerId::detached())
+                .or_default()
+                .insert(b"a".to_vec(), 1);
 
-        let ghost = PeerId::detached();
-        routing.by_peer.insert(ghost, Message::from("ghost"));
-        routing
-            .by_key
-            .insert(RoutingKey::from_wire(b"ghost"), ghost);
-        routing.learn_peers(&core);
-        assert_eq!(
-            routing.len(),
-            1,
-            "nothing changed, so nothing was reconciled"
-        );
+            events.reconcile(&core);
+            assert!(
+                events.departed.is_empty(),
+                "the peer set has not changed, so nobody was looked for"
+            );
 
-        a_peer_arrives(&core);
-        routing.learn_peers(&core);
-        assert_eq!(
-            routing.len(),
-            0,
-            "the set changed, and the ghost is dropped"
-        );
+            a_peer_arrives(&core);
+            events.reconcile(&core);
+            assert_eq!(
+                events.departed.len(),
+                1,
+                "the set changed, and the peer is gone"
+            );
+        }
+        /// Claim: **a ROUTER reconciles its routing table only when the peer set
+        /// has changed**, for the same reason: re-reading every peer on every
+        /// message is a cost a stranger multiplies by connecting. Shown with an
+        /// entry for a peer the engine does not have.
+        #[tokio::test]
+        async fn a_router_reconciles_only_when_the_peer_set_changed() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let core = SocketCore::new(
+                &ctx,
+                SocketType::Router,
+                SocketOptions {
+                    reconnect_ivl: None,
+                    ..SocketOptions::default()
+                },
+            )
+            .expect("core");
+            let mut routing = Routing::new();
+            routing.learn_peers(&core);
+
+            let ghost = PeerId::detached();
+            routing.by_peer.insert(ghost, Message::from("ghost"));
+            routing
+                .by_key
+                .insert(RoutingKey::from_wire(b"ghost"), ghost);
+            routing.learn_peers(&core);
+            assert_eq!(
+                routing.len(),
+                1,
+                "nothing changed, so nothing was reconciled"
+            );
+
+            a_peer_arrives(&core);
+            routing.learn_peers(&core);
+            assert_eq!(
+                routing.len(),
+                0,
+                "the set changed, and the ghost is dropped"
+            );
+        }
     }
 }

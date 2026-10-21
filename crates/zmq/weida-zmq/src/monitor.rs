@@ -728,80 +728,87 @@ mod tests {
         }
     }
 
-    /// Claim: a real socket's lifecycle reaches **both** renderings, and
-    /// they agree — the typed stream and the two-frame `inproc://` PAIR form
-    /// carry the same events in the same order, because there is one
-    /// publisher behind them.
-    #[tokio::test]
-    async fn a_sockets_lifecycle_reaches_both_renderings() {
-        use crate::context::{Context, ContextConfig};
-        use crate::pipeline::{PullSocket, PushSocket};
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let context = Context::new(ContextConfig::default()).expect("context");
-        let puller = PullSocket::new(&context).expect("pull");
-        let mut typed = puller.monitor(MonitorEvents::ALL);
+        /// Claim: a real socket's lifecycle reaches **both** renderings, and
+        /// they agree — the typed stream and the two-frame `inproc://` PAIR form
+        /// carry the same events in the same order, because there is one
+        /// publisher behind them.
+        #[tokio::test]
+        async fn a_sockets_lifecycle_reaches_both_renderings() {
+            use crate::context::{Context, ContextConfig};
+            use crate::pipeline::{PullSocket, PushSocket};
 
-        // The inproc PAIR form of the same stream, bound where libzmq's
-        // caller would have passed an endpoint to zmq_socket_monitor.
-        let rendered = typed.resubscribe();
-        let mut publisher = PairSocket::new(&context).expect("pair");
-        publisher
-            .bind("inproc://monitor.pull")
-            .await
-            .expect("bind the monitor endpoint");
-        let mut reader = PairSocket::new(&context).expect("pair");
-        reader
-            .connect("inproc://monitor.pull")
-            .expect("connect to the monitor endpoint");
-        tokio::spawn(async move {
-            let _ = serve_pair(rendered, &mut publisher).await;
-        });
+            let context = Context::new(ContextConfig::default()).expect("context");
+            let puller = PullSocket::new(&context).expect("pull");
+            let mut typed = puller.monitor(MonitorEvents::ALL);
 
-        let bound = puller.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let pusher = PushSocket::new(&context).expect("push");
-        pusher.connect(&bound.to_string()).expect("connect");
-
-        // The binder's side: listening, then a connection accepted, then its
-        // handshake.
-        let mut seen = Vec::new();
-        while seen.len() < 3 {
-            let event = tokio::time::timeout(Duration::from_secs(10), typed.recv())
+            // The inproc PAIR form of the same stream, bound where libzmq's
+            // caller would have passed an endpoint to zmq_socket_monitor.
+            let rendered = typed.resubscribe();
+            let mut publisher = PairSocket::new(&context).expect("pair");
+            publisher
+                .bind("inproc://monitor.pull")
                 .await
-                .expect("an event")
-                .expect("an event");
-            seen.push(event);
-        }
-        assert_eq!(
-            seen.iter().map(MonitorEvent::id).collect::<Vec<_>>(),
-            vec![EVENT_LISTENING, EVENT_ACCEPTED, EVENT_HANDSHAKE_SUCCEEDED],
-            "{seen:?}"
-        );
-        assert_eq!(seen[0].endpoint(), bound.to_string());
+                .expect("bind the monitor endpoint");
+            let mut reader = PairSocket::new(&context).expect("pair");
+            reader
+                .connect("inproc://monitor.pull")
+                .expect("connect to the monitor endpoint");
+            tokio::spawn(async move {
+                let _ = serve_pair(rendered, &mut publisher).await;
+            });
 
-        // The same three, off the PAIR socket, decoded from the octets.
-        for expected in &seen {
-            let message = tokio::time::timeout(Duration::from_secs(10), reader.recv())
-                .await
-                .expect("a rendered event")
-                .expect("a message");
-            assert_eq!(
-                &MonitorEvent::decode(&message).expect("decode"),
-                expected,
-                "the two renderings disagree"
-            );
-        }
+            let bound = puller.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let pusher = PushSocket::new(&context).expect("push");
+            pusher.connect(&bound.to_string()).expect("connect");
 
-        // Closing the socket ends the monitor, which is the last event a
-        // reader sees rather than a stream that simply stops.
-        puller.close();
-        let mut stopped = false;
-        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(10), typed.recv()).await
-        {
-            if event.id() == EVENT_MONITOR_STOPPED {
-                stopped = true;
-                break;
+            // The binder's side: listening, then a connection accepted, then its
+            // handshake.
+            let mut seen = Vec::new();
+            while seen.len() < 3 {
+                let event = tokio::time::timeout(Duration::from_secs(10), typed.recv())
+                    .await
+                    .expect("an event")
+                    .expect("an event");
+                seen.push(event);
             }
+            assert_eq!(
+                seen.iter().map(MonitorEvent::id).collect::<Vec<_>>(),
+                vec![EVENT_LISTENING, EVENT_ACCEPTED, EVENT_HANDSHAKE_SUCCEEDED],
+                "{seen:?}"
+            );
+            assert_eq!(seen[0].endpoint(), bound.to_string());
+
+            // The same three, off the PAIR socket, decoded from the octets.
+            for expected in &seen {
+                let message = tokio::time::timeout(Duration::from_secs(10), reader.recv())
+                    .await
+                    .expect("a rendered event")
+                    .expect("a message");
+                assert_eq!(
+                    &MonitorEvent::decode(&message).expect("decode"),
+                    expected,
+                    "the two renderings disagree"
+                );
+            }
+
+            // Closing the socket ends the monitor, which is the last event a
+            // reader sees rather than a stream that simply stops.
+            puller.close();
+            let mut stopped = false;
+            while let Ok(Ok(event)) =
+                tokio::time::timeout(Duration::from_secs(10), typed.recv()).await
+            {
+                if event.id() == EVENT_MONITOR_STOPPED {
+                    stopped = true;
+                    break;
+                }
+            }
+            assert!(stopped, "the monitor said when it stopped");
         }
-        assert!(stopped, "the monitor said when it stopped");
     }
 }

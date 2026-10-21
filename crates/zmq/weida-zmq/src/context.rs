@@ -518,7 +518,7 @@ mod tests {
 
     /// Claim: a terminated context admits no new socket, and the sockets it
     /// still holds know they are on one.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_terminated_context_admits_nothing_and_says_so() {
         let ctx = Context::new(ContextConfig::default()).expect("context");
         let slot = ctx.open_socket().expect("a slot");
@@ -537,7 +537,7 @@ mod tests {
 
     /// Claim: shutdown waits for an open socket and returns as soon as the
     /// last one is dropped — the bounded version of `zmq_ctx_term()`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_waits_for_the_last_socket_within_the_budget() {
         let ctx = Context::new(ContextConfig {
             close_budget: Duration::from_secs(30),
@@ -555,7 +555,7 @@ mod tests {
             drop(slot);
         });
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let report = ctx.shutdown().await;
         closing.await.expect("the closing task");
         assert_eq!(report.outstanding(), 0);
@@ -571,7 +571,7 @@ mod tests {
     /// Margin: a 20 ms budget against a 5 s assertion, so the machine has
     /// 250 times the budget to get there; the defect — an infinite linger —
     /// never returns at all, which no margin can rescue.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_close_budget_is_finite() {
         let ctx = Context::new(ContextConfig {
             close_budget: Duration::from_millis(20),
@@ -580,7 +580,7 @@ mod tests {
         .expect("context");
         let _held = ctx.open_socket().expect("a slot");
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let report = ctx.shutdown().await;
         assert_eq!(report.outstanding(), 1);
         assert!(

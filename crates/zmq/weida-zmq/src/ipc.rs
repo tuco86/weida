@@ -186,61 +186,6 @@ mod tests {
             .clone()
     }
 
-    /// Claim: a bind creates the node with mode `0600` and removes it again
-    /// when the binding is dropped — the hygiene of 0010 §4.5, observed on
-    /// the filesystem rather than asserted in a comment.
-    #[tokio::test]
-    async fn a_bind_owns_the_node_and_its_mode() {
-        let exec = exec();
-        let path = scratch_path("hygiene");
-        let binding = IpcBinding::bind(&exec, &path).expect("bind");
-        let mode = std::fs::metadata(&path)
-            .expect("the node exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "the mode is set after bind, not inherited");
-        assert_eq!(binding.path(), path.as_path());
-
-        drop(binding);
-        assert!(
-            !path.exists(),
-            "dropping the binding must remove the socket file"
-        );
-    }
-
-    /// Claim: a path holding something that is not a socket is refused
-    /// instead of unlinked — a bind that deletes a caller's file would be
-    /// worse than a bind that fails.
-    #[tokio::test]
-    async fn a_path_that_is_not_a_socket_is_refused() {
-        let exec = exec();
-        let path = scratch_path("regular-file");
-        std::fs::write(&path, b"not a socket").expect("write");
-
-        let err = IpcBinding::bind(&exec, &path).unwrap_err();
-        assert_eq!(err.errno(), "EADDRINUSE", "{err}");
-        assert!(path.exists(), "the file must still be there");
-        std::fs::remove_file(&path).expect("clean up");
-    }
-
-    /// Claim: a stale socket file — the node a crash leaves behind, with
-    /// nobody listening — is replaced, because otherwise the endpoint would
-    /// be permanently unbindable. A node somebody *is* listening on is taken
-    /// over as libzmq does (`tests/ipc.rs`).
-    #[tokio::test]
-    async fn a_stale_node_is_replaced() {
-        let exec = exec();
-        let path = scratch_path("stale");
-        // A listener that is closed and not unlinked leaves exactly what a
-        // crash leaves: a socket node that nothing answers on.
-        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
-        assert!(path.exists());
-
-        let second = IpcBinding::bind(&exec, &path).expect("rebind over the stale node");
-        assert_eq!(second.path(), path.as_path());
-    }
-
     /// Claim: a path past the kernel's `sun_path` budget is refused rather
     /// than silently truncated to a different endpoint.
     #[tokio::test]
@@ -255,40 +200,6 @@ mod tests {
         );
     }
 
-    /// Claim: both ends learn the other's credentials from the kernel, they
-    /// agree because the peer is this process, and the pid is this process's
-    /// where the platform reports one — the fact ZAP will be handed,
-    /// captured at connect time.
-    #[tokio::test]
-    async fn both_ends_learn_the_peers_credentials() {
-        let exec = exec();
-        let path = scratch_path("credentials");
-        let binding = IpcBinding::bind(&exec, &path).expect("bind");
-
-        let dialling = tokio::spawn({
-            let path = path.clone();
-            async move { dial(&path).await }
-        });
-        let mut accepted = binding.accept().await.expect("accept");
-        let mut dialled = dialling.await.expect("the task").expect("dial");
-
-        let theirs = accepted.peer_credentials().expect("credentials at accept");
-        let ours = dialled.peer_credentials().expect("credentials at connect");
-        assert_eq!(
-            theirs, ours,
-            "both ends of one connection are this process, so the kernel says the same thing twice"
-        );
-        if let Some(pid) = theirs.pid {
-            assert_eq!(pid, std::process::id(), "and it is this process");
-        }
-
-        // And it is a real connection underneath, not just a credential.
-        dialled.write_all(b"hello").await.expect("write");
-        let mut got = [0u8; 5];
-        accepted.read_exact(&mut got).await.expect("read");
-        assert_eq!(&got, b"hello");
-    }
-
     /// Claim: a tcp or inproc stream has no credentials to report, because
     /// there is no kernel fact about a peer there — `None` rather than a
     /// zero that would read as root.
@@ -296,5 +207,97 @@ mod tests {
     async fn only_a_unix_stream_has_credentials() {
         let (theirs, _ours) = tokio::io::duplex(64);
         assert!(Stream::inproc(theirs).peer_credentials().is_none());
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Claim: a bind creates the node with mode `0600` and removes it again
+        /// when the binding is dropped — the hygiene of 0010 §4.5, observed on
+        /// the filesystem rather than asserted in a comment.
+        #[tokio::test]
+        async fn a_bind_owns_the_node_and_its_mode() {
+            let exec = exec();
+            let path = scratch_path("hygiene");
+            let binding = IpcBinding::bind(&exec, &path).expect("bind");
+            let mode = std::fs::metadata(&path)
+                .expect("the node exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the mode is set after bind, not inherited");
+            assert_eq!(binding.path(), path.as_path());
+
+            drop(binding);
+            assert!(
+                !path.exists(),
+                "dropping the binding must remove the socket file"
+            );
+        }
+        /// Claim: a path holding something that is not a socket is refused
+        /// instead of unlinked — a bind that deletes a caller's file would be
+        /// worse than a bind that fails.
+        #[tokio::test]
+        async fn a_path_that_is_not_a_socket_is_refused() {
+            let exec = exec();
+            let path = scratch_path("regular-file");
+            std::fs::write(&path, b"not a socket").expect("write");
+
+            let err = IpcBinding::bind(&exec, &path).unwrap_err();
+            assert_eq!(err.errno(), "EADDRINUSE", "{err}");
+            assert!(path.exists(), "the file must still be there");
+            std::fs::remove_file(&path).expect("clean up");
+        }
+        /// Claim: a stale socket file — the node a crash leaves behind, with
+        /// nobody listening — is replaced, because otherwise the endpoint would
+        /// be permanently unbindable. A node somebody *is* listening on is taken
+        /// over as libzmq does (`tests/ipc.rs`).
+        #[tokio::test]
+        async fn a_stale_node_is_replaced() {
+            let exec = exec();
+            let path = scratch_path("stale");
+            // A listener that is closed and not unlinked leaves exactly what a
+            // crash leaves: a socket node that nothing answers on.
+            drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+            assert!(path.exists());
+
+            let second = IpcBinding::bind(&exec, &path).expect("rebind over the stale node");
+            assert_eq!(second.path(), path.as_path());
+        }
+        /// Claim: both ends learn the other's credentials from the kernel, they
+        /// agree because the peer is this process, and the pid is this process's
+        /// where the platform reports one — the fact ZAP will be handed,
+        /// captured at connect time.
+        #[tokio::test]
+        async fn both_ends_learn_the_peers_credentials() {
+            let exec = exec();
+            let path = scratch_path("credentials");
+            let binding = IpcBinding::bind(&exec, &path).expect("bind");
+
+            let dialling = tokio::spawn({
+                let path = path.clone();
+                async move { dial(&path).await }
+            });
+            let mut accepted = binding.accept().await.expect("accept");
+            let mut dialled = dialling.await.expect("the task").expect("dial");
+
+            let theirs = accepted.peer_credentials().expect("credentials at accept");
+            let ours = dialled.peer_credentials().expect("credentials at connect");
+            assert_eq!(
+                theirs, ours,
+                "both ends of one connection are this process, so the kernel says the same thing twice"
+            );
+            if let Some(pid) = theirs.pid {
+                assert_eq!(pid, std::process::id(), "and it is this process");
+            }
+
+            // And it is a real connection underneath, not just a credential.
+            dialled.write_all(b"hello").await.expect("write");
+            let mut got = [0u8; 5];
+            accepted.read_exact(&mut got).await.expect("read");
+            assert_eq!(&got, b"hello");
+        }
     }
 }

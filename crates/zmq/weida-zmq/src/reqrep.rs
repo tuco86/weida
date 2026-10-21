@@ -474,159 +474,6 @@ mod tests {
             .collect()
     }
 
-    /// Claim: a request goes out, a reply comes back, and neither side ever
-    /// sees the envelope — REP gets the body, REQ gets the reply body.
-    #[tokio::test]
-    async fn a_request_and_a_reply_cross_without_their_envelope() {
-        let ctx = context();
-        let mut server = RepSocket::new(&ctx).expect("rep");
-        let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut client = ReqSocket::new(&ctx).expect("req");
-        client.connect(&endpoint.to_string()).expect("connect");
-
-        client.send("ping").await.expect("send");
-        assert!(client.awaiting_reply());
-
-        let request = server.recv().await.expect("recv");
-        assert_eq!(body(&request), vec![b"ping".to_vec()]);
-        assert!(server.owes_reply());
-
-        assert_eq!(server.send("pong").await.expect("reply"), Sent::Queued);
-        let reply = client.recv().await.expect("reply");
-        assert_eq!(body(&reply), vec![b"pong".to_vec()]);
-        assert!(!client.awaiting_reply());
-        assert!(!server.owes_reply());
-
-        // And the pair alternates again, which is the whole pattern.
-        client.send("two").await.expect("send");
-        assert_eq!(
-            body(&server.recv().await.expect("recv")),
-            vec![b"two".to_vec()]
-        );
-        server.send("done").await.expect("reply");
-        assert_eq!(
-            body(&client.recv().await.expect("reply")),
-            vec![b"done".to_vec()]
-        );
-    }
-
-    /// Claim: REQ's alternation is strict and `EFSM` names the violation —
-    /// and a socket discarded after `EFSM` leaves nothing behind, which is
-    /// what Lazy Pirate's close-and-reopen needs.
-    #[tokio::test]
-    async fn req_alternation_is_efsm_and_recoverable_by_reopening() {
-        let ctx = context();
-        let mut server = RepSocket::new(&ctx).expect("rep");
-        let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut client = ReqSocket::new(&ctx).expect("req");
-        client.connect(&endpoint.to_string()).expect("connect");
-
-        // Receive before send.
-        let err = client.try_recv().unwrap_err();
-        assert_eq!(err.errno(), "EFSM", "{err}");
-
-        client.send("one").await.expect("send");
-        let err = client.send("two").await.unwrap_err();
-        assert_eq!(err.errno(), "EFSM", "{err}");
-
-        // The request itself is fine; it is the second one that was refused.
-        let stale = server.recv().await.expect("the first request");
-        assert_eq!(body(&stale), vec![b"one".to_vec()]);
-
-        // Lazy Pirate: after EFSM, throw the socket away. The reply then has
-        // nowhere to go and is discarded rather than blocking the server.
-        drop(client);
-        let gone = std::time::Instant::now();
-        while server.peer_count() > 0 {
-            assert!(
-                gone.elapsed() < Duration::from_secs(10),
-                "the closed requester never went away"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(server.send("late").await.expect("reply"), Sent::Dropped);
-
-        // And a fresh socket completes its own exchange, which is what
-        // close-and-reopen needs.
-        let mut reopened = ReqSocket::new(&ctx).expect("a fresh req");
-        reopened.connect(&endpoint.to_string()).expect("connect");
-        reopened.send("after efsm").await.expect("send");
-        assert_eq!(
-            body(&server.recv().await.expect("recv")),
-            vec![b"after efsm".to_vec()]
-        );
-        server.send("welcome back").await.expect("reply");
-        assert_eq!(
-            body(&reopened.recv().await.expect("reply")),
-            vec![b"welcome back".to_vec()]
-        );
-    }
-
-    /// Claim: REP's alternation is strict too, in both directions.
-    #[tokio::test]
-    async fn rep_alternation_is_efsm() {
-        let ctx = context();
-        let mut server = RepSocket::new(&ctx).expect("rep");
-        let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let err = server.send("unasked").await.unwrap_err();
-        assert_eq!(err.errno(), "EFSM", "{err}");
-
-        let mut client = ReqSocket::new(&ctx).expect("req");
-        client.connect(&endpoint.to_string()).expect("connect");
-        client.send("ask").await.expect("send");
-        server.recv().await.expect("recv");
-
-        let err = server.try_recv().unwrap_err();
-        assert_eq!(err.errno(), "EFSM", "{err}");
-    }
-
-    /// Claim: REQ round-robins over its peers and reads only the one it sent
-    /// to, discarding whatever another peer says unasked.
-    #[tokio::test]
-    async fn req_round_robins_and_hears_only_the_peer_it_asked() {
-        let ctx = context();
-        let mut first = RepSocket::new(&ctx).expect("rep one");
-        let mut second = RepSocket::new(&ctx).expect("rep two");
-        let one = first.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let two = second.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut client = ReqSocket::new(&ctx).expect("req");
-        client.connect(&one.to_string()).expect("connect one");
-        client.connect(&two.to_string()).expect("connect two");
-        // Both peers must exist before the rotation means anything.
-        while client.peer_count() < 2 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        // Two requests, and each server sees exactly one: the rotation.
-        client.send("a").await.expect("first");
-        let served_first = tokio::time::timeout(Duration::from_secs(5), first.recv()).await;
-        let (mut asked, mut other) = match served_first {
-            Ok(Ok(request)) => {
-                assert_eq!(body(&request), vec![b"a".to_vec()]);
-                (first, second)
-            }
-            _ => {
-                let request = second.recv().await.expect("the other server");
-                assert_eq!(body(&request), vec![b"a".to_vec()]);
-                (second, first)
-            }
-        };
-
-        // The server that was *not* asked speaks anyway. A REQ socket must
-        // discard that silently, so the real reply is what arrives.
-        other_speaks_unasked(&mut other).await;
-        asked.send("the real reply").await.expect("reply");
-        let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
-            .await
-            .expect("a reply arrived")
-            .expect("reply");
-        assert_eq!(body(&reply), vec![b"the real reply".to_vec()]);
-    }
-
     /// Pushes a message into the unasked server's outgoing queue, bypassing
     /// its state machine: a REQ socket must not accept it.
     async fn other_speaks_unasked(other: &mut RepSocket) {
@@ -640,210 +487,363 @@ mod tests {
         }
     }
 
-    /// Claim: `ZMQ_REQ_CORRELATE` puts a request-id frame in front of the
-    /// delimiter on the wire, and a reply that does not echo it is discarded
-    /// — checked against a peer driven by the codec itself, because that is
-    /// where "on the wire" can be read.
-    #[tokio::test]
-    async fn correlate_prefixes_the_request_and_filters_the_reply() {
-        let ctx = context();
-        let mut client = ReqSocket::with_options(
-            &ctx,
-            SocketOptions {
-                req_correlate: true,
-                ..SocketOptions::default()
-            },
-        )
-        .expect("req");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        client
-            .core
-            .connect(&format!("tcp://127.0.0.1:{port}"))
-            .expect("connect");
+        /// Claim: a request goes out, a reply comes back, and neither side ever
+        /// sees the envelope — REP gets the body, REQ gets the reply body.
+        #[tokio::test]
+        async fn a_request_and_a_reply_cross_without_their_envelope() {
+            let ctx = context();
+            let mut server = RepSocket::new(&ctx).expect("rep");
+            let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
 
-        let peer = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut wire = Wire::new(stream, MessageLimits::default());
-            // The handshake, from the peer's side.
-            let mut greeting = [0u8; greeting::GREETING_LEN];
-            wire.read_exactly_for_test(&mut greeting).await;
-            wire.write_raw_for_test(&Greeting::null().encode()).await;
-            let _ready = wire.read_next().await.expect("READY");
-            wire.write_command(&Command::Ready(
-                Metadata::new().with_socket_type(SocketType::Rep),
-            ))
-            .await
-            .expect("our READY");
+            let mut client = ReqSocket::new(&ctx).expect("req");
+            client.connect(&endpoint.to_string()).expect("connect");
 
-            // The request: [request-id][empty][body].
-            let Incoming::Message(request) = wire.read_next().await.expect("request") else {
-                panic!("expected a message");
+            client.send("ping").await.expect("send");
+            assert!(client.awaiting_reply());
+
+            let request = server.recv().await.expect("recv");
+            assert_eq!(body(&request), vec![b"ping".to_vec()]);
+            assert!(server.owes_reply());
+
+            assert_eq!(server.send("pong").await.expect("reply"), Sent::Queued);
+            let reply = client.recv().await.expect("reply");
+            assert_eq!(body(&reply), vec![b"pong".to_vec()]);
+            assert!(!client.awaiting_reply());
+            assert!(!server.owes_reply());
+
+            // And the pair alternates again, which is the whole pattern.
+            client.send("two").await.expect("send");
+            assert_eq!(
+                body(&server.recv().await.expect("recv")),
+                vec![b"two".to_vec()]
+            );
+            server.send("done").await.expect("reply");
+            assert_eq!(
+                body(&client.recv().await.expect("reply")),
+                vec![b"done".to_vec()]
+            );
+        }
+        /// Claim: REQ's alternation is strict and `EFSM` names the violation —
+        /// and a socket discarded after `EFSM` leaves nothing behind, which is
+        /// what Lazy Pirate's close-and-reopen needs.
+        #[tokio::test]
+        async fn req_alternation_is_efsm_and_recoverable_by_reopening() {
+            let ctx = context();
+            let mut server = RepSocket::new(&ctx).expect("rep");
+            let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut client = ReqSocket::new(&ctx).expect("req");
+            client.connect(&endpoint.to_string()).expect("connect");
+
+            // Receive before send.
+            let err = client.try_recv().unwrap_err();
+            assert_eq!(err.errno(), "EFSM", "{err}");
+
+            client.send("one").await.expect("send");
+            let err = client.send("two").await.unwrap_err();
+            assert_eq!(err.errno(), "EFSM", "{err}");
+
+            // The request itself is fine; it is the second one that was refused.
+            let stale = server.recv().await.expect("the first request");
+            assert_eq!(body(&stale), vec![b"one".to_vec()]);
+
+            // Lazy Pirate: after EFSM, throw the socket away. The reply then has
+            // nowhere to go and is discarded rather than blocking the server.
+            drop(client);
+            let gone = std::time::Instant::now();
+            while server.peer_count() > 0 {
+                assert!(
+                    gone.elapsed() < Duration::from_secs(10),
+                    "the closed requester never went away"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(server.send("late").await.expect("reply"), Sent::Dropped);
+
+            // And a fresh socket completes its own exchange, which is what
+            // close-and-reopen needs.
+            let mut reopened = ReqSocket::new(&ctx).expect("a fresh req");
+            reopened.connect(&endpoint.to_string()).expect("connect");
+            reopened.send("after efsm").await.expect("send");
+            assert_eq!(
+                body(&server.recv().await.expect("recv")),
+                vec![b"after efsm".to_vec()]
+            );
+            server.send("welcome back").await.expect("reply");
+            assert_eq!(
+                body(&reopened.recv().await.expect("reply")),
+                vec![b"welcome back".to_vec()]
+            );
+        }
+        /// Claim: REP's alternation is strict too, in both directions.
+        #[tokio::test]
+        async fn rep_alternation_is_efsm() {
+            let ctx = context();
+            let mut server = RepSocket::new(&ctx).expect("rep");
+            let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let err = server.send("unasked").await.unwrap_err();
+            assert_eq!(err.errno(), "EFSM", "{err}");
+
+            let mut client = ReqSocket::new(&ctx).expect("req");
+            client.connect(&endpoint.to_string()).expect("connect");
+            client.send("ask").await.expect("send");
+            server.recv().await.expect("recv");
+
+            let err = server.try_recv().unwrap_err();
+            assert_eq!(err.errno(), "EFSM", "{err}");
+        }
+        /// Claim: REQ round-robins over its peers and reads only the one it sent
+        /// to, discarding whatever another peer says unasked.
+        #[tokio::test]
+        async fn req_round_robins_and_hears_only_the_peer_it_asked() {
+            let ctx = context();
+            let mut first = RepSocket::new(&ctx).expect("rep one");
+            let mut second = RepSocket::new(&ctx).expect("rep two");
+            let one = first.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let two = second.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut client = ReqSocket::new(&ctx).expect("req");
+            client.connect(&one.to_string()).expect("connect one");
+            client.connect(&two.to_string()).expect("connect two");
+            // Both peers must exist before the rotation means anything.
+            while client.peer_count() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            // Two requests, and each server sees exactly one: the rotation.
+            client.send("a").await.expect("first");
+            let served_first = tokio::time::timeout(Duration::from_secs(5), first.recv()).await;
+            let (mut asked, mut other) = match served_first {
+                Ok(Ok(request)) => {
+                    assert_eq!(body(&request), vec![b"a".to_vec()]);
+                    (first, second)
+                }
+                _ => {
+                    let request = second.recv().await.expect("the other server");
+                    assert_eq!(body(&request), vec![b"a".to_vec()]);
+                    (second, first)
+                }
             };
-            assert_eq!(request.len(), 3, "id, delimiter, body");
-            assert_eq!(request.frames()[0].len(), REQUEST_ID_LEN);
-            assert!(request.frames()[1].is_empty());
-            assert_eq!(request.frames()[2].as_slice(), b"hello");
-            let id = request.frames()[0].as_slice().to_vec();
 
-            // A reply with the wrong id first: it must be discarded.
-            let wrong = Multipart::new(vec![
-                Message::from(vec![0xde, 0xad, 0xbe, 0xef]),
-                Message::empty(),
-                Message::from("stale"),
-            ])
-            .expect("frames");
-            wire.write_message(&wrong).await.expect("wrong reply");
-            // Then the right one.
-            let right = Multipart::new(vec![
-                Message::from(id),
-                Message::empty(),
-                Message::from("fresh"),
-            ])
-            .expect("frames");
-            wire.write_message(&right).await.expect("right reply");
-            // Hold the connection while the client reads its reply.
-            // Margin: 200 ms against a reply the client awaits rather than
-            // samples for, so this only has to outlast the await.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        });
-
-        client.send("hello").await.expect("send");
-        let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
-            .await
-            .expect("a reply arrived")
-            .expect("reply");
-        assert_eq!(body(&reply), vec![b"fresh".to_vec()]);
-        peer.await.expect("the peer");
-    }
-
-    /// Claim: a misbehaving peer cannot make a REQ socket return something
-    /// that is not a reply. A message with no delimiter is discarded and the
-    /// well-formed one behind it is delivered.
-    #[tokio::test]
-    async fn a_misbehaving_peer_is_discarded_not_delivered() {
-        let ctx = context();
-        let mut client = ReqSocket::new(&ctx).expect("req");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        client
-            .core
-            .connect(&format!("tcp://127.0.0.1:{port}"))
-            .expect("connect");
-
-        let peer = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut wire = Wire::new(stream, MessageLimits::default());
-            let mut greeting = [0u8; greeting::GREETING_LEN];
-            wire.read_exactly_for_test(&mut greeting).await;
-            wire.write_raw_for_test(&Greeting::null().encode()).await;
-            let _ready = wire.read_next().await.expect("READY");
-            wire.write_command(&Command::Ready(
-                Metadata::new().with_socket_type(SocketType::Rep),
-            ))
-            .await
-            .expect("our READY");
-            let _request = wire.read_next().await.expect("request");
-
-            // No delimiter: not a request-reply message at all.
-            wire.write_message(&Multipart::single("naked"))
+            // The server that was *not* asked speaks anyway. A REQ socket must
+            // discard that silently, so the real reply is what arrives.
+            other_speaks_unasked(&mut other).await;
+            asked.send("the real reply").await.expect("reply");
+            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
                 .await
-                .expect("malformed reply");
-            wire.write_message(
-                &Multipart::new(vec![Message::empty(), Message::from("proper")]).expect("frames"),
+                .expect("a reply arrived")
+                .expect("reply");
+            assert_eq!(body(&reply), vec![b"the real reply".to_vec()]);
+        }
+        /// Claim: `ZMQ_REQ_CORRELATE` puts a request-id frame in front of the
+        /// delimiter on the wire, and a reply that does not echo it is discarded
+        /// — checked against a peer driven by the codec itself, because that is
+        /// where "on the wire" can be read.
+        #[tokio::test]
+        async fn correlate_prefixes_the_request_and_filters_the_reply() {
+            let ctx = context();
+            let mut client = ReqSocket::with_options(
+                &ctx,
+                SocketOptions {
+                    req_correlate: true,
+                    ..SocketOptions::default()
+                },
             )
-            .await
-            .expect("proper reply");
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        });
+            .expect("req");
 
-        client.send("hello").await.expect("send");
-        let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
-            .await
-            .expect("a reply arrived")
-            .expect("reply");
-        assert_eq!(body(&reply), vec![b"proper".to_vec()]);
-        peer.await.expect("the peer");
-    }
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            client
+                .core
+                .connect(&format!("tcp://127.0.0.1:{port}"))
+                .expect("connect");
 
-    /// Claim: `ZMQ_REQ_RELAXED` lets a second request go out with no `EFSM`,
-    /// and the abandoned exchange's reply is discarded rather than returned
-    /// as the answer to the new one — which is why the option requires
-    /// correlation, and why the pair without it is refused.
-    #[tokio::test]
-    async fn relaxed_abandons_the_exchange_and_discards_its_late_reply() {
-        let ctx = context();
-        let err = ReqSocket::with_options(
-            &ctx,
-            SocketOptions {
-                req_relaxed: true,
-                ..SocketOptions::default()
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err.errno(), "EINVAL", "{err}");
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut wire = Wire::new(stream, MessageLimits::default());
+                // The handshake, from the peer's side.
+                let mut greeting = [0u8; greeting::GREETING_LEN];
+                wire.read_exactly_for_test(&mut greeting).await;
+                wire.write_raw_for_test(&Greeting::null().encode()).await;
+                let _ready = wire.read_next().await.expect("READY");
+                wire.write_command(&Command::Ready(
+                    Metadata::new().with_socket_type(SocketType::Rep),
+                ))
+                .await
+                .expect("our READY");
 
-        let mut server = RepSocket::new(&ctx).expect("rep");
-        let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut client = ReqSocket::with_options(
-            &ctx,
-            SocketOptions {
-                req_relaxed: true,
-                req_correlate: true,
-                ..SocketOptions::default()
-            },
-        )
-        .expect("req");
-        client.connect(&endpoint.to_string()).expect("connect");
+                // The request: [request-id][empty][body].
+                let Incoming::Message(request) = wire.read_next().await.expect("request") else {
+                    panic!("expected a message");
+                };
+                assert_eq!(request.len(), 3, "id, delimiter, body");
+                assert_eq!(request.frames()[0].len(), REQUEST_ID_LEN);
+                assert!(request.frames()[1].is_empty());
+                assert_eq!(request.frames()[2].as_slice(), b"hello");
+                let id = request.frames()[0].as_slice().to_vec();
 
-        client.send("first").await.expect("first");
-        // No EFSM: the first exchange is abandoned.
-        client.send("second").await.expect("second");
+                // A reply with the wrong id first: it must be discarded.
+                let wrong = Multipart::new(vec![
+                    Message::from(vec![0xde, 0xad, 0xbe, 0xef]),
+                    Message::empty(),
+                    Message::from("stale"),
+                ])
+                .expect("frames");
+                wire.write_message(&wrong).await.expect("wrong reply");
+                // Then the right one.
+                let right = Multipart::new(vec![
+                    Message::from(id),
+                    Message::empty(),
+                    Message::from("fresh"),
+                ])
+                .expect("frames");
+                wire.write_message(&right).await.expect("right reply");
+                // Hold the connection while the client reads its reply.
+                // Margin: 200 ms against a reply the client awaits rather than
+                // samples for, so this only has to outlast the await.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
 
-        // The server answers both, oldest first. The stale reply carries the
-        // abandoned request id and must be discarded.
-        let one = server.recv().await.expect("first request");
-        assert_eq!(body(&one), vec![b"first".to_vec()]);
-        server.send("answer to first").await.expect("reply");
-        let two = server.recv().await.expect("second request");
-        assert_eq!(body(&two), vec![b"second".to_vec()]);
-        server.send("answer to second").await.expect("reply");
+            client.send("hello").await.expect("send");
+            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
+                .await
+                .expect("a reply arrived")
+                .expect("reply");
+            assert_eq!(body(&reply), vec![b"fresh".to_vec()]);
+            peer.await.expect("the peer");
+        }
+        /// Claim: a misbehaving peer cannot make a REQ socket return something
+        /// that is not a reply. A message with no delimiter is discarded and the
+        /// well-formed one behind it is delivered.
+        #[tokio::test]
+        async fn a_misbehaving_peer_is_discarded_not_delivered() {
+            let ctx = context();
+            let mut client = ReqSocket::new(&ctx).expect("req");
 
-        let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
-            .await
-            .expect("a reply arrived")
-            .expect("reply");
-        assert_eq!(
-            body(&reply),
-            vec![b"answer to second".to_vec()],
-            "the abandoned exchange's reply must not be returned"
-        );
-    }
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            client
+                .core
+                .connect(&format!("tcp://127.0.0.1:{port}"))
+                .expect("connect");
 
-    /// Claim: `ZMQ_RCVTIMEO` bounds a wait for a reply that is not coming,
-    /// with `EAGAIN` — Lazy Pirate's poll, which is a timeout and then a
-    /// decision.
-    #[tokio::test]
-    async fn a_reply_that_never_comes_times_out_with_eagain() {
-        let ctx = context();
-        let server = RepSocket::new(&ctx).expect("rep");
-        let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut client = ReqSocket::with_options(
-            &ctx,
-            SocketOptions {
-                recv_timeout: Some(Duration::from_millis(50)),
-                ..SocketOptions::default()
-            },
-        )
-        .expect("req");
-        client.connect(&endpoint.to_string()).expect("connect");
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut wire = Wire::new(stream, MessageLimits::default());
+                let mut greeting = [0u8; greeting::GREETING_LEN];
+                wire.read_exactly_for_test(&mut greeting).await;
+                wire.write_raw_for_test(&Greeting::null().encode()).await;
+                let _ready = wire.read_next().await.expect("READY");
+                wire.write_command(&Command::Ready(
+                    Metadata::new().with_socket_type(SocketType::Rep),
+                ))
+                .await
+                .expect("our READY");
+                let _request = wire.read_next().await.expect("request");
 
-        client.send("unanswered").await.expect("send");
-        let err = client.recv().await.unwrap_err();
-        assert_eq!(err.errno(), "EAGAIN", "{err}");
-        // The exchange is still outstanding: a timeout is not a reply.
-        assert!(client.awaiting_reply());
+                // No delimiter: not a request-reply message at all.
+                wire.write_message(&Multipart::single("naked"))
+                    .await
+                    .expect("malformed reply");
+                wire.write_message(
+                    &Multipart::new(vec![Message::empty(), Message::from("proper")])
+                        .expect("frames"),
+                )
+                .await
+                .expect("proper reply");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+
+            client.send("hello").await.expect("send");
+            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
+                .await
+                .expect("a reply arrived")
+                .expect("reply");
+            assert_eq!(body(&reply), vec![b"proper".to_vec()]);
+            peer.await.expect("the peer");
+        }
+        /// Claim: `ZMQ_REQ_RELAXED` lets a second request go out with no `EFSM`,
+        /// and the abandoned exchange's reply is discarded rather than returned
+        /// as the answer to the new one — which is why the option requires
+        /// correlation, and why the pair without it is refused.
+        #[tokio::test]
+        async fn relaxed_abandons_the_exchange_and_discards_its_late_reply() {
+            let ctx = context();
+            let err = ReqSocket::with_options(
+                &ctx,
+                SocketOptions {
+                    req_relaxed: true,
+                    ..SocketOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.errno(), "EINVAL", "{err}");
+
+            let mut server = RepSocket::new(&ctx).expect("rep");
+            let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut client = ReqSocket::with_options(
+                &ctx,
+                SocketOptions {
+                    req_relaxed: true,
+                    req_correlate: true,
+                    ..SocketOptions::default()
+                },
+            )
+            .expect("req");
+            client.connect(&endpoint.to_string()).expect("connect");
+
+            client.send("first").await.expect("first");
+            // No EFSM: the first exchange is abandoned.
+            client.send("second").await.expect("second");
+
+            // The server answers both, oldest first. The stale reply carries the
+            // abandoned request id and must be discarded.
+            let one = server.recv().await.expect("first request");
+            assert_eq!(body(&one), vec![b"first".to_vec()]);
+            server.send("answer to first").await.expect("reply");
+            let two = server.recv().await.expect("second request");
+            assert_eq!(body(&two), vec![b"second".to_vec()]);
+            server.send("answer to second").await.expect("reply");
+
+            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
+                .await
+                .expect("a reply arrived")
+                .expect("reply");
+            assert_eq!(
+                body(&reply),
+                vec![b"answer to second".to_vec()],
+                "the abandoned exchange's reply must not be returned"
+            );
+        }
+        /// Claim: `ZMQ_RCVTIMEO` bounds a wait for a reply that is not coming,
+        /// with `EAGAIN` — Lazy Pirate's poll, which is a timeout and then a
+        /// decision.
+        #[tokio::test]
+        async fn a_reply_that_never_comes_times_out_with_eagain() {
+            let ctx = context();
+            let server = RepSocket::new(&ctx).expect("rep");
+            let endpoint = server.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut client = ReqSocket::with_options(
+                &ctx,
+                SocketOptions {
+                    recv_timeout: Some(Duration::from_millis(50)),
+                    ..SocketOptions::default()
+                },
+            )
+            .expect("req");
+            client.connect(&endpoint.to_string()).expect("connect");
+
+            client.send("unanswered").await.expect("send");
+            let err = client.recv().await.unwrap_err();
+            assert_eq!(err.errno(), "EAGAIN", "{err}");
+            // The exchange is still outstanding: a timeout is not a reply.
+            assert!(client.awaiting_reply());
+        }
     }
 }

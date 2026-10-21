@@ -268,341 +268,340 @@ mod tests {
         }
     }
 
-    /// Claim: a subscription made in the gap between `connect` and the
-    /// handshake reaches the publisher **once**, so one `unsubscribe`
-    /// undoes it.
-    ///
-    /// Subscriptions count rather than set — "subscribing to 'A' and 'A'
-    /// counts as two subscriptions, and would require two CANCEL commands to
-    /// undo" — so a socket that both queued the subscription and replayed it
-    /// from its table at the handshake would leave the publisher needing two
-    /// cancellations for something the application asked for once, and the
-    /// application's `unsubscribe` would change nothing at all, so the
-    /// unsubscriptions would never appear in the Espresso trace.
-    #[tokio::test]
-    async fn a_subscription_made_before_the_handshake_needs_one_cancel() {
-        let ctx = context();
-        let mut publisher = PubSocket::new(&ctx).expect("pub");
-        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let mut subscriber = SubSocket::new(&ctx).expect("sub");
-        subscriber.connect(&endpoint.to_string()).expect("connect");
-        // In the gap: the pipe exists, the handshake has not finished.
-        subscriber.subscribe("A").expect("subscribe");
-        wait_for(|| publisher.anybody_wants(b"A")).await;
-
-        subscriber.unsubscribe("A").expect("unsubscribe");
-        wait_for(|| !publisher.anybody_wants(b"A")).await;
-        assert_eq!(
-            publisher.publish("A one").delivered,
-            0,
-            "one unsubscribe stopped the publisher"
-        );
-    }
-
-    /// Claim: the filter is a binary prefix on the first frame, applied by
-    /// the publisher — and a fresh subscriber gets nothing until it asks.
-    #[tokio::test]
-    async fn a_fresh_subscriber_gets_nothing_and_a_prefix_gets_its_topics() {
-        let ctx = context();
-        let mut publisher = PubSocket::new(&ctx).expect("pub");
-        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut subscriber = SubSocket::new(&ctx).expect("sub");
-        subscriber.connect(&endpoint.to_string()).expect("connect");
-        wait_for(|| publisher.subscriber_count() == 1).await;
-
-        // Subscribed to nothing: the publisher has nothing to send it.
-        let report = publisher.publish("weather.uk.london 12C");
-        assert_eq!(report.delivered, 0);
-        assert_eq!(report.unmatched, 1, "a fresh SUB filters everything out");
-
-        subscriber.subscribe("weather.uk").expect("subscribe");
-        wait_for(|| publisher.anybody_wants(b"weather.uk.london")).await;
-
-        assert_eq!(publisher.publish("weather.uk.london 12C").delivered, 1);
-        assert_eq!(
-            publisher.publish("weather.us.boston 20C").unmatched,
-            1,
-            "a prefix that does not match is not sent"
-        );
-        assert_eq!(
-            text(&subscriber.recv().await.expect("recv")),
-            "weather.uk.london 12C"
-        );
-
-        // The empty subscription takes everything, including what no other
-        // prefix matched.
-        subscriber.subscribe("").expect("subscribe to all");
-        wait_for(|| publisher.anybody_wants(b"anything")).await;
-        assert_eq!(publisher.publish("weather.us.boston 20C").delivered, 1);
-        assert_eq!(
-            text(&subscriber.recv().await.expect("recv")),
-            "weather.us.boston 20C"
-        );
-    }
-
-    /// Claim: subscriptions are additive and non-idempotent all the way to
-    /// the publisher — two subscribes need two cancellations before the
-    /// publisher stops sending.
-    #[tokio::test]
-    async fn two_subscribes_need_two_cancels() {
-        let ctx = context();
-        let mut publisher = PubSocket::new(&ctx).expect("pub");
-        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut subscriber = SubSocket::new(&ctx).expect("sub");
-        subscriber.connect(&endpoint.to_string()).expect("connect");
-        wait_for(|| publisher.subscriber_count() == 1).await;
-
-        subscriber.subscribe("topic").expect("first");
-        subscriber.subscribe("topic").expect("second");
-        wait_for(|| publisher.anybody_wants(b"topic")).await;
-
-        subscriber.unsubscribe("topic").expect("first cancel");
-        // One cancellation is not enough: the publisher counted two.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            publisher.anybody_wants(b"topic"),
-            "one CANCEL must not undo two SUBSCRIBEs"
-        );
-        assert_eq!(publisher.publish("topic still wanted").delivered, 1);
-
-        subscriber.unsubscribe("topic").expect("second cancel");
-        wait_for(|| !publisher.anybody_wants(b"topic")).await;
-        assert_eq!(publisher.publish("topic no longer").unmatched, 1);
-
-        let err = subscriber.unsubscribe("topic").unwrap_err();
-        assert_eq!(err.errno(), "EINVAL", "{err}");
-    }
-
-    /// Claim: a subscriber whose queue is full loses copies rather than
-    /// slowing the publisher down, and the loss is reported rather than
-    /// silent. `ZMQ_SNDHWM` of 1 makes the bound reachable in a test; the
-    /// behaviour at the bound is what is asserted.
-    #[tokio::test]
-    async fn a_full_subscriber_loses_copies_and_the_publisher_says_so() {
-        let ctx = context();
-        let mut publisher = PubSocket::with_options(
-            &ctx,
-            SocketOptions {
-                pipe: PipeConfig {
-                    outgoing: QueueConfig {
-                        hwm: 1,
-                        mute: MuteAction::Drop,
-                        ..PipeConfig::default().outgoing
-                    },
-                    ..PipeConfig::default()
-                },
-                ..SocketOptions::default()
-            },
-        )
-        .expect("pub");
-        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut subscriber = SubSocket::new(&ctx).expect("sub");
-        subscriber.connect(&endpoint.to_string()).expect("connect");
-        wait_for(|| publisher.subscriber_count() == 1).await;
-        subscriber.subscribe("").expect("subscribe to all");
-        wait_for(|| publisher.anybody_wants(b"x")).await;
-
-        // Publish far more than the queue and the socket buffers can hold.
-        // Nothing blocks and nothing fails; some copies are lost, and the
-        // publisher reports how many.
-        let mut dropped = 0;
-        for n in 0..5_000 {
-            let report = publisher.publish(format!("event {n}"));
-            dropped += report.dropped;
-        }
-        assert!(
-            dropped > 0,
-            "a subscriber that never reads must lose copies rather than block the publisher"
-        );
-
-        // And the subscriber still works: what it does get is well-formed.
-        let first = subscriber.recv().await.expect("recv");
-        assert!(text(&first).starts_with("event "));
-    }
-
-    /// Claim: with `ZMQ_SNDHWM` set to libzmq's "no limit", a subscriber
-    /// that never reads is **still** bounded, because the queue is bounded
-    /// in bytes as well (`pipe::DEFAULT_QUEUE_BYTES`). Nothing here
-    /// can refuse on a message count: `hwm: 0` means there is none.
-    #[tokio::test]
-    async fn a_byte_ceiling_bounds_a_subscriber_whose_high_water_mark_is_unlimited() {
-        let ctx = context();
-        let mut publisher = PubSocket::with_options(
-            &ctx,
-            SocketOptions {
-                pipe: PipeConfig {
-                    outgoing: QueueConfig {
-                        hwm: 0,
-                        max_bytes: 4096,
-                        mute: MuteAction::Drop,
-                    },
-                    ..PipeConfig::default()
-                },
-                ..SocketOptions::default()
-            },
-        )
-        .expect("pub");
-        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut subscriber = SubSocket::new(&ctx).expect("sub");
-        subscriber.connect(&endpoint.to_string()).expect("connect");
-        wait_for(|| publisher.subscriber_count() == 1).await;
-        subscriber.subscribe("").expect("subscribe to all");
-        wait_for(|| publisher.anybody_wants(b"x")).await;
-
-        // A kibibyte per message and five mebibytes in total: far more than
-        // the ceiling, the socket buffers and anything the subscriber's
-        // unread queue could absorb.
-        let body = "x".repeat(1024);
-        let mut dropped = 0;
-        for _ in 0..5_000 {
-            dropped += publisher.publish(body.clone()).dropped;
-        }
-        assert!(
-            dropped > 0,
-            "a queue with no message bound must still refuse at its byte ceiling"
-        );
-        for peer in publisher.core.peers().iter() {
-            assert!(
-                peer.pipe.outgoing().queued_bytes() <= 4096 + 1024,
-                "the ceiling plus the one message an empty queue always takes: {}",
-                peer.pipe.outgoing().queued_bytes()
-            );
-        }
-    }
-
-    /// Claim: both subscription wire forms work. The default sends 3.x
-    /// commands; `SubscriptionForm::LegacyMessage` sends ZMTP 2.0's
-    /// one-frame message — what a 3.0 peer such as `zeromq` 0.6 reads — and a
-    /// publisher accepts either, because one that read only one form would
-    /// silently have no subscribers from an implementation that sends the
-    /// other.
-    #[tokio::test]
-    async fn both_subscription_wire_forms_reach_the_publisher() {
-        let ctx = context();
-        for form in [SubscriptionForm::Commands, SubscriptionForm::LegacyMessage] {
+        /// Claim: a subscription made in the gap between `connect` and the
+        /// handshake reaches the publisher **once**, so one `unsubscribe`
+        /// undoes it.
+        ///
+        /// Subscriptions count rather than set — "subscribing to 'A' and 'A'
+        /// counts as two subscriptions, and would require two CANCEL commands to
+        /// undo" — so a socket that both queued the subscription and replayed it
+        /// from its table at the handshake would leave the publisher needing two
+        /// cancellations for something the application asked for once, and the
+        /// application's `unsubscribe` would change nothing at all, so the
+        /// unsubscriptions would never appear in the Espresso trace.
+        #[tokio::test]
+        async fn a_subscription_made_before_the_handshake_needs_one_cancel() {
+            let ctx = context();
             let mut publisher = PubSocket::new(&ctx).expect("pub");
             let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut subscriber = SubSocket::new(&ctx).expect("sub");
+            subscriber.connect(&endpoint.to_string()).expect("connect");
+            // In the gap: the pipe exists, the handshake has not finished.
+            subscriber.subscribe("A").expect("subscribe");
+            wait_for(|| publisher.anybody_wants(b"A")).await;
+
+            subscriber.unsubscribe("A").expect("unsubscribe");
+            wait_for(|| !publisher.anybody_wants(b"A")).await;
+            assert_eq!(
+                publisher.publish("A one").delivered,
+                0,
+                "one unsubscribe stopped the publisher"
+            );
+        }
+        /// Claim: the filter is a binary prefix on the first frame, applied by
+        /// the publisher — and a fresh subscriber gets nothing until it asks.
+        #[tokio::test]
+        async fn a_fresh_subscriber_gets_nothing_and_a_prefix_gets_its_topics() {
+            let ctx = context();
+            let mut publisher = PubSocket::new(&ctx).expect("pub");
+            let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut subscriber = SubSocket::new(&ctx).expect("sub");
+            subscriber.connect(&endpoint.to_string()).expect("connect");
+            wait_for(|| publisher.subscriber_count() == 1).await;
+
+            // Subscribed to nothing: the publisher has nothing to send it.
+            let report = publisher.publish("weather.uk.london 12C");
+            assert_eq!(report.delivered, 0);
+            assert_eq!(report.unmatched, 1, "a fresh SUB filters everything out");
+
+            subscriber.subscribe("weather.uk").expect("subscribe");
+            wait_for(|| publisher.anybody_wants(b"weather.uk.london")).await;
+
+            assert_eq!(publisher.publish("weather.uk.london 12C").delivered, 1);
+            assert_eq!(
+                publisher.publish("weather.us.boston 20C").unmatched,
+                1,
+                "a prefix that does not match is not sent"
+            );
+            assert_eq!(
+                text(&subscriber.recv().await.expect("recv")),
+                "weather.uk.london 12C"
+            );
+
+            // The empty subscription takes everything, including what no other
+            // prefix matched.
+            subscriber.subscribe("").expect("subscribe to all");
+            wait_for(|| publisher.anybody_wants(b"anything")).await;
+            assert_eq!(publisher.publish("weather.us.boston 20C").delivered, 1);
+            assert_eq!(
+                text(&subscriber.recv().await.expect("recv")),
+                "weather.us.boston 20C"
+            );
+        }
+        /// Claim: subscriptions are additive and non-idempotent all the way to
+        /// the publisher — two subscribes need two cancellations before the
+        /// publisher stops sending.
+        #[tokio::test]
+        async fn two_subscribes_need_two_cancels() {
+            let ctx = context();
+            let mut publisher = PubSocket::new(&ctx).expect("pub");
+            let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut subscriber = SubSocket::new(&ctx).expect("sub");
+            subscriber.connect(&endpoint.to_string()).expect("connect");
+            wait_for(|| publisher.subscriber_count() == 1).await;
+
+            subscriber.subscribe("topic").expect("first");
+            subscriber.subscribe("topic").expect("second");
+            wait_for(|| publisher.anybody_wants(b"topic")).await;
+
+            subscriber.unsubscribe("topic").expect("first cancel");
+            // One cancellation is not enough: the publisher counted two.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                publisher.anybody_wants(b"topic"),
+                "one CANCEL must not undo two SUBSCRIBEs"
+            );
+            assert_eq!(publisher.publish("topic still wanted").delivered, 1);
+
+            subscriber.unsubscribe("topic").expect("second cancel");
+            wait_for(|| !publisher.anybody_wants(b"topic")).await;
+            assert_eq!(publisher.publish("topic no longer").unmatched, 1);
+
+            let err = subscriber.unsubscribe("topic").unwrap_err();
+            assert_eq!(err.errno(), "EINVAL", "{err}");
+        }
+        /// Claim: a subscriber whose queue is full loses copies rather than
+        /// slowing the publisher down, and the loss is reported rather than
+        /// silent. `ZMQ_SNDHWM` of 1 makes the bound reachable in a test; the
+        /// behaviour at the bound is what is asserted.
+        #[tokio::test]
+        async fn a_full_subscriber_loses_copies_and_the_publisher_says_so() {
+            let ctx = context();
+            let mut publisher = PubSocket::with_options(
+                &ctx,
+                SocketOptions {
+                    pipe: PipeConfig {
+                        outgoing: QueueConfig {
+                            hwm: 1,
+                            mute: MuteAction::Drop,
+                            ..PipeConfig::default().outgoing
+                        },
+                        ..PipeConfig::default()
+                    },
+                    ..SocketOptions::default()
+                },
+            )
+            .expect("pub");
+            let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut subscriber = SubSocket::new(&ctx).expect("sub");
+            subscriber.connect(&endpoint.to_string()).expect("connect");
+            wait_for(|| publisher.subscriber_count() == 1).await;
+            subscriber.subscribe("").expect("subscribe to all");
+            wait_for(|| publisher.anybody_wants(b"x")).await;
+
+            // Publish far more than the queue and the socket buffers can hold.
+            // Nothing blocks and nothing fails; some copies are lost, and the
+            // publisher reports how many.
+            let mut dropped = 0;
+            for n in 0..5_000 {
+                let report = publisher.publish(format!("event {n}"));
+                dropped += report.dropped;
+            }
+            assert!(
+                dropped > 0,
+                "a subscriber that never reads must lose copies rather than block the publisher"
+            );
+
+            // And the subscriber still works: what it does get is well-formed.
+            let first = subscriber.recv().await.expect("recv");
+            assert!(text(&first).starts_with("event "));
+        }
+        /// Claim: with `ZMQ_SNDHWM` set to libzmq's "no limit", a subscriber
+        /// that never reads is **still** bounded, because the queue is bounded
+        /// in bytes as well (`pipe::DEFAULT_QUEUE_BYTES`). Nothing here
+        /// can refuse on a message count: `hwm: 0` means there is none.
+        #[tokio::test]
+        async fn a_byte_ceiling_bounds_a_subscriber_whose_high_water_mark_is_unlimited() {
+            let ctx = context();
+            let mut publisher = PubSocket::with_options(
+                &ctx,
+                SocketOptions {
+                    pipe: PipeConfig {
+                        outgoing: QueueConfig {
+                            hwm: 0,
+                            max_bytes: 4096,
+                            mute: MuteAction::Drop,
+                        },
+                        ..PipeConfig::default()
+                    },
+                    ..SocketOptions::default()
+                },
+            )
+            .expect("pub");
+            let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut subscriber = SubSocket::new(&ctx).expect("sub");
+            subscriber.connect(&endpoint.to_string()).expect("connect");
+            wait_for(|| publisher.subscriber_count() == 1).await;
+            subscriber.subscribe("").expect("subscribe to all");
+            wait_for(|| publisher.anybody_wants(b"x")).await;
+
+            // A kibibyte per message and five mebibytes in total: far more than
+            // the ceiling, the socket buffers and anything the subscriber's
+            // unread queue could absorb.
+            let body = "x".repeat(1024);
+            let mut dropped = 0;
+            for _ in 0..5_000 {
+                dropped += publisher.publish(body.clone()).dropped;
+            }
+            assert!(
+                dropped > 0,
+                "a queue with no message bound must still refuse at its byte ceiling"
+            );
+            for peer in publisher.core.peers().iter() {
+                assert!(
+                    peer.pipe.outgoing().queued_bytes() <= 4096 + 1024,
+                    "the ceiling plus the one message an empty queue always takes: {}",
+                    peer.pipe.outgoing().queued_bytes()
+                );
+            }
+        }
+        /// Claim: both subscription wire forms work. The default sends 3.x
+        /// commands; `SubscriptionForm::LegacyMessage` sends ZMTP 2.0's
+        /// one-frame message — what a 3.0 peer such as `zeromq` 0.6 reads — and a
+        /// publisher accepts either, because one that read only one form would
+        /// silently have no subscribers from an implementation that sends the
+        /// other.
+        #[tokio::test]
+        async fn both_subscription_wire_forms_reach_the_publisher() {
+            let ctx = context();
+            for form in [SubscriptionForm::Commands, SubscriptionForm::LegacyMessage] {
+                let mut publisher = PubSocket::new(&ctx).expect("pub");
+                let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+                let mut subscriber = SubSocket::with_options(
+                    &ctx,
+                    SocketOptions {
+                        subscription_form: form,
+                        ..SocketOptions::default()
+                    },
+                )
+                .expect("sub");
+                subscriber.connect(&endpoint.to_string()).expect("connect");
+                wait_for(|| publisher.subscriber_count() == 1).await;
+
+                subscriber.subscribe("news").expect("subscribe");
+                wait_for(|| publisher.anybody_wants(b"news.today")).await;
+                assert_eq!(
+                    publisher.publish("news.today headline").delivered,
+                    1,
+                    "{form:?} must reach the publisher"
+                );
+                assert_eq!(
+                    text(&subscriber.recv().await.expect("recv")),
+                    "news.today headline"
+                );
+
+                // And the unsubscribe in the same form is heard too.
+                subscriber.unsubscribe("news").expect("unsubscribe");
+                wait_for(|| !publisher.anybody_wants(b"news.today")).await;
+            }
+        }
+        /// Claim: a subscription survives a reconnect without the application
+        /// asking — the set travels with the session, so a publisher that comes
+        /// back is told what this socket wants.
+        #[tokio::test]
+        async fn a_subscription_is_re_sent_on_reconnect() {
+            let ctx = context();
+            let first = PubSocket::new(&ctx).expect("pub");
+            let endpoint = first.bind("tcp://127.0.0.1:0").await.expect("bind");
             let mut subscriber = SubSocket::with_options(
                 &ctx,
                 SocketOptions {
-                    subscription_form: form,
+                    reconnect_ivl: Some(Duration::from_millis(20)),
                     ..SocketOptions::default()
                 },
             )
             .expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            wait_for(|| publisher.subscriber_count() == 1).await;
+            wait_for(|| first.subscriber_count() == 1).await;
+            subscriber.subscribe("live").expect("subscribe");
+            wait_for(|| first.anybody_wants(b"live.feed")).await;
 
-            subscriber.subscribe("news").expect("subscribe");
-            wait_for(|| publisher.anybody_wants(b"news.today")).await;
-            assert_eq!(
-                publisher.publish("news.today headline").delivered,
-                1,
-                "{form:?} must reach the publisher"
-            );
-            assert_eq!(
-                text(&subscriber.recv().await.expect("recv")),
-                "news.today headline"
-            );
-
-            // And the unsubscribe in the same form is heard too.
-            subscriber.unsubscribe("news").expect("unsubscribe");
-            wait_for(|| !publisher.anybody_wants(b"news.today")).await;
-        }
-    }
-
-    /// Claim: a subscription survives a reconnect without the application
-    /// asking — the set travels with the session, so a publisher that comes
-    /// back is told what this socket wants.
-    #[tokio::test]
-    async fn a_subscription_is_re_sent_on_reconnect() {
-        let ctx = context();
-        let first = PubSocket::new(&ctx).expect("pub");
-        let endpoint = first.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut subscriber = SubSocket::with_options(
-            &ctx,
-            SocketOptions {
-                reconnect_ivl: Some(Duration::from_millis(20)),
-                ..SocketOptions::default()
-            },
-        )
-        .expect("sub");
-        subscriber.connect(&endpoint.to_string()).expect("connect");
-        wait_for(|| first.subscriber_count() == 1).await;
-        subscriber.subscribe("live").expect("subscribe");
-        wait_for(|| first.anybody_wants(b"live.feed")).await;
-
-        // The publisher goes away and a new one takes the same endpoint. The
-        // retry is the OS releasing the listening socket, not a race in the
-        // library: closing a socket aborts its accept task, and the kernel
-        // frees the port when that task is actually dropped.
-        first.close();
-        drop(first);
-        let mut second = PubSocket::new(&ctx).expect("second pub");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match second.bind(&endpoint.to_string()).await {
-                Ok(_) => break,
-                Err(e) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the endpoint never came free: {e}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            // The publisher goes away and a new one takes the same endpoint. The
+            // retry is the OS releasing the listening socket, not a race in the
+            // library: closing a socket aborts its accept task, and the kernel
+            // frees the port when that task is actually dropped.
+            first.close();
+            drop(first);
+            let mut second = PubSocket::new(&ctx).expect("second pub");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match second.bind(&endpoint.to_string()).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the endpoint never came free: {e}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
             }
-        }
 
-        // Nobody called subscribe again, and the new publisher knows.
-        wait_for(|| second.anybody_wants(b"live.feed")).await;
-        assert_eq!(second.publish("live.feed again").delivered, 1);
-        assert_eq!(
-            text(&subscriber.recv().await.expect("recv")),
-            "live.feed again"
-        );
-    }
-
-    /// Claim: a publisher discards what a subscriber sends it — "PUB SHALL
-    /// silently discard any messages that subscribers send it" — while still
-    /// reading the one thing such a message may be, a subscription in the
-    /// 2.0 form. The subscription arrives; the payload does not.
-    #[tokio::test]
-    async fn a_publisher_discards_what_a_subscriber_sends() {
-        let ctx = context();
-        let publisher = PubSocket::new(&ctx).expect("pub");
-        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let subscriber = SubSocket::new(&ctx).expect("sub");
-        subscriber.connect(&endpoint.to_string()).expect("connect");
-        wait_for(|| publisher.subscriber_count() == 1).await;
-
-        // Push a payload straight onto the wire, bypassing the socket's own
-        // API: this is what a misbehaving subscriber does.
-        let peers = subscriber.core.peers();
-        peers[0]
-            .pipe
-            .outgoing()
-            .try_send(Multipart::single("i am not a subscription"))
-            .expect("queued");
-        // And a legitimate 2.0-form subscription behind it.
-        peers[0]
-            .pipe
-            .outgoing()
-            .try_send(Multipart::single(subscriptions::write_message_form(
-                true, b"ok",
-            )))
-            .expect("queued");
-
-        // The subscription took effect, which proves the publisher read past
-        // the payload rather than choking on it — and the payload reached no
-        // application, because a PUB has nowhere to put one.
-        wait_for(|| publisher.anybody_wants(b"ok.then")).await;
-        for peer in publisher.core.peers().iter() {
-            assert!(
-                peer.pipe.incoming().is_empty(),
-                "a publisher must hand its application nothing a subscriber sent"
+            // Nobody called subscribe again, and the new publisher knows.
+            wait_for(|| second.anybody_wants(b"live.feed")).await;
+            assert_eq!(second.publish("live.feed again").delivered, 1);
+            assert_eq!(
+                text(&subscriber.recv().await.expect("recv")),
+                "live.feed again"
             );
+        }
+        /// Claim: a publisher discards what a subscriber sends it — "PUB SHALL
+        /// silently discard any messages that subscribers send it" — while still
+        /// reading the one thing such a message may be, a subscription in the
+        /// 2.0 form. The subscription arrives; the payload does not.
+        #[tokio::test]
+        async fn a_publisher_discards_what_a_subscriber_sends() {
+            let ctx = context();
+            let publisher = PubSocket::new(&ctx).expect("pub");
+            let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let subscriber = SubSocket::new(&ctx).expect("sub");
+            subscriber.connect(&endpoint.to_string()).expect("connect");
+            wait_for(|| publisher.subscriber_count() == 1).await;
+
+            // Push a payload straight onto the wire, bypassing the socket's own
+            // API: this is what a misbehaving subscriber does.
+            let peers = subscriber.core.peers();
+            peers[0]
+                .pipe
+                .outgoing()
+                .try_send(Multipart::single("i am not a subscription"))
+                .expect("queued");
+            // And a legitimate 2.0-form subscription behind it.
+            peers[0]
+                .pipe
+                .outgoing()
+                .try_send(Multipart::single(subscriptions::write_message_form(
+                    true, b"ok",
+                )))
+                .expect("queued");
+
+            // The subscription took effect, which proves the publisher read past
+            // the payload rather than choking on it — and the payload reached no
+            // application, because a PUB has nowhere to put one.
+            wait_for(|| publisher.anybody_wants(b"ok.then")).await;
+            for peer in publisher.core.peers().iter() {
+                assert!(
+                    peer.pipe.incoming().is_empty(),
+                    "a publisher must hand its application nothing a subscriber sent"
+                );
+            }
         }
     }
 }

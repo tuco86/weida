@@ -1026,7 +1026,7 @@ mod tests {
     /// Claim: at the bound, a blocking queue blocks — and the send completes
     /// as soon as a receive makes room. This is the backpressure PUSH,
     /// DEALER and PAIR apply, and the reason they never discard.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn at_the_bound_a_blocking_queue_waits_for_room() {
         let q = queue(1, MuteAction::Block);
         assert_eq!(q.send(message("first")).await.expect("first"), Sent::Queued);
@@ -1105,7 +1105,7 @@ mod tests {
 
     /// Claim: a receive that finds nothing is `EAGAIN` without waiting, and
     /// the blocking one returns as soon as a message arrives.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_receive_waits_and_dontwait_does_not() {
         let q = queue(DEFAULT_RCVHWM, MuteAction::Block);
         let err = q.try_recv().unwrap_err();
@@ -1183,7 +1183,7 @@ mod tests {
     /// Claim: at the byte ceiling every mute action means what it means at
     /// the message bound — a dropping socket type drops and counts, and a
     /// blocking one waits until a receive frees the bytes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn at_the_byte_ceiling_the_mute_action_still_decides() {
         let dropping = byte_queue(64, MuteAction::Drop);
         dropping.send(message(&"a".repeat(60))).await.expect("kept");
@@ -1409,7 +1409,7 @@ mod tests {
     /// Claim: destroying a peer's pipe discards what it held and unblocks
     /// everyone on it — the pattern RFCs' disconnect rule, and the reason a
     /// send that returned is not a delivery.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_destroyed_pipe_discards_and_unblocks() {
         let q = queue(2, MuteAction::Block);
         q.send(message("one")).await.expect("one");

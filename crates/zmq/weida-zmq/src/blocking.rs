@@ -485,116 +485,119 @@ blocking_recv!(PairSocket);
 mod tests {
     use super::*;
 
-    /// Claim: a caller with no reactor at all runs a request-reply exchange,
-    /// with **each side blocking on its own thread** — which is how every
-    /// libzmq program is written, and is asserted from a plain `#[test]` for
-    /// exactly that reason: no `#[tokio::test]`, no ambient runtime, nothing
-    /// but the context's own reactor threads.
-    ///
-    /// The server serves in a loop and is never joined, which is
-    /// `hwserver.c`'s `while (1)` and is also load-bearing here: a reply is
-    /// **queued** when `send` returns, and a socket dropped before its
-    /// session wrote that queue out takes the reply with it. libzmq answers
-    /// that with `ZMQ_LINGER` on `zmq_close`; this library answers it with a
-    /// finite close budget on the *context* (`DEFAULT_CLOSE_BUDGET`), so a
-    /// socket that is simply let go discards what it had queued. A server
-    /// that outlives its clients has nothing to linger for.
-    #[test]
-    fn a_caller_with_no_reactor_runs_request_reply() {
-        let context = BlockingContext::new().expect("context");
-        let mut responder = RepSocket::new(&context).expect("rep");
-        let bound = responder.bind("tcp://127.0.0.1:0").expect("bind");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        std::thread::spawn(move || {
-            while let Ok(request) = responder.recv() {
-                assert_eq!(request.frames()[0].as_slice(), b"Hello");
-                responder.send(Multipart::single("World")).expect("reply");
+        /// Claim: a caller with no reactor at all runs a request-reply exchange,
+        /// with **each side blocking on its own thread** — which is how every
+        /// libzmq program is written, and is asserted from a plain `#[test]` for
+        /// exactly that reason: no `#[tokio::test]`, no ambient runtime, nothing
+        /// but the context's own reactor threads.
+        ///
+        /// The server serves in a loop and is never joined, which is
+        /// `hwserver.c`'s `while (1)` and is also load-bearing here: a reply is
+        /// **queued** when `send` returns, and a socket dropped before its
+        /// session wrote that queue out takes the reply with it. libzmq answers
+        /// that with `ZMQ_LINGER` on `zmq_close`; this library answers it with a
+        /// finite close budget on the *context* (`DEFAULT_CLOSE_BUDGET`), so a
+        /// socket that is simply let go discards what it had queued. A server
+        /// that outlives its clients has nothing to linger for.
+        #[test]
+        fn a_caller_with_no_reactor_runs_request_reply() {
+            let context = BlockingContext::new().expect("context");
+            let mut responder = RepSocket::new(&context).expect("rep");
+            let bound = responder.bind("tcp://127.0.0.1:0").expect("bind");
+
+            std::thread::spawn(move || {
+                while let Ok(request) = responder.recv() {
+                    assert_eq!(request.frames()[0].as_slice(), b"Hello");
+                    responder.send(Multipart::single("World")).expect("reply");
+                }
+            });
+
+            let mut requester = ReqSocket::new(&context).expect("req");
+            requester.connect(&bound.to_string()).expect("connect");
+            for _ in 0..3 {
+                requester.send(Multipart::single("Hello")).expect("send");
+                let reply = requester
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("a reply");
+                assert_eq!(reply.frames()[0].as_slice(), b"World");
             }
-        });
-
-        let mut requester = ReqSocket::new(&context).expect("req");
-        requester.connect(&bound.to_string()).expect("connect");
-        for _ in 0..3 {
-            requester.send(Multipart::single("Hello")).expect("send");
-            let reply = requester
-                .recv_timeout(Duration::from_secs(10))
-                .expect("a reply");
-            assert_eq!(reply.frames()[0].as_slice(), b"World");
         }
-    }
+        /// Claim: a pipeline works the same way across two blocking threads —
+        /// the facade is not a REQ/REP special case.
+        #[test]
+        fn a_pipeline_crosses_two_blocking_threads() {
+            let context = BlockingContext::new().expect("context");
+            let mut puller = PullSocket::new(&context).expect("pull");
+            let bound = puller.bind("tcp://127.0.0.1:0").expect("bind");
+            let worker = std::thread::spawn(move || {
+                puller
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("a task")
+            });
 
-    /// Claim: a pipeline works the same way across two blocking threads —
-    /// the facade is not a REQ/REP special case.
-    #[test]
-    fn a_pipeline_crosses_two_blocking_threads() {
-        let context = BlockingContext::new().expect("context");
-        let mut puller = PullSocket::new(&context).expect("pull");
-        let bound = puller.bind("tcp://127.0.0.1:0").expect("bind");
-        let worker = std::thread::spawn(move || {
-            puller
-                .recv_timeout(Duration::from_secs(10))
-                .expect("a task")
-        });
+            let mut pusher = PushSocket::new(&context).expect("push");
+            pusher.connect(&bound.to_string()).expect("connect");
+            pusher.send(Multipart::single("work")).expect("send");
+            let task = worker.join().expect("the worker");
+            assert_eq!(task.frames()[0].as_slice(), b"work");
+        }
+        /// Claim: `ZMQ_RCVTIMEO` and `ZMQ_DONTWAIT` are the asynchronous
+        /// socket's, passed down rather than re-decided here — a bounded receive
+        /// on a socket with no peer gives `EAGAIN`, and so does the
+        /// `ZMQ_DONTWAIT` form, which never touches the reactor at all.
+        #[test]
+        fn the_timeouts_are_the_options_and_not_a_second_policy() {
+            let context = BlockingContext::new().expect("context");
+            let options = SocketOptions {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..SocketOptions::default()
+            };
+            let mut puller = PullSocket::with_options(&context, options).expect("pull");
+            puller.bind("tcp://127.0.0.1:0").expect("bind");
 
-        let mut pusher = PushSocket::new(&context).expect("push");
-        pusher.connect(&bound.to_string()).expect("connect");
-        pusher.send(Multipart::single("work")).expect("send");
-        let task = worker.join().expect("the worker");
-        assert_eq!(task.frames()[0].as_slice(), b"work");
-    }
+            let started = std::time::Instant::now();
+            let err = puller.recv().unwrap_err();
+            assert_eq!(err.errno(), "EAGAIN", "{err}");
+            assert!(
+                started.elapsed() >= Duration::from_millis(50),
+                "the option's own bound was waited out"
+            );
 
-    /// Claim: `ZMQ_RCVTIMEO` and `ZMQ_DONTWAIT` are the asynchronous
-    /// socket's, passed down rather than re-decided here — a bounded receive
-    /// on a socket with no peer gives `EAGAIN`, and so does the
-    /// `ZMQ_DONTWAIT` form, which never touches the reactor at all.
-    #[test]
-    fn the_timeouts_are_the_options_and_not_a_second_policy() {
-        let context = BlockingContext::new().expect("context");
-        let options = SocketOptions {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..SocketOptions::default()
-        };
-        let mut puller = PullSocket::with_options(&context, options).expect("pull");
-        puller.bind("tcp://127.0.0.1:0").expect("bind");
+            let err = puller.try_recv().unwrap_err();
+            assert_eq!(err.errno(), "EAGAIN", "{err}");
 
-        let started = std::time::Instant::now();
-        let err = puller.recv().unwrap_err();
-        assert_eq!(err.errno(), "EAGAIN", "{err}");
-        assert!(
-            started.elapsed() >= Duration::from_millis(50),
-            "the option's own bound was waited out"
-        );
+            let err = puller.recv_timeout(Duration::from_millis(10)).unwrap_err();
+            assert_eq!(err.errno(), "EAGAIN", "{err}");
+        }
+        /// Claim: the socket underneath is reachable, so nothing pattern-specific
+        /// had to be wrapped — a SUB subscribes through it and then receives
+        /// through the facade.
+        #[test]
+        fn pattern_specific_calls_stay_on_the_socket_underneath() {
+            let context = BlockingContext::new().expect("context");
+            let mut publisher = PubSocket::new(&context).expect("pub");
+            let bound = publisher.bind("tcp://127.0.0.1:0").expect("bind");
+            let mut subscriber = SubSocket::new(&context).expect("sub");
+            subscriber.connect(&bound.to_string()).expect("connect");
+            // `subscribe` is synchronous on the asynchronous socket, so the
+            // facade does not wrap it.
+            subscriber.socket().subscribe("px").expect("subscribe");
 
-        let err = puller.try_recv().unwrap_err();
-        assert_eq!(err.errno(), "EAGAIN", "{err}");
-
-        let err = puller.recv_timeout(Duration::from_millis(10)).unwrap_err();
-        assert_eq!(err.errno(), "EAGAIN", "{err}");
-    }
-
-    /// Claim: the socket underneath is reachable, so nothing pattern-specific
-    /// had to be wrapped — a SUB subscribes through it and then receives
-    /// through the facade.
-    #[test]
-    fn pattern_specific_calls_stay_on_the_socket_underneath() {
-        let context = BlockingContext::new().expect("context");
-        let mut publisher = PubSocket::new(&context).expect("pub");
-        let bound = publisher.bind("tcp://127.0.0.1:0").expect("bind");
-        let mut subscriber = SubSocket::new(&context).expect("sub");
-        subscriber.connect(&bound.to_string()).expect("connect");
-        // `subscribe` is synchronous on the asynchronous socket, so the
-        // facade does not wrap it.
-        subscriber.socket().subscribe("px").expect("subscribe");
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let delivered = loop {
-            publisher.publish(Multipart::single("px.eur 1.09"));
-            if let Ok(message) = subscriber.try_recv() {
-                break message;
-            }
-            assert!(std::time::Instant::now() < deadline, "nothing arrived");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(delivered.frames()[0].as_slice(), b"px.eur 1.09");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let delivered = loop {
+                publisher.publish(Multipart::single("px.eur 1.09"));
+                if let Ok(message) = subscriber.try_recv() {
+                    break message;
+                }
+                assert!(std::time::Instant::now() < deadline, "nothing arrived");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(delivered.frames()[0].as_slice(), b"px.eur 1.09");
+        }
     }
 }

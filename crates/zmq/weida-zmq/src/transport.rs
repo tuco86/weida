@@ -287,84 +287,6 @@ mod tests {
         (dialled.expect("connect"), accepted.expect("accept").0)
     }
 
-    /// Claim: **`ZMQ_TCP_KEEPALIVE` is applied as libzmq applies it.** `-1`
-    /// leaves `SO_KEEPALIVE` as the operating system has it, whichever way
-    /// that is; `0` switches it off and `1` switches it on.
-    #[tokio::test]
-    async fn the_keepalive_switch_is_applied_as_libzmq_applies_it() {
-        let (tcp, _peer) = pair().await;
-        let stream = Stream::tcp(tcp);
-        let socket = || SockRef::from(stream.as_tcp().expect("a TCP stream"));
-        let with = |tcp_keepalive| SocketOptions {
-            tcp_keepalive,
-            ..SocketOptions::default()
-        };
-
-        for before in [false, true] {
-            socket().set_keepalive(before).expect("set");
-            stream.set_keepalive(&with(None)).expect("apply -1");
-            assert_eq!(
-                socket().keepalive().expect("get"),
-                before,
-                "-1 leaves SO_KEEPALIVE as it was"
-            );
-        }
-
-        socket().set_keepalive(true).expect("set");
-        stream.set_keepalive(&with(Some(false))).expect("apply 0");
-        assert!(!socket().keepalive().expect("get"), "0 switches it off");
-
-        stream.set_keepalive(&with(Some(true))).expect("apply 1");
-        assert!(socket().keepalive().expect("get"), "1 switches it on");
-    }
-
-    /// Claim: the three tuning options become the kernel's idle time, probe
-    /// interval and probe count, and one left at `-1` keeps the kernel's own.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn the_keepalive_tuning_reaches_the_kernel() {
-        let (tcp, _peer) = pair().await;
-        let stream = Stream::tcp(tcp);
-        let socket = SockRef::from(stream.as_tcp().expect("a TCP stream"));
-        stream
-            .set_keepalive(&SocketOptions {
-                tcp_keepalive: Some(true),
-                tcp_keepalive_idle: Some(Duration::from_secs(41)),
-                tcp_keepalive_intvl: Some(Duration::from_secs(7)),
-                tcp_keepalive_cnt: Some(5),
-                ..SocketOptions::default()
-            })
-            .expect("apply");
-        assert!(socket.keepalive().expect("get"));
-        assert_eq!(
-            socket.tcp_keepalive_time().expect("idle"),
-            Duration::from_secs(41)
-        );
-        assert_eq!(
-            socket.tcp_keepalive_interval().expect("interval"),
-            Duration::from_secs(7)
-        );
-        assert_eq!(socket.tcp_keepalive_retries().expect("count"), 5);
-
-        let (tcp, _peer) = pair().await;
-        let stream = Stream::tcp(tcp);
-        let socket = SockRef::from(stream.as_tcp().expect("a TCP stream"));
-        let (idle, interval) = (
-            socket.tcp_keepalive_time().expect("idle"),
-            socket.tcp_keepalive_interval().expect("interval"),
-        );
-        stream
-            .set_keepalive(&SocketOptions {
-                tcp_keepalive: Some(true),
-                tcp_keepalive_cnt: Some(3),
-                ..SocketOptions::default()
-            })
-            .expect("apply");
-        assert_eq!(socket.tcp_keepalive_retries().expect("count"), 3);
-        assert_eq!(socket.tcp_keepalive_time().expect("idle"), idle);
-        assert_eq!(socket.tcp_keepalive_interval().expect("interval"), interval);
-    }
-
     /// Claim: a transport with no kernel probe takes the options and does
     /// nothing, as it does for `TCP_NODELAY`.
     #[test]
@@ -376,5 +298,88 @@ mod tests {
                 ..SocketOptions::default()
             })
             .expect("a property that cannot apply is not a failure");
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Claim: **`ZMQ_TCP_KEEPALIVE` is applied as libzmq applies it.** `-1`
+        /// leaves `SO_KEEPALIVE` as the operating system has it, whichever way
+        /// that is; `0` switches it off and `1` switches it on.
+        #[tokio::test]
+        async fn the_keepalive_switch_is_applied_as_libzmq_applies_it() {
+            let (tcp, _peer) = pair().await;
+            let stream = Stream::tcp(tcp);
+            let socket = || SockRef::from(stream.as_tcp().expect("a TCP stream"));
+            let with = |tcp_keepalive| SocketOptions {
+                tcp_keepalive,
+                ..SocketOptions::default()
+            };
+
+            for before in [false, true] {
+                socket().set_keepalive(before).expect("set");
+                stream.set_keepalive(&with(None)).expect("apply -1");
+                assert_eq!(
+                    socket().keepalive().expect("get"),
+                    before,
+                    "-1 leaves SO_KEEPALIVE as it was"
+                );
+            }
+
+            socket().set_keepalive(true).expect("set");
+            stream.set_keepalive(&with(Some(false))).expect("apply 0");
+            assert!(!socket().keepalive().expect("get"), "0 switches it off");
+
+            stream.set_keepalive(&with(Some(true))).expect("apply 1");
+            assert!(socket().keepalive().expect("get"), "1 switches it on");
+        }
+        /// Claim: the three tuning options become the kernel's idle time, probe
+        /// interval and probe count, and one left at `-1` keeps the kernel's own.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn the_keepalive_tuning_reaches_the_kernel() {
+            let (tcp, _peer) = pair().await;
+            let stream = Stream::tcp(tcp);
+            let socket = SockRef::from(stream.as_tcp().expect("a TCP stream"));
+            stream
+                .set_keepalive(&SocketOptions {
+                    tcp_keepalive: Some(true),
+                    tcp_keepalive_idle: Some(Duration::from_secs(41)),
+                    tcp_keepalive_intvl: Some(Duration::from_secs(7)),
+                    tcp_keepalive_cnt: Some(5),
+                    ..SocketOptions::default()
+                })
+                .expect("apply");
+            assert!(socket.keepalive().expect("get"));
+            assert_eq!(
+                socket.tcp_keepalive_time().expect("idle"),
+                Duration::from_secs(41)
+            );
+            assert_eq!(
+                socket.tcp_keepalive_interval().expect("interval"),
+                Duration::from_secs(7)
+            );
+            assert_eq!(socket.tcp_keepalive_retries().expect("count"), 5);
+
+            let (tcp, _peer) = pair().await;
+            let stream = Stream::tcp(tcp);
+            let socket = SockRef::from(stream.as_tcp().expect("a TCP stream"));
+            let (idle, interval) = (
+                socket.tcp_keepalive_time().expect("idle"),
+                socket.tcp_keepalive_interval().expect("interval"),
+            );
+            stream
+                .set_keepalive(&SocketOptions {
+                    tcp_keepalive: Some(true),
+                    tcp_keepalive_cnt: Some(3),
+                    ..SocketOptions::default()
+                })
+                .expect("apply");
+            assert_eq!(socket.tcp_keepalive_retries().expect("count"), 3);
+            assert_eq!(socket.tcp_keepalive_time().expect("idle"), idle);
+            assert_eq!(socket.tcp_keepalive_interval().expect("interval"), interval);
+        }
     }
 }

@@ -192,118 +192,122 @@ mod tests {
         }
     }
 
-    /// Claim: PUSH rotates over its workers, so nine tasks and three workers
-    /// are three each — the load balancing the pattern is for. The wait for
-    /// all three to arrive is the pattern's own slow joiner, not a fudge:
-    /// "the accurate rotation of messages only happens when all PULL sockets
-    /// are successfully connected".
-    #[tokio::test]
-    async fn push_round_robins_over_its_workers() {
-        let ctx = context();
-        let mut ventilator = PushSocket::new(&ctx).expect("push");
-        let endpoint = ventilator.bind("tcp://127.0.0.1:0").await.expect("bind");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let mut workers = Vec::new();
-        for _ in 0..3 {
-            let worker = PullSocket::new(&ctx).expect("pull");
-            worker.connect(&endpoint.to_string()).expect("connect");
-            workers.push(worker);
-        }
-        wait_for(|| ventilator.peer_count() == 3).await;
+        /// Claim: PUSH rotates over its workers, so nine tasks and three workers
+        /// are three each — the load balancing the pattern is for. The wait for
+        /// all three to arrive is the pattern's own slow joiner, not a fudge:
+        /// "the accurate rotation of messages only happens when all PULL sockets
+        /// are successfully connected".
+        #[tokio::test]
+        async fn push_round_robins_over_its_workers() {
+            let ctx = context();
+            let mut ventilator = PushSocket::new(&ctx).expect("push");
+            let endpoint = ventilator.bind("tcp://127.0.0.1:0").await.expect("bind");
 
-        for n in 0..9 {
-            ventilator.send(format!("task {n}")).await.expect("send");
-        }
-
-        for worker in &mut workers {
-            let mut taken = Vec::new();
+            let mut workers = Vec::new();
             for _ in 0..3 {
-                let task = tokio::time::timeout(Duration::from_secs(10), worker.recv())
-                    .await
-                    .expect("a task arrived")
-                    .expect("task");
-                taken.push(text(&task));
+                let worker = PullSocket::new(&ctx).expect("pull");
+                worker.connect(&endpoint.to_string()).expect("connect");
+                workers.push(worker);
             }
-            assert_eq!(taken.len(), 3, "each worker takes its third: {taken:?}");
+            wait_for(|| ventilator.peer_count() == 3).await;
+
+            for n in 0..9 {
+                ventilator.send(format!("task {n}")).await.expect("send");
+            }
+
+            for worker in &mut workers {
+                let mut taken = Vec::new();
+                for _ in 0..3 {
+                    let task = tokio::time::timeout(Duration::from_secs(10), worker.recv())
+                        .await
+                        .expect("a task arrived")
+                        .expect("task");
+                    taken.push(text(&task));
+                }
+                assert_eq!(taken.len(), 3, "each worker takes its third: {taken:?}");
+            }
         }
-    }
+        /// Claim: with nowhere to send, PUSH **waits** — it does not discard and
+        /// it does not error. The task goes out when a worker appears, which is
+        /// 30/PIPELINE's "block or error when none" and "never discard" in one.
+        #[tokio::test]
+        async fn push_blocks_rather_than_discarding_when_there_is_no_worker() {
+            let ctx = context();
+            let mut ventilator = PushSocket::new(&ctx).expect("push");
+            let endpoint = ventilator.bind("tcp://127.0.0.1:0").await.expect("bind");
+            assert_eq!(ventilator.peer_count(), 0);
 
-    /// Claim: with nowhere to send, PUSH **waits** — it does not discard and
-    /// it does not error. The task goes out when a worker appears, which is
-    /// 30/PIPELINE's "block or error when none" and "never discard" in one.
-    #[tokio::test]
-    async fn push_blocks_rather_than_discarding_when_there_is_no_worker() {
-        let ctx = context();
-        let mut ventilator = PushSocket::new(&ctx).expect("push");
-        let endpoint = ventilator.bind("tcp://127.0.0.1:0").await.expect("bind");
-        assert_eq!(ventilator.peer_count(), 0);
+            let sending = tokio::spawn(async move {
+                ventilator.send("work").await.expect("send");
+                ventilator
+            });
 
-        let sending = tokio::spawn(async move {
-            ventilator.send("work").await.expect("send");
-            ventilator
-        });
+            // Margin: 50 ms for a send that must *not* complete; a send that
+            // wrongly dropped the task would have returned in microseconds.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!sending.is_finished(), "a PUSH with no worker must wait");
 
-        // Margin: 50 ms for a send that must *not* complete; a send that
-        // wrongly dropped the task would have returned in microseconds.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!sending.is_finished(), "a PUSH with no worker must wait");
-
-        let mut worker = PullSocket::new(&ctx).expect("pull");
-        worker.connect(&endpoint.to_string()).expect("connect");
-        let task = tokio::time::timeout(Duration::from_secs(10), worker.recv())
-            .await
-            .expect("the task survived the wait")
-            .expect("task");
-        assert_eq!(text(&task), "work");
-        let ventilator = sending.await.expect("the sender completed");
-        assert_eq!(ventilator.peer_count(), 1);
-    }
-
-    /// Claim: PULL fair-queues, so one busy sender cannot starve another —
-    /// the first two messages come from two different senders even though
-    /// each has a queue full of its own.
-    #[tokio::test]
-    async fn pull_fair_queues_its_peers() {
-        let ctx = context();
-        let mut sink = PullSocket::new(&ctx).expect("pull");
-        let endpoint = sink.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut first = PushSocket::new(&ctx).expect("push one");
-        let mut second = PushSocket::new(&ctx).expect("push two");
-        first.connect(&endpoint.to_string()).expect("connect one");
-        second.connect(&endpoint.to_string()).expect("connect two");
-        wait_for(|| sink.peer_count() == 2).await;
-
-        for n in 0..3 {
-            first.send(format!("a{n}")).await.expect("send");
-            second.send(format!("b{n}")).await.expect("send");
+            let mut worker = PullSocket::new(&ctx).expect("pull");
+            worker.connect(&endpoint.to_string()).expect("connect");
+            let task = tokio::time::timeout(Duration::from_secs(10), worker.recv())
+                .await
+                .expect("the task survived the wait")
+                .expect("task");
+            assert_eq!(text(&task), "work");
+            let ventilator = sending.await.expect("the sender completed");
+            assert_eq!(ventilator.peer_count(), 1);
         }
-        // Both senders' queues are full before the sink reads, so the order
-        // is the sink's rotation rather than the network's.
-        wait_for(|| {
-            sink.core
-                .engine()
-                .peers()
-                .iter()
-                .all(|peer| !peer.pipe.incoming().is_empty())
-        })
-        .await;
+        /// Claim: PULL fair-queues, so one busy sender cannot starve another —
+        /// the first two messages come from two different senders even though
+        /// each has a queue full of its own.
+        #[tokio::test]
+        async fn pull_fair_queues_its_peers() {
+            let ctx = context();
+            let mut sink = PullSocket::new(&ctx).expect("pull");
+            let endpoint = sink.bind("tcp://127.0.0.1:0").await.expect("bind");
 
-        let first_two = [
-            text(&sink.recv().await.expect("one")),
-            text(&sink.recv().await.expect("two")),
-        ];
-        assert_ne!(
-            first_two[0].as_bytes()[0],
-            first_two[1].as_bytes()[0],
-            "fair-queueing must alternate rather than drain one peer: {first_two:?}"
-        );
+            let mut first = PushSocket::new(&ctx).expect("push one");
+            let mut second = PushSocket::new(&ctx).expect("push two");
+            first.connect(&endpoint.to_string()).expect("connect one");
+            second.connect(&endpoint.to_string()).expect("connect two");
+            wait_for(|| sink.peer_count() == 2).await;
 
-        let mut all = first_two.to_vec();
-        for _ in 0..4 {
-            all.push(text(&sink.recv().await.expect("rest")));
+            for n in 0..3 {
+                first.send(format!("a{n}")).await.expect("send");
+                second.send(format!("b{n}")).await.expect("send");
+            }
+            // Both senders' queues are full before the sink reads, so the order
+            // is the sink's rotation rather than the network's.
+            wait_for(|| {
+                sink.core
+                    .engine()
+                    .peers()
+                    .iter()
+                    .all(|peer| !peer.pipe.incoming().is_empty())
+            })
+            .await;
+
+            let first_two = [
+                text(&sink.recv().await.expect("one")),
+                text(&sink.recv().await.expect("two")),
+            ];
+            assert_ne!(
+                first_two[0].as_bytes()[0],
+                first_two[1].as_bytes()[0],
+                "fair-queueing must alternate rather than drain one peer: {first_two:?}"
+            );
+
+            let mut all = first_two.to_vec();
+            for _ in 0..4 {
+                all.push(text(&sink.recv().await.expect("rest")));
+            }
+            all.sort();
+            assert_eq!(all, vec!["a0", "a1", "a2", "b0", "b1", "b2"]);
         }
-        all.sort();
-        assert_eq!(all, vec!["a0", "a1", "a2", "b0", "b1", "b2"]);
     }
 }

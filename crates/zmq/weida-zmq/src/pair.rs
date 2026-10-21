@@ -162,120 +162,123 @@ mod tests {
         }
     }
 
-    /// Claim: the pair talks both ways with no envelope and no state — and
-    /// only the two of them.
-    #[tokio::test]
-    async fn a_pair_talks_both_ways() {
-        let ctx = context();
-        let mut bound = PairSocket::new(&ctx).expect("pair");
-        let endpoint = bound.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut dialled = PairSocket::new(&ctx).expect("pair");
-        dialled.connect(&endpoint.to_string()).expect("connect");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        dialled.send("hello").await.expect("send");
-        assert_eq!(text(&bound.recv().await.expect("recv")), "hello");
-        bound.send("hello back").await.expect("send");
-        assert_eq!(text(&dialled.recv().await.expect("recv")), "hello back");
+        /// Claim: the pair talks both ways with no envelope and no state — and
+        /// only the two of them.
+        #[tokio::test]
+        async fn a_pair_talks_both_ways() {
+            let ctx = context();
+            let mut bound = PairSocket::new(&ctx).expect("pair");
+            let endpoint = bound.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut dialled = PairSocket::new(&ctx).expect("pair");
+            dialled.connect(&endpoint.to_string()).expect("connect");
 
-        // Both directions again, unrestricted: PAIR has no alternation.
-        dialled.send("one").await.expect("send");
-        dialled.send("two").await.expect("send");
-        assert_eq!(text(&bound.recv().await.expect("recv")), "one");
-        assert_eq!(text(&bound.recv().await.expect("recv")), "two");
-    }
+            dialled.send("hello").await.expect("send");
+            assert_eq!(text(&bound.recv().await.expect("recv")), "hello");
+            bound.send("hello back").await.expect("send");
+            assert_eq!(text(&dialled.recv().await.expect("recv")), "hello back");
 
-    /// Claim: while one peer is live, a further incoming connection is
-    /// **terminated** — `zmq_socket(3)`'s own warning, and the reason PAIR is
-    /// unsuitable for TCP in most cases. The interloper reads EOF and the
-    /// live pair keeps working.
-    #[tokio::test]
-    async fn a_second_incoming_connection_is_terminated() {
-        let ctx = context();
-        let mut bound = PairSocket::new(&ctx).expect("pair");
-        let endpoint = bound.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut dialled = PairSocket::new(&ctx).expect("pair");
-        dialled.connect(&endpoint.to_string()).expect("connect");
-        dialled.send("mine").await.expect("send");
-        assert_eq!(text(&bound.recv().await.expect("recv")), "mine");
+            // Both directions again, unrestricted: PAIR has no alternation.
+            dialled.send("one").await.expect("send");
+            dialled.send("two").await.expect("send");
+            assert_eq!(text(&bound.recv().await.expect("recv")), "one");
+            assert_eq!(text(&bound.recv().await.expect("recv")), "two");
+        }
+        /// Claim: while one peer is live, a further incoming connection is
+        /// **terminated** — `zmq_socket(3)`'s own warning, and the reason PAIR is
+        /// unsuitable for TCP in most cases. The interloper reads EOF and the
+        /// live pair keeps working.
+        #[tokio::test]
+        async fn a_second_incoming_connection_is_terminated() {
+            let ctx = context();
+            let mut bound = PairSocket::new(&ctx).expect("pair");
+            let endpoint = bound.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut dialled = PairSocket::new(&ctx).expect("pair");
+            dialled.connect(&endpoint.to_string()).expect("connect");
+            dialled.send("mine").await.expect("send");
+            assert_eq!(text(&bound.recv().await.expect("recv")), "mine");
 
-        let addr: std::net::SocketAddr = endpoint.to_string()["tcp://".len()..]
-            .parse()
-            .expect("addr");
-        let mut interloper = TcpStream::connect(addr).await.expect("connect");
-        let mut byte = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(5), interloper.read(&mut byte))
-            .await
-            .expect("the second connection was not left hanging")
-            .expect("read");
-        assert_eq!(read, 0, "a second peer must be terminated, not served");
+            let addr: std::net::SocketAddr = endpoint.to_string()["tcp://".len()..]
+                .parse()
+                .expect("addr");
+            let mut interloper = TcpStream::connect(addr).await.expect("connect");
+            let mut byte = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(5), interloper.read(&mut byte))
+                .await
+                .expect("the second connection was not left hanging")
+                .expect("read");
+            assert_eq!(read, 0, "a second peer must be terminated, not served");
 
-        // And the established pair is untouched.
-        assert!(bound.has_peer());
-        dialled.send("still here").await.expect("send");
-        assert_eq!(text(&bound.recv().await.expect("recv")), "still here");
-    }
+            // And the established pair is untouched.
+            assert!(bound.has_peer());
+            dialled.send("still here").await.expect("send");
+            assert_eq!(text(&bound.recv().await.expect("recv")), "still here");
+        }
+        /// Claim: PAIR does not auto-reconnect. When the peer goes away the
+        /// socket stays without one, and no further connect attempt is made —
+        /// the property `zmq_socket(3)` names, and the one that keeps a PAIR from
+        /// silently acquiring a *different* peer.
+        #[tokio::test]
+        async fn a_pair_does_not_auto_reconnect() {
+            let ctx = context();
+            let mut bound = PairSocket::new(&ctx).expect("pair");
+            let endpoint = bound.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut dialled = PairSocket::new(&ctx).expect("pair");
+            dialled.connect(&endpoint.to_string()).expect("connect");
+            dialled.send("hello").await.expect("send");
+            assert_eq!(text(&bound.recv().await.expect("recv")), "hello");
+            assert_eq!(dialled.core.options().reconnect_ivl, None);
 
-    /// Claim: PAIR does not auto-reconnect. When the peer goes away the
-    /// socket stays without one, and no further connect attempt is made —
-    /// the property `zmq_socket(3)` names, and the one that keeps a PAIR from
-    /// silently acquiring a *different* peer.
-    #[tokio::test]
-    async fn a_pair_does_not_auto_reconnect() {
-        let ctx = context();
-        let mut bound = PairSocket::new(&ctx).expect("pair");
-        let endpoint = bound.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut dialled = PairSocket::new(&ctx).expect("pair");
-        dialled.connect(&endpoint.to_string()).expect("connect");
-        dialled.send("hello").await.expect("send");
-        assert_eq!(text(&bound.recv().await.expect("recv")), "hello");
-        assert_eq!(dialled.core.options().reconnect_ivl, None);
+            // The bound end goes away entirely.
+            bound.close();
+            drop(bound);
+            wait_for(|| !dialled.has_peer()).await;
 
-        // The bound end goes away entirely.
-        bound.close();
-        drop(bound);
-        wait_for(|| !dialled.has_peer()).await;
+            // One attempt was made and no more: a reconnecting socket would be
+            // climbing here. Margin: 100 ms against a 100 ms default reconnect
+            // interval, so a socket that did reconnect would have tried at least
+            // once inside it.
+            let attempts = dialled
+                .core
+                .engine()
+                .peers()
+                .first()
+                .map(|peer| peer.attempts);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let later = dialled
+                .core
+                .engine()
+                .peers()
+                .first()
+                .map(|peer| peer.attempts);
+            assert_eq!(attempts, later, "a PAIR must not try again");
+        }
+        /// Claim: one peer means one endpoint — a second `connect` is refused
+        /// rather than quietly interleaving two peers, and a `disconnect` makes
+        /// the socket usable again.
+        #[tokio::test]
+        async fn a_pair_has_at_most_one_endpoint() {
+            let ctx = context();
+            let listener = PairSocket::new(&ctx).expect("pair");
+            let endpoint = listener.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let second = PairSocket::new(&ctx).expect("pair");
+            let elsewhere = second.bind("tcp://127.0.0.1:0").await.expect("bind");
 
-        // One attempt was made and no more: a reconnecting socket would be
-        // climbing here. Margin: 100 ms against a 100 ms default reconnect
-        // interval, so a socket that did reconnect would have tried at least
-        // once inside it.
-        let attempts = dialled
-            .core
-            .engine()
-            .peers()
-            .first()
-            .map(|peer| peer.attempts);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let later = dialled
-            .core
-            .engine()
-            .peers()
-            .first()
-            .map(|peer| peer.attempts);
-        assert_eq!(attempts, later, "a PAIR must not try again");
-    }
+            let dialled = PairSocket::new(&ctx).expect("pair");
+            dialled.connect(&endpoint.to_string()).expect("first");
+            let err = dialled.connect(&elsewhere.to_string()).unwrap_err();
+            assert_eq!(err.errno(), "EINVAL", "{err}");
 
-    /// Claim: one peer means one endpoint — a second `connect` is refused
-    /// rather than quietly interleaving two peers, and a `disconnect` makes
-    /// the socket usable again.
-    #[tokio::test]
-    async fn a_pair_has_at_most_one_endpoint() {
-        let ctx = context();
-        let listener = PairSocket::new(&ctx).expect("pair");
-        let endpoint = listener.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let second = PairSocket::new(&ctx).expect("pair");
-        let elsewhere = second.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let dialled = PairSocket::new(&ctx).expect("pair");
-        dialled.connect(&endpoint.to_string()).expect("first");
-        let err = dialled.connect(&elsewhere.to_string()).unwrap_err();
-        assert_eq!(err.errno(), "EINVAL", "{err}");
-
-        dialled
-            .disconnect(&endpoint.to_string())
-            .expect("disconnect");
-        dialled
-            .connect(&elsewhere.to_string())
-            .expect("after disconnecting, one endpoint is free again");
+            dialled
+                .disconnect(&endpoint.to_string())
+                .expect("disconnect");
+            dialled
+                .connect(&elsewhere.to_string())
+                .expect("after disconnecting, one endpoint is free again");
+        }
     }
 }

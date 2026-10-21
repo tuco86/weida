@@ -5,14 +5,22 @@
 mod common;
 
 mod inproc;
-mod interop_libzmq;
-mod interop_zmqrs;
 mod ipc;
 mod plain_zap;
-mod router_identity;
-mod split;
-mod thread_rule;
 mod wakeups;
 mod zguide_clone;
-mod zguide_majordomo;
-mod zguide_pirates;
+
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    mod interop_libzmq;
+    mod interop_zmqrs;
+    mod ipc;
+    mod plain_zap;
+    mod router_identity;
+    mod split;
+    mod thread_rule;
+    mod zguide_clone;
+    mod zguide_majordomo;
+    mod zguide_pirates;
+}

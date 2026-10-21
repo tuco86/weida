@@ -2250,717 +2250,6 @@ mod tests {
         (asked, task)
     }
 
-    /// Claim: a PLAIN client's handshake is 24/ZMTP-PLAIN's — a greeting
-    /// naming PLAIN with `as-server` clear, `HELLO` carrying the username
-    /// and password, `INITIATE` carrying the metadata `READY` would have
-    /// carried under NULL, and nothing sent before the server's `WELCOME`.
-    #[tokio::test]
-    async fn a_plain_client_sends_hello_then_initiate() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Req,
-            SocketOptions {
-                plain_username: Some("admin".to_owned()),
-                plain_password: Some("secret".to_owned()),
-                ..options()
-            },
-            Role::Connecter,
-            &context(),
-        );
-
-        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
-        assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::PLAIN);
-        assert!(!greeting.as_server, "a client's as-server octet is zero");
-        peer.greet_as(weida_zmtp::Mechanism::PLAIN, true).await;
-
-        let (name, body) = peer.read_command_name().await;
-        assert_eq!(name, "HELLO");
-        assert_eq!(
-            Command::decode(&body).expect("HELLO"),
-            Command::Hello {
-                username: b"admin",
-                password: b"secret",
-            }
-        );
-
-        peer.command(Command::Welcome).await;
-        let (name, body) = peer.read_command_name().await;
-        assert_eq!(name, "INITIATE", "the metadata travels in INITIATE");
-        let Command::Initiate(metadata) = Command::decode(&body).expect("INITIATE") else {
-            panic!("expected INITIATE");
-        };
-        assert_eq!(metadata.socket_type(), Some(SocketType::Req));
-
-        peer.ready(SocketType::Rep).await;
-        drop(peer);
-        let _ = task.await;
-    }
-
-    /// Claim: a PLAIN server asks the ZAP handler about the credentials it
-    /// was given, sends `WELCOME` on a 200, and records the user id the
-    /// handler named — a per-connection fact, not an identity.
-    #[tokio::test]
-    async fn a_plain_server_asks_the_handler_and_keeps_its_answer() {
-        let context = context();
-        let (_asked, handler) = zap_handler(&context, |request| {
-            assert_eq!(request.mechanism, "PLAIN");
-            assert_eq!(request.domain, "test");
-            assert_eq!(request.address, "127.0.0.1");
-            let (username, password) = request.plain_credentials().expect("PLAIN credentials");
-            assert_eq!(username, b"admin");
-            assert_eq!(password, b"secret");
-            ZapReply::allowed(request.request_id, "operator")
-        })
-        .await;
-
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, user, task) = drive_session(
-            ours,
-            SocketType::Rep,
-            SocketOptions {
-                plain_server: true,
-                zap_domain: "test".to_owned(),
-                ..options()
-            },
-            Role::Binder,
-            &context,
-        );
-
-        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
-        assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::PLAIN);
-        assert!(greeting.as_server, "a server's as-server octet is one");
-        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
-
-        peer.command(Command::Hello {
-            username: b"admin",
-            password: b"secret",
-        })
-        .await;
-        let (name, _) = peer.read_command_name().await;
-        assert_eq!(name, "WELCOME", "a 200 is a WELCOME");
-
-        peer.command(Command::Initiate(
-            Metadata::new().with_socket_type(SocketType::Req),
-        ))
-        .await;
-        let (name, _) = peer.read_command_name().await;
-        assert_eq!(name, "READY");
-
-        let recorded = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(id) = user.get() {
-                    return id;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the user id was recorded");
-        assert_eq!(recorded.as_str(), "operator");
-
-        drop(peer);
-        let _ = task.await;
-        handler.abort();
-    }
-
-    /// Claim: a 400 refuses the connection **before any message flows** —
-    /// the server answers `ERROR` with the handler's text instead of
-    /// `WELCOME`, and the session ends with `EACCES`.
-    #[tokio::test]
-    async fn a_four_hundred_refuses_before_any_message() {
-        let context = context();
-        let (_asked, handler) = zap_handler(&context, |request| {
-            ZapReply::refused(
-                request.request_id,
-                ZapStatus::AuthenticationFailure,
-                "unknown user",
-            )
-        })
-        .await;
-
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, user, task) = drive_session(
-            ours,
-            SocketType::Rep,
-            SocketOptions {
-                plain_server: true,
-                zap_domain: "test".to_owned(),
-                ..options()
-            },
-            Role::Binder,
-            &context,
-        );
-
-        peer.read_greeting().await;
-        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
-        peer.command(Command::Hello {
-            username: b"nobody",
-            password: b"guess",
-        })
-        .await;
-
-        let (name, body) = peer.read_command_name().await;
-        assert_eq!(name, "ERROR", "a refusal is an ERROR, not a WELCOME");
-        let Command::Error(reason) = Command::decode(&body).expect("ERROR") else {
-            panic!("expected ERROR");
-        };
-        assert!(reason.contains("400"), "{reason}");
-
-        let outcome = task.await.expect("the session task");
-        let err = outcome.unwrap_err();
-        assert_eq!(err.errno(), "EACCES", "{err}");
-        assert!(
-            err.cause().contains("unknown user"),
-            "the handler's reason must survive: {err}"
-        );
-        assert_eq!(user.get(), None, "nothing was authorized");
-        handler.abort();
-    }
-
-    /// Claim: a server that must authorize and finds no handler refuses the
-    /// connection instead of admitting one nobody checked — 27/ZAP's "the
-    /// handler SHALL start before any server starts", enforced where it can
-    /// be.
-    #[tokio::test]
-    async fn a_server_without_a_handler_admits_nobody() {
-        let context = context();
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Rep,
-            SocketOptions {
-                plain_server: true,
-                zap_domain: "test".to_owned(),
-                ..options()
-            },
-            Role::Binder,
-            &context,
-        );
-
-        peer.read_greeting().await;
-        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
-        peer.command(Command::Hello {
-            username: b"admin",
-            password: b"secret",
-        })
-        .await;
-
-        let (name, _) = peer.read_command_name().await;
-        assert_eq!(name, "ERROR");
-        let err = task.await.expect("the session task").unwrap_err();
-        assert_eq!(err.errno(), "ENOTSOCK", "{err}");
-        assert!(err.cause().contains("zeromq.zap.01"), "{err}");
-    }
-
-    /// Claim: NULL authorizes too when a domain is configured — "NULL
-    /// provides no security credentials but allows a server to filter bogus
-    /// clients on the basis of IP address" — and the handler is told the
-    /// address and the identity the peer announced, with no credential
-    /// frames.
-    #[tokio::test]
-    async fn null_with_a_domain_asks_the_handler_about_the_address() {
-        let context = context();
-        let (asked, handler) = zap_handler(&context, |request| {
-            ZapReply::allowed(request.request_id, "by-address")
-        })
-        .await;
-
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, user, task) = drive_session(
-            ours,
-            SocketType::Rep,
-            SocketOptions {
-                zap_domain: "global".to_owned(),
-                ..options()
-            },
-            Role::Binder,
-            &context,
-        );
-
-        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
-        assert_eq!(
-            greeting.mechanism,
-            weida_zmtp::Mechanism::NULL,
-            "a domain does not change the mechanism"
-        );
-        peer.greet(greeting::VERSION).await;
-        peer.read_command_name().await;
-        let ready = Command::Ready(
-            Metadata::new()
-                .with_socket_type(SocketType::Req)
-                .with("Identity", b"client-9"),
-        )
-        .encode()
-        .expect("READY");
-        peer.send(&ready).await;
-
-        let recorded = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(id) = user.get() {
-                    return id;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the user id was recorded");
-        assert_eq!(recorded.as_str(), "by-address");
-
-        let request = asked
-            .lock()
-            .expect("asked")
-            .first()
-            .cloned()
-            .expect("one request");
-        assert_eq!(request.mechanism, "NULL");
-        assert!(
-            request.credentials.is_empty(),
-            "NULL has no credentials to send"
-        );
-        assert_eq!(request.address, "127.0.0.1");
-        assert_eq!(request.identity, b"client-9".to_vec());
-        assert_eq!(request.domain, "global");
-
-        drop(peer);
-        let _ = task.await;
-        handler.abort();
-    }
-
-    /// Claim: without a domain, NULL does not authorize at all — libzmq's
-    /// "when the ZAP domain is empty, which is the default, ZAP
-    /// authentication is disabled" — so a handler that would refuse
-    /// everything is never asked.
-    #[tokio::test]
-    async fn null_without_a_domain_does_not_authorize() {
-        let context = context();
-        let (asked, handler) = zap_handler(&context, |request| {
-            ZapReply::refused(
-                request.request_id,
-                ZapStatus::AuthenticationFailure,
-                "would refuse",
-            )
-        })
-        .await;
-
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (pipe, user, task) =
-            drive_session(ours, SocketType::Pull, options(), Role::Binder, &context);
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_command_name().await;
-        peer.ready(SocketType::Push).await;
-
-        // The handshake completed and a message flows, which it could not
-        // have done if the refusing handler had been consulted.
-        let message = Multipart::single(Message::from("work")).encode();
-        peer.send(&message).await;
-        let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
-            .await
-            .expect("the message arrived")
-            .expect("a message");
-        assert_eq!(arrived.frames()[0].as_slice(), b"work");
-        assert_eq!(user.get(), None, "nothing was authorized");
-        assert!(asked.lock().expect("asked").is_empty(), "nobody was asked");
-
-        drop(peer);
-        let _ = task.await;
-        handler.abort();
-    }
-
-    /// Claim: the greeting we send is the specification's 64 octets, exactly
-    /// as the codec encodes them, and our `READY` carries `Socket-Type` and —
-    /// when `ZMQ_ROUTING_ID` is set — `Identity`.
-    #[tokio::test]
-    async fn the_handshake_sends_the_greeting_and_a_ready() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Req,
-            SocketOptions {
-                routing_id: Some(RoutingId::new(b"client-7").expect("id")),
-                ..options()
-            },
-            Role::Connecter,
-            &context(),
-        );
-
-        // Byte-for-byte: what the codec says a NULL 3.1 greeting is.
-        assert_eq!(peer.read_greeting().await, Greeting::null().encode());
-        peer.greet(greeting::VERSION).await;
-
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command);
-        let metadata = match Command::decode(&body).expect("a command") {
-            Command::Ready(metadata) => metadata,
-            other => panic!("expected READY, got {}", other.name()),
-        };
-        assert_eq!(metadata.socket_type(), Some(SocketType::Req));
-        assert_eq!(metadata.get("Identity"), Some(b"client-7".as_slice()));
-
-        peer.ready(SocketType::Rep).await;
-        drop(peer);
-        // The peer's close ends the session, which is not an error worth
-        // asserting beyond its shape.
-        let _ = task.await.expect("the session task");
-    }
-
-    /// Claim: messages cross in both directions, multipart intact, with MORE
-    /// on every frame but the last.
-    #[tokio::test]
-    async fn messages_cross_in_both_directions() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Dealer,
-            options(),
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_frame().await;
-        peer.ready(SocketType::Router).await;
-
-        // Outbound: a two-frame message goes out as MORE then last.
-        let envelope =
-            Multipart::new(vec![Message::empty(), Message::from("hello")]).expect("frames");
-        pipe.outgoing()
-            .send(envelope.clone())
-            .await
-            .expect("queued");
-        let (first, body) = peer.read_frame().await;
-        assert_eq!(first, FrameKind::Message { more: true });
-        assert!(body.is_empty(), "the delimiter frame is empty");
-        let (second, body) = peer.read_frame().await;
-        assert_eq!(second, FrameKind::Message { more: false });
-        assert_eq!(body, b"hello");
-
-        // Inbound: the same shape arrives as one Multipart.
-        peer.send(&envelope.encode()).await;
-        let arrived = tokio::time::timeout(Duration::from_secs(5), pipe.incoming().recv())
-            .await
-            .expect("delivered")
-            .expect("a message");
-        assert_eq!(arrived, envelope);
-
-        drop(peer);
-        let _ = task.await.expect("the session task");
-    }
-
-    /// Claim: a ZMTP 3.0 peer is accepted by downgrading, and **never
-    /// receives a PING** even with the heartbeat configured — the interop
-    /// lesson, where a command a 3.0 peer does not know ends the connection.
-    #[tokio::test]
-    async fn a_three_zero_peer_is_accepted_and_never_pinged() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Push,
-            SocketOptions {
-                heartbeat_ivl: Some(Duration::from_millis(10)),
-                ..options()
-            },
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(Version { major: 3, minor: 0 }).await;
-        let (kind, _) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command, "READY is still a command");
-        peer.ready(SocketType::Pull).await;
-
-        // Margin: fifteen heartbeat intervals (150 ms over a 10 ms
-        // ZMQ_HEARTBEAT_IVL). The phenomenon is a PING that must never come,
-        // so the interval count is the margin: a session that sent one would
-        // have sent fifteen. The message afterwards proves the silence is the
-        // version's doing rather than a stalled session.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        pipe.outgoing()
-            .send(Multipart::single("still alive"))
-            .await
-            .expect("queued");
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(
-            kind,
-            FrameKind::Message { more: false },
-            "a 3.0 peer must receive no PING"
-        );
-        assert_eq!(body, b"still alive");
-
-        drop(peer);
-        let _ = task.await.expect("the session task");
-    }
-
-    /// Claim: a 3.1 peer does get `PING`s on `ZMQ_HEARTBEAT_IVL`, carrying
-    /// the `ZMQ_HEARTBEAT_TTL` hint in deciseconds.
-    ///
-    /// Margin: none is needed in the assertion — the read below waits for
-    /// the PING rather than sampling for it, so a 10 ms interval only sets
-    /// how soon the test finishes, and a heartbeat that never came would
-    /// hang the read until the harness kills it rather than pass.
-    #[tokio::test]
-    async fn a_three_one_peer_is_pinged_on_the_interval() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Push,
-            SocketOptions {
-                heartbeat_ivl: Some(Duration::from_millis(10)),
-                heartbeat_timeout: Some(Duration::from_secs(30)),
-                heartbeat_ttl: Some(Duration::from_secs(3)),
-                ..options()
-            },
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_frame().await;
-        peer.ready(SocketType::Pull).await;
-
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command);
-        match Command::decode(&body).expect("a command") {
-            Command::Ping { ttl, context } => {
-                assert_eq!(ttl, 30, "3 s is 30 deciseconds on the wire");
-                assert_eq!(context, PING_CONTEXT);
-            }
-            other => panic!("expected PING, got {}", other.name()),
-        }
-
-        drop(peer);
-        let _ = task.await.expect("the session task");
-    }
-
-    /// Claim: our session answers a peer's `PING` with a `PONG` that echoes
-    /// the context, whatever else is going on.
-    #[tokio::test]
-    async fn a_ping_is_answered_with_a_pong_that_echoes() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Rep,
-            options(),
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_frame().await;
-        peer.ready(SocketType::Req).await;
-
-        let ping = Command::Ping {
-            ttl: 100,
-            context: b"abcd",
-        }
-        .encode()
-        .expect("PING");
-        peer.send(&ping).await;
-
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command);
-        match Command::decode(&body).expect("a command") {
-            Command::Pong { context } => assert_eq!(context, b"abcd"),
-            other => panic!("expected PONG, got {}", other.name()),
-        }
-
-        drop(peer);
-        let _ = task.await.expect("the session task");
-    }
-
-    /// Claim: an incompatible socket type is refused with an `ERROR` on the
-    /// wire and then a close — the specification's own way of saying no — and
-    /// the session reports `ENOCOMPATPROTO`.
-    #[tokio::test]
-    async fn an_incompatible_socket_type_gets_an_error_then_a_close() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Req,
-            options(),
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_frame().await;
-        // A PUB may not talk to a REQ.
-        peer.ready(SocketType::Pub).await;
-
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command);
-        match Command::decode(&body).expect("a command") {
-            Command::Error(reason) => {
-                assert!(reason.contains("PUB"), "{reason}");
-                assert!(reason.contains("REQ"), "{reason}");
-            }
-            other => panic!("expected ERROR, got {}", other.name()),
-        }
-
-        let err = task.await.expect("the session task").unwrap_err();
-        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
-    }
-
-    /// Claim: a `READY` with no `Socket-Type` is refused, because no
-    /// compatibility check is possible against a peer that will not say what
-    /// it is.
-    #[tokio::test]
-    async fn a_ready_without_a_socket_type_is_refused() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Pull,
-            options(),
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_frame().await;
-        peer.send(&Command::Ready(Metadata::new()).encode().expect("READY"))
-            .await;
-
-        let (_, body) = peer.read_frame().await;
-        assert!(matches!(
-            Command::decode(&body).expect("a command"),
-            Command::Error(_)
-        ));
-        let err = task.await.expect("the session task").unwrap_err();
-        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
-    }
-
-    /// Claim: an `ERROR` from the peer is fatal, at the handshake and after
-    /// it — "the peer SHALL treat an incoming ERROR command as fatal".
-    #[tokio::test]
-    async fn an_error_from_the_peer_is_fatal() {
-        for during_handshake in [true, false] {
-            let (ours, theirs) = pair().await;
-            let mut peer = CodecPeer::new(theirs);
-            let (_pipe, _user, task) = drive_session(
-                ours,
-                SocketType::Pull,
-                options(),
-                Role::Connecter,
-                &context(),
-            );
-
-            peer.read_greeting().await;
-            peer.greet(greeting::VERSION).await;
-            peer.read_frame().await;
-            if !during_handshake {
-                peer.ready(SocketType::Push).await;
-            }
-            peer.send(&Command::Error("go away").encode().expect("ERROR"))
-                .await;
-
-            let err = task.await.expect("the session task").unwrap_err();
-            assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
-            assert!(err.cause().contains("go away"), "{err}");
-        }
-    }
-
-    /// Claim: `ZMQ_MAXMSGSIZE` is enforced on the wire from the declared
-    /// length, so a peer cannot make us allocate by announcing a huge frame.
-    #[tokio::test]
-    async fn an_oversized_declaration_ends_the_connection() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Pull,
-            SocketOptions {
-                max_message_size: 1024,
-                ..options()
-            },
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_frame().await;
-        peer.ready(SocketType::Push).await;
-
-        // A long header declaring 2^31 octets, and no body at all.
-        let mut header = vec![0x02u8];
-        header.extend_from_slice(&(1u64 << 31).to_be_bytes());
-        peer.send(&header).await;
-
-        let err = task.await.expect("the session task").unwrap_err();
-        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
-    }
-
-    /// Claim: the session is the seam the engine expects — an `Engine`
-    /// carrying `ZmtpSession` completes the handshake against a real ZeroMQ
-    /// peer driven by the codec, and messages then flow through the engine's
-    /// pipe.
-    #[tokio::test]
-    async fn the_engine_and_the_session_speak_zmtp_end_to_end() {
-        let ctx = Context::new(ContextConfig::default()).expect("context");
-        let engine = Engine::new(
-            &ctx,
-            options(),
-            Arc::new(ZmtpSession::new(SocketType::Push)) as Arc<dyn Session>,
-        )
-        .expect("engine");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        let peer_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut peer = CodecPeer::new(stream);
-            assert_eq!(peer.read_greeting().await, Greeting::null().encode());
-            peer.greet(greeting::VERSION).await;
-            let (kind, body) = peer.read_frame().await;
-            assert_eq!(kind, FrameKind::Command);
-            match Command::decode(&body).expect("a command") {
-                Command::Ready(metadata) => {
-                    assert_eq!(metadata.socket_type(), Some(SocketType::Push));
-                }
-                other => panic!("expected READY, got {}", other.name()),
-            }
-            peer.ready(SocketType::Pull).await;
-            let (kind, body) = peer.read_frame().await;
-            assert_eq!(kind, FrameKind::Message { more: false });
-            body
-        });
-
-        let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
-        let peer_id = engine.connect(&endpoint).expect("connect");
-        let pipe = engine.peer(peer_id).expect("peer").pipe;
-        pipe.outgoing()
-            .send(Multipart::single("through the engine"))
-            .await
-            .expect("queued");
-
-        let delivered = tokio::time::timeout(Duration::from_secs(10), peer_task)
-            .await
-            .expect("the peer finished")
-            .expect("the peer task");
-        assert_eq!(delivered, b"through the engine");
-    }
-
     /// A CURVE server's options, and the key a client needs to reach it.
     fn curve_server_options(zap_domain: &str) -> (SocketOptions, crate::curve::CurvePublicKey) {
         let (public, secret) = crate::curve::keypair();
@@ -3020,246 +2309,6 @@ mod tests {
         let metadata = Metadata::decode(&metadata_bytes).expect("the server's metadata");
         assert_eq!(metadata.socket_type(), Some(SocketType::Pair));
         client.into_transport().expect("transport")
-    }
-
-    /// Claim: the octets a CURVE server puts on the wire are 26/CURVEZMQ's,
-    /// and nothing after the `READY` is in clear text.
-    ///
-    /// Driven from the other side by this crate's own client half over a raw
-    /// socket, so what is asserted is the wire and not an agreement between
-    /// two copies of the same state machine.
-    #[tokio::test]
-    async fn a_curve_server_seals_everything_after_its_ready() {
-        let context = context();
-        let (server_options, server_key) = curve_server_options("");
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Pair,
-            server_options,
-            Role::Binder,
-            &context,
-        );
-
-        let (public, secret) = crate::curve::keypair();
-        let mut transport = curve_handshake_as_client(&mut peer, server_key, public, &secret).await;
-
-        // Outbound: the message is a `MESSAGE` whose body is a command body
-        // behind a **message** frame header, which is what libzmq sends and
-        // accepts (`tests/interop_libzmq.rs`), and the plaintext is nowhere
-        // in the octets. The outer MORE is always zero: the real one is the
-        // flags octet inside the box.
-        pipe.outgoing()
-            .send(Multipart::single("the quiet part"))
-            .await
-            .expect("queued");
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Message { more: false });
-        assert!(body.starts_with(b"\x07MESSAGE"), "named MESSAGE");
-        assert!(
-            !body.windows(14).any(|window| window == b"the quiet part"),
-            "the payload travelled in clear text"
-        );
-        let (flags, payload) = transport.open_message(&body).expect("open");
-        assert_eq!(flags, 0, "one frame, so no MORE");
-        assert_eq!(payload, b"the quiet part");
-
-        // A multipart message: MORE travels inside the box under CURVE, so a
-        // single frame would not exercise it.
-        let mut multipart = Multipart::single("first");
-        multipart.push("second");
-        pipe.outgoing().send(multipart).await.expect("queued");
-        for (expected_flags, expected_body) in [
-            (curve_layout::MESSAGE_FLAG_MORE, &b"first"[..]),
-            (0, &b"second"[..]),
-        ] {
-            let (kind, body) = peer.read_frame().await;
-            assert_eq!(kind, FrameKind::Message { more: false });
-            let (flags, payload) = transport.open_message(&body).expect("open");
-            assert_eq!(flags, expected_flags);
-            assert_eq!(payload, expected_body);
-        }
-
-        // Inbound: a sealed message reaches the application, and a plaintext
-        // one does not.
-        peer.send(&transport.seal_frame(0, b"the other way").expect("seal"))
-            .await;
-        let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
-            .await
-            .expect("the message arrived")
-            .expect("a message");
-        assert_eq!(arrived.frames()[0].as_slice(), b"the other way");
-
-        // A frame in clear text is refused — not because of its frame kind,
-        // which is the same kind a sealed `MESSAGE` uses, but because its
-        // body is not a `MESSAGE` at all and no box was opened.
-        peer.send(&Multipart::single("in the open").encode()).await;
-        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("the session ended")
-            .expect("the task");
-        let err = outcome.unwrap_err();
-        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
-        assert!(err.cause().contains("CURVE"), "{err}");
-    }
-
-    /// Claim: the CURVE credential a ZAP handler is given is the peer's
-    /// long-term public key — the one that never travelled in clear text —
-    /// and 26/CURVEZMQ's second and third security models are the handler's
-    /// answer to it: an allowed key is admitted, a 200 that names a user is
-    /// kept per connection, and a key that is not in the table is refused
-    /// before any message flows.
-    #[tokio::test]
-    async fn a_curve_server_hands_the_peers_key_to_the_handler() {
-        let context = context();
-        let (server_options, server_key) = curve_server_options("realm");
-        let (allowed_public, allowed_secret) = crate::curve::keypair();
-
-        // Model 3: a table with one entry per client, whose 200 also names
-        // the user that key belongs to. Model 2 is the same handler with one
-        // shared entry, and this one's refusal path is what both do to a key
-        // they do not hold.
-        let allowed = allowed_public;
-        let (asked, handler) = zap_handler(&context, move |request| {
-            assert_eq!(request.mechanism, "CURVE");
-            assert_eq!(request.domain, "realm");
-            let key = crate::curve::CurvePublicKey::parse(&request.credentials[0])
-                .expect("a 32-octet key");
-            if key == allowed {
-                ZapReply::allowed(request.request_id, "client-a")
-            } else {
-                ZapReply::refused(
-                    request.request_id,
-                    ZapStatus::AuthenticationFailure,
-                    "not on the list",
-                )
-            }
-        })
-        .await;
-
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (pipe, user, task) = drive_session(
-            ours,
-            SocketType::Pair,
-            server_options.clone(),
-            Role::Binder,
-            &context,
-        );
-        let mut transport =
-            curve_handshake_as_client(&mut peer, server_key, allowed_public, &allowed_secret).await;
-
-        peer.send(&transport.seal_frame(0, b"authorized").expect("seal"))
-            .await;
-        let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
-            .await
-            .expect("the message arrived")
-            .expect("a message");
-        assert_eq!(arrived.frames()[0].as_slice(), b"authorized");
-        assert_eq!(
-            user.get().expect("a user id").as_str(),
-            "client-a",
-            "model 3: access granted according to an authenticated identity"
-        );
-        {
-            let asked = asked.lock().expect("asked");
-            assert_eq!(asked.len(), 1);
-            assert_eq!(
-                asked[0].credentials,
-                vec![allowed_public.as_bytes().to_vec()],
-                "one frame, the peer's 32-octet long-term key"
-            );
-        }
-        assert_eq!(
-            crate::curve::security_model(&server_options, &context),
-            Some(crate::curve::SecurityModel::CheckedByHandler)
-        );
-        drop(peer);
-        let _ = task.await;
-
-        // A key the table does not hold: the handshake ends with the
-        // handler's own text, and no message ever flows.
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (pipe, user, task) = drive_session(
-            ours,
-            SocketType::Pair,
-            server_options,
-            Role::Binder,
-            &context,
-        );
-        let (stranger_public, stranger_secret) = crate::curve::keypair();
-        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
-        assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::CURVE);
-        peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
-        let mut client = CurveClient::new(stranger_public, &stranger_secret, server_key);
-        peer.send(&client.hello().expect("HELLO")).await;
-        let (_, body) = peer.read_frame().await;
-        client.read_welcome(&body).expect("read WELCOME");
-        peer.send(&client.initiate(&Metadata::new()).expect("INITIATE"))
-            .await;
-
-        // The refusal is an ERROR carrying the handler's status and text,
-        // sent before the READY that would have completed the handshake.
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command);
-        let Command::Error(reason) = Command::decode(&body).expect("a command") else {
-            panic!("expected an ERROR");
-        };
-        assert!(reason.contains("not on the list"), "{reason}");
-        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("the session ended")
-            .expect("the task");
-        let err = outcome.unwrap_err();
-        assert_eq!(err.errno(), "EACCES", "{err}");
-        assert_eq!(user.get(), None, "a refusal names no user");
-        assert!(
-            pipe.incoming().try_recv().is_err(),
-            "nothing flowed under a refused connection"
-        );
-        handler.abort();
-    }
-
-    /// Claim: a client that does not hold the server's public key cannot get
-    /// past `HELLO`, and is told so rather than left waiting.
-    #[tokio::test]
-    async fn a_curve_client_with_the_wrong_server_key_is_refused() {
-        let context = context();
-        let (server_options, _) = curve_server_options("");
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Pair,
-            server_options,
-            Role::Binder,
-            &context,
-        );
-
-        peer.read_greeting().await;
-        peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
-        // A HELLO whose signature box is sealed to another server's key: the
-        // octets are 26/CURVEZMQ's and the box does not open.
-        let (elsewhere, _) = crate::curve::keypair();
-        let (public, secret) = crate::curve::keypair();
-        let mut client = CurveClient::new(public, &secret, elsewhere);
-        peer.send(&client.hello().expect("HELLO")).await;
-
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command);
-        let Command::Error(reason) = Command::decode(&body).expect("a command") else {
-            panic!("expected an ERROR rather than silence");
-        };
-        assert!(reason.contains("signature box"), "{reason}");
-
-        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("the session ended")
-            .expect("the task");
-        let err = outcome.unwrap_err();
-        assert_eq!(err.errno(), "EACCES", "{err}");
     }
 
     // ---- hostile peers: what a stranger can make this side hold or wait for ----
@@ -3501,51 +2550,9 @@ mod tests {
         );
     }
 
-    /// Claim: **a message that is started and not finished does not hold the
-    /// connection for ever**, whether the heartbeat is on or not (it is off
-    /// here, which is the default): a peer that announces a large message
-    /// and sends a few kilobytes of it ends the connection.
-    #[tokio::test]
-    async fn a_message_that_stops_arriving_ends_the_connection() {
-        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
-        let mut wire =
-            Wire::new(ours, MessageLimits::default()).with_message_ivl(Duration::from_millis(200));
-        let options = options();
-        let pipe = Pipe::new(options.pipe);
-        let subscriptions = Arc::new(Subscriptions::new(
-            crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
-            crate::subscriptions::DEFAULT_MAX_SUBSCRIPTION_BYTES,
-        ));
-        let exec = Exec::current().expect("ambient reactor");
-
-        let mut head = vec![0x02u8];
-        head.extend_from_slice(&(900u64 * 1024).to_be_bytes());
-        head.extend_from_slice(&[0u8; 2048]);
-        theirs.write_all(&head).await.expect("write");
-
-        let started = std::time::Instant::now();
-        let outcome = within(pump(
-            &mut wire,
-            SocketType::Pull,
-            &subscriptions,
-            &pipe,
-            &options,
-            &exec,
-            greeting::VERSION,
-        ))
-        .await;
-        let err = outcome.unwrap_err();
-        assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "it took {:?}",
-            started.elapsed()
-        );
-    }
-
     /// Claim: the allowance is bought by octets that arrive, so a message
     /// that keeps arriving — slowly, but steadily — is never overdue.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_message_that_keeps_arriving_is_never_overdue() {
         let (ours, mut theirs) = tokio::io::duplex(1 << 20);
         let mut wire =
@@ -3586,64 +2593,10 @@ mod tests {
         let _ = sender.await;
     }
 
-    /// Claim: **a peer that stops reading cannot hold a session** with the
-    /// heartbeat on. The write that the peer's full window blocks is an arm
-    /// of the session's loop rather than an await that stops everything, so
-    /// the heartbeat still runs and ends the connection by `ETIMEDOUT`.
-    #[tokio::test]
-    async fn a_peer_that_stops_reading_cannot_hold_the_session() {
-        let (pipe, task, _peer) = handshaken_over_a_duplex(
-            SocketOptions {
-                heartbeat_ivl: Some(Duration::from_millis(50)),
-                heartbeat_timeout: Some(Duration::from_millis(200)),
-                ..options()
-            },
-            64 * 1024,
-        )
-        .await;
-
-        // Far more than the stream's window: the writer blocks for good.
-        for _ in 0..16 {
-            pipe.outgoing()
-                .send(Multipart::single(vec![7u8; 64 * 1024]))
-                .await
-                .expect("queued");
-        }
-        let err = within(task).await.expect("the task").unwrap_err();
-        assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
-    }
-
-    /// Claim: **our own traffic does not keep a vanished peer alive.** The
-    /// heartbeat timer is not rebuilt on every message, so an application
-    /// that publishes every few milliseconds to a peer that has gone quiet
-    /// still finds the connection ended.
-    #[tokio::test]
-    async fn a_busy_session_still_times_out_a_silent_peer() {
-        let (pipe, task, _peer) = handshaken_over_a_duplex(
-            SocketOptions {
-                heartbeat_ivl: Some(Duration::from_millis(100)),
-                heartbeat_timeout: Some(Duration::from_millis(500)),
-                ..options()
-            },
-            1 << 20,
-        )
-        .await;
-
-        let outgoing = pipe.outgoing();
-        let sender = tokio::spawn(async move {
-            while outgoing.send(Multipart::single("tick")).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-        let err = within(task).await.expect("the task").unwrap_err();
-        assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
-        sender.abort();
-    }
-
     /// Claim: **a message that takes longer than the heartbeat timeout to
     /// arrive is traffic, not silence.** The octets of a slow transfer count
     /// as a sign of life as they arrive, and not when the message is done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slowly_arriving_message_is_not_silence() {
         let (pipe, task, mut peer) = handshaken_over_a_duplex(
             SocketOptions {
@@ -3702,233 +2655,6 @@ mod tests {
             Command::Pong { context } if context == b"still here"
         ));
         assert!(!task.is_finished());
-    }
-
-    /// Claim: a `READY` with more properties than any peer has is refused in
-    /// the handshake, from the codec's own cap, instead of being parsed into
-    /// a list a peer sized.
-    #[tokio::test]
-    async fn a_ready_with_too_many_properties_is_refused() {
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, _user, task) = drive_session(
-            ours,
-            SocketType::Pull,
-            options(),
-            Role::Connecter,
-            &context(),
-        );
-
-        peer.read_greeting().await;
-        peer.greet(greeting::VERSION).await;
-        peer.read_frame().await;
-        let mut body = b"\x05READY".to_vec();
-        for _ in 0..(weida_zmtp::MAX_PROPERTIES + 1) {
-            body.extend_from_slice(b"\x01a\x00\x00\x00\x00");
-        }
-        peer.send(&frame::encode(FrameKind::Command, &body)).await;
-
-        let err = within(task).await.expect("the task").unwrap_err();
-        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
-        assert!(err.cause().contains("properties"), "{err}");
-    }
-
-    /// Claim: **a CURVE server asks a bound ZAP handler about a client even
-    /// when no `ZMQ_ZAP_DOMAIN` is set**, which is libzmq's rule (measured in
-    /// `tests/interop_libzmq.rs`). A deployment that bound a handler to
-    /// allow-list client keys and never set a domain is not silently open: the
-    /// handler's 400 refuses the client, and it was asked once.
-    #[tokio::test]
-    async fn a_curve_server_asks_a_bound_handler_without_a_domain() {
-        let context = context();
-        let (server_options, server_key) = curve_server_options("");
-        let (asked, handler) = zap_handler(&context, |request| {
-            ZapReply::refused(
-                request.request_id,
-                ZapStatus::AuthenticationFailure,
-                "not on the list",
-            )
-        })
-        .await;
-
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (pipe, user, task) = drive_session(
-            ours,
-            SocketType::Pair,
-            server_options.clone(),
-            Role::Binder,
-            &context,
-        );
-        let (public, secret) = crate::curve::keypair();
-        peer.read_greeting().await;
-        peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
-        let mut client = CurveClient::new(public, &secret, server_key);
-        peer.send(&client.hello().expect("HELLO")).await;
-        let (_, body) = peer.read_frame().await;
-        client.read_welcome(&body).expect("read WELCOME");
-        peer.send(&client.initiate(&Metadata::new()).expect("INITIATE"))
-            .await;
-
-        let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command);
-        let Command::Error(reason) = Command::decode(&body).expect("a command") else {
-            panic!("expected an ERROR, not a READY: the handler was not asked");
-        };
-        assert!(reason.contains("not on the list"), "{reason}");
-        let err = within(task).await.expect("the task").unwrap_err();
-        assert_eq!(err.errno(), "EACCES", "{err}");
-        assert_eq!(user.get(), None);
-        assert!(pipe.incoming().try_recv().is_err());
-        assert_eq!(asked.lock().expect("asked").len(), 1, "asked exactly once");
-        assert_eq!(
-            crate::curve::security_model(&server_options, &context),
-            Some(crate::curve::SecurityModel::CheckedByHandler),
-            "a bound handler makes the server a checked one"
-        );
-        assert_eq!(
-            crate::curve::security_model(&server_options, &self::context()),
-            Some(crate::curve::SecurityModel::AnyClient),
-            "no handler and no domain is model 1"
-        );
-        handler.abort();
-    }
-
-    /// Claim: **a PLAIN credential cannot pose as the kernel's statement.** A
-    /// username that begins like the `X-Local-Principal` extension frame is
-    /// refused before any handler is asked, so a handler that scans for the
-    /// prefix instead of counting frames cannot be made to read a peer's bytes
-    /// as a local principal.
-    #[tokio::test]
-    async fn a_username_that_imitates_the_local_principal_is_refused() {
-        let context = context();
-        let (asked, handler) = zap_handler(&context, |request| {
-            ZapReply::allowed(request.request_id, "root")
-        })
-        .await;
-        let (ours, theirs) = pair().await;
-        let mut peer = CodecPeer::new(theirs);
-        let (_pipe, user, task) = drive_session(
-            ours,
-            SocketType::Rep,
-            SocketOptions {
-                plain_server: true,
-                zap_domain: "test".to_owned(),
-                ..options()
-            },
-            Role::Binder,
-            &context,
-        );
-
-        peer.read_greeting().await;
-        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
-        peer.command(Command::Hello {
-            username: b"X-Local-Principal: uid=0, gid=0",
-            password: b"pw",
-        })
-        .await;
-
-        let (name, _) = within(peer.read_command_name()).await;
-        assert_eq!(name, "ERROR");
-        let err = within(task).await.expect("the task").unwrap_err();
-        assert_eq!(err.errno(), "EACCES", "{err}");
-        assert_eq!(user.get(), None);
-        assert!(
-            asked.lock().expect("asked").is_empty(),
-            "the handler was asked about a forged principal"
-        );
-        handler.abort();
-    }
-
-    /// Claim: **pending authorizations do not use up the context's sockets.**
-    /// Each ZAP dialog used to build a socket and take one of the context's
-    /// `ZMQ_MAX_SOCKETS`, so a handler slower than the connections arriving
-    /// left every other `zmq_socket()` in the application failing. Here six
-    /// connections wait on a handler that has not answered, a context with
-    /// room for two sockets still has its second free, and all six are
-    /// authorized once the handler answers.
-    #[tokio::test]
-    async fn pending_authorizations_take_no_socket_slots() {
-        let context = Context::new(ContextConfig {
-            max_sockets: 2,
-            ..ContextConfig::default()
-        })
-        .expect("context");
-
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut handler = crate::RepSocket::new(&context).expect("rep");
-        handler
-            .bind(crate::zap::ZAP_ENDPOINT)
-            .await
-            .expect("bind the ZAP endpoint");
-        let answering = tokio::spawn({
-            let gate = Arc::clone(&gate);
-            let asked = Arc::clone(&asked);
-            async move {
-                while let Ok(message) = handler.recv().await {
-                    asked.fetch_add(1, Ordering::SeqCst);
-                    let request = crate::zap::ZapRequest::decode(&message).expect("a request");
-                    gate.acquire().await.expect("the gate").forget();
-                    if handler
-                        .send(ZapReply::allowed(request.request_id, "operator").encode())
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        });
-
-        let mut peers = Vec::new();
-        let mut users = Vec::new();
-        for _ in 0..6 {
-            let (ours, theirs) = pair().await;
-            let mut peer = CodecPeer::new(theirs);
-            let (_pipe, user, _task) = drive_session(
-                ours,
-                SocketType::Rep,
-                SocketOptions {
-                    zap_domain: "global".to_owned(),
-                    ..options()
-                },
-                Role::Binder,
-                &context,
-            );
-            peer.read_greeting().await;
-            peer.greet(greeting::VERSION).await;
-            peer.read_frame().await;
-            peer.ready(SocketType::Req).await;
-            peers.push(peer);
-            users.push(user);
-        }
-
-        // The handler holds the first request; the other five dialogs wait
-        // behind it. Margin: five connections need microseconds to dial; the
-        // phenomenon is the absence of a free slot, which a dialog that took
-        // one would show at once.
-        within(async {
-            while asked.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let slot = context
-            .open_socket()
-            .expect("a socket slot is free while authorizations are pending");
-        drop(slot);
-
-        gate.add_permits(6);
-        within(async {
-            while users.iter().any(|user| user.get().is_none()) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        assert_eq!(asked.load(Ordering::SeqCst), 6);
-        answering.abort();
     }
 
     // ---- the Wire against arbitrary streams ----
@@ -4074,41 +2800,6 @@ mod tests {
         }
     }
 
-    /// Claim: **arbitrary octets never panic the reader** — they are a
-    /// message, a command or an error, and the stream ends — in the clear and
-    /// under a CURVE session, where every frame has to open as a box.
-    #[tokio::test]
-    async fn arbitrary_octets_are_never_a_panic() {
-        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
-        for round in 0..3000 {
-            let len = rng.below(700);
-            let mut data = rng.bytes(len);
-            // Bias a share of the streams towards plausible frame headers, so
-            // that the parser is exercised beyond its first refusal.
-            if round % 3 == 0 {
-                for at in (0..data.len()).step_by(1 + rng.below(40)) {
-                    data[at] = [0x00, 0x01, 0x02, 0x04, 0x06][rng.below(5)];
-                }
-            }
-            let sealed = round % 2 == 0;
-            let drip = Drip {
-                data,
-                at: 0,
-                chunk: 1 + rng.below(64),
-            };
-            let mut wire = Wire::new(drip, MessageLimits::new(4096, 8));
-            if sealed {
-                wire.encrypt_with(curve_transports().1);
-            }
-            // Every item consumes at least two octets, so this ends.
-            for _ in 0..=len {
-                if within(wire.read_next()).await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-
     /// Claim: **batching never reorders or splits anything.** Two thousand
     /// two-frame messages — one in ten spanning many windows — go through a
     /// stream whose window is a kilobyte, with a peer that reads as it can:
@@ -4156,7 +2847,7 @@ mod tests {
     /// that peer's reads and nobody else's, and the application then receives
     /// every `\x01` notification, in order. A proxy forwarding them upstream
     /// would otherwise never learn some of its subscribers' topics.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_xpub_notification_waits_for_the_application_instead_of_being_dropped() {
         let mut xpub_options = options();
         xpub_options.pipe.incoming.hwm = 4;
@@ -4209,5 +2900,1298 @@ mod tests {
             );
         }
         assert!(!task.is_finished());
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Claim: a PLAIN client's handshake is 24/ZMTP-PLAIN's — a greeting
+        /// naming PLAIN with `as-server` clear, `HELLO` carrying the username
+        /// and password, `INITIATE` carrying the metadata `READY` would have
+        /// carried under NULL, and nothing sent before the server's `WELCOME`.
+        #[tokio::test]
+        async fn a_plain_client_sends_hello_then_initiate() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Req,
+                SocketOptions {
+                    plain_username: Some("admin".to_owned()),
+                    plain_password: Some("secret".to_owned()),
+                    ..options()
+                },
+                Role::Connecter,
+                &context(),
+            );
+
+            let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+            assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::PLAIN);
+            assert!(!greeting.as_server, "a client's as-server octet is zero");
+            peer.greet_as(weida_zmtp::Mechanism::PLAIN, true).await;
+
+            let (name, body) = peer.read_command_name().await;
+            assert_eq!(name, "HELLO");
+            assert_eq!(
+                Command::decode(&body).expect("HELLO"),
+                Command::Hello {
+                    username: b"admin",
+                    password: b"secret",
+                }
+            );
+
+            peer.command(Command::Welcome).await;
+            let (name, body) = peer.read_command_name().await;
+            assert_eq!(name, "INITIATE", "the metadata travels in INITIATE");
+            let Command::Initiate(metadata) = Command::decode(&body).expect("INITIATE") else {
+                panic!("expected INITIATE");
+            };
+            assert_eq!(metadata.socket_type(), Some(SocketType::Req));
+
+            peer.ready(SocketType::Rep).await;
+            drop(peer);
+            let _ = task.await;
+        }
+        /// Claim: a PLAIN server asks the ZAP handler about the credentials it
+        /// was given, sends `WELCOME` on a 200, and records the user id the
+        /// handler named — a per-connection fact, not an identity.
+        #[tokio::test]
+        async fn a_plain_server_asks_the_handler_and_keeps_its_answer() {
+            let context = context();
+            let (_asked, handler) = zap_handler(&context, |request| {
+                assert_eq!(request.mechanism, "PLAIN");
+                assert_eq!(request.domain, "test");
+                assert_eq!(request.address, "127.0.0.1");
+                let (username, password) = request.plain_credentials().expect("PLAIN credentials");
+                assert_eq!(username, b"admin");
+                assert_eq!(password, b"secret");
+                ZapReply::allowed(request.request_id, "operator")
+            })
+            .await;
+
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, user, task) = drive_session(
+                ours,
+                SocketType::Rep,
+                SocketOptions {
+                    plain_server: true,
+                    zap_domain: "test".to_owned(),
+                    ..options()
+                },
+                Role::Binder,
+                &context,
+            );
+
+            let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+            assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::PLAIN);
+            assert!(greeting.as_server, "a server's as-server octet is one");
+            peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+
+            peer.command(Command::Hello {
+                username: b"admin",
+                password: b"secret",
+            })
+            .await;
+            let (name, _) = peer.read_command_name().await;
+            assert_eq!(name, "WELCOME", "a 200 is a WELCOME");
+
+            peer.command(Command::Initiate(
+                Metadata::new().with_socket_type(SocketType::Req),
+            ))
+            .await;
+            let (name, _) = peer.read_command_name().await;
+            assert_eq!(name, "READY");
+
+            let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(id) = user.get() {
+                        return id;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the user id was recorded");
+            assert_eq!(recorded.as_str(), "operator");
+
+            drop(peer);
+            let _ = task.await;
+            handler.abort();
+        }
+        /// Claim: a 400 refuses the connection **before any message flows** —
+        /// the server answers `ERROR` with the handler's text instead of
+        /// `WELCOME`, and the session ends with `EACCES`.
+        #[tokio::test]
+        async fn a_four_hundred_refuses_before_any_message() {
+            let context = context();
+            let (_asked, handler) = zap_handler(&context, |request| {
+                ZapReply::refused(
+                    request.request_id,
+                    ZapStatus::AuthenticationFailure,
+                    "unknown user",
+                )
+            })
+            .await;
+
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, user, task) = drive_session(
+                ours,
+                SocketType::Rep,
+                SocketOptions {
+                    plain_server: true,
+                    zap_domain: "test".to_owned(),
+                    ..options()
+                },
+                Role::Binder,
+                &context,
+            );
+
+            peer.read_greeting().await;
+            peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+            peer.command(Command::Hello {
+                username: b"nobody",
+                password: b"guess",
+            })
+            .await;
+
+            let (name, body) = peer.read_command_name().await;
+            assert_eq!(name, "ERROR", "a refusal is an ERROR, not a WELCOME");
+            let Command::Error(reason) = Command::decode(&body).expect("ERROR") else {
+                panic!("expected ERROR");
+            };
+            assert!(reason.contains("400"), "{reason}");
+
+            let outcome = task.await.expect("the session task");
+            let err = outcome.unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+            assert!(
+                err.cause().contains("unknown user"),
+                "the handler's reason must survive: {err}"
+            );
+            assert_eq!(user.get(), None, "nothing was authorized");
+            handler.abort();
+        }
+        /// Claim: a server that must authorize and finds no handler refuses the
+        /// connection instead of admitting one nobody checked — 27/ZAP's "the
+        /// handler SHALL start before any server starts", enforced where it can
+        /// be.
+        #[tokio::test]
+        async fn a_server_without_a_handler_admits_nobody() {
+            let context = context();
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Rep,
+                SocketOptions {
+                    plain_server: true,
+                    zap_domain: "test".to_owned(),
+                    ..options()
+                },
+                Role::Binder,
+                &context,
+            );
+
+            peer.read_greeting().await;
+            peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+            peer.command(Command::Hello {
+                username: b"admin",
+                password: b"secret",
+            })
+            .await;
+
+            let (name, _) = peer.read_command_name().await;
+            assert_eq!(name, "ERROR");
+            let err = task.await.expect("the session task").unwrap_err();
+            assert_eq!(err.errno(), "ENOTSOCK", "{err}");
+            assert!(err.cause().contains("zeromq.zap.01"), "{err}");
+        }
+        /// Claim: NULL authorizes too when a domain is configured — "NULL
+        /// provides no security credentials but allows a server to filter bogus
+        /// clients on the basis of IP address" — and the handler is told the
+        /// address and the identity the peer announced, with no credential
+        /// frames.
+        #[tokio::test]
+        async fn null_with_a_domain_asks_the_handler_about_the_address() {
+            let context = context();
+            let (asked, handler) = zap_handler(&context, |request| {
+                ZapReply::allowed(request.request_id, "by-address")
+            })
+            .await;
+
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, user, task) = drive_session(
+                ours,
+                SocketType::Rep,
+                SocketOptions {
+                    zap_domain: "global".to_owned(),
+                    ..options()
+                },
+                Role::Binder,
+                &context,
+            );
+
+            let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+            assert_eq!(
+                greeting.mechanism,
+                weida_zmtp::Mechanism::NULL,
+                "a domain does not change the mechanism"
+            );
+            peer.greet(greeting::VERSION).await;
+            peer.read_command_name().await;
+            let ready = Command::Ready(
+                Metadata::new()
+                    .with_socket_type(SocketType::Req)
+                    .with("Identity", b"client-9"),
+            )
+            .encode()
+            .expect("READY");
+            peer.send(&ready).await;
+
+            let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(id) = user.get() {
+                        return id;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the user id was recorded");
+            assert_eq!(recorded.as_str(), "by-address");
+
+            let request = asked
+                .lock()
+                .expect("asked")
+                .first()
+                .cloned()
+                .expect("one request");
+            assert_eq!(request.mechanism, "NULL");
+            assert!(
+                request.credentials.is_empty(),
+                "NULL has no credentials to send"
+            );
+            assert_eq!(request.address, "127.0.0.1");
+            assert_eq!(request.identity, b"client-9".to_vec());
+            assert_eq!(request.domain, "global");
+
+            drop(peer);
+            let _ = task.await;
+            handler.abort();
+        }
+        /// Claim: without a domain, NULL does not authorize at all — libzmq's
+        /// "when the ZAP domain is empty, which is the default, ZAP
+        /// authentication is disabled" — so a handler that would refuse
+        /// everything is never asked.
+        #[tokio::test]
+        async fn null_without_a_domain_does_not_authorize() {
+            let context = context();
+            let (asked, handler) = zap_handler(&context, |request| {
+                ZapReply::refused(
+                    request.request_id,
+                    ZapStatus::AuthenticationFailure,
+                    "would refuse",
+                )
+            })
+            .await;
+
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (pipe, user, task) =
+                drive_session(ours, SocketType::Pull, options(), Role::Binder, &context);
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_command_name().await;
+            peer.ready(SocketType::Push).await;
+
+            // The handshake completed and a message flows, which it could not
+            // have done if the refusing handler had been consulted.
+            let message = Multipart::single(Message::from("work")).encode();
+            peer.send(&message).await;
+            let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
+                .await
+                .expect("the message arrived")
+                .expect("a message");
+            assert_eq!(arrived.frames()[0].as_slice(), b"work");
+            assert_eq!(user.get(), None, "nothing was authorized");
+            assert!(asked.lock().expect("asked").is_empty(), "nobody was asked");
+
+            drop(peer);
+            let _ = task.await;
+            handler.abort();
+        }
+        /// Claim: the greeting we send is the specification's 64 octets, exactly
+        /// as the codec encodes them, and our `READY` carries `Socket-Type` and —
+        /// when `ZMQ_ROUTING_ID` is set — `Identity`.
+        #[tokio::test]
+        async fn the_handshake_sends_the_greeting_and_a_ready() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Req,
+                SocketOptions {
+                    routing_id: Some(RoutingId::new(b"client-7").expect("id")),
+                    ..options()
+                },
+                Role::Connecter,
+                &context(),
+            );
+
+            // Byte-for-byte: what the codec says a NULL 3.1 greeting is.
+            assert_eq!(peer.read_greeting().await, Greeting::null().encode());
+            peer.greet(greeting::VERSION).await;
+
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            let metadata = match Command::decode(&body).expect("a command") {
+                Command::Ready(metadata) => metadata,
+                other => panic!("expected READY, got {}", other.name()),
+            };
+            assert_eq!(metadata.socket_type(), Some(SocketType::Req));
+            assert_eq!(metadata.get("Identity"), Some(b"client-7".as_slice()));
+
+            peer.ready(SocketType::Rep).await;
+            drop(peer);
+            // The peer's close ends the session, which is not an error worth
+            // asserting beyond its shape.
+            let _ = task.await.expect("the session task");
+        }
+        /// Claim: messages cross in both directions, multipart intact, with MORE
+        /// on every frame but the last.
+        #[tokio::test]
+        async fn messages_cross_in_both_directions() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Dealer,
+                options(),
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            peer.ready(SocketType::Router).await;
+
+            // Outbound: a two-frame message goes out as MORE then last.
+            let envelope =
+                Multipart::new(vec![Message::empty(), Message::from("hello")]).expect("frames");
+            pipe.outgoing()
+                .send(envelope.clone())
+                .await
+                .expect("queued");
+            let (first, body) = peer.read_frame().await;
+            assert_eq!(first, FrameKind::Message { more: true });
+            assert!(body.is_empty(), "the delimiter frame is empty");
+            let (second, body) = peer.read_frame().await;
+            assert_eq!(second, FrameKind::Message { more: false });
+            assert_eq!(body, b"hello");
+
+            // Inbound: the same shape arrives as one Multipart.
+            peer.send(&envelope.encode()).await;
+            let arrived = tokio::time::timeout(Duration::from_secs(5), pipe.incoming().recv())
+                .await
+                .expect("delivered")
+                .expect("a message");
+            assert_eq!(arrived, envelope);
+
+            drop(peer);
+            let _ = task.await.expect("the session task");
+        }
+        /// Claim: a ZMTP 3.0 peer is accepted by downgrading, and **never
+        /// receives a PING** even with the heartbeat configured — the interop
+        /// lesson, where a command a 3.0 peer does not know ends the connection.
+        #[tokio::test]
+        async fn a_three_zero_peer_is_accepted_and_never_pinged() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Push,
+                SocketOptions {
+                    heartbeat_ivl: Some(Duration::from_millis(10)),
+                    ..options()
+                },
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(Version { major: 3, minor: 0 }).await;
+            let (kind, _) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command, "READY is still a command");
+            peer.ready(SocketType::Pull).await;
+
+            // Margin: fifteen heartbeat intervals (150 ms over a 10 ms
+            // ZMQ_HEARTBEAT_IVL). The phenomenon is a PING that must never come,
+            // so the interval count is the margin: a session that sent one would
+            // have sent fifteen. The message afterwards proves the silence is the
+            // version's doing rather than a stalled session.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            pipe.outgoing()
+                .send(Multipart::single("still alive"))
+                .await
+                .expect("queued");
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(
+                kind,
+                FrameKind::Message { more: false },
+                "a 3.0 peer must receive no PING"
+            );
+            assert_eq!(body, b"still alive");
+
+            drop(peer);
+            let _ = task.await.expect("the session task");
+        }
+        /// Claim: a 3.1 peer does get `PING`s on `ZMQ_HEARTBEAT_IVL`, carrying
+        /// the `ZMQ_HEARTBEAT_TTL` hint in deciseconds.
+        ///
+        /// Margin: none is needed in the assertion — the read below waits for
+        /// the PING rather than sampling for it, so a 10 ms interval only sets
+        /// how soon the test finishes, and a heartbeat that never came would
+        /// hang the read until the harness kills it rather than pass.
+        #[tokio::test]
+        async fn a_three_one_peer_is_pinged_on_the_interval() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Push,
+                SocketOptions {
+                    heartbeat_ivl: Some(Duration::from_millis(10)),
+                    heartbeat_timeout: Some(Duration::from_secs(30)),
+                    heartbeat_ttl: Some(Duration::from_secs(3)),
+                    ..options()
+                },
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            peer.ready(SocketType::Pull).await;
+
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            match Command::decode(&body).expect("a command") {
+                Command::Ping { ttl, context } => {
+                    assert_eq!(ttl, 30, "3 s is 30 deciseconds on the wire");
+                    assert_eq!(context, PING_CONTEXT);
+                }
+                other => panic!("expected PING, got {}", other.name()),
+            }
+
+            drop(peer);
+            let _ = task.await.expect("the session task");
+        }
+        /// Claim: our session answers a peer's `PING` with a `PONG` that echoes
+        /// the context, whatever else is going on.
+        #[tokio::test]
+        async fn a_ping_is_answered_with_a_pong_that_echoes() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Rep,
+                options(),
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            peer.ready(SocketType::Req).await;
+
+            let ping = Command::Ping {
+                ttl: 100,
+                context: b"abcd",
+            }
+            .encode()
+            .expect("PING");
+            peer.send(&ping).await;
+
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            match Command::decode(&body).expect("a command") {
+                Command::Pong { context } => assert_eq!(context, b"abcd"),
+                other => panic!("expected PONG, got {}", other.name()),
+            }
+
+            drop(peer);
+            let _ = task.await.expect("the session task");
+        }
+        /// Claim: an incompatible socket type is refused with an `ERROR` on the
+        /// wire and then a close — the specification's own way of saying no — and
+        /// the session reports `ENOCOMPATPROTO`.
+        #[tokio::test]
+        async fn an_incompatible_socket_type_gets_an_error_then_a_close() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Req,
+                options(),
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            // A PUB may not talk to a REQ.
+            peer.ready(SocketType::Pub).await;
+
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            match Command::decode(&body).expect("a command") {
+                Command::Error(reason) => {
+                    assert!(reason.contains("PUB"), "{reason}");
+                    assert!(reason.contains("REQ"), "{reason}");
+                }
+                other => panic!("expected ERROR, got {}", other.name()),
+            }
+
+            let err = task.await.expect("the session task").unwrap_err();
+            assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+        }
+        /// Claim: a `READY` with no `Socket-Type` is refused, because no
+        /// compatibility check is possible against a peer that will not say what
+        /// it is.
+        #[tokio::test]
+        async fn a_ready_without_a_socket_type_is_refused() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Pull,
+                options(),
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            peer.send(&Command::Ready(Metadata::new()).encode().expect("READY"))
+                .await;
+
+            let (_, body) = peer.read_frame().await;
+            assert!(matches!(
+                Command::decode(&body).expect("a command"),
+                Command::Error(_)
+            ));
+            let err = task.await.expect("the session task").unwrap_err();
+            assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+        }
+        /// Claim: an `ERROR` from the peer is fatal, at the handshake and after
+        /// it — "the peer SHALL treat an incoming ERROR command as fatal".
+        #[tokio::test]
+        async fn an_error_from_the_peer_is_fatal() {
+            for during_handshake in [true, false] {
+                let (ours, theirs) = pair().await;
+                let mut peer = CodecPeer::new(theirs);
+                let (_pipe, _user, task) = drive_session(
+                    ours,
+                    SocketType::Pull,
+                    options(),
+                    Role::Connecter,
+                    &context(),
+                );
+
+                peer.read_greeting().await;
+                peer.greet(greeting::VERSION).await;
+                peer.read_frame().await;
+                if !during_handshake {
+                    peer.ready(SocketType::Push).await;
+                }
+                peer.send(&Command::Error("go away").encode().expect("ERROR"))
+                    .await;
+
+                let err = task.await.expect("the session task").unwrap_err();
+                assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+                assert!(err.cause().contains("go away"), "{err}");
+            }
+        }
+        /// Claim: `ZMQ_MAXMSGSIZE` is enforced on the wire from the declared
+        /// length, so a peer cannot make us allocate by announcing a huge frame.
+        #[tokio::test]
+        async fn an_oversized_declaration_ends_the_connection() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Pull,
+                SocketOptions {
+                    max_message_size: 1024,
+                    ..options()
+                },
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            peer.ready(SocketType::Push).await;
+
+            // A long header declaring 2^31 octets, and no body at all.
+            let mut header = vec![0x02u8];
+            header.extend_from_slice(&(1u64 << 31).to_be_bytes());
+            peer.send(&header).await;
+
+            let err = task.await.expect("the session task").unwrap_err();
+            assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+        }
+        /// Claim: the session is the seam the engine expects — an `Engine`
+        /// carrying `ZmtpSession` completes the handshake against a real ZeroMQ
+        /// peer driven by the codec, and messages then flow through the engine's
+        /// pipe.
+        #[tokio::test]
+        async fn the_engine_and_the_session_speak_zmtp_end_to_end() {
+            let ctx = Context::new(ContextConfig::default()).expect("context");
+            let engine = Engine::new(
+                &ctx,
+                options(),
+                Arc::new(ZmtpSession::new(SocketType::Push)) as Arc<dyn Session>,
+            )
+            .expect("engine");
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            let peer_task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut peer = CodecPeer::new(stream);
+                assert_eq!(peer.read_greeting().await, Greeting::null().encode());
+                peer.greet(greeting::VERSION).await;
+                let (kind, body) = peer.read_frame().await;
+                assert_eq!(kind, FrameKind::Command);
+                match Command::decode(&body).expect("a command") {
+                    Command::Ready(metadata) => {
+                        assert_eq!(metadata.socket_type(), Some(SocketType::Push));
+                    }
+                    other => panic!("expected READY, got {}", other.name()),
+                }
+                peer.ready(SocketType::Pull).await;
+                let (kind, body) = peer.read_frame().await;
+                assert_eq!(kind, FrameKind::Message { more: false });
+                body
+            });
+
+            let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
+            let peer_id = engine.connect(&endpoint).expect("connect");
+            let pipe = engine.peer(peer_id).expect("peer").pipe;
+            pipe.outgoing()
+                .send(Multipart::single("through the engine"))
+                .await
+                .expect("queued");
+
+            let delivered = tokio::time::timeout(Duration::from_secs(10), peer_task)
+                .await
+                .expect("the peer finished")
+                .expect("the peer task");
+            assert_eq!(delivered, b"through the engine");
+        }
+        /// Claim: the octets a CURVE server puts on the wire are 26/CURVEZMQ's,
+        /// and nothing after the `READY` is in clear text.
+        ///
+        /// Driven from the other side by this crate's own client half over a raw
+        /// socket, so what is asserted is the wire and not an agreement between
+        /// two copies of the same state machine.
+        #[tokio::test]
+        async fn a_curve_server_seals_everything_after_its_ready() {
+            let context = context();
+            let (server_options, server_key) = curve_server_options("");
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Pair,
+                server_options,
+                Role::Binder,
+                &context,
+            );
+
+            let (public, secret) = crate::curve::keypair();
+            let mut transport =
+                curve_handshake_as_client(&mut peer, server_key, public, &secret).await;
+
+            // Outbound: the message is a `MESSAGE` whose body is a command body
+            // behind a **message** frame header, which is what libzmq sends and
+            // accepts (`tests/interop_libzmq.rs`), and the plaintext is nowhere
+            // in the octets. The outer MORE is always zero: the real one is the
+            // flags octet inside the box.
+            pipe.outgoing()
+                .send(Multipart::single("the quiet part"))
+                .await
+                .expect("queued");
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Message { more: false });
+            assert!(body.starts_with(b"\x07MESSAGE"), "named MESSAGE");
+            assert!(
+                !body.windows(14).any(|window| window == b"the quiet part"),
+                "the payload travelled in clear text"
+            );
+            let (flags, payload) = transport.open_message(&body).expect("open");
+            assert_eq!(flags, 0, "one frame, so no MORE");
+            assert_eq!(payload, b"the quiet part");
+
+            // A multipart message: MORE travels inside the box under CURVE, so a
+            // single frame would not exercise it.
+            let mut multipart = Multipart::single("first");
+            multipart.push("second");
+            pipe.outgoing().send(multipart).await.expect("queued");
+            for (expected_flags, expected_body) in [
+                (curve_layout::MESSAGE_FLAG_MORE, &b"first"[..]),
+                (0, &b"second"[..]),
+            ] {
+                let (kind, body) = peer.read_frame().await;
+                assert_eq!(kind, FrameKind::Message { more: false });
+                let (flags, payload) = transport.open_message(&body).expect("open");
+                assert_eq!(flags, expected_flags);
+                assert_eq!(payload, expected_body);
+            }
+
+            // Inbound: a sealed message reaches the application, and a plaintext
+            // one does not.
+            peer.send(&transport.seal_frame(0, b"the other way").expect("seal"))
+                .await;
+            let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
+                .await
+                .expect("the message arrived")
+                .expect("a message");
+            assert_eq!(arrived.frames()[0].as_slice(), b"the other way");
+
+            // A frame in clear text is refused — not because of its frame kind,
+            // which is the same kind a sealed `MESSAGE` uses, but because its
+            // body is not a `MESSAGE` at all and no box was opened.
+            peer.send(&Multipart::single("in the open").encode()).await;
+            let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("the session ended")
+                .expect("the task");
+            let err = outcome.unwrap_err();
+            assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+            assert!(err.cause().contains("CURVE"), "{err}");
+        }
+        /// Claim: the CURVE credential a ZAP handler is given is the peer's
+        /// long-term public key — the one that never travelled in clear text —
+        /// and 26/CURVEZMQ's second and third security models are the handler's
+        /// answer to it: an allowed key is admitted, a 200 that names a user is
+        /// kept per connection, and a key that is not in the table is refused
+        /// before any message flows.
+        #[tokio::test]
+        async fn a_curve_server_hands_the_peers_key_to_the_handler() {
+            let context = context();
+            let (server_options, server_key) = curve_server_options("realm");
+            let (allowed_public, allowed_secret) = crate::curve::keypair();
+
+            // Model 3: a table with one entry per client, whose 200 also names
+            // the user that key belongs to. Model 2 is the same handler with one
+            // shared entry, and this one's refusal path is what both do to a key
+            // they do not hold.
+            let allowed = allowed_public;
+            let (asked, handler) = zap_handler(&context, move |request| {
+                assert_eq!(request.mechanism, "CURVE");
+                assert_eq!(request.domain, "realm");
+                let key = crate::curve::CurvePublicKey::parse(&request.credentials[0])
+                    .expect("a 32-octet key");
+                if key == allowed {
+                    ZapReply::allowed(request.request_id, "client-a")
+                } else {
+                    ZapReply::refused(
+                        request.request_id,
+                        ZapStatus::AuthenticationFailure,
+                        "not on the list",
+                    )
+                }
+            })
+            .await;
+
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (pipe, user, task) = drive_session(
+                ours,
+                SocketType::Pair,
+                server_options.clone(),
+                Role::Binder,
+                &context,
+            );
+            let mut transport =
+                curve_handshake_as_client(&mut peer, server_key, allowed_public, &allowed_secret)
+                    .await;
+
+            peer.send(&transport.seal_frame(0, b"authorized").expect("seal"))
+                .await;
+            let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
+                .await
+                .expect("the message arrived")
+                .expect("a message");
+            assert_eq!(arrived.frames()[0].as_slice(), b"authorized");
+            assert_eq!(
+                user.get().expect("a user id").as_str(),
+                "client-a",
+                "model 3: access granted according to an authenticated identity"
+            );
+            {
+                let asked = asked.lock().expect("asked");
+                assert_eq!(asked.len(), 1);
+                assert_eq!(
+                    asked[0].credentials,
+                    vec![allowed_public.as_bytes().to_vec()],
+                    "one frame, the peer's 32-octet long-term key"
+                );
+            }
+            assert_eq!(
+                crate::curve::security_model(&server_options, &context),
+                Some(crate::curve::SecurityModel::CheckedByHandler)
+            );
+            drop(peer);
+            let _ = task.await;
+
+            // A key the table does not hold: the handshake ends with the
+            // handler's own text, and no message ever flows.
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (pipe, user, task) = drive_session(
+                ours,
+                SocketType::Pair,
+                server_options,
+                Role::Binder,
+                &context,
+            );
+            let (stranger_public, stranger_secret) = crate::curve::keypair();
+            let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+            assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::CURVE);
+            peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
+            let mut client = CurveClient::new(stranger_public, &stranger_secret, server_key);
+            peer.send(&client.hello().expect("HELLO")).await;
+            let (_, body) = peer.read_frame().await;
+            client.read_welcome(&body).expect("read WELCOME");
+            peer.send(&client.initiate(&Metadata::new()).expect("INITIATE"))
+                .await;
+
+            // The refusal is an ERROR carrying the handler's status and text,
+            // sent before the READY that would have completed the handshake.
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            let Command::Error(reason) = Command::decode(&body).expect("a command") else {
+                panic!("expected an ERROR");
+            };
+            assert!(reason.contains("not on the list"), "{reason}");
+            let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("the session ended")
+                .expect("the task");
+            let err = outcome.unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+            assert_eq!(user.get(), None, "a refusal names no user");
+            assert!(
+                pipe.incoming().try_recv().is_err(),
+                "nothing flowed under a refused connection"
+            );
+            handler.abort();
+        }
+        /// Claim: a client that does not hold the server's public key cannot get
+        /// past `HELLO`, and is told so rather than left waiting.
+        #[tokio::test]
+        async fn a_curve_client_with_the_wrong_server_key_is_refused() {
+            let context = context();
+            let (server_options, _) = curve_server_options("");
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Pair,
+                server_options,
+                Role::Binder,
+                &context,
+            );
+
+            peer.read_greeting().await;
+            peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
+            // A HELLO whose signature box is sealed to another server's key: the
+            // octets are 26/CURVEZMQ's and the box does not open.
+            let (elsewhere, _) = crate::curve::keypair();
+            let (public, secret) = crate::curve::keypair();
+            let mut client = CurveClient::new(public, &secret, elsewhere);
+            peer.send(&client.hello().expect("HELLO")).await;
+
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            let Command::Error(reason) = Command::decode(&body).expect("a command") else {
+                panic!("expected an ERROR rather than silence");
+            };
+            assert!(reason.contains("signature box"), "{reason}");
+
+            let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("the session ended")
+                .expect("the task");
+            let err = outcome.unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+        }
+        /// Claim: a `READY` with more properties than any peer has is refused in
+        /// the handshake, from the codec's own cap, instead of being parsed into
+        /// a list a peer sized.
+        #[tokio::test]
+        async fn a_ready_with_too_many_properties_is_refused() {
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Pull,
+                options(),
+                Role::Connecter,
+                &context(),
+            );
+
+            peer.read_greeting().await;
+            peer.greet(greeting::VERSION).await;
+            peer.read_frame().await;
+            let mut body = b"\x05READY".to_vec();
+            for _ in 0..(weida_zmtp::MAX_PROPERTIES + 1) {
+                body.extend_from_slice(b"\x01a\x00\x00\x00\x00");
+            }
+            peer.send(&frame::encode(FrameKind::Command, &body)).await;
+
+            let err = within(task).await.expect("the task").unwrap_err();
+            assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+            assert!(err.cause().contains("properties"), "{err}");
+        }
+        /// Claim: **a CURVE server asks a bound ZAP handler about a client even
+        /// when no `ZMQ_ZAP_DOMAIN` is set**, which is libzmq's rule (measured in
+        /// `tests/interop_libzmq.rs`). A deployment that bound a handler to
+        /// allow-list client keys and never set a domain is not silently open: the
+        /// handler's 400 refuses the client, and it was asked once.
+        #[tokio::test]
+        async fn a_curve_server_asks_a_bound_handler_without_a_domain() {
+            let context = context();
+            let (server_options, server_key) = curve_server_options("");
+            let (asked, handler) = zap_handler(&context, |request| {
+                ZapReply::refused(
+                    request.request_id,
+                    ZapStatus::AuthenticationFailure,
+                    "not on the list",
+                )
+            })
+            .await;
+
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (pipe, user, task) = drive_session(
+                ours,
+                SocketType::Pair,
+                server_options.clone(),
+                Role::Binder,
+                &context,
+            );
+            let (public, secret) = crate::curve::keypair();
+            peer.read_greeting().await;
+            peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
+            let mut client = CurveClient::new(public, &secret, server_key);
+            peer.send(&client.hello().expect("HELLO")).await;
+            let (_, body) = peer.read_frame().await;
+            client.read_welcome(&body).expect("read WELCOME");
+            peer.send(&client.initiate(&Metadata::new()).expect("INITIATE"))
+                .await;
+
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            let Command::Error(reason) = Command::decode(&body).expect("a command") else {
+                panic!("expected an ERROR, not a READY: the handler was not asked");
+            };
+            assert!(reason.contains("not on the list"), "{reason}");
+            let err = within(task).await.expect("the task").unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+            assert_eq!(user.get(), None);
+            assert!(pipe.incoming().try_recv().is_err());
+            assert_eq!(asked.lock().expect("asked").len(), 1, "asked exactly once");
+            assert_eq!(
+                crate::curve::security_model(&server_options, &context),
+                Some(crate::curve::SecurityModel::CheckedByHandler),
+                "a bound handler makes the server a checked one"
+            );
+            assert_eq!(
+                crate::curve::security_model(&server_options, &self::context()),
+                Some(crate::curve::SecurityModel::AnyClient),
+                "no handler and no domain is model 1"
+            );
+            handler.abort();
+        }
+        /// Claim: **a PLAIN credential cannot pose as the kernel's statement.** A
+        /// username that begins like the `X-Local-Principal` extension frame is
+        /// refused before any handler is asked, so a handler that scans for the
+        /// prefix instead of counting frames cannot be made to read a peer's bytes
+        /// as a local principal.
+        #[tokio::test]
+        async fn a_username_that_imitates_the_local_principal_is_refused() {
+            let context = context();
+            let (asked, handler) = zap_handler(&context, |request| {
+                ZapReply::allowed(request.request_id, "root")
+            })
+            .await;
+            let (ours, theirs) = pair().await;
+            let mut peer = CodecPeer::new(theirs);
+            let (_pipe, user, task) = drive_session(
+                ours,
+                SocketType::Rep,
+                SocketOptions {
+                    plain_server: true,
+                    zap_domain: "test".to_owned(),
+                    ..options()
+                },
+                Role::Binder,
+                &context,
+            );
+
+            peer.read_greeting().await;
+            peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+            peer.command(Command::Hello {
+                username: b"X-Local-Principal: uid=0, gid=0",
+                password: b"pw",
+            })
+            .await;
+
+            let (name, _) = within(peer.read_command_name()).await;
+            assert_eq!(name, "ERROR");
+            let err = within(task).await.expect("the task").unwrap_err();
+            assert_eq!(err.errno(), "EACCES", "{err}");
+            assert_eq!(user.get(), None);
+            assert!(
+                asked.lock().expect("asked").is_empty(),
+                "the handler was asked about a forged principal"
+            );
+            handler.abort();
+        }
+        /// Claim: **pending authorizations do not use up the context's sockets.**
+        /// Each ZAP dialog used to build a socket and take one of the context's
+        /// `ZMQ_MAX_SOCKETS`, so a handler slower than the connections arriving
+        /// left every other `zmq_socket()` in the application failing. Here six
+        /// connections wait on a handler that has not answered, a context with
+        /// room for two sockets still has its second free, and all six are
+        /// authorized once the handler answers.
+        #[tokio::test]
+        async fn pending_authorizations_take_no_socket_slots() {
+            let context = Context::new(ContextConfig {
+                max_sockets: 2,
+                ..ContextConfig::default()
+            })
+            .expect("context");
+
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut handler = crate::RepSocket::new(&context).expect("rep");
+            handler
+                .bind(crate::zap::ZAP_ENDPOINT)
+                .await
+                .expect("bind the ZAP endpoint");
+            let answering = tokio::spawn({
+                let gate = Arc::clone(&gate);
+                let asked = Arc::clone(&asked);
+                async move {
+                    while let Ok(message) = handler.recv().await {
+                        asked.fetch_add(1, Ordering::SeqCst);
+                        let request = crate::zap::ZapRequest::decode(&message).expect("a request");
+                        gate.acquire().await.expect("the gate").forget();
+                        if handler
+                            .send(ZapReply::allowed(request.request_id, "operator").encode())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let mut peers = Vec::new();
+            let mut users = Vec::new();
+            for _ in 0..6 {
+                let (ours, theirs) = pair().await;
+                let mut peer = CodecPeer::new(theirs);
+                let (_pipe, user, _task) = drive_session(
+                    ours,
+                    SocketType::Rep,
+                    SocketOptions {
+                        zap_domain: "global".to_owned(),
+                        ..options()
+                    },
+                    Role::Binder,
+                    &context,
+                );
+                peer.read_greeting().await;
+                peer.greet(greeting::VERSION).await;
+                peer.read_frame().await;
+                peer.ready(SocketType::Req).await;
+                peers.push(peer);
+                users.push(user);
+            }
+
+            // The handler holds the first request; the other five dialogs wait
+            // behind it. Margin: five connections need microseconds to dial; the
+            // phenomenon is the absence of a free slot, which a dialog that took
+            // one would show at once.
+            within(async {
+                while asked.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let slot = context
+                .open_socket()
+                .expect("a socket slot is free while authorizations are pending");
+            drop(slot);
+
+            gate.add_permits(6);
+            within(async {
+                while users.iter().any(|user| user.get().is_none()) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert_eq!(asked.load(Ordering::SeqCst), 6);
+            answering.abort();
+        }
+
+        /// Claim: **a message that is started and not finished does not hold the
+        /// connection for ever**, whether the heartbeat is on or not (it is off
+        /// here, which is the default): a peer that announces a large message
+        /// and sends a few kilobytes of it ends the connection.
+        #[tokio::test]
+        async fn a_message_that_stops_arriving_ends_the_connection() {
+            let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+            let mut wire = Wire::new(ours, MessageLimits::default())
+                .with_message_ivl(Duration::from_millis(200));
+            let options = options();
+            let pipe = Pipe::new(options.pipe);
+            let subscriptions = Arc::new(Subscriptions::new(
+                crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
+                crate::subscriptions::DEFAULT_MAX_SUBSCRIPTION_BYTES,
+            ));
+            let exec = Exec::current().expect("ambient reactor");
+
+            let mut head = vec![0x02u8];
+            head.extend_from_slice(&(900u64 * 1024).to_be_bytes());
+            head.extend_from_slice(&[0u8; 2048]);
+            theirs.write_all(&head).await.expect("write");
+
+            let started = std::time::Instant::now();
+            let outcome = within(pump(
+                &mut wire,
+                SocketType::Pull,
+                &subscriptions,
+                &pipe,
+                &options,
+                &exec,
+                greeting::VERSION,
+            ))
+            .await;
+            let err = outcome.unwrap_err();
+            assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "it took {:?}",
+                started.elapsed()
+            );
+        }
+        /// Claim: **a peer that stops reading cannot hold a session** with the
+        /// heartbeat on. The write that the peer's full window blocks is an arm
+        /// of the session's loop rather than an await that stops everything, so
+        /// the heartbeat still runs and ends the connection by `ETIMEDOUT`.
+        #[tokio::test]
+        async fn a_peer_that_stops_reading_cannot_hold_the_session() {
+            let (pipe, task, _peer) = handshaken_over_a_duplex(
+                SocketOptions {
+                    heartbeat_ivl: Some(Duration::from_millis(50)),
+                    heartbeat_timeout: Some(Duration::from_millis(200)),
+                    ..options()
+                },
+                64 * 1024,
+            )
+            .await;
+
+            // Far more than the stream's window: the writer blocks for good.
+            for _ in 0..16 {
+                pipe.outgoing()
+                    .send(Multipart::single(vec![7u8; 64 * 1024]))
+                    .await
+                    .expect("queued");
+            }
+            let err = within(task).await.expect("the task").unwrap_err();
+            assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
+        }
+        /// Claim: **our own traffic does not keep a vanished peer alive.** The
+        /// heartbeat timer is not rebuilt on every message, so an application
+        /// that publishes every few milliseconds to a peer that has gone quiet
+        /// still finds the connection ended.
+        #[tokio::test]
+        async fn a_busy_session_still_times_out_a_silent_peer() {
+            let (pipe, task, _peer) = handshaken_over_a_duplex(
+                SocketOptions {
+                    heartbeat_ivl: Some(Duration::from_millis(100)),
+                    heartbeat_timeout: Some(Duration::from_millis(500)),
+                    ..options()
+                },
+                1 << 20,
+            )
+            .await;
+
+            let outgoing = pipe.outgoing();
+            let sender = tokio::spawn(async move {
+                while outgoing.send(Multipart::single("tick")).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            let err = within(task).await.expect("the task").unwrap_err();
+            assert_eq!(err.errno(), "ETIMEDOUT", "{err}");
+            sender.abort();
+        }
+
+        /// Claim: **arbitrary octets never panic the reader** — they are a
+        /// message, a command or an error, and the stream ends — in the clear and
+        /// under a CURVE session, where every frame has to open as a box.
+        #[tokio::test]
+        async fn arbitrary_octets_are_never_a_panic() {
+            let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+            for round in 0..3000 {
+                let len = rng.below(700);
+                let mut data = rng.bytes(len);
+                // Bias a share of the streams towards plausible frame headers, so
+                // that the parser is exercised beyond its first refusal.
+                if round % 3 == 0 {
+                    for at in (0..data.len()).step_by(1 + rng.below(40)) {
+                        data[at] = [0x00, 0x01, 0x02, 0x04, 0x06][rng.below(5)];
+                    }
+                }
+                let sealed = round % 2 == 0;
+                let drip = Drip {
+                    data,
+                    at: 0,
+                    chunk: 1 + rng.below(64),
+                };
+                let mut wire = Wire::new(drip, MessageLimits::new(4096, 8));
+                if sealed {
+                    wire.encrypt_with(curve_transports().1);
+                }
+                // Every item consumes at least two octets, so this ends.
+                for _ in 0..=len {
+                    if within(wire.read_next()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }

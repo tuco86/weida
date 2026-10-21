@@ -2236,39 +2236,6 @@ mod tests {
         }
     }
 
-    /// Claim: a wildcard bind is only usable through the endpoint it reports —
-    /// `ZMQ_LAST_ENDPOINT` — and that endpoint unbinds it. The requested form
-    /// unbinds it too, and an endpoint nothing is bound at is `ENOENT`.
-    #[tokio::test]
-    async fn a_wildcard_bind_reports_the_endpoint_it_got() {
-        let ctx = context();
-        let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-
-        let requested = Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint");
-        let bound = engine.bind(&requested).await.expect("bind");
-        assert!(!bound.has_wildcard_port(), "the port must be resolved");
-        assert_eq!(engine.last_endpoint().as_ref(), Some(&bound));
-        assert_eq!(engine.bound(), vec![bound.clone()]);
-
-        let err = engine
-            .unbind(&Endpoint::parse("tcp://127.0.0.1:1").expect("endpoint"))
-            .unwrap_err();
-        assert_eq!(err.errno(), "ENOENT", "{err}");
-
-        engine
-            .unbind(&bound)
-            .expect("unbind by the reported endpoint");
-        assert!(engine.bound().is_empty());
-
-        // And the requested form works too, for a caller that kept it.
-        let bound = engine.bind(&requested).await.expect("rebind");
-        engine
-            .unbind(&requested)
-            .expect("unbind by the requested form");
-        assert!(engine.bound().is_empty());
-        drop(bound);
-    }
-
     /// Claim: an `inproc://` bind and connect meet inside one context, both
     /// sides get a session with the role they played, and the name is
     /// released when the bind is undone — the `ipc` transport's stealing is
@@ -2324,426 +2291,12 @@ mod tests {
         wait_for(|| client.peer(peer).is_some_and(|peer| peer.connected)).await;
     }
 
-    /// Claim: one socket binds many endpoints and connects many, and accepts
-    /// automatically on each — `zmq_socket(3)`'s "many-to-many".
-    #[tokio::test]
-    async fn one_socket_binds_and_connects_many_endpoints() {
-        let ctx = context();
-        let server_session = Recorder::new();
-        let server = Engine::new(&ctx, options(), as_session(&server_session)).expect("server");
-        let first = server
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("first bind");
-        let second = server
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("second bind");
-        assert_eq!(server.bound().len(), 2);
-
-        let client_session = Recorder::new();
-        let client = Engine::new(&ctx, options(), as_session(&client_session)).expect("client");
-        client.connect(&first).expect("connect one");
-        client.connect(&second).expect("connect two");
-        assert_eq!(client.connected().len(), 2);
-
-        wait_for(|| server_session.count() == 2 && client_session.count() == 2).await;
-        assert_eq!(server_session.roles(), vec![Role::Binder, Role::Binder]);
-        assert_eq!(
-            client_session.roles(),
-            vec![Role::Connecter, Role::Connecter]
-        );
-        wait_for(|| client.peers().iter().all(|peer| peer.connected)).await;
-        assert_eq!(client.peers().len(), 2);
-        assert_eq!(server.peers().len(), 2);
-    }
-
-    /// Claim: the queue exists before the connection does — the pattern
-    /// RFCs' "whether or not the connection is established" — so a sender may
-    /// fill it while the endpoint is still being dialled.
-    #[tokio::test]
-    async fn a_peer_that_never_connected_still_has_a_queue() {
-        let ctx = context();
-        let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-        // Port 9 is discard, and nothing listens on it here.
-        let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
-        let peer = engine.connect(&nowhere).expect("connect");
-
-        let peers = engine.outgoing_peers();
-        assert_eq!(peers.len(), 1, "the peer is there immediately");
-        assert!(!peers[0].connected);
-        assert_eq!(
-            peers[0]
-                .pipe
-                .outgoing()
-                .send(Multipart::single("queued for nobody"))
-                .await
-                .expect("queued"),
-            Sent::Queued
-        );
-        assert_eq!(engine.peer(peer).expect("peer").pipe.outgoing().len(), 1);
-
-        // And it is dialling, not sitting still.
-        wait_for(|| engine.peer(peer).map(|p| p.attempts) >= Some(2)).await;
-    }
-
-    /// Claim: `ZMQ_IMMEDIATE` hides a peer from the sender until its
-    /// connection completes, which is what "messages shall be queued only to
-    /// completed connections" means for a round-robin socket.
-    #[tokio::test]
-    async fn immediate_hides_a_peer_until_it_connects() {
-        let ctx = context();
-        let server = Engine::new(&ctx, options(), Recorder::new()).expect("server");
-        let endpoint = server
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
-
-        let immediate = SocketOptions {
-            immediate: true,
-            ..options()
-        };
-        let client = Engine::new(&ctx, immediate, Recorder::new()).expect("client");
-        let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
-        client.connect(&nowhere).expect("connect to nothing");
-        assert_eq!(client.peers().len(), 1, "the peer and its queue exist");
-        assert!(
-            client.outgoing_peers().is_empty(),
-            "but a sender may not use it yet"
-        );
-
-        client.connect(&endpoint).expect("connect to the server");
-        wait_for(|| client.outgoing_peers().len() == 1).await;
-        assert!(client.outgoing_peers()[0].connected);
-        assert_eq!(client.peers().len(), 2);
-    }
-
-    /// Claim: a lost connection is redialled, so a peer whose listener goes
-    /// away and comes back is reconnected without the application asking.
-    #[tokio::test]
-    async fn a_dropped_peer_is_reconnected_when_it_returns() {
-        let ctx = context();
-        let session = Recorder::new();
-        let engine = Engine::new(&ctx, options(), as_session(&session)).expect("engine");
-
-        // A peer that accepts one connection and immediately drops it.
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
-        let accepted = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            drop(stream);
-            drop(listener);
-        });
-
-        let peer = engine.connect(&endpoint).expect("connect");
-        wait_for(|| session.count() == 1).await;
-        accepted.await.expect("the peer served once");
-        wait_for(|| engine.peer(peer).is_some_and(|p| !p.connected)).await;
-
-        // The peer comes back on the same port, and nobody told the socket.
-        let again = TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .expect("rebind");
-        let served = tokio::spawn(async move {
-            let (stream, _) = again.accept().await.expect("accept");
-            // Hold it while the assertions below run. Margin: 200 ms
-            // against `wait_for`'s 5 ms polling, and the assertions are
-            // waits rather than samples, so this only has to outlast them.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            drop(stream);
-        });
-        wait_for(|| session.count() == 2).await;
-        wait_for(|| engine.peer(peer).is_some_and(|p| p.connected)).await;
-        assert!(
-            engine.peer(peer).expect("peer").attempts >= 2,
-            "the reconnect is a second attempt, not a retained connection"
-        );
-        served.await.expect("the peer served twice");
-    }
-
-    /// Claim: `ZMQ_CONNECT_TIMEOUT` bounds one attempt, so a black-hole
-    /// address does not park the socket on the OS's SYN retries. RFC 8305's
-    /// 250 ms scale, not the tens of seconds Linux would take.
-    #[tokio::test]
-    async fn connect_timeout_bounds_an_attempt_against_a_black_hole() {
-        let ctx = context();
-        let bounded = SocketOptions {
-            connect_timeout: Some(Duration::from_millis(250)),
-            reconnect_ivl: Some(Duration::from_millis(20)),
-            ..SocketOptions::default()
-        };
-        let engine = Engine::new(&ctx, bounded, Recorder::new()).expect("engine");
-        // TEST-NET-3 (RFC 5737): documentation space, routed nowhere.
-        let black_hole = Endpoint::parse("tcp://203.0.113.1:5555").expect("endpoint");
-        let peer = engine.connect(&black_hole).expect("connect");
-
-        let started = std::time::Instant::now();
-        wait_for(|| engine.peer(peer).map(|p| p.attempts) >= Some(2)).await;
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "two attempts must fit in seconds, not in SYN retries: {:?}",
-            started.elapsed()
-        );
-        assert!(!engine.peer(peer).expect("peer").connected);
-    }
-
-    /// Claim: `ZMQ_HANDSHAKE_IVL` closes a connection whose handshake never
-    /// completes — the defence against a peer that connects and says nothing.
-    #[tokio::test]
-    async fn a_handshake_that_never_completes_is_closed() {
-        let ctx = context();
-        let silent = Recorder::silent();
-        let dropped = Arc::clone(&silent.dropped);
-        let engine = Engine::new(
-            &ctx,
-            SocketOptions {
-                // Margin: a 30 ms handshake interval against a peer that is
-                // held open for 5 s, so the interval is two orders of
-                // magnitude inside the window in which it must fire; the
-                // assertions wait for the drop rather than sampling for it.
-                handshake_ivl: Some(Duration::from_millis(30)),
-                // One attempt, so the assertion counts one connection.
-                reconnect_ivl: None,
-                ..SocketOptions::default()
-            },
-            as_session(&silent),
-        )
-        .expect("engine");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        let held = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            // A peer that connects and never speaks: held open deliberately.
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            drop(stream);
-        });
-
-        let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
-        let peer = engine.connect(&endpoint).expect("connect");
-        wait_for(|| silent.count() == 1).await;
-        wait_for(|| dropped.load(Ordering::SeqCst) == 1).await;
-        wait_for(|| engine.peer(peer).is_some_and(|p| !p.connected)).await;
-        held.abort();
-    }
-
-    /// Claim: `disconnect` destroys the endpoint's pipe and the messages in
-    /// it are counted rather than quietly lost — the RFCs' "discarding any
-    /// messages it contains", made a number.
-    #[tokio::test]
-    async fn disconnect_destroys_the_pipe_and_counts_what_it_held() {
-        let ctx = context();
-        let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-        let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
-        let peer = engine.connect(&nowhere).expect("connect");
-
-        let pipe = engine.peer(peer).expect("peer").pipe;
-        for n in 0..3 {
-            pipe.outgoing()
-                .send(Multipart::single(format!("{n}")))
-                .await
-                .expect("queued");
-        }
-
-        let discarded = engine.disconnect(&nowhere).expect("disconnect");
-        assert_eq!(
-            discarded,
-            Discarded {
-                outgoing: 3,
-                incoming: 0
-            }
-        );
-        assert!(engine.peers().is_empty());
-        assert!(engine.connected().is_empty());
-        assert!(pipe.outgoing().is_closed());
-
-        let err = engine.disconnect(&nowhere).unwrap_err();
-        assert_eq!(err.errno(), "ENOENT", "{err}");
-    }
-
-    /// Claim: every transport this engine carries is accepted where it is
-    /// asked for, and the wildcard address — which binds — is refused as a
-    /// dial. A transport the library does not implement at all is refused by
-    /// the endpoint parser, where it is named; there is no half-accepted
-    /// endpoint anywhere in between.
-    #[tokio::test]
-    async fn every_carried_transport_is_accepted_and_the_wildcard_is_not_dialled() {
-        let ctx = context();
-        let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-
-        let inproc = Endpoint::parse("inproc://orders").expect("endpoint");
-        engine.bind(&inproc).await.expect("inproc is carried");
-        engine.connect(&inproc).expect("inproc is carried");
-
-        #[cfg(unix)]
-        {
-            let path = std::env::temp_dir().join(format!("weida-zmq-{}-eng.sock", nonce()));
-            let ipc = Endpoint::parse(&format!("ipc://{}", path.display())).expect("endpoint");
-            engine.bind(&ipc).await.expect("ipc is carried");
-            engine.connect(&ipc).expect("ipc is carried");
-        }
-
-        let err = Endpoint::parse("epgm://239.0.0.1:5555").unwrap_err();
-        assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
-
-        // The wildcard binds; it does not dial.
-        let err = engine
-            .connect(&Endpoint::parse("tcp://*:5555").expect("endpoint"))
-            .unwrap_err();
-        assert_eq!(err.errno(), "EINVAL", "{err}");
-    }
-
     /// A number no other test in this process uses, for a socket path.
     #[cfg(unix)]
     fn nonce() -> u64 {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::SeqCst) as u64;
         u64::from(std::process::id()) * 1000 + n
-    }
-
-    /// Claim: an `ipc://` bind and connect meet over `AF_UNIX`, both sides
-    /// are recorded with the kernel's statement about the other, and the
-    /// socket file is gone once the bind is undone — the node belongs to the
-    /// binding.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_ipc_bind_and_connect_meet_with_credentials() {
-        let ctx = context();
-        let binder = Recorder::new();
-        let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
-        let dialler = Recorder::new();
-        let client = Engine::new(&ctx, options(), as_session(&dialler)).expect("engine");
-
-        let path = std::env::temp_dir().join(format!("weida-zmq-{}-meet.sock", nonce()));
-        let endpoint = Endpoint::parse(&format!("ipc://{}", path.display())).expect("endpoint");
-        let bound = server.bind(&endpoint).await.expect("bind");
-        assert_eq!(bound, endpoint, "an ipc bind has nothing to resolve");
-        assert!(path.exists(), "the socket file is the endpoint");
-
-        let peer = client.connect(&endpoint).expect("connect");
-        wait_for(|| binder.count() == 1 && dialler.count() == 1).await;
-        assert_eq!(binder.roles(), vec![Role::Binder]);
-        assert_eq!(dialler.roles(), vec![Role::Connecter]);
-
-        // Both ends hold the kernel's answer, which for two ends of one
-        // connection in one process is this process.
-        let dialled = client.peer(peer).expect("the dialled peer");
-        let credentials = dialled.credentials.expect("credentials at connect");
-        if let Some(pid) = credentials.pid {
-            assert_eq!(pid, std::process::id());
-        }
-        wait_for(|| {
-            server
-                .peers()
-                .first()
-                .is_some_and(|peer| peer.credentials.is_some())
-        })
-        .await;
-
-        server.unbind(&endpoint).expect("unbind");
-        wait_for(|| !path.exists()).await;
-    }
-
-    /// Claim: a TCP peer has no credentials to report — there is no kernel
-    /// fact about a process behind an address, and `None` says so rather
-    /// than a zero that would read as root.
-    #[tokio::test]
-    async fn a_tcp_peer_has_no_credentials() {
-        let ctx = context();
-        let binder = Recorder::new();
-        let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
-        let bound = server
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
-        let client = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-        let peer = client.connect(&bound).expect("connect");
-        wait_for(|| client.peer(peer).is_some_and(|peer| peer.connected)).await;
-        assert!(client.peer(peer).expect("peer").credentials.is_none());
-    }
-
-    /// Claim: closing the socket stops everything and destroys the pipes, and
-    /// a terminated context refuses further operations with `ETERM`.
-    #[tokio::test]
-    async fn a_closed_socket_and_a_terminated_context_refuse_work() {
-        let ctx = context();
-        let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-        let bound = engine
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
-        let peer = engine.connect(&bound).expect("connect");
-        wait_for(|| engine.peer(peer).is_some_and(|p| p.connected)).await;
-
-        engine.close();
-        assert!(engine.peers().is_empty());
-        assert!(engine.bound().is_empty());
-        let err = engine.connect(&bound).unwrap_err();
-        assert_eq!(err.errno(), "ENOTSOCK", "{err}");
-
-        let terminating = ctx.clone();
-        let report = terminating.shutdown().await;
-        assert_eq!(report.outstanding(), 1, "the socket slot is still held");
-        let err = engine.bind(&bound).await.unwrap_err();
-        assert_eq!(err.errno(), "ETERM", "{err}");
-    }
-
-    /// Claim: **a stranger cannot make one socket hold unboundedly many
-    /// peers.** `max_peers` bounds the accepted connections; the excess is
-    /// closed rather than admitted, leaves no entry behind, and the admitted
-    /// one keeps working. Neither `ZMQ_MAX_SOCKETS` nor `ZMQ_BACKLOG` is
-    /// this bound, which is why the option exists.
-    #[tokio::test]
-    async fn accepted_peers_stop_at_max_peers() {
-        use tokio::io::AsyncReadExt;
-
-        let ctx = context();
-        let session = Recorder::new();
-        let engine = Engine::new(
-            &ctx,
-            SocketOptions {
-                max_peers: 1,
-                ..options()
-            },
-            as_session(&session),
-        )
-        .expect("engine");
-        let bound = engine
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
-        let addr: std::net::SocketAddr = bound.to_string()["tcp://".len()..].parse().expect("addr");
-
-        let admitted = TcpStream::connect(addr).await.expect("first connection");
-        wait_for(|| engine.peers().len() == 1).await;
-
-        // Three more, all past the ceiling: each is accepted by the kernel
-        // and then closed, which a foreign peer observes as an immediate EOF.
-        for _ in 0..3 {
-            let mut refused = TcpStream::connect(addr)
-                .await
-                .expect("a further connection");
-            let mut byte = [0u8; 1];
-            let read = tokio::time::timeout(Duration::from_secs(5), refused.read(&mut byte))
-                .await
-                .expect("the refusal was not left hanging")
-                .expect("read");
-            assert_eq!(read, 0, "a refused connection must be closed, not served");
-        }
-
-        // No entry is left behind, and the admitted peer is untouched.
-        assert_eq!(engine.peers().len(), 1, "the ceiling held");
-        assert_eq!(session.count(), 1, "only the admitted one got a session");
-        assert!(engine.peers()[0].connected);
-
-        // And a slot freed by a peer going away is usable again.
-        drop(admitted);
-        wait_for(|| engine.peers().is_empty()).await;
-        let _next = TcpStream::connect(addr)
-            .await
-            .expect("after the slot freed");
-        wait_for(|| engine.peers().len() == 1).await;
     }
 
     /// A session that panics inside its future, as a bug in a session would.
@@ -2837,98 +2390,6 @@ mod tests {
         drop(far);
         wait_for(|| engine.peers().is_empty()).await;
         listener.abort();
-    }
-
-    /// Claim: an accept that keeps failing is retried on a backoff rather than
-    /// in a spin. The backoff of 10, 20, 40 and 80 ms allows about four attempts
-    /// in 150 ms, where a spin would make thousands.
-    #[tokio::test]
-    async fn a_failing_acceptor_does_not_spin() {
-        let ctx = context();
-        let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let acceptor = Scripted {
-            failures: usize::MAX,
-            calls: Arc::clone(&calls),
-            connection: None,
-        };
-        let endpoint = Endpoint::parse("inproc://broken").expect("endpoint");
-        let listener = tokio::spawn(accept_forever(engine.task_ctx(), acceptor, endpoint));
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        listener.abort();
-        let attempts = calls.load(Ordering::SeqCst);
-        assert!(
-            attempts <= 6,
-            "{attempts} accepts in 150 ms: the listener is spinning"
-        );
-    }
-
-    /// Claim: a session that panics releases its slot. With one slot, the
-    /// second connection is admitted only because the first one's panic
-    /// released it.
-    #[tokio::test]
-    async fn a_panicking_session_releases_its_slot() {
-        let ctx = context();
-        let runs = Arc::new(AtomicUsize::new(0));
-        let engine = Engine::new(
-            &ctx,
-            SocketOptions {
-                max_peers: 1,
-                ..options()
-            },
-            Arc::new(Panicking {
-                runs: Arc::clone(&runs),
-            }),
-        )
-        .expect("engine");
-        let bound = engine
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
-        let addr: std::net::SocketAddr = bound.to_string()["tcp://".len()..].parse().expect("addr");
-
-        let first = TcpStream::connect(addr).await.expect("first connection");
-        wait_for(|| runs.load(Ordering::SeqCst) == 1).await;
-        wait_for(|| engine.peers().is_empty()).await;
-
-        let second = TcpStream::connect(addr).await.expect("second connection");
-        wait_for(|| runs.load(Ordering::SeqCst) == 2).await;
-        wait_for(|| engine.peers().is_empty()).await;
-        drop((first, second));
-    }
-
-    /// Claim: a dialled session that panics ends its own task. The connecter
-    /// survives it, sees a failed connection, and dials again.
-    #[tokio::test]
-    async fn a_panicking_dialled_session_is_retried() {
-        let ctx = context();
-        let recorder = Recorder::new();
-        let session = Arc::new(PanicsOnce {
-            runs: AtomicUsize::new(0),
-            then: Arc::clone(&recorder),
-        });
-        let engine = Engine::new(&ctx, options(), session).expect("engine");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
-        // The peer keeps what it accepts open, so each dial stays connected.
-        let served = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                held.push(stream);
-            }
-        });
-
-        let peer = engine.connect(&endpoint).expect("connect");
-        wait_for(|| recorder.count() == 1).await;
-        wait_for(|| engine.peer(peer).is_some_and(|p| p.connected)).await;
-        assert!(
-            engine.peer(peer).expect("peer").attempts >= 2,
-            "the panicked session was followed by a second dial"
-        );
-        served.abort();
     }
 
     /// Claim: a panic while the engine's state lock is held does not brick the
@@ -3100,92 +2561,6 @@ mod tests {
         }
     }
 
-    /// Claim: a newcomer takes the slot of a stalled handshake and never the
-    /// slot of a live one. Until a handshake has stalled for
-    /// `HANDSHAKE_EVICT_AFTER`, a newcomer is refused. Then the oldest stalled
-    /// handshake is closed and the newcomer admitted, and a handshake that
-    /// completed is never chosen.
-    #[tokio::test]
-    async fn a_stalled_handshake_is_evicted_for_a_newcomer() {
-        let ctx = context();
-        let silent = Recorder::silent();
-        let engine = Engine::new(
-            &ctx,
-            SocketOptions {
-                max_peers: 2,
-                ..options()
-            },
-            as_session(&silent),
-        )
-        .expect("engine");
-        let bound = engine
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
-        let addr: std::net::SocketAddr = bound.to_string()["tcp://".len()..].parse().expect("addr");
-
-        // Two peers that never speak, connected one after the other, so the
-        // first is the older of the two.
-        let mut older_conn = TcpStream::connect(addr).await.expect("first connection");
-        wait_for(|| engine.peers().len() == 1).await;
-        let _younger_conn = TcpStream::connect(addr).await.expect("second connection");
-        wait_for(|| engine.peers().len() == 2).await;
-        let ids: Vec<PeerId> = engine.peers().iter().map(|peer| peer.id).collect();
-        let (older, younger) = (ids[0], ids[1]);
-        let handshake_started = |peer: PeerId| {
-            lock_unpoisoned(&engine.inner.admission)
-                .handshaking
-                .get(&peer)
-                .map(|handshake| handshake.since)
-                .expect("a handshake that has not completed is tracked")
-        };
-        let older_since = handshake_started(older);
-        let younger_since = handshake_started(younger);
-        let newcomer = |at: Instant| {
-            engine
-                .inner
-                .admit(None, None, Pipe::new(options().pipe), at)
-        };
-
-        // One second in, nothing has stalled for two seconds, so the newcomer is
-        // refused and takes no slot.
-        assert!(matches!(
-            newcomer(older_since + Duration::from_secs(1)),
-            Admitted::AtCeiling
-        ));
-        assert_eq!(engine.peers().len(), 2, "a refused newcomer takes no slot");
-
-        // Two seconds in, the oldest stalled handshake is closed and the newcomer
-        // takes its slot.
-        let Admitted::Peer(_newcomer) = newcomer(older_since + HANDSHAKE_EVICT_AFTER) else {
-            panic!("a stalled handshake was not evicted for a newcomer");
-        };
-        let mut byte = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(10), older_conn.read(&mut byte))
-            .await
-            .expect("the evicted connection closed in time")
-            .expect("read");
-        assert_eq!(read, 0, "the socket closed the evicted connection");
-        assert!(engine.peer(older).is_none(), "the evicted peer is gone");
-        assert!(
-            engine.peer(younger).is_some(),
-            "the younger handshake stays"
-        );
-
-        // A completed handshake is no longer in the set that eviction draws from,
-        // however old it is. The newcomer admitted above has not stalled yet at
-        // this instant, so nothing is evictable.
-        engine.inner.handshake_completed(younger);
-        assert!(matches!(
-            newcomer(younger_since + HANDSHAKE_EVICT_AFTER),
-            Admitted::AtCeiling
-        ));
-        assert!(
-            engine.peer(younger).is_some(),
-            "a completed handshake is never chosen"
-        );
-    }
-
     /// Claim: a refusal storm is logged once per period, and the next period
     /// reports how many events it stood in for.
     #[test]
@@ -3209,42 +2584,6 @@ mod tests {
         assert_eq!(gate.permit_at(next), None, "and it logs one of its own");
     }
 
-    /// Claim: every connection the socket refuses at admission is counted on
-    /// the engine, whether or not its log line gets through.
-    #[tokio::test]
-    async fn refused_connections_are_counted() {
-        let ctx = context();
-        let session = Recorder::new();
-        let engine = Engine::new(
-            &ctx,
-            SocketOptions {
-                max_peers: 1,
-                ..options()
-            },
-            as_session(&session),
-        )
-        .expect("engine");
-        let bound = engine
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
-        let addr: std::net::SocketAddr = bound.to_string()["tcp://".len()..].parse().expect("addr");
-
-        let _admitted = TcpStream::connect(addr).await.expect("first connection");
-        wait_for(|| engine.peers().len() == 1).await;
-        for _ in 0..3 {
-            let _refused = TcpStream::connect(addr)
-                .await
-                .expect("a further connection");
-        }
-        wait_for(|| engine.inner.refused.load(Ordering::SeqCst) == 3).await;
-        assert_eq!(
-            engine.peers().len(),
-            1,
-            "the refused connections took no slot"
-        );
-    }
-
     /// An engine that dials once and gives up, so that a peer which never
     /// connects stays exactly as it is: no retry counts an attempt and
     /// publishes a new snapshot under a test that is comparing two.
@@ -3253,128 +2592,6 @@ mod tests {
             reconnect_ivl: None,
             ..options()
         }
-    }
-
-    /// Claim: **the peers are one shared snapshot until something about them
-    /// changes** — the same `Arc`, not an equal copy — so a send or a receive
-    /// per message costs a lock and a reference-count bump instead of a lock
-    /// per peer and an allocation or three, at a peer count a stranger
-    /// chooses. A peer arriving, an announcement and a peer going each publish
-    /// a new one, and a snapshot already taken is never altered under its
-    /// holder.
-    #[tokio::test]
-    async fn the_peers_are_one_shared_snapshot_until_something_changes() {
-        let ctx = context();
-        let engine = Engine::new(&ctx, dials_once(), Recorder::new()).expect("engine");
-        let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
-        let elsewhere = Endpoint::parse("tcp://127.0.0.1:10").expect("endpoint");
-        let first = engine.connect(&nowhere).expect("connect");
-        // The one attempt is counted, and that is the last change there is
-        // until the test makes one.
-        wait_for(|| engine.peers().first().map(|peer| peer.attempts) == Some(1)).await;
-
-        let before = engine.peers();
-        assert!(
-            Arc::ptr_eq(&before, &engine.peers()),
-            "nothing changed, so nothing was rebuilt"
-        );
-        assert!(
-            Arc::ptr_eq(&before, &engine.outgoing_peers()),
-            "without ZMQ_IMMEDIATE every peer is one a sender may use"
-        );
-
-        let before_connect = engine.generation();
-        assert_eq!(before_connect, engine.generation(), "nothing changed");
-        engine.connect(&elsewhere).expect("connect");
-        let grown = engine.peers();
-        assert!(!Arc::ptr_eq(&before, &grown), "a peer arrived");
-        let grown_at = engine.generation();
-        assert!(grown_at > before_connect, "a peer arrived");
-        assert_eq!(grown.len(), 2);
-        assert!(
-            grown.windows(2).all(|pair| pair[0].id < pair[1].id),
-            "sorted by id, which is what lets a reader search it"
-        );
-        assert_eq!(before.len(), 1, "the snapshot already taken is unchanged");
-
-        engine.assume(
-            first,
-            Some(ZapUserId::new("alice")),
-            Some(RoutingId::new(b"alpha".to_vec()).expect("id")),
-        );
-        let announced = engine.peers();
-        assert!(!Arc::ptr_eq(&grown, &announced), "an announcement");
-        let announced_at = engine.generation();
-        assert!(
-            announced_at > grown_at,
-            "an announcement is a change of its own"
-        );
-        let peer = announced
-            .iter()
-            .find(|peer| peer.id == first)
-            .expect("peer");
-        assert!(peer.announced);
-        assert_eq!(
-            peer.identity.as_ref().map(RoutingId::as_bytes),
-            Some(&b"alpha"[..])
-        );
-        assert_eq!(peer.user_id.as_ref().map(ZapUserId::as_str), Some("alice"));
-        assert!(!grown[0].announced, "an older snapshot does not learn it");
-
-        engine.disconnect(&nowhere).expect("disconnect");
-        let shrunk = engine.peers();
-        assert!(!Arc::ptr_eq(&announced, &shrunk), "a peer went");
-        assert!(engine.generation() > announced_at, "a peer went");
-        assert_eq!(shrunk.len(), 1);
-    }
-
-    /// Claim: **every change to the peer set rings both bells a socket's waits
-    /// are parked on**, whichever way the set changes — a peer arriving, an
-    /// announcement, a peer going — because a socket waiting for "a message or
-    /// a peer" has nothing else to be woken by.
-    #[tokio::test]
-    async fn a_change_to_the_peer_set_rings_both_bells() {
-        use std::task::{Context as TaskContext, Poll, Waker};
-
-        let ctx = context();
-        let engine = Engine::new(&ctx, dials_once(), Recorder::new()).expect("engine");
-        let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
-        let mut cx = TaskContext::from_waker(Waker::noop());
-
-        let mut rung = |change: &dyn Fn()| {
-            let mut readable = std::pin::pin!(engine.readable());
-            let mut writable = std::pin::pin!(engine.writable());
-            assert!(readable.as_mut().poll(&mut cx).is_pending());
-            assert!(writable.as_mut().poll(&mut cx).is_pending());
-            change();
-            (
-                readable.as_mut().poll(&mut cx) == Poll::Ready(()),
-                writable.as_mut().poll(&mut cx) == Poll::Ready(()),
-            )
-        };
-
-        let first = std::cell::Cell::new(None);
-        assert_eq!(
-            rung(&|| first.set(Some(engine.connect(&nowhere).expect("connect")))),
-            (true, true),
-            "a peer arrived"
-        );
-        let first = first.get().expect("the peer");
-        // A wait reads the peers after it creates its bell, which is what
-        // publishes the peer and makes its announcement report to the engine.
-        let _published = engine.peers();
-        assert_eq!(
-            rung(&|| engine.assume(first, None, None)),
-            (true, true),
-            "a peer announced"
-        );
-        assert_eq!(
-            rung(&|| {
-                engine.disconnect(&nowhere).expect("disconnect");
-            }),
-            (true, true),
-            "a peer went"
-        );
     }
 
     /// What the kernel has for one TCP connection: `SO_KEEPALIVE` and the three
@@ -3425,43 +2642,816 @@ mod tests {
         }
     }
 
-    /// Claim: **`ZMQ_TCP_KEEPALIVE` and its tuning options reach both kinds of
-    /// TCP connection**, the one a listener accepts and the one a connecter
-    /// dials, each from its own socket's options. A half-open connection is
-    /// found by the kernel's probes or not at all while the heartbeat is off,
-    /// and the probes are configured on the connection, not on the socket
-    /// that listens or dials.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn keepalive_is_set_on_accepted_and_dialled_connections() {
-        let keepalive = |idle: u64, intvl: u64, cnt: u32| SocketOptions {
-            tcp_keepalive: Some(true),
-            tcp_keepalive_idle: Some(Duration::from_secs(idle)),
-            tcp_keepalive_intvl: Some(Duration::from_secs(intvl)),
-            tcp_keepalive_cnt: Some(cnt),
-            ..options()
-        };
-        let ctx = context();
-        let accepting = Arc::new(KeepaliveProbe::default());
-        let server = Engine::new(&ctx, keepalive(31, 7, 4), accepting.clone()).expect("server");
-        let endpoint = server
-            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
-            .await
-            .expect("bind");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let dialling = Arc::new(KeepaliveProbe::default());
-        let client = Engine::new(&ctx, keepalive(43, 9, 6), dialling.clone()).expect("client");
-        client.connect(&endpoint).expect("connect");
-        wait_for(|| !accepting.seen().is_empty() && !dialling.seen().is_empty()).await;
+        /// Claim: a wildcard bind is only usable through the endpoint it reports —
+        /// `ZMQ_LAST_ENDPOINT` — and that endpoint unbinds it. The requested form
+        /// unbinds it too, and an endpoint nothing is bound at is `ENOENT`.
+        #[tokio::test]
+        async fn a_wildcard_bind_reports_the_endpoint_it_got() {
+            let ctx = context();
+            let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
 
-        let state = |role, idle, interval, count| KeepaliveState {
-            role,
-            enabled: true,
-            idle: Duration::from_secs(idle),
-            interval: Duration::from_secs(interval),
-            count,
-        };
-        assert_eq!(accepting.seen(), [state(Role::Binder, 31, 7, 4)]);
-        assert_eq!(dialling.seen(), [state(Role::Connecter, 43, 9, 6)]);
+            let requested = Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint");
+            let bound = engine.bind(&requested).await.expect("bind");
+            assert!(!bound.has_wildcard_port(), "the port must be resolved");
+            assert_eq!(engine.last_endpoint().as_ref(), Some(&bound));
+            assert_eq!(engine.bound(), vec![bound.clone()]);
+
+            let err = engine
+                .unbind(&Endpoint::parse("tcp://127.0.0.1:1").expect("endpoint"))
+                .unwrap_err();
+            assert_eq!(err.errno(), "ENOENT", "{err}");
+
+            engine
+                .unbind(&bound)
+                .expect("unbind by the reported endpoint");
+            assert!(engine.bound().is_empty());
+
+            // And the requested form works too, for a caller that kept it.
+            let bound = engine.bind(&requested).await.expect("rebind");
+            engine
+                .unbind(&requested)
+                .expect("unbind by the requested form");
+            assert!(engine.bound().is_empty());
+            drop(bound);
+        }
+        /// Claim: one socket binds many endpoints and connects many, and accepts
+        /// automatically on each — `zmq_socket(3)`'s "many-to-many".
+        #[tokio::test]
+        async fn one_socket_binds_and_connects_many_endpoints() {
+            let ctx = context();
+            let server_session = Recorder::new();
+            let server = Engine::new(&ctx, options(), as_session(&server_session)).expect("server");
+            let first = server
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("first bind");
+            let second = server
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("second bind");
+            assert_eq!(server.bound().len(), 2);
+
+            let client_session = Recorder::new();
+            let client = Engine::new(&ctx, options(), as_session(&client_session)).expect("client");
+            client.connect(&first).expect("connect one");
+            client.connect(&second).expect("connect two");
+            assert_eq!(client.connected().len(), 2);
+
+            wait_for(|| server_session.count() == 2 && client_session.count() == 2).await;
+            assert_eq!(server_session.roles(), vec![Role::Binder, Role::Binder]);
+            assert_eq!(
+                client_session.roles(),
+                vec![Role::Connecter, Role::Connecter]
+            );
+            wait_for(|| client.peers().iter().all(|peer| peer.connected)).await;
+            assert_eq!(client.peers().len(), 2);
+            assert_eq!(server.peers().len(), 2);
+        }
+        /// Claim: the queue exists before the connection does — the pattern
+        /// RFCs' "whether or not the connection is established" — so a sender may
+        /// fill it while the endpoint is still being dialled.
+        #[tokio::test]
+        async fn a_peer_that_never_connected_still_has_a_queue() {
+            let ctx = context();
+            let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+            // Port 9 is discard, and nothing listens on it here.
+            let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+            let peer = engine.connect(&nowhere).expect("connect");
+
+            let peers = engine.outgoing_peers();
+            assert_eq!(peers.len(), 1, "the peer is there immediately");
+            assert!(!peers[0].connected);
+            assert_eq!(
+                peers[0]
+                    .pipe
+                    .outgoing()
+                    .send(Multipart::single("queued for nobody"))
+                    .await
+                    .expect("queued"),
+                Sent::Queued
+            );
+            assert_eq!(engine.peer(peer).expect("peer").pipe.outgoing().len(), 1);
+
+            // And it is dialling, not sitting still.
+            wait_for(|| engine.peer(peer).map(|p| p.attempts) >= Some(2)).await;
+        }
+        /// Claim: `ZMQ_IMMEDIATE` hides a peer from the sender until its
+        /// connection completes, which is what "messages shall be queued only to
+        /// completed connections" means for a round-robin socket.
+        #[tokio::test]
+        async fn immediate_hides_a_peer_until_it_connects() {
+            let ctx = context();
+            let server = Engine::new(&ctx, options(), Recorder::new()).expect("server");
+            let endpoint = server
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+
+            let immediate = SocketOptions {
+                immediate: true,
+                ..options()
+            };
+            let client = Engine::new(&ctx, immediate, Recorder::new()).expect("client");
+            let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+            client.connect(&nowhere).expect("connect to nothing");
+            assert_eq!(client.peers().len(), 1, "the peer and its queue exist");
+            assert!(
+                client.outgoing_peers().is_empty(),
+                "but a sender may not use it yet"
+            );
+
+            client.connect(&endpoint).expect("connect to the server");
+            wait_for(|| client.outgoing_peers().len() == 1).await;
+            assert!(client.outgoing_peers()[0].connected);
+            assert_eq!(client.peers().len(), 2);
+        }
+        /// Claim: a lost connection is redialled, so a peer whose listener goes
+        /// away and comes back is reconnected without the application asking.
+        #[tokio::test]
+        async fn a_dropped_peer_is_reconnected_when_it_returns() {
+            let ctx = context();
+            let session = Recorder::new();
+            let engine = Engine::new(&ctx, options(), as_session(&session)).expect("engine");
+
+            // A peer that accepts one connection and immediately drops it.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
+            let accepted = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                drop(stream);
+                drop(listener);
+            });
+
+            let peer = engine.connect(&endpoint).expect("connect");
+            wait_for(|| session.count() == 1).await;
+            accepted.await.expect("the peer served once");
+            wait_for(|| engine.peer(peer).is_some_and(|p| !p.connected)).await;
+
+            // The peer comes back on the same port, and nobody told the socket.
+            let again = TcpListener::bind(format!("127.0.0.1:{port}"))
+                .await
+                .expect("rebind");
+            let served = tokio::spawn(async move {
+                let (stream, _) = again.accept().await.expect("accept");
+                // Hold it while the assertions below run. Margin: 200 ms
+                // against `wait_for`'s 5 ms polling, and the assertions are
+                // waits rather than samples, so this only has to outlast them.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                drop(stream);
+            });
+            wait_for(|| session.count() == 2).await;
+            wait_for(|| engine.peer(peer).is_some_and(|p| p.connected)).await;
+            assert!(
+                engine.peer(peer).expect("peer").attempts >= 2,
+                "the reconnect is a second attempt, not a retained connection"
+            );
+            served.await.expect("the peer served twice");
+        }
+        /// Claim: `ZMQ_CONNECT_TIMEOUT` bounds one attempt, so a black-hole
+        /// address does not park the socket on the OS's SYN retries. RFC 8305's
+        /// 250 ms scale, not the tens of seconds Linux would take.
+        #[tokio::test]
+        async fn connect_timeout_bounds_an_attempt_against_a_black_hole() {
+            let ctx = context();
+            let bounded = SocketOptions {
+                connect_timeout: Some(Duration::from_millis(250)),
+                reconnect_ivl: Some(Duration::from_millis(20)),
+                ..SocketOptions::default()
+            };
+            let engine = Engine::new(&ctx, bounded, Recorder::new()).expect("engine");
+            // TEST-NET-3 (RFC 5737): documentation space, routed nowhere.
+            let black_hole = Endpoint::parse("tcp://203.0.113.1:5555").expect("endpoint");
+            let peer = engine.connect(&black_hole).expect("connect");
+
+            let started = std::time::Instant::now();
+            wait_for(|| engine.peer(peer).map(|p| p.attempts) >= Some(2)).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "two attempts must fit in seconds, not in SYN retries: {:?}",
+                started.elapsed()
+            );
+            assert!(!engine.peer(peer).expect("peer").connected);
+        }
+        /// Claim: `ZMQ_HANDSHAKE_IVL` closes a connection whose handshake never
+        /// completes — the defence against a peer that connects and says nothing.
+        #[tokio::test]
+        async fn a_handshake_that_never_completes_is_closed() {
+            let ctx = context();
+            let silent = Recorder::silent();
+            let dropped = Arc::clone(&silent.dropped);
+            let engine = Engine::new(
+                &ctx,
+                SocketOptions {
+                    // Margin: a 30 ms handshake interval against a peer that is
+                    // held open for 5 s, so the interval is two orders of
+                    // magnitude inside the window in which it must fire; the
+                    // assertions wait for the drop rather than sampling for it.
+                    handshake_ivl: Some(Duration::from_millis(30)),
+                    // One attempt, so the assertion counts one connection.
+                    reconnect_ivl: None,
+                    ..SocketOptions::default()
+                },
+                as_session(&silent),
+            )
+            .expect("engine");
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            let held = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                // A peer that connects and never speaks: held open deliberately.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(stream);
+            });
+
+            let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
+            let peer = engine.connect(&endpoint).expect("connect");
+            wait_for(|| silent.count() == 1).await;
+            wait_for(|| dropped.load(Ordering::SeqCst) == 1).await;
+            wait_for(|| engine.peer(peer).is_some_and(|p| !p.connected)).await;
+            held.abort();
+        }
+        /// Claim: `disconnect` destroys the endpoint's pipe and the messages in
+        /// it are counted rather than quietly lost — the RFCs' "discarding any
+        /// messages it contains", made a number.
+        #[tokio::test]
+        async fn disconnect_destroys_the_pipe_and_counts_what_it_held() {
+            let ctx = context();
+            let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+            let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+            let peer = engine.connect(&nowhere).expect("connect");
+
+            let pipe = engine.peer(peer).expect("peer").pipe;
+            for n in 0..3 {
+                pipe.outgoing()
+                    .send(Multipart::single(format!("{n}")))
+                    .await
+                    .expect("queued");
+            }
+
+            let discarded = engine.disconnect(&nowhere).expect("disconnect");
+            assert_eq!(
+                discarded,
+                Discarded {
+                    outgoing: 3,
+                    incoming: 0
+                }
+            );
+            assert!(engine.peers().is_empty());
+            assert!(engine.connected().is_empty());
+            assert!(pipe.outgoing().is_closed());
+
+            let err = engine.disconnect(&nowhere).unwrap_err();
+            assert_eq!(err.errno(), "ENOENT", "{err}");
+        }
+        /// Claim: every transport this engine carries is accepted where it is
+        /// asked for, and the wildcard address — which binds — is refused as a
+        /// dial. A transport the library does not implement at all is refused by
+        /// the endpoint parser, where it is named; there is no half-accepted
+        /// endpoint anywhere in between.
+        #[tokio::test]
+        async fn every_carried_transport_is_accepted_and_the_wildcard_is_not_dialled() {
+            let ctx = context();
+            let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+
+            let inproc = Endpoint::parse("inproc://orders").expect("endpoint");
+            engine.bind(&inproc).await.expect("inproc is carried");
+            engine.connect(&inproc).expect("inproc is carried");
+
+            #[cfg(unix)]
+            {
+                let path = std::env::temp_dir().join(format!("weida-zmq-{}-eng.sock", nonce()));
+                let ipc = Endpoint::parse(&format!("ipc://{}", path.display())).expect("endpoint");
+                engine.bind(&ipc).await.expect("ipc is carried");
+                engine.connect(&ipc).expect("ipc is carried");
+            }
+
+            let err = Endpoint::parse("epgm://239.0.0.1:5555").unwrap_err();
+            assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
+
+            // The wildcard binds; it does not dial.
+            let err = engine
+                .connect(&Endpoint::parse("tcp://*:5555").expect("endpoint"))
+                .unwrap_err();
+            assert_eq!(err.errno(), "EINVAL", "{err}");
+        }
+        /// Claim: an `ipc://` bind and connect meet over `AF_UNIX`, both sides
+        /// are recorded with the kernel's statement about the other, and the
+        /// socket file is gone once the bind is undone — the node belongs to the
+        /// binding.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_ipc_bind_and_connect_meet_with_credentials() {
+            let ctx = context();
+            let binder = Recorder::new();
+            let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
+            let dialler = Recorder::new();
+            let client = Engine::new(&ctx, options(), as_session(&dialler)).expect("engine");
+
+            let path = std::env::temp_dir().join(format!("weida-zmq-{}-meet.sock", nonce()));
+            let endpoint = Endpoint::parse(&format!("ipc://{}", path.display())).expect("endpoint");
+            let bound = server.bind(&endpoint).await.expect("bind");
+            assert_eq!(bound, endpoint, "an ipc bind has nothing to resolve");
+            assert!(path.exists(), "the socket file is the endpoint");
+
+            let peer = client.connect(&endpoint).expect("connect");
+            wait_for(|| binder.count() == 1 && dialler.count() == 1).await;
+            assert_eq!(binder.roles(), vec![Role::Binder]);
+            assert_eq!(dialler.roles(), vec![Role::Connecter]);
+
+            // Both ends hold the kernel's answer, which for two ends of one
+            // connection in one process is this process.
+            let dialled = client.peer(peer).expect("the dialled peer");
+            let credentials = dialled.credentials.expect("credentials at connect");
+            if let Some(pid) = credentials.pid {
+                assert_eq!(pid, std::process::id());
+            }
+            wait_for(|| {
+                server
+                    .peers()
+                    .first()
+                    .is_some_and(|peer| peer.credentials.is_some())
+            })
+            .await;
+
+            server.unbind(&endpoint).expect("unbind");
+            wait_for(|| !path.exists()).await;
+        }
+        /// Claim: a TCP peer has no credentials to report — there is no kernel
+        /// fact about a process behind an address, and `None` says so rather
+        /// than a zero that would read as root.
+        #[tokio::test]
+        async fn a_tcp_peer_has_no_credentials() {
+            let ctx = context();
+            let binder = Recorder::new();
+            let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
+            let bound = server
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+            let client = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+            let peer = client.connect(&bound).expect("connect");
+            wait_for(|| client.peer(peer).is_some_and(|peer| peer.connected)).await;
+            assert!(client.peer(peer).expect("peer").credentials.is_none());
+        }
+        /// Claim: closing the socket stops everything and destroys the pipes, and
+        /// a terminated context refuses further operations with `ETERM`.
+        #[tokio::test]
+        async fn a_closed_socket_and_a_terminated_context_refuse_work() {
+            let ctx = context();
+            let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+            let bound = engine
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+            let peer = engine.connect(&bound).expect("connect");
+            wait_for(|| engine.peer(peer).is_some_and(|p| p.connected)).await;
+
+            engine.close();
+            assert!(engine.peers().is_empty());
+            assert!(engine.bound().is_empty());
+            let err = engine.connect(&bound).unwrap_err();
+            assert_eq!(err.errno(), "ENOTSOCK", "{err}");
+
+            let terminating = ctx.clone();
+            let report = terminating.shutdown().await;
+            assert_eq!(report.outstanding(), 1, "the socket slot is still held");
+            let err = engine.bind(&bound).await.unwrap_err();
+            assert_eq!(err.errno(), "ETERM", "{err}");
+        }
+        /// Claim: **a stranger cannot make one socket hold unboundedly many
+        /// peers.** `max_peers` bounds the accepted connections; the excess is
+        /// closed rather than admitted, leaves no entry behind, and the admitted
+        /// one keeps working. Neither `ZMQ_MAX_SOCKETS` nor `ZMQ_BACKLOG` is
+        /// this bound, which is why the option exists.
+        #[tokio::test]
+        async fn accepted_peers_stop_at_max_peers() {
+            use tokio::io::AsyncReadExt;
+
+            let ctx = context();
+            let session = Recorder::new();
+            let engine = Engine::new(
+                &ctx,
+                SocketOptions {
+                    max_peers: 1,
+                    ..options()
+                },
+                as_session(&session),
+            )
+            .expect("engine");
+            let bound = engine
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+            let addr: std::net::SocketAddr =
+                bound.to_string()["tcp://".len()..].parse().expect("addr");
+
+            let admitted = TcpStream::connect(addr).await.expect("first connection");
+            wait_for(|| engine.peers().len() == 1).await;
+
+            // Three more, all past the ceiling: each is accepted by the kernel
+            // and then closed, which a foreign peer observes as an immediate EOF.
+            for _ in 0..3 {
+                let mut refused = TcpStream::connect(addr)
+                    .await
+                    .expect("a further connection");
+                let mut byte = [0u8; 1];
+                let read = tokio::time::timeout(Duration::from_secs(5), refused.read(&mut byte))
+                    .await
+                    .expect("the refusal was not left hanging")
+                    .expect("read");
+                assert_eq!(read, 0, "a refused connection must be closed, not served");
+            }
+
+            // No entry is left behind, and the admitted peer is untouched.
+            assert_eq!(engine.peers().len(), 1, "the ceiling held");
+            assert_eq!(session.count(), 1, "only the admitted one got a session");
+            assert!(engine.peers()[0].connected);
+
+            // And a slot freed by a peer going away is usable again.
+            drop(admitted);
+            wait_for(|| engine.peers().is_empty()).await;
+            let _next = TcpStream::connect(addr)
+                .await
+                .expect("after the slot freed");
+            wait_for(|| engine.peers().len() == 1).await;
+        }
+        /// Claim: an accept that keeps failing is retried on a backoff rather than
+        /// in a spin. The backoff of 10, 20, 40 and 80 ms allows about four attempts
+        /// in 150 ms, where a spin would make thousands.
+        #[tokio::test]
+        async fn a_failing_acceptor_does_not_spin() {
+            let ctx = context();
+            let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let acceptor = Scripted {
+                failures: usize::MAX,
+                calls: Arc::clone(&calls),
+                connection: None,
+            };
+            let endpoint = Endpoint::parse("inproc://broken").expect("endpoint");
+            let listener = tokio::spawn(accept_forever(engine.task_ctx(), acceptor, endpoint));
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            listener.abort();
+            let attempts = calls.load(Ordering::SeqCst);
+            assert!(
+                attempts <= 6,
+                "{attempts} accepts in 150 ms: the listener is spinning"
+            );
+        }
+        /// Claim: a session that panics releases its slot. With one slot, the
+        /// second connection is admitted only because the first one's panic
+        /// released it.
+        #[tokio::test]
+        async fn a_panicking_session_releases_its_slot() {
+            let ctx = context();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let engine = Engine::new(
+                &ctx,
+                SocketOptions {
+                    max_peers: 1,
+                    ..options()
+                },
+                Arc::new(Panicking {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .expect("engine");
+            let bound = engine
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+            let addr: std::net::SocketAddr =
+                bound.to_string()["tcp://".len()..].parse().expect("addr");
+
+            let first = TcpStream::connect(addr).await.expect("first connection");
+            wait_for(|| runs.load(Ordering::SeqCst) == 1).await;
+            wait_for(|| engine.peers().is_empty()).await;
+
+            let second = TcpStream::connect(addr).await.expect("second connection");
+            wait_for(|| runs.load(Ordering::SeqCst) == 2).await;
+            wait_for(|| engine.peers().is_empty()).await;
+            drop((first, second));
+        }
+        /// Claim: a dialled session that panics ends its own task. The connecter
+        /// survives it, sees a failed connection, and dials again.
+        #[tokio::test]
+        async fn a_panicking_dialled_session_is_retried() {
+            let ctx = context();
+            let recorder = Recorder::new();
+            let session = Arc::new(PanicsOnce {
+                runs: AtomicUsize::new(0),
+                then: Arc::clone(&recorder),
+            });
+            let engine = Engine::new(&ctx, options(), session).expect("engine");
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            let endpoint = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("endpoint");
+            // The peer keeps what it accepts open, so each dial stays connected.
+            let served = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                }
+            });
+
+            let peer = engine.connect(&endpoint).expect("connect");
+            wait_for(|| recorder.count() == 1).await;
+            wait_for(|| engine.peer(peer).is_some_and(|p| p.connected)).await;
+            assert!(
+                engine.peer(peer).expect("peer").attempts >= 2,
+                "the panicked session was followed by a second dial"
+            );
+            served.abort();
+        }
+        /// Claim: a newcomer takes the slot of a stalled handshake and never the
+        /// slot of a live one. Until a handshake has stalled for
+        /// `HANDSHAKE_EVICT_AFTER`, a newcomer is refused. Then the oldest stalled
+        /// handshake is closed and the newcomer admitted, and a handshake that
+        /// completed is never chosen.
+        #[tokio::test]
+        async fn a_stalled_handshake_is_evicted_for_a_newcomer() {
+            let ctx = context();
+            let silent = Recorder::silent();
+            let engine = Engine::new(
+                &ctx,
+                SocketOptions {
+                    max_peers: 2,
+                    ..options()
+                },
+                as_session(&silent),
+            )
+            .expect("engine");
+            let bound = engine
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+            let addr: std::net::SocketAddr =
+                bound.to_string()["tcp://".len()..].parse().expect("addr");
+
+            // Two peers that never speak, connected one after the other, so the
+            // first is the older of the two.
+            let mut older_conn = TcpStream::connect(addr).await.expect("first connection");
+            wait_for(|| engine.peers().len() == 1).await;
+            let _younger_conn = TcpStream::connect(addr).await.expect("second connection");
+            wait_for(|| engine.peers().len() == 2).await;
+            let ids: Vec<PeerId> = engine.peers().iter().map(|peer| peer.id).collect();
+            let (older, younger) = (ids[0], ids[1]);
+            let handshake_started = |peer: PeerId| {
+                lock_unpoisoned(&engine.inner.admission)
+                    .handshaking
+                    .get(&peer)
+                    .map(|handshake| handshake.since)
+                    .expect("a handshake that has not completed is tracked")
+            };
+            let older_since = handshake_started(older);
+            let younger_since = handshake_started(younger);
+            let newcomer = |at: Instant| {
+                engine
+                    .inner
+                    .admit(None, None, Pipe::new(options().pipe), at)
+            };
+
+            // One second in, nothing has stalled for two seconds, so the newcomer is
+            // refused and takes no slot.
+            assert!(matches!(
+                newcomer(older_since + Duration::from_secs(1)),
+                Admitted::AtCeiling
+            ));
+            assert_eq!(engine.peers().len(), 2, "a refused newcomer takes no slot");
+
+            // Two seconds in, the oldest stalled handshake is closed and the newcomer
+            // takes its slot.
+            let Admitted::Peer(_newcomer) = newcomer(older_since + HANDSHAKE_EVICT_AFTER) else {
+                panic!("a stalled handshake was not evicted for a newcomer");
+            };
+            let mut byte = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(10), older_conn.read(&mut byte))
+                .await
+                .expect("the evicted connection closed in time")
+                .expect("read");
+            assert_eq!(read, 0, "the socket closed the evicted connection");
+            assert!(engine.peer(older).is_none(), "the evicted peer is gone");
+            assert!(
+                engine.peer(younger).is_some(),
+                "the younger handshake stays"
+            );
+
+            // A completed handshake is no longer in the set that eviction draws from,
+            // however old it is. The newcomer admitted above has not stalled yet at
+            // this instant, so nothing is evictable.
+            engine.inner.handshake_completed(younger);
+            assert!(matches!(
+                newcomer(younger_since + HANDSHAKE_EVICT_AFTER),
+                Admitted::AtCeiling
+            ));
+            assert!(
+                engine.peer(younger).is_some(),
+                "a completed handshake is never chosen"
+            );
+        }
+        /// Claim: every connection the socket refuses at admission is counted on
+        /// the engine, whether or not its log line gets through.
+        #[tokio::test]
+        async fn refused_connections_are_counted() {
+            let ctx = context();
+            let session = Recorder::new();
+            let engine = Engine::new(
+                &ctx,
+                SocketOptions {
+                    max_peers: 1,
+                    ..options()
+                },
+                as_session(&session),
+            )
+            .expect("engine");
+            let bound = engine
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+            let addr: std::net::SocketAddr =
+                bound.to_string()["tcp://".len()..].parse().expect("addr");
+
+            let _admitted = TcpStream::connect(addr).await.expect("first connection");
+            wait_for(|| engine.peers().len() == 1).await;
+            for _ in 0..3 {
+                let _refused = TcpStream::connect(addr)
+                    .await
+                    .expect("a further connection");
+            }
+            wait_for(|| engine.inner.refused.load(Ordering::SeqCst) == 3).await;
+            assert_eq!(
+                engine.peers().len(),
+                1,
+                "the refused connections took no slot"
+            );
+        }
+        /// Claim: **the peers are one shared snapshot until something about them
+        /// changes** — the same `Arc`, not an equal copy — so a send or a receive
+        /// per message costs a lock and a reference-count bump instead of a lock
+        /// per peer and an allocation or three, at a peer count a stranger
+        /// chooses. A peer arriving, an announcement and a peer going each publish
+        /// a new one, and a snapshot already taken is never altered under its
+        /// holder.
+        #[tokio::test]
+        async fn the_peers_are_one_shared_snapshot_until_something_changes() {
+            let ctx = context();
+            let engine = Engine::new(&ctx, dials_once(), Recorder::new()).expect("engine");
+            let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+            let elsewhere = Endpoint::parse("tcp://127.0.0.1:10").expect("endpoint");
+            let first = engine.connect(&nowhere).expect("connect");
+            // The one attempt is counted, and that is the last change there is
+            // until the test makes one.
+            wait_for(|| engine.peers().first().map(|peer| peer.attempts) == Some(1)).await;
+
+            let before = engine.peers();
+            assert!(
+                Arc::ptr_eq(&before, &engine.peers()),
+                "nothing changed, so nothing was rebuilt"
+            );
+            assert!(
+                Arc::ptr_eq(&before, &engine.outgoing_peers()),
+                "without ZMQ_IMMEDIATE every peer is one a sender may use"
+            );
+
+            let before_connect = engine.generation();
+            assert_eq!(before_connect, engine.generation(), "nothing changed");
+            engine.connect(&elsewhere).expect("connect");
+            let grown = engine.peers();
+            assert!(!Arc::ptr_eq(&before, &grown), "a peer arrived");
+            let grown_at = engine.generation();
+            assert!(grown_at > before_connect, "a peer arrived");
+            assert_eq!(grown.len(), 2);
+            assert!(
+                grown.windows(2).all(|pair| pair[0].id < pair[1].id),
+                "sorted by id, which is what lets a reader search it"
+            );
+            assert_eq!(before.len(), 1, "the snapshot already taken is unchanged");
+
+            engine.assume(
+                first,
+                Some(ZapUserId::new("alice")),
+                Some(RoutingId::new(b"alpha".to_vec()).expect("id")),
+            );
+            let announced = engine.peers();
+            assert!(!Arc::ptr_eq(&grown, &announced), "an announcement");
+            let announced_at = engine.generation();
+            assert!(
+                announced_at > grown_at,
+                "an announcement is a change of its own"
+            );
+            let peer = announced
+                .iter()
+                .find(|peer| peer.id == first)
+                .expect("peer");
+            assert!(peer.announced);
+            assert_eq!(
+                peer.identity.as_ref().map(RoutingId::as_bytes),
+                Some(&b"alpha"[..])
+            );
+            assert_eq!(peer.user_id.as_ref().map(ZapUserId::as_str), Some("alice"));
+            assert!(!grown[0].announced, "an older snapshot does not learn it");
+
+            engine.disconnect(&nowhere).expect("disconnect");
+            let shrunk = engine.peers();
+            assert!(!Arc::ptr_eq(&announced, &shrunk), "a peer went");
+            assert!(engine.generation() > announced_at, "a peer went");
+            assert_eq!(shrunk.len(), 1);
+        }
+        /// Claim: **every change to the peer set rings both bells a socket's waits
+        /// are parked on**, whichever way the set changes — a peer arriving, an
+        /// announcement, a peer going — because a socket waiting for "a message or
+        /// a peer" has nothing else to be woken by.
+        #[tokio::test]
+        async fn a_change_to_the_peer_set_rings_both_bells() {
+            use std::task::{Context as TaskContext, Poll, Waker};
+
+            let ctx = context();
+            let engine = Engine::new(&ctx, dials_once(), Recorder::new()).expect("engine");
+            let nowhere = Endpoint::parse("tcp://127.0.0.1:9").expect("endpoint");
+            let mut cx = TaskContext::from_waker(Waker::noop());
+
+            let mut rung = |change: &dyn Fn()| {
+                let mut readable = std::pin::pin!(engine.readable());
+                let mut writable = std::pin::pin!(engine.writable());
+                assert!(readable.as_mut().poll(&mut cx).is_pending());
+                assert!(writable.as_mut().poll(&mut cx).is_pending());
+                change();
+                (
+                    readable.as_mut().poll(&mut cx) == Poll::Ready(()),
+                    writable.as_mut().poll(&mut cx) == Poll::Ready(()),
+                )
+            };
+
+            let first = std::cell::Cell::new(None);
+            assert_eq!(
+                rung(&|| first.set(Some(engine.connect(&nowhere).expect("connect")))),
+                (true, true),
+                "a peer arrived"
+            );
+            let first = first.get().expect("the peer");
+            // A wait reads the peers after it creates its bell, which is what
+            // publishes the peer and makes its announcement report to the engine.
+            let _published = engine.peers();
+            assert_eq!(
+                rung(&|| engine.assume(first, None, None)),
+                (true, true),
+                "a peer announced"
+            );
+            assert_eq!(
+                rung(&|| {
+                    engine.disconnect(&nowhere).expect("disconnect");
+                }),
+                (true, true),
+                "a peer went"
+            );
+        }
+        /// Claim: **`ZMQ_TCP_KEEPALIVE` and its tuning options reach both kinds of
+        /// TCP connection**, the one a listener accepts and the one a connecter
+        /// dials, each from its own socket's options. A half-open connection is
+        /// found by the kernel's probes or not at all while the heartbeat is off,
+        /// and the probes are configured on the connection, not on the socket
+        /// that listens or dials.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn keepalive_is_set_on_accepted_and_dialled_connections() {
+            let keepalive = |idle: u64, intvl: u64, cnt: u32| SocketOptions {
+                tcp_keepalive: Some(true),
+                tcp_keepalive_idle: Some(Duration::from_secs(idle)),
+                tcp_keepalive_intvl: Some(Duration::from_secs(intvl)),
+                tcp_keepalive_cnt: Some(cnt),
+                ..options()
+            };
+            let ctx = context();
+            let accepting = Arc::new(KeepaliveProbe::default());
+            let server = Engine::new(&ctx, keepalive(31, 7, 4), accepting.clone()).expect("server");
+            let endpoint = server
+                .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+                .await
+                .expect("bind");
+
+            let dialling = Arc::new(KeepaliveProbe::default());
+            let client = Engine::new(&ctx, keepalive(43, 9, 6), dialling.clone()).expect("client");
+            client.connect(&endpoint).expect("connect");
+            wait_for(|| !accepting.seen().is_empty() && !dialling.seen().is_empty()).await;
+
+            let state = |role, idle, interval, count| KeepaliveState {
+                role,
+                enabled: true,
+                idle: Duration::from_secs(idle),
+                interval: Duration::from_secs(interval),
+                count,
+            };
+            assert_eq!(accepting.seen(), [state(Role::Binder, 31, 7, 4)]);
+            assert_eq!(dialling.seen(), [state(Role::Connecter, 43, 9, 6)]);
+        }
     }
 }

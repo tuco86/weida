@@ -876,26 +876,6 @@ mod tests {
         }
     }
 
-    /// Claim: the tree is observably the naive table — the same return values,
-    /// counts, refusals, key sets and matches — over random operation mixes
-    /// that hit the table ceiling, the length ceiling, and the prune paths.
-    #[test]
-    fn the_tree_agrees_with_a_naive_table() {
-        for seed in [
-            0x9E37_79B9_7F4A_7C15,
-            0x0123_4567_89AB_CDEF,
-            0xDEAD_BEEF_CAFE_F00D,
-            0x5DEE_CE66_D000_0001,
-        ] {
-            model_check(
-                seed,
-                DEFAULT_MAX_SUBSCRIPTIONS,
-                DEFAULT_MAX_SUBSCRIPTION_BYTES,
-                2000,
-            );
-        }
-    }
-
     /// Claim: the same agreement holds when both ceilings are small enough to
     /// be hit constantly, so refusal and the repeat-takes-no-slot rule are
     /// exercised on every few operations.
@@ -1047,5 +1027,31 @@ mod tests {
         assert!(subs.matches(&vec![b'a'; DEPTH]));
         assert!(!subs.matches(&vec![b'a'; DEPTH / 2 - 1]));
         // The rest is dropped with the table still holding them.
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// Claim: the tree is observably the naive table — the same return values,
+        /// counts, refusals, key sets and matches — over random operation mixes
+        /// that hit the table ceiling, the length ceiling, and the prune paths.
+        #[test]
+        fn the_tree_agrees_with_a_naive_table() {
+            for seed in [
+                0x9E37_79B9_7F4A_7C15,
+                0x0123_4567_89AB_CDEF,
+                0xDEAD_BEEF_CAFE_F00D,
+                0x5DEE_CE66_D000_0001,
+            ] {
+                model_check(
+                    seed,
+                    DEFAULT_MAX_SUBSCRIPTIONS,
+                    DEFAULT_MAX_SUBSCRIPTION_BYTES,
+                    2000,
+                );
+            }
+        }
     }
 }

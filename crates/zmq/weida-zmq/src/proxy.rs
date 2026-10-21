@@ -734,209 +734,6 @@ mod tests {
         assert!(err.cause().contains("TERMINATE"), "{err}");
     }
 
-    /// Claim: a pub-sub proxy over XSUB/XPUB forwards a publisher's messages
-    /// to a subscriber, forwards the subscriber's subscription upstream, and
-    /// gives the capture socket a copy of what passed — the zguide's
-    /// forwarder and Espresso in one.
-    #[tokio::test]
-    async fn a_pubsub_proxy_forwards_both_ways_and_captures() {
-        use crate::pubsub::{PubSocket, SubSocket};
-
-        let context = context();
-        let mut publisher = PubSocket::new(&context).expect("pub");
-        let front = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut frontend = XSubSocket::new(&context).expect("xsub");
-        frontend.connect(&front.to_string()).expect("connect");
-        let mut backend = XPubSocket::new(&context).expect("xpub");
-        let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut subscriber = SubSocket::new(&context).expect("sub");
-        subscriber.connect(&back.to_string()).expect("connect");
-        subscriber.subscribe("px").expect("subscribe");
-
-        // The capture socket: a PAIR over inproc, which is what the Espresso
-        // recipe reads.
-        let mut capture = PairSocket::new(&context).expect("pair");
-        capture
-            .bind("inproc://capture.pubsub")
-            .await
-            .expect("bind capture");
-        let mut watcher = PairSocket::new(&context).expect("pair");
-        watcher
-            .connect("inproc://capture.pubsub")
-            .expect("connect capture");
-
-        let device =
-            tokio::spawn(
-                async move { proxy(&mut frontend, &mut backend, Some(&mut capture)).await },
-            );
-
-        // The subscription reaches the publisher through the proxy, so a
-        // message published after it arrives is matched. The publisher drops
-        // what nobody wants, so this is retried until one lands.
-        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                publisher.publish(Multipart::single(Message::from("px.eur 1.09")));
-                if let Ok(message) = subscriber.try_recv() {
-                    return message;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the subscriber got a message");
-        assert_eq!(delivered.frames()[0].as_slice(), b"px.eur 1.09");
-
-        // The capture socket saw a copy of what went past — subscriptions
-        // included, since a proxy forwards those too.
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.recv())
-            .await
-            .expect("a captured message")
-            .expect("a message");
-        assert!(
-            !seen.frames().is_empty(),
-            "the capture socket received a copy"
-        );
-        device.abort();
-    }
-
-    /// Claim: the queue device over ROUTER/DEALER carries a request to a
-    /// worker and its reply back to the right client, which is the envelope
-    /// passing through the proxy untouched.
-    #[tokio::test]
-    async fn a_queue_device_routes_a_request_and_its_reply() {
-        use crate::reqrep::{RepSocket, ReqSocket};
-
-        let context = context();
-        let mut frontend = RouterSocket::new(&context).expect("router");
-        let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut backend = DealerSocket::new(&context).expect("dealer");
-        let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut client = ReqSocket::new(&context).expect("req");
-        client.connect(&front.to_string()).expect("connect");
-        let mut worker = RepSocket::new(&context).expect("rep");
-        worker.connect(&back.to_string()).expect("connect");
-
-        let device = tokio::spawn(async move {
-            proxy::<_, _, PairSocket>(&mut frontend, &mut backend, None).await
-        });
-
-        client.send(Multipart::single("work")).await.expect("send");
-        let request = tokio::time::timeout(std::time::Duration::from_secs(10), worker.recv())
-            .await
-            .expect("the request arrived")
-            .expect("a request");
-        assert_eq!(request.frames()[0].as_slice(), b"work");
-        worker.send(Multipart::single("done")).await.expect("reply");
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), client.recv())
-            .await
-            .expect("the reply arrived")
-            .expect("a reply");
-        assert_eq!(reply.frames()[0].as_slice(), b"done");
-        device.abort();
-    }
-
-    /// Claim: the zguide's streamer — PULL in, PUSH out — forwards, and so
-    /// does the same pair the other way round; a side that cannot receive is
-    /// a side that never delivers, not a failure at the first poll. The
-    /// steerable form and a send-only capture socket get the same treatment.
-    #[tokio::test]
-    async fn a_streamer_forwards_through_a_side_that_never_receives() {
-        let context = context();
-        // PULL frontend, PUSH backend: the streamer as the guide draws it.
-        let mut frontend = PullSocket::new(&context).expect("pull");
-        let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut backend = PushSocket::new(&context).expect("push");
-        let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
-        // The capture socket is a PUSH too: it only ever sends.
-        let mut capture = PushSocket::new(&context).expect("push");
-        let tap = capture.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut producer = PushSocket::new(&context).expect("push");
-        producer.connect(&front.to_string()).expect("connect");
-        let mut consumer = PullSocket::new(&context).expect("pull");
-        consumer.connect(&back.to_string()).expect("connect");
-        let mut watcher = PullSocket::new(&context).expect("pull");
-        watcher.connect(&tap.to_string()).expect("connect");
-
-        let device =
-            tokio::spawn(
-                async move { proxy(&mut frontend, &mut backend, Some(&mut capture)).await },
-            );
-
-        producer
-            .send(Multipart::single("job 1"))
-            .await
-            .expect("send");
-        let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
-            .await
-            .expect("the job crossed the streamer")
-            .expect("a job");
-        assert_eq!(crossed.frames()[0].as_slice(), b"job 1");
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.recv())
-            .await
-            .expect("the capture socket saw it")
-            .expect("a copy");
-        assert_eq!(seen.frames()[0].as_slice(), b"job 1");
-        assert!(
-            !device.is_finished(),
-            "a streamer does not die at its first poll"
-        );
-        device.abort();
-
-        // The same pair the other way round: PUSH frontend, PULL backend.
-        // Traffic flows backend to frontend and nothing is read from the
-        // PUSH.
-        let mut frontend = PushSocket::new(&context).expect("push");
-        let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut backend = PullSocket::new(&context).expect("pull");
-        let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut control = PairSocket::new(&context).expect("pair");
-        control
-            .bind("inproc://proxy.streamer.control")
-            .await
-            .expect("bind control");
-        let mut steer = PairSocket::new(&context).expect("pair");
-        steer
-            .connect("inproc://proxy.streamer.control")
-            .expect("connect control");
-        let mut consumer = PullSocket::new(&context).expect("pull");
-        consumer.connect(&front.to_string()).expect("connect");
-        let mut producer = PushSocket::new(&context).expect("push");
-        producer.connect(&back.to_string()).expect("connect");
-
-        let device = tokio::spawn(async move {
-            proxy_steerable::<_, _, PushSocket, _>(&mut frontend, &mut backend, None, &mut control)
-                .await
-        });
-        producer
-            .send(Multipart::single("job 2"))
-            .await
-            .expect("send");
-        let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
-            .await
-            .expect("the job crossed the reversed streamer")
-            .expect("a job");
-        assert_eq!(crossed.frames()[0].as_slice(), b"job 2");
-        steer
-            .send(Multipart::single(CONTROL_TERMINATE.to_vec()))
-            .await
-            .expect("terminate");
-        let statistics = tokio::time::timeout(std::time::Duration::from_secs(10), device)
-            .await
-            .expect("the proxy terminated")
-            .expect("the task")
-            .expect("the counters");
-        assert_eq!(statistics.backend_in.messages, 1);
-        assert_eq!(statistics.frontend_out.messages, 1);
-        assert_eq!(
-            statistics.frontend_in.messages, 0,
-            "a PUSH frontend is never read"
-        );
-    }
-
     /// Claim: a device whose two ends both never deliver is refused rather
     /// than parked forever.
     #[tokio::test]
@@ -948,109 +745,6 @@ mod tests {
             .await
             .expect_err("nothing to forward");
         assert_eq!(err.errno(), "ENOTSUP", "{err}");
-    }
-
-    /// Claim: the control socket steers — `PAUSE` stops the traffic,
-    /// `RESUME` starts it again, `STATISTICS` answers with the eight
-    /// counters, and `TERMINATE` ends the proxy and returns them.
-    #[tokio::test]
-    async fn the_steerable_proxy_pauses_resumes_reports_and_terminates() {
-        let context = context();
-        // A PAIR-to-PAIR proxy: the simplest device there is, and the one
-        // where a paused proxy is observable without a pattern's own rules in
-        // the way.
-        let mut frontend = PairSocket::new(&context).expect("pair");
-        let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
-        let mut backend = PairSocket::new(&context).expect("pair");
-        let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
-
-        let mut sender = PairSocket::new(&context).expect("pair");
-        sender.connect(&front.to_string()).expect("connect");
-        let mut receiver = PairSocket::new(&context).expect("pair");
-        receiver.connect(&back.to_string()).expect("connect");
-
-        let mut control = PairSocket::new(&context).expect("pair");
-        control
-            .bind("inproc://proxy.control")
-            .await
-            .expect("bind control");
-        let mut steer = PairSocket::new(&context).expect("pair");
-        steer
-            .connect("inproc://proxy.control")
-            .expect("connect control");
-
-        let device = tokio::spawn(async move {
-            proxy_steerable::<_, _, PairSocket, _>(&mut frontend, &mut backend, None, &mut control)
-                .await
-        });
-
-        // Running: a message goes through.
-        sender.send(Multipart::single("first")).await.expect("send");
-        let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
-            .await
-            .expect("forwarded")
-            .expect("a message");
-        assert_eq!(arrived.frames()[0].as_slice(), b"first");
-
-        // Paused: the next message waits in the frontend's queue rather than
-        // reaching the receiver.
-        steer
-            .send(Multipart::single(CONTROL_PAUSE.to_vec()))
-            .await
-            .expect("pause");
-        // The pause has to be observed before the message is sent, and the
-        // only observable that does not race is STATISTICS: the proxy answers
-        // it from the same loop that took the PAUSE.
-        steer
-            .send(Multipart::single(CONTROL_STATISTICS.to_vec()))
-            .await
-            .expect("ask");
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), steer.recv())
-            .await
-            .expect("a statistics reply")
-            .expect("a reply");
-        let statistics = ProxyStatistics::decode(&reply).expect("decode");
-        assert_eq!(statistics.frontend_in.messages, 1);
-        assert_eq!(statistics.backend_out.messages, 1);
-        assert_eq!(statistics.frontend_in.bytes, 5, "\"first\" is five octets");
-
-        sender
-            .send(Multipart::single("second"))
-            .await
-            .expect("send");
-        assert!(
-            receiver.try_recv().is_err(),
-            "a paused proxy forwards nothing"
-        );
-
-        // Resumed: it arrives.
-        steer
-            .send(Multipart::single(CONTROL_RESUME.to_vec()))
-            .await
-            .expect("resume");
-        let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
-            .await
-            .expect("forwarded after the resume")
-            .expect("a message");
-        assert_eq!(arrived.frames()[0].as_slice(), b"second");
-
-        // Terminated: the proxy ends and hands back its counters.
-        steer
-            .send(Multipart::single(CONTROL_TERMINATE.to_vec()))
-            .await
-            .expect("terminate");
-        let statistics = tokio::time::timeout(std::time::Duration::from_secs(10), device)
-            .await
-            .expect("the proxy ended")
-            .expect("the task")
-            .expect("the counters");
-        assert_eq!(statistics.frontend_in.messages, 2);
-        assert_eq!(statistics.backend_out.messages, 2);
-        assert_eq!(statistics.frontend_in.bytes, 11, "five and six octets");
-        assert_eq!(
-            statistics.backend_in.messages, 0,
-            "nothing came back the other way"
-        );
     }
 
     /// Bounds one await in a test: a hang becomes a failure that names the
@@ -1169,147 +863,6 @@ mod tests {
             .expect("the counters")
     }
 
-    /// Claim: a ROUTER frontend refuses a message that carries only a routing
-    /// id with EINVAL, and that refusal does not end the queue device. One
-    /// worker's malformed message must not take the broker down for every
-    /// client: the message is counted and dropped, and the next request still
-    /// crosses.
-    #[tokio::test]
-    async fn a_refused_message_does_not_end_a_queue_device() {
-        let context = context();
-        let frontend = RouterSocket::new(&context).expect("router");
-        let statistics = a_queue_device_outlives_a_refused_message(
-            &context,
-            frontend,
-            Multipart::single(b"x".to_vec()),
-            "inproc://proxy.queue.refused",
-        )
-        .await;
-        assert_eq!(statistics.refused, 1, "{statistics}");
-    }
-
-    /// Claim: with ZMQ_ROUTER_MANDATORY a reply to a routing id nobody holds
-    /// is refused with EHOSTUNREACH, which is the everyday race in which the
-    /// client has already gone away. It must not end the device that serves
-    /// everybody else.
-    #[tokio::test]
-    async fn a_reply_to_a_departed_client_does_not_end_a_queue_device() {
-        let context = context();
-        let options = SocketOptions {
-            router_mandatory: true,
-            ..SocketOptions::default()
-        };
-        let frontend = RouterSocket::with_options(&context, options).expect("router");
-        // A reply addressed to a routing id that no connected client holds.
-        let mut departed = Multipart::single(b"gone".to_vec());
-        departed.push(Vec::new());
-        departed.push(b"late reply".to_vec());
-        let statistics = a_queue_device_outlives_a_refused_message(
-            &context,
-            frontend,
-            departed,
-            "inproc://proxy.queue.departed",
-        )
-        .await;
-        assert_eq!(statistics.refused, 1, "{statistics}");
-    }
-
-    /// Claim: a capture socket that refuses its copy does not stop the message
-    /// reaching its destination, and the refusal is counted. The capture is a
-    /// ROUTER, which refuses a message that has no routing id.
-    #[tokio::test]
-    async fn a_refused_capture_copy_still_reaches_its_destination() {
-        let context = context();
-        let mut frontend = PairSocket::new(&context).expect("pair");
-        let front = bounded("bind the frontend", frontend.bind("tcp://127.0.0.1:0"))
-            .await
-            .expect("bind");
-        let mut backend = PairSocket::new(&context).expect("pair");
-        let back = bounded("bind the backend", backend.bind("tcp://127.0.0.1:0"))
-            .await
-            .expect("bind");
-        let mut capture = RouterSocket::new(&context).expect("router");
-
-        let mut sender = PairSocket::new(&context).expect("pair");
-        sender.connect(&front.to_string()).expect("connect");
-        let mut receiver = PairSocket::new(&context).expect("pair");
-        receiver.connect(&back.to_string()).expect("connect");
-
-        let mut control = PairSocket::new(&context).expect("pair");
-        bounded(
-            "bind the control",
-            control.bind("inproc://proxy.capture.refused"),
-        )
-        .await
-        .expect("bind");
-        let mut steer = PairSocket::new(&context).expect("pair");
-        steer
-            .connect("inproc://proxy.capture.refused")
-            .expect("connect");
-
-        let device = tokio::spawn(async move {
-            proxy_steerable::<_, _, RouterSocket, _>(
-                &mut frontend,
-                &mut backend,
-                Some(&mut capture),
-                &mut control,
-            )
-            .await
-        });
-
-        bounded("the sender sends", sender.send(Multipart::single("first")))
-            .await
-            .expect("send");
-        let arrived = bounded("the message is forwarded", receiver.recv())
-            .await
-            .expect("a message");
-        assert_eq!(arrived.frames()[0].as_slice(), b"first");
-
-        bounded(
-            "TERMINATE",
-            steer.send(Multipart::single(CONTROL_TERMINATE.to_vec())),
-        )
-        .await
-        .expect("terminate");
-        let statistics = bounded("the proxy ends", device)
-            .await
-            .expect("the task")
-            .expect("the counters");
-        assert_eq!(statistics.refused, 1, "the capture copy was refused");
-        assert_eq!(statistics.frontend_in.messages, 1);
-        assert_eq!(
-            statistics.backend_out.messages, 1,
-            "the message still went on"
-        );
-    }
-
-    /// Claim: a failure that is about the socket, not the message, still ends
-    /// the device with its error. A PULL cannot send, so forwarding to it is
-    /// ENOTSUP: a wrong device, which no later message can fix.
-    #[tokio::test]
-    async fn a_socket_that_cannot_send_still_ends_the_device() {
-        let context = context();
-        let mut frontend = PairSocket::new(&context).expect("pair");
-        let front = bounded("bind the frontend", frontend.bind("tcp://127.0.0.1:0"))
-            .await
-            .expect("bind");
-        let mut backend = PullSocket::new(&context).expect("pull");
-        let mut sender = PairSocket::new(&context).expect("pair");
-        sender.connect(&front.to_string()).expect("connect");
-
-        let device = tokio::spawn(async move {
-            proxy::<_, _, PairSocket>(&mut frontend, &mut backend, None).await
-        });
-        bounded("the sender sends", sender.send(Multipart::single("job")))
-            .await
-            .expect("send");
-        let err = bounded("the device ends", device)
-            .await
-            .expect("the task")
-            .expect_err("a send the socket cannot make ends the device");
-        assert_eq!(err.errno(), "ENOTSUP", "{err}");
-    }
-
     /// Claim: a control message that names no command is counted and skipped;
     /// the proxy keeps running, and a TERMINATE sent after it still ends it.
     #[tokio::test]
@@ -1418,25 +971,6 @@ mod tests {
         events
     }
 
-    /// Claim: **a prefix two subscribers hold goes upstream once, and its
-    /// cancel goes when the last of them lets go.** Upstream is an XPUB that
-    /// reports every subscribe it is sent, repeats included, so a prefix
-    /// forwarded for each subscriber shows as two. The first subscriber to
-    /// leave must not cancel it for the other, which a publisher that keeps a
-    /// set of connections per prefix — libzmq's — would otherwise do.
-    #[tokio::test]
-    async fn a_prefix_two_subscribers_hold_goes_upstream_once_and_is_cancelled_with_the_last() {
-        two_subscribers_hold_a_prefix(false).await;
-    }
-
-    /// Claim: the same holds with the XPUB as the device's **frontend** and the
-    /// XSUB as its backend: a device is symmetric, and which end faces the
-    /// subscribers is the caller's choice.
-    #[tokio::test]
-    async fn the_same_holds_with_the_xpub_as_the_frontend() {
-        two_subscribers_hold_a_prefix(true).await;
-    }
-
     async fn two_subscribers_hold_a_prefix(xpub_is_frontend: bool) {
         let context = context();
         let mut upstream = XPubSocket::with_options(
@@ -1497,97 +1031,6 @@ mod tests {
         format!("junk-{index:04}")
     }
 
-    /// Claim: **one subscriber with 1024 junk prefixes cannot stop an honest
-    /// one from receiving a new topic.** The subscribers behind a proxy share
-    /// one table upstream; a subscriber that filled it would have every topic
-    /// asked for afterwards refused there in silence. It is held to its share
-    /// instead: the prefixes past it are not forwarded, it is told with an
-    /// `ERROR` — which this library's own subscriber answers by ending its
-    /// connection — and what it did hold is cancelled upstream as it goes.
-    #[tokio::test]
-    async fn one_subscriber_with_junk_prefixes_cannot_stop_an_honest_one() {
-        let context = context();
-        let upstream = XPubSocket::new(&context).expect("xpub");
-        let upstream_at = bounded("bind upstream", upstream.bind("tcp://127.0.0.1:0"))
-            .await
-            .expect("bind")
-            .to_string();
-        let (mut publish, mut reports) = upstream.split();
-        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let collecting = {
-            let seen = Arc::clone(&seen);
-            tokio::spawn(async move {
-                while let Ok(event) = reports.recv().await {
-                    seen.lock().expect("seen").push(bytes_of(&event));
-                }
-            })
-        };
-        let (downstream, _device) = forwarder(&context, &upstream_at, false).await;
-
-        // The junk subscriber holds as many prefixes as a table takes, and says
-        // so all at once at its handshake. It does not reconnect after the
-        // `ERROR`, so that what upstream sees is one try.
-        let mut junk_subscriber = SubSocket::with_options(
-            &context,
-            SocketOptions {
-                reconnect_ivl: None,
-                ..SocketOptions::default()
-            },
-        )
-        .expect("sub");
-        for index in 0..DEFAULT_MAX_SUBSCRIPTIONS {
-            junk_subscriber
-                .subscribe(junk(index))
-                .expect("a prefix the subscriber's own table takes");
-        }
-        junk_subscriber.connect(&downstream).expect("connect");
-
-        let share = upstream_share(DEFAULT_MAX_SUBSCRIPTIONS);
-        let upstream_saw = |kind: &[u8]| {
-            seen.lock()
-                .expect("seen")
-                .iter()
-                .filter(|event| event.starts_with(kind) && event[1..].starts_with(b"junk-"))
-                .count()
-        };
-        let junk_subscriber_is_gone =
-            |subscriber: &SubSocket| subscriber.connections().iter().all(|peer| !peer.connected);
-
-        // The honest subscriber asks for its topic once the junk has been taken
-        // in: all of it is upstream, or its subscriber was refused and let go
-        // after the share. Asking sooner would let the topic in ahead of the
-        // flood whatever the proxy does about it.
-        let mut honest = subscriber_of(&context, &downstream);
-        wait_for(|| {
-            upstream_saw(b"\x01") == DEFAULT_MAX_SUBSCRIPTIONS
-                || (upstream_saw(b"\x01") >= share && junk_subscriber_is_gone(&junk_subscriber))
-        })
-        .await;
-        honest.subscribe("news").expect("subscribe");
-        let mut publishing = |message: Multipart| {
-            publish.publish(message);
-        };
-        published_until_received(&mut publishing, &mut honest, "news 1").await;
-
-        // The junk subscriber was refused, in the way this library has of
-        // refusing a subscriber, and its connection ended on it.
-        wait_for(|| junk_subscriber_is_gone(&junk_subscriber)).await;
-
-        // Upstream was asked for no more of the junk than the share, and was
-        // told to cancel all of it once its subscriber was gone.
-        wait_for(|| upstream_saw(b"\x00") == share).await;
-        assert_eq!(
-            upstream_saw(b"\x01"),
-            share,
-            "no more than its share was forwarded"
-        );
-        assert!(
-            seen.lock().expect("seen").contains(&b"\x01news".to_vec()),
-            "the honest subscriber's topic was forwarded"
-        );
-        collecting.abort();
-    }
-
     /// Claim: **an XSUB device end keeps what it forwards in its own table**,
     /// so that it is what a publisher is told at a handshake, and refuses what a
     /// table refuses: a cancel for a prefix it does not hold. Data passes as
@@ -1618,40 +1061,601 @@ mod tests {
         assert_eq!(err.errno(), "EINVAL", "{err}");
     }
 
-    /// Claim: **a forwarder tells a publisher that restarted what it holds**,
-    /// because the subscription it forwarded is in its XSUB's table and goes
-    /// out again at every handshake. A forwarder that counts a prefix once
-    /// and forwards it once would otherwise go deaf upstream the first time its
-    /// publisher did, for every subscriber that already held the prefix.
-    #[tokio::test]
-    async fn a_forwarder_tells_a_restarted_publisher_what_it_holds() {
-        let context = context();
-        let mut upstream = XPubSocket::new(&context).expect("xpub");
-        let upstream_at = bounded("bind upstream", upstream.bind("tcp://127.0.0.1:0"))
-            .await
-            .expect("bind")
-            .to_string();
-        let (downstream, _device) = forwarder(&context, &upstream_at, false).await;
-        let mut subscriber = subscriber_of(&context, &downstream);
-        subscriber.subscribe("news").expect("subscribe");
-        let first = bounded("the subscription", upstream.recv())
-            .await
-            .expect("an event");
-        assert_eq!(bytes_of(&first), b"\x01news");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        // The publisher goes, and a new one binds where it was.
-        upstream.close();
-        drop(upstream);
-        let mut restarted = XPubSocket::new(&context).expect("xpub");
-        bounded("the new publisher binds", async {
-            while restarted.bind(&upstream_at).await.is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        let again = bounded("the subscription again", restarted.recv())
+        /// Claim: a pub-sub proxy over XSUB/XPUB forwards a publisher's messages
+        /// to a subscriber, forwards the subscriber's subscription upstream, and
+        /// gives the capture socket a copy of what passed — the zguide's
+        /// forwarder and Espresso in one.
+        #[tokio::test]
+        async fn a_pubsub_proxy_forwards_both_ways_and_captures() {
+            use crate::pubsub::{PubSocket, SubSocket};
+
+            let context = context();
+            let mut publisher = PubSocket::new(&context).expect("pub");
+            let front = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut frontend = XSubSocket::new(&context).expect("xsub");
+            frontend.connect(&front.to_string()).expect("connect");
+            let mut backend = XPubSocket::new(&context).expect("xpub");
+            let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut subscriber = SubSocket::new(&context).expect("sub");
+            subscriber.connect(&back.to_string()).expect("connect");
+            subscriber.subscribe("px").expect("subscribe");
+
+            // The capture socket: a PAIR over inproc, which is what the Espresso
+            // recipe reads.
+            let mut capture = PairSocket::new(&context).expect("pair");
+            capture
+                .bind("inproc://capture.pubsub")
+                .await
+                .expect("bind capture");
+            let mut watcher = PairSocket::new(&context).expect("pair");
+            watcher
+                .connect("inproc://capture.pubsub")
+                .expect("connect capture");
+
+            let device = tokio::spawn(async move {
+                proxy(&mut frontend, &mut backend, Some(&mut capture)).await
+            });
+
+            // The subscription reaches the publisher through the proxy, so a
+            // message published after it arrives is matched. The publisher drops
+            // what nobody wants, so this is retried until one lands.
+            let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    publisher.publish(Multipart::single(Message::from("px.eur 1.09")));
+                    if let Ok(message) = subscriber.try_recv() {
+                        return message;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
             .await
-            .expect("an event");
-        assert_eq!(bytes_of(&again), b"\x01news");
+            .expect("the subscriber got a message");
+            assert_eq!(delivered.frames()[0].as_slice(), b"px.eur 1.09");
+
+            // The capture socket saw a copy of what went past — subscriptions
+            // included, since a proxy forwards those too.
+            let seen = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.recv())
+                .await
+                .expect("a captured message")
+                .expect("a message");
+            assert!(
+                !seen.frames().is_empty(),
+                "the capture socket received a copy"
+            );
+            device.abort();
+        }
+        /// Claim: the queue device over ROUTER/DEALER carries a request to a
+        /// worker and its reply back to the right client, which is the envelope
+        /// passing through the proxy untouched.
+        #[tokio::test]
+        async fn a_queue_device_routes_a_request_and_its_reply() {
+            use crate::reqrep::{RepSocket, ReqSocket};
+
+            let context = context();
+            let mut frontend = RouterSocket::new(&context).expect("router");
+            let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut backend = DealerSocket::new(&context).expect("dealer");
+            let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut client = ReqSocket::new(&context).expect("req");
+            client.connect(&front.to_string()).expect("connect");
+            let mut worker = RepSocket::new(&context).expect("rep");
+            worker.connect(&back.to_string()).expect("connect");
+
+            let device = tokio::spawn(async move {
+                proxy::<_, _, PairSocket>(&mut frontend, &mut backend, None).await
+            });
+
+            client.send(Multipart::single("work")).await.expect("send");
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), worker.recv())
+                .await
+                .expect("the request arrived")
+                .expect("a request");
+            assert_eq!(request.frames()[0].as_slice(), b"work");
+            worker.send(Multipart::single("done")).await.expect("reply");
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(10), client.recv())
+                .await
+                .expect("the reply arrived")
+                .expect("a reply");
+            assert_eq!(reply.frames()[0].as_slice(), b"done");
+            device.abort();
+        }
+        /// Claim: the zguide's streamer — PULL in, PUSH out — forwards, and so
+        /// does the same pair the other way round; a side that cannot receive is
+        /// a side that never delivers, not a failure at the first poll. The
+        /// steerable form and a send-only capture socket get the same treatment.
+        #[tokio::test]
+        async fn a_streamer_forwards_through_a_side_that_never_receives() {
+            let context = context();
+            // PULL frontend, PUSH backend: the streamer as the guide draws it.
+            let mut frontend = PullSocket::new(&context).expect("pull");
+            let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut backend = PushSocket::new(&context).expect("push");
+            let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
+            // The capture socket is a PUSH too: it only ever sends.
+            let mut capture = PushSocket::new(&context).expect("push");
+            let tap = capture.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut producer = PushSocket::new(&context).expect("push");
+            producer.connect(&front.to_string()).expect("connect");
+            let mut consumer = PullSocket::new(&context).expect("pull");
+            consumer.connect(&back.to_string()).expect("connect");
+            let mut watcher = PullSocket::new(&context).expect("pull");
+            watcher.connect(&tap.to_string()).expect("connect");
+
+            let device = tokio::spawn(async move {
+                proxy(&mut frontend, &mut backend, Some(&mut capture)).await
+            });
+
+            producer
+                .send(Multipart::single("job 1"))
+                .await
+                .expect("send");
+            let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
+                .await
+                .expect("the job crossed the streamer")
+                .expect("a job");
+            assert_eq!(crossed.frames()[0].as_slice(), b"job 1");
+            let seen = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.recv())
+                .await
+                .expect("the capture socket saw it")
+                .expect("a copy");
+            assert_eq!(seen.frames()[0].as_slice(), b"job 1");
+            assert!(
+                !device.is_finished(),
+                "a streamer does not die at its first poll"
+            );
+            device.abort();
+
+            // The same pair the other way round: PUSH frontend, PULL backend.
+            // Traffic flows backend to frontend and nothing is read from the
+            // PUSH.
+            let mut frontend = PushSocket::new(&context).expect("push");
+            let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut backend = PullSocket::new(&context).expect("pull");
+            let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut control = PairSocket::new(&context).expect("pair");
+            control
+                .bind("inproc://proxy.streamer.control")
+                .await
+                .expect("bind control");
+            let mut steer = PairSocket::new(&context).expect("pair");
+            steer
+                .connect("inproc://proxy.streamer.control")
+                .expect("connect control");
+            let mut consumer = PullSocket::new(&context).expect("pull");
+            consumer.connect(&front.to_string()).expect("connect");
+            let mut producer = PushSocket::new(&context).expect("push");
+            producer.connect(&back.to_string()).expect("connect");
+
+            let device = tokio::spawn(async move {
+                proxy_steerable::<_, _, PushSocket, _>(
+                    &mut frontend,
+                    &mut backend,
+                    None,
+                    &mut control,
+                )
+                .await
+            });
+            producer
+                .send(Multipart::single("job 2"))
+                .await
+                .expect("send");
+            let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
+                .await
+                .expect("the job crossed the reversed streamer")
+                .expect("a job");
+            assert_eq!(crossed.frames()[0].as_slice(), b"job 2");
+            steer
+                .send(Multipart::single(CONTROL_TERMINATE.to_vec()))
+                .await
+                .expect("terminate");
+            let statistics = tokio::time::timeout(std::time::Duration::from_secs(10), device)
+                .await
+                .expect("the proxy terminated")
+                .expect("the task")
+                .expect("the counters");
+            assert_eq!(statistics.backend_in.messages, 1);
+            assert_eq!(statistics.frontend_out.messages, 1);
+            assert_eq!(
+                statistics.frontend_in.messages, 0,
+                "a PUSH frontend is never read"
+            );
+        }
+        /// Claim: the control socket steers — `PAUSE` stops the traffic,
+        /// `RESUME` starts it again, `STATISTICS` answers with the eight
+        /// counters, and `TERMINATE` ends the proxy and returns them.
+        #[tokio::test]
+        async fn the_steerable_proxy_pauses_resumes_reports_and_terminates() {
+            let context = context();
+            // A PAIR-to-PAIR proxy: the simplest device there is, and the one
+            // where a paused proxy is observable without a pattern's own rules in
+            // the way.
+            let mut frontend = PairSocket::new(&context).expect("pair");
+            let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
+            let mut backend = PairSocket::new(&context).expect("pair");
+            let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+            let mut sender = PairSocket::new(&context).expect("pair");
+            sender.connect(&front.to_string()).expect("connect");
+            let mut receiver = PairSocket::new(&context).expect("pair");
+            receiver.connect(&back.to_string()).expect("connect");
+
+            let mut control = PairSocket::new(&context).expect("pair");
+            control
+                .bind("inproc://proxy.control")
+                .await
+                .expect("bind control");
+            let mut steer = PairSocket::new(&context).expect("pair");
+            steer
+                .connect("inproc://proxy.control")
+                .expect("connect control");
+
+            let device = tokio::spawn(async move {
+                proxy_steerable::<_, _, PairSocket, _>(
+                    &mut frontend,
+                    &mut backend,
+                    None,
+                    &mut control,
+                )
+                .await
+            });
+
+            // Running: a message goes through.
+            sender.send(Multipart::single("first")).await.expect("send");
+            let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
+                .await
+                .expect("forwarded")
+                .expect("a message");
+            assert_eq!(arrived.frames()[0].as_slice(), b"first");
+
+            // Paused: the next message waits in the frontend's queue rather than
+            // reaching the receiver.
+            steer
+                .send(Multipart::single(CONTROL_PAUSE.to_vec()))
+                .await
+                .expect("pause");
+            // The pause has to be observed before the message is sent, and the
+            // only observable that does not race is STATISTICS: the proxy answers
+            // it from the same loop that took the PAUSE.
+            steer
+                .send(Multipart::single(CONTROL_STATISTICS.to_vec()))
+                .await
+                .expect("ask");
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(10), steer.recv())
+                .await
+                .expect("a statistics reply")
+                .expect("a reply");
+            let statistics = ProxyStatistics::decode(&reply).expect("decode");
+            assert_eq!(statistics.frontend_in.messages, 1);
+            assert_eq!(statistics.backend_out.messages, 1);
+            assert_eq!(statistics.frontend_in.bytes, 5, "\"first\" is five octets");
+
+            sender
+                .send(Multipart::single("second"))
+                .await
+                .expect("send");
+            assert!(
+                receiver.try_recv().is_err(),
+                "a paused proxy forwards nothing"
+            );
+
+            // Resumed: it arrives.
+            steer
+                .send(Multipart::single(CONTROL_RESUME.to_vec()))
+                .await
+                .expect("resume");
+            let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
+                .await
+                .expect("forwarded after the resume")
+                .expect("a message");
+            assert_eq!(arrived.frames()[0].as_slice(), b"second");
+
+            // Terminated: the proxy ends and hands back its counters.
+            steer
+                .send(Multipart::single(CONTROL_TERMINATE.to_vec()))
+                .await
+                .expect("terminate");
+            let statistics = tokio::time::timeout(std::time::Duration::from_secs(10), device)
+                .await
+                .expect("the proxy ended")
+                .expect("the task")
+                .expect("the counters");
+            assert_eq!(statistics.frontend_in.messages, 2);
+            assert_eq!(statistics.backend_out.messages, 2);
+            assert_eq!(statistics.frontend_in.bytes, 11, "five and six octets");
+            assert_eq!(
+                statistics.backend_in.messages, 0,
+                "nothing came back the other way"
+            );
+        }
+        /// Claim: a ROUTER frontend refuses a message that carries only a routing
+        /// id with EINVAL, and that refusal does not end the queue device. One
+        /// worker's malformed message must not take the broker down for every
+        /// client: the message is counted and dropped, and the next request still
+        /// crosses.
+        #[tokio::test]
+        async fn a_refused_message_does_not_end_a_queue_device() {
+            let context = context();
+            let frontend = RouterSocket::new(&context).expect("router");
+            let statistics = a_queue_device_outlives_a_refused_message(
+                &context,
+                frontend,
+                Multipart::single(b"x".to_vec()),
+                "inproc://proxy.queue.refused",
+            )
+            .await;
+            assert_eq!(statistics.refused, 1, "{statistics}");
+        }
+        /// Claim: with ZMQ_ROUTER_MANDATORY a reply to a routing id nobody holds
+        /// is refused with EHOSTUNREACH, which is the everyday race in which the
+        /// client has already gone away. It must not end the device that serves
+        /// everybody else.
+        #[tokio::test]
+        async fn a_reply_to_a_departed_client_does_not_end_a_queue_device() {
+            let context = context();
+            let options = SocketOptions {
+                router_mandatory: true,
+                ..SocketOptions::default()
+            };
+            let frontend = RouterSocket::with_options(&context, options).expect("router");
+            // A reply addressed to a routing id that no connected client holds.
+            let mut departed = Multipart::single(b"gone".to_vec());
+            departed.push(Vec::new());
+            departed.push(b"late reply".to_vec());
+            let statistics = a_queue_device_outlives_a_refused_message(
+                &context,
+                frontend,
+                departed,
+                "inproc://proxy.queue.departed",
+            )
+            .await;
+            assert_eq!(statistics.refused, 1, "{statistics}");
+        }
+        /// Claim: a capture socket that refuses its copy does not stop the message
+        /// reaching its destination, and the refusal is counted. The capture is a
+        /// ROUTER, which refuses a message that has no routing id.
+        #[tokio::test]
+        async fn a_refused_capture_copy_still_reaches_its_destination() {
+            let context = context();
+            let mut frontend = PairSocket::new(&context).expect("pair");
+            let front = bounded("bind the frontend", frontend.bind("tcp://127.0.0.1:0"))
+                .await
+                .expect("bind");
+            let mut backend = PairSocket::new(&context).expect("pair");
+            let back = bounded("bind the backend", backend.bind("tcp://127.0.0.1:0"))
+                .await
+                .expect("bind");
+            let mut capture = RouterSocket::new(&context).expect("router");
+
+            let mut sender = PairSocket::new(&context).expect("pair");
+            sender.connect(&front.to_string()).expect("connect");
+            let mut receiver = PairSocket::new(&context).expect("pair");
+            receiver.connect(&back.to_string()).expect("connect");
+
+            let mut control = PairSocket::new(&context).expect("pair");
+            bounded(
+                "bind the control",
+                control.bind("inproc://proxy.capture.refused"),
+            )
+            .await
+            .expect("bind");
+            let mut steer = PairSocket::new(&context).expect("pair");
+            steer
+                .connect("inproc://proxy.capture.refused")
+                .expect("connect");
+
+            let device = tokio::spawn(async move {
+                proxy_steerable::<_, _, RouterSocket, _>(
+                    &mut frontend,
+                    &mut backend,
+                    Some(&mut capture),
+                    &mut control,
+                )
+                .await
+            });
+
+            bounded("the sender sends", sender.send(Multipart::single("first")))
+                .await
+                .expect("send");
+            let arrived = bounded("the message is forwarded", receiver.recv())
+                .await
+                .expect("a message");
+            assert_eq!(arrived.frames()[0].as_slice(), b"first");
+
+            bounded(
+                "TERMINATE",
+                steer.send(Multipart::single(CONTROL_TERMINATE.to_vec())),
+            )
+            .await
+            .expect("terminate");
+            let statistics = bounded("the proxy ends", device)
+                .await
+                .expect("the task")
+                .expect("the counters");
+            assert_eq!(statistics.refused, 1, "the capture copy was refused");
+            assert_eq!(statistics.frontend_in.messages, 1);
+            assert_eq!(
+                statistics.backend_out.messages, 1,
+                "the message still went on"
+            );
+        }
+        /// Claim: a failure that is about the socket, not the message, still ends
+        /// the device with its error. A PULL cannot send, so forwarding to it is
+        /// ENOTSUP: a wrong device, which no later message can fix.
+        #[tokio::test]
+        async fn a_socket_that_cannot_send_still_ends_the_device() {
+            let context = context();
+            let mut frontend = PairSocket::new(&context).expect("pair");
+            let front = bounded("bind the frontend", frontend.bind("tcp://127.0.0.1:0"))
+                .await
+                .expect("bind");
+            let mut backend = PullSocket::new(&context).expect("pull");
+            let mut sender = PairSocket::new(&context).expect("pair");
+            sender.connect(&front.to_string()).expect("connect");
+
+            let device = tokio::spawn(async move {
+                proxy::<_, _, PairSocket>(&mut frontend, &mut backend, None).await
+            });
+            bounded("the sender sends", sender.send(Multipart::single("job")))
+                .await
+                .expect("send");
+            let err = bounded("the device ends", device)
+                .await
+                .expect("the task")
+                .expect_err("a send the socket cannot make ends the device");
+            assert_eq!(err.errno(), "ENOTSUP", "{err}");
+        }
+        /// Claim: **a prefix two subscribers hold goes upstream once, and its
+        /// cancel goes when the last of them lets go.** Upstream is an XPUB that
+        /// reports every subscribe it is sent, repeats included, so a prefix
+        /// forwarded for each subscriber shows as two. The first subscriber to
+        /// leave must not cancel it for the other, which a publisher that keeps a
+        /// set of connections per prefix — libzmq's — would otherwise do.
+        #[tokio::test]
+        async fn a_prefix_two_subscribers_hold_goes_upstream_once_and_is_cancelled_with_the_last() {
+            two_subscribers_hold_a_prefix(false).await;
+        }
+        /// Claim: the same holds with the XPUB as the device's **frontend** and the
+        /// XSUB as its backend: a device is symmetric, and which end faces the
+        /// subscribers is the caller's choice.
+        #[tokio::test]
+        async fn the_same_holds_with_the_xpub_as_the_frontend() {
+            two_subscribers_hold_a_prefix(true).await;
+        }
+        /// Claim: **one subscriber with 1024 junk prefixes cannot stop an honest
+        /// one from receiving a new topic.** The subscribers behind a proxy share
+        /// one table upstream; a subscriber that filled it would have every topic
+        /// asked for afterwards refused there in silence. It is held to its share
+        /// instead: the prefixes past it are not forwarded, it is told with an
+        /// `ERROR` — which this library's own subscriber answers by ending its
+        /// connection — and what it did hold is cancelled upstream as it goes.
+        #[tokio::test]
+        async fn one_subscriber_with_junk_prefixes_cannot_stop_an_honest_one() {
+            let context = context();
+            let upstream = XPubSocket::new(&context).expect("xpub");
+            let upstream_at = bounded("bind upstream", upstream.bind("tcp://127.0.0.1:0"))
+                .await
+                .expect("bind")
+                .to_string();
+            let (mut publish, mut reports) = upstream.split();
+            let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let collecting = {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    while let Ok(event) = reports.recv().await {
+                        seen.lock().expect("seen").push(bytes_of(&event));
+                    }
+                })
+            };
+            let (downstream, _device) = forwarder(&context, &upstream_at, false).await;
+
+            // The junk subscriber holds as many prefixes as a table takes, and says
+            // so all at once at its handshake. It does not reconnect after the
+            // `ERROR`, so that what upstream sees is one try.
+            let mut junk_subscriber = SubSocket::with_options(
+                &context,
+                SocketOptions {
+                    reconnect_ivl: None,
+                    ..SocketOptions::default()
+                },
+            )
+            .expect("sub");
+            for index in 0..DEFAULT_MAX_SUBSCRIPTIONS {
+                junk_subscriber
+                    .subscribe(junk(index))
+                    .expect("a prefix the subscriber's own table takes");
+            }
+            junk_subscriber.connect(&downstream).expect("connect");
+
+            let share = upstream_share(DEFAULT_MAX_SUBSCRIPTIONS);
+            let upstream_saw = |kind: &[u8]| {
+                seen.lock()
+                    .expect("seen")
+                    .iter()
+                    .filter(|event| event.starts_with(kind) && event[1..].starts_with(b"junk-"))
+                    .count()
+            };
+            let junk_subscriber_is_gone = |subscriber: &SubSocket| {
+                subscriber.connections().iter().all(|peer| !peer.connected)
+            };
+
+            // The honest subscriber asks for its topic once the junk has been taken
+            // in: all of it is upstream, or its subscriber was refused and let go
+            // after the share. Asking sooner would let the topic in ahead of the
+            // flood whatever the proxy does about it.
+            let mut honest = subscriber_of(&context, &downstream);
+            wait_for(|| {
+                upstream_saw(b"\x01") == DEFAULT_MAX_SUBSCRIPTIONS
+                    || (upstream_saw(b"\x01") >= share && junk_subscriber_is_gone(&junk_subscriber))
+            })
+            .await;
+            honest.subscribe("news").expect("subscribe");
+            let mut publishing = |message: Multipart| {
+                publish.publish(message);
+            };
+            published_until_received(&mut publishing, &mut honest, "news 1").await;
+
+            // The junk subscriber was refused, in the way this library has of
+            // refusing a subscriber, and its connection ended on it.
+            wait_for(|| junk_subscriber_is_gone(&junk_subscriber)).await;
+
+            // Upstream was asked for no more of the junk than the share, and was
+            // told to cancel all of it once its subscriber was gone.
+            wait_for(|| upstream_saw(b"\x00") == share).await;
+            assert_eq!(
+                upstream_saw(b"\x01"),
+                share,
+                "no more than its share was forwarded"
+            );
+            assert!(
+                seen.lock().expect("seen").contains(&b"\x01news".to_vec()),
+                "the honest subscriber's topic was forwarded"
+            );
+            collecting.abort();
+        }
+        /// Claim: **a forwarder tells a publisher that restarted what it holds**,
+        /// because the subscription it forwarded is in its XSUB's table and goes
+        /// out again at every handshake. A forwarder that counts a prefix once
+        /// and forwards it once would otherwise go deaf upstream the first time its
+        /// publisher did, for every subscriber that already held the prefix.
+        #[tokio::test]
+        async fn a_forwarder_tells_a_restarted_publisher_what_it_holds() {
+            let context = context();
+            let mut upstream = XPubSocket::new(&context).expect("xpub");
+            let upstream_at = bounded("bind upstream", upstream.bind("tcp://127.0.0.1:0"))
+                .await
+                .expect("bind")
+                .to_string();
+            let (downstream, _device) = forwarder(&context, &upstream_at, false).await;
+            let mut subscriber = subscriber_of(&context, &downstream);
+            subscriber.subscribe("news").expect("subscribe");
+            let first = bounded("the subscription", upstream.recv())
+                .await
+                .expect("an event");
+            assert_eq!(bytes_of(&first), b"\x01news");
+
+            // The publisher goes, and a new one binds where it was.
+            upstream.close();
+            drop(upstream);
+            let mut restarted = XPubSocket::new(&context).expect("xpub");
+            bounded("the new publisher binds", async {
+                while restarted.bind(&upstream_at).await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let again = bounded("the subscription again", restarted.recv())
+                .await
+                .expect("an event");
+            assert_eq!(bytes_of(&again), b"\x01news");
+        }
     }
 }

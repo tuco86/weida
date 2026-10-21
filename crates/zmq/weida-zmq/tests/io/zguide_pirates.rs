@@ -32,10 +32,10 @@ use std::time::{Duration, Instant};
 
 use weida_zmq::blocking::BlockingContext;
 use weida_zmq::{Context, ContextConfig};
-#[path = "../examples/paranoid_pirate.rs"]
+#[path = "../../examples/paranoid_pirate.rs"]
 #[allow(dead_code)]
 mod paranoid_pirate;
-#[path = "../examples/simple_pirate.rs"]
+#[path = "../../examples/simple_pirate.rs"]
 #[allow(dead_code)]
 mod simple_pirate;
 

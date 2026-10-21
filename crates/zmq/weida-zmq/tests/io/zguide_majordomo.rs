@@ -34,10 +34,10 @@ use std::time::{Duration, Instant};
 
 use weida_zmq::{Context, ContextConfig, Result};
 
-#[path = "../examples/freelance.rs"]
+#[path = "../../examples/freelance.rs"]
 #[allow(dead_code)]
 mod freelance;
-#[path = "../examples/majordomo.rs"]
+#[path = "../../examples/majordomo.rs"]
 #[allow(dead_code)]
 mod majordomo;
 

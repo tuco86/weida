@@ -75,6 +75,8 @@ zmq = { version = "0.9", optional = true }
 # Drives the owned-context doctest and tests from an executor that is not
 # tokio, which is what `Context::owned` exists for.
 futures.workspace = true
+# `start_paused` for the tests that wait on a timer.
+tokio = { workspace = true, features = ["test-util"] }
 # The compile-fail harness for libzmq's thread rule: a socket is `Send` and
 # **not** `Sync`, and the second half only a compiler can assert.
 trybuild.workspace = true
