@@ -184,3 +184,32 @@ async fn a_draining_runtime_refuses_a_late_stream_on_an_open_connection() {
     client.shutdown().await;
     server.peer.join().expect("peer thread");
 }
+
+/// Claim: a late **exchange** on an open connection is refused the way a late
+/// one-way transfer is: the requester learns `Rejected`, whichever of the two
+/// `SHUTDOWN` codes it meets first, the stop of its request or the reset of
+/// the reply ([0009](../../../docs/decisions/0009-drain.md) §4.5).
+#[tokio::test]
+async fn a_draining_runtime_refuses_a_late_request_on_an_open_connection() {
+    let server = Draining::start().await;
+    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let requester = client.requester(Trust::by_address());
+    within(requester.connect(&format!("{}/early", server.url)))
+        .await
+        .expect("connect");
+
+    let drain = server.begin(Duration::from_secs(2)).await;
+
+    let err = within(requester.request(b"late"))
+        .await
+        .expect_err("a late exchange must be refused");
+    assert!(
+        matches!(err, weida::Error::Rejected),
+        "SHUTDOWN must reach the requester as a refusal, got {err:?}"
+    );
+    assert!(!drain.is_finished(), "the drain was still running");
+
+    within(drain).await.expect("drain task");
+    client.shutdown().await;
+    server.peer.join().expect("peer thread");
+}

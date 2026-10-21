@@ -372,12 +372,15 @@ pub(crate) fn write_error(e: quinn::WriteError) -> Error {
 /// Maps a stream read failure onto the outcome vocabulary.
 pub(crate) fn read_error(e: quinn::ReadError) -> Error {
     match e {
-        quinn::ReadError::Reset(code) => match code.into_inner() {
-            codes::CANCELED => Error::Canceled,
-            codes::REJECTED => Error::Rejected,
-            codes::UNKNOWN_ENDPOINT => Error::UnknownEndpoint,
-            codes::UNSUPPORTED => Error::Unsupported,
-            other => Error::Transport(format!("peer reset the stream with code {other}")),
+        // A reset carries the same codes a stop does and means the same
+        // outcome, so it maps through the one table every local transport
+        // uses too: a draining peer's `SHUTDOWN` is a refusal whichever half
+        // of an exchange it arrives on.
+        quinn::ReadError::Reset(code) => match codes::stop_reason(code.into_inner()) {
+            weida_core::StopReason::Other(other) => {
+                Error::Transport(format!("peer reset the stream with code {other}"))
+            }
+            reason => reason.into(),
         },
         quinn::ReadError::ConnectionLost(e) => conn_error(e),
         quinn::ReadError::ClosedStream => Error::Transport("stream already closed".into()),
