@@ -500,19 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_dropped_on_another_thread_wakes_a_parked_acquire() {
-        let slot: Arc<Slot<u32>> = Slot::new(3);
-        let lease = slot.try_acquire().expect("free");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            drop(lease);
-        });
-        let lease = futures::executor::block_on(slot.acquire());
-        assert_eq!(*lease, 3);
-        releaser.join().expect("the releasing thread finished");
-    }
-
-    #[test]
     fn a_retired_slot_hands_out_its_handle_once_and_then_refuses() {
         let slot = Retirable::new(5u32);
         assert_eq!(futures::executor::block_on(slot.retire()), Ok(5));
@@ -564,37 +551,55 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_retirement_races_parked_acquires_on_other_threads_and_leaves_none_waiting() {
-        let slot = Retirable::new(3u32);
-        let held = futures::executor::block_on(slot.acquire()).expect("not retired");
-        let (done, finished) = std::sync::mpsc::channel();
-        for retires in [true, false, false] {
-            let slot = slot.clone();
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let handed = if retires {
-                    futures::executor::block_on(slot.retire()).is_ok()
-                } else {
-                    futures::executor::block_on(slot.acquire()).is_ok()
-                };
-                let _ = done.send((retires, handed));
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn a_lease_dropped_on_another_thread_wakes_a_parked_acquire() {
+            let slot: Arc<Slot<u32>> = Slot::new(3);
+            let lease = slot.try_acquire().expect("free");
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                drop(lease);
             });
+            let lease = futures::executor::block_on(slot.acquire());
+            assert_eq!(*lease, 3);
+            releaser.join().expect("the releasing thread finished");
         }
-        // All three are parked behind `held` well within this.
-        std::thread::sleep(Duration::from_millis(100));
-        drop(held);
-        let mut retirements = 0;
-        for _ in 0..3 {
-            let (retires, handed) = finished
-                .recv_timeout(Duration::from_secs(10))
-                .expect("a parked call was never answered");
-            if retires {
-                assert!(handed, "the one retirement got the handle");
-                retirements += 1;
+        #[test]
+        fn a_retirement_races_parked_acquires_on_other_threads_and_leaves_none_waiting() {
+            let slot = Retirable::new(3u32);
+            let held = futures::executor::block_on(slot.acquire()).expect("not retired");
+            let (done, finished) = std::sync::mpsc::channel();
+            for retires in [true, false, false] {
+                let slot = slot.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let handed = if retires {
+                        futures::executor::block_on(slot.retire()).is_ok()
+                    } else {
+                        futures::executor::block_on(slot.acquire()).is_ok()
+                    };
+                    let _ = done.send((retires, handed));
+                });
             }
+            // All three are parked behind `held` well within this.
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+            let mut retirements = 0;
+            for _ in 0..3 {
+                let (retires, handed) = finished
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("a parked call was never answered");
+                if retires {
+                    assert!(handed, "the one retirement got the handle");
+                    retirements += 1;
+                }
+            }
+            assert_eq!(retirements, 1);
+            assert!(futures::executor::block_on(slot.acquire()).is_err());
         }
-        assert_eq!(retirements, 1);
-        assert!(futures::executor::block_on(slot.acquire()).is_err());
     }
 }

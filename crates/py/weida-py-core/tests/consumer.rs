@@ -245,37 +245,43 @@ async def main():
 asyncio.run(main())
 "#;
 
-#[test]
-fn a_binding_of_nothing_proves_the_foundation() {
-    Python::initialize();
-    let (exec, reactor) = Exec::owned(2, "py-core-test").expect("a reactor for the test");
+/// Tests that touch the filesystem, network, processes or real time: the
+/// integration tier (`.config/nextest.toml`).
+mod io {
+    use super::*;
 
-    let outcome = Python::attach(|py| -> PyResult<()> {
-        let module = PyModule::new(py, "demo")?;
-        module.add_class::<Demo>()?;
-        ERRORS.install(&module, "DemoError", &["EAGAIN", "ETERM"])?;
+    #[test]
+    fn a_binding_of_nothing_proves_the_foundation() {
+        Python::initialize();
+        let (exec, reactor) = Exec::owned(2, "py-core-test").expect("a reactor for the test");
 
-        let (feed, receiver) = unbounded();
-        let demo = Py::new(
-            py,
-            Demo {
-                bridge: Bridge::new(exec.clone(), to_py),
-                source: Slot::new(receiver),
-                feed,
-            },
-        )?;
-        let globals = module.dict();
-        globals.set_item("demo", demo)?;
+        let outcome = Python::attach(|py| -> PyResult<()> {
+            let module = PyModule::new(py, "demo")?;
+            module.add_class::<Demo>()?;
+            ERRORS.install(&module, "DemoError", &["EAGAIN", "ETERM"])?;
 
-        let script = CString::new(SCRIPT).expect("the script has no NUL");
-        py.run(script.as_c_str(), Some(&globals), None)
-    });
+            let (feed, receiver) = unbounded();
+            let demo = Py::new(
+                py,
+                Demo {
+                    bridge: Bridge::new(exec.clone(), to_py),
+                    source: Slot::new(receiver),
+                    feed,
+                },
+            )?;
+            let globals = module.dict();
+            globals.set_item("demo", demo)?;
 
-    // Drop the reactor before reporting, so a failure does not also leak a
-    // runtime into the next test.
-    drop(reactor);
-    if let Err(err) = outcome {
-        Python::attach(|py| err.print(py));
-        panic!("the Python consumer failed; its traceback is above");
+            let script = CString::new(SCRIPT).expect("the script has no NUL");
+            py.run(script.as_c_str(), Some(&globals), None)
+        });
+
+        // Drop the reactor before reporting, so a failure does not also leak a
+        // runtime into the next test.
+        drop(reactor);
+        if let Err(err) = outcome {
+            Python::attach(|py| err.print(py));
+            panic!("the Python consumer failed; its traceback is above");
+        }
     }
 }

@@ -205,25 +205,35 @@ mod tests {
     }
 
     #[test]
-    fn a_future_woken_from_another_thread_ends_the_wait() {
-        Python::initialize();
-        let (exec, _reactor) = exec();
-        // A reactor task finishes after the waiting thread has parked.
-        let sleeper = exec.clone();
-        let joined = exec.spawn(async move {
-            sleeper.sleep(Duration::from_millis(30)).await;
-            9u8
-        });
-        Python::attach(|py| {
-            let out = interruptible(py, &exec, move || joined).expect("no signal pending");
-            assert_eq!(out.expect("the task finished"), 9);
-        });
-    }
-
-    #[test]
     fn a_thread_that_is_not_main_does_not_ask_for_signals() {
         Python::initialize();
-        // Test threads are never the main thread, which is the point.
-        Python::attach(|py| assert!(!on_main_thread(py)));
+        // A thread of its own is never the main thread, which is the point;
+        // the test's own thread can be (nextest runs one test per process,
+        // on its main thread).
+        std::thread::spawn(|| Python::attach(|py| assert!(!on_main_thread(py))))
+            .join()
+            .expect("the assertion holds");
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn a_future_woken_from_another_thread_ends_the_wait() {
+            Python::initialize();
+            let (exec, _reactor) = exec();
+            // A reactor task finishes after the waiting thread has parked.
+            let sleeper = exec.clone();
+            let joined = exec.spawn(async move {
+                sleeper.sleep(Duration::from_millis(30)).await;
+                9u8
+            });
+            Python::attach(|py| {
+                let out = interruptible(py, &exec, move || joined).expect("no signal pending");
+                assert_eq!(out.expect("the task finished"), 9);
+            });
+        }
     }
 }

@@ -314,17 +314,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_open_gate_admits_and_counts() {
-        let gate = Gate::new();
-        let first = gate.enter().expect("open");
-        let second = gate.enter().expect("open");
-        assert!(!gate.wait_until_idle(Duration::from_millis(5)));
-        drop(first);
-        drop(second);
-        assert!(gate.wait_until_idle(Duration::from_millis(5)));
-    }
-
-    #[test]
     fn a_closed_gate_admits_nobody_and_leaves_no_count_behind() {
         let gate = Gate::new();
         gate.close();
@@ -332,17 +321,33 @@ mod tests {
         assert!(gate.wait_until_idle(Duration::from_millis(5)), "no leak");
     }
 
-    #[test]
-    fn closing_waits_for_the_hand_over_already_inside() {
-        let gate = Gate::new();
-        let inside = gate.enter().expect("open");
-        gate.close();
-        std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| gate.wait_until_idle(Duration::from_secs(5)));
-            std::thread::sleep(Duration::from_millis(20));
-            drop(inside);
-            assert!(waiter.join().expect("the waiter finished"));
-        });
-        assert!(gate.enter().is_none(), "and nobody enters afterwards");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn an_open_gate_admits_and_counts() {
+            let gate = Gate::new();
+            let first = gate.enter().expect("open");
+            let second = gate.enter().expect("open");
+            assert!(!gate.wait_until_idle(Duration::from_millis(5)));
+            drop(first);
+            drop(second);
+            assert!(gate.wait_until_idle(Duration::from_millis(5)));
+        }
+        #[test]
+        fn closing_waits_for_the_hand_over_already_inside() {
+            let gate = Gate::new();
+            let inside = gate.enter().expect("open");
+            gate.close();
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| gate.wait_until_idle(Duration::from_secs(5)));
+                std::thread::sleep(Duration::from_millis(20));
+                drop(inside);
+                assert!(waiter.join().expect("the waiter finished"));
+            });
+            assert!(gate.enter().is_none(), "and nobody enters afterwards");
+        }
     }
 }
