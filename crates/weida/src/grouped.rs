@@ -698,7 +698,8 @@ impl<S: Stream> Grouped<S> {
             parked_rx: tokio::sync::Mutex::new(parked_rx),
             deficit: Arc::new(Deficit::default()),
             peer,
-            slots: Arc::new(Semaphore::new(max_streams)),
+            // tokio panics above `Semaphore::MAX_PERMITS`.
+            slots: Arc::new(Semaphore::new(max_streams.min(Semaphore::MAX_PERMITS))),
             max_parked,
             closing,
             id: crate::transport::next_serial(),

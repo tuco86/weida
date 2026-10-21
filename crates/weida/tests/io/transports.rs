@@ -667,3 +667,11 @@ async fn a_unix_subscriber_idle_past_the_header_deadline_still_receives() {
     client.shutdown().await;
     h.shutdown().await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unbounded_limits_are_held_at_the_semaphore_ceiling_over_unix() {
+    let h = Harness::start_with(Transport::Unix, unbounded_limits()).await;
+    limits_beyond_what_a_semaphore_counts_are_held_at_its_ceiling(&h).await;
+    h.shutdown().await;
+}

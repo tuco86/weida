@@ -582,7 +582,8 @@ impl Listener {
             guarantees: self.inner.runtime.config.guarantees,
             shared: self.inner.runtime.shared(),
             link,
-            admitted: Arc::new(Semaphore::new(max_connections)),
+            // tokio panics above `Semaphore::MAX_PERMITS`.
+            admitted: Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS))),
             departing: Arc::new(Semaphore::new(
                 max_connections.clamp(1, Semaphore::MAX_PERMITS),
             )),

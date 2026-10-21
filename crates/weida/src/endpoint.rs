@@ -1427,7 +1427,8 @@ impl Attach for BusAttach {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
         Box::pin(async move {
             let (tx, rx) = mpsc::channel(self.depth);
-            let budget = Arc::new(Semaphore::new(self.budget));
+            // tokio panics above `Semaphore::MAX_PERMITS`.
+            let budget = Arc::new(Semaphore::new(self.budget.min(Semaphore::MAX_PERMITS)));
             conn.exec.spawn(bus_writer(
                 ConnHandle::clone(conn),
                 Arc::from(path),

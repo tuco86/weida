@@ -488,7 +488,10 @@ impl Peer {
                 },
                 segment_topics: SegmentTopics::new(limits.max_sequence_scopes),
                 segment_drops: Arc::new(DropTable::new(limits.max_sequence_scopes)),
-                segment_budget: Arc::new(Semaphore::new(limits.subscriber_buffer_bytes)),
+                // tokio panics above `Semaphore::MAX_PERMITS`.
+                segment_budget: Arc::new(Semaphore::new(
+                    limits.subscriber_buffer_bytes.min(Semaphore::MAX_PERMITS),
+                )),
             }),
             alive,
         }

@@ -549,6 +549,58 @@ async fn push_pull_waits_for_a_slot_over_inproc() {
     h.shutdown().await;
 }
 
+/// The configuration of [`limits_beyond_what_a_semaphore_counts_are_held_at_its_ceiling`]:
+/// every count and byte budget a semaphore is built from set to `usize::MAX`.
+pub(crate) fn unbounded_limits() -> RuntimeConfig {
+    RuntimeConfig {
+        max_connections: usize::MAX,
+        limits: Limits {
+            subscriber_buffer_bytes: usize::MAX,
+            max_local_streams: usize::MAX,
+            max_header_streams: usize::MAX,
+            ..Limits::default()
+        },
+        ..RuntimeConfig::default()
+    }
+}
+
+/// `usize::MAX` reads as "no bound of mine" for a count or a byte budget,
+/// and the library takes it that way everywhere: a semaphore that cannot
+/// count that far is held at what it can count, as Pub/Sub's and RADIO's
+/// budgets already are, rather than panicking in the call that builds it.
+/// `h` and its client run [`unbounded_limits`].
+pub(crate) async fn limits_beyond_what_a_semaphore_counts_are_held_at_its_ceiling(h: &Harness) {
+    let puller = h.listener.puller("/jobs").expect("puller");
+
+    let client = h.client_with(unbounded_limits());
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    within(pusher.send(b"job")).await.expect("send");
+    let received = within(puller.recv()).await.expect("recv");
+    assert_eq!(within(received.collect(16)).await.expect("collect"), b"job");
+
+    let member = client
+        .listener()
+        .bus("/bus", h.trust())
+        .expect("bus member");
+    let joined = h.listener.bus("/bus", h.trust()).expect("bus member");
+    within(member.connect(&h.url("/bus"))).await.expect("join");
+    assert_eq!(within(member.send(b"all")).await.expect("send"), 1);
+    let copy = within(joined.recv()).await.expect("recv");
+    assert_eq!(within(copy.collect(16)).await.expect("collect"), b"all");
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn unbounded_limits_are_held_at_the_semaphore_ceiling_over_inproc() {
+    let h = Harness::start_with(Transport::Inproc, unbounded_limits()).await;
+    limits_beyond_what_a_semaphore_counts_are_held_at_its_ceiling(&h).await;
+    h.shutdown().await;
+}
+
 /// Claim: a bus nobody bound is unreachable, and the address rules of
 /// [0010 §4.8] are enforced before anything is dialled.
 #[tokio::test]

@@ -171,7 +171,8 @@ impl ConnCtx {
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
             segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
             remote: crate::report::RemoteSlot::default(),
-            header_slots: Semaphore::new(limits.header_slots()),
+            // tokio panics above `Semaphore::MAX_PERMITS`.
+            header_slots: Semaphore::new(limits.header_slots().min(Semaphore::MAX_PERMITS)),
         });
 
         // Once per connection, never per message: a drain collects the

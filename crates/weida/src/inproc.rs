@@ -177,8 +177,9 @@ impl LocalConn {
             closed: Notify::new(),
         });
         // One budget per connection, shared by both directions: what the cap
-        // bounds is the live transfers on this connection.
-        let slots = Arc::new(Semaphore::new(max_streams));
+        // bounds is the live transfers on this connection. tokio panics
+        // above `Semaphore::MAX_PERMITS`.
+        let slots = Arc::new(Semaphore::new(max_streams.min(Semaphore::MAX_PERMITS)));
         let (id, peer_id) = (
             crate::transport::next_serial(),
             crate::transport::next_serial(),
