@@ -225,7 +225,7 @@ mod tests {
         drop(reactor);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn within_gives_up_on_a_future_that_never_finishes() {
         let exec = Exec::current().expect("ambient runtime");
         assert!(

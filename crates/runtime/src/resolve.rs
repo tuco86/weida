@@ -308,19 +308,6 @@ mod tests {
         assert_eq!(addrs[0].port(), DEFAULT_PORT);
     }
 
-    #[tokio::test]
-    async fn an_unresolvable_name_is_an_error_rather_than_an_empty_set() {
-        let exec = Exec::current().expect("ambient runtime");
-        let err = SystemResolver
-            .resolve(&exec, "no-such-host.invalid", Some(1), 8)
-            .await
-            .expect_err("`.invalid` never resolves");
-        assert!(
-            err.to_string().contains("no-such-host.invalid"),
-            "the error names what could not be resolved: {err}"
-        );
-    }
-
     /// The load-balancer shape: one address, several ports, which no A/AAAA
     /// answer can express and a replaced resolver can.
     #[tokio::test]
@@ -390,33 +377,11 @@ mod tests {
         assert!(v6[0].is_ipv6());
     }
 
-    /// Claim: a hostname yields every address the resolver offers, in its
-    /// order and no more than the cap. `localhost` is the case that matters —
-    /// it commonly resolves to both `::1` and `127.0.0.1`, and dialling only
-    /// the first reaches a server bound to the other never.
-    #[tokio::test]
-    async fn a_hostname_resolves_to_every_address_up_to_the_cap() {
-        let exec = Exec::current().expect("ambient runtime");
-        let all = SystemResolver
-            .resolve(&exec, "localhost", Some(7443), 8)
-            .await
-            .expect("localhost");
-        assert!(!all.is_empty());
-        assert!(all.iter().all(|a| a.port() == 7443));
-
-        let capped = SystemResolver
-            .resolve(&exec, "localhost", Some(7443), 1)
-            .await
-            .expect("localhost");
-        assert_eq!(capped.len(), 1, "the cap must bound the answer");
-        assert_eq!(capped[0], all[0], "and it must keep the resolver's order");
-    }
-
     /// Claim: a deadline that ends the wait does not free the lookup's place,
     /// because the thread behind it is still in `getaddrinfo`; a lookup asked
     /// for beyond the cap is refused rather than queued, and a place frees
     /// when the lookup returns.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lookup_the_caller_gave_up_on_keeps_its_place_until_it_returns() {
         static CAPPED: Lookups = Lookups::new(2);
         let exec = Exec::current().expect("ambient runtime");
@@ -453,5 +418,45 @@ mod tests {
             .await
             .expect("admitted again")
             .expect("answered");
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[tokio::test]
+        async fn an_unresolvable_name_is_an_error_rather_than_an_empty_set() {
+            let exec = Exec::current().expect("ambient runtime");
+            let err = SystemResolver
+                .resolve(&exec, "no-such-host.invalid", Some(1), 8)
+                .await
+                .expect_err("`.invalid` never resolves");
+            assert!(
+                err.to_string().contains("no-such-host.invalid"),
+                "the error names what could not be resolved: {err}"
+            );
+        }
+        /// Claim: a hostname yields every address the resolver offers, in its
+        /// order and no more than the cap. `localhost` is the case that matters —
+        /// it commonly resolves to both `::1` and `127.0.0.1`, and dialling only
+        /// the first reaches a server bound to the other never.
+        #[tokio::test]
+        async fn a_hostname_resolves_to_every_address_up_to_the_cap() {
+            let exec = Exec::current().expect("ambient runtime");
+            let all = SystemResolver
+                .resolve(&exec, "localhost", Some(7443), 8)
+                .await
+                .expect("localhost");
+            assert!(!all.is_empty());
+            assert!(all.iter().all(|a| a.port() == 7443));
+
+            let capped = SystemResolver
+                .resolve(&exec, "localhost", Some(7443), 1)
+                .await
+                .expect("localhost");
+            assert_eq!(capped.len(), 1, "the cap must bound the answer");
+            assert_eq!(capped[0], all[0], "and it must keep the resolver's order");
+        }
     }
 }

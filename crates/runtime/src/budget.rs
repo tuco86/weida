@@ -66,27 +66,32 @@ impl CloseBudget {
 mod tests {
     use super::*;
 
-    /// Claim: the phases of one close share one budget — what the second
-    /// phase gets is what the first left, and never more than the limit.
-    #[test]
-    fn a_budget_is_spent_by_the_phases_that_share_it() {
-        let budget = CloseBudget::start(Duration::from_millis(50));
-        assert_eq!(budget.limit(), Duration::from_millis(50));
-        let before = budget.remaining();
-        assert!(before <= Duration::from_millis(50));
-        std::thread::sleep(Duration::from_millis(10));
-        let after = budget.remaining();
-        assert!(after < before, "{after:?} must be less than {before:?}");
-        assert!(!budget.is_spent());
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    /// Claim: an overrun leaves zero rather than wrapping, so the next phase
-    /// is still bounded.
-    #[test]
-    fn an_overrun_budget_is_zero_and_not_negative() {
-        let budget = CloseBudget::start(Duration::from_millis(1));
-        std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(budget.remaining(), Duration::ZERO);
-        assert!(budget.is_spent());
+        /// Claim: the phases of one close share one budget — what the second
+        /// phase gets is what the first left, and never more than the limit.
+        #[test]
+        fn a_budget_is_spent_by_the_phases_that_share_it() {
+            let budget = CloseBudget::start(Duration::from_millis(50));
+            assert_eq!(budget.limit(), Duration::from_millis(50));
+            let before = budget.remaining();
+            assert!(before <= Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(10));
+            let after = budget.remaining();
+            assert!(after < before, "{after:?} must be less than {before:?}");
+            assert!(!budget.is_spent());
+        }
+        /// Claim: an overrun leaves zero rather than wrapping, so the next phase
+        /// is still bounded.
+        #[test]
+        fn an_overrun_budget_is_zero_and_not_negative() {
+            let budget = CloseBudget::start(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(5));
+            assert_eq!(budget.remaining(), Duration::ZERO);
+            assert!(budget.is_spent());
+        }
     }
 }

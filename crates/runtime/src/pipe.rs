@@ -163,49 +163,53 @@ mod tests {
         format!(r"\\.\pipe\weida-runtime-{}-{tag}", std::process::id())
     }
 
-    /// Claim: both ends learn the same account, which is this process's,
-    /// and the server learns it only after the client wrote.
-    #[tokio::test]
-    async fn both_ends_name_this_process() {
-        let exec = Exec::current().expect("runtime");
-        let path = name("who");
-        let (bound, server) = BoundPipe::bind(path.clone()).expect("bind");
-        let client = connect_pipe(&exec, bound.path()).await.expect("connect");
-        server.connect().await.expect("accept");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let mut client = client;
-        let server_seen_by_client = server_principal(&client).expect("owner");
-        client.write_all(b"x").await.expect("write");
-        let mut byte = [0u8; 1];
-        let mut server = server;
-        server.read_exact(&mut byte).await.expect("read");
-        let client_seen_by_server = client_principal(&server).expect("token");
+        /// Claim: both ends learn the same account, which is this process's,
+        /// and the server learns it only after the client wrote.
+        #[tokio::test]
+        async fn both_ends_name_this_process() {
+            let exec = Exec::current().expect("runtime");
+            let path = name("who");
+            let (bound, server) = BoundPipe::bind(path.clone()).expect("bind");
+            let client = connect_pipe(&exec, bound.path()).await.expect("connect");
+            server.connect().await.expect("accept");
 
-        assert_eq!(client_seen_by_server.sid, server_seen_by_client.sid);
-        assert_eq!(client_seen_by_server.pid, Some(std::process::id()));
-        assert_eq!(server_seen_by_client.pid, Some(std::process::id()));
-    }
+            let mut client = client;
+            let server_seen_by_client = server_principal(&client).expect("owner");
+            client.write_all(b"x").await.expect("write");
+            let mut byte = [0u8; 1];
+            let mut server = server;
+            server.read_exact(&mut byte).await.expect("read");
+            let client_seen_by_server = client_principal(&server).expect("token");
 
-    /// Claim: a name that exists is refused, not shared.
-    #[tokio::test]
-    async fn a_taken_name_is_not_bound_twice() {
-        let path = name("taken");
-        let (_bound, _first) = BoundPipe::bind(path.clone()).expect("bind");
-        let err = BoundPipe::bind(path).unwrap_err();
-        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
-    }
-
-    /// Claim: a pipe nobody serves is the peer being gone.
-    #[tokio::test]
-    async fn an_absent_pipe_is_a_closed_peer() {
-        let exec = Exec::current().expect("runtime");
-        let path = name("absent");
-        let err = connect_pipe(&exec, std::ffi::OsStr::new(&path))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::ConnectionLost(LossCause::PeerClosed)),
-            "{err:?}"
-        );
+            assert_eq!(client_seen_by_server.sid, server_seen_by_client.sid);
+            assert_eq!(client_seen_by_server.pid, Some(std::process::id()));
+            assert_eq!(server_seen_by_client.pid, Some(std::process::id()));
+        }
+        /// Claim: a name that exists is refused, not shared.
+        #[tokio::test]
+        async fn a_taken_name_is_not_bound_twice() {
+            let path = name("taken");
+            let (_bound, _first) = BoundPipe::bind(path.clone()).expect("bind");
+            let err = BoundPipe::bind(path).unwrap_err();
+            assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
+        }
+        /// Claim: a pipe nobody serves is the peer being gone.
+        #[tokio::test]
+        async fn an_absent_pipe_is_a_closed_peer() {
+            let exec = Exec::current().expect("runtime");
+            let path = name("absent");
+            let err = connect_pipe(&exec, std::ffi::OsStr::new(&path))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ConnectionLost(LossCause::PeerClosed)),
+                "{err:?}"
+            );
+        }
     }
 }
