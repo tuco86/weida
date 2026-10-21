@@ -1,4 +1,4 @@
-# Sourced by the platform build and check jobs and by publish.sh; no header,
+# Sourced by the platform check jobs and by publish.sh; no header,
 # so not a job. Run from the workspace root, with CI_PLATFORM set by the
 # job's `platform`.
 

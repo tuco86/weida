@@ -1,12 +1,11 @@
 #!/bin/sh
 # /// ci
-# needs = ["build-darwin-arm64"]
+# on = ["push main", "tag v*", "cron 0 4 * * *"]
 # platform = "darwin-arm64"
 # timeout_minutes = 120
 # ///
-# clippy, the tests and the doctests on darwin-arm64, in the workspace the
-# build left warm: the unit tier on a push or manual run, both tiers on the
-# nightly cron and a release tag.
+# clippy, the tests and the doctests on darwin-arm64: the unit tier on a push
+# or manual run, both tiers on the nightly cron and a release tag.
 set -eu
 
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"

@@ -1,4 +1,4 @@
-# Dot-sourced by the Windows build and check jobs; no header, so not a job.
+# Dot-sourced by the Windows check job; no header, so not a job.
 # Sets `Run`, `Install-Nextest`, `$cache`, `$exclude` and CARGO_TARGET_DIR.
 $ErrorActionPreference = 'Stop'
 

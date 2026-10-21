@@ -1,6 +1,6 @@
 #!/bin/sh
 # /// ci
-# needs = ["build-linux-amd64"]
+# on = ["push main", "tag v*", "cron 0 4 * * *"]
 # platform = "linux-amd64"
 # image = "trixie"
 # when_busy = "freeze"

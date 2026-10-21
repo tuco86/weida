@@ -1,6 +1,6 @@
 #!/bin/bash
 # /// ci
-# needs = ["build-linux-amd64", "build-linux-arm64", "build-windows-amd64", "build-darwin-arm64", "check-linux-amd64", "check-linux-arm64", "check-windows-amd64", "check-darwin-arm64"]
+# needs = ["check-linux-amd64", "check-linux-arm64", "check-windows-amd64", "check-darwin-arm64"]
 # channels = ["release"]
 # platform = "linux-amd64"
 # image = "trixie"
@@ -9,7 +9,7 @@
 # timeout_minutes = 60
 # ///
 # Publishes the workspace to crates.io for a `v*` tag, once every platform
-# built and checked it. A crate whose version crates.io already has is left
+# checked it. A crate whose version crates.io already has is left
 # out, so a rerun after a partial publish finishes the rest. A manual run
 # (`run_jobs`) packages and verifies the workspace without uploading.
 set -euo pipefail
