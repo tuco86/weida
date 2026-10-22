@@ -69,7 +69,7 @@ kind: code | size: 15 | status: done fae8a04 | needs: []
 acceptance: the scripted server's `handshake` no longer waits `SILENCE` (200 ms) before its `INFO`, since the tests of the server speaking first assert the silence themselves; `io::driver::close_returns_only_once_the_state_says_closed` (50 connections, 10.1-10.5 s measured on the runners) falls well under the 10 s default and its 40 s nextest override is deleted. Found while reviewing the io tests behind nextest overrides after B-374.
 
 ### B-376 — Raw `quinn` peers on the simulated network; the raw-peer io suites into the unit tier
-kind: code | size: 90 | status: in_progress 2026-10-22T23:39Z | needs: []
+kind: code | size: 90 | status: done b4dc3c4 | needs: []
 acceptance: `SimNet::endpoint(addr, server)` (feature `test-util`) gives a test a bare `quinn` endpoint on the network; the harness's raw clients and servers use it; `io::hostile` (41), `io::cursors` (6), `io::dedup` (3), `io::reorder` (2), `io::stats` (2), `io::raw_streams` (1), `io::interrupted` (1), `io::redial_storm` (1), `io::radio` (5) and `io::identity` (1) run in the unit tier on a paused clock with no socket (the UDP delay proxy becomes `SimNet::set_delay`, a dropped reactor becomes `SimNet::partition`, a name a resolver the harness owns), each module stress-run; 0042 and ARCHITECTURE §7 name the API. Asked for after B-374: "build more into the sim, then we can unit test it".
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
