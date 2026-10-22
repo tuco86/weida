@@ -64,6 +64,10 @@ acceptance: `ClientOptions::request_timeout: Option<Duration>` bounds a request 
 kind: code | size: 60 | status: done 248db99 | needs: []
 acceptance: `weida-nng` `io::pipeline::a_puller_that_cannot_accept_is_skipped_rather_than_waited_for` (pipeline #42), `weida-nng` `io::pair::a_paired_socket_admits_one_peer_at_a_time` (#44) and `weida` `io::cli::a_send_reaches_a_sink_over_a_unix_socket` (#46, after 20.5 s) failed once each on `check-darwin-arm64` with every other test green and no change to either crate in between; the cause of each is named and fixed where it is the code's; a claim that does not depend on the kernel moves to the unit tier over `inproc://` or an in-memory stream; the CLI test survives 1500 local stress runs; two consecutive both-tier runner pipelines are green on all four platforms. Found in the review pass after B-370.
 
+### B-375 — `weida-nats` io tests stop waiting out a silence they do not assert
+kind: code | size: 15 | status: in_progress 2026-10-22T23:23Z | needs: []
+acceptance: the scripted server's `handshake` no longer waits `SILENCE` (200 ms) before its `INFO`, since the tests of the server speaking first assert the silence themselves; `io::driver::close_returns_only_once_the_state_says_closed` (50 connections, 10.1-10.5 s measured on the runners) falls well under the 10 s default and its 40 s nextest override is deleted. Found while reviewing the io tests behind nextest overrides after B-374.
+
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
