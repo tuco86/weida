@@ -52,6 +52,10 @@ acceptance: Step 11; `docs/libraries/http.md` in the eleven-section shape; every
 kind: protocol | size: 90 | status: ready | needs: [B-366]
 acceptance: `crates/http/weida-http-py` on `weida-py-core` with an asyncio and a synchronous surface over `Client` and `Server`, the shape of `weida-nats-py`; `docs/libraries/http-py.md`; excluded from the darwin/windows checks like the other bindings.
 
+### B-372 — `weida-http`: a client request deadline
+kind: code | size: 45 | status: ready | needs: [B-369]
+acceptance: `ClientOptions::request_timeout: Option<Duration>` bounds a request from dial to response head (`Error::Timeout { step: "the response head" }`); a unit test over `tokio::io::duplex` on a paused clock with a server that never answers; `weida-openbao` drops its own `exec.within` around the head in favour of it. Found in the review pass after B-364: today a server that accepts and never answers holds `Client::request` until the caller's own deadline.
+
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
