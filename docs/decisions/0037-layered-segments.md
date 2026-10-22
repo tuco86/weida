@@ -3,7 +3,7 @@
 - **Status:** accepted
 - **Date:** 2026-10-04
 - **Amended:** 2026-10-04, §4.11 (numbers and freshness per connection, a copy that follows
-  upstream)
+  upstream); 2026-10-22, §4.5 (the finish grace learns each connection's settle time)
 - **Items:** B-304 to B-312, B-314
 - **Answers:** [requirements/griasdi-video.md](../requirements/griasdi-video.md) (all five asks
   of its "Proposal"; its open questions stay open)
@@ -287,6 +287,19 @@ It amends [0034](0034-late-is-lost.md) §4.6's supersession row, "resets every c
 on that topic that is still unacknowledged", which is exactly what lost the healthy dish its
 GOPs. Rule 1 of 0034 §4.6 stands: supersession still holds nothing, it only waits for bytes that
 are already the transport's.
+
+**Amended 2026-10-22, by the owner's choice.** The grace is the larger of the rule above and
+what the copy's connection has taught: every finished copy acknowledged whole is one sample of
+its time from FIN to acknowledgement, and the connection keeps a smoothed mean and mean
+deviation of those samples as RFC 6298 does for a retransmission timeout (gains 1/8 and 1/4); a
+finished copy is reset no earlier than its FIN plus the mean plus four deviations (at least
+1 ms, RFC 9002's `kGranularity`). The fixed 50 ms lost a healthy copy on a loaded Windows host
+whose acknowledgements scattered more than that around the smoothed round trip (nightly #21,
+`a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole`: grace 346 ms at an `rtt`
+of 212 ms, no loss). `quinn` 0.11 exposes no RTT variance, so the samples are weida's own; they
+measure exactly the wait the grace covers, queueing, carry, round trip and ack delay together.
+A copy reset at its grace is not a sample, so a connection that stops acknowledging cannot
+stretch the grace (`SettleTime` in `crates/weida/src/segment.rs`).
 
 ### 4.6 Signals for adaptation; weida decides nothing about bitrate
 

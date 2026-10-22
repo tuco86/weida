@@ -21,9 +21,10 @@
 //! * **supersession** — opening segment *n+1* resets at once every layer of
 //!   segment *n* on that topic whose writer had not finished it, or whose
 //!   queued chunks the transport does not take at once, and every layer
-//!   above it; a finished layer gets the time its path needs,
-//!   `rtt + 50 ms + rtt * bytes / cwnd`, and is reset only if still
-//!   unacknowledged then. A copy that follows upstream
+//!   above it; a finished layer gets the time its path needs, the larger of
+//!   `rtt + 50 ms + rtt * bytes / cwnd` and what finished copies on its
+//!   connection have taken from FIN to acknowledgement ([`SettleTime`]),
+//!   and is reset only if still unacknowledged then. A copy that follows upstream
 //!   ([`SegmentTerms::follows_upstream`]) is treated as finished until a
 //!   write has to wait. No other topic's copies are touched;
 //! * **expiry** — the smaller of the sender's and the receiver's `max_age`,
@@ -76,6 +77,62 @@ fn finish_grace(rtt: Duration, cwnd: u64, sent: u64) -> Duration {
     let carry = Duration::try_from_secs_f64(rtt.as_secs_f64() * sent as f64 / cwnd.max(1) as f64)
         .unwrap_or(Duration::MAX);
     rtt.saturating_add(SUPERSEDE_SLACK).saturating_add(carry)
+}
+
+/// The smallest deviation [`SettleTime::bound`] adds: RFC 9002's
+/// `kGranularity`, below which a timer cannot tell two waits apart.
+const SETTLE_GRANULARITY: Duration = Duration::from_millis(1);
+
+/// How long finished copies on one connection take from their FIN to the
+/// peer's acknowledgement, estimated as RFC 6298 estimates a retransmission
+/// timeout: a smoothed mean (gain 1/8) and a smoothed mean deviation (gain
+/// 1/4) of the observed times.
+///
+/// It is what [`finish_grace`] cannot see. A path's smoothed round trip says
+/// nothing about how much single acknowledgements scatter around it, and on
+/// a receiver with coarse timers or a jittery link the scatter is larger
+/// than [`SUPERSEDE_SLACK`]; a healthy copy was then reset as superseded. The
+/// time is measured end to end, so it holds the copy's queueing and carry
+/// time, the round trip and the peer's ack delay, which is exactly the wait
+/// the grace has to cover. Only acknowledged copies are samples: a copy
+/// reset at its grace says only that it took longer, and feeding that in
+/// would let a path that stopped acknowledging stretch the grace for ever.
+#[derive(Debug, Default)]
+pub(crate) struct SettleTime(Mutex<Option<Settle>>);
+
+#[derive(Clone, Copy, Debug)]
+struct Settle {
+    mean: Duration,
+    dev: Duration,
+}
+
+impl SettleTime {
+    /// Takes one copy's time from FIN to acknowledgement.
+    pub(crate) fn observe(&self, sample: Duration) {
+        let mut settle = lock(&self.0);
+        *settle = Some(match *settle {
+            // RFC 6298 §2.2: the first sample sets the mean, half of it the
+            // deviation.
+            None => Settle {
+                mean: sample,
+                dev: sample / 2,
+            },
+            // §2.3: the deviation first, against the old mean.
+            Some(Settle { mean, dev }) => Settle {
+                mean: (mean.saturating_mul(7).saturating_add(sample)) / 8,
+                dev: (dev.saturating_mul(3).saturating_add(mean.abs_diff(sample))) / 4,
+            },
+        });
+    }
+
+    /// How long after its FIN a finished copy on this connection may still
+    /// be acknowledged: the mean plus four deviations, at least
+    /// [`SETTLE_GRANULARITY`] above it. `None` before the first sample.
+    pub(crate) fn bound(&self) -> Option<Duration> {
+        lock(&self.0).map(|Settle { mean, dev }| {
+            mean.saturating_add(dev.saturating_mul(4).max(SETTLE_GRANULARITY))
+        })
+    }
 }
 
 /// The `quinn` priority of a copy's stream for `layer`: layer-major, so
@@ -937,20 +994,33 @@ async fn expiry(spec: &CopySpec) {
     }
 }
 
-/// Resolves when a layer past its FIN has had its grace after supersession:
-/// the time its path needs to carry the copy's bytes at the congestion
-/// window, one round trip for the receipt and [`SUPERSEDE_SLACK`].
-async fn finish_grace_over(rx: &mut watch::Receiver<bool>, ctl: &CopyCtl, spec: &CopySpec) {
+/// Resolves when a layer past its FIN, written at `fin_at`, has had its grace
+/// after supersession: at least [`finish_grace`] from the supersession, and
+/// until the connection's [`SettleTime::bound`] past the FIN. The bound is
+/// read again whenever the wait ends, because the copies that teach it are
+/// often the ones still in flight: early on a connection, when the window is
+/// small, two or three segments are superseded before the first one is
+/// acknowledged. A local transport has no path and gets no grace.
+async fn finish_grace_over(
+    rx: &mut watch::Receiver<bool>,
+    ctl: &CopyCtl,
+    spec: &CopySpec,
+    fin_at: Instant,
+) {
     superseded(rx).await;
-    let wait = spec
-        .conn
-        .conn
-        .transport_stats()
-        .map(|t| t.path)
-        .map_or(Duration::ZERO, |p| {
-            finish_grace(p.rtt, p.cwnd, ctl.total.load(Ordering::Acquire))
-        });
-    spec.conn.exec.sleep(wait).await;
+    let Some(path) = spec.conn.conn.transport_stats().map(|t| t.path) else {
+        return;
+    };
+    let exec = &spec.conn.exec;
+    let floor = finish_grace(path.rtt, path.cwnd, ctl.total.load(Ordering::Acquire));
+    exec.sleep(floor).await;
+    while let Some(left) = spec.conn.settle.bound().and_then(|bound| {
+        let until = fin_at.checked_add(bound)?;
+        let left = until.saturating_duration_since(exec.now());
+        (!left.is_zero()).then_some(left)
+    }) {
+        exec.sleep(left).await;
+    }
 }
 
 /// Writes one layer of one copy, racing every step against cuts,
@@ -1075,6 +1145,7 @@ async fn run_layer(
                     ctl.cut(layer, None, spec);
                     return;
                 }
+                let fin_at = spec.conn.exec.now();
                 // Until the receiver's transport holds every byte, the layer
                 // can still be cut, superseded or expire: a reset is
                 // accepted after FIN until then.
@@ -1085,8 +1156,16 @@ async fn run_layer(
                         stream.reset(codes::CANCELED);
                         ctl.cut(layer, Some(DropCause::Expired), spec);
                     }
-                    _ = stream.stopped() => {}
-                    () = finish_grace_over(&mut superseded_rx, ctl, spec) => {
+                    receipt = stream.stopped() => {
+                        // Acknowledged whole: one sample of what the grace
+                        // has to cover on this connection.
+                        if matches!(receipt, Ok(None)) {
+                            spec.conn
+                                .settle
+                                .observe(spec.conn.exec.now().saturating_duration_since(fin_at));
+                        }
+                    }
+                    () = finish_grace_over(&mut superseded_rx, ctl, spec, fin_at) => {
                         stream.reset(codes::CANCELED);
                         ctl.cut(layer, Some(DropCause::Superseded), spec);
                     }
@@ -1141,6 +1220,39 @@ mod tests {
     /// Ends a copy as its last holder does: its handle count drops to zero.
     fn end(copy: &CopyCtl) {
         copy.handles.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// The case a fixed slack lost on a loaded Windows host: acknowledgements
+    /// that mostly settle in 300 ms and sometimes in 400 ms. The learned
+    /// bound covers the slow ones, where 50 ms beyond the round trip did not.
+    #[test]
+    fn a_connection_whose_acknowledgements_scatter_gets_a_grace_past_the_scatter() {
+        let settle = SettleTime::default();
+        assert_eq!(settle.bound(), None, "nothing learned before a sample");
+        for _ in 0..20 {
+            settle.observe(Duration::from_millis(300));
+            settle.observe(Duration::from_millis(400));
+        }
+        let bound = settle.bound().expect("learned");
+        assert!(bound > Duration::from_millis(400), "{bound:?}");
+    }
+
+    /// A steady connection does not keep its first, wide guess: the bound
+    /// closes in on the settle time, so a superseded copy that will never be
+    /// acknowledged is let go soon after it should have been.
+    #[test]
+    fn a_steady_connection_brings_its_grace_down_to_its_settle_time() {
+        let settle = SettleTime::default();
+        settle.observe(Duration::from_millis(200));
+        assert_eq!(settle.bound(), Some(Duration::from_millis(600)));
+        for _ in 0..30 {
+            settle.observe(Duration::from_millis(200));
+        }
+        let bound = settle.bound().expect("learned");
+        assert!(
+            bound >= Duration::from_millis(201) && bound <= Duration::from_millis(205),
+            "{bound:?}"
+        );
     }
 
     #[test]

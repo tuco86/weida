@@ -506,7 +506,9 @@ impl Radio {
     /// supersedes segment *n* on that topic: a copy whose writer had not
     /// finished it, or whose queued chunks the transport does not take at
     /// once, is reset at once; a finished copy gets the time its path needs,
-    /// `rtt + 50 ms + rtt * bytes / cwnd`, and is reset only if it is still
+    /// the larger of `rtt + 50 ms + rtt * bytes / cwnd` and what finished
+    /// copies on its connection have taken from FIN to acknowledgement (mean
+    /// plus four deviations), and is reset only if it is still
     /// unacknowledged then. On a local transport that grace is zero.
     ///
     /// `terms` set the sender's side

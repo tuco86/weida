@@ -107,6 +107,10 @@ pub(crate) struct ConnCtx {
     /// to dishes and every other receiver alike: what a stale segment is
     /// checked against; at most `max_sequence_scopes` entries (0037 §4.11).
     pub segments_in: crate::segment::Newest,
+    /// How long finished segment copies on this connection take from FIN to
+    /// acknowledgement: what a superseded copy's grace learns from
+    /// ([`crate::segment::SettleTime`]).
+    pub settle: crate::segment::SettleTime,
     /// The peer's latest path record and whether its REPORT stream was seen:
     /// one fixed-size slot ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
     /// §4.5).
@@ -170,6 +174,7 @@ impl ConnCtx {
             established: exec.now(),
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
             segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
+            settle: crate::segment::SettleTime::default(),
             remote: crate::report::RemoteSlot::default(),
             // tokio panics above `Semaphore::MAX_PERMITS`.
             header_slots: Semaphore::new(limits.header_slots().min(Semaphore::MAX_PERMITS)),
