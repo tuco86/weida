@@ -49,7 +49,7 @@ kind: spec | size: 45 | status: done bda8582 | needs: [B-368, B-369]
 acceptance: Step 11; `docs/libraries/http.md` in the eleven-section shape; every listed document names the sixth family; `git grep -n 'five foreign-protocol\|all five libraries\|twenty-five' -- README.md docs` finds no stale count.
 
 ### B-373 — `weida-http`: a reset stream frees no place in the HTTP/2 accept hand-off
-kind: code | size: 30 | status: in_progress 2026-10-23T04:12Z | needs: [B-367]
+kind: code | size: 30 | status: done 3ae9464 | needs: [B-367]
 acceptance: the HTTP/2 server driver refuses a new stream with REFUSED_STREAM while `max_concurrent_streams` exchanges wait for the accept queue, so a client that opens and resets streams while the application is not accepting grows `pending_exchanges` to at most that number; a unit test over `tokio::io::duplex` (a raw peer opens and resets 3 × the limit with nobody accepting, then sees REFUSED_STREAM for every stream past the limit); INVARIANTS and `docs/libraries/http.md` §5 (hyper's `max_pending_accept_reset_streams`) and §9 name it. Found in the review pass after B-370: RST_STREAM removes a stream from `streams`, so the admission check no longer counts its exchange, which stays queued in the driver while the application's accept queue is full.
 
 ### B-371 — `weida-http-py`
