@@ -1015,7 +1015,18 @@ outruns its puller reaches the ceiling, where `open` must not refuse with `Limit
 `Reject` where [GUARANTEES.md](GUARANTEES.md) §6 promises `Block`. A local `open` waits for a
 slot exactly as a QUIC `open` waits on the peer's stream budget, cancelled by dropping the
 future and bounded by the caller's own deadline;
-`push_pull_waits_for_a_slot_over_{inproc,unix}` pins it.
+`push_pull_waits_for_a_slot_over_{inproc,unix,pipe}` pins it.
+
+**Named pipes, measured on wohnzimmer (Windows 10, debug build).** A pipe instance is one
+connection, and a client that finds no instance listening retries on the runtime's timer,
+which Windows rounds to its 15.6 ms tick. With one listening instance, every waiting client
+woke on the same tick and one got in: 600 concurrent one-way sends did not finish within 10 s,
+under 60 transfers a second, and a client gave up after 5 s of `ERROR_PIPE_BUSY`. The binding
+now keeps up to 16 instances listening, each holding a place, and a busy pipe is waited out
+for as long as it lasts, the caller's own deadline ending the wait: the same 600 sends take
+1.42-1.87 s, **320-423 transfers a second**, three runs
+(`cargo nextest run -p weida --profile ci -E 'test(push_pull_waits_for_a_slot_over_pipe)'`
+with the send loop timed, run through `run_jobs` on `check-windows-amd64`).
 
 ### 4.14 What a payload costs crossing into Python
 

@@ -1186,12 +1186,74 @@ async fn accept_unix(
     }
 }
 
+/// Pipe instances a binding keeps listening at once, each holding a place.
+///
+/// A pipe instance is one connection, and a client that finds none
+/// listening retries on the timer, which Windows rounds to its 15.6 ms tick:
+/// with one listening instance every waiting client wakes on the same tick
+/// and one of them gets in, about 64 connections a second however many
+/// wait. Every listening instance is one more client per tick. libuv keeps
+/// four; weida opens a connection per transfer, so it keeps more.
+#[cfg(windows)]
+const PIPE_LISTENING: usize = 16;
+
+/// One pipe instance waiting for a client, with the place it holds.
+#[cfg(windows)]
+type PipeListening = std::pin::Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    tokio::net::windows::named_pipe::NamedPipeServer,
+                    OwnedSemaphorePermit,
+                    io::Result<()>,
+                ),
+            > + Send,
+    >,
+>;
+
+#[cfg(windows)]
+fn pipe_listen(
+    server: tokio::net::windows::named_pipe::NamedPipeServer,
+    place: OwnedSemaphorePermit,
+) -> PipeListening {
+    Box::pin(async move {
+        let connected = server.connect().await;
+        (server, place, connected)
+    })
+}
+
+/// The first of `listening` a client connected to, taken out of the set.
+/// Never resolves while the set is empty.
+#[cfg(windows)]
+async fn pipe_connected(
+    listening: &mut Vec<PipeListening>,
+) -> (
+    tokio::net::windows::named_pipe::NamedPipeServer,
+    OwnedSemaphorePermit,
+    io::Result<()>,
+) {
+    std::future::poll_fn(|cx| {
+        for i in 0..listening.len() {
+            if let std::task::Poll::Ready(out) = listening[i].as_mut().poll(cx) {
+                drop(listening.swap_remove(i));
+                return std::task::Poll::Ready(out);
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// Accepts named-pipe connections and serves each one.
 ///
-/// A pipe instance is one connection: after each accept the next listening
-/// instance is created before the accepted one is served, so that a client
-/// arriving in between finds the pipe busy rather than absent
-/// (`docs/research/ipc.md` §3.1).
+/// Up to [`PIPE_LISTENING`] instances listen at once, and each takes a place
+/// before it listens, for the reason `accept_unix` gives: the surplus waits
+/// on the pipe, which a client sees as busy, instead of being accepted and
+/// dropped. One more instance, `spare`, exists whenever none listens, so
+/// that the pipe never has no instance at all: a client that finds every
+/// instance taken sees the pipe busy rather than absent, and absent reads
+/// as the peer gone (`docs/research/ipc.md` §3.1). A client may connect to
+/// the spare before it holds a place; it is accepted with the next place.
 #[cfg(windows)]
 async fn accept_pipe(
     binding: weida_runtime::BoundPipe,
@@ -1199,49 +1261,14 @@ async fn accept_pipe(
     mut stop: tokio::sync::oneshot::Receiver<()>,
     serve: LocalAccept<crate::pipe::PipeStream>,
 ) {
-    let mut listening = first;
+    let mut spare = Some(first);
+    let mut listening: Vec<PipeListening> = Vec::with_capacity(PIPE_LISTENING);
     loop {
-        // A place is taken before a client is accepted, for the reason
-        // `accept_unix` gives: the surplus waits on the pipe, which a
-        // client sees as busy, instead of being accepted and dropped.
-        let place = tokio::select! {
-            place = Arc::clone(&serve.admitted).acquire_owned() => match place {
-                Ok(place) => place,
-                Err(_) => return,
-            },
-            _ = &mut stop => {
-                tracing::debug!("pipe binding dropped; accept loop ending");
-                return;
-            }
-        };
-        let connected = tokio::select! {
-            connected = listening.connect() => connected,
-            _ = &mut stop => {
-                tracing::debug!("pipe binding dropped; accept loop ending");
-                return;
-            }
-        };
-        if let Err(e) = connected {
-            // A failed connect leaves this instance in no state to be trusted:
-            // wait, take a fresh one if one can be made, and ask again.
-            if let Some(held_back) = serve.refusals.pass() {
-                tracing::warn!(error = %e, held_back, "pipe accept failed; retrying");
-            }
-            tokio::select! {
-                () = serve.exec.sleep(ACCEPT_RETRY) => {}
-                _ = &mut stop => return,
-            }
-            if let Ok(fresh) = binding.next_instance() {
-                listening = fresh;
-            }
-            continue;
-        }
-        // The next listening instance is made before the accepted one is
-        // served; failing to make it is waited out, not the end of the
-        // binding.
-        let next = loop {
+        // The pipe always has an instance: made before the last listening
+        // one is served, and a failure to make it is waited out.
+        while spare.is_none() && listening.is_empty() {
             match binding.next_instance() {
-                Ok(next) => break next,
+                Ok(next) => spare = Some(next),
                 Err(e) => {
                     if let Some(held_back) = serve.refusals.pass() {
                         tracing::warn!(error = %e, held_back, "pipe instance not created; retrying");
@@ -1252,15 +1279,66 @@ async fn accept_pipe(
                     }
                 }
             }
-        };
-        let accepted = std::mem::replace(&mut listening, next);
-        if serve.shared.drain.is_draining() {
-            // Admission stopped: the accepted instance is dropped, which
-            // disconnects the client.
-            continue;
         }
-        let stream = crate::pipe::PipeStream::accepted(accepted, serve.exec.clone());
-        serve.exec.spawn(serve.clone_for().serve(stream, place));
+        tokio::select! {
+            place = Arc::clone(&serve.admitted).acquire_owned(),
+                if listening.len() < PIPE_LISTENING =>
+            {
+                // The semaphore is never closed, so this only fails if it were.
+                let Ok(place) = place else { return };
+                let server = match spare.take() {
+                    Some(spare) => spare,
+                    None => match binding.next_instance() {
+                        Ok(next) => next,
+                        Err(e) => {
+                            if let Some(held_back) = serve.refusals.pass() {
+                                tracing::warn!(error = %e, held_back, "pipe instance not created; retrying");
+                            }
+                            tokio::select! {
+                                () = serve.exec.sleep(ACCEPT_RETRY) => {}
+                                _ = &mut stop => return,
+                            }
+                            continue;
+                        }
+                    },
+                };
+                listening.push(pipe_listen(server, place));
+            }
+            (accepted, place, connected) = pipe_connected(&mut listening),
+                if !listening.is_empty() =>
+            {
+                if let Err(e) = connected {
+                    // A failed connect leaves this instance in no state to be
+                    // trusted: it is dropped with its place, and the place is
+                    // taken again for a fresh instance after a pause.
+                    if let Some(held_back) = serve.refusals.pass() {
+                        tracing::warn!(error = %e, held_back, "pipe accept failed; retrying");
+                    }
+                    drop((accepted, place));
+                    tokio::select! {
+                        () = serve.exec.sleep(ACCEPT_RETRY) => {}
+                        _ = &mut stop => return,
+                    }
+                    continue;
+                }
+                if listening.is_empty() && spare.is_none() {
+                    // Before the accepted instance is served, for the rule
+                    // above; a failure here is retried at the top of the loop.
+                    spare = binding.next_instance().ok();
+                }
+                if serve.shared.drain.is_draining() {
+                    // Admission stopped: the accepted instance is dropped,
+                    // which disconnects the client.
+                    continue;
+                }
+                let stream = crate::pipe::PipeStream::accepted(accepted, serve.exec.clone());
+                serve.exec.spawn(serve.clone_for().serve(stream, place));
+            }
+            _ = &mut stop => {
+                tracing::debug!("pipe binding dropped; accept loop ending");
+                return;
+            }
+        }
     }
 }
 
