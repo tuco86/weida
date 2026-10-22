@@ -138,6 +138,7 @@ therefore also runs, for each crate whose sources it touched:
 | `weida-zmq` | `blocking` | the same two with `-p weida-zmq` |
 | `weida-mqtt` | `blocking` | the same two with `-p weida-mqtt` |
 | `weida-nng` | `blocking` | the same two with `-p weida-nng` |
+| `weida-http` | `h3` | the same two with `-p weida-http --features h3` |
 
 A commit that touches the core (`weida`, `weida-protocol`, `weida-runtime`, `weida-core`) runs
 all four, because every facade sits on it.

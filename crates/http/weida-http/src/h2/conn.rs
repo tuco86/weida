@@ -26,9 +26,9 @@ use weida_http_codec::uri::Scheme;
 use weida_http_codec::{DecodeError, Limits, hpack};
 use weida_runtime::Exec;
 
-#[cfg(feature = "tls")]
-use super::H2Handle;
-use super::{Cmd, H2Responder, Opened, RecvShared, StreamError, StreamReader, StreamWriter};
+use super::{
+    Cmd, H2Handle, H2Responder, Opened, RecvShared, StreamError, StreamReader, StreamWriter,
+};
 use crate::body::BodyReader;
 use crate::client::Response;
 use crate::error::{Error, Result};
@@ -132,7 +132,6 @@ struct Driver {
 
 /// Starts the client side of an HTTP/2 connection on `stream` (TLS with ALPN
 /// `h2` already done) and returns its handle.
-#[cfg(feature = "tls")]
 pub(crate) fn spawn_client(exec: &Exec, stream: Stream, local: Local) -> H2Handle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let alive = Arc::new(AtomicBool::new(true));
@@ -1285,7 +1284,7 @@ fn to_fields(fields: &[(Vec<u8>, Vec<u8>)]) -> Fields {
 
 /// The request head in `fields` (RFC 9113 §8.3.1), and its declared length;
 /// `None` for a malformed request.
-fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<(RequestHead, Option<u64>)> {
+pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<(RequestHead, Option<u64>)> {
     let mut method = None;
     let mut scheme = None;
     let mut path = None;
@@ -1358,7 +1357,9 @@ fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<(RequestHead, Option<u6
 
 /// The status, fields and declared length of a response head; `None` for a
 /// malformed one.
-fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<(Status, Fields, Option<u64>)> {
+pub(crate) fn response_head(
+    fields: &[(Vec<u8>, Vec<u8>)],
+) -> Option<(Status, Fields, Option<u64>)> {
     let mut status = None;
     let mut regular = Fields::new();
     let mut length = None;
@@ -1390,7 +1391,7 @@ fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<(Status, Fields, Optio
     Some((status?, regular, length))
 }
 
-#[cfg(all(test, feature = "tls"))]
+#[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;

@@ -10,6 +10,8 @@ mod common;
 mod io {
     // Every row has a TLS twin, and the client's TLS option exists only
     // with the feature.
+    #[cfg(feature = "h3")]
+    mod interop_h3;
     #[cfg(feature = "tls")]
     mod interop_hyper;
     #[cfg(feature = "tls")]

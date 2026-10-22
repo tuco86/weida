@@ -3,20 +3,28 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+#[cfg(feature = "tls")]
 use tokio::sync::oneshot;
 use weida_http_codec::fields::is_connection_specific;
 use weida_http_codec::uri::Scheme;
 use weida_runtime::Exec;
 
-use crate::body::{BodyReader, BodyWriter, OutBody};
+use crate::body::BodyReader;
+#[cfg(feature = "tls")]
+use crate::body::BodyWriter;
+#[cfg(feature = "tls")]
+use crate::body::OutBody;
 use crate::dial::{self, Budget};
 use crate::error::{Error, Result};
 use crate::h1::Conn;
 use crate::h1::client::{OutFraming, Upload};
+#[cfg(feature = "tls")]
 use crate::h2::H2Handle;
 #[cfg(feature = "tls")]
 use crate::h2::conn::Local;
 use crate::options::{ClientOptions, Protocol};
+#[cfg(feature = "tls")]
+use crate::pool::SharedConn;
 use crate::pool::{OriginKey, Pool, PoolReturn};
 use crate::types::{Fields, Method, RequestHead, ResponseHead, Url, Version};
 
@@ -43,6 +51,8 @@ struct Inner {
     exec: Exec,
     options: ClientOptions,
     pool: Arc<Pool>,
+    #[cfg(feature = "h3")]
+    quic: crate::h3::ClientEndpoints,
 }
 
 impl std::fmt::Debug for Client {
@@ -62,14 +72,21 @@ pub struct OpenRequest {
 #[derive(Debug)]
 enum OpenInner {
     H1(Upload),
+    #[cfg(feature = "tls")]
     H2 {
         body: BodyWriter,
         response: oneshot::Receiver<Result<Response>>,
+    },
+    #[cfg(feature = "h3")]
+    H3 {
+        body: BodyWriter,
+        response: crate::h3::H3Response,
     },
 }
 
 /// The stream's own error when there is one: a write that failed because the
 /// stream was refused or reset says less than the refusal itself.
+#[cfg(feature = "tls")]
 fn stream_error(response: &mut oneshot::Receiver<Result<Response>>, e: Error) -> Error {
     match response.try_recv() {
         Ok(Err(stream)) => stream,
@@ -87,10 +104,13 @@ impl OpenRequest {
     pub async fn write(&mut self, data: Bytes) -> Result<()> {
         match &mut self.inner {
             OpenInner::H1(upload) => upload.write(data).await,
+            #[cfg(feature = "tls")]
             OpenInner::H2 { body, response } => match body.write(data).await {
                 Ok(()) => Ok(()),
                 Err(e) => Err(stream_error(response, e)),
             },
+            #[cfg(feature = "h3")]
+            OpenInner::H3 { body, .. } => body.write(data).await,
         }
     }
 
@@ -119,11 +139,17 @@ impl OpenRequest {
     async fn end(self, trailers: Option<Fields>) -> Result<Response> {
         match self.inner {
             OpenInner::H1(upload) => upload.finish(trailers.as_ref()).await,
+            #[cfg(feature = "tls")]
             OpenInner::H2 { body, mut response } => {
                 if let Err(e) = body.end(trailers).await {
                     return Err(stream_error(&mut response, e));
                 }
                 response.await.map_err(|_| Error::Closed)?
+            }
+            #[cfg(feature = "h3")]
+            OpenInner::H3 { body, response } => {
+                body.end(trailers).await?;
+                response.head().await
             }
         }
     }
@@ -153,6 +179,8 @@ impl Client {
             exec: exec.clone(),
             options,
             pool,
+            #[cfg(feature = "h3")]
+            quic: crate::h3::ClientEndpoints::default(),
         })))
     }
 
@@ -274,8 +302,8 @@ impl Client {
     }
 
     /// A connection to `url`'s origin, and the request started on it: the
-    /// origin's shared HTTP/2 connection, else its newest idle HTTP/1.1 one,
-    /// else a new one.
+    /// origin's shared HTTP/2 or HTTP/3 connection, else its newest idle
+    /// HTTP/1.1 one, else a new one.
     async fn start(
         &self,
         url: &Url,
@@ -288,14 +316,25 @@ impl Client {
                 return Err(Error::Unsupported("h2 without TLS (h2c)"));
             }
             (Protocol::Http3, Scheme::Http) => return Err(Error::Unsupported("h3 without TLS")),
+            #[cfg(not(feature = "h3"))]
             (Protocol::Http3, Scheme::Https) => {
                 return Err(Error::Unsupported("built without the h3 feature"));
             }
             _ => {}
         }
         let key: OriginKey = (url.scheme, url.host.to_ascii_lowercase(), url.port);
-        if let Some(handle) = self.0.pool.shared(&key) {
-            return open_h2(&handle, head, framing).await;
+        match self.0.pool.shared(&key) {
+            #[cfg(feature = "tls")]
+            Some(SharedConn::H2(handle)) => return open_h2(&handle, head, framing).await,
+            #[cfg(feature = "h3")]
+            Some(SharedConn::H3(handle)) => return open_h3(&handle, head, framing).await,
+            None => {}
+        }
+        #[cfg(feature = "h3")]
+        if options.protocol == Protocol::Http3 {
+            let handle = self.dial_h3(url).await?;
+            self.0.pool.set_shared(key, SharedConn::H3(handle.clone()));
+            return open_h3(&handle, head, framing).await;
         }
         let (conn, reused) = match self.0.pool.take_h1(&key) {
             Some(conn) => (conn, true),
@@ -305,7 +344,7 @@ impl Client {
                 Dialed::H2(handle) => {
                     // The first h2 connection to an origin is its shared one;
                     // a later one serves this request and closes after it.
-                    self.0.pool.set_shared(key, &handle);
+                    self.0.pool.set_shared(key, SharedConn::H2(handle.clone()));
                     return open_h2(&handle, head, framing).await;
                 }
             },
@@ -315,6 +354,39 @@ impl Client {
         Ok(OpenRequest {
             inner: OpenInner::H1(upload),
         })
+    }
+
+    /// A new HTTP/3 connection to `url`'s origin, lookup and handshake
+    /// within `connect_timeout`.
+    #[cfg(feature = "h3")]
+    async fn dial_h3(&self, url: &Url) -> Result<crate::h3::H3Handle> {
+        let exec = &self.0.exec;
+        let options = &self.0.options;
+        let tls = options
+            .tls
+            .as_ref()
+            .ok_or_else(|| Error::Configuration("https needs ClientOptions::tls".into()))?;
+        let budget = Budget::start(exec, options.connect_timeout);
+        let addrs = dial::resolve(
+            exec,
+            &url.host,
+            url.port,
+            options.max_resolved_addresses,
+            &budget,
+        )
+        .await?;
+        crate::h3::connect(crate::h3::Dial {
+            exec,
+            endpoints: &self.0.quic,
+            tls,
+            host: &url.host,
+            addrs: &addrs,
+            budget: &budget,
+            stream_window: options.stream_window,
+            connection_window: options.connection_window,
+            limits: options.limits,
+        })
+        .await
     }
 
     async fn dial(&self, url: &Url) -> Result<Dialed> {
@@ -376,6 +448,7 @@ enum Dialed {
 }
 
 /// Opens a stream for `head` on an HTTP/2 connection.
+#[cfg(feature = "tls")]
 pub(crate) async fn open_h2(
     handle: &H2Handle,
     head: &RequestHead,
@@ -398,6 +471,27 @@ pub(crate) async fn open_h2(
         inner: OpenInner::H2 {
             body,
             response: opened.response,
+        },
+    })
+}
+
+/// Opens a request stream for `head` on an HTTP/3 connection.
+#[cfg(feature = "h3")]
+async fn open_h3(
+    handle: &crate::h3::H3Handle,
+    head: &RequestHead,
+    framing: OutFraming,
+) -> Result<OpenRequest> {
+    let (length, body_framing, end_stream) = match framing {
+        OutFraming::None => (None, OutBody::None, true),
+        OutFraming::Length(n) => (Some(n), OutBody::Length(n), n == 0),
+        OutFraming::Chunked => (None, OutBody::Open, false),
+    };
+    let (writer, response) = handle.open(head, length, end_stream).await?;
+    Ok(OpenRequest {
+        inner: OpenInner::H3 {
+            body: crate::h3::writer(writer, body_framing),
+            response,
         },
     })
 }

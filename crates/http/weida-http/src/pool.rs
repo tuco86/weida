@@ -14,17 +14,41 @@ use weida_http_codec::uri::Scheme;
 use weida_runtime::Exec;
 
 use crate::h1::Conn;
+#[cfg(feature = "tls")]
 use crate::h2::H2Handle;
 
 /// An origin: scheme, lowercase host, port (RFC 9110 §4.3.1).
 pub(crate) type OriginKey = (Scheme, String, u16);
 
+/// A connection every request to its origin shares.
+#[derive(Clone, Debug)]
+pub(crate) enum SharedConn {
+    #[cfg(feature = "tls")]
+    H2(H2Handle),
+    #[cfg(feature = "h3")]
+    H3(crate::h3::H3Handle),
+}
+
+impl SharedConn {
+    fn is_usable(&self) -> bool {
+        // Matched by value with `ref` bindings: without the `tls` feature the
+        // enum has no variants, and only a by-value match of it is exhaustive.
+        match *self {
+            #[cfg(feature = "tls")]
+            SharedConn::H2(ref h) => h.is_usable(),
+            #[cfg(feature = "h3")]
+            SharedConn::H3(ref h) => h.is_usable(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Origin {
     /// Oldest first.
     idle_h1: Vec<(Instant, Conn)>,
-    /// The one HTTP/2 connection every request to the origin shares.
-    shared: Option<H2Handle>,
+    /// The one HTTP/2 or HTTP/3 connection every request to the origin
+    /// shares.
+    shared: Option<SharedConn>,
 }
 
 /// The idle connections of one client.
@@ -81,13 +105,13 @@ impl Pool {
         }
     }
 
-    /// The origin's shared HTTP/2 connection, if it can still open streams;
-    /// one that cannot is forgotten.
-    pub(crate) fn shared(&self, key: &OriginKey) -> Option<H2Handle> {
+    /// The origin's shared connection, if it can still open streams; one that
+    /// cannot is forgotten.
+    pub(crate) fn shared(&self, key: &OriginKey) -> Option<SharedConn> {
         let mut origins = self.origins();
         let origin = origins.get_mut(key)?;
         match &origin.shared {
-            Some(handle) if handle.is_usable() => Some(handle.clone()),
+            Some(conn) if conn.is_usable() => Some(conn.clone()),
             Some(_) => {
                 origin.shared = None;
                 None
@@ -96,16 +120,16 @@ impl Pool {
         }
     }
 
-    /// Makes `handle` the origin's shared connection unless a usable one is
+    /// Makes `conn` the origin's shared connection unless a usable one is
     /// already there; returns whether it was taken.
     #[cfg(feature = "tls")]
-    pub(crate) fn set_shared(&self, key: OriginKey, handle: &H2Handle) -> bool {
+    pub(crate) fn set_shared(&self, key: OriginKey, conn: SharedConn) -> bool {
         let mut origins = self.origins();
         let origin = origins.entry(key).or_default();
-        if origin.shared.as_ref().is_some_and(H2Handle::is_usable) {
+        if origin.shared.as_ref().is_some_and(SharedConn::is_usable) {
             return false;
         }
-        origin.shared = Some(handle.clone());
+        origin.shared = Some(conn);
         true
     }
 

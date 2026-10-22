@@ -41,7 +41,7 @@ nextest_env() {
 }
 
 # The feature rows of docs/LOOP.md §6: crate:feature.
-features="weida:blocking weida:swarm weida-zmq:blocking weida-mqtt:blocking weida-nng:blocking"
+features="weida:blocking weida:swarm weida-zmq:blocking weida-mqtt:blocking weida-nng:blocking weida-http:h3"
 
 # The nextest profile (`.config/nextest.toml`): a push or manual run takes the
 # unit tier; the nightly cron and a release tag take both tiers.

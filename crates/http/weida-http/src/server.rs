@@ -116,7 +116,10 @@ enum ResponderInner {
         head_request: bool,
         minor: u8,
     },
+    #[cfg(feature = "tls")]
     H2(crate::h2::H2Responder),
+    #[cfg(feature = "h3")]
+    H3(crate::h3::H3Responder),
 }
 
 /// Adds `date` (RFC 9110 §6.6.1: an origin server with a clock MUST) when
@@ -164,9 +167,17 @@ impl Responder {
         }
     }
 
+    #[cfg(feature = "tls")]
     pub(crate) fn h2(responder: crate::h2::H2Responder) -> Responder {
         Responder {
             inner: ResponderInner::H2(responder),
+        }
+    }
+
+    #[cfg(feature = "h3")]
+    pub(crate) fn h3(responder: crate::h3::H3Responder) -> Responder {
+        Responder {
+            inner: ResponderInner::H3(responder),
         }
     }
 
@@ -205,6 +216,7 @@ impl Responder {
                 .map_err(|_| Error::Closed)?;
                 Ok(BodyWriter::channel(wtx, framing))
             }
+            #[cfg(feature = "tls")]
             ResponderInner::H2(mut responder) => {
                 // HTTP/2 frames every body, so "until close" never arises.
                 let framing = h1_framing(&head, responder.head_request, 1)?;
@@ -215,6 +227,13 @@ impl Responder {
                 } else {
                     BodyWriter::h2(responder.writer(), framing)
                 })
+            }
+            #[cfg(feature = "h3")]
+            ResponderInner::H3(mut responder) => {
+                let framing = h1_framing(&head, responder.head_request(), 1)?;
+                let end_stream = framing == OutBody::None;
+                let writer = responder.send_head(head, end_stream).await?;
+                Ok(crate::h3::writer(writer, framing))
             }
         }
     }
@@ -262,6 +281,7 @@ impl Responder {
                 .map_err(|_| Error::Closed)?;
                 wrote.await.map_err(|_| Error::Closed)?
             }
+            #[cfg(feature = "tls")]
             ResponderInner::H2(mut responder) => {
                 if !no_body {
                     head.fields
@@ -276,6 +296,21 @@ impl Responder {
                 let mut writer =
                     BodyWriter::h2(responder.writer(), OutBody::Length(body.len() as u64));
                 writer.write(body).await?;
+                writer.finish().await
+            }
+            #[cfg(feature = "h3")]
+            ResponderInner::H3(mut responder) => {
+                if !no_body {
+                    head.fields
+                        .insert("content-length", body.len().to_string())
+                        .expect("digits are a field value");
+                }
+                let end_stream = no_body || responder.head_request() || body.is_empty();
+                let writer = responder.send_head(head, end_stream).await?;
+                let mut writer = crate::h3::writer(writer, OutBody::Length(body.len() as u64));
+                if !end_stream {
+                    writer.write(body).await?;
+                }
                 writer.finish().await
             }
         }
@@ -445,6 +480,45 @@ impl Server {
         Ok(local)
     }
 
+    /// Serves HTTP/3 on UDP `addr` with the caller's certificate
+    /// configuration, cloned with ALPN `h3`; returns the address bound.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Tls`] when the configuration cannot drive QUIC (QUIC needs
+    /// TLS 1.3); [`Error::Io`] when the address cannot be bound;
+    /// [`Error::Closed`] after [`Server::close`].
+    #[cfg(feature = "h3")]
+    pub async fn bind_quic(
+        &self,
+        addr: SocketAddr,
+        config: Arc<rustls::ServerConfig>,
+    ) -> Result<SocketAddr> {
+        if *self.0.state.borrow() != State::Open {
+            return Err(Error::Closed);
+        }
+        let server_config = crate::h3::server_config(&config, &self.0.options)?;
+        let endpoint = {
+            let _guard = self.0.exec.enter();
+            quinn::Endpoint::server(server_config, addr)?
+        };
+        let local = endpoint.local_addr()?;
+        let ctx = Listening {
+            exec: self.0.exec.clone(),
+            options: self.0.options.clone(),
+            exchanges: self.0.exchanges_tx.clone(),
+            permits: self.0.permits.clone(),
+            state: self.0.state.subscribe(),
+        };
+        let handle = self.0.exec.spawn(quic_accept_loop(ctx, endpoint));
+        self.0
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(handle);
+        Ok(local)
+    }
+
     /// The next exchange.
     ///
     /// # Errors
@@ -495,6 +569,39 @@ struct Listening {
     exchanges: mpsc::Sender<Exchange>,
     permits: Arc<Semaphore>,
     state: watch::Receiver<State>,
+}
+
+#[cfg(feature = "h3")]
+async fn quic_accept_loop(ctx: Listening, endpoint: quinn::Endpoint) {
+    let mut state = ctx.state.clone();
+    loop {
+        let permit = tokio::select! {
+            permit = ctx.permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+            _ = state.wait_for(|s| *s != State::Open) => return,
+        };
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => incoming,
+                None => return,
+            },
+            _ = state.wait_for(|s| *s != State::Open) => return,
+        };
+        let conn = ConnCtx {
+            exec: ctx.exec.clone(),
+            options: ctx.options.clone(),
+            exchanges: ctx.exchanges.clone(),
+            state: ctx.state.clone(),
+            peer: incoming.remote_address(),
+            scheme: Scheme::Https,
+        };
+        ctx.exec.spawn(async move {
+            crate::h3::serve(incoming, conn).await;
+            drop(permit);
+        });
+    }
 }
 
 async fn accept_loop(ctx: Listening, listener: TcpListener, acceptor: Acceptor) {
@@ -561,9 +668,10 @@ async fn serve(
             }
         }
     };
+    #[cfg(feature = "tls")]
     if stream.alpn() == Some(b"h2") {
         crate::h2::conn::serve(stream, ctx).await;
-    } else {
-        h1::server::serve(Conn::new(stream), ctx).await;
+        return;
     }
+    h1::server::serve(Conn::new(stream), ctx).await;
 }

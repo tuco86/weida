@@ -306,6 +306,7 @@ impl Fields {
     }
 
     /// Every field with its sensitivity.
+    #[cfg(feature = "tls")]
     pub(crate) fn iter_full(&self) -> impl Iterator<Item = (&str, &Bytes, bool)> {
         self.entries.iter().map(|(n, v, s)| (&**n, v, *s))
     }

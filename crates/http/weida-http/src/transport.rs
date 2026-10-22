@@ -28,6 +28,7 @@ pub(crate) enum Stream {
     Test(tokio::io::DuplexStream),
 }
 
+#[cfg(feature = "tls")]
 impl Stream {
     /// The protocol ALPN selected, if any.
     pub(crate) fn alpn(&self) -> Option<&[u8]> {

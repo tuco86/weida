@@ -86,7 +86,10 @@ enum ReaderInner {
     Empty,
     H1(H1Body),
     Channel(ChannelBody),
+    #[cfg(feature = "tls")]
     H2(crate::h2::StreamReader),
+    #[cfg(feature = "h3")]
+    H3(Box<crate::h3::H3Reader>),
 }
 
 /// A body that arrives.
@@ -108,9 +111,17 @@ impl BodyReader {
         }
     }
 
+    #[cfg(feature = "tls")]
     pub(crate) fn h2(body: crate::h2::StreamReader) -> BodyReader {
         BodyReader {
             inner: ReaderInner::H2(body),
+        }
+    }
+
+    #[cfg(feature = "h3")]
+    pub(crate) fn h3(body: crate::h3::H3Reader) -> BodyReader {
+        BodyReader {
+            inner: ReaderInner::H3(Box::new(body)),
         }
     }
 
@@ -132,7 +143,10 @@ impl BodyReader {
             ReaderInner::Empty => Ok(None),
             ReaderInner::H1(body) => body.chunk().await,
             ReaderInner::Channel(body) => body.chunk().await,
+            #[cfg(feature = "tls")]
             ReaderInner::H2(body) => body.chunk().await,
+            #[cfg(feature = "h3")]
+            ReaderInner::H3(body) => body.chunk().await,
         }
     }
 
@@ -164,7 +178,10 @@ impl BodyReader {
             ReaderInner::Empty => Some(0),
             ReaderInner::H1(body) => body.content_length(),
             ReaderInner::Channel(body) => body.content_length,
+            #[cfg(feature = "tls")]
             ReaderInner::H2(body) => body.content_length(),
+            #[cfg(feature = "h3")]
+            ReaderInner::H3(body) => body.content_length(),
         }
     }
 
@@ -175,7 +192,10 @@ impl BodyReader {
             ReaderInner::Empty => None,
             ReaderInner::H1(body) => body.trailers(),
             ReaderInner::Channel(body) => body.trailers.as_ref(),
+            #[cfg(feature = "tls")]
             ReaderInner::H2(body) => body.trailers(),
+            #[cfg(feature = "h3")]
+            ReaderInner::H3(body) => body.trailers(),
         }
     }
 }
@@ -211,7 +231,11 @@ enum Sink {
     /// An HTTP/1.1 connection task.
     Channel(mpsc::Sender<WriteEvent>),
     /// An HTTP/2 stream.
+    #[cfg(feature = "tls")]
     H2(crate::h2::StreamWriter),
+    /// An HTTP/3 stream.
+    #[cfg(feature = "h3")]
+    H3(Box<crate::h3::H3Writer>),
     /// Finished or aborted.
     Gone,
 }
@@ -239,6 +263,16 @@ impl BodyWriter {
         }
     }
 
+    #[cfg(feature = "h3")]
+    pub(crate) fn h3(writer: crate::h3::H3Writer, framing: OutBody) -> BodyWriter {
+        BodyWriter {
+            sink: Sink::H3(Box::new(writer)),
+            framing,
+            written: 0,
+        }
+    }
+
+    #[cfg(feature = "tls")]
     pub(crate) fn h2(writer: crate::h2::StreamWriter, framing: OutBody) -> BodyWriter {
         BodyWriter {
             sink: Sink::H2(writer),
@@ -248,6 +282,7 @@ impl BodyWriter {
     }
 
     /// A writer for a message that carries no body and is already complete.
+    #[cfg(feature = "tls")]
     pub(crate) fn done() -> BodyWriter {
         BodyWriter {
             sink: Sink::Gone,
@@ -290,7 +325,10 @@ impl BodyWriter {
                 .send(WriteEvent::Data(data))
                 .await
                 .map_err(|_| Error::Closed),
+            #[cfg(feature = "tls")]
             Sink::H2(writer) => writer.write(data).await,
+            #[cfg(feature = "h3")]
+            Sink::H3(writer) => writer.write(data).await,
             Sink::Gone => Err(Error::Closed),
         };
         result.map_err(|e| self.abort(e))
@@ -337,7 +375,10 @@ impl BodyWriter {
                     .map_err(|_| Error::Closed)?;
                 wrote.await.map_err(|_| Error::Closed)?
             }
+            #[cfg(feature = "tls")]
             Sink::H2(writer) => writer.finish(trailers).await,
+            #[cfg(feature = "h3")]
+            Sink::H3(writer) => writer.finish(trailers).await,
             Sink::Gone if self.framing == OutBody::None => Ok(()),
             Sink::Gone => Err(Error::Closed),
         }

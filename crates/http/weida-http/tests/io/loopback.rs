@@ -20,21 +20,45 @@ struct Fixture {
     version: Version,
 }
 
+#[cfg(feature = "h3")]
+async fn bind_quic(
+    server: &Server,
+    addr: SocketAddr,
+    tls: Arc<tokio_rustls::rustls::ServerConfig>,
+) -> SocketAddr {
+    server.bind_quic(addr, tls).await.unwrap()
+}
+
+#[cfg(not(feature = "h3"))]
+async fn bind_quic(
+    _: &Server,
+    _: SocketAddr,
+    _: Arc<tokio_rustls::rustls::ServerConfig>,
+) -> SocketAddr {
+    unreachable!("no h3 rows without the feature")
+}
+
 async fn fixture(tls: bool, protocol: Protocol) -> Fixture {
     let exec = Exec::current().unwrap();
     let server = Arc::new(Server::new(&exec, ServerOptions::default()).unwrap());
     let any = SocketAddr::from(([127, 0, 0, 1], 0));
     let version = match (tls, protocol) {
         (true, Protocol::Auto | Protocol::Http2) => Version::Http2,
+        (true, Protocol::Http3) => Version::Http3,
         _ => Version::Http11,
     };
     let (base, client_tls) = if tls {
         let (client_tls, server_tls) = tls_pair();
-        let addr = server.bind_tls(any, server_tls).await.unwrap();
-        (
-            format!("https://localhost:{}", addr.port()),
-            Some(client_tls),
-        )
+        if protocol == Protocol::Http3 {
+            let addr = bind_quic(&server, any, server_tls).await;
+            (format!("https://{addr}"), Some(client_tls))
+        } else {
+            let addr = server.bind_tls(any, server_tls).await.unwrap();
+            (
+                format!("https://localhost:{}", addr.port()),
+                Some(client_tls),
+            )
+        }
     } else {
         let addr = server.bind_tcp(any).await.unwrap();
         (format!("http://{addr}"), None)
@@ -200,4 +224,16 @@ async fn close_lets_a_response_in_flight_finish() {
 #[tokio::test]
 async fn close_lets_an_h2_response_in_flight_finish() {
     close_with_one_in_flight(true, Protocol::Http2).await;
+}
+
+#[cfg(feature = "h3")]
+#[tokio::test]
+async fn our_client_against_our_server_over_h3() {
+    rows(true, Protocol::Http3).await;
+}
+
+#[cfg(feature = "h3")]
+#[tokio::test]
+async fn close_lets_an_h3_response_in_flight_finish() {
+    close_with_one_in_flight(true, Protocol::Http3).await;
 }

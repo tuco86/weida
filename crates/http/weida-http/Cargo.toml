@@ -36,6 +36,8 @@ tracing.workspace = true
 # clone.
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+# HTTP/3's transport; opt-in so a default build links no QUIC stack.
+quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
 # A certificate for the TLS tests. The trust anchors are the caller's
@@ -52,17 +54,24 @@ tokio = { workspace = true, features = [
     "test-util",
 ] }
 tokio-rustls.workspace = true
-# The foreign peers, which always run: hyper 1 for HTTP/1.1 and HTTP/2 in
-# both roles. Dev-only, in no build of this library.
+# The foreign peers, which always run: hyper 1 for HTTP/1.1 and HTTP/2 and
+# h3 on h3-quinn for HTTP/3, in both roles. Dev-only, in no build of this
+# library.
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = { version = "0.1", features = ["channel"] }
 http = "1"
+# The HTTP/3 peer, on the same quinn 0.11 as this crate.
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn.workspace = true
 
 [features]
 default = ["tls"]
 # https and HTTP/2.
 tls = ["dep:tokio-rustls", "dep:rustls"]
+# HTTP/3 over QUIC, opt-in (0044 §4).
+h3 = ["tls", "dep:quinn"]
 
 [lints]
 workspace = true
@@ -71,3 +80,7 @@ workspace = true
 [[test]]
 name = "it"
 path = "tests/main.rs"
+
+[[example]]
+name = "hello"
+required-features = ["h3"]
