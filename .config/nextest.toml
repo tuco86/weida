@@ -53,10 +53,16 @@ slow-timeout = { period = "50s", terminate-after = 1 }
 
 # Arbitrary octets through a session, many rounds: 7.3 s on darwin-arm64 and
 # 5.3 s on windows-amd64, and 10 s on windows-amd64 beside the whole nightly.
+# The budget race spins two threads for ten rounds: 4.5 s on darwin-arm64,
+# past 10 s there and on windows-amd64 in `-p weida --features blocking`,
+# where weida's heavy tests overlap. The guide's large payload: 6.7 s on
+# darwin-arm64, 4.1 s on windows-amd64, past 10 s in that same run. The CLI
+# tests start a child process that mints an identity and wait on it for up
+# to their own 20 s deadline, which a 10 s kill would never let them report.
 [[profile.integration.overrides]]
-filter = 'package(weida-zmq) and test(=session::tests::io::arbitrary_octets_are_never_a_panic)'
+filter = '(package(weida-zmq) and test(=session::tests::io::arbitrary_octets_are_never_a_panic)) | (package(weida) and (test(=segment::tests::io::a_writer_that_releases_at_once_never_strands_budget) | test(=io::guide::the_same_calls_carry_a_payload_no_cap_would_admit) | test(/^io::cli::/)))'
 slow-timeout = { period = "30s", terminate-after = 1 }
 
 [[profile.ci.overrides]]
-filter = 'package(weida-zmq) and test(=session::tests::io::arbitrary_octets_are_never_a_panic)'
+filter = '(package(weida-zmq) and test(=session::tests::io::arbitrary_octets_are_never_a_panic)) | (package(weida) and (test(=segment::tests::io::a_writer_that_releases_at_once_never_strands_budget) | test(=io::guide::the_same_calls_carry_a_payload_no_cap_would_admit) | test(/^io::cli::/)))'
 slow-timeout = { period = "30s", terminate-after = 1 }
