@@ -41,3 +41,81 @@ pub fn tls_pair() -> (Arc<ClientConfig>, Arc<ServerConfig>) {
 pub fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i % 251) as u8).collect()
 }
+
+/// The test application: answers every exchange `server` accepts until it
+/// closes.
+///
+/// * `/three`: `abc`;
+/// * `/echo`: the request body, collected under 8 MiB;
+/// * `/stream`: 4 MiB in 64 KiB writes with no length (chunked on HTTP/1.1);
+/// * `/peer`: the client's port, which names its connection;
+/// * `/trailers`: the request body's `x-in` trailer back as an `x-out`
+///   trailer, after the body `t`;
+/// * `/slow`: waits for `release` before answering `late`.
+pub fn serve_app(
+    server: Arc<weida_http::Server>,
+    release: Option<Arc<tokio::sync::Notify>>,
+) -> tokio::task::JoinHandle<()> {
+    use bytes::Bytes;
+    use weida_http::{Fields, ResponseHead, Status};
+    tokio::spawn(async move {
+        while let Ok(mut ex) = server.accept().await {
+            let release = release.clone();
+            tokio::spawn(async move {
+                let ok = ResponseHead::new(Status::OK);
+                match ex.head.path.as_str() {
+                    "/three" => {
+                        let _ = ex
+                            .responder
+                            .respond_bytes(ok, Bytes::from_static(b"abc"))
+                            .await;
+                    }
+                    "/echo" => {
+                        let body = ex.body.collect(8 << 20).await.unwrap();
+                        let _ = ex.responder.respond_bytes(ok, body).await;
+                    }
+                    "/stream" => {
+                        let mut w = ex.responder.respond(ok).await.unwrap();
+                        let piece = Bytes::from(pattern(64 * 1024));
+                        for _ in 0..64 {
+                            w.write(piece.clone()).await.unwrap();
+                        }
+                        w.finish().await.unwrap();
+                    }
+                    "/peer" => {
+                        let port = ex.peer.port().to_string();
+                        let _ = ex.responder.respond_bytes(ok, Bytes::from(port)).await;
+                    }
+                    "/trailers" => {
+                        ex.body.collect(1 << 20).await.unwrap();
+                        let echoed = ex
+                            .body
+                            .trailers()
+                            .and_then(|t| t.get("x-in").cloned())
+                            .unwrap_or_default();
+                        let mut w = ex.responder.respond(ok).await.unwrap();
+                        w.write(Bytes::from_static(b"t")).await.unwrap();
+                        let mut trailers = Fields::new();
+                        trailers.append("x-out", echoed).unwrap();
+                        w.finish_with_trailers(trailers).await.unwrap();
+                    }
+                    "/slow" => {
+                        if let Some(release) = release {
+                            release.notified().await;
+                        }
+                        let _ = ex
+                            .responder
+                            .respond_bytes(ok, Bytes::from_static(b"late"))
+                            .await;
+                    }
+                    _ => {
+                        let _ = ex
+                            .responder
+                            .respond_bytes(ResponseHead::new(Status::NOT_FOUND), Bytes::new())
+                            .await;
+                    }
+                }
+            });
+        }
+    })
+}

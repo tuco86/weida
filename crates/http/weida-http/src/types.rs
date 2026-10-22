@@ -157,6 +157,37 @@ impl Status {
     pub const fn is_redirection(self) -> bool {
         self.0 >= 300 && self.0 < 400
     }
+
+    /// The reason phrase this library writes on HTTP/1.1, which a client
+    /// ignores (RFC 9112 §4).
+    pub(crate) fn reason(self) -> &'static str {
+        match self.0 {
+            100 => "Continue",
+            200 => "OK",
+            201 => "Created",
+            204 => "No Content",
+            206 => "Partial Content",
+            301 => "Moved Permanently",
+            302 => "Found",
+            304 => "Not Modified",
+            307 => "Temporary Redirect",
+            308 => "Permanent Redirect",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            408 => "Request Timeout",
+            413 => "Content Too Large",
+            431 => "Request Header Fields Too Large",
+            500 => "Internal Server Error",
+            501 => "Not Implemented",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            505 => "HTTP Version Not Supported",
+            _ => "",
+        }
+    }
 }
 
 impl fmt::Debug for Status {

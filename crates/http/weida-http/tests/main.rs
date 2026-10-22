@@ -12,4 +12,6 @@ mod io {
     // with the feature.
     #[cfg(feature = "tls")]
     mod interop_hyper;
+    #[cfg(feature = "tls")]
+    mod loopback;
 }

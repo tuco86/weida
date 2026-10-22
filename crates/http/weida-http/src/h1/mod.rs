@@ -2,6 +2,7 @@
 //! `server`.
 
 pub(crate) mod client;
+pub(crate) mod server;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

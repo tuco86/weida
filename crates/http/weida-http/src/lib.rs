@@ -50,13 +50,15 @@ mod error;
 mod h1;
 mod options;
 mod pool;
+mod server;
 mod transport;
 mod types;
 
-pub use body::BodyReader;
+pub use body::{BodyReader, BodyWriter};
 pub use client::{Client, OpenRequest, Response};
 pub use error::{Error, Result};
 pub use options::{ClientOptions, Protocol, ServerOptions};
+pub use server::{Exchange, Responder, Server};
 pub use types::{Fields, Method, RequestHead, ResponseHead, Status, Url, Version};
 pub use weida_http_codec::Limits;
 pub use weida_http_codec::uri::Scheme;

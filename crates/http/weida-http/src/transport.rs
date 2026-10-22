@@ -20,6 +20,9 @@ pub(crate) enum Stream {
     /// A client's TLS over TCP.
     #[cfg(feature = "tls")]
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// A server's TLS over TCP.
+    #[cfg(feature = "tls")]
+    TlsServer(Box<tokio_rustls::server::TlsStream<TcpStream>>),
     /// An in-memory pipe, for the unit tests.
     #[cfg(test)]
     Test(tokio::io::DuplexStream),
@@ -34,6 +37,11 @@ macro_rules! each {
             }
             #[cfg(feature = "tls")]
             Stream::Tls($s) => {
+                let $s = Pin::new($s.as_mut());
+                $e
+            }
+            #[cfg(feature = "tls")]
+            Stream::TlsServer($s) => {
                 let $s = Pin::new($s.as_mut());
                 $e
             }

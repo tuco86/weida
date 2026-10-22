@@ -191,3 +191,75 @@ async fn two_requests_share_one_keep_alive_connection() {
     }
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
+
+/// hyper's HTTP/1.1 client against our server: one connection, three
+/// requests on it.
+#[tokio::test]
+async fn hyper_h1_client_against_our_server() {
+    let exec = Exec::current().unwrap();
+    let server =
+        Arc::new(weida_http::Server::new(&exec, weida_http::ServerOptions::default()).unwrap());
+    let addr = server
+        .bind_tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    crate::common::serve_app(server.clone(), None);
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+
+    let send = |path: &str, method: &str, body: Bytes| {
+        hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", addr.to_string())
+            .body(Full::new(body))
+            .unwrap()
+    };
+
+    let r = within(
+        "GET /three",
+        sender.send_request(send("/three", "GET", Bytes::new())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.headers().contains_key("date"));
+    let body = within("the body", r.into_body().collect())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(body, "abc");
+
+    let sent = Bytes::from(pattern(1 << 20));
+    let r = within(
+        "POST /echo",
+        sender.send_request(send("/echo", "POST", sent.clone())),
+    )
+    .await
+    .unwrap();
+    let body = within("the echo", r.into_body().collect())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(body, sent);
+
+    let r = within(
+        "GET /stream",
+        sender.send_request(send("/stream", "GET", Bytes::new())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.headers().get("transfer-encoding").map(|v| v.as_bytes()),
+        Some(&b"chunked"[..])
+    );
+    let body = within("the stream", r.into_body().collect())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(body.len(), 4 << 20);
+}
