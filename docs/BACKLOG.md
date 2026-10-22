@@ -37,7 +37,7 @@ kind: protocol | size: 90 | status: done 31586b2 | needs: [B-363, B-366]
 acceptance: one connection driver for both roles per Step 8; ALPN `h2`; flow control both directions; GOAWAY and RST_STREAM; hyper 1 http2 interop rows both roles; the pool shares one h2 connection per origin.
 
 ### B-368 — `weida-http`: HTTP/3 client and server (feature `h3`)
-kind: protocol | size: 90 | status: in_progress 2026-10-23T01:41Z | needs: [B-364, B-367]
+kind: protocol | size: 90 | status: done 4933a7d | needs: [B-364, B-367]
 acceptance: Step 9 over quinn; control stream SETTINGS, no QPACK streams opened; h3 0.0.8 + h3-quinn 0.0.10 interop rows both roles; LOOP §6 and `.zeughaus-ci` feature row `weida-http:h3`.
 
 ### B-369 — `weida-openbao` onto `weida-http`; `reqwest` removed
