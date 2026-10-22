@@ -285,7 +285,9 @@ at most `connection_window` (4 MiB) unread, and quinn's receive windows carry th
 numbers for HTTP/3; HTTP/1.1 reads the socket only while the exchange's queue of four chunks
 has room. The server holds at most `max_connections` (1024) connections, `max_concurrent_streams`
 (100) streams on each multiplexed one (HTTP/2 refuses a stream past it with REFUSED_STREAM;
-QUIC never grants more), and `accept_queue` (64) exchanges waiting for `accept`; a head must
+QUIC never grants more), the same number of exchanges per HTTP/2 connection waiting for the
+accept queue, counted apart from its streams because a stream the client reset leaves while
+its exchange still waits, and `accept_queue` (64) exchanges waiting for `accept`; a head must
 arrive within `header_timeout` (10 s) and an idle connection is closed after `idle_timeout`.
 What it writes is bounded too: an HTTP/2 connection stops reading frames once 256 KiB of
 its output is queued and unwritten, so a peer that sends without reading cannot grow it.

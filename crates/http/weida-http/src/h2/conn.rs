@@ -1016,7 +1016,9 @@ impl Driver {
             return Ok(());
         }
         let limit = self.local.max_concurrent_streams.unwrap_or(u32::MAX);
-        if self.streams.len() as u32 >= limit {
+        // A stream the peer reset leaves `streams` while its exchange still
+        // waits for the accept queue, so both are counted against the limit.
+        if self.streams.len() as u32 >= limit || self.pending_exchanges.len() as u32 >= limit {
             self.frame(&Frame::RstStream {
                 stream: id,
                 code: code::REFUSED_STREAM,
@@ -1721,6 +1723,81 @@ mod tests {
         assert_eq!(
             resets,
             [(1, code::PROTOCOL_ERROR), (3, code::PROTOCOL_ERROR)]
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_reset_while_nobody_accepts_are_refused_past_the_limit() {
+        const LIMIT: u32 = 4;
+        const OPENED: u32 = 3 * LIMIT;
+        let (mut peer, b) = tokio::io::duplex(1 << 20);
+        let (mut ctx, _unused, _state) = server_ctx(ServerOptions {
+            max_concurrent_streams: LIMIT,
+            ..ServerOptions::default()
+        });
+        // An accept queue of one that nobody reads.
+        let (tx, _exchanges) = mpsc::channel(1);
+        ctx.exchanges = tx;
+        tokio::spawn(serve(Stream::Test(b), ctx));
+
+        let mut out = h2::PREFACE.to_vec();
+        Frame::Settings {
+            ack: false,
+            params: vec![],
+        }
+        .encode(&mut out);
+        let mut enc = hpack::Encoder::new();
+        let request: [(&[u8], &[u8], bool); 4] = [
+            (b":method", b"GET", false),
+            (b":scheme", b"https", false),
+            (b":authority", b"a", false),
+            (b":path", b"/", false),
+        ];
+        for i in 0..OPENED {
+            let stream = 2 * i + 1;
+            let mut block = Vec::new();
+            enc.encode(&request, &mut block);
+            Frame::Headers {
+                stream,
+                end_stream: true,
+                end_headers: true,
+                block: &block,
+            }
+            .encode(&mut out);
+            Frame::RstStream {
+                stream,
+                code: code::CANCEL,
+            }
+            .encode(&mut out);
+        }
+        Frame::Ping {
+            ack: false,
+            data: *b"after-it",
+        }
+        .encode(&mut out);
+        peer.write_all(&out).await.unwrap();
+
+        // Output is in order, so every refusal precedes the PING's answer.
+        let mut buf = BytesMut::new();
+        let mut refused = Vec::new();
+        within(frames(&mut peer, &mut buf, |f| match f {
+            Frame::RstStream { stream, code } => {
+                assert_eq!(*code, code::REFUSED_STREAM);
+                refused.push(*stream);
+                false
+            }
+            Frame::Ping { ack, .. } => *ack,
+            _ => false,
+        }))
+        .await;
+        // At most the limit wait in the driver and one in the accept queue;
+        // every later stream is refused.
+        let taken = OPENED - refused.len() as u32;
+        assert!(taken <= LIMIT + 1, "{taken} exchanges kept");
+        let first_refused = 2 * taken + 1;
+        assert_eq!(
+            refused,
+            (first_refused..2 * OPENED).step_by(2).collect::<Vec<_>>()
         );
     }
 }

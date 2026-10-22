@@ -76,6 +76,7 @@ There is no "partial". Measured claims were measured against hyper 1.11.1 with h
 | connect timeout | `ClientOptions::connect_timeout` (lookup, TCP, TLS or QUIC together) | present |
 | request timeout | absent: the caller's deadline (`Exec::within`); filed as B-372 | absent |
 | `http2::Builder::adaptive_window` | absent: windows are fixed by the options | absent |
+| `http2::Builder::max_pending_accept_reset_streams` | `ServerOptions::max_concurrent_streams` also bounds the exchanges a connection holds for `accept`, reset streams included; past it a new stream gets REFUSED_STREAM | present (`h2::conn::tests::streams_reset_while_nobody_accepts_are_refused_past_the_limit`) |
 | `h3` `max_field_section_size` | `Limits::max_head_bytes`, advertised in SETTINGS | present |
 | QPACK table capacity, blocked streams | fixed at 0 | refused (0044 §4) |
 
@@ -127,7 +128,7 @@ Bounds, each the caller's:
 | `Limits::max_frame_size` | 16 384 | an h2 frame; an h3 frame other than DATA and HEADERS |
 | `stream_window` | 1 MiB | what one h2/h3 stream may send before it is read |
 | `connection_window` | 4 MiB | what one h2/h3 connection may send before it is read |
-| `ServerOptions::max_concurrent_streams` | 100 | streams a client may open at once |
+| `ServerOptions::max_concurrent_streams` | 100 | streams a client may open at once, and the exchanges one connection holds back for `accept`, streams the client reset included |
 | `ServerOptions::max_connections` | 1024 | connections served at once |
 | `ServerOptions::accept_queue` | 64 | exchanges waiting for `accept` |
 | `ClientOptions::max_idle_per_origin` | 4 | idle HTTP/1.1 connections per origin |
