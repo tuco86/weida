@@ -14,4 +14,9 @@ cargo_env
 # the bindings' test binaries link libpython.
 exclude="--exclude weida-py-core --exclude weida-py --exclude weida-zmq-py --exclude weida-nng-py --exclude weida-mqtt-py --exclude weida-amqp-py --exclude weida-nats-py"
 
+# macOS starts a process with a soft limit of 256 descriptors, below what a
+# test holds with both ends of a local transport in one process
+# (`max_local_streams` is 255 on each side); Linux starts at 1024 or more.
+ulimit -n 10240 2>/dev/null || ulimit -n "$(ulimit -Hn)"
+
 check_platform
