@@ -48,6 +48,10 @@ acceptance: Step 10; every existing `weida-openbao` test passes unchanged; `carg
 kind: spec | size: 45 | status: done bda8582 | needs: [B-368, B-369]
 acceptance: Step 11; `docs/libraries/http.md` in the eleven-section shape; every listed document names the sixth family; `git grep -n 'five foreign-protocol\|all five libraries\|twenty-five' -- README.md docs` finds no stale count.
 
+### B-373 — `weida-http`: a reset stream frees no place in the HTTP/2 accept hand-off
+kind: code | size: 30 | status: ready | needs: [B-367]
+acceptance: the HTTP/2 server driver refuses a new stream with REFUSED_STREAM while `max_concurrent_streams` exchanges wait for the accept queue, so a client that opens and resets streams while the application is not accepting grows `pending_exchanges` to at most that number; a unit test over `tokio::io::duplex` (a raw peer opens and resets 3 × the limit with nobody accepting, then sees REFUSED_STREAM for every stream past the limit); INVARIANTS and `docs/libraries/http.md` §5 (hyper's `max_pending_accept_reset_streams`) and §9 name it. Found in the review pass after B-370: RST_STREAM removes a stream from `streams`, so the admission check no longer counts its exchange, which stays queued in the driver while the application's accept queue is full.
+
 ### B-371 — `weida-http-py`
 kind: protocol | size: 90 | status: ready | needs: [B-366]
 acceptance: `crates/http/weida-http-py` on `weida-py-core` with an asyncio and a synchronous surface over `Client` and `Server`, the shape of `weida-nats-py`; `docs/libraries/http-py.md`; excluded from the darwin/windows checks like the other bindings.
@@ -55,6 +59,10 @@ acceptance: `crates/http/weida-http-py` on `weida-py-core` with an asyncio and a
 ### B-372 — `weida-http`: a client request deadline
 kind: code | size: 45 | status: ready | needs: [B-369]
 acceptance: `ClientOptions::request_timeout: Option<Duration>` bounds a request from dial to response head (`Error::Timeout { step: "the response head" }`); a unit test over `tokio::io::duplex` on a paused clock with a server that never answers; `weida-openbao` drops its own `exec.within` around the head in favour of it. Found in the review pass after B-364: today a server that accepts and never answers holds `Client::request` until the caller's own deadline.
+
+### B-374 — Two `weida-nng` io tests fail on the darwin runner
+kind: code | size: 30 | status: ready | needs: []
+acceptance: `io::pipeline::a_puller_that_cannot_accept_is_skipped_rather_than_waited_for` (pipeline #42) and `io::pair::a_paired_socket_admits_one_peer_at_a_time` (pipeline #44) failed once each on `check-darwin-arm64` with every other test green and no `weida-nng` change in between; the cause is named (a timing assumption or a real race) and fixed so that ten `run_jobs` runs of the darwin check pass both. Found in the review pass after B-370.
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
