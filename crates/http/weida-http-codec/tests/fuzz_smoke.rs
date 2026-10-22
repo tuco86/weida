@@ -21,6 +21,7 @@
 
 use weida_http_codec::fields::Field;
 use weida_http_codec::h1::{self, Chunk, ChunkedDecoder};
+use weida_http_codec::h2::{self, Frame};
 use weida_http_codec::hpack;
 use weida_http_codec::uri::Target;
 use weida_http_codec::{DecodeError, Limits};
@@ -382,4 +383,89 @@ fn fuzz_smoke_hpack() {
         assert_eq!(back, out);
     }
     assert!(accepted > ITERATIONS / 100, "only {accepted} accepted");
+}
+
+fn h2_frame(rng: &mut Rng, payload: &[u8]) -> Vec<u8> {
+    let stream = [0u32, 1, 3, 0x7fff_ffff][rng.below(4)];
+    let code = rng.next() as u32;
+    let frame = match rng.below(10) {
+        0 => Frame::Data {
+            stream,
+            end_stream: rng.below(2) == 0,
+            data: payload,
+        },
+        1 => Frame::Headers {
+            stream,
+            end_stream: false,
+            end_headers: true,
+            block: payload,
+        },
+        2 => Frame::Priority { stream },
+        3 => Frame::RstStream { stream, code },
+        4 => Frame::Settings {
+            ack: false,
+            params: (0..rng.below(4))
+                .map(|_| {
+                    (
+                        rng.below(8) as u16,
+                        [0, 1, 16_384, 65_535, 1 << 31][rng.below(5)],
+                    )
+                })
+                .collect(),
+        },
+        5 => Frame::PushPromise {
+            stream,
+            promised: 2,
+            end_headers: true,
+            block: payload,
+        },
+        6 => Frame::Ping {
+            ack: rng.below(2) == 0,
+            data: *b"pingpong",
+        },
+        7 => Frame::GoAway {
+            last_stream: stream,
+            code,
+            debug: payload,
+        },
+        8 => Frame::WindowUpdate {
+            stream,
+            increment: rng.next() as u32 & 0x7fff_ffff,
+        },
+        _ => Frame::Continuation {
+            stream,
+            end_headers: false,
+            block: payload,
+        },
+    };
+    let mut out = Vec::new();
+    frame.encode(&mut out);
+    out
+}
+
+#[test]
+fn fuzz_smoke_h2_frame() {
+    let mut rng = Rng::new(0x5eed_0007);
+    let max = 64;
+    let mut accepted = 0;
+    for _ in 0..ITERATIONS {
+        let payload = rng.bytes(b"\x00\x01\x08\xffab", 80);
+        let wire = h2_frame(&mut rng, &payload);
+        let wire = rng.mutate(wire);
+        let Ok((frame, used)) = Frame::decode(&wire, max) else {
+            continue;
+        };
+        accepted += 1;
+        let declared = u32::from_be_bytes([0, wire[0], wire[1], wire[2]]);
+        assert!(declared <= max);
+        assert_eq!(used, h2::HEADER_LEN + declared as usize);
+        if matches!(frame, Frame::Unknown { .. }) {
+            continue;
+        }
+        let mut out = Vec::new();
+        frame.encode(&mut out);
+        let (again, again_used) = Frame::decode(&out, max).expect("the re-encoding decodes");
+        assert_eq!((again, again_used), (frame, out.len()));
+    }
+    assert!(accepted > ITERATIONS / 10, "only {accepted} accepted");
 }

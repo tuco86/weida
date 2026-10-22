@@ -11,6 +11,7 @@
 //!
 //! * [`h1`]: HTTP/1.1 request and response heads, body framing, chunked
 //!   bodies (RFC 9112).
+//! * [`h2`]: HTTP/2 frames (RFC 9113 §4, §6).
 //! * [`hpack`]: HTTP/2 field compression with its [`huffman`] code
 //!   (RFC 7541).
 //! * [`fields`]: the field name and value grammar every version shares
@@ -67,13 +68,14 @@
 //!
 //! # Sources
 //!
-//! Every rule comes from `docs/research/http.md`, which cites RFC 9110 and
-//! RFC 9112 (June 2022).
+//! Every rule comes from `docs/research/http.md`, which cites RFC 9110,
+//! RFC 9112, RFC 9113 (June 2022) and RFC 7541 (May 2015).
 
 pub mod date;
 pub mod error;
 pub mod fields;
 pub mod h1;
+pub mod h2;
 pub mod hpack;
 pub mod huffman;
 pub mod limits;
