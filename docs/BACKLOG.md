@@ -61,7 +61,7 @@ kind: code | size: 45 | status: ready | needs: [B-369]
 acceptance: `ClientOptions::request_timeout: Option<Duration>` bounds a request from dial to response head (`Error::Timeout { step: "the response head" }`); a unit test over `tokio::io::duplex` on a paused clock with a server that never answers; `weida-openbao` drops its own `exec.within` around the head in favour of it. Found in the review pass after B-364: today a server that accepts and never answers holds `Client::request` until the caller's own deadline.
 
 ### B-374 — Three io tests fail at random on the darwin runner
-kind: code | size: 60 | status: in_progress 2026-10-22T23:12Z | needs: []
+kind: code | size: 60 | status: done 248db99 | needs: []
 acceptance: `weida-nng` `io::pipeline::a_puller_that_cannot_accept_is_skipped_rather_than_waited_for` (pipeline #42), `weida-nng` `io::pair::a_paired_socket_admits_one_peer_at_a_time` (#44) and `weida` `io::cli::a_send_reaches_a_sink_over_a_unix_socket` (#46, after 20.5 s) failed once each on `check-darwin-arm64` with every other test green and no change to either crate in between; the cause of each is named and fixed where it is the code's; a claim that does not depend on the kernel moves to the unit tier over `inproc://` or an in-memory stream; the CLI test survives 1500 local stress runs; two consecutive both-tier runner pipelines are green on all four platforms. Found in the review pass after B-370.
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
