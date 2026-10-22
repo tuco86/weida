@@ -485,14 +485,17 @@ pub(crate) async fn push_pull_waits_for_a_slot(h: &Harness) {
     /// hundreds of sends still to place.
     const MESSAGES: usize = 600;
     /// Per message: far slower than a local send, which is what makes the
-    /// transfers pile up against the ceiling.
+    /// transfers pile up against the ceiling. An interval rather than a sleep
+    /// per message: Windows rounds a sleep up to its 15.6 ms timer tick, and
+    /// the interval catches up in bursts, so the pace holds there too.
     const PULL_DELAY: Duration = Duration::from_micros(500);
 
     let puller = h.listener.puller("/jobs").expect("puller");
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
     let pulling = tokio::spawn(async move {
+        let mut pace = tokio::time::interval(PULL_DELAY);
         for _ in 0..MESSAGES {
-            tokio::time::sleep(PULL_DELAY).await;
+            pace.tick().await;
             let Ok(transfer) = puller.recv().await else {
                 break;
             };

@@ -552,9 +552,10 @@ carries the `AF_UNIX` bind hygiene of [0010](decisions/0010-local-transport.md) 
 (`sun_path` budget, socket-type check, unlink-then-bind, explicit `0600`, node removed on
 drop), plus `peer_credentials`; and on Windows `BoundPipe`, which creates the instances of
 a named pipe with an owner-only DACL, `PIPE_REJECT_REMOTE_CLIENTS` and the first-instance
-flag, `connect_pipe`, which waits out `ERROR_PIPE_BUSY` on the runtime's timer, and
-`client_principal` / `server_principal`. Dependencies: `weida-core` for one error
-vocabulary, `tokio`, and on Windows `weida-winpipe`. Nothing else.
+flag, `connect_pipe`, which waits out `ERROR_PIPE_BUSY` on the runtime's timer for as long as
+it lasts (backpressure, ended by the caller's own deadline), and `client_principal` /
+`server_principal`. Dependencies: `weida-core` for one error vocabulary, `tokio`, and on
+Windows `weida-winpipe`. Nothing else.
 
 ### `weida-winpipe`
 

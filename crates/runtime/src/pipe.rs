@@ -27,13 +27,19 @@ use weida_core::{Error, LossCause, WindowsPrincipal};
 
 use crate::Exec;
 
-/// How long a client keeps retrying `ERROR_PIPE_BUSY` before giving up.
+/// The first wait before a client opens a busy pipe again; each further one
+/// doubles, up to [`BUSY_STEP_MAX`].
 ///
 /// Busy means every instance is connected and the server has not created
-/// the next one yet — a window of one accept-loop iteration, so the budget
-/// is generous and the step is short.
-const BUSY_BUDGET: Duration = Duration::from_secs(5);
+/// the next one: for one accept-loop iteration, or for as long as the
+/// server holds back accepting because its places are taken. The second is
+/// backpressure, the same wait an `AF_UNIX` client spends in the listen
+/// backlog, so there is no budget here: the caller's own deadline ends it.
 const BUSY_STEP: Duration = Duration::from_millis(10);
+
+/// The longest wait between two opens of a busy pipe: a client stuck behind
+/// a full server tries five times a second rather than a hundred.
+const BUSY_STEP_MAX: Duration = Duration::from_millis(200);
 
 /// A named pipe this process owns: the name is held as long as at least one
 /// instance exists, and every instance carries the same descriptor.
@@ -93,13 +99,16 @@ impl BoundPipe {
 /// Opens the client end of the pipe at `path`, waiting out
 /// `ERROR_PIPE_BUSY`.
 ///
-/// Busy is the accept-loop race of `docs/research/ipc.md` §3.1: every
-/// instance is connected and the next one is not created yet. Rather than
+/// Busy is either the accept-loop race of `docs/research/ipc.md` §3.1, every
+/// instance connected and the next one not created yet, or a server that
+/// holds back accepting while its places are taken. Rather than
 /// `WaitNamedPipe`, which blocks a thread, the open is retried on the
-/// runtime's timer for at most five seconds. A pipe that does not exist is
-/// the peer being gone, reported as such so a caller can redial.
+/// runtime's timer, from 10 ms doubling to 200 ms between tries, for as
+/// long as the pipe stays busy: the wait is backpressure and ends when the
+/// caller stops waiting. A pipe that does not exist is the peer being gone,
+/// reported as such so a caller can redial.
 pub async fn connect_pipe(exec: &Exec, path: &std::ffi::OsStr) -> Result<NamedPipeClient, Error> {
-    let started = std::time::Instant::now();
+    let mut step = BUSY_STEP;
     loop {
         let attempt = {
             // Inside the runtime context: tokio registers the handle with the
@@ -110,13 +119,8 @@ pub async fn connect_pipe(exec: &Exec, path: &std::ffi::OsStr) -> Result<NamedPi
         match attempt {
             Ok(client) => return Ok(client),
             Err(e) if weida_winpipe::is_pipe_busy(&e) => {
-                if started.elapsed() >= BUSY_BUDGET {
-                    return Err(Error::Transport(format!(
-                        "{}: every pipe instance stayed busy for {BUSY_BUDGET:?}",
-                        path.to_string_lossy()
-                    )));
-                }
-                exec.sleep(BUSY_STEP).await;
+                exec.sleep(step).await;
+                step = (step * 2).min(BUSY_STEP_MAX);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::ConnectionLost(LossCause::PeerClosed));
@@ -210,6 +214,35 @@ mod tests {
                 matches!(err, Error::ConnectionLost(LossCause::PeerClosed)),
                 "{err:?}"
             );
+        }
+        /// Claim: a pipe that stays busy is waited out, however long, and the
+        /// open completes once the server makes an instance: busy is
+        /// backpressure, not a failure. The minute of busy is on a paused
+        /// clock; the pipe itself is real.
+        #[tokio::test(start_paused = true)]
+        async fn a_pipe_busy_for_a_minute_is_still_opened() {
+            let exec = Exec::current().expect("runtime");
+            let path = name("busy");
+            let (bound, first) = BoundPipe::bind(path.clone()).expect("bind");
+            // The only instance, taken: the next open finds the pipe busy.
+            let _taken = connect_pipe(&exec, bound.path()).await.expect("connect");
+            first.connect().await.expect("accept");
+
+            let waiting = {
+                let exec = exec.clone();
+                let path = bound.path().to_owned();
+                tokio::spawn(async move { connect_pipe(&exec, &path).await })
+            };
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            assert!(!waiting.is_finished(), "the open gave up on a busy pipe");
+
+            let next = bound.next_instance().expect("next instance");
+            let opened = tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("the open completes once an instance exists")
+                .expect("task");
+            assert!(opened.is_ok(), "{opened:?}");
+            next.connect().await.expect("accept");
         }
     }
 }
