@@ -17,7 +17,7 @@ kind: protocol | size: 90 | status: done 93a38fa | needs: [B-361]
 acceptance: `prefix`, `huffman`, `hpack` per Step 3; RFC 7541 Appendix C.1-C.6 decode and encode byte-exact (C.2 decode only); fuzz target `hpack` and mirror.
 
 ### B-363 — `weida-http-codec`: HTTP/2 frames
-kind: protocol | size: 60 | status: ready | needs: [B-361]
+kind: protocol | size: 60 | status: in_progress 2026-10-22T22:21Z | needs: [B-361]
 acceptance: `h2` per Step 4; every frame type encodes and decodes; length, stream-id and SETTINGS value rules refused by name; fuzz target `h2_frame` and mirror.
 
 ### B-364 — `weida-http-codec`: QUIC varints, QPACK (static), HTTP/3 frames
