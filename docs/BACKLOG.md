@@ -33,7 +33,7 @@ kind: protocol | size: 90 | status: done ececb59 | needs: [B-365]
 acceptance: `Server`, `Exchange`, `Responder` per Step 7; keep-alive, pipelined requests answered in order, 100-continue, 400/431/501/505 refusals, header timeout; hyper 1 client interop rows; our client against our server in `tests/io/loopback.rs`.
 
 ### B-367 — `weida-http`: HTTP/2 client and server
-kind: protocol | size: 90 | status: ready | needs: [B-363, B-366]
+kind: protocol | size: 90 | status: in_progress 2026-10-23T00:21Z | needs: [B-363, B-366]
 acceptance: one connection driver for both roles per Step 8; ALPN `h2`; flow control both directions; GOAWAY and RST_STREAM; hyper 1 http2 interop rows both roles; the pool shares one h2 connection per origin.
 
 ### B-368 — `weida-http`: HTTP/3 client and server (feature `h3`)
