@@ -4,6 +4,8 @@
 
 mod local_transports;
 mod options;
+mod pair;
+mod pipeline;
 mod raw_device;
 mod tls;
 

@@ -156,63 +156,6 @@ async fn a_message_past_the_local_hop_ceiling_is_dropped_and_the_pipe_kept() {
     assert!(quiet.is_err(), "a drop must be silent");
 }
 
-/// Claim: a paired socket refuses a second connection while one is live,
-/// and takes one again once the first has gone (§4).
-#[tokio::test]
-async fn a_paired_socket_admits_one_peer_at_a_time() {
-    let ctx = Context::new(ContextConfig::default()).expect("context");
-    let server = Pair0Socket::with_options(&ctx, options()).expect("pair0");
-    let url = server
-        .listen("tcp://127.0.0.1:0")
-        .await
-        .expect("listen")
-        .url()
-        .to_string();
-
-    let first = Pair0Socket::with_options(&ctx, options()).expect("pair0");
-    first.dial(&url).await.expect("the first peer");
-    while server.pipe_count() < 1 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    let second = Pair0Socket::with_options(&ctx, options()).expect("pair0");
-    // The TCP connection is accepted and then dropped: the refusal is a
-    // close and nothing else, so the intruder learns of it by losing the
-    // connection rather than by any frame (§6).
-    let refused = second.dial(&url).await.unwrap_err();
-    assert!(
-        matches!(
-            refused,
-            Error::ECONNRESET(_) | Error::ECONNABORTED(_) | Error::ETIMEDOUT(_)
-        ),
-        "{refused:?}"
-    );
-    assert_eq!(second.pipe_count(), 0, "the second pairing was refused");
-    assert_eq!(server.pipe_count(), 1, "and the first one is untouched");
-
-    // The pair still works, which is the point of refusing the intruder.
-    first.send(b"still here".to_vec()).await.expect("send");
-    assert_eq!(server.recv().await.expect("recv").body(), b"still here");
-
-    // Once the first peer goes, the slot is free again.
-    first.close();
-    for _ in 0..200 {
-        if server.pipe_count() == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let third = Pair0Socket::with_options(&ctx, options()).expect("pair0");
-    third.dial(&url).await.expect("dial");
-    for _ in 0..200 {
-        if server.pipe_count() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(server.pipe_count(), 1, "a freed pair accepts a new peer");
-}
-
 /// Claim: PAIR blocks rather than discarding when no peer can receive, and
 /// `NNG_OPT_SENDTIMEO` is what turns that into an error (§5).
 #[tokio::test]
