@@ -9,7 +9,7 @@ kind: research | size: 60 | status: done 664803f | needs: []
 acceptance: `docs/research/http.md` in the research template (§0-§14), protocol-native vocabulary, every claim sourced (RFC 9110/9112/9113/7541/9114/9204/9000 with dates), README "Sheets" row added.
 
 ### B-361 — `weida-http-codec`: HTTP/1.1, fields, URLs, dates
-kind: protocol | size: 90 | status: ready | needs: []
+kind: protocol | size: 90 | status: in_progress 2026-10-22T21:33Z | needs: []
 acceptance: `crates/http/weida-http-codec` with an empty `[dependencies]`; `limits`, `error`, `fields`, `uri`, `date`, `h1` per Step 2; golden vectors from RFC 9112/9110 examples both directions; fuzz workspace with `h1_request`, `h1_response`, `chunked`, `uri` and their `fuzz_smoke` mirrors; caps checked before allocation.
 
 ### B-362 — `weida-http-codec`: HPACK
