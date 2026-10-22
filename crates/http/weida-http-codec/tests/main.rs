@@ -4,5 +4,6 @@
 
 mod fuzz_smoke;
 mod golden_h2;
+mod golden_h3;
 mod golden_hpack;
 mod golden_vectors;

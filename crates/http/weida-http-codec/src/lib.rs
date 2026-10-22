@@ -14,6 +14,10 @@
 //! * [`h2`]: HTTP/2 frames (RFC 9113 §4, §6).
 //! * [`hpack`]: HTTP/2 field compression with its [`huffman`] code
 //!   (RFC 7541).
+//! * [`h3`]: HTTP/3 frame headers, SETTINGS and GOAWAY, stream types and
+//!   error codes (RFC 9114); [`qpack`]: its field compression with the
+//!   static table only (RFC 9204); [`varint`]: QUIC's variable-length
+//!   integer (RFC 9000 §16).
 //! * [`fields`]: the field name and value grammar every version shares
 //!   (RFC 9110 §5).
 //! * [`uri`]: `http`/`https` URLs for a client, origin-form targets for a
@@ -69,18 +73,22 @@
 //! # Sources
 //!
 //! Every rule comes from `docs/research/http.md`, which cites RFC 9110,
-//! RFC 9112, RFC 9113 (June 2022) and RFC 7541 (May 2015).
+//! RFC 9112, RFC 9113, RFC 9114, RFC 9204 (June 2022), RFC 7541 (May 2015)
+//! and RFC 9000 (May 2021).
 
 pub mod date;
 pub mod error;
 pub mod fields;
 pub mod h1;
 pub mod h2;
+pub mod h3;
 pub mod hpack;
 pub mod huffman;
 pub mod limits;
 mod prefix;
+pub mod qpack;
 pub mod uri;
+pub mod varint;
 
 pub use error::{DecodeError, EncodeError};
 pub use limits::Limits;

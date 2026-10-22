@@ -22,9 +22,10 @@
 use weida_http_codec::fields::Field;
 use weida_http_codec::h1::{self, Chunk, ChunkedDecoder};
 use weida_http_codec::h2::{self, Frame};
+use weida_http_codec::h3::{self, frame};
 use weida_http_codec::hpack;
 use weida_http_codec::uri::Target;
-use weida_http_codec::{DecodeError, Limits};
+use weida_http_codec::{DecodeError, Limits, qpack};
 
 const ITERATIONS: usize = 100_000;
 
@@ -466,6 +467,112 @@ fn fuzz_smoke_h2_frame() {
         frame.encode(&mut out);
         let (again, again_used) = Frame::decode(&out, max).expect("the re-encoding decodes");
         assert_eq!((again, again_used), (frame, out.len()));
+    }
+    assert!(accepted > ITERATIONS / 10, "only {accepted} accepted");
+}
+
+#[test]
+fn fuzz_smoke_qpack() {
+    let mut rng = Rng::new(0x5eed_0008);
+    let names: &[&[u8]] = &[
+        b":path",
+        b":method",
+        b"x-a",
+        b"authorization",
+        b"accept",
+        b"content-type",
+    ];
+    let mut accepted = 0;
+    for _ in 0..ITERATIONS / 10 {
+        let list: Vec<(Vec<u8>, Vec<u8>, bool)> = (0..rng.below(6))
+            .map(|_| {
+                let name = rng.pick(names).to_vec();
+                let value = rng.bytes(b"GETab/*09 =;", 16);
+                (name, value, rng.below(8) == 0)
+            })
+            .collect();
+        let fields: Vec<_> = list
+            .iter()
+            .map(|(n, v, s)| (n.as_slice(), v.as_slice(), *s))
+            .collect();
+        let mut block = Vec::new();
+        qpack::encode_field_section(&fields, &mut block);
+        let mut out = Vec::new();
+        qpack::decode_field_section(&block, Limits::DEFAULT, &mut out)
+            .expect("our own section decodes");
+        let expect: Vec<_> = list
+            .iter()
+            .map(|(n, v, _)| (n.clone(), v.clone()))
+            .collect();
+        assert_eq!(out, expect);
+
+        let mutated = rng.mutate(block);
+        let mut out = Vec::new();
+        if qpack::decode_field_section(&mutated, LIMITS, &mut out).is_err() {
+            continue;
+        }
+        accepted += 1;
+        let fields: Vec<_> = out
+            .iter()
+            .map(|(n, v)| (n.as_slice(), v.as_slice(), false))
+            .collect();
+        let mut again = Vec::new();
+        qpack::encode_field_section(&fields, &mut again);
+        let mut back = Vec::new();
+        qpack::decode_field_section(&again, LIMITS, &mut back).expect("the re-encoding decodes");
+        assert_eq!(back, out);
+    }
+    assert!(accepted > ITERATIONS / 100, "only {accepted} accepted");
+}
+
+#[test]
+fn fuzz_smoke_h3_frame() {
+    let mut rng = Rng::new(0x5eed_0009);
+    let mut accepted = 0;
+    for _ in 0..ITERATIONS {
+        let mut wire = Vec::new();
+        if rng.below(2) == 0 {
+            let settings: Vec<(u64, u64)> = (0..rng.below(4))
+                .map(|i| ([1u64, 6, 7, 0x21][i], rng.next() >> (2 + rng.below(62))))
+                .collect();
+            h3::encode_settings(&settings, &mut wire).unwrap();
+        } else {
+            h3::encode_goaway(rng.next() >> (2 + rng.below(62)), &mut wire).unwrap();
+        }
+        let wire = rng.mutate(wire);
+        let Ok((head, used)) = h3::decode_frame_header(&wire) else {
+            continue;
+        };
+        let rest = &wire[used..];
+        let Some(payload) = usize::try_from(head.len).ok().and_then(|n| rest.get(..n)) else {
+            continue;
+        };
+        match head.kind {
+            frame::SETTINGS => {
+                let Ok(settings) = h3::decode_settings(payload, Limits::DEFAULT) else {
+                    continue;
+                };
+                accepted += 1;
+                let mut out = Vec::new();
+                h3::encode_settings(&settings, &mut out).unwrap();
+                let (_, used) = h3::decode_frame_header(&out).unwrap();
+                assert_eq!(
+                    h3::decode_settings(&out[used..], Limits::DEFAULT).unwrap(),
+                    settings
+                );
+            }
+            frame::GOAWAY => {
+                let Ok(id) = h3::decode_goaway(payload) else {
+                    continue;
+                };
+                accepted += 1;
+                let mut out = Vec::new();
+                h3::encode_goaway(id, &mut out).unwrap();
+                let (_, used) = h3::decode_frame_header(&out).unwrap();
+                assert_eq!(h3::decode_goaway(&out[used..]), Ok(id));
+            }
+            _ => {}
+        }
     }
     assert!(accepted > ITERATIONS / 10, "only {accepted} accepted");
 }
