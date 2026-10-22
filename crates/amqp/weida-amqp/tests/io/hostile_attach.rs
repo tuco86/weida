@@ -336,6 +336,10 @@ async fn an_attach_handle_above_the_handle_max_we_advertised_closes_the_connecti
 async fn a_second_answering_begin_is_illegal_state() {
     let exec = Exec::current().unwrap();
     let (listener, port) = scripted().await;
+    // The second answer waits until the test has seen the session begin:
+    // sent at once, it can reach the client before `begin` returns, and the
+    // session is then already ended when its state is read.
+    let (begun_tx, begun_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server = tokio::spawn(async move {
         let mut server = accept(&listener).await;
@@ -343,6 +347,7 @@ async fn a_second_answering_begin_is_illegal_state() {
         let (_, name, _) = server.read_named().await;
         assert_eq!(name, "begin");
         server.answer_begin(4, 0).await;
+        begun_rx.await.expect("the test saw the session begin");
 
         // A second answer for the same session, on another incoming channel.
         let mut again = Begin::new(0, 400, 400);
@@ -366,6 +371,7 @@ async fn a_second_answering_begin_is_illegal_state() {
         .unwrap()
         .unwrap();
     assert_eq!(session.state(), SessionState::Begun);
+    begun_tx.send(()).expect("the server is waiting");
 
     match tokio::time::timeout(DEADLINE, connection.closed())
         .await
