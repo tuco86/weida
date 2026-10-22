@@ -205,13 +205,13 @@ impl ConnCtx {
         ctx
     }
 
-    /// Waits until the peer HELLO has been negotiated and ours is written.
+    /// Waits until the peer HELLO has been negotiated.
     ///
     /// QUIC streams are unordered relative to each other, so a DATA stream can
     /// be accepted before the peer's HELLO. Parking here is correct behaviour,
-    /// not a protocol violation. Our own HELLO is waited for too, so nothing
-    /// this side sends can be reported delivered before the HELLO the peer
-    /// needs to accept it.
+    /// not a protocol violation. Only the peer's HELLO is waited for: a peer
+    /// that grants this side no unidirectional stream keeps our own HELLO
+    /// from ever being written, and its data must not wait behind it.
     ///
     /// A connection that dies while we wait fails this immediately with the
     /// reason it died. That matters most for a client whose handshake looked
@@ -219,20 +219,35 @@ impl ConnCtx {
     /// connection close that arrives *after* `connect` resolved, and the
     /// HELLO that would end this wait is never coming.
     pub(crate) async fn negotiated(&self) -> Result<Agreed, Error> {
+        negotiation(self.agreed.clone(), None, self.conn.closed(), || {
+            self.lost()
+        })
+        .await
+    }
+
+    /// Waits until the connection may be handed to the application: the
+    /// peer's HELLO negotiated, as for [`ConnCtx::negotiated`], and ours
+    /// written. The peer parks everything this side sends until our HELLO
+    /// arrives, so a dialler handed its connection earlier could report a
+    /// payload delivered and exit before the HELLO the peer needs to accept
+    /// it.
+    pub(crate) async fn established(&self) -> Result<Agreed, Error> {
         negotiation(
             self.agreed.clone(),
-            self.hello_sent.clone(),
+            Some(self.hello_sent.clone()),
             self.conn.closed(),
-            || {
-                // The sender is gone because the connection is: the accept
-                // loops, the deadline and the HELLO task hold it and end
-                // with it. Report why, not merely that.
-                self.conn
-                    .close_reason()
-                    .unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed))
-            },
+            || self.lost(),
         )
         .await
+    }
+
+    /// Why a wait on negotiation ended without one: a sender is gone because
+    /// the connection is (the accept loops, the deadline and the HELLO task
+    /// hold them and end with it). Reports why, not merely that.
+    fn lost(&self) -> Error {
+        self.conn
+            .close_reason()
+            .unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed))
     }
 
     /// The negotiated parameters if negotiation has completed, without
@@ -308,12 +323,13 @@ impl ConnCtx {
     }
 }
 
-/// The wait of [`ConnCtx::negotiated`]: until the peer's HELLO is agreed
-/// and ours is written, or `closed` says why the connection ended, or a
-/// channel's sender is gone without either, which `lost` explains.
+/// The wait of [`ConnCtx::negotiated`] and [`ConnCtx::established`]: until
+/// the peer's HELLO is agreed and, where `sent` is given, ours is written; or
+/// `closed` says why the connection ended; or a channel's sender is gone
+/// without either, which `lost` explains.
 async fn negotiation(
     mut agreed: watch::Receiver<Option<Agreed>>,
-    mut sent: watch::Receiver<bool>,
+    mut sent: Option<watch::Receiver<bool>>,
     closed: impl Future<Output = Error>,
     lost: impl Fn() -> Error,
 ) -> Result<Agreed, Error> {
@@ -321,17 +337,23 @@ async fn negotiation(
     loop {
         // Once it is written the sender may be gone, so its channel is
         // only watched while it is not.
-        let sent_now = *sent.borrow_and_update();
+        let sent_now = sent.as_mut().is_none_or(|sent| *sent.borrow_and_update());
         if sent_now && let Some(negotiated) = *agreed.borrow_and_update() {
             return Ok(negotiated);
         }
+        let written = async {
+            match sent.as_mut() {
+                Some(sent) if !sent_now => sent.changed().await,
+                _ => std::future::pending().await,
+            }
+        };
         tokio::select! {
             changed = agreed.changed() => {
                 if changed.is_err() {
                     return Err(lost());
                 }
             }
-            changed = sent.changed(), if !sent_now => {
+            changed = written => {
                 if changed.is_err() {
                     return Err(lost());
                 }
@@ -1915,47 +1937,59 @@ mod tests {
             .await
     }
 
-    /// The peer's HELLO alone does not end negotiation: until ours is
-    /// written, the peer parks everything this side sends, so a receipt
+    fn lost() -> weida_core::Error {
+        weida_core::Error::ConnectionLost(weida_core::LossCause::LocallyClosed)
+    }
+
+    /// The peer's HELLO alone does not establish a connection: until ours
+    /// is written, the peer parks everything this side sends, so a receipt
     /// given before it could be for bytes the peer never accepts — a sender
     /// that pushed and exited at once lost its payload that way.
     #[tokio::test]
-    async fn negotiation_waits_for_our_own_hello_as_well_as_the_peers() {
+    async fn establishing_waits_for_our_own_hello_as_well_as_the_peers() {
         use std::task::Poll;
         let (agreed_tx, agreed_rx) = tokio::sync::watch::channel(None);
         let (sent_tx, sent_rx) = tokio::sync::watch::channel(false);
         let mut waiting = Box::pin(super::negotiation(
             agreed_rx,
-            sent_rx,
+            Some(sent_rx),
             std::future::pending(),
-            || weida_core::Error::ConnectionLost(weida_core::LossCause::LocallyClosed),
+            lost,
         ));
         assert!(poll_once(&mut waiting).await.is_pending());
         agreed_tx.send_replace(Some(agreed()));
         assert!(
             poll_once(&mut waiting).await.is_pending(),
-            "the peer's HELLO alone is not negotiation"
+            "the peer's HELLO alone does not establish the connection"
         );
         sent_tx.send_replace(true);
         // Once written, the sender may go: the wait must not read that as a loss.
         drop(sent_tx);
         match poll_once(&mut waiting).await {
             Poll::Ready(Ok(negotiated)) => assert_eq!(negotiated, agreed()),
-            other => panic!("negotiated once both were there: {other:?}"),
+            other => panic!("established once both were there: {other:?}"),
         }
     }
 
-    /// A HELLO that could not be written fails negotiation instead of
+    /// What arrives waits for the peer's HELLO only: a peer that grants this
+    /// side no unidirectional stream keeps our HELLO unwritten for ever, and
+    /// its own data must still be read.
+    #[tokio::test]
+    async fn incoming_streams_wait_for_the_peers_hello_alone() {
+        let (_agreed_tx, agreed_rx) = tokio::sync::watch::channel(Some(agreed()));
+        let outcome = super::negotiation(agreed_rx, None, std::future::pending(), lost).await;
+        assert_eq!(outcome.expect("negotiated"), agreed());
+    }
+
+    /// A HELLO that could not be written fails establishing instead of
     /// leaving it to wait for ever.
     #[tokio::test]
-    async fn negotiation_fails_when_our_hello_cannot_be_written() {
-        let (agreed_tx, agreed_rx) = tokio::sync::watch::channel(Some(agreed()));
+    async fn establishing_fails_when_our_hello_cannot_be_written() {
+        let (_agreed_tx, agreed_rx) = tokio::sync::watch::channel(Some(agreed()));
         let (sent_tx, sent_rx) = tokio::sync::watch::channel(false);
         drop(sent_tx);
-        let outcome = super::negotiation(agreed_rx, sent_rx, std::future::pending(), || {
-            weida_core::Error::ConnectionLost(weida_core::LossCause::LocallyClosed)
-        })
-        .await;
+        let outcome =
+            super::negotiation(agreed_rx, Some(sent_rx), std::future::pending(), lost).await;
         assert!(
             matches!(
                 outcome,
@@ -1965,6 +1999,5 @@ mod tests {
             ),
             "{outcome:?}"
         );
-        drop(agreed_tx);
     }
 }

@@ -184,10 +184,11 @@ violation. The receiver MUST park such a stream (retain it, unread beyond its pr
 without emitting any error) until the peer HELLO has been processed and negotiation has
 succeeded, and MUST then process the parked stream normally. In the reference
 implementation the parked task awaits a `tokio::sync::watch<Option<Agreed>>`.
-Because the receiver parks every stream until it has the sender's HELLO, a side MUST NOT
-consider negotiation complete, and so opens no stream, before its own HELLO is written: a
-sender that reported a payload delivered and exited first would leave the peer parking that
-payload until `hello_timeout` closes the connection.
+Because the receiver parks every stream until it has the sender's HELLO, a dialling side
+MUST NOT hand its connection to the application before its own HELLO is written: a sender
+that reported a payload delivered and exited first would leave the peer parking that payload
+until `hello_timeout` closes the connection. What arrives waits for the peer's HELLO alone,
+since a peer that grants no unidirectional stream keeps this side's HELLO unwritten.
 
 If the peer HELLO has not arrived within `hello_timeout` (default 10 s, see §10), the local
 side MUST close the connection with application error code `NEGOTIATION_FAILED`.

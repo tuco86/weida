@@ -292,10 +292,11 @@ impl ClientPool {
             config.guarantees,
             Arc::clone(&self.shared),
         );
-        // Negotiation must complete before the caller can send anything: a
-        // DATA frame ahead of our own HELLO would be parked by the peer, and a
-        // version mismatch must fail `connect`, not the first request.
-        handle.negotiated().await?;
+        // The connection must be established before the caller can send
+        // anything: a DATA frame ahead of our own HELLO would be parked by
+        // the peer, and a version mismatch must fail `connect`, not the first
+        // request.
+        handle.established().await?;
 
         // The race the released lock allows, settled: whoever inserted first
         // owns the key, and this connection is closed rather than left open

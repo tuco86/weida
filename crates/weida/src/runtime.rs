@@ -118,9 +118,9 @@ impl RuntimeInner {
             self.config.guarantees,
             self.shared(),
         );
-        // The same rule as on QUIC: negotiation completes before the caller
-        // can send anything (`docs/PROTOCOL.md` §2.3).
-        handle.negotiated().await?;
+        // The same rule as on QUIC: the connection is established before the
+        // caller can send anything (`docs/PROTOCOL.md` §2.3).
+        handle.established().await?;
         Ok(handle)
     }
 
@@ -151,7 +151,7 @@ impl RuntimeInner {
             self.config.guarantees,
             self.shared(),
         );
-        handle.negotiated().await?;
+        handle.established().await?;
         Ok(handle)
     }
 
@@ -180,7 +180,7 @@ impl RuntimeInner {
             self.config.guarantees,
             self.shared(),
         );
-        handle.negotiated().await?;
+        handle.established().await?;
         Ok(handle)
     }
 
