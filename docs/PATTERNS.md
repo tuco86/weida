@@ -315,7 +315,9 @@ one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
   `a_stalled_path_does_not_stall_another_path` is a statement about QUIC, and locally it is
   true by construction. What replaces it is a descriptor count — every live transfer is a
   file descriptor, bounded by `max_local_streams` (255, the number Windows' pipe instance cap
-  fixes) rather than by a stream budget.
+  fixes) rather than by a stream budget. The process's own descriptor limit applies on top:
+  macOS starts at 256, which the default nearly fills on one side, so a process that holds
+  both ends raises `RLIMIT_NOFILE` or lowers `max_local_streams`.
 - **§1.4's stream budget becomes that descriptor count.** `open` waits for a descriptor at
   the local ceiling exactly as it waits for a QUIC stream at the peer's budget: the
   backpressure is a wait on every transport, bounded by the caller's own deadline and

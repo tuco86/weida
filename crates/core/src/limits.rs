@@ -71,6 +71,13 @@ pub struct Limits {
     /// QUIC `open` waits on the peer's stream budget, rather than refusing.
     /// A peer configured with zero can therefore open nothing and waits
     /// until its caller's deadline, exactly as one granted no QUIC streams.
+    ///
+    /// **Each local stream is a file descriptor** on `AF_UNIX` (a handle on
+    /// a named pipe), on each side, besides the connection's own. QUIC is not
+    /// affected: all its streams share one UDP socket. macOS starts a
+    /// process with a soft limit of 256 descriptors, which the default alone
+    /// nearly fills, and a process that holds both ends overruns it with
+    /// `EMFILE`; such a process raises `RLIMIT_NOFILE` or lowers this limit.
     pub max_local_streams: usize,
     /// Connections a subscriber parks toward a peer it dialled, so that peer
     /// can open a stream back
