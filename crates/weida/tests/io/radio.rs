@@ -199,11 +199,15 @@ async fn a_dish_that_refuses_every_flow_costs_a_few_opens_not_one_per_datagram()
     dishes(&radio, 1).await;
 
     // A datagram a millisecond, so each refusal arrives between two sends:
-    // without a backoff every send would open a flow of its own.
+    // without a backoff every send would open a flow of its own. An
+    // interval rather than a sleep per send: Windows rounds a 1 ms sleep up
+    // to its 15.6 ms timer tick, and the interval catches up in bursts, so
+    // the thousand sends take a second there too.
     within(async {
+        let mut tick = tokio::time::interval(Duration::from_millis(1));
         for _ in 0..1000 {
+            tick.tick().await;
             radio.datagram("voice", vec![0x33; 150]).expect("send");
-            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await;
