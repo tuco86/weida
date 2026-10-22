@@ -21,6 +21,7 @@
 
 use weida_http_codec::fields::Field;
 use weida_http_codec::h1::{self, Chunk, ChunkedDecoder};
+use weida_http_codec::hpack;
 use weida_http_codec::uri::Target;
 use weida_http_codec::{DecodeError, Limits};
 
@@ -311,4 +312,74 @@ fn fuzz_smoke_prefixes() {
             assert_incomplete(run_chunked(&wire[..cut]), &wire[..cut]);
         }
     }
+}
+
+#[test]
+fn fuzz_smoke_hpack() {
+    let mut rng = Rng::new(0x5eed_0006);
+    // One encoder and decoder pair across every block, so the dynamic table
+    // fills, evicts and is resized; a mutated copy of each block goes to a
+    // fresh decoder.
+    let mut enc = hpack::Encoder::new();
+    let mut dec = hpack::Decoder::new(4096);
+    let names: &[&[u8]] = &[
+        b":path",
+        b"x-a",
+        b"cookie",
+        b"accept",
+        b"content-type",
+        b"x-long-name",
+    ];
+    let mut accepted = 0;
+    for i in 0..ITERATIONS / 10 {
+        if i % 97 == 0 {
+            let size = [0, 64, 256, 4096][rng.below(4)];
+            enc.set_peer_max_table_size(size);
+            dec.set_max_table_size(4096);
+        }
+        let list: Vec<(Vec<u8>, Vec<u8>, bool)> = (0..rng.below(6))
+            .map(|_| {
+                let name = rng.pick(names).to_vec();
+                let value = rng.bytes(b"abc/09 =;", 16);
+                (name, value, rng.below(8) == 0)
+            })
+            .collect();
+        let fields: Vec<_> = list
+            .iter()
+            .map(|(n, v, s)| (n.as_slice(), v.as_slice(), *s))
+            .collect();
+        let mut block = Vec::new();
+        enc.encode(&fields, &mut block);
+        let mut out = Vec::new();
+        dec.decode(&block, Limits::DEFAULT, &mut out)
+            .expect("our own block decodes");
+        let expect: Vec<_> = list
+            .iter()
+            .map(|(n, v, _)| (n.clone(), v.clone()))
+            .collect();
+        assert_eq!(out, expect);
+
+        let mutated = rng.mutate(block);
+        let mut out = Vec::new();
+        if hpack::Decoder::new(4096)
+            .decode(&mutated, LIMITS, &mut out)
+            .is_err()
+        {
+            continue;
+        }
+        accepted += 1;
+        assert!(out.len() <= LIMITS.max_fields);
+        let fields: Vec<_> = out
+            .iter()
+            .map(|(n, v)| (n.as_slice(), v.as_slice(), false))
+            .collect();
+        let mut again = Vec::new();
+        hpack::Encoder::new().encode(&fields, &mut again);
+        let mut back = Vec::new();
+        hpack::Decoder::new(4096)
+            .decode(&again, LIMITS, &mut back)
+            .expect("the re-encoding decodes");
+        assert_eq!(back, out);
+    }
+    assert!(accepted > ITERATIONS / 100, "only {accepted} accepted");
 }

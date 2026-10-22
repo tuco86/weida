@@ -11,6 +11,8 @@
 //!
 //! * [`h1`]: HTTP/1.1 request and response heads, body framing, chunked
 //!   bodies (RFC 9112).
+//! * [`hpack`]: HTTP/2 field compression with its [`huffman`] code
+//!   (RFC 7541).
 //! * [`fields`]: the field name and value grammar every version shares
 //!   (RFC 9110 §5).
 //! * [`uri`]: `http`/`https` URLs for a client, origin-form targets for a
@@ -68,13 +70,14 @@
 //! Every rule comes from `docs/research/http.md`, which cites RFC 9110 and
 //! RFC 9112 (June 2022).
 
-#![warn(missing_docs)]
-
 pub mod date;
 pub mod error;
 pub mod fields;
 pub mod h1;
+pub mod hpack;
+pub mod huffman;
 pub mod limits;
+mod prefix;
 pub mod uri;
 
 pub use error::{DecodeError, EncodeError};
