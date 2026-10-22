@@ -75,10 +75,12 @@ mod tests {
         /// phase gets is what the first left, and never more than the limit.
         #[test]
         fn a_budget_is_spent_by_the_phases_that_share_it() {
-            let budget = CloseBudget::start(Duration::from_millis(50));
-            assert_eq!(budget.limit(), Duration::from_millis(50));
+            // Far longer than the sleep: atik's scheduler has let a 10 ms sleep
+            // run past 40 ms, which spent a 50 ms budget.
+            let budget = CloseBudget::start(Duration::from_secs(10));
+            assert_eq!(budget.limit(), Duration::from_secs(10));
             let before = budget.remaining();
-            assert!(before <= Duration::from_millis(50));
+            assert!(before <= Duration::from_secs(10));
             std::thread::sleep(Duration::from_millis(10));
             let after = budget.remaining();
             assert!(after < before, "{after:?} must be less than {before:?}");
