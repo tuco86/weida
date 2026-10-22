@@ -438,9 +438,9 @@ the authority, and each form has one validation rule that is not optional:
   will not meet.
 - **`weida+unix`** — the socket path is **percent-encoded**, because it contains the same
   separator the endpoint path uses. After decoding it MUST fit the platform's budget: **107
-  bytes** on Linux and **104** on macOS, both including the terminating NUL. The check happens
-  before `bind` and before `connect`, on the *expanded* path, since a container or App Group
-  prefix consumes most of the budget.
+  bytes** on Linux and **103** on macOS, `sun_path` (108 and 104 bytes) less the terminating
+  NUL. The check happens before `bind` and before `connect`, on the *expanded* path, since a
+  container or App Group prefix consumes most of the budget.
 - **`weida+pipe`** — the name maps to `\\.\pipe\<name>` and MUST NOT be a UNC path naming
   another host; that is the address-level half of `PIPE_REJECT_REMOTE_CLIENTS`.
 

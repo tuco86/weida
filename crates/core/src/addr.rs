@@ -270,13 +270,14 @@ pub const SCHEME_UNIX: &str = "weida+unix";
 
 /// Longest socket path this platform accepts, in bytes, after decoding.
 ///
-/// `sun_path` is `char[108]` on Linux including its NUL — 107 usable — and
-/// exactly 104 characters on macOS, where an App Group container path plus a
-/// team-ID-prefixed group name consumes most of it, so the budget is checked
-/// against the *expanded* path
+/// `sun_path` is `char[108]` on Linux and `char[104]` on macOS, and Rust's
+/// standard library, which every bind and connect here goes through, keeps
+/// room for the terminating NUL on both: 107 usable on Linux, 103 on macOS.
+/// On macOS an App Group container path plus a team-ID-prefixed group name
+/// consumes most of it, so the budget is checked against the *expanded* path
 /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md) §4.5,
 /// `docs/research/ipc.md` §1.1, §2.1, §6.1).
-pub const MAX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "macos") { 104 } else { 107 };
+pub const MAX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
 
 /// A parsed `weida+unix://<percent-encoded-socket-path>/<path>` address.
 #[derive(Clone, Debug, PartialEq, Eq)]
