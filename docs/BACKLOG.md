@@ -41,7 +41,7 @@ kind: protocol | size: 90 | status: done 4933a7d | needs: [B-364, B-367]
 acceptance: Step 9 over quinn; control stream SETTINGS, no QPACK streams opened; h3 0.0.8 + h3-quinn 0.0.10 interop rows both roles; LOOP §6 and `.zeughaus-ci` feature row `weida-http:h3`.
 
 ### B-369 — `weida-openbao` onto `weida-http`; `reqwest` removed
-kind: code | size: 60 | status: ready | needs: [B-367]
+kind: code | size: 60 | status: in_progress 2026-10-23T03:06Z | needs: [B-367]
 acceptance: Step 10; every existing `weida-openbao` test passes unchanged; `cargo tree -e normal -p weida-openbao` lists none of hyper, reqwest, tower, url, idna; the root `reqwest` entry and its comment are gone.
 
 ### B-370 — HTTP parity document and the family's documents
