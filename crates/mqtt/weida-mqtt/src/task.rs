@@ -344,6 +344,13 @@ impl Task {
 
     pub(crate) async fn run(mut self, mut reader: Reader) {
         let outcome = self.drive(&mut reader).await;
+        // A DISCONNECT the application asked for ended the loop cleanly; only
+        // then is there a packet the server must still read.
+        let asked_to_close = outcome.is_ok()
+            && self
+                .closing
+                .as_ref()
+                .is_none_or(|closing| closing.cause.is_none());
         let error = self.conclude(outcome);
 
         // The socket closes **first**, and what was waiting on it is released
@@ -369,9 +376,14 @@ impl Task {
             stalled,
             flush_waiters,
             held,
+            exec,
             ..
         } = self;
-        drop((reader, writer));
+        if asked_to_close {
+            crate::connection::linger_close(&exec, reader, writer, crate::connection::LINGER).await;
+        } else {
+            drop((reader, writer));
+        }
         drop((
             waiters,
             subscribe_waiters,

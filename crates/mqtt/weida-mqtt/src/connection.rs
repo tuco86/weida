@@ -447,6 +447,45 @@ impl Writer {
     }
 }
 
+/// How long a connection that sent its DISCONNECT keeps reading after its
+/// own FIN, for the server's close.
+pub(crate) const LINGER: Duration = Duration::from_secs(1);
+
+/// Closes a connection whose DISCONNECT is flushed so that the DISCONNECT
+/// reaches the server: the write side is shut down, which puts a FIN (and on
+/// TLS a `close_notify`) behind it, and then whatever the server still sends
+/// is read and discarded until it closes too, for at most `linger`.
+///
+/// Dropping the socket at once is what loses it. A socket closed with
+/// unread bytes in its receive buffer is reset rather than closed (RFC 1122
+/// §4.2.2.13), and Windows then discards what it had not sent yet, the
+/// DISCONNECT included: the server never reads it, takes the end for a
+/// network failure and publishes the Will (MQTT 5.0 §3.1.2.5), which a
+/// normal DISCONNECT exists to prevent (§3.14.4).
+pub(crate) async fn linger_close(
+    exec: &Exec,
+    reader: Reader,
+    mut writer: Writer,
+    linger: Duration,
+) {
+    let mut half = reader.half;
+    let ended = async {
+        if writer.half.shutdown().await.is_err() {
+            return;
+        }
+        let mut sink = vec![0u8; READ_CHUNK];
+        while let Ok(read) = half.read(&mut sink).await {
+            if read == 0 {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        () = ended => {}
+        () = exec.sleep(linger) => {}
+    }
+}
+
 /// What a completed handshake produced.
 pub(crate) struct Handshake {
     pub(crate) reader: Reader,
