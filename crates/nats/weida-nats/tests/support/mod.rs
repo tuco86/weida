@@ -199,10 +199,12 @@ impl Server {
         self.write(&out).await;
     }
 
-    /// The opening exchange every test needs: silence, `INFO`, then the
-    /// `CONNECT` and the `PING` that confirms it. Returns the `CONNECT` line.
+    /// The opening exchange every test needs: `INFO`, then the `CONNECT` and
+    /// the `PING` that confirms it. Returns the `CONNECT` line. It does not
+    /// first wait out [`SILENCE`]: the tests of the server speaking first
+    /// assert that themselves, and every other test would pay it per
+    /// connection.
     pub async fn handshake(&mut self, json: &str) -> String {
-        self.expect_silence().await;
         self.send_info(json).await;
         let connect = self.read_op().await;
         assert!(
