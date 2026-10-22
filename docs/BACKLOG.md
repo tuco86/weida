@@ -21,7 +21,7 @@ kind: protocol | size: 60 | status: done 3261c84 | needs: [B-361]
 acceptance: `h2` per Step 4; every frame type encodes and decodes; length, stream-id and SETTINGS value rules refused by name; fuzz target `h2_frame` and mirror.
 
 ### B-364 — `weida-http-codec`: QUIC varints, QPACK (static), HTTP/3 frames
-kind: protocol | size: 90 | status: in_progress 2026-10-22T22:36Z | needs: [B-362]
+kind: protocol | size: 90 | status: done fe159cd | needs: [B-362]
 acceptance: `varint`, `qpack`, `h3` per Step 5; RFC 9000 §A.1 varint examples, RFC 9204 Appendix B.1 field section decoded; a Required Insert Count above 0 refused; fuzz targets `qpack`, `h3_frame` and mirrors.
 
 ### B-365 — `weida-http`: types, dial, HTTP/1.1 client and pool
