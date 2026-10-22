@@ -60,9 +60,9 @@ acceptance: `crates/http/weida-http-py` on `weida-py-core` with an asyncio and a
 kind: code | size: 45 | status: ready | needs: [B-369]
 acceptance: `ClientOptions::request_timeout: Option<Duration>` bounds a request from dial to response head (`Error::Timeout { step: "the response head" }`); a unit test over `tokio::io::duplex` on a paused clock with a server that never answers; `weida-openbao` drops its own `exec.within` around the head in favour of it. Found in the review pass after B-364: today a server that accepts and never answers holds `Client::request` until the caller's own deadline.
 
-### B-374 — Two `weida-nng` io tests fail on the darwin runner
+### B-374 — Three io tests fail at random on the darwin runner
 kind: code | size: 30 | status: ready | needs: []
-acceptance: `io::pipeline::a_puller_that_cannot_accept_is_skipped_rather_than_waited_for` (pipeline #42) and `io::pair::a_paired_socket_admits_one_peer_at_a_time` (pipeline #44) failed once each on `check-darwin-arm64` with every other test green and no `weida-nng` change in between; the cause is named (a timing assumption or a real race) and fixed so that ten `run_jobs` runs of the darwin check pass both. Found in the review pass after B-370.
+acceptance: `weida-nng` `io::pipeline::a_puller_that_cannot_accept_is_skipped_rather_than_waited_for` (pipeline #42), `weida-nng` `io::pair::a_paired_socket_admits_one_peer_at_a_time` (#44) and `weida` `io::cli::a_send_reaches_a_sink_over_a_unix_socket` (#46, after 20.5 s) failed once each on `check-darwin-arm64` with every other test green and no change to either crate in between; the cause of each is named (a timing assumption, the runner's load while `check-linux-arm64` shares the host, or a real race) and fixed so that ten `run_jobs` runs of the darwin check pass all three. Found in the review pass after B-370.
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
