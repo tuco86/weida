@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-360 — HTTP research sheet
-kind: research | size: 60 | status: ready | needs: []
+kind: research | size: 60 | status: in_progress 2026-10-22T21:25Z | needs: []
 acceptance: `docs/research/http.md` in the research template (§0-§14), protocol-native vocabulary, every claim sourced (RFC 9110/9112/9113/7541/9114/9204/9000 with dates), README "Sheets" row added.
 
 ### B-361 — `weida-http-codec`: HTTP/1.1, fields, URLs, dates
