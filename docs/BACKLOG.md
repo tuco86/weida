@@ -25,7 +25,7 @@ kind: protocol | size: 90 | status: done fe159cd | needs: [B-362]
 acceptance: `varint`, `qpack`, `h3` per Step 5; RFC 9000 §A.1 varint examples, RFC 9204 Appendix B.1 field section decoded; a Required Insert Count above 0 refused; fuzz targets `qpack`, `h3_frame` and mirrors.
 
 ### B-365 — `weida-http`: types, dial, HTTP/1.1 client and pool
-kind: protocol | size: 90 | status: ready | needs: [B-361]
+kind: protocol | size: 90 | status: in_progress 2026-10-22T22:53Z | needs: [B-361]
 acceptance: `crates/http/weida-http` per Step 6; the client speaks HTTP/1.1 over TCP and TLS, keeps idle connections per origin; unit tests over `tokio::io::duplex`; `tests/io/interop_hyper.rs` h1 rows against a hyper 1 server; CI doc loops list `weida-http`.
 
 ### B-366 — `weida-http`: HTTP/1.1 server
