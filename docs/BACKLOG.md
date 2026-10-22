@@ -13,7 +13,7 @@ kind: protocol | size: 90 | status: done 18ffe41 | needs: []
 acceptance: `crates/http/weida-http-codec` with an empty `[dependencies]`; `limits`, `error`, `fields`, `uri`, `date`, `h1` per Step 2; golden vectors from RFC 9112/9110 examples both directions; fuzz workspace with `h1_request`, `h1_response`, `chunked`, `uri` and their `fuzz_smoke` mirrors; caps checked before allocation.
 
 ### B-362 — `weida-http-codec`: HPACK
-kind: protocol | size: 90 | status: ready | needs: [B-361]
+kind: protocol | size: 90 | status: in_progress 2026-10-22T21:59Z | needs: [B-361]
 acceptance: `prefix`, `huffman`, `hpack` per Step 3; RFC 7541 Appendix C.1-C.6 decode and encode byte-exact (C.2 decode only); fuzz target `hpack` and mirror.
 
 ### B-363 — `weida-http-codec`: HTTP/2 frames
