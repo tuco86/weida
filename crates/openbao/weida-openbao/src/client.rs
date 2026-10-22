@@ -3,10 +3,10 @@
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use reqwest::header::{HeaderValue, LOCATION};
 use serde_json::Value;
-use tokio_rustls::rustls;
 use weida::Pem;
+use weida_http::{BodyReader, ClientOptions, Fields, Method, Protocol, Scheme, Url};
+use weida_runtime::Exec;
 
 use crate::auth::{Auth, TokenInfo};
 use crate::secret::Secret;
@@ -122,7 +122,9 @@ impl Session {
 /// node, or let the standby forward.
 #[derive(Clone)]
 pub struct OpenBao {
-    http: reqwest::Client,
+    http: weida_http::Client,
+    exec: Exec,
+    timeout: Duration,
     base: String,
     namespace: Option<String>,
     session: Arc<RwLock<Option<Session>>>,
@@ -131,31 +133,26 @@ pub struct OpenBao {
 impl OpenBao {
     /// A client for `config`, not yet authenticated.
     ///
-    /// Must be created inside a Tokio runtime: the HTTP client registers
-    /// with the reactor as it is built.
+    /// Must be created inside a Tokio runtime: the HTTP client runs on the
+    /// runtime it was created in.
     ///
     /// Refused with [`Error::Config`] for an address that is not `https://`
     /// unless [`Config::allow_insecure`] allows `http://`.
     pub fn new(config: Config) -> Result<OpenBao> {
-        let address = reqwest::Url::parse(&config.address)
+        let address = Url::parse(&config.address)
             .map_err(|e| Error::Config(format!("address {:?}: {e}", config.address)))?;
-        match address.scheme() {
-            "https" => {}
-            "http" if config.allow_insecure => {}
-            "http" => {
+        match address.scheme {
+            Scheme::Https => {}
+            Scheme::Http if config.allow_insecure => {}
+            Scheme::Http => {
                 return Err(Error::Config(format!(
                     "address {:?}: http:// sends the token and every secret in clear; use \
                      https://, or set `Config::allow_insecure` for a server on this host",
                     config.address
                 )));
             }
-            other => {
-                return Err(Error::Config(format!(
-                    "address {:?}: the scheme {other:?} is not spoken; use https://",
-                    config.address
-                )));
-            }
         }
+        let exec = Exec::current().map_err(|e| Error::Http(e.to_string()))?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         match &config.ca {
@@ -183,14 +180,17 @@ impl OpenBao {
             .map_err(|e| Error::Tls(e.to_string()))?
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let http = reqwest::Client::builder()
-            .use_preconfigured_tls(tls)
-            .timeout(config.timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| Error::Http(e.to_string()))?;
+        let options = ClientOptions {
+            tls: Some(Arc::new(tls)),
+            protocol: Protocol::Auto,
+            ..ClientOptions::default()
+        };
+        let http =
+            weida_http::Client::new(&exec, options).map_err(|e| Error::Http(e.to_string()))?;
         Ok(OpenBao {
             http,
+            exec,
+            timeout: config.timeout,
             base: config.address.trim_end_matches('/').to_owned(),
             namespace: config.namespace,
             session: Arc::new(RwLock::new(None)),
@@ -238,12 +238,11 @@ impl OpenBao {
             .map(|s| s.info.clone())
     }
 
-    /// The session token as the header it is sent in, marked sensitive so
-    /// that nothing in the HTTP stack prints it.
-    fn token_header(&self) -> Result<HeaderValue> {
+    /// The session token, for the `X-Vault-Token` field it is sent in.
+    fn token(&self) -> Result<String> {
         let session = self.session.read().expect("session poisoned");
         let session = session.as_ref().ok_or(Error::Unauthenticated)?;
-        sensitive_header(session.token.expose())
+        Ok(session.token.expose().to_owned())
     }
 
     /// What the renewal loop needs to know about the session.
@@ -315,14 +314,15 @@ impl OpenBao {
 
     /// `GET /v1/<path>`.
     pub async fn get(&self, path: &str) -> Result<Value> {
-        let request = self.http.get(self.url(path));
-        self.send(request, Some(self.token_header()?)).await
+        let token = self.token()?;
+        self.send(Method::GET, path, None, Some(&token), &[]).await
     }
 
     /// `POST /v1/<path>` with a JSON body.
     pub async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let request = self.http.post(self.url(path)).json(&body);
-        self.send(request, Some(self.token_header()?)).await
+        let token = self.token()?;
+        self.send(Method::POST, path, Some(&body), Some(&token), &[])
+            .await
     }
 
     /// `POST /v1/<path>` asking OpenBao to **wrap** the answer: what comes
@@ -336,11 +336,17 @@ impl OpenBao {
         body: Value,
         wrap_ttl: Duration,
     ) -> Result<Secret> {
-        let request = self.http.post(self.url(path)).json(&body).header(
-            "X-Vault-Wrap-TTL",
-            format!("{}s", wrap_ttl.as_secs().max(1)),
-        );
-        let mut answer = self.send(request, Some(self.token_header()?)).await?;
+        let token = self.token()?;
+        let ttl = format!("{}s", wrap_ttl.as_secs().max(1));
+        let mut answer = self
+            .send(
+                Method::POST,
+                path,
+                Some(&body),
+                Some(&token),
+                &[("x-vault-wrap-ttl", ttl)],
+            )
+            .await?;
         // Moved out of the answer: a copy would leave the original behind in a
         // tree that is not wiped when it is dropped.
         match answer.get_mut("wrap_info").and_then(|w| w.get_mut("token")) {
@@ -365,17 +371,21 @@ impl OpenBao {
 
     /// `POST /v1/<path>` with a JSON body and **no** token: logins.
     pub(crate) async fn post_anonymous(&self, path: &str, body: Value) -> Result<Value> {
-        let request = self.http.post(self.url(path)).json(&body);
-        self.send(request, None).await
+        self.send(Method::POST, path, Some(&body), None, &[]).await
     }
 
     /// `sys/wrapping/unwrap` with `wrapping_token` as the token: the one
     /// request a wrapping token is good for. A token that was already
     /// redeemed — or never existed — is [`Error::HandoffStolen`].
     pub async fn unwrap(&self, wrapping_token: &str) -> Result<Value> {
-        let request = self.http.post(self.url("sys/wrapping/unwrap"));
         match self
-            .send(request, Some(sensitive_header(wrapping_token)?))
+            .send(
+                Method::POST,
+                "sys/wrapping/unwrap",
+                None,
+                Some(wrapping_token),
+                &[],
+            )
             .await
         {
             Ok(answer) => Ok(answer),
@@ -395,38 +405,54 @@ impl OpenBao {
         format!("{}/v1/{}", self.base, path.trim_start_matches('/'))
     }
 
+    /// One request and its whole answer, within [`Config::timeout`].
     async fn send(
         &self,
-        request: reqwest::RequestBuilder,
-        token: Option<HeaderValue>,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        token: Option<&str>,
+        extra: &[(&str, String)],
     ) -> Result<Value> {
-        let mut request = request.header("X-Vault-Request", "true");
-        if let Some(token) = token {
-            request = request.header("X-Vault-Token", token);
-        }
-        if let Some(namespace) = &self.namespace {
-            request = request.header("X-Vault-Namespace", namespace);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?;
-        let status = response.status();
-        if status.is_redirection() {
-            let location = response
-                .headers()
-                .get(LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .map_or_else(|| "an unreadable address".to_owned(), clip);
-            return Err(Error::Api {
-                status: status.as_u16(),
-                errors: vec![format!(
-                    "redirected to {location}: this client follows no redirects, so address \
-                     the active node directly"
-                )],
-            });
-        }
-        let body = read_capped(response).await?;
+        let fields = request_fields(token, self.namespace.as_deref(), extra, body.is_some())?;
+        let body = match body {
+            Some(body) => serde_json::to_vec(body)
+                .map_err(|e| Error::Shape(format!("the request is not JSON: {e}")))?
+                .into(),
+            None => Default::default(),
+        };
+        let url = self.url(path);
+        let exchange = async {
+            let mut response = self
+                .http
+                .request(method, &url, fields, body)
+                .await
+                .map_err(|e| Error::Http(e.to_string()))?;
+            let status = response.head.status;
+            if status.is_redirection() {
+                let location = response
+                    .head
+                    .fields
+                    .get("location")
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .map_or_else(|| "an unreadable address".to_owned(), clip);
+                return Err(Error::Api {
+                    status: status.as_u16(),
+                    errors: vec![format!(
+                        "redirected to {location}: this client follows no redirects, so address \
+                         the active node directly"
+                    )],
+                });
+            }
+            let body = read_capped(&mut response.body).await?;
+            Ok((status, body))
+        };
+        let (status, body) = match self.exec.within(self.timeout, exchange).await {
+            Some(answer) => answer?,
+            None => {
+                return Err(Error::Http(format!("no answer within {:?}", self.timeout)));
+            }
+        };
         if !status.is_success() {
             let errors = serde_json::from_slice::<Value>(&body)
                 .ok()
@@ -479,39 +505,56 @@ fn renewal_wait(ttl: Duration, elapsed: Duration, failures: u32) -> Duration {
     }
 }
 
-/// The header a token travels in, marked so that nothing prints its value.
-fn sensitive_header(token: &str) -> Result<HeaderValue> {
-    let mut value = HeaderValue::from_str(token)
-        .map_err(|_| Error::Shape("the token is not a valid header value".into()))?;
-    value.set_sensitive(true);
-    Ok(value)
+/// The fields of one request. The token travels as a sensitive field, which
+/// HTTP/2 and HTTP/3 never put into a compression table and nothing prints.
+fn request_fields(
+    token: Option<&str>,
+    namespace: Option<&str>,
+    extra: &[(&str, String)],
+    json: bool,
+) -> Result<Fields> {
+    let mut fields = Fields::new();
+    let field = |e: weida_http::Error| Error::Shape(format!("a request field: {e}"));
+    fields.append("x-vault-request", "true").map_err(field)?;
+    if let Some(token) = token {
+        fields
+            .append_sensitive("x-vault-token", token.to_owned())
+            .map_err(|_| Error::Shape("the token is not a valid header value".into()))?;
+    }
+    if let Some(namespace) = namespace {
+        fields
+            .append("x-vault-namespace", namespace.to_owned())
+            .map_err(field)?;
+    }
+    for (name, value) in extra {
+        fields.append(name, value.clone()).map_err(field)?;
+    }
+    if json {
+        fields
+            .append("content-type", "application/json")
+            .map_err(field)?;
+    }
+    Ok(fields)
 }
 
 /// Reads an answer's body, up to [`MAX_RESPONSE_BYTES`] and no further.
-async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>> {
+async fn read_capped(body: &mut BodyReader) -> Result<Vec<u8>> {
     let too_large = || {
         Error::Http(format!(
             "the answer is larger than the {MAX_RESPONSE_BYTES}-byte cap"
         ))
     };
-    if response
+    if body
         .content_length()
         .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
     {
         return Err(too_large());
     }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| Error::Http(e.to_string()))?
-    {
-        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(too_large());
-        }
-        body.extend_from_slice(&chunk);
+    match body.collect(MAX_RESPONSE_BYTES).await {
+        Ok(bytes) => Ok(bytes.to_vec()),
+        Err(weida_http::Error::TooLarge { .. }) => Err(too_large()),
+        Err(e) => Err(Error::Http(e.to_string())),
     }
-    Ok(body)
 }
 
 /// `text` cut to [`MAX_ERROR_TEXT`] bytes at a character boundary, with
@@ -609,9 +652,16 @@ mod tests {
     }
 
     #[test]
-    fn a_token_header_is_marked_sensitive() {
-        let header = sensitive_header("s.token").expect("a header value");
-        assert!(header.is_sensitive());
-        assert!(!format!("{header:?}").contains("s.token"));
+    fn the_token_never_prints() {
+        let fields = request_fields(Some("s.token"), None, &[], true).expect("fields");
+        assert_eq!(
+            fields.get("x-vault-token").map(|v| &v[..]),
+            Some(&b"s.token"[..])
+        );
+        assert!(!format!("{fields:?}").contains("s.token"));
+        assert!(matches!(
+            request_fields(Some("s.tok\nen"), None, &[], false),
+            Err(Error::Shape(_))
+        ));
     }
 }

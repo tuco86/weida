@@ -3,9 +3,10 @@
 OpenBao (and Vault) for weida
 ([decisions/0032](../decisions/0032-identity-sources-and-the-handoff.md)): the client, the
 three ways a process authenticates, and the sources it drives. Its own crate, because the
-OpenBao API is JSON over HTTPS and nothing else in the workspace speaks either; `reqwest`
-(rustls, no default features, the TLS configuration built here on the same `ring` provider
-weida uses) and `serde_json` (`Value` only) are the two dependencies that justify the cut.
+OpenBao API is JSON over HTTPS and nothing else in `weida` speaks either; `weida-http` (the
+workspace's own HTTP client, default features, the TLS configuration built here on the same
+`ring` provider weida uses, [0044](../decisions/0044-weida-http.md)) and `serde_json` (`Value`
+only) are the two dependencies that justify the cut.
 
 ## 1. What it is for
 

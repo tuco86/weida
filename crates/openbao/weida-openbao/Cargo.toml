@@ -19,14 +19,14 @@ autotests = false
 weida.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# The two dependencies that make this its own crate: the OpenBao API is JSON
-# over HTTPS, and nothing else in the workspace speaks either. The TLS
-# configuration is built here on the same `ring` provider weida uses and
-# handed to `reqwest`, so no process-wide provider is installed.
-reqwest.workspace = true
+# JSON over HTTPS: `weida-http` for HTTP, `serde_json` for the JSON; the TLS
+# configuration is built here on the `ring` provider and handed to the
+# client, so no process-wide provider is installed.
+weida-http.workspace = true
+# The `Exec` the HTTP client runs on, and its deadline for one request.
+weida-runtime.workspace = true
 serde_json.workspace = true
-tokio-rustls.workspace = true
-# For its version floor only; see the workspace entry.
+# The client's TLS configuration, by name; the floor is the workspace entry's.
 rustls.workspace = true
 rustls-pki-types.workspace = true
 webpki-roots.workspace = true

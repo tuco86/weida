@@ -125,7 +125,8 @@ there on first use with `0700`/`0600`, load it afterwards, and **reload** when t
 agent plugs in. `Static` — an `Identity` value, for a caller that manages the material itself.
 
 **4.3 `weida-openbao`.** One crate, one HTTP client, one JSON codec, both named in its manifest
-with the reason: the OpenBao API is JSON over HTTPS and the workspace has neither. It offers
+with the reason: the OpenBao API is JSON over HTTPS and `weida` speaks neither. The HTTP client
+is `weida-http` since [0044](0044-weida-http.md) (it was `reqwest` until then). It offers
 `Auth::{Token, AppRole, Handoff}`, where `Handoff` reads a wrapping token from a file or the
 credentials directory, unwraps it **before anything else**, and turns a failed unwrap into
 `IdentityEvent::HandoffStolen` plus an error the application exits on. A renewal task keeps
