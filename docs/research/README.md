@@ -123,6 +123,7 @@ through this list; the synthesis compares the answers side by side.
 | `mqtt5.md` | MQTT 5.0, with 3.1.1 differences | done |
 | `nats.md` | NATS core and JetStream | done; §1, §3, §4 and §13 carry what writing a client from the protocol reference settled where the reference is silent [30] and what the server's own subject validator enforces [31]. **No `nats-server` was reachable**, so nothing added is an observation of a server and the sheet says so at the source |
 | `nanomsg-nng.md` | nanomsg / NNG scalability protocols | done; §1, §3, §4, §6, §8, §11 and §13 carry what an implementation run against NNG 1.4.0-rc.0 through `nng` 1.0.1 observed [30], including the byte-level layouts the RFCs leave in prose |
+| `http.md` | HTTP semantics, HTTP/1.1, HTTP/2 with HPACK, HTTP/3 with QPACK | done |
 | `kafka.md` | Apache Kafka protocol and client semantics | done |
 | `ipc.md` | Inter-process and in-process transports per platform | done |
 | `quic-standards.md` | QUIC RFCs, extensions, drafts and measurement literature | done |
