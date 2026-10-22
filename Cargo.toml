@@ -32,6 +32,7 @@ members = [
     "crates/nats/weida-nats-codec",
     "crates/nats/weida-nats",
     "crates/nats/weida-nats-py",
+    "crates/http/weida-http-codec",
     # The shared PyO3 foundation every Python binding sits on, with nothing
     # protocol-specific in it (0014 §2).
     "crates/py/weida-py-core",
@@ -89,6 +90,7 @@ weida-amqp-py = { path = "crates/amqp/weida-amqp-py", version = "0.1.0-alpha.9-d
 weida-nats-codec = { path = "crates/nats/weida-nats-codec", version = "0.1.0-alpha.9-dev" }
 weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0-alpha.9-dev" }
 weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0-alpha.9-dev" }
+weida-http-codec = { path = "crates/http/weida-http-codec", version = "0.1.0-alpha.9-dev" }
 weida-openbao = { path = "crates/openbao/weida-openbao", version = "0.1.0-alpha.9-dev" }
 # The two dependencies `weida-openbao` alone carries, and the reason the
 # OpenBao client is its own crate ([decisions/0032](docs/decisions/0032-identity-sources-and-the-handoff.md)

@@ -1,0 +1,31 @@
+[package]
+name = "weida-http-codec"
+description = "HTTP/1.1, HPACK, HTTP/2 framing, QPACK and HTTP/3 framing, sans-I/O"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# No dependencies, deliberately: not even weida-core. The codec is the half of
+# the HTTP library that can be tested byte-for-byte against RFC 9112, RFC 7541,
+# RFC 9113, RFC 9204 and RFC 9114, so it must not be able to reach for weida's
+# types, its limits or its error vocabulary. `weida-http` depends on this crate
+# and on `weida-runtime`; this one depends on neither
+# (`docs/decisions/0013-competitor-libraries.md` §4.3). Published, unlike the
+# other family codecs, because `weida-http` is published and so is
+# `weida-openbao` on top of it (`docs/decisions/0044-weida-http.md` §4).
+autotests = false
+
+[dependencies]
+
+[lints]
+workspace = true
+
+# Integration tests are one binary (`tests/main.rs`): see its module docs.
+[[test]]
+name = "it"
+path = "tests/main.rs"

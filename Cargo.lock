@@ -3680,6 +3680,10 @@ name = "weida-core"
 version = "0.1.0-alpha.9-dev"
 
 [[package]]
+name = "weida-http-codec"
+version = "0.1.0-alpha.9-dev"
+
+[[package]]
 name = "weida-mqtt"
 version = "0.1.0-alpha.9-dev"
 dependencies = [

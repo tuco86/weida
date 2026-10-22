@@ -1,0 +1,50 @@
+[package]
+name = "weida-http-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+# Its own workspace (see below), so nothing to inherit; unpublished, so the
+# manifest needs no registry metadata.
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+weida-http-codec = { path = ".." }
+
+# Deliberately its own workspace: the fuzz crate needs nightly and must not
+# affect `cargo build --workspace` or the lockfile of the library crates.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "h1_request"
+path = "fuzz_targets/h1_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_response"
+path = "fuzz_targets/h1_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked"
+path = "fuzz_targets/chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uri"
+path = "fuzz_targets/uri.rs"
+test = false
+doc = false
+bench = false
