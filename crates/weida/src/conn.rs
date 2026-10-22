@@ -124,6 +124,12 @@ pub(crate) struct ConnCtx {
     /// not by what its streams go on to do.
     pub header_slots: Semaphore,
     agreed: watch::Receiver<Option<Agreed>>,
+    /// Whether our own HELLO has been written. Negotiation waits for it as
+    /// well as for the peer's: a peer parks every stream until our HELLO
+    /// arrives, so a dialler that sent a payload and exited before its HELLO
+    /// was on the wire would have reported a receipt for bytes the peer can
+    /// never accept.
+    hello_sent: watch::Receiver<bool>,
 }
 
 pub(crate) type ConnHandle = Arc<ConnCtx>;
@@ -141,6 +147,7 @@ impl ConnCtx {
     ) -> ConnHandle {
         let (ctl_tx, ctl_rx) = mpsc::channel(CTL_QUEUE);
         let (agreed_tx, agreed_rx) = watch::channel(None);
+        let (sent_tx, sent_rx) = watch::channel(false);
         let agreed_tx = Arc::new(agreed_tx);
 
         let streams_are_local = conn.streams_are_local();
@@ -171,6 +178,7 @@ impl ConnCtx {
             shared,
             flows: crate::flow::FlowTable::new(&limits),
             agreed: agreed_rx,
+            hello_sent: sent_rx,
             established: exec.now(),
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
             segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
@@ -188,7 +196,7 @@ impl ConnCtx {
         exec.spawn(hello_deadline(Arc::clone(&ctx), Arc::clone(&agreed_tx)));
         exec.spawn(accept_uni_loop(Arc::clone(&ctx), agreed_tx));
         exec.spawn(accept_bi_loop(Arc::clone(&ctx)));
-        exec.spawn(send_hello(Arc::clone(&ctx), limits, guarantees));
+        exec.spawn(send_hello(Arc::clone(&ctx), limits, guarantees, sent_tx));
         // One reader per connection, and only where the profile enabled
         // flows: a connection that enables nothing runs no reader at all.
         if limits.datagram_receive_bytes > 0 && ctx.conn.is_quic() {
@@ -197,11 +205,13 @@ impl ConnCtx {
         ctx
     }
 
-    /// Waits until the peer HELLO has been negotiated.
+    /// Waits until the peer HELLO has been negotiated and ours is written.
     ///
     /// QUIC streams are unordered relative to each other, so a DATA stream can
     /// be accepted before the peer's HELLO. Parking here is correct behaviour,
-    /// not a protocol violation.
+    /// not a protocol violation. Our own HELLO is waited for too, so nothing
+    /// this side sends can be reported delivered before the HELLO the peer
+    /// needs to accept it.
     ///
     /// A connection that dies while we wait fails this immediately with the
     /// reason it died. That matters most for a client whose handshake looked
@@ -209,26 +219,20 @@ impl ConnCtx {
     /// connection close that arrives *after* `connect` resolved, and the
     /// HELLO that would end this wait is never coming.
     pub(crate) async fn negotiated(&self) -> Result<Agreed, Error> {
-        let mut rx = self.agreed.clone();
-        loop {
-            if let Some(agreed) = *rx.borrow_and_update() {
-                return Ok(agreed);
-            }
-            tokio::select! {
-                changed = rx.changed() => {
-                    if changed.is_err() {
-                        // The sender is gone because the connection is: the
-                        // accept loops and the deadline hold it and end with
-                        // it. Report why, not merely that.
-                        return Err(self
-                            .conn
-                            .close_reason()
-                            .unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed)));
-                    }
-                }
-                reason = self.conn.closed() => return Err(reason),
-            }
-        }
+        negotiation(
+            self.agreed.clone(),
+            self.hello_sent.clone(),
+            self.conn.closed(),
+            || {
+                // The sender is gone because the connection is: the accept
+                // loops, the deadline and the HELLO task hold it and end
+                // with it. Report why, not merely that.
+                self.conn
+                    .close_reason()
+                    .unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed))
+            },
+        )
+        .await
     }
 
     /// The negotiated parameters if negotiation has completed, without
@@ -300,6 +304,39 @@ impl ConnCtx {
                 freed,
                 "reaped settled receipts to make room for another stream"
             );
+        }
+    }
+}
+
+/// The wait of [`ConnCtx::negotiated`]: until the peer's HELLO is agreed
+/// and ours is written, or `closed` says why the connection ended, or a
+/// channel's sender is gone without either, which `lost` explains.
+async fn negotiation(
+    mut agreed: watch::Receiver<Option<Agreed>>,
+    mut sent: watch::Receiver<bool>,
+    closed: impl Future<Output = Error>,
+    lost: impl Fn() -> Error,
+) -> Result<Agreed, Error> {
+    tokio::pin!(closed);
+    loop {
+        // Once it is written the sender may be gone, so its channel is
+        // only watched while it is not.
+        let sent_now = *sent.borrow_and_update();
+        if sent_now && let Some(negotiated) = *agreed.borrow_and_update() {
+            return Ok(negotiated);
+        }
+        tokio::select! {
+            changed = agreed.changed() => {
+                if changed.is_err() {
+                    return Err(lost());
+                }
+            }
+            changed = sent.changed(), if !sent_now => {
+                if changed.is_err() {
+                    return Err(lost());
+                }
+            }
+            reason = &mut closed => return Err(reason),
         }
     }
 }
@@ -485,11 +522,21 @@ fn hello_for(limits: Limits, guarantees: GuaranteeSet, quic: bool) -> Hello {
     }
 }
 
-/// Sends our HELLO, declaring the configured guarantee set.
-async fn send_hello(ctx: ConnHandle, limits: Limits, guarantees: GuaranteeSet) {
+/// Sends our HELLO, declaring the configured guarantee set, and says so on
+/// `sent` once it is written. A HELLO that cannot be written drops `sent`
+/// unset, which fails every wait for negotiation on this connection.
+async fn send_hello(
+    ctx: ConnHandle,
+    limits: Limits,
+    guarantees: GuaranteeSet,
+    sent: watch::Sender<bool>,
+) {
     let hello = hello_for(limits, guarantees, ctx.conn.is_quic());
-    if let Err(e) = write_control(&ctx.conn, FrameKind::Hello, &hello.encode()).await {
-        tracing::debug!(error = %e, "failed to send HELLO");
+    match write_control(&ctx.conn, FrameKind::Hello, &hello.encode()).await {
+        Ok(()) => {
+            sent.send_replace(true);
+        }
+        Err(e) => tracing::debug!(error = %e, "failed to send HELLO"),
     }
 }
 
@@ -1855,5 +1902,69 @@ mod tests {
             free,
             "and the slot is given back after"
         );
+    }
+
+    fn agreed() -> weida_protocol::Agreed {
+        let hello = weida_protocol::header::Hello::v0(8192, 100);
+        weida_protocol::negotiate(&hello, &hello).expect("two v0 HELLOs agree")
+    }
+
+    /// Polls `negotiation` once, without waiting.
+    async fn poll_once<F: Future + Unpin>(fut: &mut F) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *fut).poll(cx)))
+            .await
+    }
+
+    /// The peer's HELLO alone does not end negotiation: until ours is
+    /// written, the peer parks everything this side sends, so a receipt
+    /// given before it could be for bytes the peer never accepts — a sender
+    /// that pushed and exited at once lost its payload that way.
+    #[tokio::test]
+    async fn negotiation_waits_for_our_own_hello_as_well_as_the_peers() {
+        use std::task::Poll;
+        let (agreed_tx, agreed_rx) = tokio::sync::watch::channel(None);
+        let (sent_tx, sent_rx) = tokio::sync::watch::channel(false);
+        let mut waiting = Box::pin(super::negotiation(
+            agreed_rx,
+            sent_rx,
+            std::future::pending(),
+            || weida_core::Error::ConnectionLost(weida_core::LossCause::LocallyClosed),
+        ));
+        assert!(poll_once(&mut waiting).await.is_pending());
+        agreed_tx.send_replace(Some(agreed()));
+        assert!(
+            poll_once(&mut waiting).await.is_pending(),
+            "the peer's HELLO alone is not negotiation"
+        );
+        sent_tx.send_replace(true);
+        // Once written, the sender may go: the wait must not read that as a loss.
+        drop(sent_tx);
+        match poll_once(&mut waiting).await {
+            Poll::Ready(Ok(negotiated)) => assert_eq!(negotiated, agreed()),
+            other => panic!("negotiated once both were there: {other:?}"),
+        }
+    }
+
+    /// A HELLO that could not be written fails negotiation instead of
+    /// leaving it to wait for ever.
+    #[tokio::test]
+    async fn negotiation_fails_when_our_hello_cannot_be_written() {
+        let (agreed_tx, agreed_rx) = tokio::sync::watch::channel(Some(agreed()));
+        let (sent_tx, sent_rx) = tokio::sync::watch::channel(false);
+        drop(sent_tx);
+        let outcome = super::negotiation(agreed_rx, sent_rx, std::future::pending(), || {
+            weida_core::Error::ConnectionLost(weida_core::LossCause::LocallyClosed)
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(weida_core::Error::ConnectionLost(
+                    weida_core::LossCause::LocallyClosed
+                ))
+            ),
+            "{outcome:?}"
+        );
+        drop(agreed_tx);
     }
 }

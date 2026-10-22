@@ -363,8 +363,22 @@ pub(crate) async fn accept_control<S: Stream>(
     exec: Exec,
 ) -> Result<Grouped<S>, Error> {
     let token = random_token();
-    stream.write_all(&token).await.map_err(Error::Io)?;
+    let slots = stream_slots(max_streams);
     let (transfers_tx, transfers_rx) = mpsc::unbounded_channel();
+    // The pool is the peer's and the link's at once: the peer fills it over
+    // the socket, the link spends it on fan-out [0012 §4.4].
+    let reverse = Arc::new(ReversePool::new(Arc::clone(&slots), max_parked));
+    // Registered before the token goes out: the peer dials its transfer
+    // connections the moment it reads the token, and the accept loop may
+    // admit one on another thread before this task runs again. A token the
+    // peer can read always names a group.
+    groups.insert(token, principal.clone(), transfers_tx, Arc::clone(&reverse));
+    let registered = Registered {
+        groups: &groups,
+        token,
+    };
+    stream.write_all(&token).await.map_err(Error::Io)?;
+    std::mem::forget(registered);
     let mut link = Grouped::new(
         Side::Accept {
             groups: Arc::clone(&groups),
@@ -372,17 +386,33 @@ pub(crate) async fn accept_control<S: Stream>(
             exec,
         },
         stream,
-        Some(principal.clone()),
-        max_streams,
+        Some(principal),
+        slots,
         max_parked,
     );
-    // The pool is the peer's and the link's at once: the peer fills it over
-    // the socket, the link spends it on fan-out [0012 §4.4].
-    let reverse = Arc::new(ReversePool::new(Arc::clone(&link.slots), max_parked));
-    link.reverse = Some(Arc::clone(&reverse));
+    link.reverse = Some(reverse);
     link.transfers = tokio::sync::Mutex::new(Some(transfers_rx));
-    groups.insert(token, principal, transfers_tx, reverse);
     Ok(link)
+}
+
+/// A group registered for a control connection whose token has not gone out
+/// yet: dropped, on a failed write or a cancelled accept, it leaves the
+/// registry again.
+struct Registered<'a, S: Stream> {
+    groups: &'a Groups<S>,
+    token: [u8; TOKEN_LEN],
+}
+
+impl<S: Stream> Drop for Registered<'_, S> {
+    fn drop(&mut self) {
+        self.groups.remove(&self.token);
+    }
+}
+
+/// The `max_local_streams` slots of one link; tokio panics above
+/// `Semaphore::MAX_PERMITS`.
+fn stream_slots(max_streams: usize) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(max_streams.min(Semaphore::MAX_PERMITS)))
 }
 
 /// Parks an accepted reverse connection with the peer its token names
@@ -426,7 +456,7 @@ pub(crate) async fn dial<S: Stream>(
         Side::Dial { endpoint, token },
         stream,
         Some(principal),
-        max_streams,
+        stream_slots(max_streams),
         max_parked,
     ))
 }
@@ -681,7 +711,7 @@ impl<S: Stream> Grouped<S> {
         side: Side<S>,
         control: S,
         peer: Option<S::Principal>,
-        max_streams: usize,
+        slots: Arc<Semaphore>,
         max_parked: usize,
     ) -> Grouped<S> {
         let (recv, send) = control.split();
@@ -698,8 +728,7 @@ impl<S: Stream> Grouped<S> {
             parked_rx: tokio::sync::Mutex::new(parked_rx),
             deficit: Arc::new(Deficit::default()),
             peer,
-            // tokio panics above `Semaphore::MAX_PERMITS`.
-            slots: Arc::new(Semaphore::new(max_streams.min(Semaphore::MAX_PERMITS))),
+            slots,
             max_parked,
             closing,
             id: crate::transport::next_serial(),
@@ -1222,6 +1251,209 @@ impl<S: Stream> Drop for LocalRecv<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{DuplexStream, ReadBuf, ReadHalf, WriteHalf};
+    use weida_core::LocalPrincipal;
+
+    use crate::chunked::{ChunkReader, ChunkWriter, Marker};
+
+    /// The principal every in-memory connection reports.
+    const PEER: LocalPrincipal = LocalPrincipal {
+        uid: 1000,
+        gid: 1000,
+        pid: Some(4242),
+    };
+
+    /// What a raw write is shown to before it reaches the other end.
+    type WriteHook = Box<dyn FnMut(&[u8]) + Send>;
+
+    /// A local connection in memory: one end of a `tokio::io::duplex`, with
+    /// the chunk framing of the socket transports on its halves. `on_write`
+    /// sees every raw write before the other end can read it, which is how a
+    /// test looks at the state the moment bytes go out.
+    struct Mem {
+        io: DuplexStream,
+        exec: Exec,
+        on_write: Option<WriteHook>,
+    }
+
+    impl Mem {
+        fn new(io: DuplexStream) -> Mem {
+            Mem {
+                io,
+                exec: Exec::current().expect("a tokio runtime"),
+                on_write: None,
+            }
+        }
+    }
+
+    /// Where an in-memory dial lands: the accepting side's queue.
+    struct MemEndpoint {
+        accept: mpsc::UnboundedSender<Mem>,
+    }
+
+    impl AsyncRead for Mem {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Mem {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if let Some(hook) = this.on_write.as_mut() {
+                hook(buf);
+            }
+            Pin::new(&mut this.io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+        }
+    }
+
+    impl Stream for Mem {
+        type Endpoint = MemEndpoint;
+        type Principal = LocalPrincipal;
+        type Writer = ChunkWriter<WriteHalf<DuplexStream>>;
+        type Reader = ChunkReader<ReadHalf<DuplexStream>>;
+
+        async fn connect(endpoint: &MemEndpoint) -> Result<Mem, Error> {
+            let (ours, theirs) = tokio::io::duplex(64 * 1024);
+            endpoint
+                .accept
+                .send(Mem::new(theirs))
+                .map_err(|_| Error::ConnectionLost(LossCause::PeerClosed))?;
+            Ok(Mem::new(ours))
+        }
+
+        fn principal(&self) -> Result<LocalPrincipal, Error> {
+            Ok(PEER)
+        }
+
+        fn split(self) -> (Self::Reader, Self::Writer) {
+            let (recv, send) = tokio::io::split(self.io);
+            (
+                ChunkReader::new(recv, self.exec.clone()),
+                ChunkWriter::new(send, self.exec),
+            )
+        }
+
+        fn same_peer(group: &LocalPrincipal, asking: &LocalPrincipal) -> bool {
+            group == asking
+        }
+
+        fn identity(principal: &LocalPrincipal) -> PeerIdentity {
+            PeerIdentity::Local(*principal)
+        }
+
+        fn finish(writer: Self::Writer, claims: Claims) {
+            writer.end(Marker::Fin, claims);
+        }
+
+        fn reset(writer: Self::Writer, code: u64, claims: Claims) {
+            writer.end(Marker::Reset(code), claims);
+        }
+
+        fn stop(reader: Self::Reader, _code: u64, claims: Claims) {
+            reader.drain(claims);
+        }
+
+        fn read_error(error: std::io::Error) -> Error {
+            crate::chunked::read_error(error)
+        }
+    }
+
+    /// A place of a binding's `max_connections`, for an admitted connection.
+    fn place() -> Place {
+        Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a free place")
+    }
+
+    /// The peer dials its transfer connections the moment it reads the
+    /// token, and the accept loop may admit one on another thread before the
+    /// control task runs again: a token that went out before its group was
+    /// registered refused that transfer, and the sender, whose bytes the
+    /// kernel had already taken, reported it delivered.
+    #[tokio::test]
+    async fn a_token_names_its_group_before_the_peer_can_read_it() {
+        let groups = Arc::new(Groups::<Mem>::default());
+        let (mut dialler, accepted) = tokio::io::duplex(1024);
+        let mut accepted = Mem::new(accepted);
+        let registered = Arc::new(StdMutex::new(Vec::new()));
+        accepted.on_write = Some({
+            let groups = Arc::clone(&groups);
+            let registered = Arc::clone(&registered);
+            Box::new(move |bytes: &[u8]| {
+                let token: [u8; TOKEN_LEN] = bytes.try_into().expect("the token in one write");
+                registered
+                    .lock()
+                    .expect("poisoned")
+                    .push(groups.live(&token).is_some());
+            })
+        });
+        let link = accept_control(
+            accepted,
+            PEER,
+            Arc::clone(&groups),
+            8,
+            8,
+            Exec::current().expect("a tokio runtime"),
+        )
+        .await
+        .expect("accepted");
+        assert_eq!(*registered.lock().expect("poisoned"), [true]);
+
+        // A transfer connection with the token the peer read joins the link.
+        let mut token = [0u8; TOKEN_LEN];
+        dialler.read_exact(&mut token).await.expect("the token");
+        let (_transfer, admitted) = tokio::io::duplex(1024);
+        assert!(admit_transfer(
+            &groups,
+            &token,
+            &PEER,
+            Mem::new(admitted),
+            place()
+        ));
+        drop(link);
+    }
+
+    /// An accept that ends before its token went out, cancelled or failed,
+    /// leaves no group behind: nothing could ever close it.
+    #[tokio::test]
+    async fn an_accept_cut_short_leaves_no_group() {
+        let groups = Arc::new(Groups::<Mem>::default());
+        // Room for one octet of the token, and a peer that never reads.
+        let (_dialler, accepted) = tokio::io::duplex(1);
+        let mut accepting = Box::pin(accept_control(
+            Mem::new(accepted),
+            PEER,
+            Arc::clone(&groups),
+            8,
+            8,
+            Exec::current().expect("a tokio runtime"),
+        ));
+        let polled =
+            std::future::poll_fn(|cx| Poll::Ready(accepting.as_mut().poll(cx).is_pending())).await;
+        assert!(polled, "the token does not fit");
+        assert_eq!(groups.entries.lock().expect("poisoned").len(), 1);
+        drop(accepting);
+        assert!(groups.entries.lock().expect("poisoned").is_empty());
+    }
 
     /// The live count is a semaphore, and tokio refuses one larger than its
     /// platform's ceiling with a panic: on a 32-bit target the first local

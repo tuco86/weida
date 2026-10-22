@@ -115,6 +115,10 @@ reports one [0012 §4.2]. An unbound connection is dispatched nowhere. The
 token binds connections and resumes nothing: no subscriptions, no sequence
 position, no dedup window, and it is meaningless once the control connection
 closes, which is why it is not the session state §11 excludes [0012 §4.5].
+The accepting side MUST register a token before it writes it: the peer dials
+its transfer connections the moment it reads the token, and one admitted
+against a token not yet registered would be refused after the sender's
+bytes were already in the kernel.
 
 **A local connection keeps its place for its life.** Each local connection takes one of the binding's `max_connections` places before it is accepted, and keeps it while it lives: a control connection for as long as its link does, a transfer or parked connection until its last half is gone and nothing in the background, a drain still reading a refused transfer or an end marker still being written, owns its descriptor. A closed connection gives its place back before the queues it consumed on are told it is gone, so a queue that nobody reads cannot keep dead connections counted. Its preamble must arrive within `hello_timeout_ms`, or the socket is closed. The dialling side keeps its control connection open for the life of the link, and the accepting side watches that connection: when it ends, the accepting side closes the link with `SHUTDOWN` and the peer's subscriptions and group go with it, so a peer that exits without a word is noticed without a keep-alive.
 
@@ -180,6 +184,10 @@ violation. The receiver MUST park such a stream (retain it, unread beyond its pr
 without emitting any error) until the peer HELLO has been processed and negotiation has
 succeeded, and MUST then process the parked stream normally. In the reference
 implementation the parked task awaits a `tokio::sync::watch<Option<Agreed>>`.
+Because the receiver parks every stream until it has the sender's HELLO, a side MUST NOT
+consider negotiation complete, and so opens no stream, before its own HELLO is written: a
+sender that reported a payload delivered and exited first would leave the peer parking that
+payload until `hello_timeout` closes the connection.
 
 If the peer HELLO has not arrived within `hello_timeout` (default 10 s, see §10), the local
 side MUST close the connection with application error code `NEGOTIATION_FAILED`.
