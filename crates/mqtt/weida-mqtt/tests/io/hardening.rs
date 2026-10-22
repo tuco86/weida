@@ -80,12 +80,20 @@ async fn a_peer_that_stops_reading_ends_the_connection_and_disconnect_still_retu
     let _silent = within(accepted).await.expect("task");
 
     let client = Arc::new(client);
+    // Publishes until one sticks: Winsock takes a whole non-blocking send
+    // while its buffer has any room, so there the first publishes go and a
+    // later write waits; elsewhere the first one already does.
     let publishing = {
         let client = Arc::clone(&client);
         tokio::spawn(async move {
-            client
-                .publish(Message::new("t", vec![0u8; 16 * 1024 * 1024]))
-                .await
+            loop {
+                if let Err(error) = client
+                    .publish(Message::new("t", vec![0u8; 16 * 1024 * 1024]))
+                    .await
+                {
+                    return error;
+                }
+            }
         })
     };
     // Long enough for the task to take the command and fill the socket.
@@ -107,10 +115,8 @@ async fn a_peer_that_stops_reading_ends_the_connection_and_disconnect_still_retu
         Some(Event::Disconnected(Error::Timeout(what))) => assert_eq!(what, "write"),
         other => panic!("expected Disconnected(Timeout(\"write\")), got {other:?}"),
     }
-    assert!(
-        within(publishing).await.expect("task").is_err(),
-        "the stuck publish is released, not left pending"
-    );
+    // Ends with an error rather than hanging: the stuck publish is released.
+    within(publishing).await.expect("task");
 }
 
 /// A full event queue stops the socket being read and nothing else: the

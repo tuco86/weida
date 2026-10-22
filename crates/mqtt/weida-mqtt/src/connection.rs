@@ -1209,17 +1209,23 @@ mod tests {
             let (mut writer, peer) = stalling().await;
             // Far more than the two socket buffers hold, so the write must wait.
             let big = vec![1u8; 4 * 1024 * 1024];
-            let queued = writer
-                .queue(&Packet::Publish(Publish {
-                    topic: "t",
-                    payload: &big,
-                    ..Publish::default()
-                }))
-                .expect("queues");
+            let publish = Packet::Publish(Publish {
+                topic: "t",
+                payload: &big,
+                ..Publish::default()
+            });
+            let mut queued = writer.queue(&publish).expect("queues");
 
             // Steps until one has to wait; each that completes took some bytes.
+            // Winsock takes a whole non-blocking send while its buffer has any
+            // room, however large the send, so there the first step takes the
+            // packet and only the next one waits: a step that left nothing to
+            // do queues another.
             let mut waited = false;
             for _ in 0..1000 {
+                if !writer.has_work() {
+                    queued = writer.queue(&publish).expect("queues");
+                }
                 if tokio::time::timeout(Duration::from_millis(100), writer.step())
                     .await
                     .is_err()
@@ -1234,7 +1240,10 @@ mod tests {
             );
             assert!(writer.has_work());
             assert!(writer.written() < queued, "not all of it went");
-            assert_eq!(writer.confirmed(), 0, "and none of it is confirmed");
+            assert!(
+                writer.confirmed() < queued,
+                "and not all of it is confirmed"
+            );
 
             // The peer starts reading, and the same writer finishes the packet.
             let reader = tokio::spawn(async move {
