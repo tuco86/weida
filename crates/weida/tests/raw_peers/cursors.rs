@@ -1,4 +1,5 @@
-//! The tests of `tests/cursors.rs` that need the network, a process or real time.
+//! The tests of `tests/cursors.rs` that need a raw peer: bare `quinn`
+//! endpoints on the simulated network, writing CURSOR records by hand.
 
 use crate::common;
 use common::{Server, raw};
@@ -8,18 +9,25 @@ use weida_protocol::{CursorHeader, FrameKind, encode_cursor_record, encode_pream
 
 use crate::cursors::*;
 
-#[tokio::test]
+/// A client runtime on `net`.
+fn sim_client(net: &weida::SimNet) -> weida::Runtime {
+    weida::Runtime::new(weida::RuntimeConfig {
+        network: weida::Network::sim(net),
+        ..weida::RuntimeConfig::default()
+    })
+    .expect("runtime")
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_push_transfer_that_orders_cursors_stays_one_unidirectional_stream() {
     // The end-to-end proof of 0024 §4.4a: a raw peer counts the streams, so
     // the assertion is about the wire rather than about our own bookkeeping.
+    let net = weida::SimNet::new();
     let certs = common::Certs::generate();
-    let files = certs.files();
-    let (endpoint, addr) = raw::server_endpoint(&certs);
+    let (endpoint, addr) = raw::sim_server_endpoint(&net, &certs);
 
-    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
-    let pusher = client.pusher(weida::ClientTls::new(weida::Trust::anchor_file(
-        &files.cert_pem,
-    )));
+    let client = sim_client(&net);
+    let pusher = client.pusher(certs.client_tls());
     let url = format!("weida://127.0.0.1:{}/jobs", addr.port());
 
     let peer = tokio::spawn(async move {
@@ -75,16 +83,14 @@ async fn a_push_transfer_that_orders_cursors_stays_one_unidirectional_stream() {
     assert_eq!(peer.await.expect("peer"), payload.len());
     client.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_reordered_or_duplicated_record_changes_nothing() {
+    let net = weida::SimNet::new();
     let certs = common::Certs::generate();
-    let files = certs.files();
-    let (endpoint, addr) = raw::server_endpoint(&certs);
+    let (endpoint, addr) = raw::sim_server_endpoint(&net, &certs);
 
-    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
-    let pusher = client.pusher(weida::ClientTls::new(weida::Trust::anchor_file(
-        &files.cert_pem,
-    )));
+    let client = sim_client(&net);
+    let pusher = client.pusher(certs.client_tls());
     let url = format!("weida://127.0.0.1:{}/jobs", addr.port());
 
     let peer = tokio::spawn(async move {
@@ -125,12 +131,12 @@ async fn a_reordered_or_duplicated_record_changes_nothing() {
     peer.await.expect("peer");
     client.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_cursor_stream_for_an_unknown_report_id_is_reset_and_the_connection_survives() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let replier = server.listener.replier("/t").expect("replier");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -170,13 +176,13 @@ async fn a_cursor_stream_for_an_unknown_report_id_is_reset_and_the_connection_su
     assert_eq!(preamble.kind, FrameKind::Data);
     handler.await.expect("handler");
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn coalescing_loses_nothing() {
     // The claim of 0023 §4.3b, measured: a reporter that drops every
     // intermediate record leaves the reader at exactly the same offset as one
     // that writes all hundred. The counts come from a raw peer, because the
     // reader-side API keeps only the latest value by design.
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
     // Coarse: a megabyte or an hour, so nothing after the first record is
@@ -194,12 +200,12 @@ async fn coalescing_loses_nothing() {
     assert_eq!(coarse.last().expect("a record").1, 100);
     assert_eq!(fine.last().expect("a record").1, 100);
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn final_only_emits_exactly_one_record_per_level() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -237,16 +243,14 @@ async fn final_only_emits_exactly_one_record_per_level() {
 /// backwards by starting that stream lower. Keeping the maximum per level is
 /// the property the whole carrier rests on
 /// ([PROTOCOL.md](../../../docs/PROTOCOL.md) §6.7 rule 1).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_second_cursor_stream_for_one_report_cannot_move_it_backwards() {
+    let net = weida::SimNet::new();
     let certs = common::Certs::generate();
-    let files = certs.files();
-    let (endpoint, addr) = raw::server_endpoint(&certs);
+    let (endpoint, addr) = raw::sim_server_endpoint(&net, &certs);
 
-    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
-    let pusher = client.pusher(weida::ClientTls::new(weida::Trust::anchor_file(
-        &files.cert_pem,
-    )));
+    let client = sim_client(&net);
+    let pusher = client.pusher(certs.client_tls());
     let url = format!("weida://127.0.0.1:{}/jobs", addr.port());
 
     let (first_seen, wait_for_first) = tokio::sync::oneshot::channel::<()>();

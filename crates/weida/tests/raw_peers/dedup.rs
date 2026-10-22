@@ -50,16 +50,16 @@ async fn send_numbered(conn: &quinn::Connection, path: &str, sequence: u64, body
     stream.finish().expect("finish");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replay_inside_the_window_is_suppressed_and_counted() {
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         guarantees: bounded(),
         ..RuntimeConfig::default()
     })
     .await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -101,16 +101,16 @@ async fn a_replay_inside_the_window_is_suppressed_and_counted() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_identity_replayed_after_the_window_is_delivered() {
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         guarantees: bounded(),
         ..RuntimeConfig::default()
     })
     .await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -146,14 +146,14 @@ async fn an_identity_replayed_after_the_window_is_delivered() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn nothing_is_suppressed_without_the_negotiated_level() {
     // The default `core` set: the same replay is delivered twice, because no
     // deduplication was negotiated and none is applied.
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");

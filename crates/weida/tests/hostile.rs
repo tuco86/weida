@@ -4,6 +4,9 @@
 //! sequences the library would never produce, and assert on the QUIC
 //! application error codes and on the outcomes the local API reports. The
 //! library has no test hooks; everything below is written against the wire.
+//! The raw peers are bare `quinn` endpoints on the same `SimNet` as the
+//! runtime under test (`SimNet::endpoint`), so the suite runs on a paused
+//! clock with no socket.
 
 use crate::common;
 
@@ -11,14 +14,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{Certs, Server, raw};
-use weida::{Error, Incoming, Runtime, RuntimeConfig, TransferMeta, codes};
+use weida::{Error, Incoming, Network, Runtime, RuntimeConfig, SimNet, TransferMeta, codes};
 use weida_protocol::header::{GuaranteeSet, OrderingMode};
 use weida_protocol::{
     CreditHeader, DataHeader, ErrorHeader, FlowHeader, FrameKind, Hello, MAGIC, SubscriptionHeader,
     encode_frame, encode_preamble,
 };
 
-/// Generous ceiling: every assertion below should settle in milliseconds.
+/// A ceiling on the paused clock: every assertion below settles in
+/// milliseconds of simulated time.
 const DEADLINE: Duration = Duration::from_secs(15);
 
 async fn within<F: Future>(f: F) -> F::Output {
@@ -29,12 +33,12 @@ async fn within<F: Future>(f: F) -> F::Output {
 
 // --- hostile client against our server ----------------------------------
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn garbage_first_bytes_close_the_connection() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _replier = server.listener.replier("/t").expect("replier");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -71,10 +75,10 @@ async fn garbage_first_bytes_close_the_connection() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unknown_frame_kind_closes_the_connection() {
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -88,12 +92,12 @@ async fn an_unknown_frame_kind_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_flow_from_a_peer_without_the_datagram_capability_closes_the_connection() {
     // Kind 7 is FLOW, legal only when both HELLOs listed capability code 1.
     // The server enables flows; this peer's HELLO lists nothing
     // (`docs/PROTOCOL.md` §6.1, §3.2).
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits: weida::Limits {
             datagram_receive_bytes: weida::DEFAULT_DATAGRAM_RECEIVE_BYTES,
             ..weida::Limits::default()
@@ -102,7 +106,7 @@ async fn a_flow_from_a_peer_without_the_datagram_capability_closes_the_connectio
     })
     .await;
     let _acceptor = server.listener.acceptor("/v").expect("acceptor");
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -121,16 +125,16 @@ async fn a_flow_from_a_peer_without_the_datagram_capability_closes_the_connectio
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_credit_frame_for_a_path_with_no_queue_is_ignored() {
     // Kind 5 is CREDIT. A peer may send one for any path, and a
     // path with no queue behind it has nothing to honour — so the frame is
     // dropped and the connection survives. Closing on it would let any peer
     // kill a connection with a legal frame, and there is no reply half to
     // refuse on ([PROTOCOL.md](../../docs/PROTOCOL.md) §4).
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _replier = server.listener.replier("/rpc").expect("replier");
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -168,13 +172,13 @@ async fn a_credit_frame_for_a_path_with_no_queue_is_ignored() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_malformed_credit_header_closes_the_connection() {
     // A legal *kind* with an illegal header is still a framing violation: the
     // three keys of §6.6 are required, and a filter that breaks §6.4's grammar
     // is refused at the codec boundary.
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -192,10 +196,10 @@ async fn a_malformed_credit_header_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn hello_with_an_unsupported_version_fails_negotiation() {
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -212,10 +216,10 @@ async fn hello_with_an_unsupported_version_fails_negotiation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_required_capability_we_lack_fails_negotiation() {
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -236,10 +240,10 @@ async fn a_required_capability_we_lack_fails_negotiation() {
 /// A peer that requires a guarantee level this build does not offer gets a
 /// failed handshake, never a quieter success
 /// (`docs/PROTOCOL.md` §2.3 step 6).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_required_guarantee_level_we_do_not_offer_fails_negotiation() {
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -263,7 +267,7 @@ async fn a_required_guarantee_level_we_do_not_offer_fails_negotiation() {
 
 /// A guarantee set the grammar of §6.5 forbids is a framing violation, not a
 /// negotiation failure: the header never becomes a declaration at all.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_malformed_guarantee_set_is_a_framing_violation() {
     for header in [
         // An unknown ordering level.
@@ -279,8 +283,8 @@ async fn a_malformed_guarantee_set_is_a_framing_violation() {
         // `control_isolated` is a flag, not a number.
         raw::hello_with_guarantee_map(&[(9, 2)]),
     ] {
-        let server = Server::start_os().await;
-        let endpoint = raw::client_endpoint(&server.certs);
+        let server = Server::start().await;
+        let endpoint = server.raw_client();
         let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
             .await
             .expect("handshake");
@@ -292,10 +296,10 @@ async fn a_malformed_guarantee_set_is_a_framing_violation() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_oversized_header_length_closes_the_connection_before_allocating() {
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -311,10 +315,10 @@ async fn an_oversized_header_length_closes_the_connection_before_allocating() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_malformed_cbor_header_closes_the_connection() {
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -333,15 +337,15 @@ async fn a_malformed_cbor_header_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn uni_data_without_an_endpoint_is_a_violation() {
     // The decoder accepts an empty DATA map — a reply half legitimately sends
     // one — so the endpoint requirement is enforced where the stream context
     // is known: dispatch.
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -359,12 +363,12 @@ async fn uni_data_without_an_endpoint_is_a_violation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bidi_data_without_an_endpoint_is_a_violation() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _replier = server.listener.replier("/t").expect("replier");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -383,14 +387,14 @@ async fn bidi_data_without_an_endpoint_is_a_violation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn error_frame_on_a_uni_stream_is_a_violation() {
     // ERROR answers a request, and a request always arrives on a bidirectional
     // stream. On a unidirectional one it refers to nothing.
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _replier = server.listener.replier("/t").expect("replier");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -405,12 +409,12 @@ async fn error_frame_on_a_uni_stream_is_a_violation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_non_data_frame_may_not_open_a_bidirectional_stream() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _replier = server.listener.replier("/t").expect("replier");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -430,12 +434,12 @@ async fn a_non_data_frame_may_not_open_a_bidirectional_stream() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bidi_request_to_a_pull_path_is_refused_with_unsupported() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -476,12 +480,12 @@ async fn bidi_request_to_a_pull_path_is_refused_with_unsupported() {
     assert!(conn.close_reason().is_none());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bidi_request_to_an_unknown_path_is_refused_with_unknown_endpoint() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _replier = server.listener.replier("/known").expect("replier");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -506,7 +510,7 @@ async fn bidi_request_to_an_unknown_path_is_refused_with_unknown_endpoint() {
 /// A raw peer whose HELLO lists capability code `2`, against a server whose
 /// profile does (`reporting`) or does not ask for path reports.
 async fn reporting_peer(reporting: bool) -> (Server, quinn::Connection) {
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits: weida::Limits {
             path_report: reporting,
             ..weida::Limits::default()
@@ -514,7 +518,7 @@ async fn reporting_peer(reporting: bool) -> (Server, quinn::Connection) {
         ..RuntimeConfig::default()
     })
     .await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -535,7 +539,7 @@ async fn report_stream(conn: &quinn::Connection, records: &[u8]) -> quinn::SendS
     stream
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_report_without_the_agreed_capability_closes_the_connection() {
     // The peer lists code 2, the server does not: nothing was agreed.
     let (_server, conn) = reporting_peer(false).await;
@@ -546,7 +550,7 @@ async fn a_report_without_the_agreed_capability_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_second_report_stream_closes_the_connection() {
     let (_server, conn) = reporting_peer(true).await;
     let _first = report_stream(&conn, &[]).await;
@@ -557,7 +561,7 @@ async fn a_second_report_stream_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_report_record_above_256_bytes_closes_the_connection() {
     let (_server, conn) = reporting_peer(true).await;
     // `41 01` is a length of 257.
@@ -568,7 +572,7 @@ async fn a_report_record_above_256_bytes_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_report_record_cut_at_fin_closes_the_connection() {
     let (_server, conn) = reporting_peer(true).await;
     let mut stream = report_stream(&conn, &[0x0D, 0xA3, 0x00, 0x19]).await;
@@ -579,7 +583,7 @@ async fn a_report_record_cut_at_fin_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_whole_report_record_keeps_the_connection() {
     // The control case: the same stream with a whole record and FIN is
     // legal, so the violations above are the record rules and nothing else.
@@ -596,13 +600,14 @@ async fn a_whole_report_record_keeps_the_connection() {
 
 // --- hostile server against our client ----------------------------------
 
-/// Spawns a raw server that runs `behaviour` for its first connection.
-fn raw_server<F, Fut>(certs: &Certs, behaviour: F) -> std::net::SocketAddr
+/// Spawns a raw server on `net` that runs `behaviour` for its first
+/// connection.
+fn raw_server<F, Fut>(net: &SimNet, certs: &Certs, behaviour: F) -> std::net::SocketAddr
 where
     F: FnOnce(quinn::Connection) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send,
 {
-    let (endpoint, addr) = raw::server_endpoint(certs);
+    let (endpoint, addr) = raw::sim_server_endpoint(net, certs);
     tokio::spawn(async move {
         let incoming = endpoint.accept().await.expect("a connection");
         let conn = incoming.await.expect("handshake");
@@ -613,14 +618,23 @@ where
     addr
 }
 
-fn client_for() -> Runtime {
-    Runtime::new(RuntimeConfig::default()).expect("client runtime")
+fn client_for(net: &SimNet) -> Runtime {
+    client_with(net, RuntimeConfig::default())
 }
 
-#[tokio::test]
+fn client_with(net: &SimNet, config: RuntimeConfig) -> Runtime {
+    Runtime::new(RuntimeConfig {
+        network: Network::sim(net),
+        ..config
+    })
+    .expect("client runtime")
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_server_that_never_answers_yields_indeterminate() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let addr = raw_server(&certs, |conn| async move {
+    let addr = raw_server(&net, &certs, |conn| async move {
         raw::send_hello(&conn).await;
         // Read the request to FIN, then vanish without a reply.
         let (_send, mut recv, header) = raw::accept_exchange(&conn).await;
@@ -634,7 +648,7 @@ async fn a_server_that_never_answers_yields_indeterminate() {
         conn.close(quinn::VarInt::from_u32(0), b"bye");
     });
 
-    let client = client_for();
+    let client = client_for(&net);
     let requester = client.requester(certs.client_tls());
     within(requester.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
         .await
@@ -665,10 +679,11 @@ async fn a_server_that_never_answers_yields_indeterminate() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_server_that_disappears_mid_stream_yields_connection_lost() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let addr = raw_server(&certs, |conn| async move {
+    let addr = raw_server(&net, &certs, |conn| async move {
         raw::send_hello(&conn).await;
         let (_send, mut recv, _header) = raw::accept_exchange(&conn).await;
         // Read only a little, then drop the connection before the FIN.
@@ -677,7 +692,7 @@ async fn a_server_that_disappears_mid_stream_yields_connection_lost() {
         conn.close(quinn::VarInt::from_u32(0), b"gone");
     });
 
-    let client = client_for();
+    let client = client_for(&net);
     let requester = client.requester(certs.client_tls());
     within(requester.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
         .await
@@ -705,10 +720,11 @@ async fn a_server_that_disappears_mid_stream_yields_connection_lost() {
     assert!(err.is_definite_failure());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_server_that_never_sends_hello_is_dropped_after_the_timeout() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let addr = raw_server(&certs, |conn| async move {
+    let addr = raw_server(&net, &certs, |conn| async move {
         // Stay silent: no HELLO, ever.
         conn.closed().await;
     });
@@ -717,11 +733,13 @@ async fn a_server_that_never_sends_hello_is_dropped_after_the_timeout() {
         hello_timeout_ms: 500,
         ..weida::Limits::default()
     };
-    let client = Runtime::new(RuntimeConfig {
-        limits,
-        ..RuntimeConfig::default()
-    })
-    .expect("client runtime");
+    let client = client_with(
+        &net,
+        RuntimeConfig {
+            limits,
+            ..RuntimeConfig::default()
+        },
+    );
 
     let requester = client.requester(certs.client_tls());
     let err = within(requester.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
@@ -735,12 +753,12 @@ async fn a_server_that_never_sends_hello_is_dropped_after_the_timeout() {
 
 // --- subscriptions and one-way transfers --------------------------------
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn subscribe_with_an_oversized_filter_closes_the_connection() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let _publisher = server.listener.publisher("/md").expect("publisher");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -758,20 +776,20 @@ async fn subscribe_with_an_oversized_filter_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_subscribe_flood_closes_the_connection_with_limit_exceeded() {
     let limits = weida::Limits {
         max_subscriptions: 8,
         ..weida::Limits::default()
     };
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits,
         ..RuntimeConfig::default()
     })
     .await;
     let _publisher = server.listener.publisher("/md").expect("publisher");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -800,12 +818,12 @@ async fn a_subscribe_flood_closes_the_connection_with_limit_exceeded() {
     assert_eq!(within(raw::closed_code(&conn)).await, codes::LIMIT_EXCEEDED);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unsubscribing_an_unknown_filter_is_ignored() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -830,12 +848,12 @@ async fn unsubscribing_an_unknown_filter_is_ignored() {
     assert!(conn.close_reason().is_none(), "the connection must survive");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn data_before_hello_is_parked_not_rejected() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -867,9 +885,9 @@ async fn data_before_hello_is_parked_not_rejected() {
     assert!(conn.close_reason().is_none(), "the connection must survive");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_exchange_before_hello_is_parked_not_rejected() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let replier = server.listener.replier("/t").expect("replier");
     let handler = tokio::spawn(async move {
         let mut request = replier.accept().await.expect("accept");
@@ -880,7 +898,7 @@ async fn an_exchange_before_hello_is_parked_not_rejected() {
         reply.finish().expect("finish");
     });
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
@@ -965,20 +983,20 @@ impl std::io::Write for LogSink {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_frame_head_is_stopped_at_the_deadline_and_the_connection_survives() {
     let limits = weida::Limits {
         header_timeout_ms: 300,
         ..weida::Limits::default()
     };
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits,
         ..RuntimeConfig::default()
     })
     .await;
     let _puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = dial(&endpoint, &server).await;
     raw::send_hello(&conn).await;
 
@@ -995,7 +1013,7 @@ async fn a_stalled_frame_head_is_stopped_at_the_deadline_and_the_connection_surv
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_header_holds_its_slot_until_the_deadline() {
     // One header slot per connection: the stalled head takes it, so a complete
     // frame on another stream waits until the stalled head is stopped.
@@ -1004,14 +1022,14 @@ async fn a_stalled_header_holds_its_slot_until_the_deadline() {
         header_timeout_ms: 1500,
         ..weida::Limits::default()
     };
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits,
         ..RuntimeConfig::default()
     })
     .await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = dial(&endpoint, &server).await;
     raw::send_hello(&conn).await;
 
@@ -1043,10 +1061,10 @@ async fn a_stalled_header_holds_its_slot_until_the_deadline() {
     assert_eq!(body, b"valid payload");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_second_hello_closes_the_connection() {
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
 
     // Control: one HELLO is the whole negotiation and the connection stays.
     let control = dial(&endpoint, &server).await;
@@ -1066,13 +1084,13 @@ async fn a_second_hello_closes_the_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unsubscribe_without_a_subscription_frees_no_reservation() {
     let limits = weida::Limits {
         max_subscriptions: 8,
         ..weida::Limits::default()
     };
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits,
         ..RuntimeConfig::default()
     })
@@ -1080,7 +1098,7 @@ async fn an_unsubscribe_without_a_subscription_frees_no_reservation() {
     let publisher = server.listener.publisher("/md").expect("publisher");
     let _acceptor = server.listener.acceptor("/q").expect("acceptor");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = dial(&endpoint, &server).await;
     raw::send_hello(&conn).await;
 
@@ -1110,12 +1128,12 @@ async fn an_unsubscribe_without_a_subscription_frees_no_reservation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_queue_consumer_with_a_second_filter_is_reported_gone_with_its_connection() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let acceptor = server.listener.acceptor("/q").expect("acceptor");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = dial(&endpoint, &server).await;
     raw::send_hello(&conn).await;
 
@@ -1163,20 +1181,20 @@ async fn a_queue_consumer_with_a_second_filter_is_reported_gone_with_its_connect
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_repeated_subscribe_is_counted_and_announced_once() {
     let limits = weida::Limits {
         max_subscriptions: 2,
         ..weida::Limits::default()
     };
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits,
         ..RuntimeConfig::default()
     })
     .await;
     let acceptor = server.listener.acceptor("/q").expect("acceptor");
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = dial(&endpoint, &server).await;
     raw::send_hello(&conn).await;
 
@@ -1208,16 +1226,17 @@ async fn a_repeated_subscribe_is_counted_and_announced_once() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_header_longer_than_the_peer_reads_is_refused_before_it_is_written() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let client = client_for();
+    let client = client_for(&net);
 
     // A peer that reads 64-byte headers only. Every stream the sender opens is
     // read to its end: a stream that ends with no bytes is one opened for a
     // send that was then refused, and a receiver treats it as a violation.
     let (report_tx, report_rx) = tokio::sync::oneshot::channel::<(Option<String>, usize, bool)>();
-    let addr = raw_server(&certs, move |conn| async move {
+    let addr = raw_server(&net, &certs, move |conn| async move {
         raw::send_frame(&conn, FrameKind::Hello, &Hello::v0(64, 8).encode()).await;
         let mut empty = 0usize;
         let topic = loop {
@@ -1272,7 +1291,7 @@ async fn a_header_longer_than_the_peer_reads_is_refused_before_it_is_written() {
     // side, and the connection carrying the short filter survives it.
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let (sub_tx, sub_rx) = tokio::sync::oneshot::channel::<bool>();
-    let addr = raw_server(&certs, move |conn| async move {
+    let addr = raw_server(&net, &certs, move |conn| async move {
         raw::send_frame(&conn, FrameKind::Hello, &Hello::v0(64, 8).encode()).await;
         let (_stream, header) = bounded(raw::accept_frame(&conn, FrameKind::Subscribe)).await;
         let header = SubscriptionHeader::decode(&header).expect("decode SUBSCRIBE");
@@ -1305,22 +1324,25 @@ async fn a_header_longer_than_the_peer_reads_is_refused_before_it_is_written() {
 /// anything is sent, and it must not use up a producer sequence number: the
 /// receiver reads a number that nobody sent as a transfer it lost, and in
 /// reassemble mode holds the transfers behind it back for it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refused_header_does_not_use_up_a_sequence_number() {
+    let net = SimNet::new();
     let certs = Certs::generate();
     let ordered = GuaranteeSet {
         ordering: OrderingMode::PerProducerDetect,
         ..GuaranteeSet::CORE
     };
-    let client = Runtime::new(RuntimeConfig {
-        guarantees: ordered,
-        ..RuntimeConfig::default()
-    })
-    .expect("client runtime");
+    let client = client_with(
+        &net,
+        RuntimeConfig {
+            guarantees: ordered,
+            ..RuntimeConfig::default()
+        },
+    );
 
     // A peer that reads 64-byte headers only, and agrees on the ordering.
     let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Option<u64>>();
-    let addr = raw_server(&certs, move |conn| async move {
+    let addr = raw_server(&net, &certs, move |conn| async move {
         let hello = Hello {
             guarantees_offered: Some(ordered),
             guarantees_required: Some(ordered),
@@ -1369,7 +1391,7 @@ async fn a_refused_header_does_not_use_up_a_sequence_number() {
     client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn peer_supplied_strings_are_logged_on_one_line() {
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let writer = Arc::clone(&captured);
@@ -1382,8 +1404,8 @@ async fn peer_supplied_strings_are_logged_on_one_line() {
     // log into this subscriber.
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let server = Server::start_os().await;
-    let endpoint = raw::client_endpoint(&server.certs);
+    let server = Server::start().await;
+    let endpoint = server.raw_client();
     let conn = dial(&endpoint, &server).await;
     raw::send_hello(&conn).await;
 
@@ -1417,11 +1439,11 @@ async fn peer_supplied_strings_are_logged_on_one_line() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn consumer_ids_are_never_reused_across_connections() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let acceptor = server.listener.acceptor("/q").expect("acceptor");
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
 
     let mut ids = Vec::new();
     for _ in 0..200 {
@@ -1460,13 +1482,13 @@ async fn consumer_ids_are_never_reused_across_connections() {
 /// orders a report and then grants no stream to carry it cannot hold the
 /// receiving application: its `report` and `finish` return, and the report
 /// is over, as it is for any other transport failure.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_report_to_a_sender_that_grants_no_stream_does_not_hold_the_receiver() {
     let limits = weida::Limits {
         header_timeout_ms: 300,
         ..weida::Limits::default()
     };
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits,
         ..RuntimeConfig::default()
     })
@@ -1478,7 +1500,7 @@ async fn a_report_to_a_sender_that_grants_no_stream_does_not_hold_the_receiver()
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
     config.transport_config(Arc::new(transport));
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = bounded(
         endpoint
             .connect_with(config, server.addr, "127.0.0.1")

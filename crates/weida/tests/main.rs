@@ -12,6 +12,7 @@ mod drain;
 mod flows;
 mod foreign_executor;
 mod guide;
+mod hostile;
 mod identity;
 mod interrupted;
 mod pair;
@@ -19,6 +20,20 @@ mod pubsub;
 mod pushpull;
 mod radio;
 mod raw_streams;
+
+/// Raw `quinn` peers on the simulated network, speaking hand-encoded frames
+/// to a runtime under test on a paused clock.
+mod raw_peers {
+    mod cursors;
+    mod dedup;
+    mod identity;
+    mod interrupted;
+    mod radio;
+    mod raw_streams;
+    mod redial_storm;
+    mod reorder;
+    mod stats;
+}
 mod reconnect;
 mod reorder;
 mod reqrep;
@@ -36,22 +51,12 @@ mod io {
     mod accept_limits;
     mod blocking;
     mod cli;
-    mod cursors;
-    mod dedup;
     mod drain;
     mod guide;
-    mod hostile;
-    mod identity;
     mod identity_source;
-    mod interrupted;
     mod local_hostile;
     mod pubsub;
-    mod radio;
-    mod raw_streams;
     mod reconnect;
-    mod redial_storm;
-    mod reorder;
-    mod stats;
     mod streams;
     mod tls_trust;
     mod transports;

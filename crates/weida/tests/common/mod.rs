@@ -1,7 +1,8 @@
 //! Shared harness for the integration tests: a real QUIC server and client on
 //! a simulated network (`SimNet`), with a freshly generated self-signed
-//! certificate held in memory. `Server::start_os` puts a server on the OS
-//! network for the tests whose peer is a raw `quinn` endpoint or a UDP proxy.
+//! certificate held in memory. Raw `quinn` peers live on the same network
+//! (`Server::raw_client`, `raw::sim_server_endpoint`); `Server::start_os`
+//! puts a server on the OS network for the tests that need a real socket.
 //!
 //! No test hooks exist in the library. Everything below drives the public API
 //! or, for the hostile-peer suite, speaks the wire protocol directly.
@@ -24,6 +25,35 @@ use weida::{
     Binding, ClientTls, Fingerprint, Identity, Limits, Listener, Network, Runtime, RuntimeConfig,
     ServerTls, SimNet, Trust,
 };
+
+/// A resolver that knows `localhost` and nothing else, so a test that dials
+/// by name looks nothing up in the system.
+#[derive(Debug)]
+pub struct Loopback;
+
+impl weida::Resolver for Loopback {
+    fn resolve<'a>(
+        &'a self,
+        _exec: &'a weida_runtime::Exec,
+        name: &'a str,
+        port: Option<u16>,
+        _max_addresses: usize,
+    ) -> weida::Resolved<'a> {
+        Box::pin(async move {
+            match (name, port) {
+                ("localhost", Some(port)) => Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]),
+                _ => Err(weida::Error::InvalidAddress(format!(
+                    "{name} is not localhost with a port"
+                ))),
+            }
+        })
+    }
+}
+
+/// [`Loopback`], shared as a runtime configuration takes it.
+pub fn loopback() -> weida::SharedResolver {
+    weida::SharedResolver::new(Loopback)
+}
 
 /// A generated certificate and its key, as PEM in memory.
 pub struct Certs {
@@ -240,6 +270,13 @@ impl Server {
             ..config
         })
         .expect("client runtime")
+    }
+
+    /// A bare `quinn` client on the server's simulated network, trusting its
+    /// certificate: a peer that writes what weida never would.
+    pub fn raw_client(&self) -> quinn::Endpoint {
+        let net = self.net.as_ref().expect("a server on a simulated network");
+        raw::sim_client_endpoint(net, &self.certs)
     }
 
     /// Trust anchors for this server, to hand to a dialling endpoint.
@@ -678,6 +715,31 @@ pub mod raw {
             "127.0.0.1:0".parse().expect("loopback"),
         )
         .expect("server endpoint");
+        let addr = endpoint.local_addr().expect("local addr");
+        (endpoint, addr)
+    }
+
+    /// A client endpoint on `net`, trusting `certs` and offering the weida
+    /// ALPN: [`client_endpoint`] without a socket.
+    pub fn sim_client_endpoint(net: &weida::SimNet, certs: &Certs) -> quinn::Endpoint {
+        let mut endpoint = net
+            .endpoint("127.0.0.1:0".parse().expect("loopback"), None)
+            .expect("client endpoint");
+        endpoint.set_default_client_config(client_config(certs));
+        endpoint
+    }
+
+    /// A server endpoint on `net`: [`server_endpoint`] without a socket.
+    pub fn sim_server_endpoint(
+        net: &weida::SimNet,
+        certs: &Certs,
+    ) -> (quinn::Endpoint, std::net::SocketAddr) {
+        let endpoint = net
+            .endpoint(
+                "127.0.0.1:0".parse().expect("loopback"),
+                Some(server_config(certs)),
+            )
+            .expect("server endpoint");
         let addr = endpoint.local_addr().expect("local addr");
         (endpoint, addr)
     }

@@ -1,4 +1,5 @@
-//! The tests of `tests/stats.rs` that need the network, a process or real time.
+//! The tests of `tests/stats.rs` that dial by name: a `localhost` the
+//! harness's resolver answers, on the simulated network with a path delay.
 
 use crate::common;
 use common::Server;
@@ -7,15 +8,25 @@ use weida::{RuntimeConfig, TransferMeta};
 
 use crate::stats::*;
 
+/// Holds every datagram to and from the server for 5 ms, so the round trip
+/// the statistics measure is not zero on the paused clock.
+fn sim_delay(server: &Server) {
+    server
+        .net
+        .as_ref()
+        .expect("a simulated network")
+        .set_delay(server.addr, Duration::from_millis(5));
+}
+
 /// Claim: a requester sees its connection's path and traffic with no flow
 /// on it, labelled by the URL exactly as dialled, and the record names no
 /// address the application did not write.
 ///
 /// The URL says `localhost`; the connection runs to `127.0.0.1`. Neither
 /// that address nor `::1` may appear anywhere in the record.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_requester_reads_its_connection_without_a_flow() {
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let replier = server.listener.replier("/echo").expect("replier");
     let serving = tokio::spawn(async move {
         while let Ok(mut request) = replier.accept().await {
@@ -30,7 +41,12 @@ async fn a_requester_reads_its_connection_without_a_flow() {
         }
     });
 
-    let client = server.client_runtime();
+    // A delay on the simulated path, so the round trip is a measurable one.
+    sim_delay(&server);
+    let client = server.client_runtime_with_config(RuntimeConfig {
+        resolver: common::loopback(),
+        ..RuntimeConfig::default()
+    });
     let requester = client.requester(server.trust());
     assert!(
         requester.connection_stats().is_empty(),
@@ -89,14 +105,19 @@ async fn a_requester_reads_its_connection_without_a_flow() {
 /// Claim: with `path_report` on both sides, a dialling handle reads the
 /// peer's view of the path — the peer's losses are this side's download loss
 /// — and a record arrives at once, then every 2 s (0036 §4.5).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn both_sides_reporting_give_the_dialling_side_the_peers_view() {
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits: reporting(),
         ..RuntimeConfig::default()
     })
     .await;
-    let client = server.client_runtime_with(reporting());
+    sim_delay(&server);
+    let client = server.client_runtime_with_config(RuntimeConfig {
+        limits: reporting(),
+        resolver: common::loopback(),
+        ..RuntimeConfig::default()
+    });
     let peer = client.peer(server.trust());
     // Dialled by name, so the only label holds no address either.
     let url = format!("weida://localhost:{}/any", server.addr.port());

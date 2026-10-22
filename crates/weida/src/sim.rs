@@ -168,6 +168,27 @@ impl SimNet {
         }
     }
 
+    /// A bare `quinn` endpoint at `addr` on this network, accepting connections when `server`
+    /// is given: a peer that speaks the wire protocol by hand, for a test that sends what weida
+    /// never would. Port `0` takes the next free port, as [`Network::sim`] bindings do. Call it
+    /// inside a Tokio runtime.
+    ///
+    /// [`Network::sim`]: crate::Network::sim
+    pub fn endpoint(
+        &self,
+        addr: SocketAddr,
+        server: Option<quinn::ServerConfig>,
+    ) -> Result<quinn::Endpoint, Error> {
+        let socket = self.bind(addr)?;
+        quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            server,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(Error::Io)
+    }
+
     /// Binds a socket at `addr`; port `0` takes the next free port.
     pub(crate) fn bind(&self, addr: SocketAddr) -> Result<Arc<SimSocket>, Error> {
         let mut state = self.inner.lock();

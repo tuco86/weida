@@ -1,8 +1,9 @@
-//! The tests of `tests/identity.rs` that need the network, a process or real time.
+//! The tests of `tests/identity.rs` that need a raw server: a bare `quinn`
+//! endpoint on the simulated network whose identity a test can swap.
 
 use crate::common;
 use common::Certs;
-use weida::{ClientTls, Error, Runtime, RuntimeConfig, Trust};
+use weida::{ClientTls, Error, Network, Runtime, RuntimeConfig, SimNet, Trust};
 
 use crate::identity::*;
 
@@ -17,14 +18,15 @@ use crate::identity::*;
 /// `quinn` endpoints cannot share a port: one socket, whose identity is
 /// swapped between the two handshakes. The client trusts both keys, so nothing
 /// but the binding rule can refuse the second dial.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_second_path_that_answers_with_another_identity_is_refused() {
     let first = Certs::generate();
     let second = Certs::generate();
     let first_fp = first.fingerprint();
     let second_fp = second.fingerprint();
 
-    let (endpoint, addr) = common::raw::server_endpoint(&first);
+    let net = SimNet::new();
+    let (endpoint, addr) = common::raw::sim_server_endpoint(&net, &first);
     let swap = common::raw::server_config(&second);
     tokio::spawn(async move {
         // First handshake: identity one. The identity is swapped *before* the
@@ -45,7 +47,11 @@ async fn a_second_path_that_answers_with_another_identity_is_refused() {
         held.closed().await;
     });
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        ..RuntimeConfig::default()
+    })
+    .expect("client");
     let pusher = client.pusher(ClientTls::new(Trust::pin(first_fp).and_pin(second_fp)));
 
     let base = format!("weida://127.0.0.1:{}", addr.port());

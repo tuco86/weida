@@ -1,4 +1,5 @@
-//! The tests of `tests/radio.rs` that need the network, a process or real time.
+//! The tests of `tests/radio.rs` that need a raw peer or a slow path: bare
+//! `quinn` endpoints and path delays on the simulated network.
 
 use crate::common;
 use common::Server;
@@ -9,7 +10,7 @@ use weida::{JoinTerms, RuntimeConfig, SegmentTerms};
 
 use crate::radio::*;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
     // Frames of a 30 fps video, ten to a segment, the next segment opening
     // one frame interval after the previous one's last frame: the dish reads
@@ -17,15 +18,21 @@ async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
     // round trip away when the successor opens.
     const SEGMENTS: usize = 6;
     const FRAMES: usize = 10;
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
-    let front = common::delay_proxy(server.addr, Duration::from_millis(100)).await;
+    // A 100 ms one-way delay on the path to and from the server: what the
+    // UDP delay proxy did, without a socket.
+    server
+        .net
+        .as_ref()
+        .expect("a simulated network")
+        .set_delay(server.addr, Duration::from_millis(100));
     let runtime = server.client_runtime();
     let dish = runtime.dish(server.trust());
     within(dish.join("v", JoinTerms::default()))
         .await
         .expect("join");
-    within(dish.connect(&format!("weida://127.0.0.1:{}/r", front.port())))
+    within(dish.connect(&server.url("/r")))
         .await
         .expect("connect");
     dishes(&radio, 1).await;
@@ -82,15 +89,15 @@ async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
     assert_eq!(superseded, 0);
     runtime.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_receiver_delivers_each_layer_of_a_segment_once() {
     use common::raw;
     use weida::codes;
     use weida_protocol::{DataHeader, FrameKind, encode_frame};
 
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let acceptor = server.listener.acceptor("/up").expect("acceptor");
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
         .await
         .expect("handshake");
@@ -137,15 +144,15 @@ async fn a_receiver_delivers_each_layer_of_a_segment_once() {
         "a stale layer reached the acceptor"
     );
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_acceptor_refuses_a_segment_older_than_one_it_delivered() {
     use common::raw;
     use weida::codes;
     use weida_protocol::{DataHeader, FrameKind, encode_frame};
 
-    let server = Server::start_os().await;
+    let server = Server::start().await;
     let acceptor = server.listener.acceptor("/up").expect("acceptor");
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
         .await
         .expect("handshake");
@@ -187,9 +194,9 @@ async fn an_acceptor_refuses_a_segment_older_than_one_it_delivered() {
         "a stale segment reached the acceptor"
     );
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dish_that_refuses_every_flow_costs_a_few_opens_not_one_per_datagram() {
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits: with_datagrams(),
         ..RuntimeConfig::default()
     })
@@ -217,9 +224,9 @@ async fn a_dish_that_refuses_every_flow_costs_a_few_opens_not_one_per_datagram()
     assert!(drops.subscriber_queue >= 900, "{drops:?}");
     conn.close(0u32.into(), b"done");
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refused_flow_is_opened_again_after_its_backoff_and_takes_datagrams() {
-    let server = Server::start_os_with_config(RuntimeConfig {
+    let server = Server::start_with_config(RuntimeConfig {
         limits: with_datagrams(),
         ..RuntimeConfig::default()
     })

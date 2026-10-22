@@ -1169,6 +1169,8 @@ impl SimNet {                                               // real QUIC and TLS
     pub fn partition(&self, addr: SocketAddr);              // lost at idle_timeout (IdleTimeout)
     pub fn heal(&self, addr: SocketAddr);
     pub fn stats(&self) -> SimStats;
+    pub fn endpoint(&self, addr: SocketAddr, server: Option<quinn::ServerConfig>)
+        -> Result<quinn::Endpoint, Error>;                   // a raw peer for hostile tests
 }
 pub struct SimStats { pub delivered: u64, pub dropped: u64 }
 pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file

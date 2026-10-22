@@ -867,7 +867,7 @@ pub(crate) async fn raw_dish(
     use weida::codes;
     use weida_protocol::{CAPABILITY_DATAGRAM, FrameKind, Hello, SubscriptionHeader};
 
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
         .await
         .expect("handshake");

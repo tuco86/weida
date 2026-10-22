@@ -107,8 +107,16 @@ impl SimNet {
     pub fn partition(&self, addr: SocketAddr);
     pub fn heal(&self, addr: SocketAddr);
     pub fn stats(&self) -> SimStats;           // delivered, dropped
+    pub fn endpoint(&self, addr: SocketAddr, server: Option<quinn::ServerConfig>)
+        -> Result<quinn::Endpoint, Error>;     // amended by B-376
 }
 ```
+
+- **Raw peers** (amended by B-376). `SimNet::endpoint` gives a test a bare `quinn` endpoint on
+  the network, accepting connections when it is handed a server configuration: the peer that
+  speaks the wire protocol by hand, which the hostile-peer suites need. It puts `quinn` in the
+  `test-util` API, which is acceptable for a testing feature and means a `quinn` major release
+  changes that API with it.
 
 - **Addressing.** A port identifies one socket in a `SimNet`, whatever its IP. Port 0 takes the
   next free port from 49152 upward. A port in use is `Error::Io(AddrInUse)` until its binding

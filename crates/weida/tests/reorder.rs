@@ -62,7 +62,7 @@ pub(crate) async fn send_numbered(conn: &quinn::Connection, path: &str, sequence
 /// A raw peer that has declared reassemble ordering, so the handshake with a
 /// server requiring it succeeds.
 pub(crate) async fn declaring_peer(server: &Server) -> quinn::Connection {
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");

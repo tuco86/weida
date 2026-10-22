@@ -6,11 +6,12 @@ use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{Certs, raw};
 use quinn::VarInt;
-use weida::{ReconnectPolicy, Runtime, RuntimeConfig};
+use tokio::time::Instant;
+use weida::{Network, ReconnectPolicy, Runtime, RuntimeConfig, SimNet};
 
 /// Ceiling on any single await in this test.
 const BOUND: Duration = Duration::from_secs(10);
@@ -21,10 +22,11 @@ async fn within<F: Future>(f: F) -> F::Output {
         .expect("operation timed out")
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_server_that_accepts_says_hello_and_hangs_up_is_redialled_ever_more_slowly() {
+    let net = SimNet::new();
     let certs = Certs::generate();
-    let (endpoint, addr) = raw::server_endpoint(&certs);
+    let (endpoint, addr) = raw::sim_server_endpoint(&net, &certs);
     let accepted = Arc::new(AtomicUsize::new(0));
 
     // Every connection completes its handshake, says HELLO, and is closed
@@ -52,6 +54,7 @@ async fn a_server_that_accepts_says_hello_and_hangs_up_is_redialled_ever_more_sl
             jitter: false,
             ..ReconnectPolicy::default()
         },
+        network: Network::sim(&net),
         ..RuntimeConfig::default()
     })
     .expect("client runtime");

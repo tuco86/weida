@@ -370,7 +370,7 @@ pub(crate) async fn run_with_granularity(
     interval: Duration,
     report_id: u64,
 ) -> Vec<(CursorLevel, u64)> {
-    let endpoint = raw::client_endpoint(&server.certs);
+    let endpoint = server.raw_client();
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");

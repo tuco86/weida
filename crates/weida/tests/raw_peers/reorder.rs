@@ -5,9 +5,9 @@ use common::Server;
 
 use crate::reorder::*;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn scrambled_arrivals_are_delivered_in_sequence_order() {
-    let server = Server::start_os_with_config(config(256)).await;
+    let server = Server::start_with_config(config(256)).await;
     let puller = server.listener.puller("/jobs").expect("puller");
     let conn = declaring_peer(&server).await;
 
@@ -38,9 +38,9 @@ async fn scrambled_arrivals_are_delivered_in_sequence_order() {
     }
     assert_eq!(arrivals, vec![0, 1, 2, 3, 4]);
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_full_hold_releases_out_of_order_and_reports_the_gap() {
-    let server = Server::start_os_with_config(config(2)).await;
+    let server = Server::start_with_config(config(2)).await;
     let puller = server.listener.puller("/jobs").expect("puller");
     let conn = declaring_peer(&server).await;
 
