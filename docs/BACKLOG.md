@@ -29,7 +29,7 @@ kind: protocol | size: 90 | status: done 6011fc3 | needs: [B-361]
 acceptance: `crates/http/weida-http` per Step 6; the client speaks HTTP/1.1 over TCP and TLS, keeps idle connections per origin; unit tests over `tokio::io::duplex`; `tests/io/interop_hyper.rs` h1 rows against a hyper 1 server; CI doc loops list `weida-http`.
 
 ### B-366 — `weida-http`: HTTP/1.1 server
-kind: protocol | size: 90 | status: in_progress 2026-10-22T23:46Z | needs: [B-365]
+kind: protocol | size: 90 | status: done ececb59 | needs: [B-365]
 acceptance: `Server`, `Exchange`, `Responder` per Step 7; keep-alive, pipelined requests answered in order, 100-continue, 400/431/501/505 refusals, header timeout; hyper 1 client interop rows; our client against our server in `tests/io/loopback.rs`.
 
 ### B-367 — `weida-http`: HTTP/2 client and server
