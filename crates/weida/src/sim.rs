@@ -30,12 +30,23 @@
 //! **Bound.** A socket's receive buffer holds [`INBOX_DATAGRAMS`] datagrams; one arriving at a
 //! full buffer is dropped and counted, as UDP drops past its receive buffer.
 //!
+//! **Local sockets** (on unix). A runtime on a `SimNet` binds and dials `weida+unix://` there
+//! too: `bind_unix` takes the path on the network, not on disk (`AddrInUse` while a live
+//! binding holds it, free again when it is dropped), and a dial is an in-memory pair with
+//! 256 KiB each way, through the production unix transport, grouping and chunk framing. Both
+//! ends report one simulated principal, so what the kernel proves (`SO_PEERCRED`, socket files
+//! and their modes) still needs a real socket. [`SimNet::connect_unix`] is the raw dial for a
+//! test that writes the local preamble by hand. A listener holds 128 connections it has not
+//! accepted, and refuses the next, as a listen backlog does.
+//!
 //! `Binding::hand_over` needs an OS socket and panics on a simulated binding.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -44,7 +55,13 @@ use std::time::Duration;
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
+#[cfg(unix)]
+use tokio::io::DuplexStream;
+#[cfg(unix)]
+use tokio::sync::mpsc;
 use weida_core::Error;
+#[cfg(unix)]
+use weida_core::LocalPrincipal;
 
 /// A simulated socket's receive buffer, in datagrams. A datagram that finds it full is dropped
 /// and counted in [`SimStats::dropped`].
@@ -54,6 +71,26 @@ pub(crate) const INBOX_DATAGRAMS: usize = 4096;
 const FIRST_EPHEMERAL: u16 = 49152;
 /// Ports from [`FIRST_EPHEMERAL`] to 65535.
 const EPHEMERAL_PORTS: u32 = 65536 - FIRST_EPHEMERAL as u32;
+
+/// The connections a simulated `AF_UNIX` listener holds before it accepts them, as a kernel's
+/// listen backlog does; a connection past it is refused.
+#[cfg(unix)]
+const LOCAL_BACKLOG: usize = 128;
+
+/// What one simulated local connection holds in each direction before a writer waits: a
+/// socket's send and receive buffers together.
+#[cfg(unix)]
+const LOCAL_BUFFER: usize = 256 * 1024;
+
+/// The peer every simulated local connection reports, in both directions: the processes it
+/// stands in for are this one, so a credential check passes as it does between two processes
+/// of one user.
+#[cfg(unix)]
+pub(crate) const SIM_PRINCIPAL: LocalPrincipal = LocalPrincipal {
+    uid: 1000,
+    gid: 1000,
+    pid: Some(1),
+};
 
 /// An in-memory UDP network: QUIC and TLS run over it unchanged, so identities, pinned
 /// addresses, mTLS refusals, redials and their `PeerEvent`s are the real ones. Clone to share.
@@ -85,6 +122,10 @@ impl Default for Net {
                 sockets: HashMap::new(),
                 faults: HashMap::new(),
                 next_port: FIRST_EPHEMERAL,
+                #[cfg(unix)]
+                locals: HashMap::new(),
+                #[cfg(unix)]
+                next_local: 0,
             }),
             delivered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -97,6 +138,12 @@ struct NetState {
     sockets: HashMap<u16, Weak<SimSocket>>,
     faults: HashMap<u16, Fault>,
     next_port: u16,
+    /// Simulated `AF_UNIX` listeners by path: the serial of the binding that
+    /// holds the path, and where its connections arrive.
+    #[cfg(unix)]
+    locals: HashMap<PathBuf, (u64, mpsc::Sender<DuplexStream>)>,
+    #[cfg(unix)]
+    next_local: u64,
 }
 
 /// The faults on one port.
@@ -227,6 +274,94 @@ impl SimNet {
         });
         state.sockets.insert(port, Arc::downgrade(&socket));
         Ok(socket)
+    }
+
+    /// Listens on the `AF_UNIX` path `path`: `AddrInUse` while a live listener holds it, as
+    /// the socket's live-listener probe finds; a path whose listener is gone is taken over,
+    /// as a stale socket file is replaced.
+    #[cfg(unix)]
+    pub(crate) fn bind_local(&self, path: &Path) -> Result<LocalListener, Error> {
+        let mut state = self.inner.lock();
+        if let Some((_, live)) = state.locals.get(path)
+            && !live.is_closed()
+        {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("{} is in use on this simulated network", path.display()),
+            )));
+        }
+        let serial = state.next_local;
+        state.next_local += 1;
+        let (tx, incoming) = mpsc::channel(LOCAL_BACKLOG);
+        state.locals.insert(path.to_owned(), (serial, tx));
+        Ok(LocalListener {
+            incoming,
+            lease: LocalLease {
+                net: Arc::clone(&self.inner),
+                path: path.to_owned(),
+                serial,
+            },
+        })
+    }
+
+    /// A bare connection to the `weida+unix://` binding on `path` of a runtime on this network:
+    /// what `UnixStream::connect` is to an OS binding, and what the unix transport dials under
+    /// `Network::sim`; a test that writes the local preamble and frames by hand uses it too.
+    /// `ConnectionLost(PeerClosed)` where nothing listens or its backlog of 128 is full, as a
+    /// refused `connect` is.
+    #[cfg(unix)]
+    pub fn connect_unix(&self, path: impl AsRef<Path>) -> Result<DuplexStream, Error> {
+        let path = path.as_ref();
+        let refused = || Error::ConnectionLost(weida_core::LossCause::PeerClosed);
+        let listener = self
+            .inner
+            .lock()
+            .locals
+            .get(path)
+            .map(|(_, tx)| tx.clone())
+            .ok_or_else(refused)?;
+        let (ours, theirs) = tokio::io::duplex(LOCAL_BUFFER);
+        listener.try_send(theirs).map_err(|_| refused())?;
+        Ok(ours)
+    }
+}
+
+/// A simulated `AF_UNIX` listener: the connections dialled to its path, and the path itself,
+/// which it frees when it is dropped.
+#[cfg(unix)]
+pub(crate) struct LocalListener {
+    pub(crate) incoming: mpsc::Receiver<DuplexStream>,
+    pub(crate) lease: LocalLease,
+}
+
+/// A path a simulated `AF_UNIX` listener holds; dropped, the path is free again, unless a newer
+/// listener took it over.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct LocalLease {
+    net: Arc<Net>,
+    path: PathBuf,
+    serial: u64,
+}
+
+#[cfg(unix)]
+impl LocalLease {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LocalLease {
+    fn drop(&mut self) {
+        let mut state = self.net.lock();
+        if state
+            .locals
+            .get(&self.path)
+            .is_some_and(|(serial, _)| *serial == self.serial)
+        {
+            state.locals.remove(&self.path);
+        }
     }
 }
 

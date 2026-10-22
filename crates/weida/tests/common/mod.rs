@@ -369,6 +369,11 @@ pub enum Transport {
     /// proved by the kernel [0010 §4.4, §4.5].
     #[cfg(unix)]
     Unix,
+    /// `weida+unix://` on the harness's `SimNet`: the production unix
+    /// transport, grouping and framing over in-memory connections, with no
+    /// socket file and a simulated peer principal.
+    #[cfg(unix)]
+    SimUnix,
     /// A Windows named pipe: `weida+pipe://<name>/<path>`, no TLS, the peer
     /// proved by the kernel [0010 §4.4, §4.5].
     #[cfg(windows)]
@@ -411,6 +416,11 @@ impl Harness {
     pub async fn start_on(net: &SimNet, transport: Transport, config: RuntimeConfig) -> Harness {
         let config = match transport {
             Transport::Quic => RuntimeConfig {
+                network: Network::sim(net),
+                ..config
+            },
+            #[cfg(unix)]
+            Transport::SimUnix => RuntimeConfig {
                 network: Network::sim(net),
                 ..config
             },
@@ -488,6 +498,26 @@ impl Harness {
                     unix: Some((binding, path)),
                 }
             }
+            #[cfg(unix)]
+            Transport::SimUnix => {
+                static SOCKET: AtomicU32 = AtomicU32::new(0);
+                // A path on the simulated network only: nothing is created
+                // on disk.
+                let path = std::path::PathBuf::from(format!(
+                    "/weida-sim/s{}",
+                    SOCKET.fetch_add(1, Ordering::Relaxed)
+                ));
+                let binding = listener.bind_unix(&path).expect("bind simulated unix");
+                Harness {
+                    transport,
+                    runtime,
+                    listener,
+                    quic: None,
+                    net: Some(net.clone()),
+                    local: None,
+                    unix: Some((binding, path)),
+                }
+            }
             #[cfg(windows)]
             Transport::Pipe => {
                 static PIPE: AtomicU32 = AtomicU32::new(0);
@@ -546,6 +576,11 @@ impl Harness {
         self.unix.as_ref().map(|(_, path)| path.as_path())
     }
 
+    /// The simulated network of a QUIC or simulated unix harness.
+    pub fn net(&self) -> Option<&SimNet> {
+        self.net.as_ref()
+    }
+
     /// The pipe name, on the named-pipe harness.
     #[cfg(windows)]
     pub fn pipe_name(&self) -> Option<&str> {
@@ -567,7 +602,8 @@ impl Harness {
     }
 
     /// A client runtime with a whole configuration: on the harness's `SimNet`
-    /// for QUIC, on the default network otherwise.
+    /// for QUIC and the simulated unix transport, on the default network
+    /// otherwise.
     pub fn client_with(&self, config: RuntimeConfig) -> Runtime {
         let network = match &self.net {
             Some(net) => Network::sim(net),

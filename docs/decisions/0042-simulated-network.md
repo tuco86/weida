@@ -109,6 +109,9 @@ impl SimNet {
     pub fn stats(&self) -> SimStats;           // delivered, dropped
     pub fn endpoint(&self, addr: SocketAddr, server: Option<quinn::ServerConfig>)
         -> Result<quinn::Endpoint, Error>;     // amended by B-376
+    #[cfg(unix)]
+    pub fn connect_unix(&self, path: impl AsRef<Path>)
+        -> Result<tokio::io::DuplexStream, Error>; // amended by B-377
 }
 ```
 
@@ -117,6 +120,15 @@ impl SimNet {
   speaks the wire protocol by hand, which the hostile-peer suites need. It puts `quinn` in the
   `test-util` API, which is acceptable for a testing feature and means a `quinn` major release
   changes that API with it.
+
+- **Local sockets** (amended by B-377). On unix, a runtime on a `SimNet` binds and dials
+  `weida+unix://` on the network too: the path is the network's, not the filesystem's
+  (`AddrInUse` while a live binding holds it), a dial is an in-memory pair through the
+  production `UnixLocal`, grouping and chunk framing, and both ends report one simulated
+  principal. What only the kernel answers — peer credentials, socket files and their modes —
+  keeps a real socket. `connect_unix` is the raw dial for hand-written local preambles.
+  `weida+inproc` and `weida+pipe` are unaffected. This replaces the original statement that
+  local transports are not simulated.
 
 - **Addressing.** A port identifies one socket in a `SimNet`, whatever its IP. Port 0 takes the
   next free port from 49152 upward. A port in use is `Error::Io(AddrInUse)` until its binding

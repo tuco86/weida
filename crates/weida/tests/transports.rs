@@ -99,7 +99,7 @@ pub(crate) async fn push_pull_delivery(h: &Harness) {
     // the kernel proves a principal on a socket [0010 §4.4].
     match h.transport {
         #[cfg(unix)]
-        Transport::Unix => {
+        Transport::Unix | Transport::SimUnix => {
             let peer = received.meta().peer.clone().expect("the kernel proved one");
             assert!(peer.local().is_some() && peer.key().is_none());
         }

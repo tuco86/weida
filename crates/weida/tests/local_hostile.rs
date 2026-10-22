@@ -2,18 +2,19 @@
 //! `docs/PROTOCOL.md` §2.1 and the grouping of `crates/weida/src/grouped.rs` by
 //! hand. Nothing here is a library hook; the bytes are written as a peer would
 //! write them, so the tests can express what a well-formed client never does:
-//! go silent, hold a place without a word, or vanish without closing.
+//! go silent, hold a place without a word, or vanish without closing. The
+//! binding is the production unix transport on a `SimNet`
+//! (`Transport::SimUnix`), and the raw peers dial it with
+//! `SimNet::connect_unix`, on a paused clock.
 
 #![cfg(unix)]
 
 use crate::common;
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{Harness, Transport};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use weida::{Incoming, Limits, RuntimeConfig};
 use weida_protocol::{DataHeader, FrameKind, Hello, SubscriptionHeader, encode_frame};
 
@@ -58,10 +59,21 @@ fn hello_frame() -> Vec<u8> {
     encode_frame(FrameKind::Hello, &Hello::v0(16 * 1024, 1024).encode())
 }
 
+/// A raw connection to the harness's binding, as `UnixStream::connect` is to
+/// a socket file.
+fn connect(harness: &Harness) -> DuplexStream {
+    harness
+        .net()
+        .expect("a simulated unix harness")
+        .connect_unix(harness.socket_path().expect("a unix harness has a path"))
+        .expect("connect")
+}
+
 /// Opens a control connection and reads the 16-byte group token the server
-/// issues. The socket is returned open: whether it stays open is the test's.
-async fn dial_control(path: &Path) -> (UnixStream, [u8; 16]) {
-    let mut stream = within(UnixStream::connect(path)).await.expect("connect");
+/// issues. The connection is returned open: whether it stays open is the
+/// test's.
+async fn dial_control(harness: &Harness) -> (DuplexStream, [u8; 16]) {
+    let mut stream = connect(harness);
     within(stream.write_all(&[KIND_CONTROL]))
         .await
         .expect("control byte");
@@ -73,8 +85,8 @@ async fn dial_control(path: &Path) -> (UnixStream, [u8; 16]) {
 }
 
 /// Opens a transfer connection for `token`. Nothing is written yet.
-async fn dial_transfer(path: &Path, token: &[u8; 16]) -> UnixStream {
-    let mut stream = within(UnixStream::connect(path)).await.expect("connect");
+async fn dial_transfer(harness: &Harness, token: &[u8; 16]) -> DuplexStream {
+    let mut stream = connect(harness);
     let mut preamble = vec![KIND_TRANSFER];
     preamble.extend_from_slice(token);
     within(stream.write_all(&preamble))
@@ -83,28 +95,20 @@ async fn dial_transfer(path: &Path, token: &[u8; 16]) -> UnixStream {
     stream
 }
 
-fn unix_socket(harness: &Harness) -> PathBuf {
-    harness
-        .socket_path()
-        .expect("a unix harness has a socket")
-        .to_path_buf()
-}
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_local_peer_that_exits_after_its_hello_is_torn_down() {
-    let harness = Harness::start(Transport::Unix).await;
+    let harness = Harness::start(Transport::SimUnix).await;
     let acceptor = harness.listener.acceptor("/q").expect("acceptor");
-    let path = unix_socket(&harness);
 
     // The peer's HELLO, and the control socket is then left open: it is the
     // peer's end of the link, and the server reads it to learn of the exit.
-    let (mut control, token) = dial_control(&path).await;
+    let (mut control, token) = dial_control(&harness).await;
     within(control.write_all(&chunk(&hello_frame())))
         .await
         .expect("control HELLO");
 
     // One SUBSCRIBE on a transfer connection, then the FIN.
-    let mut transfer = dial_transfer(&path, &token).await;
+    let mut transfer = dial_transfer(&harness, &token).await;
     let subscribe = encode_frame(
         FrameKind::Subscribe,
         &SubscriptionHeader::new("/q", "").encode(),
@@ -140,10 +144,10 @@ async fn a_local_peer_that_exits_after_its_hello_is_torn_down() {
     within(harness.shutdown()).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_idle_local_connection_is_closed_after_the_hello_timeout() {
     let harness = Harness::start_with(
-        Transport::Unix,
+        Transport::SimUnix,
         RuntimeConfig {
             limits: Limits {
                 hello_timeout_ms: 300,
@@ -153,10 +157,9 @@ async fn an_idle_local_connection_is_closed_after_the_hello_timeout() {
         },
     )
     .await;
-    let path = unix_socket(&harness);
 
     // Connected, and silent: the server must give up on the preamble and close.
-    let mut idle = within(UnixStream::connect(&path)).await.expect("connect");
+    let mut idle = connect(&harness);
     let mut byte = [0u8; 1];
     let read = within_for(Duration::from_secs(3), idle.read(&mut byte))
         .await
@@ -166,10 +169,10 @@ async fn an_idle_local_connection_is_closed_after_the_hello_timeout() {
     within(harness.shutdown()).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn connections_over_max_connections_wait_for_a_place() {
     let harness = Harness::start_with(
-        Transport::Unix,
+        Transport::SimUnix,
         RuntimeConfig {
             max_connections: 2,
             limits: Limits {
@@ -180,16 +183,15 @@ async fn connections_over_max_connections_wait_for_a_place() {
         },
     )
     .await;
-    let path = unix_socket(&harness);
 
     // Two sockets that never send a preamble hold both places until their
     // HELLO timeout passes.
-    let idle_a = within(UnixStream::connect(&path)).await.expect("connect");
-    let idle_b = within(UnixStream::connect(&path)).await.expect("connect");
+    let idle_a = connect(&harness);
+    let idle_b = connect(&harness);
 
     // A third peer with a complete preamble: it must wait for a place rather
     // than be answered while the limit is full.
-    let mut third = within(UnixStream::connect(&path)).await.expect("connect");
+    let mut third = connect(&harness);
     within(third.write_all(&[KIND_CONTROL]))
         .await
         .expect("control byte");
@@ -218,26 +220,25 @@ async fn connections_over_max_connections_wait_for_a_place() {
 /// drain lives; otherwise a peer that has its connections refused and keeps
 /// them open makes the binding hold as many descriptors as the process may
 /// open, with the places never running out.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refused_transfer_keeps_its_place_until_its_drain_has_ended() {
     // Two places: the control connection and the transfer.
     let harness = Harness::start_with(
-        Transport::Unix,
+        Transport::SimUnix,
         RuntimeConfig {
             max_connections: 2,
             ..RuntimeConfig::default()
         },
     )
     .await;
-    let path = unix_socket(&harness);
 
-    let (mut control, token) = dial_control(&path).await;
+    let (mut control, token) = dial_control(&harness).await;
     within(control.write_all(&chunk(&hello_frame())))
         .await
         .expect("control HELLO");
 
     // A transfer to a path nothing serves, left open and never ended.
-    let mut transfer = dial_transfer(&path, &token).await;
+    let mut transfer = dial_transfer(&harness, &token).await;
     let head = encode_frame(FrameKind::Data, &DataHeader::addressed("/nowhere").encode());
     within(transfer.write_all(&chunk(&head)))
         .await
@@ -253,7 +254,7 @@ async fn a_refused_transfer_keeps_its_place_until_its_drain_has_ended() {
 
     // The drain still reads that socket, so its place is still taken: a third
     // connection waits for one instead of being served.
-    let mut third = within(UnixStream::connect(&path)).await.expect("connect");
+    let mut third = connect(&harness);
     within(third.write_all(&[KIND_CONTROL]))
         .await
         .expect("control byte");
@@ -279,12 +280,12 @@ async fn a_refused_transfer_keeps_its_place_until_its_drain_has_ended() {
 /// queue a notice when it closes, and the notice waits for room. The wait
 /// must not keep the connection's place of `max_connections`: a binding
 /// whose queue is stuck would otherwise stop serving anyone new.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_closed_local_consumer_waiting_to_be_announced_does_not_hold_a_place() {
     // Three places: the consumer's control connection, and the control and
     // transfer connections of the peer that fills the queue.
     let harness = Harness::start_with(
-        Transport::Unix,
+        Transport::SimUnix,
         RuntimeConfig {
             max_connections: 3,
             endpoint_queue: 1,
@@ -293,15 +294,14 @@ async fn a_closed_local_consumer_waiting_to_be_announced_does_not_hold_a_place()
     )
     .await;
     let acceptor = harness.listener.acceptor("/q").expect("acceptor");
-    let path = unix_socket(&harness);
 
     // A consumer subscribes. Reading its event once proves it was recorded,
     // and leaves the queue's single slot free.
-    let (mut consumer, token) = dial_control(&path).await;
+    let (mut consumer, token) = dial_control(&harness).await;
     within(consumer.write_all(&chunk(&hello_frame())))
         .await
         .expect("consumer HELLO");
-    let mut subscribe = dial_transfer(&path, &token).await;
+    let mut subscribe = dial_transfer(&harness, &token).await;
     let frame = encode_frame(
         FrameKind::Subscribe,
         &SubscriptionHeader::new("/q", "").encode(),
@@ -319,11 +319,11 @@ async fn a_closed_local_consumer_waiting_to_be_announced_does_not_hold_a_place()
     drop(subscribe);
 
     // Another peer fills that slot with a transfer nobody reads.
-    let (mut filler, filler_token) = dial_control(&path).await;
+    let (mut filler, filler_token) = dial_control(&harness).await;
     within(filler.write_all(&chunk(&hello_frame())))
         .await
         .expect("filler HELLO");
-    let mut transfer = dial_transfer(&path, &filler_token).await;
+    let mut transfer = dial_transfer(&harness, &filler_token).await;
     let mut data = encode_frame(FrameKind::Data, &DataHeader::addressed("/q").encode());
     data.extend_from_slice(b"payload");
     within(transfer.write_all(&chunk(&data)))
@@ -336,8 +336,10 @@ async fn a_closed_local_consumer_waiting_to_be_announced_does_not_hold_a_place()
     drop(consumer);
 
     // The place it held is given out again, though the notice still waits.
-    let (_fourth, _) =
-        within_for(Duration::from_secs(5), async { dial_control(&path).await }).await;
+    let (_fourth, _) = within_for(Duration::from_secs(5), async {
+        dial_control(&harness).await
+    })
+    .await;
 
     // The notice itself is not lost: it follows the transfer once the queue
     // is read. A local connection says nothing of a reply, so a path with an

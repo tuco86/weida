@@ -9,8 +9,9 @@ use weida_core::Error;
 use crate::runtime::Exec;
 
 /// Where a runtime's QUIC sockets live: the operating system's UDP (the default) or, with the
-/// cargo feature `test-util`, a `SimNet` shared by the runtimes of one test. Local transports
-/// (`weida+inproc`, `+unix`, `+pipe`) are not affected.
+/// cargo feature `test-util`, a `SimNet` shared by the runtimes of one test. On a `SimNet` a
+/// `weida+unix` binding and dial are simulated too (by path, with no socket file);
+/// `weida+inproc` and `weida+pipe` are not affected.
 #[derive(Clone, Debug, Default)]
 pub struct Network {
     kind: Kind,
@@ -30,6 +31,15 @@ impl Network {
     pub fn sim(net: &crate::SimNet) -> Network {
         Network {
             kind: Kind::Sim(net.clone()),
+        }
+    }
+
+    /// The simulated network, where this is one: what a `weida+unix` binding and dial use.
+    #[cfg(all(unix, feature = "test-util"))]
+    pub(crate) fn sim_net(&self) -> Option<&crate::sim::SimNet> {
+        match &self.kind {
+            Kind::Os => None,
+            Kind::Sim(net) => Some(net),
         }
     }
 

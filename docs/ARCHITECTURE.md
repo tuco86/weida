@@ -1171,6 +1171,8 @@ impl SimNet {                                               // real QUIC and TLS
     pub fn stats(&self) -> SimStats;
     pub fn endpoint(&self, addr: SocketAddr, server: Option<quinn::ServerConfig>)
         -> Result<quinn::Endpoint, Error>;                   // a raw peer for hostile tests
+    #[cfg(unix)] pub fn connect_unix(&self, path: impl AsRef<Path>)
+        -> Result<tokio::io::DuplexStream, Error>;           // raw dial of a simulated weida+unix binding
 }
 pub struct SimStats { pub delivered: u64, pub dropped: u64 }
 pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file

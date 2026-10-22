@@ -137,6 +137,8 @@ impl RuntimeInner {
             crate::unix::UnixEndpoint {
                 path: std::path::PathBuf::from(socket),
                 exec: self.exec.clone(),
+                #[cfg(feature = "test-util")]
+                sim: self.config.network.sim_net().cloned(),
             },
             self.config.limits.max_local_streams,
             self.config.limits.max_parked_reverse,

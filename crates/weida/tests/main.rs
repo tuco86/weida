@@ -15,6 +15,7 @@ mod guide;
 mod hostile;
 mod identity;
 mod interrupted;
+mod local_hostile;
 mod pair;
 mod pubsub;
 mod pushpull;
@@ -38,6 +39,8 @@ mod reconnect;
 mod reorder;
 mod reqrep;
 mod sim;
+#[cfg(unix)]
+mod sim_unix;
 mod stats;
 mod streams;
 mod survey;
@@ -54,7 +57,6 @@ mod io {
     mod drain;
     mod guide;
     mod identity_source;
-    mod local_hostile;
     mod pubsub;
     mod reconnect;
     mod streams;

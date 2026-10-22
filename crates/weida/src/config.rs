@@ -152,8 +152,9 @@ pub struct RuntimeConfig {
     /// outstanding at once.
     pub resolver: SharedResolver,
     /// Where this runtime's QUIC sockets live: the operating system's UDP (the default) or, with
-    /// the cargo feature `test-util`, a `SimNet` shared by the runtimes of one test. Local
-    /// transports (`weida+inproc`, `+unix`, `+pipe`) are not affected.
+    /// the cargo feature `test-util`, a `SimNet` shared by the runtimes of one test. On a
+    /// `SimNet`, `weida+unix` bindings and dials are simulated too, by path; `weida+inproc` and
+    /// `weida+pipe` are not affected.
     ///
     /// With `test-util`, `Network::sim(&net)` puts this runtime on `net`: give every runtime of
     /// one test the same `SimNet`

@@ -513,6 +513,18 @@ impl Listener {
     pub fn bind_unix(&self, path: impl AsRef<std::path::Path>) -> Result<UnixBinding, Error> {
         let path = path.as_ref();
         let exec = self.inner.runtime.exec.clone();
+        #[cfg(feature = "test-util")]
+        if let Some(net) = self.inner.runtime.config.network.sim_net() {
+            let crate::sim::LocalListener { incoming, lease } = net.bind_local(path)?;
+            exec.spawn(accept_sim_unix(
+                incoming,
+                self.local_accept(|link| Link::Unix(Box::new(link))),
+            ));
+            tracing::info!(path = %path.display(), "simulated unix binding listening");
+            return Ok(UnixBinding {
+                inner: UnixBound::Sim(lease),
+            });
+        }
         let (binding, listener) = {
             // Inside the runtime context: tokio registers the socket with the
             // reactor as it is constructed, and the calling thread may have
@@ -530,7 +542,9 @@ impl Listener {
             self.local_accept(|link| Link::Unix(Box::new(link))),
         ));
         tracing::info!(path = %path.display(), "unix binding listening");
-        Ok(UnixBinding { inner: binding })
+        Ok(UnixBinding {
+            inner: UnixBound::Os(binding),
+        })
     }
 
     /// Binds a Windows named pipe, `\\.\pipe\<name>`, and serves it.
@@ -969,18 +983,31 @@ impl Drop for LocalBinding {
     }
 }
 
-/// One `AF_UNIX` binding: the socket file, removed when this drops.
+/// One `AF_UNIX` binding: the socket file, removed when this drops; or, under
+/// `Network::sim`, the simulated path, freed when this drops.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct UnixBinding {
-    inner: weida_runtime::BoundUnixSocket,
+    inner: UnixBound,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum UnixBound {
+    Os(weida_runtime::BoundUnixSocket),
+    #[cfg(feature = "test-util")]
+    Sim(crate::sim::LocalLease),
 }
 
 #[cfg(unix)]
 impl UnixBinding {
     /// The socket path actually bound.
     pub fn path(&self) -> &std::path::Path {
-        self.inner.path()
+        match &self.inner {
+            UnixBound::Os(socket) => socket.path(),
+            #[cfg(feature = "test-util")]
+            UnixBound::Sim(lease) => lease.path(),
+        }
     }
 }
 
@@ -1182,6 +1209,31 @@ async fn accept_unix(
         // The accepted socket carries the runtime its halves write their
         // end-of-payload marker on, exactly as a pipe instance does.
         let stream = crate::unix::UnixLocal::accepted(stream, serve.exec.clone());
+        serve.exec.spawn(serve.clone_for().serve(stream, place));
+    }
+}
+
+/// [`accept_unix`] for a binding on a simulated network: the same place
+/// before each accept and the same drain rule, over the connections the
+/// `SimNet` hands this path. Ends once the binding is dropped and no dial
+/// is still on its way in.
+#[cfg(all(unix, feature = "test-util"))]
+async fn accept_sim_unix(
+    mut incoming: tokio::sync::mpsc::Receiver<tokio::io::DuplexStream>,
+    serve: LocalAccept<crate::unix::UnixLocal>,
+) {
+    loop {
+        // The semaphore is never closed, so this only fails if it were.
+        let Ok(place) = Arc::clone(&serve.admitted).acquire_owned().await else {
+            return;
+        };
+        let Some(stream) = incoming.recv().await else {
+            return;
+        };
+        if serve.shared.drain.is_draining() {
+            continue;
+        }
+        let stream = crate::unix::UnixLocal::accepted_sim(stream, serve.exec.clone());
         serve.exec.spawn(serve.clone_for().serve(stream, place));
     }
 }
