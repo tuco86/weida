@@ -45,7 +45,7 @@ kind: code | size: 60 | status: done 459be56 | needs: [B-367]
 acceptance: Step 10; every existing `weida-openbao` test passes unchanged; `cargo tree -e normal -p weida-openbao` lists none of hyper, reqwest, tower, url, idna; the root `reqwest` entry and its comment are gone.
 
 ### B-370 — HTTP parity document and the family's documents
-kind: spec | size: 45 | status: in_progress 2026-10-23T03:31Z | needs: [B-368, B-369]
+kind: spec | size: 45 | status: done bda8582 | needs: [B-368, B-369]
 acceptance: Step 11; `docs/libraries/http.md` in the eleven-section shape; every listed document names the sixth family; `git grep -n 'five foreign-protocol\|all five libraries\|twenty-five' -- README.md docs` finds no stale count.
 
 ### B-371 — `weida-http-py`
