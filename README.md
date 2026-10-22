@@ -23,18 +23,21 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 
 **Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
 `weida-broker`, `weida-raft` and `weida-openbao` are published on crates.io, all at
-`0.1.0-alpha.8`. The other seventeen members are not published: `weida-py-core`, every Python
-binding and all five protocol libraries with their codecs. The one exception on crates.io,
+`0.1.0-alpha.8`; `weida-http-codec` and `weida-http` are published from the next release on,
+because `weida-openbao` speaks HTTP through them. The other seventeen members are not
+published: `weida-py-core`, every Python binding and the other five protocol libraries with
+their codecs. The one exception on crates.io,
 `weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI
 and there are no prebuilt binaries. Wire protocol version `0` is experimental and breaking
 changes are permitted within `0.x`. Phase status lives in
 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §1.
 
-Beside weida the repository ships **five protocol libraries**, none of which has weida in its
+Beside weida the repository ships **six protocol libraries**, none of which has weida in its
 picture: ZeroMQ (`weida-zmtp` + `weida-zmq` + `weida-zmq-py`), the nanomsg SP protocols
 (`weida-sp` + `weida-nng` + `weida-nng-py`), MQTT 5 (`weida-mqtt-codec` + `weida-mqtt` +
-`weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` + `weida-amqp-py`) and Core NATS
-(`weida-nats-codec` + `weida-nats` + `weida-nats-py`), each with a parity document under
+`weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` + `weida-amqp-py`), Core NATS
+(`weida-nats-codec` + `weida-nats` + `weida-nats-py`) and HTTP/1.1, HTTP/2 and HTTP/3
+(`weida-http-codec` + `weida-http`), each with a parity document under
 [docs/libraries/](docs/libraries/) and each measured against a real peer where one exists.
 `weida-zmq` is complete against
 [decisions/0013](docs/decisions/0013-competitor-libraries.md) §4.7's definition of
@@ -78,7 +81,7 @@ beside each finished library. A user may compose those public APIs explicitly. T
 does not define a general translation from foreign socket types onto weida patterns.
 The `kind` column says which product a crate belongs to
 ([decisions/0013](docs/decisions/0013-competitor-libraries.md) §4). The table lists **every
-one of the twenty-five `[workspace] members`** and is read off `cargo metadata`, not kept by
+one of the twenty-seven `[workspace] members`** and is read off `cargo metadata`, not kept by
 hand.
 
 | Path | Package | kind | Responsibility |
@@ -108,6 +111,8 @@ hand.
 | `crates/nats/weida-nats-codec` | `weida-nats-codec` | codec | the NATS client protocol — twelve control-line verbs and the `NATS/1.0` header block — sans-I/O |
 | `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; its interop tests are written and **not run**, because they need a `nats-server` ([docs/libraries/nats.md](docs/libraries/nats.md)) |
 | `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
+| `crates/http/weida-http-codec` | `weida-http-codec` | codec | HTTP/1.1 heads and chunked bodies, HPACK with Huffman, HTTP/2 frames, QUIC varints, static-table QPACK and HTTP/3 frames — sans-I/O, every cap an argument |
+| `crates/http/weida-http` | `weida-http` | library | the HTTP client and pull-style server: HTTP/1.1, HTTP/2 over TLS by ALPN, HTTP/3 over QUIC (feature `h3`), per-origin pooling, interop-tested against hyper 1.11.1 and h3 0.0.8 in both roles ([docs/libraries/http.md](docs/libraries/http.md)) |
 
 ## Quick start, without writing a program
 

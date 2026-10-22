@@ -273,6 +273,23 @@ only when it is at least a quarter of the allocation it was read into; any other
 so a few octets never pin a read buffer, and a connection that went quiet after one large
 frame does not keep the allocation it came in.
 
+**`weida-http` bounds what a peer can make it buffer, in every version and both roles**
+(`docs/libraries/http.md` §9 has the table). An HTTP/1.1 head or trailer section is read up
+to `Limits::max_head_bytes` (64 KiB) and `Limits::max_fields` (128) and refused past them
+(431 on the server), a chunk-size line up to `max_chunk_line` (1 KiB); an HTTP/2 header
+block, CONTINUATION frames included, and its decoded field section are held to the same
+`max_head_bytes`, as is an HTTP/3 HEADERS frame. Unread request or response body is bounded
+by flow control, not by a count: HTTP/2 credits a stream and the connection only when the
+reader takes the data, so one stream holds at most `stream_window` (1 MiB) and one connection
+at most `connection_window` (4 MiB) unread, and quinn's receive windows carry the same two
+numbers for HTTP/3; HTTP/1.1 reads the socket only while the exchange's queue of four chunks
+has room. The server holds at most `max_connections` (1024) connections, `max_concurrent_streams`
+(100) streams on each multiplexed one (HTTP/2 refuses a stream past it with REFUSED_STREAM;
+QUIC never grants more), and `accept_queue` (64) exchanges waiting for `accept`; a head must
+arrive within `header_timeout` (10 s) and an idle connection is closed after `idle_timeout`.
+What it writes is bounded too: an HTTP/2 connection stops reading frames once 256 KiB of
+its output is queued and unwritten, so a peer that sends without reading cannot grow it.
+
 **And a payload-byte budget is not a bound either, if a message may be empty.** The L2
 broker's queue is the case: `weida_broker::BrokerConfig::queue_bytes` (8 MiB per queue)
 bounds what a queue holds, but a producer of zero-byte messages costs zero payload bytes and

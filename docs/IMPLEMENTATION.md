@@ -26,8 +26,8 @@ across phases. A phase is `done`, `partial` (its row says what is missing) or `n
 | 6 | Standalone broker | partial | `weida-broker`: queues, publisher confirm, absolute credit and settlement with requeue. Not built: the redelivery count, report relay, retirement and an inspection API beyond the in-process counters. |
 | 7 | Broker clustering | not started | Nothing is built. `weida-raft` is the consensus transport it will use. |
 | 8 | Web binding | not started | Nothing is built. |
-| 9 | Standalone foreign-protocol libraries | partial | All five libraries with codecs, fuzzing and interop; the NATS interop is written and not run. |
-| 10 | Language bindings | partial | Python for `weida` and all five libraries; no other language. |
+| 9 | Standalone foreign-protocol libraries | partial | All six libraries with codecs, fuzzing and interop; the NATS interop is written and not run. |
+| 10 | Language bindings | partial | Python for `weida` and the first five libraries; HTTP's is filed (B-371); no other language. |
 | 11 | CLI and administration | partial | The `weida` binary with `serve`, `request`, `send` and `sub`; no broker or cluster inspection. |
 | 12 | Documentation/site/stabilization | partial | [GUIDE.md](GUIDE.md) and the website, which lives in its own repository ([0033](decisions/0033-the-website-moves-out.md)). |
 
@@ -375,8 +375,8 @@ set, which is Phases 5 and 7.
 
 ### Phase 9 — Standalone foreign-protocol libraries
 
-Five independent families, each a sans-I/O codec with an empty `[dependencies]`, a native
-library with a bounded resource model and a Python binding (Phase 10). A library depends on
+Six independent families, each a sans-I/O codec with an empty `[dependencies]`, a native
+library with a bounded resource model and a Python binding (Phase 10; HTTP's is B-371). A library depends on
 `weida-core`, `weida-runtime` and its codec, never on `weida` or `weida-protocol`, needs none
 of the later weida phases and keeps its own protocol semantics: no general bridge or mapping
 onto weida patterns exists ([0013](decisions/0013-competitor-libraries.md),
@@ -392,13 +392,15 @@ that states, row by row, what it does against the reference implementation
 | MQTT 5 | `weida-mqtt-codec` | `weida-mqtt`: a client | rumqttd 0.20.0 and rmqtt 0.23.1 (`tests/interop_rumqttd.rs`, `tests/interop_mqtt5.rs`, `#[ignore]`d) |
 | AMQP 1.0 | `weida-amqp-codec` | `weida-amqp`: a client | `fe2o3-amqp` 0.17.0, both roles (`tests/interop_fe2o3.rs`); RabbitMQ (`tests/interop_rabbitmq.rs`, `#[ignore]`d) is written and not run |
 | Core NATS | `weida-nats-codec` | `weida-nats`: a client | `tests/interop_nats_server.rs` is written and `#[ignore]`d, not run: it needs a `nats-server` |
+| HTTP | `weida-http-codec` (HTTP/1.1, HPACK, HTTP/2 frames, static QPACK, HTTP/3 frames) | `weida-http`: client and pull-style server, HTTP/1.1, HTTP/2 over TLS by ALPN, HTTP/3 over quinn behind the feature `h3` ([0044](decisions/0044-weida-http.md)) | hyper 1.11.1 for HTTP/1.1 and HTTP/2 and h3 0.0.8 on h3-quinn 0.0.10 for HTTP/3, both roles, always run (`tests/io/interop_hyper.rs`, `tests/io/interop_h3.rs`) |
 
 **Not built:** MQTT's and AMQP's server halves ([0014](decisions/0014-parallel-libraries.md)
 §2).
 
 ### Phase 10 — Language bindings
 
-Python is built for weida and for all five libraries. Every binding has an asyncio surface and
+Python is built for weida and for the first five libraries; `weida-http-py` is filed as B-371.
+Every binding has an asyncio surface and
 a synchronous surface and stands on `weida-py-core` (`crates/py/weida-py-core`), the shared
 PyO3 foundation ([0014](decisions/0014-parallel-libraries.md) §2): one exception class per
 error variant, the bridge that drives a Rust future on the caller's event loop — it polls once
@@ -410,7 +412,8 @@ inline and spawns only a future that has to wait, so a ready operation costs no 
   (levels are integers) and connection statistics, with a `weida.sync` module over
   `weida::blocking` ([libraries/weida-py.md](libraries/weida-py.md)).
 - `weida-zmq-py`, `weida-nng-py`, `weida-mqtt-py`, `weida-amqp-py` and `weida-nats-py` bind the
-  five libraries, each following its own library, with a parity document in `docs/libraries/`.
+  first five libraries, each following its own library, with a parity document in
+  `docs/libraries/`.
 - `weida::blocking`, behind the non-default `blocking` feature of `weida`, is the synchronous
   facade, in the shape the libraries' own `blocking` facades have: every method is a `block_on`
   around the asynchronous endpoint's own, over a `Runtime::owned` reactor the caller never

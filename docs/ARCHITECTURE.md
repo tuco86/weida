@@ -482,6 +482,8 @@ crates/
     nats/weida-nats-codec/     →  weida-nats-codec  NATS codec, no I/O
     nats/weida-nats/           →  weida-nats        the NATS client
     nats/weida-nats-py/        →  weida-nats-py     its Python binding
+    http/weida-http-codec/     →  weida-http-codec  HTTP/1.1, HPACK, h2 and h3 framing, QPACK, no I/O
+    http/weida-http/           →  weida-http        the HTTP client and server (h1, h2, h3)
     py/weida-py-core/          →  weida-py-core     the shared PyO3 foundation
     py/weida-py/               →  weida-py          weida's own Python binding
 ```

@@ -23,7 +23,7 @@ constructors, the capped resolver, the `AF_UNIX` and named-pipe hygiene and the 
 It depends on `weida-core`, `tokio` and, on Windows only, `weida-winpipe`, the one crate in the
 tree that may use `unsafe`. That is what lets a ZeroMQ user open a socket without linking quinn,
 rustls and weida's pattern layer. Above it the tree is **one directory per protocol family**
-(`crates/zmq/`, `crates/nng/`, `crates/mqtt/`, `crates/amqp/`, `crates/nats/`), so the
+(`crates/zmq/`, `crates/nng/`, `crates/mqtt/`, `crates/amqp/`, `crates/nats/`, `crates/http/`), so the
 directory list answers "does this repository ship a ZeroMQ?". Each codec crate has an **empty
 `[dependencies]`** section, so it can be checked against its RFC rather than against our
 reading of it; each library depends on its codec, the runtime and `weida-core`, and never on
@@ -121,17 +121,19 @@ utopian on purpose — and every program in it is a file in the tree that a test
 
 The two halves of that picture are the two products of
 [0013](decisions/0013-competitor-libraries.md) §4: weida on the left, with the guarantee
-dimensions, transports and patterns it offers, and the five standalone foreign-protocol
+dimensions, transports and patterns it offers, and the six standalone foreign-protocol
 libraries on the right. They share runtime foundations but no implicit semantic conversion.
 
 weida itself ships a library with an async API and, behind the non-default `blocking` feature,
-a synchronous one (`weida::blocking`), the `weida` binary and a Python binding. Each of the five
-libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0 and Core NATS — has a parity document in
+a synchronous one (`weida::blocking`), the `weida` binary and a Python binding. Each of the six
+libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0, Core NATS and HTTP — has a parity document in
 [libraries/](libraries/README.md) and, where a peer exists to measure against, an interop
 suite; the NATS suite is written and not run, which its parity table records as a clause **not
-met** rather than rounding up. There are **six Python bindings**: the five libraries plus
-`weida-py`, each with an asyncio and a synchronous surface on the shared `weida-py-core`
-foundation, and `weida-py` is the one that reaches every weida pattern and its cursor surface.
+met** rather than rounding up. HTTP speaks HTTP/1.1, HTTP/2 and HTTP/3 in both roles, and
+`weida-openbao` uses it in place of `reqwest`. There are **six Python bindings**: the first five
+libraries plus `weida-py`, each with an asyncio and a synchronous surface on the shared
+`weida-py-core` foundation, and `weida-py` is the one that reaches every weida pattern and its
+cursor surface; HTTP's binding is filed (B-371).
 
 ## 3. The measurements that decided something
 
