@@ -4,6 +4,54 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-360 — HTTP research sheet
+kind: research | size: 60 | status: ready | needs: []
+acceptance: `docs/research/http.md` in the research template (§0-§14), protocol-native vocabulary, every claim sourced (RFC 9110/9112/9113/7541/9114/9204/9000 with dates), README "Sheets" row added.
+
+### B-361 — `weida-http-codec`: HTTP/1.1, fields, URLs, dates
+kind: protocol | size: 90 | status: ready | needs: []
+acceptance: `crates/http/weida-http-codec` with an empty `[dependencies]`; `limits`, `error`, `fields`, `uri`, `date`, `h1` per Step 2; golden vectors from RFC 9112/9110 examples both directions; fuzz workspace with `h1_request`, `h1_response`, `chunked`, `uri` and their `fuzz_smoke` mirrors; caps checked before allocation.
+
+### B-362 — `weida-http-codec`: HPACK
+kind: protocol | size: 90 | status: ready | needs: [B-361]
+acceptance: `prefix`, `huffman`, `hpack` per Step 3; RFC 7541 Appendix C.1-C.6 decode and encode byte-exact (C.2 decode only); fuzz target `hpack` and mirror.
+
+### B-363 — `weida-http-codec`: HTTP/2 frames
+kind: protocol | size: 60 | status: ready | needs: [B-361]
+acceptance: `h2` per Step 4; every frame type encodes and decodes; length, stream-id and SETTINGS value rules refused by name; fuzz target `h2_frame` and mirror.
+
+### B-364 — `weida-http-codec`: QUIC varints, QPACK (static), HTTP/3 frames
+kind: protocol | size: 90 | status: ready | needs: [B-362]
+acceptance: `varint`, `qpack`, `h3` per Step 5; RFC 9000 §A.1 varint examples, RFC 9204 Appendix B.1 field section decoded; a Required Insert Count above 0 refused; fuzz targets `qpack`, `h3_frame` and mirrors.
+
+### B-365 — `weida-http`: types, dial, HTTP/1.1 client and pool
+kind: protocol | size: 90 | status: ready | needs: [B-361]
+acceptance: `crates/http/weida-http` per Step 6; the client speaks HTTP/1.1 over TCP and TLS, keeps idle connections per origin; unit tests over `tokio::io::duplex`; `tests/io/interop_hyper.rs` h1 rows against a hyper 1 server; CI doc loops list `weida-http`.
+
+### B-366 — `weida-http`: HTTP/1.1 server
+kind: protocol | size: 90 | status: ready | needs: [B-365]
+acceptance: `Server`, `Exchange`, `Responder` per Step 7; keep-alive, pipelined requests answered in order, 100-continue, 400/431/501/505 refusals, header timeout; hyper 1 client interop rows; our client against our server in `tests/io/loopback.rs`.
+
+### B-367 — `weida-http`: HTTP/2 client and server
+kind: protocol | size: 90 | status: ready | needs: [B-363, B-366]
+acceptance: one connection driver for both roles per Step 8; ALPN `h2`; flow control both directions; GOAWAY and RST_STREAM; hyper 1 http2 interop rows both roles; the pool shares one h2 connection per origin.
+
+### B-368 — `weida-http`: HTTP/3 client and server (feature `h3`)
+kind: protocol | size: 90 | status: ready | needs: [B-364, B-367]
+acceptance: Step 9 over quinn; control stream SETTINGS, no QPACK streams opened; h3 0.0.8 + h3-quinn 0.0.10 interop rows both roles; LOOP §6 and `.zeughaus-ci` feature row `weida-http:h3`.
+
+### B-369 — `weida-openbao` onto `weida-http`; `reqwest` removed
+kind: code | size: 60 | status: ready | needs: [B-367]
+acceptance: Step 10; every existing `weida-openbao` test passes unchanged; `cargo tree -e normal -p weida-openbao` lists none of hyper, reqwest, tower, url, idna; the root `reqwest` entry and its comment are gone.
+
+### B-370 — HTTP parity document and the family's documents
+kind: spec | size: 45 | status: ready | needs: [B-368, B-369]
+acceptance: Step 11; `docs/libraries/http.md` in the eleven-section shape; every listed document names the sixth family; `git grep -n 'five foreign-protocol\|all five libraries\|twenty-five' -- README.md docs` finds no stale count.
+
+### B-371 — `weida-http-py`
+kind: protocol | size: 90 | status: ready | needs: [B-366]
+acceptance: `crates/http/weida-http-py` on `weida-py-core` with an asyncio and a synchronous surface over `Client` and `Server`, the shape of `weida-nats-py`; `docs/libraries/http-py.md`; excluded from the darwin/windows checks like the other bindings.
+
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.

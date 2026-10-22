@@ -55,6 +55,7 @@ crates/nng/   weida-sp, weida-nng, weida-nng-py
 crates/mqtt/  weida-mqtt-codec, weida-mqtt, weida-mqtt-py
 crates/amqp/  weida-amqp-codec, weida-amqp, weida-amqp-py
 crates/nats/  weida-nats-codec, weida-nats, weida-nats-py
+crates/http/  weida-http-codec, weida-http
 ```
 
 The directory names the protocol family, not a role in a weida deployment.
