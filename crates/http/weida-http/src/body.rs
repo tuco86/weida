@@ -86,6 +86,7 @@ enum ReaderInner {
     Empty,
     H1(H1Body),
     Channel(ChannelBody),
+    H2(crate::h2::StreamReader),
 }
 
 /// A body that arrives.
@@ -107,6 +108,12 @@ impl BodyReader {
         }
     }
 
+    pub(crate) fn h2(body: crate::h2::StreamReader) -> BodyReader {
+        BodyReader {
+            inner: ReaderInner::H2(body),
+        }
+    }
+
     /// A body with nothing in it.
     #[must_use]
     pub fn empty() -> BodyReader {
@@ -125,6 +132,7 @@ impl BodyReader {
             ReaderInner::Empty => Ok(None),
             ReaderInner::H1(body) => body.chunk().await,
             ReaderInner::Channel(body) => body.chunk().await,
+            ReaderInner::H2(body) => body.chunk().await,
         }
     }
 
@@ -156,6 +164,7 @@ impl BodyReader {
             ReaderInner::Empty => Some(0),
             ReaderInner::H1(body) => body.content_length(),
             ReaderInner::Channel(body) => body.content_length,
+            ReaderInner::H2(body) => body.content_length(),
         }
     }
 
@@ -166,6 +175,7 @@ impl BodyReader {
             ReaderInner::Empty => None,
             ReaderInner::H1(body) => body.trailers(),
             ReaderInner::Channel(body) => body.trailers.as_ref(),
+            ReaderInner::H2(body) => body.trailers(),
         }
     }
 }
@@ -195,15 +205,27 @@ pub(crate) enum WriteEvent {
     },
 }
 
-/// A body a server sends, written by the connection task.
+/// Where a [`BodyWriter`]'s octets go.
+#[derive(Debug)]
+enum Sink {
+    /// An HTTP/1.1 connection task.
+    Channel(mpsc::Sender<WriteEvent>),
+    /// An HTTP/2 stream.
+    H2(crate::h2::StreamWriter),
+    /// Finished or aborted.
+    Gone,
+}
+
+/// A body that is sent: a server's response body, or a client's request
+/// body inside an [`crate::OpenRequest`].
 ///
 /// Writing more than a declared `content-length`, finishing short of it,
-/// or dropping the writer unfinished aborts the response: on HTTP/1.1 the
-/// connection is closed, so the client sees an incomplete message rather than
-/// a complete wrong one.
+/// or dropping the writer unfinished aborts the message: on HTTP/1.1 the
+/// connection is closed, on HTTP/2 the stream is reset with `CANCEL`, so the
+/// peer sees an incomplete message rather than a complete wrong one.
 #[derive(Debug)]
 pub struct BodyWriter {
-    tx: Option<mpsc::Sender<WriteEvent>>,
+    sink: Sink,
     framing: OutBody,
     written: u64,
 }
@@ -211,37 +233,49 @@ pub struct BodyWriter {
 impl BodyWriter {
     pub(crate) fn channel(tx: mpsc::Sender<WriteEvent>, framing: OutBody) -> BodyWriter {
         BodyWriter {
-            tx: Some(tx),
+            sink: Sink::Channel(tx),
             framing,
             written: 0,
         }
     }
 
+    pub(crate) fn h2(writer: crate::h2::StreamWriter, framing: OutBody) -> BodyWriter {
+        BodyWriter {
+            sink: Sink::H2(writer),
+            framing,
+            written: 0,
+        }
+    }
+
+    /// A writer for a message that carries no body and is already complete.
+    pub(crate) fn done() -> BodyWriter {
+        BodyWriter {
+            sink: Sink::Gone,
+            framing: OutBody::None,
+            written: 0,
+        }
+    }
+
     fn abort(&mut self, e: Error) -> Error {
-        self.tx = None;
+        self.sink = Sink::Gone;
         e
     }
 
     /// Sends `data` as the next part of the body; waits while the
-    /// connection has no room.
+    /// connection has no room (or, on HTTP/2, no flow-control credit).
     ///
     /// # Errors
     ///
-    /// [`Error::Protocol`] for a body on a response that has none (HEAD,
-    /// 204, 304) or past the declared `content-length`, which aborts the
-    /// response; [`Error::Closed`] when the connection is gone.
+    /// [`Error::Protocol`] for a body on a message that has none (a response
+    /// to HEAD, 204, 304) or past the declared `content-length`, which aborts
+    /// the message; [`Error::Closed`] when the connection is gone.
     pub async fn write(&mut self, data: Bytes) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        if self.tx.is_none() {
-            return Err(Error::Closed);
-        }
         match self.framing {
             OutBody::None => {
-                return Err(
-                    self.abort(Error::Protocol("a body on a response that has none".into()))
-                );
+                return Err(self.abort(Error::Protocol("a body on a message that has none".into())));
             }
             OutBody::Length(n) if self.written + data.len() as u64 > n => {
                 return Err(self.abort(Error::Protocol(format!(
@@ -251,11 +285,15 @@ impl BodyWriter {
             _ => {}
         }
         self.written += data.len() as u64;
-        let tx = self.tx.as_ref().expect("checked above");
-        if tx.send(WriteEvent::Data(data)).await.is_err() {
-            return Err(self.abort(Error::Closed));
-        }
-        Ok(())
+        let result = match &mut self.sink {
+            Sink::Channel(tx) => tx
+                .send(WriteEvent::Data(data))
+                .await
+                .map_err(|_| Error::Closed),
+            Sink::H2(writer) => writer.write(data).await,
+            Sink::Gone => Err(Error::Closed),
+        };
+        result.map_err(|e| self.abort(e))
     }
 
     /// Ends the body; returns once it reached the connection.
@@ -263,7 +301,7 @@ impl BodyWriter {
     /// # Errors
     ///
     /// [`Error::Protocol`] short of a declared `content-length`, which
-    /// aborts the response; [`Error::Closed`]; a transport error.
+    /// aborts the message; [`Error::Closed`]; a transport error.
     pub async fn finish(self) -> Result<()> {
         self.end(None).await
     }
@@ -278,8 +316,9 @@ impl BodyWriter {
         self.end(Some(trailers)).await
     }
 
-    async fn end(mut self, trailers: Option<Fields>) -> Result<()> {
-        if trailers.as_ref().is_some_and(|t| !t.is_empty()) && self.framing != OutBody::Open {
+    pub(crate) async fn end(mut self, trailers: Option<Fields>) -> Result<()> {
+        let trailers = trailers.filter(|t| !t.is_empty());
+        if trailers.is_some() && self.framing != OutBody::Open {
             return Err(self.abort(Error::Unsupported("trailers need chunked framing")));
         }
         if let OutBody::Length(n) = self.framing
@@ -290,13 +329,17 @@ impl BodyWriter {
                 "the body ended at {written} of the declared content-length of {n}"
             ))));
         }
-        let Some(tx) = self.tx.take() else {
-            return Err(Error::Closed);
-        };
-        let (done, wrote) = oneshot::channel();
-        tx.send(WriteEvent::Finish { trailers, done })
-            .await
-            .map_err(|_| Error::Closed)?;
-        wrote.await.map_err(|_| Error::Closed)?
+        match std::mem::replace(&mut self.sink, Sink::Gone) {
+            Sink::Channel(tx) => {
+                let (done, wrote) = oneshot::channel();
+                tx.send(WriteEvent::Finish { trailers, done })
+                    .await
+                    .map_err(|_| Error::Closed)?;
+                wrote.await.map_err(|_| Error::Closed)?
+            }
+            Sink::H2(writer) => writer.finish(trailers).await,
+            Sink::Gone if self.framing == OutBody::None => Ok(()),
+            Sink::Gone => Err(Error::Closed),
+        }
     }
 }

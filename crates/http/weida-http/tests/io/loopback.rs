@@ -3,9 +3,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::common::Gate;
 use bytes::Bytes;
-use tokio::sync::Notify;
-use weida_http::{Client, ClientOptions, Fields, Method, Server, ServerOptions, Status, Version};
+use weida_http::{
+    Client, ClientOptions, Fields, Method, Protocol, Server, ServerOptions, Status, Version,
+};
 use weida_runtime::Exec;
 
 use crate::common::{pattern, serve_app, tls_pair, within};
@@ -14,13 +16,18 @@ struct Fixture {
     base: String,
     client: Client,
     server: Arc<Server>,
-    release: Arc<Notify>,
+    gate: Arc<Gate>,
+    version: Version,
 }
 
-async fn fixture(tls: bool) -> Fixture {
+async fn fixture(tls: bool, protocol: Protocol) -> Fixture {
     let exec = Exec::current().unwrap();
     let server = Arc::new(Server::new(&exec, ServerOptions::default()).unwrap());
     let any = SocketAddr::from(([127, 0, 0, 1], 0));
+    let version = match (tls, protocol) {
+        (true, Protocol::Auto | Protocol::Http2) => Version::Http2,
+        _ => Version::Http11,
+    };
     let (base, client_tls) = if tls {
         let (client_tls, server_tls) = tls_pair();
         let addr = server.bind_tls(any, server_tls).await.unwrap();
@@ -32,17 +39,19 @@ async fn fixture(tls: bool) -> Fixture {
         let addr = server.bind_tcp(any).await.unwrap();
         (format!("http://{addr}"), None)
     };
-    let release = Arc::new(Notify::new());
-    serve_app(server.clone(), Some(release.clone()));
+    let gate = Arc::new(Gate::default());
+    serve_app(server.clone(), Some(gate.clone()));
     let options = ClientOptions {
         tls: client_tls,
+        protocol,
         ..ClientOptions::default()
     };
     Fixture {
         base,
         client: Client::new(&exec, options).unwrap(),
         server,
-        release,
+        gate,
+        version,
     }
 }
 
@@ -58,13 +67,13 @@ async fn get(f: &Fixture, path: &str) -> (Status, Bytes) {
     )
     .await
     .unwrap();
-    assert_eq!(r.version, Version::Http11);
+    assert_eq!(r.version, f.version);
     let body = within("the body", r.body.collect(8 << 20)).await.unwrap();
     (r.head.status, body)
 }
 
-async fn rows(tls: bool) {
-    let f = fixture(tls).await;
+async fn rows(tls: bool, protocol: Protocol) {
+    let f = fixture(tls, protocol).await;
     assert_eq!(get(&f, "/three").await, (Status::OK, Bytes::from("abc")));
 
     let sent = Bytes::from(pattern(1 << 20));
@@ -141,17 +150,23 @@ async fn rows(tls: bool) {
 
 #[tokio::test]
 async fn our_client_against_our_server() {
-    rows(false).await;
+    rows(false, Protocol::Auto).await;
 }
 
 #[tokio::test]
 async fn our_client_against_our_server_over_tls() {
-    rows(true).await;
+    rows(true, Protocol::Http1).await;
 }
 
 #[tokio::test]
-async fn close_lets_a_response_in_flight_finish() {
-    let f = fixture(false).await;
+async fn our_client_against_our_server_over_h2() {
+    rows(true, Protocol::Http2).await;
+    // Auto prefers h2 where the server offers it.
+    rows(true, Protocol::Auto).await;
+}
+
+async fn close_with_one_in_flight(tls: bool, protocol: Protocol) {
+    let f = fixture(tls, protocol).await;
     let url = format!("{}/slow", f.base);
     let client = f.client.clone();
     let pending = tokio::spawn(async move {
@@ -159,13 +174,12 @@ async fn close_lets_a_response_in_flight_finish() {
             .request(Method::GET, &url, Fields::new(), Bytes::new())
             .await
     });
-    // Wait until the exchange is in the application's hands: a second
-    // request on another connection gets its answer only after that.
-    assert_eq!(get(&f, "/three").await.0, Status::OK);
+    // Close only once the exchange is in the application's hands.
+    within("the slow request", f.gate.arrived.notified()).await;
     let server = f.server.clone();
     let closing = tokio::spawn(async move { server.close().await });
     tokio::task::yield_now().await;
-    f.release.notify_one();
+    f.gate.release.notify_one();
     let mut r = within("the slow answer", pending).await.unwrap().unwrap();
     assert_eq!(
         within("its body", r.body.collect(16)).await.unwrap(),
@@ -176,4 +190,14 @@ async fn close_lets_a_response_in_flight_finish() {
         f.server.accept().await,
         Err(weida_http::Error::Closed)
     ));
+}
+
+#[tokio::test]
+async fn close_lets_a_response_in_flight_finish() {
+    close_with_one_in_flight(false, Protocol::Http1).await;
+}
+
+#[tokio::test]
+async fn close_lets_an_h2_response_in_flight_finish() {
+    close_with_one_in_flight(true, Protocol::Http2).await;
 }

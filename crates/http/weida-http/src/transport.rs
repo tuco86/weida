@@ -28,6 +28,19 @@ pub(crate) enum Stream {
     Test(tokio::io::DuplexStream),
 }
 
+impl Stream {
+    /// The protocol ALPN selected, if any.
+    pub(crate) fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => s.get_ref().1.alpn_protocol(),
+            #[cfg(feature = "tls")]
+            Self::TlsServer(s) => s.get_ref().1.alpn_protocol(),
+            _ => None,
+        }
+    }
+}
+
 macro_rules! each {
     ($self:expr, $s:ident => $e:expr) => {
         match $self.get_mut() {

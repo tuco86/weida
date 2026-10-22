@@ -42,6 +42,15 @@ pub fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i % 251) as u8).collect()
 }
 
+/// Two signals around the test application's `/slow` exchange.
+#[derive(Default)]
+pub struct Gate {
+    /// The exchange is in the application's hands.
+    pub arrived: tokio::sync::Notify,
+    /// The application may answer it.
+    pub release: tokio::sync::Notify,
+}
+
 /// The test application: answers every exchange `server` accepts until it
 /// closes.
 ///
@@ -51,16 +60,17 @@ pub fn pattern(n: usize) -> Vec<u8> {
 /// * `/peer`: the client's port, which names its connection;
 /// * `/trailers`: the request body's `x-in` trailer back as an `x-out`
 ///   trailer, after the body `t`;
-/// * `/slow`: waits for `release` before answering `late`.
+/// * `/slow`: says it `arrived` on the gate, then waits for its `release`
+///   before answering `late`.
 pub fn serve_app(
     server: Arc<weida_http::Server>,
-    release: Option<Arc<tokio::sync::Notify>>,
+    gate: Option<Arc<Gate>>,
 ) -> tokio::task::JoinHandle<()> {
     use bytes::Bytes;
     use weida_http::{Fields, ResponseHead, Status};
     tokio::spawn(async move {
         while let Ok(mut ex) = server.accept().await {
-            let release = release.clone();
+            let gate = gate.clone();
             tokio::spawn(async move {
                 let ok = ResponseHead::new(Status::OK);
                 match ex.head.path.as_str() {
@@ -100,8 +110,9 @@ pub fn serve_app(
                         w.finish_with_trailers(trailers).await.unwrap();
                     }
                     "/slow" => {
-                        if let Some(release) = release {
-                            release.notified().await;
+                        if let Some(gate) = gate {
+                            gate.arrived.notify_one();
+                            gate.release.notified().await;
                         }
                         let _ = ex
                             .responder

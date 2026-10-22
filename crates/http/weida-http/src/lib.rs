@@ -48,6 +48,7 @@ mod client;
 mod dial;
 mod error;
 mod h1;
+mod h2;
 mod options;
 mod pool;
 mod server;

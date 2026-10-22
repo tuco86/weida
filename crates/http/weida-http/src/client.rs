@@ -3,15 +3,19 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::sync::oneshot;
 use weida_http_codec::fields::is_connection_specific;
 use weida_http_codec::uri::Scheme;
 use weida_runtime::Exec;
 
-use crate::body::BodyReader;
+use crate::body::{BodyReader, BodyWriter, OutBody};
 use crate::dial::{self, Budget};
 use crate::error::{Error, Result};
 use crate::h1::Conn;
 use crate::h1::client::{OutFraming, Upload};
+use crate::h2::H2Handle;
+#[cfg(feature = "tls")]
+use crate::h2::conn::Local;
 use crate::options::{ClientOptions, Protocol};
 use crate::pool::{OriginKey, Pool, PoolReturn};
 use crate::types::{Fields, Method, RequestHead, ResponseHead, Url, Version};
@@ -58,6 +62,19 @@ pub struct OpenRequest {
 #[derive(Debug)]
 enum OpenInner {
     H1(Upload),
+    H2 {
+        body: BodyWriter,
+        response: oneshot::Receiver<Result<Response>>,
+    },
+}
+
+/// The stream's own error when there is one: a write that failed because the
+/// stream was refused or reset says less than the refusal itself.
+fn stream_error(response: &mut oneshot::Receiver<Result<Response>>, e: Error) -> Error {
+    match response.try_recv() {
+        Ok(Err(stream)) => stream,
+        _ => e,
+    }
 }
 
 impl OpenRequest {
@@ -70,6 +87,10 @@ impl OpenRequest {
     pub async fn write(&mut self, data: Bytes) -> Result<()> {
         match &mut self.inner {
             OpenInner::H1(upload) => upload.write(data).await,
+            OpenInner::H2 { body, response } => match body.write(data).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(stream_error(response, e)),
+            },
         }
     }
 
@@ -80,9 +101,7 @@ impl OpenRequest {
     /// [`Error::Protocol`] short of a declared `content-length`; transport,
     /// decode and protocol errors.
     pub async fn finish(self) -> Result<Response> {
-        match self.inner {
-            OpenInner::H1(upload) => upload.finish(None).await,
-        }
+        self.end(None).await
     }
 
     /// Ends the body with trailer fields and waits for the response head.
@@ -94,8 +113,18 @@ impl OpenRequest {
     /// [`Error::Unsupported`] `"trailers need chunked framing"`; as
     /// [`OpenRequest::finish`].
     pub async fn finish_with_trailers(self, trailers: Fields) -> Result<Response> {
+        self.end(Some(trailers)).await
+    }
+
+    async fn end(self, trailers: Option<Fields>) -> Result<Response> {
         match self.inner {
-            OpenInner::H1(upload) => upload.finish(Some(&trailers)).await,
+            OpenInner::H1(upload) => upload.finish(trailers.as_ref()).await,
+            OpenInner::H2 { body, mut response } => {
+                if let Err(e) = body.end(trailers).await {
+                    return Err(stream_error(&mut response, e));
+                }
+                response.await.map_err(|_| Error::Closed)?
+            }
         }
     }
 }
@@ -244,7 +273,9 @@ impl Client {
         }
     }
 
-    /// A connection to `url`'s origin, and the request started on it.
+    /// A connection to `url`'s origin, and the request started on it: the
+    /// origin's shared HTTP/2 connection, else its newest idle HTTP/1.1 one,
+    /// else a new one.
     async fn start(
         &self,
         url: &Url,
@@ -256,7 +287,6 @@ impl Client {
             (Protocol::Http2, Scheme::Http) => {
                 return Err(Error::Unsupported("h2 without TLS (h2c)"));
             }
-            (Protocol::Http2, Scheme::Https) => return Err(Error::Unsupported("HTTP/2")),
             (Protocol::Http3, Scheme::Http) => return Err(Error::Unsupported("h3 without TLS")),
             (Protocol::Http3, Scheme::Https) => {
                 return Err(Error::Unsupported("built without the h3 feature"));
@@ -264,9 +294,21 @@ impl Client {
             _ => {}
         }
         let key: OriginKey = (url.scheme, url.host.to_ascii_lowercase(), url.port);
+        if let Some(handle) = self.0.pool.shared(&key) {
+            return open_h2(&handle, head, framing).await;
+        }
         let (conn, reused) = match self.0.pool.take_h1(&key) {
             Some(conn) => (conn, true),
-            None => (self.dial(url).await?, false),
+            None => match self.dial(url).await? {
+                Dialed::H1(conn) => (conn, false),
+                #[cfg(feature = "tls")]
+                Dialed::H2(handle) => {
+                    // The first h2 connection to an origin is its shared one;
+                    // a later one serves this request and closes after it.
+                    self.0.pool.set_shared(key, &handle);
+                    return open_h2(&handle, head, framing).await;
+                }
+            },
         };
         let keep = PoolReturn::new(&self.0.pool, key);
         let upload = Upload::start(conn, head, framing, options.limits, reused, Some(keep))?;
@@ -275,7 +317,7 @@ impl Client {
         })
     }
 
-    async fn dial(&self, url: &Url) -> Result<Conn> {
+    async fn dial(&self, url: &Url) -> Result<Dialed> {
         let exec = &self.0.exec;
         let options = &self.0.options;
         let budget = Budget::start(exec, options.connect_timeout);
@@ -287,23 +329,75 @@ impl Client {
             &budget,
         )
         .await?;
-        let stream = match url.scheme {
-            Scheme::Http => stream,
+        match url.scheme {
+            Scheme::Http => Ok(Dialed::H1(Conn::new(stream))),
             #[cfg(feature = "tls")]
             Scheme::Https => {
                 let config = options
                     .tls
                     .as_ref()
                     .ok_or_else(|| Error::Configuration("https needs ClientOptions::tls".into()))?;
-                dial::upgrade_tls(exec, stream, config, &url.host, &[b"http/1.1"], &budget).await?
+                let alpn: &[&[u8]] = match options.protocol {
+                    Protocol::Http1 => &[b"http/1.1"],
+                    Protocol::Http2 => &[b"h2"],
+                    _ => &[b"h2", b"http/1.1"],
+                };
+                let stream =
+                    dial::upgrade_tls(exec, stream, config, &url.host, alpn, &budget).await?;
+                if stream.alpn() == Some(b"h2") {
+                    let local = Local {
+                        stream_window: options.stream_window,
+                        connection_window: options.connection_window,
+                        max_concurrent_streams: None,
+                        limits: options.limits,
+                    };
+                    return Ok(Dialed::H2(crate::h2::conn::spawn_client(
+                        exec, stream, local,
+                    )));
+                }
+                if options.protocol == Protocol::Http2 {
+                    return Err(Error::Protocol("the server did not agree to h2".into()));
+                }
+                Ok(Dialed::H1(Conn::new(stream)))
             }
             #[cfg(not(feature = "tls"))]
-            Scheme::Https => {
-                return Err(Error::Configuration(
-                    "https needs ClientOptions::tls".into(),
-                ));
-            }
-        };
-        Ok(Conn::new(stream))
+            Scheme::Https => Err(Error::Configuration(
+                "https needs ClientOptions::tls".into(),
+            )),
+        }
     }
+}
+
+/// A new connection: HTTP/1.1, or an HTTP/2 driver.
+enum Dialed {
+    H1(Conn),
+    #[cfg(feature = "tls")]
+    H2(H2Handle),
+}
+
+/// Opens a stream for `head` on an HTTP/2 connection.
+pub(crate) async fn open_h2(
+    handle: &H2Handle,
+    head: &RequestHead,
+    framing: OutFraming,
+) -> Result<OpenRequest> {
+    let (length, body_framing, end_stream) = match framing {
+        OutFraming::None => (None, OutBody::None, true),
+        OutFraming::Length(n) => (Some(n), OutBody::Length(n), n == 0),
+        OutFraming::Chunked => (None, OutBody::Open, false),
+    };
+    let opened = handle.open(head.clone(), length, end_stream).await?;
+    let body = if end_stream {
+        // The writer has nothing to send: HEADERS carried END_STREAM.
+        opened.writer.disarm();
+        BodyWriter::done()
+    } else {
+        BodyWriter::h2(opened.writer, body_framing)
+    };
+    Ok(OpenRequest {
+        inner: OpenInner::H2 {
+            body,
+            response: opened.response,
+        },
+    })
 }

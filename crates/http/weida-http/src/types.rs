@@ -305,6 +305,11 @@ impl Fields {
         self.entries.iter().map(|(n, v, _)| (&**n, v))
     }
 
+    /// Every field with its sensitivity.
+    pub(crate) fn iter_full(&self) -> impl Iterator<Item = (&str, &Bytes, bool)> {
+        self.entries.iter().map(|(n, v, s)| (&**n, v, *s))
+    }
+
     /// The number of fields.
     #[must_use]
     pub fn len(&self) -> usize {

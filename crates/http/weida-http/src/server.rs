@@ -116,6 +116,7 @@ enum ResponderInner {
         head_request: bool,
         minor: u8,
     },
+    H2(crate::h2::H2Responder),
 }
 
 /// Adds `date` (RFC 9110 §6.6.1: an origin server with a clock MUST) when
@@ -163,6 +164,12 @@ impl Responder {
         }
     }
 
+    pub(crate) fn h2(responder: crate::h2::H2Responder) -> Responder {
+        Responder {
+            inner: ResponderInner::H2(responder),
+        }
+    }
+
     /// Sends the response head; the body follows through the returned
     /// writer. With a `content-length` field the body must be exactly that
     /// long; without one it is chunked (or, to an HTTP/1.0 client, delimited
@@ -197,6 +204,17 @@ impl Responder {
                 })
                 .map_err(|_| Error::Closed)?;
                 Ok(BodyWriter::channel(wtx, framing))
+            }
+            ResponderInner::H2(mut responder) => {
+                // HTTP/2 frames every body, so "until close" never arises.
+                let framing = h1_framing(&head, responder.head_request, 1)?;
+                let end_stream = framing == OutBody::None;
+                responder.send_head(head, end_stream).await?;
+                Ok(if end_stream {
+                    BodyWriter::done()
+                } else {
+                    BodyWriter::h2(responder.writer(), framing)
+                })
             }
         }
     }
@@ -243,6 +261,22 @@ impl Responder {
                 })
                 .map_err(|_| Error::Closed)?;
                 wrote.await.map_err(|_| Error::Closed)?
+            }
+            ResponderInner::H2(mut responder) => {
+                if !no_body {
+                    head.fields
+                        .insert("content-length", body.len().to_string())
+                        .expect("digits are a field value");
+                }
+                let end_stream = no_body || responder.head_request || body.is_empty();
+                responder.send_head(head, end_stream).await?;
+                if end_stream {
+                    return Ok(());
+                }
+                let mut writer =
+                    BodyWriter::h2(responder.writer(), OutBody::Length(body.len() as u64));
+                writer.write(body).await?;
+                writer.finish().await
             }
         }
     }
@@ -388,7 +422,7 @@ impl Server {
     }
 
     /// Serves HTTPS on `addr` with the caller's certificate configuration,
-    /// cloned with ALPN `http/1.1`; returns the address bound.
+    /// cloned with ALPN `h2` and `http/1.1`; returns the address bound.
     ///
     /// # Errors
     ///
@@ -403,7 +437,7 @@ impl Server {
             return Err(Error::Closed);
         }
         let mut config = (*config).clone();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let listener = self.listen(addr)?;
         let local = listener.local_addr()?;
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
@@ -527,5 +561,9 @@ async fn serve(
             }
         }
     };
-    h1::server::serve(Conn::new(stream), ctx).await;
+    if stream.alpn() == Some(b"h2") {
+        crate::h2::conn::serve(stream, ctx).await;
+    } else {
+        h1::server::serve(Conn::new(stream), ctx).await;
+    }
 }

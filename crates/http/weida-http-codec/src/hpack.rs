@@ -234,11 +234,15 @@ impl Decoder {
     /// [`Limits::max_fields`], `"string"` for one string longer than
     /// `max_head_bytes`; `Malformed` naming the rule: `"index"`, a table
     /// size update that is `"not at the start of a block"` or
-    /// `"above the advertised table size"`, `"uppercase field name"`,
-    /// `"truncated field block"`, `"integer"`, the Huffman refusals. A
-    /// decoder that returned an error must not be used again: the dynamic
-    /// table may hold half a block (RFC 7541 §2.3.3 makes this a connection
-    /// error).
+    /// `"above the advertised table size"`, `"truncated field block"`,
+    /// `"integer"`, the Huffman refusals. After any of these the decoder must
+    /// not be used again: the dynamic table may hold half a block (RFC 7541
+    /// §2.3.3 makes this a connection error).
+    ///
+    /// `Malformed` `"uppercase field name"` is the exception: the block is
+    /// decoded to its end first, so the dynamic table stays in step with the
+    /// peer's encoder and the connection can refuse only that stream
+    /// (RFC 9113 §8.2.1). `out` then holds the block's fields.
     pub fn decode(
         &mut self,
         block: &[u8],
@@ -254,6 +258,7 @@ impl Decoder {
         let mut at_start = true;
         let mut counted = 0usize;
         let mut count = 0usize;
+        let mut uppercase = false;
         while pos < block.len() {
             let b = block[pos];
             let rest = &block[pos..];
@@ -295,9 +300,7 @@ impl Decoder {
                 (name, value, index)
             };
             at_start = false;
-            if name.iter().any(u8::is_ascii_uppercase) {
-                return Err(malformed("uppercase field name"));
-            }
+            uppercase |= name.iter().any(u8::is_ascii_uppercase);
             count += 1;
             if count > limits.max_fields {
                 return Err(DecodeError::TooLarge {
@@ -318,6 +321,9 @@ impl Decoder {
                 self.table.insert(name.clone(), value.clone());
             }
             out.push((name, value));
+        }
+        if uppercase {
+            return Err(malformed("uppercase field name"));
         }
         Ok(())
     }
@@ -496,6 +502,30 @@ mod tests {
             d.decode(&[0x40, 0x05, b'a'], L, &mut out),
             Err(malformed("truncated field block"))
         );
+    }
+
+    #[test]
+    fn an_uppercase_name_is_refused_with_the_table_in_step() {
+        let mut d = Decoder::new(4096);
+        let mut out = Vec::new();
+        // `A: v` with incremental indexing, then `b: w` likewise.
+        let block = [0x40, 0x01, b'A', 0x01, b'v', 0x40, 0x01, b'b', 0x01, b'w'];
+        assert_eq!(
+            d.decode(&block, L, &mut out),
+            Err(malformed("uppercase field name"))
+        );
+        // Both entries went in, newest first, as the peer's encoder has them;
+        // the next block can still index them (and is refused for the same
+        // name again).
+        let mut out = Vec::new();
+        d.decode(&[0xbe], L, &mut out).unwrap();
+        assert_eq!(out, [(b"b".to_vec(), b"w".to_vec())]);
+        let mut out = Vec::new();
+        assert_eq!(
+            d.decode(&[0xbf], L, &mut out),
+            Err(malformed("uppercase field name"))
+        );
+        assert_eq!(out, [(b"A".to_vec(), b"v".to_vec())]);
     }
 
     #[test]
