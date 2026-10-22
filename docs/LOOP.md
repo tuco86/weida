@@ -159,10 +159,10 @@ So the doc step is ten runs, not one, and they cost **8 s** warm together:
 
 ```sh
 export RUSTDOCFLAGS="-D warnings"
-for c in weida weida-mqtt weida-amqp weida-nats weida-nng; do
+for c in weida weida-mqtt weida-amqp weida-nats weida-nng weida-http; do
   cargo doc -q -p "$c" --no-default-features --no-deps || exit 1
 done
-for c in weida weida-zmq weida-mqtt weida-nng weida-broker; do
+for c in weida weida-zmq weida-mqtt weida-nng weida-broker weida-http; do
   cargo doc -q -p "$c" --all-features --no-deps || exit 1
 done
 ```

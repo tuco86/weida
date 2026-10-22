@@ -1403,9 +1403,10 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
 - **`weida-zmq` and `weida-nng` duplicate their core.** Each carries its own `context.rs` (the
   socket context), `pipe.rs` (the per-pipe queue pair) and `inproc.rs` (the `inproc://`
   namespace over `weida_runtime::NameRegistry`), with the same structure in both.
-- **`weida-amqp`, `weida-nats` and `weida-mqtt` duplicate their TCP+TLS `Stream`.** Each
-  defines `Stream` in `transport.rs`: an enum over a `TcpStream` and a boxed `tokio_rustls`
-  client stream, with the same `AsyncRead` and `AsyncWrite` impls.
+- **`weida-amqp`, `weida-nats`, `weida-mqtt` and `weida-http` duplicate their TCP+TLS
+  `Stream`.** Each defines `Stream` in `transport.rs`: an enum over a `TcpStream` and a boxed
+  `tokio_rustls` client stream (`weida-http` adds the server stream), with the same `AsyncRead`
+  and `AsyncWrite` impls.
 - **The Python bindings still duplicate some plumbing.** The lease (`Slot`/`Lease`), the seconds
   validation (`weida_py_core::duration`), the Ctrl-C-aware blocking wait
   (`weida_py_core::interruptible`) and the cached `bytes` getter (`LazyBytes`) now live in

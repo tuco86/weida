@@ -73,10 +73,10 @@ check_docs() {
     step cargo clean --doc
     export RUSTDOCFLAGS="-D warnings"
     step cargo doc --locked --workspace --no-deps
-    for c in weida weida-mqtt weida-amqp weida-nats weida-nng; do
+    for c in weida weida-mqtt weida-amqp weida-nats weida-nng weida-http; do
         step cargo doc --locked -q -p "$c" --no-default-features --no-deps
     done
-    for c in weida weida-zmq weida-mqtt weida-nng weida-broker; do
+    for c in weida weida-zmq weida-mqtt weida-nng weida-broker weida-http; do
         step cargo doc --locked -q -p "$c" --all-features --no-deps
     done
     unset RUSTDOCFLAGS

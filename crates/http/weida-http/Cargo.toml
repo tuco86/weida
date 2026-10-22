@@ -1,0 +1,73 @@
+[package]
+name = "weida-http"
+description = "An HTTP/1.1 and HTTP/2 client and server in Rust on a sans-I/O codec, usable with no weida in the picture"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+autotests = false
+# Published, unlike the other family libraries: `weida-openbao` speaks HTTP
+# through this crate and is itself published
+# (`docs/decisions/0044-weida-http.md` §4).
+
+[dependencies]
+# The machine room only: the reactor, the resolver and the close budget, plus
+# one OS-error vocabulary at the boundary. `weida` and `weida-protocol` MUST
+# NOT appear here (`docs/decisions/0013-competitor-libraries.md` §4.2).
+weida-core.workspace = true
+weida-runtime.workspace = true
+tokio.workspace = true
+# The sans-I/O codec: HTTP/1.1 heads and chunked bodies, HPACK and HTTP/2
+# frames. Reused rather than reimplemented; its own manifest stays empty
+# (0013 §4.3).
+weida-http-codec.workspace = true
+# Bodies are `Bytes`: a chunk read off a connection is handed to the
+# application without a copy.
+bytes.workspace = true
+# Connection lifecycle logging.
+tracing.workspace = true
+# TLS, on by default: https, and HTTP/2, which this library speaks only over
+# TLS by ALPN `h2` (0044 §4). The trust anchors are the caller's
+# `rustls::ClientConfig` / `ServerConfig`; this crate only sets ALPN on a
+# clone.
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+# A certificate for the TLS tests. The trust anchors are the caller's
+# everywhere else; here the test is the caller.
+rcgen.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "net",
+    "time",
+    "sync",
+    # `start_paused` for the tests that wait on a timer.
+    "test-util",
+] }
+tokio-rustls.workspace = true
+# The foreign peers, which always run: hyper 1 for HTTP/1.1 and HTTP/2 in
+# both roles. Dev-only, in no build of this library.
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = { version = "0.1", features = ["channel"] }
+http = "1"
+
+[features]
+default = ["tls"]
+# https and HTTP/2.
+tls = ["dep:tokio-rustls", "dep:rustls"]
+
+[lints]
+workspace = true
+
+# Integration tests are one binary (`tests/main.rs`): see its module docs.
+[[test]]
+name = "it"
+path = "tests/main.rs"
