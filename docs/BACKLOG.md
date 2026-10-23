@@ -73,7 +73,7 @@ kind: code | size: 90 | status: done b4dc3c4 | needs: []
 acceptance: `SimNet::endpoint(addr, server)` (feature `test-util`) gives a test a bare `quinn` endpoint on the network; the harness's raw clients and servers use it; `io::hostile` (41), `io::cursors` (6), `io::dedup` (3), `io::reorder` (2), `io::stats` (2), `io::raw_streams` (1), `io::interrupted` (1), `io::redial_storm` (1), `io::radio` (5) and `io::identity` (1) run in the unit tier on a paused clock with no socket (the UDP delay proxy becomes `SimNet::set_delay`, a dropped reactor becomes `SimNet::partition`, a name a resolver the harness owns), each module stress-run; 0042 and ARCHITECTURE §7 name the API. Asked for after B-374: "build more into the sim, then we can unit test it".
 
 ### B-377 — `weida+unix` on the simulated network; the unix transport tests into the unit tier
-kind: code | size: 90 | status: in_progress 2026-10-22T23:47Z | needs: [B-376]
+kind: code | size: 90 | status: done c4690c4 | needs: [B-376]
 acceptance: under `Network::sim(&net)` a `weida+unix://` binding and dial run over in-memory connections the `SimNet` keeps by path (no socket file, a fixed simulated principal, `AddrInUse` while a live listener holds the path, `ConnectionLost(PeerClosed)` where none does), through the production `UnixLocal`, grouping, chunk framing and listener code; `docs/decisions/0042` and ARCHITECTURE say so; the tests of `io::transports` and `io::local_hostile` whose claim is not the kernel's (socket files, `SO_PEERCRED`, the OS backlog) run in the unit tier on a paused clock, stress-run; the kernel ones stay in io.
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
