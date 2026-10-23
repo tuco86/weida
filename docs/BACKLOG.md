@@ -128,6 +128,14 @@ acceptance: `.config/nextest.toml` has no `terminate-after` and no `global-timeo
 kind: test | size: 90 | status: done b960b53 | needs: [B-388]
 acceptance: the owner's decisions of 2026-10-23: (1) every wait in a test on a real clock (I/O tier, real threads, the blocking facades) goes through `weida-testkit` (`within`, `until`, `poll_until`, `recv`): it reports at every multiple of an expected time and never fails for being slow; a paused-clock test keeps its limit, which `within` applies by itself because only a paused clock runs far ahead of the wall clock; (2) a test that asserted a wall-clock duration (`elapsed() < x`) moves to a paused clock where the code under test runs on the Tokio clock, and otherwise asserts the order of events instead of a bound; (3) the CI job budget stays the hang guard until zeughaus notifies (proposals #7, #8); (4) weida only: its AGENTS.md says so, the global rules stay with zeughaus #7. `weida-testkit` is a new unpublished crate named by path only, so `cargo publish` drops it. Negative windows ("nothing arrives within 200 ms") stay: they cannot turn a slow run red. Gate: every crate's unit tier, both tiers on four platforms through `run_jobs`.
 
+### B-390 — `weida-perf`: a LAN and loopback throughput harness
+kind: measure | size: 90 | status: in_progress 2026-10-23T06:43Z | needs: []
+acceptance: unpublished crate `crates/perf` (`weida-perf serve|client`) with a fixed perf identity, the weida endpoints `/sink`, `/source`, `/blob`, `/swarm` (four bindings), `/up` relayed to the radio `/live` as griasdi's screen share does, a raw quinn and a plain TCP baseline; the client prints one markdown table of push, pull, SWARM and video cases; the job `.zeughaus-ci/perf-windows-amd64.ps1` runs the client on wohnzimmer; unit tests for the frame parser and the percentile.
+
+### B-391 — LAN and loopback baselines between wohnzimmer and tuco-pc
+kind: measure | size: 45 | status: ready | needs: [B-390]
+acceptance: the `weida-perf` table on tuco-pc loopback and on the 1 GbE LAN from wohnzimmer recorded in `docs/IMPLEMENTATION.md` §4 "LAN and loopback throughput" with commands, CPUs and NIC speeds, and the targets of the throughput plan written there; one line in NIGHTLOG `## Numbers`.
+
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
