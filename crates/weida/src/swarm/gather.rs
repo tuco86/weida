@@ -349,7 +349,7 @@ impl Fetch {
     /// orders it wrote keep running.
     pub async fn next(&mut self) -> Option<Result<Piece, Error>> {
         loop {
-            if self.scheduler.delivered().all() {
+            if self.scheduler.complete() {
                 self.close_sessions();
                 return None;
             }
@@ -382,7 +382,7 @@ impl Fetch {
                     if let Some(event) = event
                         && let Some(piece) = self.handle(event)
                     {
-                        if self.scheduler.delivered().all() {
+                        if self.scheduler.complete() {
                             self.close_sessions();
                         } else {
                             self.dispatch_planned();
@@ -518,11 +518,14 @@ impl Fetch {
                         None
                     }
                     Ok(Answer::Piece(bytes)) => {
-                        self.scheduler.finish(order, Some((bytes.len() as u64, at)));
                         let Ask::Piece(index) = ask else {
                             unreachable!("only a PIECE order answers with a piece");
                         };
-                        let others = self.scheduler.deliver(index)?;
+                        // Delivered first, so finishing the order does not
+                        // hand the piece back to the free ones for a moment.
+                        let others = self.scheduler.deliver(index);
+                        self.scheduler.finish(order, Some((bytes.len() as u64, at)));
+                        let others = others?;
                         // The other copies are not needed any more. A
                         // version-1 ask is aborted; a session order cannot
                         // be taken back, so its answer arrives and is
