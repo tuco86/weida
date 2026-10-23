@@ -17,7 +17,7 @@ use crate::support;
 
 use std::time::Duration;
 
-use support::{DEADLINE, PLAIN_INFO, Server, connected, options};
+use support::{PLAIN_INFO, Server, connected, options, within};
 use tokio::io::AsyncWriteExt;
 use weida_nats::{Error, State};
 
@@ -41,16 +41,15 @@ async fn a_peer_that_stops_reading_fails_the_connection_instead_of_hanging_it() 
         }
         Ok::<(), Error>(())
     };
-    let outcome = tokio::time::timeout(DEADLINE, publishing)
-        .await
-        .expect("a publish returned an answer rather than waiting behind a stuck write");
+    let outcome = within(
+        "a publish returned an answer rather than waiting behind a stuck write",
+        publishing,
+    )
+    .await;
     let error = outcome.expect_err("64 MiB cannot go into a socket nobody reads");
     assert!(matches!(error, Error::ConnectionGone), "{error}");
 
-    match tokio::time::timeout(DEADLINE, nats.closed())
-        .await
-        .expect("the connection reports why it ended")
-    {
+    match within("the connection reports why it ended", nats.closed()).await {
         State::Failed(why) => assert!(why.contains("accepted no octets"), "{why}"),
         other => panic!("expected a failed connection, got {other:?}"),
     }
@@ -81,9 +80,11 @@ async fn a_ping_flood_does_not_keep_a_blocked_write_alive() {
             while nats.publish("flood", &chunk).await.is_ok() {}
         })
     };
-    let state = tokio::time::timeout(DEADLINE, nats.closed())
-        .await
-        .expect("the connection failed instead of being kept busy behind a stuck write");
+    let state = within(
+        "the connection failed instead of being kept busy behind a stuck write",
+        nats.closed(),
+    )
+    .await;
     flood.abort();
     publisher.abort();
     match state {
@@ -119,10 +120,12 @@ async fn reads_keep_flowing_while_a_write_is_blocked() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     server.send_msg("news", "1", None, b"still reading").await;
-    let message = tokio::time::timeout(DEADLINE, news.next())
-        .await
-        .expect("a message arrived although the client's write was blocked")
-        .expect("the subscription is live");
+    let message = within(
+        "a message arrived although the client's write was blocked",
+        news.next(),
+    )
+    .await
+    .expect("the subscription is live");
     assert_eq!(message.payload, &b"still reading"[..]);
     publisher.abort();
 }
@@ -148,9 +151,11 @@ async fn a_publisher_that_never_pauses_still_pings() {
         })
     };
     let saw_a_ping = async { while server.read_op().await != "PING" {} };
-    tokio::time::timeout(Duration::from_secs(3), saw_a_ping)
-        .await
-        .expect("a connection that never goes quiet still pings its peer");
+    within(
+        "a connection that never goes quiet still pings its peer",
+        saw_a_ping,
+    )
+    .await;
     publisher.abort();
 }
 
@@ -172,13 +177,10 @@ async fn close_ends_a_connection_whose_peer_stopped_reading() {
     };
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    tokio::time::timeout(DEADLINE, nats.close())
+    within("close returned", nats.close())
         .await
-        .expect("close returned")
         .expect("closing never fails");
-    let state = tokio::time::timeout(DEADLINE, nats.closed())
-        .await
-        .expect("the connection is over");
+    let state = within("the connection is over", nats.closed()).await;
     assert!(!state.is_usable(), "{state:?}");
     publisher.abort();
 }
@@ -190,9 +192,8 @@ async fn close_ends_a_connection_whose_peer_stopped_reading() {
 async fn close_returns_only_once_the_state_says_closed() {
     for _ in 0..50 {
         let (nats, _server) = connected(Server::listen().await, PLAIN_INFO, options()).await;
-        tokio::time::timeout(DEADLINE, nats.close())
+        within("close returned", nats.close())
             .await
-            .expect("close returned")
             .expect("closing never fails");
         assert_eq!(nats.state(), State::Closed);
     }
@@ -215,9 +216,8 @@ async fn a_burst_of_publishes_arrives_whole_and_in_order() {
     }
     assert_eq!(server.read_op().await, "PING");
     server.write(b"PONG\r\n").await;
-    tokio::time::timeout(DEADLINE, flushing)
+    within("the flush finished", flushing)
         .await
-        .expect("the flush finished")
         .expect("the task ran")
         .expect("a PONG answered it");
 }
@@ -231,9 +231,8 @@ async fn close_writes_what_was_queued_before_it() {
             .await
             .expect("queued");
     }
-    tokio::time::timeout(DEADLINE, nats.close())
+    within("close returned", nats.close())
         .await
-        .expect("close returned")
         .expect("closing never fails");
     for n in 0..100 {
         assert_eq!(server.read_op().await, format!("PUB last.words - {n}"));
@@ -264,9 +263,11 @@ async fn a_server_cannot_raise_the_inbound_cap_by_announcing_a_huge_max_payload(
     assert_eq!(server.read_op().await, "SUB big - 1");
     server.write(b"MSG big 1 3221225472\r\n").await;
 
-    match tokio::time::timeout(DEADLINE, nats.closed())
-        .await
-        .expect("the connection failed at the cap instead of waiting for the body")
+    match within(
+        "the connection failed at the cap instead of waiting for the body",
+        nats.closed(),
+    )
+    .await
     {
         State::Failed(why) => {
             assert!(why.contains("3221225472"), "{why}");
@@ -300,9 +301,8 @@ async fn queued_bytes_stay_under_the_budget_and_the_overflow_is_counted() {
     };
     assert_eq!(server.read_op().await, "PING");
     server.write(b"PONG\r\n").await;
-    tokio::time::timeout(DEADLINE, flushing)
+    within("the flush finished", flushing)
         .await
-        .expect("the flush finished")
         .expect("the task ran")
         .expect("a PONG answered it");
 
@@ -342,9 +342,8 @@ async fn a_full_queue_counts_what_it_drops() {
     };
     assert_eq!(server.read_op().await, "PING");
     server.write(b"PONG\r\n").await;
-    tokio::time::timeout(DEADLINE, flushing)
+    within("the flush finished", flushing)
         .await
-        .expect("the flush finished")
         .expect("the task ran")
         .expect("a PONG answered it");
 
@@ -381,9 +380,8 @@ async fn a_subscription_keeps_the_connection_open_after_the_connection_is_droppe
     // Not closed, and nothing written: the subscription is still wanted.
     server.expect_silence().await;
     server.send_msg("news", "1", None, b"still here").await;
-    let message = tokio::time::timeout(DEADLINE, news.next())
+    let message = within("a message arrived", news.next())
         .await
-        .expect("a message arrived")
         .expect("the subscription is live");
     assert_eq!(message.payload, &b"still here"[..]);
 
@@ -416,9 +414,8 @@ async fn a_flush_is_answered_by_its_own_pong_and_not_an_earlier_ones() {
 
     // The server answers the first `PING` and has not looked at the publish.
     server.write(b"PONG\r\n").await;
-    tokio::time::timeout(DEADLINE, first)
+    within("the first flush finished", first)
         .await
-        .expect("the first flush finished")
         .expect("the task ran")
         .expect("its own PONG answered it");
     assert!(
@@ -429,9 +426,8 @@ async fn a_flush_is_answered_by_its_own_pong_and_not_an_earlier_ones() {
     );
 
     server.write(b"PONG\r\n").await;
-    tokio::time::timeout(DEADLINE, second)
+    within("the second flush finished", second)
         .await
-        .expect("the second flush finished")
         .expect("the task ran")
         .expect("its own PONG answered it");
 }
@@ -451,13 +447,14 @@ async fn a_timeout_too_large_to_add_to_an_instant_does_not_panic_the_driver() {
     let (nats, mut server) = connected(Server::listen().await, PLAIN_INFO, options).await;
 
     nats.publish("never", b"x").await.expect("queued");
-    let seen = tokio::time::timeout(DEADLINE, server.read_op())
-        .await
-        .expect("the driver wrote the publish rather than dying");
+    let seen = within(
+        "the driver wrote the publish rather than dying",
+        server.read_op(),
+    )
+    .await;
     assert_eq!(seen, "PUB never - x");
     assert!(nats.state().is_usable());
-    tokio::time::timeout(DEADLINE, nats.close())
+    within("the close finished", nats.close())
         .await
-        .expect("the close finished")
         .expect("closed");
 }

@@ -2160,12 +2160,12 @@ mod tests {
             assert!(infos[0].remote_addr.is_some());
 
             // The server side is admitted too, once its own handshake finishes.
-            for _ in 0..100 {
-                if server.pipes().len() == 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            weida_testkit::until(
+                "the server side admitting the pipe",
+                Duration::from_millis(500),
+                || server.pipes().len() == 1,
+            )
+            .await;
             assert_eq!(server.pipes().len(), 1);
             assert_eq!(server.pipe_infos()[0].role, Role::Listen);
         }
@@ -2249,12 +2249,10 @@ mod tests {
                 .listen(&Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap())
                 .await
                 .expect("listen");
-            for _ in 0..200 {
-                if client.pipes().len() == 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            weida_testkit::until("the retry finding the peer", Duration::from_secs(1), || {
+                client.pipes().len() == 1
+            })
+            .await;
             assert_eq!(client.pipes().len(), 1, "the retry found the peer");
             dialer.close();
         }
@@ -2282,14 +2280,11 @@ mod tests {
             let first = client.pipe_infos()[0].id;
 
             client.close_pipe(first);
-            for _ in 0..200 {
+            weida_testkit::until("the dialer redialling", Duration::from_secs(1), || {
                 let pipes = client.pipe_infos();
-                if pipes.len() == 1 && pipes[0].id != first {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            panic!("the dialer did not redial");
+                pipes.len() == 1 && pipes[0].id != first
+            })
+            .await;
         }
         /// Claim: all three pipe events reach the callback in order, and the
         /// callback's refusal at `ADD_PRE` keeps the pipe out of the socket —
@@ -2321,12 +2316,10 @@ mod tests {
 
             let id = client.pipe_infos()[0].id;
             client.close_pipe(id);
-            for _ in 0..200 {
-                if events.lock().unwrap().contains(&PipeEvent::RemPost) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            weida_testkit::until("the remove-post event", Duration::from_secs(1), || {
+                events.lock().unwrap().contains(&PipeEvent::RemPost)
+            })
+            .await;
             assert_eq!(
                 events.lock().unwrap().first(),
                 Some(&PipeEvent::AddPre),
@@ -2387,12 +2380,12 @@ mod tests {
 
             let dialer = client.dial(listener.url()).await.expect("dial");
             dialer.close();
-            for _ in 0..200 {
-                if client.pipes().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            weida_testkit::until(
+                "the dialer taking its pipe with it",
+                Duration::from_secs(1),
+                || client.pipes().is_empty(),
+            )
+            .await;
             assert!(
                 client.pipes().is_empty(),
                 "the dialer took its pipe with it"
@@ -2449,7 +2442,7 @@ mod tests {
                 EndpointType::Rep,
                 SocketOptions {
                     max_pipes_per_peer: 2,
-                    handshake_timeout: Duration::from_secs(5),
+                    handshake_timeout: Duration::from_secs(3600),
                     ..SocketOptions::default()
                 },
                 &seen,
@@ -2472,12 +2465,12 @@ mod tests {
                         .expect("connect"),
                 );
             }
-            for _ in 0..200 {
-                if server.lock().pipes.len() == 2 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            weida_testkit::until(
+                "two silent peers holding two slots",
+                Duration::from_secs(1),
+                || server.lock().pipes.len() == 2,
+            )
+            .await;
             assert_eq!(
                 server.lock().pipes.len(),
                 2,
@@ -2488,10 +2481,13 @@ mod tests {
                 .await
                 .expect("connect");
             let mut buffer = [0u8; 16];
-            let read = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buffer))
-                .await
-                .expect("the third connection from this host is closed rather than held")
-                .expect("read");
+            let read = weida_testkit::within(
+                "the third connection from this host being closed rather than held",
+                Duration::from_secs(2),
+                third.read(&mut buffer),
+            )
+            .await
+            .expect("read");
             assert_eq!(read, 0, "nothing is sent to a refused connection");
             assert_eq!(server.lock().pipes.len(), 2);
 
@@ -2503,19 +2499,19 @@ mod tests {
                 socket
                     .bind("127.0.0.2:0".parse().unwrap())
                     .expect("a second source address");
-                let _other = tokio::time::timeout(
+                let _other = weida_testkit::within(
+                    "the connect from a second source address",
                     Duration::from_secs(2),
                     socket.connect(addr.parse().unwrap()),
                 )
                 .await
-                .expect("connect")
                 .expect("connected");
-                for _ in 0..200 {
-                    if server.lock().pipes.len() == 3 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+                weida_testkit::until(
+                    "the third pipe, from another source address",
+                    Duration::from_secs(1),
+                    || server.lock().pipes.len() == 3,
+                )
+                .await;
                 assert_eq!(
                     server.lock().pipes.len(),
                     3,
@@ -2541,9 +2537,12 @@ mod tests {
 
             let wait = client.changed();
             client.dial(listener.url()).await.expect("dial");
-            tokio::time::timeout(Duration::from_secs(2), wait)
-                .await
-                .expect("the wait saw the pipe arrive although it was first polled afterwards");
+            weida_testkit::within(
+                "the wait seeing the pipe arrive although it was first polled afterwards",
+                Duration::from_secs(2),
+                wait,
+            )
+            .await;
         }
         /// Claim: what a retired pipe left in the socket's buffer takes its turn
         /// among the live pipes and is not served ahead of them. A peer that
@@ -2553,9 +2552,12 @@ mod tests {
         #[tokio::test]
         async fn what_a_retired_pipe_left_behind_takes_its_turn_among_the_live_pipes() {
             async fn bounded<T>(step: impl Future<Output = T>) -> T {
-                tokio::time::timeout(Duration::from_secs(10), step)
-                    .await
-                    .expect("the step finished within 10 s")
+                weida_testkit::within(
+                    "a step of the retired-pipe test",
+                    Duration::from_secs(10),
+                    step,
+                )
+                .await
             }
 
             let ctx = Context::new(ContextConfig::default()).expect("context");

@@ -5,7 +5,6 @@ use crate::zguide_clone::clone::{CloneClient, clone_server};
 use crate::zguide_clone::espresso::{espresso, render};
 use crate::zguide_clone::last_value_cache::last_value_cache;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 use weida_zmq::{Message, Multipart, PubSocket, Result, SubSocket};
 
 use crate::zguide_clone::*;
@@ -27,16 +26,16 @@ async fn a_snapshot_carries_the_state_and_the_raced_updates_are_discarded() -> R
     let mut writer = CloneClient::connect(&context, &server.ports, "/client/")?;
     let mut reader = CloneClient::connect(&context, &server.ports, "/client/")?;
     //  The subscription is live once a beat has arrived over it.
-    reader.wait_for_beat(PATIENCE).await?;
+    patient("the first beat", reader.wait_for_beat(FOREVER)).await?;
 
     for (key, value) in [("/client/a", "1"), ("/client/b", "2"), ("/client/a", "3")] {
-        writer.set(key, value.as_bytes(), PATIENCE).await?;
+        patient("the update", writer.set(key, value.as_bytes(), FOREVER)).await?;
     }
     //  Wait for the server to have numbered all three before asking, so the
     //  snapshot is the one that contains them.
     until(|| server.sequence.load(Ordering::Relaxed) == 3).await;
 
-    reader.snapshot(PATIENCE).await?;
+    patient("the snapshot", reader.snapshot(FOREVER)).await?;
     assert_eq!(reader.sequence, 3, "KTHXBAI carried the highest sequence");
     assert_eq!(reader.map.len(), 2, "two keys, one of them written twice");
     assert_eq!(
@@ -70,15 +69,15 @@ async fn an_update_after_the_snapshot_is_applied_and_an_empty_value_deletes() ->
     let server = clone_server(&context, BEAT).await?;
     let mut writer = CloneClient::connect(&context, &server.ports, "/client/")?;
     let mut reader = CloneClient::connect(&context, &server.ports, "/client/")?;
-    reader.wait_for_beat(PATIENCE).await?;
-    writer.set("/client/a", b"1", PATIENCE).await?;
+    patient("the first beat", reader.wait_for_beat(FOREVER)).await?;
+    patient("the update", writer.set("/client/a", b"1", FOREVER)).await?;
     until(|| server.sequence.load(Ordering::Relaxed) == 1).await;
-    reader.snapshot(PATIENCE).await?;
+    patient("the snapshot", reader.snapshot(FOREVER)).await?;
     reader.apply_pending(QUIET).await?;
     let beats_after_snapshot = reader.beats;
 
     //  Newer than the snapshot: applied.
-    writer.set("/client/b", b"2", PATIENCE).await?;
+    patient("the update", writer.set("/client/b", b"2", FOREVER)).await?;
     until_async(
         |reader: &mut CloneClient| reader.map.contains_key("/client/b"),
         &mut reader,
@@ -87,7 +86,7 @@ async fn an_update_after_the_snapshot_is_applied_and_an_empty_value_deletes() ->
     assert_eq!(reader.sequence, 2, "the sequence moved with it");
 
     //  "an empty value meaning delete"
-    writer.set("/client/a", b"", PATIENCE).await?;
+    patient("the delete", writer.set("/client/a", b"", FOREVER)).await?;
     until_async(
         |reader: &mut CloneClient| !reader.map.contains_key("/client/a"),
         &mut reader,
@@ -101,7 +100,11 @@ async fn an_update_after_the_snapshot_is_applied_and_an_empty_value_deletes() ->
 
     //  And the beats kept coming without touching the map.
     let keys_before = reader.map.len();
-    reader.apply_pending(BEAT * 3).await?;
+    until_async(
+        |reader: &mut CloneClient| reader.beats > beats_after_snapshot,
+        &mut reader,
+    )
+    .await;
     assert!(
         reader.beats > beats_after_snapshot,
         "HUGZ kept arriving: {} then {}",
@@ -192,16 +195,22 @@ async fn the_capture_socket_shows_subscriptions_data_and_unsubscriptions() -> Re
     ])
     .expect("two frames");
     //  Published until it crosses, which is the slow joiner and not a fault.
-    let deadline = Instant::now() + PATIENCE;
-    while publisher.publish(message.clone()).delivered == 0 {
-        assert!(Instant::now() < deadline, "the subscription never crossed");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    subscriber.recv_timeout(PATIENCE).await?;
+    weida_testkit::until("the subscription to cross", PATIENCE, || {
+        publisher.publish(message.clone()).delivered != 0
+    })
+    .await;
+    weida_testkit::within("the published message", PATIENCE, subscriber.recv()).await?;
     subscriber.unsubscribe("A")?;
     subscriber.unsubscribe("B")?;
 
+    //  Wait for all five, however long that takes, then keep a short window
+    //  open only to see that nothing more follows.
     let mut captured = Vec::new();
+    while captured.len() < 5 {
+        let message =
+            weida_testkit::within("a captured message", PATIENCE, trace.capture.recv()).await?;
+        captured.push(render(&message));
+    }
     while let Ok(message) = trace.capture.recv_timeout(QUIET).await {
         captured.push(render(&message));
     }
@@ -237,12 +246,11 @@ async fn a_late_subscriber_catches_up_to_the_last_value_and_no_more() -> Result<
             Message::from(body.as_bytes().to_vec()),
         ])
         .expect("two frames");
-        let deadline = Instant::now() + PATIENCE;
-        while publisher.publish(message.clone()).delivered == 0 {
-            assert!(Instant::now() < deadline, "the subscription never crossed");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        early.recv_timeout(PATIENCE).await?;
+        weida_testkit::until("the subscription to cross", PATIENCE, || {
+            publisher.publish(message.clone()).delivered != 0
+        })
+        .await;
+        weida_testkit::within("the published message", PATIENCE, early.recv()).await?;
     }
 
     //  A new subscriber, and **nothing published after it**: without the
@@ -251,7 +259,7 @@ async fn a_late_subscriber_catches_up_to_the_last_value_and_no_more() -> Result<
     let mut late = SubSocket::new(&context)?;
     late.connect(&cache.subscriber_endpoint)?;
     late.subscribe("A")?;
-    let caught_up = late.recv_timeout(PATIENCE).await?;
+    let caught_up = weida_testkit::within("the cached value", PATIENCE, late.recv()).await?;
     assert_eq!(
         (
             caught_up.frames()[0].as_slice(),

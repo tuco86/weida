@@ -27,6 +27,21 @@ use weida_runtime::Exec;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
+/// A bounded wait that cannot fail a test for being slow: it has the shape of
+/// `tokio::time::timeout(..)`, but past `expected` the step is reported by
+/// `weida_testkit::within` and the wait goes on.
+#[track_caller]
+fn timeout<F: Future>(
+    expected: Duration,
+    future: F,
+) -> impl Future<Output = Result<F::Output, std::convert::Infallible>> {
+    let at = std::panic::Location::caller();
+    async move {
+        let what = format!("the step at {}:{}", at.file(), at.line());
+        Ok(weida_testkit::within(&what, expected, future).await)
+    }
+}
+
 /// The peer's version, so that a measurement in `docs/libraries/amqp.md` names
 /// what it was measured against.
 const PEER: &str = "fe2o3-amqp 0.17.0";
@@ -48,7 +63,7 @@ async fn bound() -> (TcpListener, u16) {
 }
 
 async fn connect(exec: &Exec, port: u16) -> Connection {
-    tokio::time::timeout(
+    timeout(
         DEADLINE,
         Connection::connect(exec, "127.0.0.1", port, options()),
     )
@@ -90,11 +105,11 @@ async fn our_sender_is_read_by_a_fe2o3_receiver() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut sender = tokio::time::timeout(
+    let mut sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("interop-sender", Target::at("q1"))),
     )
@@ -103,7 +118,7 @@ async fn our_sender_is_read_by_a_fe2o3_receiver() {
     .expect("the peer answered our attach");
 
     let message = Message::value(weida_amqp_codec::Value::String("from weida-amqp"));
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&message))
+    let sent = timeout(DEADLINE, sender.send(&message))
         .await
         .expect("credit arrived from the peer")
         .expect("the message went out");
@@ -111,17 +126,17 @@ async fn our_sender_is_read_by_a_fe2o3_receiver() {
     // `fe2o3-amqp`'s acceptor grants credit by itself
     // (`CreditMode::Auto`), which is why this send completes without the
     // test granting anything — and the disposition is the peer's answer.
-    let outcome = tokio::time::timeout(DEADLINE, sender.settled(sent.delivery_id))
+    let outcome = timeout(DEADLINE, sender.settled(sent.delivery_id))
         .await
         .expect("the peer settled")
         .expect("an outcome");
     assert_eq!(outcome, Outcome::Accepted, "{PEER} accepted the message");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, peer).await.unwrap().unwrap();
+    timeout(DEADLINE, peer).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -156,11 +171,11 @@ async fn our_receiver_reads_a_fe2o3_sender() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("interop-receiver", Source::at("q1"))),
     )
@@ -168,11 +183,11 @@ async fn our_receiver_reads_a_fe2o3_sender() {
     .unwrap()
     .expect("the peer answered our attach");
 
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(4))
+    timeout(DEADLINE, receiver.grant_credit(4))
         .await
         .unwrap()
         .unwrap();
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .expect("the peer sent under our credit")
         .expect("a delivery");
@@ -182,16 +197,16 @@ async fn our_receiver_reads_a_fe2o3_sender() {
         Body::Value(weida_amqp_codec::Value::String("from fe2o3")),
         "{PEER} encodes an amqp-value body of one string"
     );
-    tokio::time::timeout(DEADLINE, receiver.accept(delivery.delivery_id))
+    timeout(DEADLINE, receiver.accept(delivery.delivery_id))
         .await
         .unwrap()
         .unwrap();
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, peer).await.unwrap().unwrap();
+    timeout(DEADLINE, peer).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -240,11 +255,11 @@ async fn a_message_split_across_frames_arrives_whole_at_the_peer() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut sender = tokio::time::timeout(
+    let mut sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("interop-large", Target::at("q1"))),
     )
@@ -252,7 +267,7 @@ async fn a_message_split_across_frames_arrives_whole_at_the_peer() {
     .unwrap()
     .unwrap();
 
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(&[b'z'; 8192])))
+    let sent = timeout(DEADLINE, sender.send(&Message::data(&[b'z'; 8192])))
         .await
         .unwrap()
         .unwrap();
@@ -264,17 +279,17 @@ async fn a_message_split_across_frames_arrives_whole_at_the_peer() {
     // Waiting for the outcome before closing is not politeness: `close` is
     // the last frame ever written, so a client that closed here would be
     // asserting that the frames left rather than that the peer read them.
-    let outcome = tokio::time::timeout(DEADLINE, sender.settled(sent.delivery_id))
+    let outcome = timeout(DEADLINE, sender.settled(sent.delivery_id))
         .await
         .expect("the peer answered")
         .expect("an outcome");
     assert_eq!(outcome, Outcome::Accepted);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, peer).await.unwrap().unwrap();
+    timeout(DEADLINE, peer).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -303,14 +318,14 @@ async fn rcv_settle_mode_second_is_accepted_by_this_peer_and_refused_when_it_say
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut asked = LinkOptions::sender("second-probe", Target::at("q1"));
     asked.snd_settle_mode = SenderSettleMode::Unsettled;
     asked.rcv_settle_mode = ReceiverSettleMode::Second;
-    let link = tokio::time::timeout(DEADLINE, session.attach(asked))
+    let link = timeout(DEADLINE, session.attach(asked))
         .await
         .unwrap()
         .expect("the attach was answered");
@@ -319,11 +334,11 @@ async fn rcv_settle_mode_second_is_accepted_by_this_peer_and_refused_when_it_say
         ReceiverSettleMode::Second,
         "{PEER} with SupportedReceiverSettleModes::Both honours `second`"
     );
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, peer).await.unwrap().unwrap();
+    timeout(DEADLINE, peer).await.unwrap().unwrap();
 
     // Probe two: an acceptor configured to support `first` only, which is the
     // shape the sheet describes. The refusal is what a client has to read,
@@ -349,14 +364,14 @@ async fn rcv_settle_mode_second_is_accepted_by_this_peer_and_refused_when_it_say
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut asked = LinkOptions::sender("second-refused", Target::at("q1"));
     asked.snd_settle_mode = SenderSettleMode::Unsettled;
     asked.rcv_settle_mode = ReceiverSettleMode::Second;
-    let refused = tokio::time::timeout(DEADLINE, session.attach(asked))
+    let refused = timeout(DEADLINE, session.attach(asked))
         .await
         .expect("the peer answered rather than hanging");
     match refused {
@@ -377,8 +392,8 @@ async fn rcv_settle_mode_second_is_accepted_by_this_peer_and_refused_when_it_say
             );
         }
     }
-    let _ = tokio::time::timeout(DEADLINE, connection.close()).await;
-    let _ = tokio::time::timeout(DEADLINE, peer).await;
+    let _ = timeout(DEADLINE, connection.close()).await;
+    let _ = timeout(DEADLINE, peer).await;
 }
 
 #[tokio::test]
@@ -401,7 +416,7 @@ async fn the_terminus_expiry_policy_we_ask_for_comes_back_in_the_answer() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
@@ -410,7 +425,7 @@ async fn the_terminus_expiry_policy_we_ask_for_comes_back_in_the_answer() {
     source.timeout = 600;
     let mut asked = LinkOptions::receiver("expiry-probe", source);
     asked.max_message_size = Some(64 * 1024);
-    let link = tokio::time::timeout(DEADLINE, session.attach(asked))
+    let link = timeout(DEADLINE, session.attach(asked))
         .await
         .unwrap()
         .expect("the attach was answered");
@@ -432,11 +447,11 @@ async fn the_terminus_expiry_policy_we_ask_for_comes_back_in_the_answer() {
         "{PEER} echoed the expiry policy asked for rather than substituting its own"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    let _ = tokio::time::timeout(DEADLINE, peer).await;
+    let _ = timeout(DEADLINE, peer).await;
 }
 
 #[tokio::test]
@@ -469,11 +484,11 @@ async fn a_reattach_after_the_peer_let_go_is_a_new_link_and_not_a_resumption() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut first = tokio::time::timeout(
+    let mut first = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("resume-probe", Target::at("q1"))),
     )
@@ -486,15 +501,15 @@ async fn a_reattach_after_the_peer_let_go_is_a_new_link_and_not_a_resumption() {
     );
     // The peer closes it; waiting for that is what makes the next attach
     // sequential rather than racing.
-    let _ = tokio::time::timeout(DEADLINE, first.next_delivery()).await;
-    let _ = tokio::time::timeout(DEADLINE, first.detach()).await;
+    let _ = timeout(DEADLINE, first.next_delivery()).await;
+    let _ = timeout(DEADLINE, first.detach()).await;
 
     // The measurement: this client's second `attach` of the same name
     // carries **no `unsettled` map**, which is exactly what distinguishes a
     // re-attach from a *resuming* attach (Part 2 §2.6.13). So the peer gets
     // a new link, nothing is recovered, and this client claims no link
     // recovery.
-    let again = tokio::time::timeout(
+    let again = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("resume-probe", Target::at("q1"))),
     )
@@ -503,11 +518,11 @@ async fn a_reattach_after_the_peer_let_go_is_a_new_link_and_not_a_resumption() {
     .expect("a re-attach of a name the peer has let go is a new link");
     assert!(again.unsettled().is_empty(), "and it resumed nothing");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    let _ = tokio::time::timeout(DEADLINE, peer).await;
+    let _ = timeout(DEADLINE, peer).await;
 }
 
 #[tokio::test]
@@ -544,11 +559,11 @@ async fn this_peer_refuses_a_duplicate_link_name_rather_than_stealing_it() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let _first = tokio::time::timeout(
+    let _first = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("stolen-probe", Target::at("q1"))),
     )
@@ -559,13 +574,13 @@ async fn this_peer_refuses_a_duplicate_link_name_rather_than_stealing_it() {
     // Our own second attach steals locally — that is Part 2 §2.6.1 and this
     // client implements it — but what the *peer* does with it is the
     // measurement, and this peer does not implement the steal.
-    let second = tokio::time::timeout(
+    let second = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("stolen-probe", Target::at("q1"))),
     )
     .await
     .expect("the peer answered rather than hanging");
-    let refusal = tokio::time::timeout(DEADLINE, peer).await.unwrap().unwrap();
+    let refusal = timeout(DEADLINE, peer).await.unwrap().unwrap();
     let refusal = refusal.expect("the peer refused the duplicate name");
     assert!(
         !refusal.is_empty(),
@@ -578,7 +593,7 @@ async fn this_peer_refuses_a_duplicate_link_name_rather_than_stealing_it() {
         second.is_err(),
         "the peer's refusal has to reach the caller somehow"
     );
-    let _ = tokio::time::timeout(DEADLINE, connection.close()).await;
+    let _ = timeout(DEADLINE, connection.close()).await;
 }
 
 #[tokio::test]
@@ -601,7 +616,7 @@ async fn a_transactional_attach_is_not_something_this_client_can_ask_for() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
@@ -627,7 +642,7 @@ async fn a_transactional_attach_is_not_something_this_client_can_ask_for() {
         "amqp:multi-txns-per-ssn",
         "amqp:multi-ssns-per-txn",
     ];
-    let link = tokio::time::timeout(
+    let link = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("txn-probe", Target::at("q1"))),
     )
@@ -643,9 +658,9 @@ async fn a_transactional_attach_is_not_something_this_client_can_ask_for() {
          coordinator capabilities, and this client offers none either: {offered:?}"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    let _ = tokio::time::timeout(DEADLINE, peer).await;
+    let _ = timeout(DEADLINE, peer).await;
 }

@@ -21,9 +21,7 @@ use weida::{
 pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("an identity step", DEADLINE, f).await
 }
 
 /// Spawns an echo replier and returns nothing; the handler runs until the

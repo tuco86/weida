@@ -20,8 +20,9 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Long enough for a QUIC handshake on a loaded machine, short enough that a
-/// hang is a failure rather than a coffee break.
+/// The expected time of one step: long enough for a QUIC handshake on a
+/// loaded machine. Past it a step reports and keeps waiting; a hang ends with
+/// the job's budget.
 const DEADLINE: Duration = Duration::from_secs(20);
 
 const BIN: &str = env!("CARGO_BIN_EXE_weida");
@@ -57,8 +58,8 @@ impl Served {
             .expect("spawn the binary");
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take();
-        // On a thread, because a `serve` that never binds must time out here
-        // rather than block the test for ever.
+        // On a thread, because a `serve` that never binds would otherwise
+        // block this one with nothing to report while it waits.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -66,10 +67,10 @@ impl Served {
             let read = reader.read_line(&mut line);
             let _ = tx.send(read.map(|_| (line, reader)));
         });
-        let (address, stdout) = match rx.recv_timeout(DEADLINE) {
+        let (address, stdout) = match weida_testkit::recv(&rx, "the served address", DEADLINE) {
             Ok(Ok((line, reader))) => (line.trim().to_owned(), reader),
             Ok(Err(e)) => panic!("reading the served address: {e}"),
-            Err(_) => panic!("the binary printed no address within {DEADLINE:?}"),
+            Err(_) => panic!("the binary exited without printing an address"),
         };
         assert!(
             !address.is_empty(),
@@ -117,7 +118,7 @@ fn run(args: &[&str], payload: &[u8]) -> (i32, Vec<u8>) {
         .expect("write the payload");
     let mut stdout = child.stdout.take().expect("piped stdout");
     // The child is waited for on a thread for the same reason `start` reads
-    // on one: a client that hangs must fail this test, not own it.
+    // on one: a client that hangs is reported while it is waited for.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut out = Vec::new();
@@ -125,10 +126,10 @@ fn run(args: &[&str], payload: &[u8]) -> (i32, Vec<u8>) {
         let status = child.wait();
         let _ = tx.send(read.and(status).map(|s| (s.code().unwrap_or(-1), out)));
     });
-    match rx.recv_timeout(DEADLINE) {
+    match weida_testkit::recv(&rx, &format!("{args:?} to finish"), DEADLINE) {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => panic!("running {args:?}: {e}"),
-        Err(_) => panic!("{args:?} did not finish within {DEADLINE:?}"),
+        Err(_) => panic!("{args:?} ended without a result"),
     }
 }
 
@@ -187,7 +188,7 @@ fn help_and_version_are_answers_rather_than_errors() {
     }
 }
 
-/// Reads `want` bytes from a running server's own stdout, bounded.
+/// Reads `want` bytes from a running server's own stdout.
 fn sunk(server: &mut Served, want: usize) -> Vec<u8> {
     let mut stdout = server.stdout.take().expect("the served stdout");
     let (tx, rx) = mpsc::channel();
@@ -196,10 +197,10 @@ fn sunk(server: &mut Served, want: usize) -> Vec<u8> {
         let read = stdout.read_exact(&mut buf);
         let _ = tx.send(read.map(|()| buf));
     });
-    match rx.recv_timeout(DEADLINE) {
+    match weida_testkit::recv(&rx, "the sink's stdout", DEADLINE) {
         Ok(Ok(buf)) => buf,
         Ok(Err(e)) => panic!("reading the sink's stdout: {e}"),
-        Err(_) => panic!("the sink printed nothing within {DEADLINE:?}"),
+        Err(_) => panic!("the sink's stdout ended without a result"),
     }
 }
 
@@ -287,7 +288,8 @@ fn publish_until_exit(
     line: &str,
     sub: &mut Stopped,
 ) -> (i32, Vec<u8>, Vec<u8>) {
-    let until = Instant::now() + DEADLINE;
+    let started = Instant::now();
+    let mut reported = 0u32;
     loop {
         publisher.say(line);
         if let Some(status) = sub.0.try_wait().expect("poll the subscriber") {
@@ -307,10 +309,10 @@ fn publish_until_exit(
                 .expect("read the subscriber's stderr");
             return (status.code().unwrap_or(-1), stdout, stderr);
         }
-        assert!(
-            Instant::now() < until,
-            "the subscriber did not finish within {DEADLINE:?}"
-        );
+        if started.elapsed() > DEADLINE * (reported + 1) {
+            reported += 1;
+            eprintln!("still waiting for the subscriber to finish: past {reported} x {DEADLINE:?}");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }

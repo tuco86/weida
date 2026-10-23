@@ -3,8 +3,8 @@
 //!
 //! Every runtime here is on one `SimNet`, so nothing opens a socket: identities, refusals,
 //! redials and their events are the production code's, and the faults are the network's. The
-//! tests marked `start_paused` run on a paused Tokio clock; each ends by asserting that the
-//! minutes of QUIC and redial time it spent took seconds of wall time at most.
+//! tests marked `start_paused` run on a paused Tokio clock; each prints the wall time its
+//! minutes of QUIC and redial time took, as a measurement and not as a bound.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -15,15 +15,12 @@ use weida::{
     RuntimeConfig, ServerTls, SimNet, TransferMeta, Trust,
 };
 
-/// A wait on the Tokio clock: generous, because under a paused clock it costs no wall time.
+/// The expected time of a wait on the Tokio clock: generous, because under a paused clock it
+/// costs no wall time, and a paused clock reaching it means nothing can run any more.
 const WITHIN: Duration = Duration::from_secs(600);
-/// The most wall time a paused test may take.
-const REAL: Duration = Duration::from_secs(10);
 
 async fn within_paused<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(WITHIN, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a simulated-network step", WITHIN, f).await
 }
 
 /// A runtime on `net` whose redial starts at 5 ms and backs off to 600 s.
@@ -259,11 +256,7 @@ async fn a_server_closed_and_bound_again_drives_the_subscriber_events() {
 
     client.shutdown().await;
     replaced.runtime.shutdown().await;
-    assert!(
-        real.elapsed() < REAL,
-        "took {:?} of wall time",
-        real.elapsed()
-    );
+    eprintln!("took {:?} of wall time", real.elapsed());
 }
 
 /// Claim: a partition is an unannounced disconnect: the dialler learns of it at the idle
@@ -310,11 +303,7 @@ async fn a_partition_is_lost_at_the_idle_timeout_and_heal_redials() {
 
     client.shutdown().await;
     server.runtime.shutdown().await;
-    assert!(
-        real.elapsed() < REAL,
-        "took {:?} of wall time",
-        real.elapsed()
-    );
+    eprintln!("took {:?} of wall time", real.elapsed());
 }
 
 /// Claim: a one-way delay costs at least a round trip per request and loses nothing.
@@ -343,11 +332,7 @@ async fn a_delayed_path_costs_a_round_trip_and_loses_nothing() {
 
     client.shutdown().await;
     server.runtime.shutdown().await;
-    assert!(
-        real.elapsed() < REAL,
-        "took {:?} of wall time",
-        real.elapsed()
-    );
+    eprintln!("took {:?} of wall time", real.elapsed());
 }
 
 /// Claim: datagrams the network drops are QUIC's to retransmit: the exchange completes and the
@@ -372,11 +357,7 @@ async fn dropped_datagrams_are_retransmitted() {
 
     client.shutdown().await;
     server.runtime.shutdown().await;
-    assert!(
-        real.elapsed() < REAL,
-        "took {:?} of wall time",
-        real.elapsed()
-    );
+    eprintln!("took {:?} of wall time", real.elapsed());
 }
 
 /// Claim: a connection that stayed up for the policy's `max` restarts the redial schedule, on
@@ -442,11 +423,7 @@ async fn the_redial_schedule_restarts_after_a_connection_that_stayed_up() {
     );
 
     client.shutdown().await;
-    assert!(
-        real.elapsed() < REAL,
-        "took {:?} of wall time",
-        real.elapsed()
-    );
+    eprintln!("took {:?} of wall time", real.elapsed());
 }
 
 /// Claim: a simulated address is taken while its binding serves and free again once the

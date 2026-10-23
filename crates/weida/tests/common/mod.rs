@@ -650,16 +650,19 @@ impl Restartable {
         let listener = runtime.listener();
         // A restart re-binds the port the old server just released; on a
         // `SimNet` it is free at once, so the retry is a guard.
-        let binding = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match listener.bind_quic(addr, certs.server_tls()).await {
-                    Ok(binding) => break binding,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        let binding = weida_testkit::within(
+            "the port to be free again",
+            Duration::from_secs(10),
+            async {
+                loop {
+                    match listener.bind_quic(addr, certs.server_tls()).await {
+                        Ok(binding) => break binding,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    }
                 }
-            }
-        })
-        .await
-        .expect("the port is free again");
+            },
+        )
+        .await;
         let addr = binding.local_addr();
         Restartable {
             _runtime: runtime,

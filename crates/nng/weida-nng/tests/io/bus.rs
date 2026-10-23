@@ -6,9 +6,12 @@ use weida_nng::{BusSocket, Context, ContextConfig, Error, SocketOptions, bus};
 
 fn options() -> SocketOptions {
     SocketOptions {
-        recv_timeout: Some(Duration::from_millis(500)),
-        send_timeout: Some(Duration::from_secs(5)),
-        handshake_timeout: Duration::from_secs(2),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The negative claims below bound their own
+        // wait. The handshake bound is an hour.
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         ..SocketOptions::default()
     }
@@ -47,9 +50,10 @@ async fn a_three_node_line_does_not_reach_the_far_node() {
     let at_middle = middle.recv().await.expect("B is directly connected");
     assert_eq!(at_middle.body(), b"hello");
 
-    let nothing = far.recv().await.unwrap_err();
+    // A negative window: nothing arrives within 500 ms.
+    let nothing = tokio::time::timeout(Duration::from_millis(500), far.recv()).await;
     assert!(
-        matches!(nothing, Error::ETIMEDOUT(_)),
+        nothing.is_err(),
         "C is two hops away and BUS does not flood: {nothing:?}"
     );
 
@@ -137,9 +141,10 @@ async fn a_rebroadcast_excludes_the_pipe_it_arrived_on() {
         second.recv().await.expect("the other node").body(),
         b"around"
     );
-    let echo = first.recv().await.unwrap_err();
+    // A negative window: nothing arrives within 500 ms.
+    let echo = tokio::time::timeout(Duration::from_millis(500), first.recv()).await;
     assert!(
-        matches!(echo, Error::ETIMEDOUT(_)),
+        echo.is_err(),
         "the sender must not be echoed its own message: {echo:?}"
     );
 

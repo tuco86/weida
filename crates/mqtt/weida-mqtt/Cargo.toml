@@ -46,6 +46,8 @@ tokio-rustls = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Waits that report instead of killing (B-389).
+weida-testkit.workspace = true
 # Drives the owned-context tests from an executor that is not tokio, which is
 # what `Context::owned` exists for.
 futures.workspace = true

@@ -5,8 +5,9 @@
 //! and in what order. A real `nats-server` (`tests/interop_nats_server.rs`)
 //! proves interoperability; these tests prove the sequence.
 //!
-//! Every await in every test that uses this is bounded by [`DEADLINE`], so a
-//! wrong turn fails the test rather than hanging the suite.
+//! Every await in every test that uses this goes through [`within`], which
+//! reports a step that outruns [`DEADLINE`] and keeps waiting: a slow run is
+//! not a failed run.
 
 // Each integration test binary uses part of this module. A helper that is
 // unused in one binary is not dead code in the crate.
@@ -21,8 +22,16 @@ use weida_nats::options::ConnectionOptions;
 use weida_nats_codec::{Headers, Limits, Op};
 use weida_runtime::Exec;
 
-/// Every await in a test is bounded by this.
+/// How long a step of a test is expected to take at most: past it, [`within`]
+/// reports and goes on waiting.
 pub const DEADLINE: Duration = Duration::from_secs(5);
+
+/// Waits for `future`, which a test expects within [`DEADLINE`]. On a real
+/// clock a slow step is reported and waited for, never failed; on a paused
+/// clock it fails at the expected time (a hang).
+pub async fn within<F: Future>(what: &str, future: F) -> F::Output {
+    weida_testkit::within(what, DEADLINE, future).await
+}
 
 /// How long a test waits to establish that the client has written *nothing*.
 ///
@@ -85,10 +94,12 @@ impl Server {
     /// NATS close: there is no `CLOSE` verb.
     pub async fn expect_end_of_stream(&mut self) {
         let mut probe = [0u8; 256];
-        let read = tokio::time::timeout(DEADLINE, self.stream.read(&mut probe))
-            .await
-            .expect("the client closed within the deadline")
-            .expect("a clean read");
+        let read = within(
+            "the client closed within the deadline",
+            self.stream.read(&mut probe),
+        )
+        .await
+        .expect("a clean read");
         assert_eq!(
             read,
             0,
@@ -296,11 +307,12 @@ fn optional(raw: Option<&[u8]>) -> String {
     raw.map_or_else(|| "-".to_owned(), text)
 }
 
-/// Test options: short deadlines, and a ping interval long enough that no
-/// keep-alive fires unless a test asks for one.
+/// Test options: a handshake budget that cannot fire (a test about the
+/// expiry sets its own), and a ping interval long enough that no keep-alive
+/// fires unless a test asks for one.
 pub fn options() -> ConnectionOptions {
     let mut options = ConnectionOptions::new();
-    options.handshake_timeout = Duration::from_secs(2);
+    options.handshake_timeout = Duration::from_secs(3600);
     options.ping_interval = Duration::from_secs(60);
     options
 }
@@ -324,16 +336,14 @@ pub async fn connected(
         server.handshake(&info).await;
         server
     });
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "the handshake finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("the handshake finished")
     .expect("the connection opened");
-    let server = tokio::time::timeout(DEADLINE, server)
+    let server = within("the server script finished", server)
         .await
-        .expect("the server script finished")
         .expect("the server script did not panic");
     (nats, server)
 }

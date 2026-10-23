@@ -14,26 +14,24 @@ the tests here are what says they run at the same time:
   both directions: its methods raise `ENOTSOCK`, and splitting twice is the
   same refusal rather than a second pair of halves.
 
-Every coroutine runs under a wall-clock bound, so a binding that deadlocks
-fails instead of hanging (docs/LOOP.md 2).
+Every coroutine runs under a wait that reports when it takes long and goes
+on waiting, so a binding that deadlocks is ended by the CI job's budget
+(docs/LOOP.md 2).
 """
 
 import asyncio
 
 import pytest
 
+import waits
 import weida_zmq
 
 DEADLINE = 10.0
 
 
 def run(coroutine):
-    """Runs one coroutine to completion, under a deadline."""
-
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    """Runs one coroutine to completion, reporting past the expected time."""
+    return waits.run(coroutine, DEADLINE)
 
 
 def test_dealer_sends_while_recv_is_parked():
@@ -58,7 +56,7 @@ def test_dealer_sends_while_recv_is_parked():
         assert asked.frames[1:] == [b"ask"]
         await server.send([asked.frames[0], b"answer"])
 
-        answer = await asyncio.wait_for(parked, DEADLINE)
+        answer = await waits.within("the parked receive", parked, DEADLINE)
         assert answer == [b"answer"]
 
     run(exchange())

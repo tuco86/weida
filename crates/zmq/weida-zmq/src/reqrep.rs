@@ -555,14 +555,12 @@ mod tests {
             // Lazy Pirate: after EFSM, throw the socket away. The reply then has
             // nowhere to go and is discarded rather than blocking the server.
             drop(client);
-            let gone = std::time::Instant::now();
-            while server.peer_count() > 0 {
-                assert!(
-                    gone.elapsed() < Duration::from_secs(10),
-                    "the closed requester never went away"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            weida_testkit::until(
+                "the closed requester to go away",
+                weida_testkit::EXPECTED,
+                || server.peer_count() == 0,
+            )
+            .await;
             assert_eq!(server.send("late").await.expect("reply"), Sent::Dropped);
 
             // And a fresh socket completes its own exchange, which is what
@@ -618,26 +616,27 @@ mod tests {
 
             // Two requests, and each server sees exactly one: the rotation.
             client.send("a").await.expect("first");
-            let served_first = tokio::time::timeout(Duration::from_secs(5), first.recv()).await;
-            let (mut asked, mut other) = match served_first {
-                Ok(Ok(request)) => {
-                    assert_eq!(body(&request), vec![b"a".to_vec()]);
-                    (first, second)
-                }
-                _ => {
-                    let request = second.recv().await.expect("the other server");
-                    assert_eq!(body(&request), vec![b"a".to_vec()]);
-                    (second, first)
-                }
+            let (request, first_asked) =
+                weida_testkit::within("the first request", weida_testkit::EXPECTED, async {
+                    tokio::select! {
+                        request = first.recv() => (request.expect("the first server"), true),
+                        request = second.recv() => (request.expect("the second server"), false),
+                    }
+                })
+                .await;
+            assert_eq!(body(&request), vec![b"a".to_vec()]);
+            let (mut asked, mut other) = if first_asked {
+                (first, second)
+            } else {
+                (second, first)
             };
 
             // The server that was *not* asked speaks anyway. A REQ socket must
             // discard that silently, so the real reply is what arrives.
             other_speaks_unasked(&mut other).await;
             asked.send("the real reply").await.expect("reply");
-            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
+            let reply = weida_testkit::within("a reply", Duration::from_secs(5), client.recv())
                 .await
-                .expect("a reply arrived")
                 .expect("reply");
             assert_eq!(body(&reply), vec![b"the real reply".to_vec()]);
         }
@@ -711,9 +710,8 @@ mod tests {
             });
 
             client.send("hello").await.expect("send");
-            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
+            let reply = weida_testkit::within("a reply", Duration::from_secs(5), client.recv())
                 .await
-                .expect("a reply arrived")
                 .expect("reply");
             assert_eq!(body(&reply), vec![b"fresh".to_vec()]);
             peer.await.expect("the peer");
@@ -761,9 +759,8 @@ mod tests {
             });
 
             client.send("hello").await.expect("send");
-            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
+            let reply = weida_testkit::within("a reply", Duration::from_secs(5), client.recv())
                 .await
-                .expect("a reply arrived")
                 .expect("reply");
             assert_eq!(body(&reply), vec![b"proper".to_vec()]);
             peer.await.expect("the peer");
@@ -811,9 +808,8 @@ mod tests {
             assert_eq!(body(&two), vec![b"second".to_vec()]);
             server.send("answer to second").await.expect("reply");
 
-            let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
+            let reply = weida_testkit::within("a reply", Duration::from_secs(5), client.recv())
                 .await
-                .expect("a reply arrived")
                 .expect("reply");
             assert_eq!(
                 body(&reply),

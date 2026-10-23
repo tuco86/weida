@@ -13,6 +13,7 @@ import asyncio
 
 import pytest
 
+import waits
 import weida_zmq
 
 DEADLINE = 10.0
@@ -78,10 +79,7 @@ FIVE_REASONS = {
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine, DEADLINE)
 
 
 def test_the_whole_table_is_reachable():
@@ -186,12 +184,11 @@ def test_a_subscription_set_as_an_option_is_applied_or_refused_at_construction()
         bound = await publisher.bind("inproc://option-subscribe")
         await subscriber.connect(bound)
 
-        for _ in range(200):
+        while True:
             published = await publisher.send([b"weather.eu", b"rain"])
             if published.delivered == 1:
                 break
             await asyncio.sleep(0.01)
-        assert published.delivered == 1, "the option's subscription was not applied"
         assert await subscriber.recv() == [b"weather.eu", b"rain"]
 
         # A socket type with no subscriptions refuses the same options where

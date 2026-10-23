@@ -43,9 +43,7 @@ pub(crate) mod guide_late_is_lost;
 pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a guide step", DEADLINE, f).await
 }
 
 /// The `Error` half of §1.3's vocabulary, without a network: the three

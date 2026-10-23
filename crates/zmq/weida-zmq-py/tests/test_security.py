@@ -18,6 +18,7 @@ import sys
 
 import pytest
 
+import waits
 import weida_zmq
 
 DEADLINE = 10.0
@@ -29,10 +30,7 @@ VERSION, REQUEST_ID, DOMAIN, ADDRESS, IDENTITY, MECHANISM = range(6)
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine, DEADLINE)
 
 
 class ZapHandler:
@@ -109,7 +107,7 @@ def test_a_python_zap_handler_answers_200_and_the_message_flows():
         await source.connect(endpoint)
 
         await source.send(b"authorized")
-        assert await sink.recv(timeout=5.0) == [b"authorized"]
+        assert await sink.recv() == [b"authorized"]
         assert handler.requests, "the handler was asked"
 
         # The user id the handler issued is readable on the peer, as its own
@@ -220,7 +218,6 @@ def test_a_curve_keys_hash_is_keyed_per_process():
             [sys.executable, "-c", program],
             capture_output=True,
             text=True,
-            timeout=DEADLINE,
             check=True,
         ).stdout
         for _ in range(3)
@@ -270,7 +267,7 @@ def test_curve_authenticates_both_ends_and_zap_sees_the_clients_key():
         await source.connect(endpoint)
 
         await source.send(b"encrypted")
-        assert await sink.recv(timeout=5.0) == [b"encrypted"]
+        assert await sink.recv() == [b"encrypted"]
         assert seen["key"] == client_public.bytes
         assert (await sink.peers())[0].user_id == "curve-client"
 
@@ -313,7 +310,7 @@ def test_a_routing_id_set_as_an_option_is_what_the_peer_announces():
         await dealer.connect(endpoint)
 
         await dealer.send(b"hello")
-        request = await router.recv(timeout=5.0)
+        request = await router.recv()
         assert request[0] == b"worker-3", "ROUTER addresses the id the peer chose"
 
         peers = await router.peers()

@@ -10,7 +10,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use weida_amqp::link::{LinkEvent, LinkOptions};
 use weida_amqp::session::{SessionOptions, SessionState};
 use weida_amqp::{Condition, Connection, Source, State, Target};
@@ -213,7 +213,7 @@ async fn a_second_attach_for_an_answered_link_steals_it_instead_of_remapping() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
@@ -224,11 +224,11 @@ async fn a_second_attach_for_an_answered_link_steals_it_instead_of_remapping() {
         handle_max: 3,
         ..SessionOptions::default()
     };
-    let session = tokio::time::timeout(DEADLINE, connection.begin(session_options))
+    let session = timeout(DEADLINE, connection.begin(session_options))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
@@ -236,10 +236,7 @@ async fn a_second_attach_for_an_answered_link_steals_it_instead_of_remapping() {
     .unwrap()
     .unwrap();
 
-    match tokio::time::timeout(DEADLINE, receiver.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, receiver.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(Some(detached))) => {
             assert_eq!(detached.condition, condition::LINK_STOLEN);
         }
@@ -251,19 +248,13 @@ async fn a_second_attach_for_an_answered_link_steals_it_instead_of_remapping() {
         "the takeover is of the link, not the session"
     );
     // Closing before the server has read the answers would race them.
-    tokio::time::timeout(DEADLINE, done_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, done_rx).await.unwrap().unwrap();
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -290,7 +281,7 @@ async fn an_attach_handle_above_the_handle_max_we_advertised_closes_the_connecti
         );
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
@@ -301,12 +292,12 @@ async fn an_attach_handle_above_the_handle_max_we_advertised_closes_the_connecti
         handle_max: 3,
         ..SessionOptions::default()
     };
-    let session = tokio::time::timeout(DEADLINE, connection.begin(session_options))
+    let session = timeout(DEADLINE, connection.begin(session_options))
         .await
         .unwrap()
         .unwrap();
 
-    let attached = tokio::time::timeout(
+    let attached = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
@@ -317,19 +308,13 @@ async fn an_attach_handle_above_the_handle_max_we_advertised_closes_the_connecti
         "the attach that was waiting on the answer is not completed"
     );
 
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(closed)) => {
             assert_eq!(closed.condition, condition::CONNECTION_FRAMING_ERROR);
         }
         other => panic!("expected Closed with framing-error, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -359,33 +344,27 @@ async fn a_second_answering_begin_is_illegal_state() {
         assert_eq!(condition.as_deref(), Some(condition::ILLEGAL_STATE));
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(session.state(), SessionState::Begun);
     begun_tx.send(()).expect("the server is waiting");
 
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(closed)) => {
             assert_eq!(closed.condition, condition::ILLEGAL_STATE);
         }
         other => panic!("expected Closed with illegal-state, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -415,18 +394,18 @@ async fn a_begin_cannot_resurrect_a_session_the_client_ended_with_an_error() {
         assert_eq!(condition.as_deref(), Some(condition::ILLEGAL_STATE));
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(
+    timeout(
         DEADLINE,
         session.end_with(Some(Condition::new(condition::DECODE_ERROR))),
     )
@@ -435,10 +414,7 @@ async fn a_begin_cannot_resurrect_a_session_the_client_ended_with_an_error() {
     .unwrap();
     assert!(session.state().is_discarding());
 
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(closed)) => {
             assert_eq!(closed.condition, condition::ILLEGAL_STATE);
         }
@@ -449,8 +425,5 @@ async fn a_begin_cannot_resurrect_a_session_the_client_ended_with_an_error() {
         SessionState::Begun,
         "a session ended with an error is not begun again"
     );
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }

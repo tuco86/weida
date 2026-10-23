@@ -636,7 +636,7 @@ mod tests {
     async fn a_reply_filed_by_a_sibling_wakes_the_context_it_belongs_to() {
         let ctx = Context::new(ContextConfig::default()).expect("context");
         let options = SocketOptions {
-            recv_timeout: Some(Duration::from_secs(2)),
+            recv_timeout: None,
             resend_time: Duration::from_secs(60),
             ..SocketOptions::default()
         };
@@ -655,7 +655,13 @@ mod tests {
 
         route(&socket.shared, PipeId::new(1), arrived(7, b"mine"));
 
-        let reply = waiting.await.expect("the reply the sibling filed");
+        let reply = weida_testkit::within(
+            "the reply the sibling filed",
+            Duration::from_secs(10),
+            waiting,
+        )
+        .await
+        .expect("the reply the sibling filed");
         assert_eq!(reply.body(), b"mine");
     }
 }
@@ -680,8 +686,8 @@ mod drop_tests {
         async fn a_reply_sent_just_before_the_replier_is_dropped_is_delivered() {
             let ctx = Context::new(ContextConfig::default()).expect("context");
             let options = SocketOptions {
-                recv_timeout: Some(Duration::from_secs(5)),
-                send_timeout: Some(Duration::from_secs(5)),
+                recv_timeout: None,
+                send_timeout: None,
                 ..SocketOptions::default()
             };
             for round in 0..30 {
@@ -718,8 +724,8 @@ mod drop_tests {
         async fn a_reply_sent_just_before_a_dialling_replier_is_dropped_is_delivered() {
             let ctx = Context::new(ContextConfig::default()).expect("context");
             let options = SocketOptions {
-                recv_timeout: Some(Duration::from_secs(5)),
-                send_timeout: Some(Duration::from_secs(5)),
+                recv_timeout: None,
+                send_timeout: None,
                 ..SocketOptions::default()
             };
             for round in 0..30 {

@@ -13,8 +13,7 @@
 
 use crate::support;
 
-use support::{DEADLINE, Server, options};
-use tokio::time::timeout;
+use support::{Server, options, within};
 use weida_nats::{Connection, RefusalKind, State};
 use weida_runtime::Exec;
 
@@ -49,21 +48,19 @@ async fn a_refused_publish_is_reported_and_the_connection_goes_on() {
         server
     });
 
-    let nats = timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut refusals = nats.refusals();
     nats.publish("orders.created", b"hello")
         .await
         .expect("queued");
 
-    let refusal = timeout(DEADLINE, refusals.next())
+    let refusal = within("the refusal arrived", refusals.next())
         .await
-        .expect("the refusal arrived")
         .expect("the connection is open");
     assert_eq!(refusal.kind, RefusalKind::PermissionViolation);
     assert_eq!(refusal.subject.as_deref(), Some("orders.created"));
@@ -72,17 +69,16 @@ async fn a_refused_publish_is_reported_and_the_connection_goes_on() {
         "the server's own sentence, without its quotes"
     );
 
-    timeout(DEADLINE, nats.flush())
+    within("the flush finished", nats.flush())
         .await
-        .expect("the flush finished")
         .expect("a refusal is not a failed connection");
     assert_eq!(nats.state(), State::Connected);
     nats.publish("orders.shipped", b"again")
         .await
         .expect("queued");
 
-    let _server = timeout(DEADLINE, server).await.unwrap().unwrap();
-    timeout(DEADLINE, nats.close()).await.unwrap().unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// A subscription the server refuses ends, and says why. The server holds no
@@ -108,38 +104,38 @@ async fn a_refused_subscription_ends_with_its_reason_and_the_connection_goes_on(
         server
     });
 
-    let nats = timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut refusals = nats.refusals();
     let mut secret = nats.subscribe("secret.>").await.expect("subscribed");
 
     assert!(
-        timeout(DEADLINE, secret.next())
-            .await
-            .expect("the subscription ended rather than waiting for ever")
-            .is_none()
+        within(
+            "the subscription ended rather than waiting for ever",
+            secret.next()
+        )
+        .await
+        .is_none()
     );
     let reason = secret.refusal().expect("it says why it ended");
     assert_eq!(reason.kind, RefusalKind::PermissionViolation);
     assert_eq!(reason.subject.as_deref(), Some("secret.>"));
-    let told = timeout(DEADLINE, refusals.next()).await.unwrap().unwrap();
+    let told = within("a step of the test", refusals.next()).await.unwrap();
     assert_eq!(&told, reason, "the connection is told as well");
 
     let mut public = nats.subscribe("public.>").await.expect("still subscribing");
-    let message = timeout(DEADLINE, public.next())
+    let message = within("a message arrived", public.next())
         .await
-        .expect("a message arrived")
         .expect("the subscription is live");
     assert_eq!(message.payload, &b"headline"[..]);
     assert!(public.refusal().is_none());
 
-    let _server = timeout(DEADLINE, server).await.unwrap().unwrap();
-    timeout(DEADLINE, nats.close()).await.unwrap().unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// A refusal that names no subscription — the server does not say which `SUB`
@@ -161,31 +157,29 @@ async fn a_refusal_that_names_no_subscription_ends_none() {
         server
     });
 
-    let nats = timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut refusals = nats.refusals();
     let mut events = nats.subscribe("events").await.expect("subscribed");
 
-    let first = timeout(DEADLINE, refusals.next()).await.unwrap().unwrap();
+    let first = within("a step of the test", refusals.next()).await.unwrap();
     assert_eq!(first.kind, RefusalKind::InvalidSubject);
-    let second = timeout(DEADLINE, refusals.next()).await.unwrap().unwrap();
+    let second = within("a step of the test", refusals.next()).await.unwrap();
     assert_eq!(second.kind, RefusalKind::SubscriptionLimit);
 
-    let message = timeout(DEADLINE, events.next())
+    let message = within("a message arrived", events.next())
         .await
-        .expect("a message arrived")
         .expect("the subscription was not ended by a refusal that named none");
     assert_eq!(message.payload, &b"still here"[..]);
     assert!(events.refusal().is_none());
     assert_eq!(nats.state(), State::Connected);
 
-    let _server = timeout(DEADLINE, server).await.unwrap().unwrap();
-    timeout(DEADLINE, nats.close()).await.unwrap().unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// Every other `-ERR` still ends the connection, in the server's own words,
@@ -208,27 +202,25 @@ async fn any_other_error_still_ends_the_connection() {
             server
         });
 
-        let nats = timeout(
-            DEADLINE,
+        let nats = within(
+            "finished",
             Connection::connect(&exec, "127.0.0.1", port, options()),
         )
         .await
-        .expect("finished")
         .expect("opened");
         let mut refusals = nats.refusals();
 
-        match timeout(DEADLINE, nats.closed()).await.expect("it ended") {
+        match within("it ended", nats.closed()).await {
             State::Failed(text) => assert!(text.contains(reason), "{reason}: {text}"),
             other => panic!("{reason}: expected Failed, got {other:?}"),
         }
         assert!(
-            timeout(DEADLINE, refusals.next())
+            within("the reader was told the connection ended", refusals.next())
                 .await
-                .expect("the reader was told the connection ended")
                 .is_none(),
             "{reason} is not a refusal"
         );
-        let _server = timeout(DEADLINE, server).await.unwrap().unwrap();
+        let _server = within("a step of the test", server).await.unwrap();
     }
 }
 
@@ -262,20 +254,19 @@ async fn a_flood_of_refusals_is_bounded_and_counted() {
 
     let mut options = options();
     options.refusal_queue = 4;
-    let nats = timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut refusals = nats.refusals();
-    timeout(DEADLINE, nats.flush()).await.unwrap().unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
 
     // The second PONG follows every refusal on the wire, so by the time this
     // flush returns the driver has seen all of them while nobody was reading.
-    timeout(DEADLINE, nats.flush()).await.unwrap().unwrap();
-    let _server = timeout(DEADLINE, server).await.unwrap().unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
 
     let mut subjects = Vec::new();
     while let Some(refusal) = refusals.try_next() {
@@ -292,5 +283,5 @@ async fn a_flood_of_refusals_is_bounded_and_counted() {
         "and the rest are counted"
     );
 
-    timeout(DEADLINE, nats.close()).await.unwrap().unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }

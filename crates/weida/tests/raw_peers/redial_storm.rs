@@ -17,9 +17,7 @@ use weida::{Network, ReconnectPolicy, Runtime, RuntimeConfig, SimNet};
 const BOUND: Duration = Duration::from_secs(10);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(BOUND, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a redial-storm step", BOUND, f).await
 }
 
 #[tokio::test(start_paused = true)]

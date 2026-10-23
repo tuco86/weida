@@ -1407,10 +1407,15 @@ mod tests {
     use crate::options::ServerOptions;
     use crate::server::State;
 
-    async fn within<F: Future>(f: F) -> F::Output {
-        tokio::time::timeout(Duration::from_secs(10), f)
-            .await
-            .expect("within 10 s")
+    /// One step of a test, expected within ten seconds: past that the wait
+    /// reports and goes on instead of failing (`weida_testkit::within`).
+    #[track_caller]
+    fn within<F: Future>(f: F) -> impl Future<Output = F::Output> {
+        let at = std::panic::Location::caller();
+        async move {
+            let what = format!("the step at {}:{}", at.file(), at.line());
+            weida_testkit::within(&what, Duration::from_secs(10), f).await
+        }
     }
 
     fn local(stream_window: u32) -> Local {

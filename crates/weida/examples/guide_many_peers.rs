@@ -166,9 +166,13 @@ pub async fn selection() -> Result<Selection, Error> {
     let mut push_per_peer = Vec::with_capacity(pullers.len());
     for puller in &pullers {
         let mut mine = 0;
-        // Each puller is asked for one more than its share and the extra wait
-        // is what proves the share: a fourth message would have to come from
-        // somewhere.
+        // Each puller is owed its share, which is awaited however long it
+        // takes; the short window after it is what proves it is no more: a
+        // fourth message would have to come from somewhere.
+        for _ in 0..PUSHES / pullers.len() {
+            puller.recv().await?.collect(1024).await?;
+            mine += 1;
+        }
         while let Ok(Ok(transfer)) =
             tokio::time::timeout(Duration::from_millis(250), puller.recv()).await
         {
@@ -195,6 +199,12 @@ pub async fn selection() -> Result<Selection, Error> {
     let mut fanout_per_subscriber = Vec::with_capacity(subs.len());
     for (_, sub) in &subs {
         let mut mine = 0;
+        // Both ticks are awaited, however long they take; only then does a
+        // short window check that no third copy follows.
+        for _ in 0..2 {
+            sub.recv().await?.collect(1024).await?;
+            mine += 1;
+        }
         while let Ok(Ok(transfer)) =
             tokio::time::timeout(Duration::from_millis(250), sub.recv()).await
         {
@@ -235,6 +245,12 @@ pub async fn selection() -> Result<Selection, Error> {
     let mut bus_per_member = Vec::with_capacity(members.len());
     for member in &members {
         let mut mine = 0;
+        // Every other member's message is awaited, however long it takes;
+        // only then does a short window check that no third one follows.
+        for _ in 0..members.len() - 1 {
+            member.recv().await?.collect(1024).await?;
+            mine += 1;
+        }
         while let Ok(Ok(transfer)) =
             tokio::time::timeout(Duration::from_millis(250), member.recv()).await
         {
@@ -335,8 +351,8 @@ pub async fn slow_reader() -> Result<SlowReader, Error> {
         if publisher.publish("px.eur", payload.clone())? == 2 {
             reached_both += 1;
         }
-        match tokio::time::timeout(Duration::from_secs(5), reading.recv()).await {
-            Ok(Ok(transfer)) => {
+        match reading.recv().await {
+            Ok(transfer) => {
                 transfer.collect(64 * 1024).await?;
                 healthy_received += 1;
             }
@@ -520,9 +536,7 @@ pub async fn width(widths: &[usize], messages: usize) -> Result<Vec<Width>, Erro
             drains.push(tokio::spawn(async move {
                 let mut mine = 0;
                 for _ in 0..messages {
-                    let Ok(Ok(transfer)) =
-                        tokio::time::timeout(Duration::from_secs(10), sub.recv()).await
-                    else {
+                    let Ok(transfer) = sub.recv().await else {
                         break;
                     };
                     if transfer.collect(64 * 1024).await.is_err() {
@@ -579,11 +593,12 @@ pub struct Surveyed {
 /// rotating past it. SURVEY is the one that has to answer "what if a peer
 /// never answers at all", and its answer is the deadline the caller passes:
 /// the run returns what arrived, and what did not arrive is the difference.
+/// `deadline` is the survey's window: the silent peer is cut off when it ends.
 ///
 /// # Errors
 ///
 /// Whatever binding, dialling or surveying reports.
-pub async fn survey_with_a_silent_peer() -> Result<Surveyed, Error> {
+pub async fn survey_with_a_silent_peer(deadline: Duration) -> Result<Surveyed, Error> {
     const ASKED: usize = 3;
 
     let mut servers = Vec::new();
@@ -626,9 +641,7 @@ pub async fn survey_with_a_silent_peer() -> Result<Surveyed, Error> {
     for server in &servers {
         surveyor.connect(&server.url).await?;
     }
-    let mut run = surveyor
-        .survey(b"who is there", Duration::from_millis(500))
-        .await?;
+    let mut run = surveyor.survey(b"who is there", deadline).await?;
     let mut answered = 0;
     while let Some(answer) = run.next(1024).await {
         if answer.is_ok() {
@@ -712,7 +725,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("§2.5 a silent peer");
-    let surveyed = survey_with_a_silent_peer().await?;
+    let surveyed = survey_with_a_silent_peer(Duration::from_millis(500)).await?;
     println!(
         "     asked {}, answered {}, silent {} within the deadline",
         surveyed.asked, surveyed.answered, surveyed.missing

@@ -13,8 +13,6 @@
 //! The namespace's own rules (one owner per name, the 256-byte budget, drop
 //! as unbind) are unit-tested in `src/inproc.rs`.
 
-use std::time::Duration;
-
 use weida_zmq::{
     Context, ContextConfig, DealerSocket, Message, Multipart, PairSocket, PubSocket, PullSocket,
     PushSocket, RepSocket, ReqSocket, RouterSocket, SubSocket, XPubSocket, XSubSocket,
@@ -42,12 +40,8 @@ fn text(message: &Multipart) -> Vec<u8> {
     message.frames()[0].as_slice().to_vec()
 }
 
-async fn wait_for(mut done: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(std::time::Instant::now() < deadline, "condition never held");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+async fn wait_for(done: impl FnMut() -> bool) {
+    weida_testkit::until("the condition", weida_testkit::EXPECTED, done).await;
 }
 
 /// Claim: REQ and REP complete a round trip over `inproc://` — the state

@@ -38,6 +38,8 @@ rcgen.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Waits that report instead of killing (B-389).
+weida-testkit.workspace = true
 # The scripted HTTP server the tests answer from.
 tokio = { workspace = true, features = ["io-util", "net"] }
 

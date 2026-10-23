@@ -47,8 +47,19 @@ use clone::CloneClient;
 /// Fast enough that a test is quick, slow enough that a loaded machine is not
 /// a failure.
 pub(crate) const BEAT: Duration = Duration::from_millis(100);
-/// A message this library cannot deliver in this long is a bug.
+/// How long a wait runs before it reports; it never fails a test.
 pub(crate) const PATIENCE: Duration = Duration::from_secs(5);
+
+/// The patience handed to an example call whose expiry is not the claim: it
+/// cannot fire in practice, and [`patient`] reports a slow call instead.
+pub(crate) const FOREVER: Duration = Duration::from_secs(3600);
+
+/// Awaits an example call that was given [`FOREVER`], reporting past
+/// `PATIENCE` instead of failing.
+pub(crate) async fn patient<T>(what: &str, call: impl Future<Output = T>) -> T {
+    weida_testkit::within(what, PATIENCE, call).await
+}
+
 /// Long enough that "nothing more arrived" means it.
 pub(crate) const QUIET: Duration = Duration::from_millis(300);
 
@@ -118,13 +129,9 @@ fn an_active_server_told_its_peer_is_active_reports_a_split_brain() {
     );
 }
 
-/// Waits for a condition, failing the test rather than hanging the suite.
-pub(crate) async fn until(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
-    while !ready() {
-        assert!(Instant::now() < deadline, "the condition never held");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+/// Waits for a condition, reporting past `PATIENCE` instead of failing.
+pub(crate) async fn until(ready: impl FnMut() -> bool) {
+    weida_testkit::until("the condition", PATIENCE, ready).await;
 }
 
 /// The same, for a condition that needs the client to read its socket first.
@@ -132,12 +139,13 @@ pub(crate) async fn until_async(
     mut ready: impl FnMut(&mut CloneClient) -> bool,
     client: &mut CloneClient,
 ) -> () {
-    let deadline = Instant::now() + PATIENCE;
-    while !ready(client) {
-        assert!(Instant::now() < deadline, "the condition never held");
-        client
-            .apply_pending(Duration::from_millis(50))
-            .await
-            .expect("reading the update stream");
-    }
+    weida_testkit::within("the condition", PATIENCE, async {
+        while !ready(client) {
+            client
+                .apply_pending(Duration::from_millis(50))
+                .await
+                .expect("reading the update stream");
+        }
+    })
+    .await;
 }

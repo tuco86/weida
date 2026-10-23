@@ -7,10 +7,11 @@ interop suites (docs/LOOP.md section 2): the file is always collected, it runs
 where a broker answers, and it never hangs waiting for one.
 """
 
-import asyncio
 import socket
 
 import pytest
+
+import waits
 
 # Where `crates/mqtt/weida-mqtt/tests/interop/rumqttd.toml` listens. Not 1883:
 # that is where a developer's own broker lives, and a test that silently
@@ -43,18 +44,15 @@ def broker():
 
 @pytest.fixture
 def run():
-    """Runs a coroutine under a deadline.
+    """Runs a coroutine to completion, reporting while it takes long.
 
-    Every await in these tests is bounded, so a broker that stops answering
-    ends a test instead of hanging it. `asyncio.run` per test rather than one
-    loop for the file: each test gets a fresh loop, and a context that outlived
-    its loop is a bug this shape cannot have.
+    There is no time limit on a real clock: a slow run is still a run, and
+    `waits.run` says on stderr what it is still waiting for. The hang guard is
+    the CI job's own budget. `asyncio.run` per test rather than one loop for
+    the file: each test gets a fresh loop, and a context that outlived its
+    loop is a bug this shape cannot have.
     """
-
-    def runner(coro, timeout=15):
-        return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
-
-    return runner
+    return waits.run
 
 
 @pytest.fixture

@@ -11,7 +11,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use weida_amqp::link::{LinkEvent, LinkOptions};
 use weida_amqp::session::SessionOptions;
 use weida_amqp::{Connection, Error, Source, Target};
@@ -205,18 +205,18 @@ async fn a_delivery_nobody_granted_credit_for_detaches_the_link() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
@@ -224,24 +224,18 @@ async fn a_delivery_nobody_granted_credit_for_detaches_the_link() {
     .unwrap()
     .unwrap();
 
-    match tokio::time::timeout(DEADLINE, receiver.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, receiver.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(Some(detached))) => {
             assert_eq!(detached.condition, condition::LINK_TRANSFER_LIMIT_EXCEEDED);
         }
         other => panic!("expected a detach with transfer-limit-exceeded, got {other:?}"),
     }
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -301,18 +295,18 @@ async fn what_was_in_flight_when_credit_was_lowered_is_still_accepted() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
@@ -320,23 +314,20 @@ async fn what_was_in_flight_when_credit_was_lowered_is_still_accepted() {
     .unwrap()
     .unwrap();
 
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(5))
+    timeout(DEADLINE, receiver.grant_credit(5))
         .await
         .unwrap()
         .unwrap();
     for _ in 0..2 {
-        tokio::time::timeout(DEADLINE, receiver.next_delivery())
+        timeout(DEADLINE, receiver.next_delivery())
             .await
             .unwrap()
             .expect("an in-flight delivery under the granted credit");
     }
 
-    tokio::time::timeout(DEADLINE, receiver.stop())
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, receiver.stop()).await.unwrap().unwrap();
     for expected in 2..5u32 {
-        let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+        let delivery = timeout(DEADLINE, receiver.next_delivery())
             .await
             .unwrap()
             .expect("a delivery that was in flight when credit was lowered");
@@ -345,24 +336,18 @@ async fn what_was_in_flight_when_credit_was_lowered_is_still_accepted() {
 
     // The link was not detached by the five deliveries above: the sixth is
     // the first event that can be a detach.
-    match tokio::time::timeout(DEADLINE, receiver.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, receiver.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(Some(detached))) => {
             assert_eq!(detached.condition, condition::LINK_TRANSFER_LIMIT_EXCEEDED);
         }
         other => panic!("expected a detach with transfer-limit-exceeded, got {other:?}"),
     }
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -405,7 +390,7 @@ async fn an_unsettled_delivery_that_finds_the_map_full_is_refused() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
@@ -418,11 +403,11 @@ async fn an_unsettled_delivery_that_finds_the_map_full_is_refused() {
         incoming_window: 4096,
         ..SessionOptions::default()
     };
-    let session = tokio::time::timeout(DEADLINE, connection.begin(session_options))
+    let session = timeout(DEADLINE, connection.begin(session_options))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
@@ -430,17 +415,14 @@ async fn an_unsettled_delivery_that_finds_the_map_full_is_refused() {
     .unwrap()
     .unwrap();
 
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(5000))
+    timeout(DEADLINE, receiver.grant_credit(5000))
         .await
         .unwrap()
         .expect("a settled-on-send link may be granted past the map");
 
     let mut delivered = 0usize;
     loop {
-        match tokio::time::timeout(DEADLINE, receiver.next_event())
-            .await
-            .unwrap()
-        {
+        match timeout(DEADLINE, receiver.next_event()).await.unwrap() {
             Some(LinkEvent::Delivery(_)) => delivered += 1,
             Some(LinkEvent::Detached(Some(detached))) => {
                 assert_eq!(detached.condition, condition::RESOURCE_LIMIT_EXCEEDED);
@@ -456,14 +438,11 @@ async fn an_unsettled_delivery_that_finds_the_map_full_is_refused() {
         "the first 2048 were recorded, the refused one was not"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -498,18 +477,18 @@ async fn a_grant_the_map_cannot_hold_is_refused() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
@@ -517,20 +496,20 @@ async fn a_grant_the_map_cannot_hold_is_refused() {
     .unwrap()
     .unwrap();
 
-    let refused = tokio::time::timeout(DEADLINE, receiver.grant_credit(2049))
+    let refused = timeout(DEADLINE, receiver.grant_credit(2049))
         .await
         .unwrap();
     assert!(
         matches!(refused, Err(Error::Configuration(_))),
         "one more than the map can hold is refused before it is sent"
     );
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(2048))
+    timeout(DEADLINE, receiver.grant_credit(2048))
         .await
         .unwrap()
         .expect("exactly what the map can hold");
 
     for _ in 0..3 {
-        tokio::time::timeout(DEADLINE, receiver.next_delivery())
+        timeout(DEADLINE, receiver.next_delivery())
             .await
             .unwrap()
             .expect("an unsettled delivery within the grant");
@@ -538,26 +517,23 @@ async fn a_grant_the_map_cannot_hold_is_refused() {
     assert_eq!(receiver.unsettled().len(), 3);
 
     // Three are held, so 2045 is the room left.
-    let refused = tokio::time::timeout(DEADLINE, receiver.grant_credit(2046))
+    let refused = timeout(DEADLINE, receiver.grant_credit(2046))
         .await
         .unwrap();
     assert!(
         matches!(refused, Err(Error::Configuration(_))),
         "the held deliveries count against the room"
     );
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(2045))
+    timeout(DEADLINE, receiver.grant_credit(2045))
         .await
         .unwrap()
         .expect("the room that is left");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -593,67 +569,59 @@ async fn a_settle_on_a_detached_link_is_an_error_and_not_an_acknowledgement() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(1))
+    timeout(DEADLINE, receiver.grant_credit(1))
         .await
         .unwrap()
         .unwrap();
 
     // The delivery was handed over before the detach, so it comes first.
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("the delivery that arrived before the detach");
     assert_eq!(delivery.delivery_id, 0);
-    match tokio::time::timeout(DEADLINE, receiver.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, receiver.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(None)) => {}
         other => panic!("expected a clean detach, got {other:?}"),
     }
 
     // Delivery 0 is still held, and the link is gone, so acknowledging it
     // cannot reach the peer: that is an error, not a silent success.
-    let refused = tokio::time::timeout(DEADLINE, receiver.accept(0))
-        .await
-        .unwrap();
+    let refused = timeout(DEADLINE, receiver.accept(0)).await.unwrap();
     assert!(
         matches!(refused, Err(Error::Closed(_))),
         "a held delivery on a detached link cannot be settled"
     );
     // Nothing is held for 99, so there is nothing to acknowledge and no frame
     // to write.
-    tokio::time::timeout(DEADLINE, receiver.accept(99))
+    timeout(DEADLINE, receiver.accept(99))
         .await
         .unwrap()
         .expect("an id never delivered is not an error");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -690,30 +658,30 @@ async fn a_multi_frame_delivery_settled_on_its_first_frame_is_not_recorded_as_un
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(1))
+    timeout(DEADLINE, receiver.grant_credit(1))
         .await
         .unwrap()
         .unwrap();
 
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("the reassembled delivery");
@@ -727,12 +695,9 @@ async fn a_multi_frame_delivery_settled_on_its_first_frame_is_not_recorded_as_un
     );
     assert!(delivery.message().is_ok(), "the payload reassembled");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }

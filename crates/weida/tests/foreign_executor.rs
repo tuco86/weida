@@ -12,31 +12,30 @@ use std::future::Future;
 use std::time::Duration;
 
 use common::Certs;
-use futures::future::{Either, select};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use weida::{Network, Runtime, RuntimeConfig, SimNet, TransferMeta};
 
-/// The same ceiling the tokio suites give `within()`; enforced by a watchdog
-/// thread here, because a timer would need the reactor this test refuses to
-/// have.
+/// The expected time of one test body. Past it a watchdog thread prints a
+/// line at every further multiple and the body keeps running: a slow run is
+/// not a failure. It is a thread because a timer would need the reactor this
+/// test refuses to have.
 const DEADLINE: Duration = Duration::from_secs(10);
 
-/// Runs `body` to completion under a foreign executor, or fails the test.
+/// Runs `body` to completion under a foreign executor, reporting when it
+/// takes longer than `DEADLINE`.
 fn within<F: Future>(body: F) -> F::Output {
-    let (tx, rx) = futures::channel::oneshot::channel::<()>();
-    std::thread::spawn(move || {
-        std::thread::sleep(DEADLINE);
-        let _ = tx.send(());
-    });
-    futures::executor::block_on(async move {
-        let deadline = Box::pin(async move {
-            let _ = rx.await;
-        });
-        match select(Box::pin(body), deadline).await {
-            Either::Left((out, _)) => out,
-            Either::Right(((), _)) => panic!("operation timed out after {DEADLINE:?}"),
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        let mut n = 0u32;
+        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(DEADLINE) {
+            n += 1;
+            eprintln!("still waiting for a foreign-executor test body, past {n} x {DEADLINE:?}");
         }
-    })
+    });
+    let out = futures::executor::block_on(body);
+    drop(tx);
+    let _ = watchdog.join();
+    out
 }
 
 #[test]

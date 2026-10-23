@@ -19,7 +19,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::time::timeout;
 use weida::{
     ClientTls, FilesOptions, IdentityEvent, IdentitySource, Runtime, RuntimeConfig, ServerTls,
 };
@@ -36,10 +35,13 @@ fn insecure(address: &str) -> Config {
     }
 }
 
-async fn within<F: Future>(f: F) -> F::Output {
-    timeout(Duration::from_secs(30), f)
-        .await
-        .expect("timed out")
+#[track_caller]
+fn within<F: Future>(f: F) -> impl Future<Output = F::Output> {
+    let at = std::panic::Location::caller();
+    async move {
+        let what = format!("the step at {}:{}", at.file(), at.line());
+        weida_testkit::within(&what, Duration::from_secs(30), f).await
+    }
 }
 
 /// A dev server on an ephemeral port, killed when dropped.
@@ -101,8 +103,10 @@ fn private_dir(tag: &str) -> std::path::PathBuf {
 }
 
 /// Claim: the hand-off, end to end. The controller (root here) mints a
-/// child token wrapped for five seconds; the service redeems it and holds a
-/// renewable token with the role's policies; a second redemption fails as
+/// child token wrapped for an hour, far longer than the test takes, so that
+/// the expiry is never what the redemption races; the service redeems it and
+/// holds a renewable token with the role's policies; a second redemption
+/// fails as
 /// `HandoffStolen`; the controller revokes by accessor and the service's
 /// token is dead.
 #[tokio::test]
@@ -130,7 +134,7 @@ async fn the_handoff_is_redeemed_once_against_a_real_server() {
     let wrapping = within(controller.post_wrapped(
         "auth/token/create/svc",
         json!({ "policies": ["svc"], "meta": { "unit": "svc.service" } }),
-        Duration::from_secs(5),
+        Duration::from_secs(3600),
     ))
     .await
     .expect("wrapped child token");
@@ -218,8 +222,12 @@ async fn a_pki_role_signs_weida_and_the_renewal_keeps_the_key() {
     let fingerprint = key_source.fingerprint().expect("fingerprint");
     let signing = PkiSign {
         ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-        ttl: Some(Duration::from_secs(10)),
-        renew_at: 0.3,
+        // The renewal is the claim, so the lifetime cannot be an hour: 60 s
+        // with the earliest renewal the client allows (a tenth, 6 s) leaves
+        // the first connect, send and receive ten times that long to finish
+        // on the first certificate. This is the one real-clock dependency.
+        ttl: Some(Duration::from_secs(60)),
+        renew_at: 0.1,
         ..PkiSign::new("svc", ["localhost"])
     };
     let served = within(signing.start(root.clone(), &key_source))
@@ -252,7 +260,7 @@ async fn a_pki_role_signs_weida_and_the_renewal_keeps_the_key() {
     let got = within(puller.recv()).await.expect("recv");
     assert_eq!(within(got.collect(64)).await.expect("collect"), b"signed");
 
-    // The renewal, three seconds in: same key, new certificate, and the next
+    // The renewal, six seconds in: same key, new certificate, and the next
     // connection verifies against it.
     assert_eq!(
         within(events.recv()).await,

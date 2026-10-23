@@ -9,9 +9,12 @@ use weida_nng::{
 
 pub(crate) fn options() -> SocketOptions {
     SocketOptions {
-        recv_timeout: Some(Duration::from_secs(5)),
-        send_timeout: Some(Duration::from_secs(5)),
-        handshake_timeout: Duration::from_secs(2),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The handshake bound is an hour, not the
+        // library's ten seconds.
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         ..SocketOptions::default()
     }

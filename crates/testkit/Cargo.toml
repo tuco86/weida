@@ -1,0 +1,20 @@
+[package]
+name = "weida-testkit"
+description = "Test support for this workspace: waits that report instead of killing"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Only ever a dev-dependency of this workspace's crates, named by path and
+# without a version, so `cargo publish` drops it from every published crate.
+publish = false
+
+[dependencies]
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time", "macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

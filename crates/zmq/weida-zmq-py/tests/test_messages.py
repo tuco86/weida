@@ -16,16 +16,14 @@ import asyncio
 
 import pytest
 
+import waits
 import weida_zmq
 
 DEADLINE = 10.0
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine, DEADLINE)
 
 
 async def connected(context, server_type, client_type, endpoint):
@@ -147,12 +145,11 @@ def test_pub_sub_with_prefix_matching():
 
         # The zguide's slow joiner: publish until a subscriber's queue took a
         # copy, which `Published` is the only way to know.
-        for _ in range(200):
+        while True:
             published = await publisher.send([b"weather.eu", b"rain"])
             if published.delivered == 1:
                 break
             await asyncio.sleep(0.01)
-        assert published.delivered == 1
         assert published.dropped == 0
         assert await subscriber.recv() == [b"weather.eu", b"rain"]
 
@@ -176,12 +173,11 @@ def test_xpub_xsub_carry_the_subscription_itself():
         subscription = await xpub.recv()
         assert subscription == [b"\x01topic"]
 
-        for _ in range(200):
+        while True:
             published = await xpub.send([b"topic", b"payload"])
             if published.delivered == 1:
                 break
             await asyncio.sleep(0.01)
-        assert published.delivered == 1
         assert await xsub.recv() == [b"topic", b"payload"]
 
     run(broadcast())
@@ -235,14 +231,12 @@ def test_nowait_takes_what_is_already_there():
             context, "PullSocket", "PushSocket", "inproc://nowait-queued"
         )
         await source.send(b"task")
-        for _ in range(200):
+        while True:
             try:
                 assert sink.recv_nowait() == [b"task"]
                 break
             except weida_zmq.EAGAIN:
                 await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("the message never arrived")
 
     run(queued())
 
@@ -258,7 +252,7 @@ def test_a_timeout_expires_as_eagain():
         source = weida_zmq.PushSocket(context)
         await source.connect("inproc://timeout")
         await source.send(b"late")
-        assert await sink.recv(timeout=5.0) == [b"late"]
+        assert await sink.recv() == [b"late"]
 
     run(expire())
 

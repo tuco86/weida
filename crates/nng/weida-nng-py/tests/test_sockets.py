@@ -7,8 +7,9 @@ PUSH never discards, PUB is best effort and says how many copies it lost, SUB
 filters at the receiver, a surveyor's deadline starts at the send, BUS
 travels one hop — rather than merely that bytes moved.
 
-Every test runs its coroutine under a wall-clock bound, so a binding that
-deadlocks fails the suite instead of hanging it (docs/LOOP.md 2).
+Every test runs its coroutine through `waits.run`: a slow run is reported on
+stderr and goes on, because the suite has no hard time limit on a real clock
+and the CI job's budget is the hang guard.
 """
 
 import asyncio
@@ -16,26 +17,17 @@ import time
 
 import pytest
 
+import waits
 import weida_nng
-
-# Long enough for a TCP handshake on a loaded machine, short enough that a
-# deadlock is a failure rather than a coffee break.
-DEADLINE = 10.0
 
 
 def run(coroutine):
-    """Runs one coroutine to completion, under a deadline."""
-
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    """Runs one coroutine to completion, reporting while it takes long."""
+    return waits.run(coroutine)
 
 
 def options(**kwargs):
-    """Defaults that turn a hang into a failed assertion."""
-    kwargs.setdefault("recv_timeout", 5.0)
-    kwargs.setdefault("send_timeout", 5.0)
+    """NNG's own defaults: wait forever, the CI job's budget is the guard."""
     return weida_nng.SocketOptions(**kwargs)
 
 
@@ -110,7 +102,7 @@ def test_a_subscriber_is_sent_only_what_it_asked_for():
         ctx = weida_nng.Context()
         publisher = weida_nng.PubSocket(ctx, options())
         subscriber = weida_nng.SubSocket(
-            ctx, options(recv_timeout=2.0, subscribe=b"weather.")
+            ctx, options(subscribe=b"weather.")
         )
         url = await publisher.listen("tcp://127.0.0.1:0")
         await subscriber.dial(url)
@@ -166,9 +158,9 @@ def test_a_pair_talks_both_ways():
 def test_a_survey_reaches_every_respondent_and_the_deadline_ends_it():
     async def survey():
         ctx = weida_nng.Context()
-        surveyor = weida_nng.SurveyorSocket(
-            ctx, options(survey_time=0.3, recv_timeout=5.0)
-        )
+        # The answers must come inside the survey; the window is generous so
+        # a slow machine still makes it, and the last collect waits it out.
+        surveyor = weida_nng.SurveyorSocket(ctx, options(survey_time=2.0))
         url = await surveyor.listen("tcp://127.0.0.1:0")
         respondents = [weida_nng.RespondentSocket(ctx, options()) for _ in range(2)]
         for respondent in respondents:
@@ -197,7 +189,7 @@ def test_a_bus_message_reaches_every_directly_connected_peer():
         ctx = weida_nng.Context()
         hub = weida_nng.BusSocket(ctx, options())
         url = await hub.listen("tcp://127.0.0.1:0")
-        spokes = [weida_nng.BusSocket(ctx, options(recv_timeout=2.0)) for _ in range(2)]
+        spokes = [weida_nng.BusSocket(ctx, options()) for _ in range(2)]
         for spoke in spokes:
             await spoke.dial(url)
         while hub.pipe_count < 2:
@@ -300,7 +292,7 @@ def test_a_message_taken_by_a_cancelled_receive_is_read_by_the_next_one():
         push.send_nowait(b"m1")
         time.sleep(0.1)
         await asyncio.sleep(0.05)
-        assert await asyncio.wait_for(pull.recv(), 2) == b"m1"
+        assert await pull.recv() == b"m1"
         await ctx.shutdown()
 
     run(scenario())

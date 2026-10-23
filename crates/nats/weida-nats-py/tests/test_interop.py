@@ -24,14 +24,14 @@ import pytest
 import weida_nats
 from weida_nats import sync
 
+import waits
+
 NEEDS_SERVER = (
     "needs nats-server: `pacman -S nats-server`, a release tarball from "
     "github.com/nats-io/nats-server/releases, "
     "`go install github.com/nats-io/nats-server/v2@latest` "
     "or `docker run -p 4222:4222 nats:2`"
 )
-
-DEADLINE = 10.0
 
 
 def free_port():
@@ -57,15 +57,13 @@ def nats_server():
     )
     try:
         # Readiness is observed, not slept on: the server says so on stderr.
-        deadline = time.monotonic() + 30.0
+        # The read blocks until it does; the CI job's budget is the guard.
         while True:
             line = child.stderr.readline()
             if not line:
                 raise AssertionError("nats-server exited before it was ready")
             if "Server is ready" in line:
                 break
-            if time.monotonic() > deadline:
-                raise AssertionError(f"nats-server was not ready: {line}")
         yield port
     finally:
         child.kill()
@@ -88,14 +86,14 @@ def test_the_asyncio_surface_against_nats_server(nats_server):
             await nats.publish(request.reply_to, b"pong")
 
         answering = asyncio.create_task(responder())
-        assert (await nats.request("service.echo", b"ping", 5.0)).payload == b"pong"
+        assert (await nats.request("service.echo", b"ping", waits.PATIENT)).payload == b"pong"
         await answering
 
         with pytest.raises(weida_nats.NoResponders):
-            await nats.request("nobody.listening", b"?", 5.0)
+            await nats.request("nobody.listening", b"?", waits.PATIENT)
         await nats.close()
 
-    asyncio.run(asyncio.wait_for(exchange(), DEADLINE))
+    waits.run(exchange())
 
 
 def test_the_synchronous_surface_against_nats_server(nats_server):
@@ -104,17 +102,17 @@ def test_the_synchronous_surface_against_nats_server(nats_server):
     responder.flush()
 
     def answer():
-        request = echo.next_msg(DEADLINE)
+        request = waits.next_msg(echo, "the request")
         responder.publish(request.reply_to, b"pong")
 
     thread = threading.Thread(target=answer)
     thread.start()
     try:
         client = sync.connect("127.0.0.1", nats_server)
-        assert client.request("service.echo", b"ping", 5.0).payload == b"pong"
+        assert client.request("service.echo", b"ping", waits.PATIENT).payload == b"pong"
         with pytest.raises(weida_nats.NoResponders):
-            client.request("nobody.listening", b"?", 5.0)
+            client.request("nobody.listening", b"?", waits.PATIENT)
         client.close()
     finally:
-        thread.join(DEADLINE)
+        waits.join(thread, "the responder thread")
         responder.close()

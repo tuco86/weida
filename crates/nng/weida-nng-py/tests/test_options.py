@@ -11,16 +11,12 @@ import asyncio
 
 import pytest
 
+import waits
 import weida_nng
-
-DEADLINE = 10.0
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine)
 
 
 def test_the_option_table_answers_for_every_name_it_carries():
@@ -184,9 +180,7 @@ def test_recvmaxsz_is_settable_per_socket_and_bounds_a_peers_declaration():
         puller = weida_nng.PullSocket(ctx, options)
         url = await puller.listen("tcp://127.0.0.1:0")
 
-        pusher = weida_nng.PushSocket(
-            ctx, weida_nng.SocketOptions(send_timeout=1.0)
-        )
+        pusher = weida_nng.PushSocket(ctx, weida_nng.SocketOptions())
         await pusher.dial(url)
         await pusher.send(b"x" * 128)
 

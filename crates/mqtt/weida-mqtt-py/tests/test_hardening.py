@@ -11,13 +11,13 @@ reactor, and with it the connection, down.
 """
 
 import asyncio
-import faulthandler
 import socket
 import threading
 import time
 
 import pytest
 
+import waits
 import weida_mqtt
 from weida_mqtt import sync
 
@@ -60,18 +60,15 @@ def test_getters_and_disconnect_do_not_wait_for_a_blocked_publish(scripted):
     thread.start()
     time.sleep(0.2)
 
-    faulthandler.dump_traceback_later(5, exit=True)
-    try:
-        assert client.client_id == "blocked-1"
-        assert "blocked-1" in repr(client)
-        assert client.session_present is False
-        assert client.is_encrypted is False
-        client.disconnect()
-    finally:
-        faulthandler.cancel_dump_traceback_later()
+    # No watchdog here: if a getter or the disconnect waited for the blocked
+    # publish this would hang, and the CI job's budget is the guard.
+    assert client.client_id == "blocked-1"
+    assert "blocked-1" in repr(client)
+    assert client.session_present is False
+    assert client.is_encrypted is False
+    client.disconnect()
 
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+    waits.join(thread, "the blocked publish to end after the disconnect")
     assert len(failures) == 1
 
 
@@ -126,7 +123,7 @@ def test_cancelled_receive_gives_the_delivery_back(broker, run, client_id):
 
         task.cancel()
         await asyncio.sleep(0.05)
-        delivery = await asyncio.wait_for(events.__anext__(), 5)
+        delivery = await events.__anext__()
         assert delivery.payload == expected
         await client.disconnect()
 

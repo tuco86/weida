@@ -260,12 +260,8 @@ mod tests {
         String::from_utf8_lossy(message.frames()[0].as_slice()).into_owned()
     }
 
-    async fn wait_for(mut done: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(std::time::Instant::now() < deadline, "condition never held");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    async fn wait_for(done: impl FnMut() -> bool) {
+        weida_testkit::until("the condition", weida_testkit::EXPECTED, done).await;
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the

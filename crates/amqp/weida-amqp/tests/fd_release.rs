@@ -10,9 +10,8 @@ mod support;
 
 use std::time::Duration;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use tokio::sync::oneshot;
-use tokio::time::{Instant, timeout};
 use weida_amqp::{Connection, State};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::performative::{Open, Performative};
@@ -84,18 +83,12 @@ mod io {
 
         // The connection handle is still alive here: what must be gone is the
         // driver's transport, not the caller's handle.
-        let started = Instant::now();
-        loop {
-            if open_descriptors() <= baseline {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "descriptors did not return to {baseline}: {} open",
-                open_descriptors()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        weida_testkit::until(
+            "the descriptors to return to the baseline",
+            Duration::from_secs(2),
+            || open_descriptors() <= baseline,
+        )
+        .await;
         drop(connection);
     }
 }

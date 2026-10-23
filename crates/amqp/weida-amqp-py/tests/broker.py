@@ -17,7 +17,64 @@ need. It is not a codec and must never grow into one — the codec is
 """
 
 import asyncio
+import queue
 import struct
+import subprocess
+import sys
+import time
+
+# How long one step of a test is expected to take at most. Past it a wait
+# says so on stderr and goes on: a slow run is still a run, and a limit that
+# fires on a loaded machine turns a healthy test red. The hang guard is the
+# CI job's own budget. (The Rust side's `weida_testkit::within`, same rule.)
+EXPECTED = 5.0
+
+
+def _still_waiting(what, waited, expected):
+    print(
+        f"still waiting for {what}: {waited:.1f}s, past its expected {expected}s",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+async def within(what, awaitable, expected=EXPECTED):
+    """Awaits `awaitable`, reporting at every multiple of `expected`, never failing."""
+    task = asyncio.ensure_future(awaitable)
+    started = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=expected)
+        if done:
+            return task.result()
+        _still_waiting(what, time.monotonic() - started, expected)
+
+
+def wait_set(event, what, expected=EXPECTED):
+    """Waits for a `threading.Event`, reporting at every multiple of `expected`."""
+    started = time.monotonic()
+    while not event.wait(expected):
+        _still_waiting(what, time.monotonic() - started, expected)
+
+
+def wait_get(source, what, expected=EXPECTED):
+    """Takes from a `queue.Queue`, reporting at every multiple of `expected`."""
+    started = time.monotonic()
+    while True:
+        try:
+            return source.get(timeout=expected)
+        except queue.Empty:
+            _still_waiting(what, time.monotonic() - started, expected)
+
+
+def wait_exit(process, what, expected=EXPECTED):
+    """Waits for a `subprocess.Popen` to exit and returns its code."""
+    started = time.monotonic()
+    while True:
+        try:
+            return process.wait(timeout=expected)
+        except subprocess.TimeoutExpired:
+            _still_waiting(what, time.monotonic() - started, expected)
+
 
 # Part 2 §2.7's descriptors, as the performatives the peer sends and reads.
 OPEN = 0x10

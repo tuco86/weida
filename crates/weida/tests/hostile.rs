@@ -26,9 +26,7 @@ use weida_protocol::{
 const DEADLINE: Duration = Duration::from_secs(15);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a hostile-peer step", DEADLINE, f).await
 }
 
 // --- hostile client against our server ----------------------------------
@@ -929,9 +927,7 @@ async fn an_exchange_before_hello_is_parked_not_rejected() {
 const SHORT_DEADLINE: Duration = Duration::from_secs(5);
 
 async fn bounded<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(SHORT_DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a bounded step", SHORT_DEADLINE, f).await
 }
 
 /// Dials `server` from a raw endpoint and completes the QUIC handshake.

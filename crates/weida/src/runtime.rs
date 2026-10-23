@@ -659,6 +659,129 @@ mod tests {
         assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
     }
 
+    /// Claim: `shutdown`'s wait for idle sockets is bounded by
+    /// `shutdown_timeout`, so process exit never waits on somebody else's
+    /// network.
+    ///
+    /// The peer is made unreachable the hard way: the server runtime is
+    /// dropped without being shut down, which closes its socket and sends
+    /// nothing, so the client's `CONNECTION_CLOSE` is answered by silence and
+    /// the close runs out its draining period, about three times the path's
+    /// probe timeout.
+    ///
+    /// The network is a `SimNet` and the clock is paused, so both times are
+    /// exact Tokio time and the comparison cannot be turned by machine load:
+    /// the same shutdown with a 1 ms cap must be at least twice as fast as
+    /// one with a cap far beyond the draining period. An unbounded wait, the
+    /// defect this defends against, makes the two times equal and fails it.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_idle_sockets_is_bounded() {
+        async fn shutdown_with(cap: Duration) -> Duration {
+            let net = crate::SimNet::new();
+            let identity = Identity::generate().expect("identity");
+            let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
+
+            let server = Runtime::new(RuntimeConfig {
+                network: crate::Network::sim(&net),
+                ..RuntimeConfig::default()
+            })
+            .expect("server runtime");
+            let listener = server.listener();
+            let binding = listener
+                .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+                .await
+                .expect("bind");
+            let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
+            let puller = listener.puller("/sink").expect("puller");
+
+            let client = Runtime::new(RuntimeConfig {
+                shutdown_timeout: cap,
+                network: crate::Network::sim(&net),
+                ..RuntimeConfig::default()
+            })
+            .expect("client runtime");
+            let pusher = client.pusher(trust);
+            pusher.connect(&url).await.expect("connect");
+
+            // The peer stops existing without saying so.
+            drop(pusher);
+            drop(puller);
+            drop(binding);
+            drop(listener);
+            drop(server);
+
+            let start = tokio::time::Instant::now();
+            client.shutdown().await;
+            start.elapsed()
+        }
+
+        let capped = shutdown_with(Duration::from_millis(1)).await;
+        let uncapped = shutdown_with(Duration::from_secs(10)).await;
+        assert!(
+            capped * 2 < uncapped,
+            "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
+        );
+    }
+
+    /// Claim: `Binding::close` waits for its socket to go idle for at most
+    /// `shutdown_timeout`, so closing one binding is not held up by its
+    /// connections' closing periods.
+    ///
+    /// The client stays connected and answers the close, but the binding's
+    /// side of the connection still runs out QUIC's closing period, about
+    /// three times the path's probe timeout. The assertion is relative, on a
+    /// paused clock over a `SimNet`, for the reason
+    /// `the_wait_for_idle_sockets_is_bounded` gives.
+    #[tokio::test(start_paused = true)]
+    async fn a_binding_close_is_bounded_by_the_shutdown_timeout() {
+        async fn close_with(cap: Duration) -> Duration {
+            let net = crate::SimNet::new();
+            let identity = Identity::generate().expect("identity");
+            let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
+
+            let server = Runtime::new(RuntimeConfig {
+                shutdown_timeout: cap,
+                network: crate::Network::sim(&net),
+                ..RuntimeConfig::default()
+            })
+            .expect("server runtime");
+            let listener = server.listener();
+            let binding = listener
+                .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+                .await
+                .expect("bind");
+            let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
+            let puller = listener.puller("/sink").expect("puller");
+
+            let client = Runtime::new(RuntimeConfig {
+                network: crate::Network::sim(&net),
+                ..RuntimeConfig::default()
+            })
+            .expect("client runtime");
+            let pusher = client.pusher(trust);
+            pusher.connect(&url).await.expect("connect");
+
+            let start = tokio::time::Instant::now();
+            binding.close().await;
+            let elapsed = start.elapsed();
+
+            drop(pusher);
+            drop(puller);
+            drop(binding);
+            drop(listener);
+            client.shutdown().await;
+            server.shutdown().await;
+            elapsed
+        }
+
+        let capped = close_with(Duration::from_millis(1)).await;
+        let uncapped = close_with(Duration::from_secs(10)).await;
+        assert!(
+            capped * 2 < uncapped,
+            "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
+        );
+    }
+
     /// Tests that touch the filesystem, network, processes or real time: the
     /// integration tier (`.config/nextest.toml`).
     mod io {
@@ -697,115 +820,6 @@ mod tests {
 
             client.shutdown().await;
             server.shutdown().await;
-        }
-        /// Claim: `shutdown`'s wait for idle sockets is bounded by
-        /// `shutdown_timeout`, so process exit never waits on somebody else's
-        /// network.
-        ///
-        /// The peer is made unreachable the hard way: the server runtime is
-        /// dropped without being shut down, which closes its socket and sends
-        /// nothing, so the client's `CONNECTION_CLOSE` is answered by silence and
-        /// the close runs out its draining period — about three times the path's
-        /// probe timeout, ~96 ms on loopback and longer as round-trip time and
-        /// loss grow.
-        ///
-        /// The assertion is **relative**, and measured in the same run: the same
-        /// shutdown with a 1 ms cap must be at least twice as fast as one with a
-        /// cap far beyond the draining period. An absolute millisecond bound would
-        /// pin this machine; an unbounded wait — the defect this defends against —
-        /// makes the two times equal and fails it.
-        #[tokio::test]
-        async fn the_wait_for_idle_sockets_is_bounded() {
-            async fn shutdown_with(cap: Duration) -> Duration {
-                let identity = Identity::generate().expect("identity");
-                let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
-
-                let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
-                let listener = server.listener();
-                let binding = listener
-                    .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
-                    .await
-                    .expect("bind");
-                let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
-                let puller = listener.puller("/sink").expect("puller");
-
-                let client = Runtime::new(RuntimeConfig {
-                    shutdown_timeout: cap,
-                    ..RuntimeConfig::default()
-                })
-                .expect("client runtime");
-                let pusher = client.pusher(trust);
-                pusher.connect(&url).await.expect("connect");
-
-                // The peer stops existing without saying so.
-                drop(pusher);
-                drop(puller);
-                drop(binding);
-                drop(listener);
-                drop(server);
-
-                let start = std::time::Instant::now();
-                client.shutdown().await;
-                start.elapsed()
-            }
-
-            let capped = shutdown_with(Duration::from_millis(1)).await;
-            let uncapped = shutdown_with(Duration::from_secs(10)).await;
-            assert!(
-                capped * 2 < uncapped,
-                "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
-            );
-        }
-        /// Claim: `Binding::close` waits for its socket to go idle for at most
-        /// `shutdown_timeout`, so closing one binding is not held up by its
-        /// connections' closing periods.
-        ///
-        /// The client stays connected and answers the close, but the binding's
-        /// side of the connection still runs out QUIC's closing period, about
-        /// three times the path's probe timeout. The assertion is relative for
-        /// the reason `the_wait_for_idle_sockets_is_bounded` gives.
-        #[tokio::test]
-        async fn a_binding_close_is_bounded_by_the_shutdown_timeout() {
-            async fn close_with(cap: Duration) -> Duration {
-                let identity = Identity::generate().expect("identity");
-                let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
-
-                let server = Runtime::new(RuntimeConfig {
-                    shutdown_timeout: cap,
-                    ..RuntimeConfig::default()
-                })
-                .expect("server runtime");
-                let listener = server.listener();
-                let binding = listener
-                    .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
-                    .await
-                    .expect("bind");
-                let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
-                let puller = listener.puller("/sink").expect("puller");
-
-                let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
-                let pusher = client.pusher(trust);
-                pusher.connect(&url).await.expect("connect");
-
-                let start = std::time::Instant::now();
-                binding.close().await;
-                let elapsed = start.elapsed();
-
-                drop(pusher);
-                drop(puller);
-                drop(binding);
-                drop(listener);
-                client.shutdown().await;
-                server.shutdown().await;
-                elapsed
-            }
-
-            let capped = close_with(Duration::from_millis(1)).await;
-            let uncapped = close_with(Duration::from_secs(10)).await;
-            assert!(
-                capped * 2 < uncapped,
-                "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
-            );
         }
         #[tokio::test]
         async fn a_binding_with_unreadable_tls_material_fails_before_serving() {

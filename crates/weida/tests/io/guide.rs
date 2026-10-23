@@ -226,7 +226,9 @@ async fn width_costs_the_publisher_and_loses_nothing() {
 /// number rather than a hang.
 #[tokio::test]
 async fn a_silent_respondent_is_a_number() {
-    let surveyed = within(survey_with_a_silent_peer())
+    // The silent respondent is the claim, so the window must elapse; it is
+    // wide enough that only a stall of seconds makes an answer late.
+    let surveyed = within(survey_with_a_silent_peer(std::time::Duration::from_secs(5)))
         .await
         .expect("the survey");
     assert_eq!(surveyed.asked, 3);

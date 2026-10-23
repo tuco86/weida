@@ -16,9 +16,7 @@ use weida::{Error, TransferMeta};
 const DEADLINE: Duration = Duration::from_secs(15);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a push/pull step", DEADLINE, f).await
 }
 
 #[tokio::test]

@@ -155,10 +155,13 @@ async fn a_device_bounds_the_pair_v1_hop_count() {
         ))
         .await
         .expect("send");
-    let (_, forwarded) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-        .await
-        .expect("forwarded")
-        .expect("a message");
+    let (_, forwarded) = weida_testkit::within(
+        "the forwarded message",
+        Duration::from_secs(5),
+        receiver.recv(),
+    )
+    .await
+    .expect("a message");
     assert_eq!(
         &forwarded.body()[..4],
         2u32.to_be_bytes(),
@@ -267,10 +270,13 @@ async fn a_client_that_stops_reading_cannot_stall_the_device() {
         .await
         .expect("dial the device");
     bounded(client.send(b"hello".to_vec())).await.expect("send");
-    let reply = tokio::time::timeout(Duration::from_secs(5), client.recv())
-        .await
-        .expect("the honest client gets its answer within 5 s")
-        .expect("a reply");
+    let reply = weida_testkit::within(
+        "the honest client getting its answer",
+        Duration::from_secs(5),
+        client.recv(),
+    )
+    .await
+    .expect("a reply");
     assert_eq!(reply.body().len(), REPLY_BYTES);
 
     // The silent client stays connected, unread, until the test is over.
@@ -309,26 +315,34 @@ async fn a_stream_of_requests_cannot_starve_the_replies() {
         })
     };
 
-    let client = ReqSocket::with_options(&ctx, options()).expect("req");
+    let client = ReqSocket::with_options(
+        &ctx,
+        SocketOptions {
+            recv_timeout: None,
+            ..options()
+        },
+    )
+    .expect("req");
     bounded(client.dial(&front_url))
         .await
         .expect("dial the device");
     eventually(|| front.pipe_count() == 1 && back.pipe_count() == 1 && backend.pipe_count() == 1)
         .await;
 
-    let flooding = tokio::spawn(flood(address(&front_url), FLOOD));
+    let flooding = tokio::spawn(flood(address(&front_url)));
+    // Let the flood build up a queue of requests in front of the device.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // The two seconds run from before the request is sent.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     bounded(client.send(HONEST.to_vec())).await.expect("send");
-    let reply = tokio::time::timeout_at(deadline, client.recv())
-        .await
-        .expect("the honest reply came back within 2 s of the request")
-        .expect("a reply");
+    let reply = bounded(client.recv()).await.expect("a reply");
     assert_eq!(reply.body(), HONEST);
-
-    bounded(flooding).await.expect("the flood ran to its end");
+    // The flood never stops by itself: a reply that came back at all came
+    // back while requests were queued in front of the device.
+    assert!(
+        !flooding.is_finished(),
+        "the honest reply came back only after the flood had ended"
+    );
+    flooding.abort();
     serving.abort();
     forwarding.abort();
 }
@@ -388,10 +402,13 @@ async fn a_stack_too_deep_for_the_backend_costs_the_message_and_not_the_backend_
         .await
         .expect("dial the device");
     bounded(client.send(b"work".to_vec())).await.expect("send");
-    let answer = tokio::time::timeout(Duration::from_secs(5), client.recv())
-        .await
-        .expect("an ordinary request gets its answer")
-        .expect("a reply");
+    let answer = weida_testkit::within(
+        "an ordinary request getting its answer",
+        Duration::from_secs(5),
+        client.recv(),
+    )
+    .await
+    .expect("a reply");
     assert_eq!(answer.body(), b"work");
 
     serving.abort();

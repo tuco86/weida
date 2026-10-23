@@ -27,6 +27,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Waits that report instead of killing (B-389).
+weida-testkit.workspace = true
 # Clusters run on a `SimNet` under a paused clock.
 weida = { workspace = true, features = ["generate", "test-util"] }
 tokio = { workspace = true, features = ["test-util"] }

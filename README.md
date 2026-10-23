@@ -24,9 +24,9 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 **Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
 `weida-broker`, `weida-raft` and `weida-openbao` are published on crates.io, all at
 `0.1.0-alpha.8`; `weida-http-codec` and `weida-http` are published from the next release on,
-because `weida-openbao` speaks HTTP through them. The other seventeen members are not
-published: `weida-py-core`, every Python binding and the other five protocol libraries with
-their codecs. The one exception on crates.io,
+because `weida-openbao` speaks HTTP through them. The other eighteen members are not
+published: `weida-py-core`, every Python binding, the other five protocol libraries with
+their codecs, and `weida-testkit`, which only tests use. The one exception on crates.io,
 `weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI
 and there are no prebuilt binaries. Wire protocol version `0` is experimental and breaking
 changes are permitted within `0.x`. Phase status lives in
@@ -81,7 +81,7 @@ beside each finished library. A user may compose those public APIs explicitly. T
 does not define a general translation from foreign socket types onto weida patterns.
 The `kind` column says which product a crate belongs to
 ([decisions/0013](docs/decisions/0013-competitor-libraries.md) §4). The table lists **every
-one of the twenty-seven `[workspace] members`** and is read off `cargo metadata`, not kept by
+one of the twenty-eight `[workspace] members`** and is read off `cargo metadata`, not kept by
 hand.
 
 | Path | Package | kind | Responsibility |
@@ -94,6 +94,7 @@ hand.
 | `crates/broker` | `weida-broker` | weida | L2, and a layer rather than a fork: queues at endpoint paths, the publisher confirm, the absolute per-subscription credit and consumer settlement with requeue; depends only on `weida`, and nothing depends on it ([0018](docs/decisions/0018-minimal-broker.md) §4.1) |
 | `crates/raft/weida-raft` | `weida-raft` | weida | openraft plus the I/O it deliberately does not have — weida's transport under it — so a Raft service supplies only its state machine and log store ([0021](docs/decisions/0021-consensus-openraft.md)) |
 | `crates/openbao/weida-openbao` | `weida-openbao` | weida | OpenBao/Vault for weida: token, AppRole and wrapped hand-off authentication, and identity sources signed by a PKI mount, anchored on its CA, or read from KV; its own crate because it carries the HTTP client and JSON the core does not ([0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3, [docs/libraries/weida-openbao.md](docs/libraries/weida-openbao.md)) |
+| `crates/testkit` | `weida-testkit` | test support | waits for tests that report instead of killing: an expected time, a "still waiting" line at each multiple of it, and a hard limit only on a paused clock, where reaching it means a hang; a dev-dependency named by path, never published |
 | `crates/py/weida-py-core` | `weida-py-core` | foundation | the shared PyO3 foundation under every binding, with nothing protocol-specific in it: errno exception families, the asyncio bridge that drives a Rust future on the caller's loop, and the bytes boundary ([0014](docs/decisions/0014-parallel-libraries.md) §2) |
 | `crates/py/weida-py` | `weida-py` | binding | the Python surface of weida itself: every pattern including the streamed fan-out, asyncio and synchronous ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
 | `crates/zmq/weida-zmtp` | `weida-zmtp` | codec | ZMTP 3.1 — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |

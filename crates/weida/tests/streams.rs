@@ -37,7 +37,7 @@ pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 pub(crate) const STALL: Duration = Duration::from_millis(300);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    timeout(DEADLINE, f).await.expect("operation timed out")
+    weida_testkit::within("a stream step", DEADLINE, f).await
 }
 
 /// Progress markers reported by a spawned sender.

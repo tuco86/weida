@@ -248,9 +248,12 @@ mod tests {
     }
 
     async fn next(receiver: &mut Receiver<Item>) -> Option<Item> {
-        tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-            .await
-            .expect("the queue answered")
+        weida_testkit::within(
+            "the queue to answer",
+            Duration::from_secs(5),
+            receiver.recv(),
+        )
+        .await
     }
 
     #[tokio::test]

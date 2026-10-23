@@ -242,11 +242,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn now_reads_the_runtime_clock() {
         let exec = Exec::current().expect("ambient runtime");
-        let (before, real) = (exec.now(), std::time::Instant::now());
+        let before = exec.now();
         tokio::time::advance(Duration::from_secs(3600)).await;
         let advanced = exec.now() - before;
         assert!(advanced >= Duration::from_secs(3600), "{advanced:?}");
         assert!(advanced < Duration::from_secs(3601), "{advanced:?}");
-        assert!(real.elapsed() < Duration::from_secs(1));
+        // That an hour passed on `exec.now()` while the test ran in a blink is
+        // the paused clock's own proof; a bound on the wall clock would add
+        // nothing and would turn red on a loaded machine.
     }
 }

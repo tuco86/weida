@@ -329,10 +329,15 @@ async fn an_inbound_qos_0_stream_does_not_suppress_the_pingreq() {
     // The deadline is the protocol's own: 1.5x Keep Alive is where a server
     // "MUST close the connection" ([MQTT-3.1.2-22]). The script takes 2.4 s,
     // so an on-time PINGREQ is read well inside it, while a client whose
-    // timer the deliveries reset would not ping until 4 s.
-    tokio::time::timeout(Duration::from_secs(3), server.finished())
-        .await
-        .expect("the PINGREQ arrived before 1.5x Keep Alive would have closed the connection");
+    // timer the deliveries reset would not ping until 4 s. On a real clock the
+    // wait only reports when it runs long; a late PINGREQ is a slow run, not a
+    // failure of this test.
+    weida_testkit::within(
+        "the PINGREQ before 1.5x Keep Alive",
+        Duration::from_secs(3),
+        server.finished(),
+    )
+    .await;
 
     assert_eq!(
         server.seen().await,
@@ -369,10 +374,12 @@ async fn an_unanswered_pingreq_times_out_rather_than_hanging() {
         .await
         .expect("connects");
 
-    let deadline = Duration::from_secs(5);
-    let event = tokio::time::timeout(deadline, events.next())
-        .await
-        .expect("the client must give up on its own");
+    let event = weida_testkit::within(
+        "the client to give up on its own",
+        Duration::from_secs(5),
+        events.next(),
+    )
+    .await;
     let Some(Event::Disconnected(error)) = event else {
         panic!("the timeout must be reported")
     };

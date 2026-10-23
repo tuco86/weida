@@ -31,9 +31,7 @@ use weida::{
 pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a transport step", DEADLINE, f).await
 }
 
 /// Req/Rep: one exchange, uppercased and returned.
@@ -217,7 +215,8 @@ pub(crate) async fn survey_one_respondent(h: &Harness) {
     within(surveyor.connect(&h.url("/poll")))
         .await
         .expect("connect");
-    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(5)))
+    // Not about expiry: an hour cannot fire.
+    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(3600)))
         .await
         .expect("survey");
     assert_eq!(run.respondents(), 1);

@@ -39,6 +39,21 @@ macro_rules! needs_rabbitmq {
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// A bounded wait that cannot fail a test for being slow: it has the shape of
+/// `tokio::time::timeout(..)`, but past `expected` the step is reported by
+/// `weida_testkit::within` and the wait goes on.
+#[track_caller]
+fn timeout<F: Future>(
+    expected: Duration,
+    future: F,
+) -> impl Future<Output = Result<F::Output, std::convert::Infallible>> {
+    let at = std::panic::Location::caller();
+    async move {
+        let what = format!("the step at {}:{}", at.file(), at.line());
+        Ok(weida_testkit::within(&what, expected, future).await)
+    }
+}
+
 /// The default guest credentials, which RabbitMQ restricts to localhost.
 const USER: &str = "guest";
 const PASSWORD: &str = "guest";
@@ -72,21 +87,22 @@ impl Broker {
     /// Readiness is observed rather than assumed: process creation is not a
     /// listening socket, and RabbitMQ takes seconds to boot its Erlang node.
     async fn wait_for_port(&self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "rabbitmq-server did not accept a connection on {} within 60 s",
-                self.port
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        weida_testkit::within(
+            "rabbitmq-server to accept a connection",
+            Duration::from_secs(60),
+            async {
+                loop {
+                    if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                        .await
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            },
+        )
+        .await;
     }
 
     /// Stopped explicitly, because a broker left running would be picked up
@@ -124,18 +140,18 @@ async fn our_sender_reaches_a_rabbitmq_queue() {
     let exec = Exec::current().unwrap();
     let broker = Broker::start(15672).await;
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", broker.port, options()),
     )
     .await
     .expect("the broker answered")
     .expect("SASL PLAIN and `open` succeeded");
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut sender = tokio::time::timeout(
+    let mut sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("interop-sender", Target::at(QUEUE))),
     )
@@ -147,17 +163,17 @@ async fn our_sender_reaches_a_rabbitmq_queue() {
     // (170 initially, per its own `rabbit.max_link_credit`), accepts our
     // `transfer`, and answers with a `disposition`. The outcome is the
     // measurement — an `accepted` here means the queue took the message.
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"from weida-amqp")))
+    let sent = timeout(DEADLINE, sender.send(&Message::data(b"from weida-amqp")))
         .await
         .expect("the broker granted credit")
         .expect("the transfer went out");
-    let outcome = tokio::time::timeout(DEADLINE, sender.settled(sent.delivery_id))
+    let outcome = timeout(DEADLINE, sender.settled(sent.delivery_id))
         .await
         .expect("the broker settled")
         .expect("an outcome");
     assert_eq!(outcome, Outcome::Accepted);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
@@ -170,32 +186,32 @@ async fn our_receiver_consumes_from_a_rabbitmq_queue() {
     let exec = Exec::current().unwrap();
     let broker = Broker::start(15673).await;
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", broker.port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
 
     // Publish first, on its own link, so the consumer has something to take.
-    let sender = tokio::time::timeout(
+    let sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("interop-feed", Target::at(QUEUE))),
     )
     .await
     .unwrap()
     .unwrap();
-    let _ = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"for the consumer")))
+    let _ = timeout(DEADLINE, sender.send(&Message::data(b"for the consumer")))
         .await
         .unwrap()
         .unwrap();
 
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("interop-consumer", Source::at(QUEUE))),
     )
@@ -206,11 +222,11 @@ async fn our_receiver_consumes_from_a_rabbitmq_queue() {
     // What this establishes: prefetch is link credit. The broker sends
     // nothing until this `flow`, which is the half of the scheme a client
     // owns, and the payload that comes back is the one published above.
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(1))
+    timeout(DEADLINE, receiver.grant_credit(1))
         .await
         .unwrap()
         .unwrap();
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .expect("the broker transferred under our credit")
         .expect("a delivery");
@@ -218,12 +234,12 @@ async fn our_receiver_consumes_from_a_rabbitmq_queue() {
         delivery.payload(),
         Message::data(b"for the consumer").to_vec().unwrap()
     );
-    tokio::time::timeout(DEADLINE, receiver.accept(delivery.delivery_id))
+    timeout(DEADLINE, receiver.accept(delivery.delivery_id))
         .await
         .unwrap()
         .unwrap();
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
@@ -236,14 +252,14 @@ async fn rcv_settle_mode_second_is_probed_rather_than_assumed() {
     let exec = Exec::current().unwrap();
     let broker = Broker::start(15674).await;
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", broker.port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
@@ -261,7 +277,7 @@ async fn rcv_settle_mode_second_is_probed_rather_than_assumed() {
     //     did not read the answer would believe it had a guarantee it has not;
     //   * the attach is refused                — an honest refusal;
     //   * the answering `attach` says `second` — the documentation is stale.
-    match tokio::time::timeout(DEADLINE, session.attach(asked)).await {
+    match timeout(DEADLINE, session.attach(asked)).await {
         Ok(Ok(link)) => {
             let mode = link.negotiated().unwrap().rcv_settle_mode;
             println!("MEASURED rcv-settle-mode: asked second, got {mode:?}");
@@ -270,7 +286,7 @@ async fn rcv_settle_mode_second_is_probed_rather_than_assumed() {
         Err(_) => panic!("the broker neither answered nor refused within {DEADLINE:?}"),
     }
 
-    let _ = tokio::time::timeout(DEADLINE, connection.close()).await;
+    let _ = timeout(DEADLINE, connection.close()).await;
     broker.stop();
 }
 
@@ -280,14 +296,14 @@ async fn the_terminus_the_broker_creates_is_recorded_rather_than_assumed() {
     let exec = Exec::current().unwrap();
     let broker = Broker::start(15675).await;
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", broker.port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
@@ -298,7 +314,7 @@ async fn the_terminus_the_broker_creates_is_recorded_rather_than_assumed() {
     // report what it actually created", so the answering `attach` is where a
     // v1 address silently becoming a v2 one, or an expiry policy being
     // replaced, becomes visible.
-    let link = tokio::time::timeout(
+    let link = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("terminus-probe", Source::at(QUEUE))),
     )
@@ -315,6 +331,6 @@ async fn the_terminus_the_broker_creates_is_recorded_rather_than_assumed() {
         negotiated.remote_offered_capabilities
     );
 
-    let _ = tokio::time::timeout(DEADLINE, connection.close()).await;
+    let _ = timeout(DEADLINE, connection.close()).await;
     broker.stop();
 }

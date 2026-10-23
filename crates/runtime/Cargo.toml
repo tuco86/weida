@@ -25,6 +25,8 @@ tokio.workspace = true
 weida-winpipe.workspace = true
 
 [dev-dependencies]
+# Waits that report instead of killing (B-389).
+weida-testkit.workspace = true
 # Drives the owned-reactor test from an executor that is not tokio, which is
 # the capability `Exec::owned` exists for.
 futures.workspace = true

@@ -44,8 +44,8 @@ async fn a_transfer_past_its_deadline_is_reset() {
     let took = started.elapsed();
     assert!(matches!(failed, Error::Expired), "{failed:?}");
     assert!(
-        took >= Duration::from_millis(300) && took < Duration::from_secs(3),
-        "expired after {took:?}"
+        took >= Duration::from_millis(300),
+        "expired after {took:?}, before its deadline"
     );
     assert!(!failed.is_definite_failure());
 

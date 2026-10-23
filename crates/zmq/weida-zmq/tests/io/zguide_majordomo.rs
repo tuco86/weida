@@ -30,7 +30,7 @@
 //! that takes ten seconds.
 
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use weida_zmq::{Context, ContextConfig, Result};
 
@@ -49,9 +49,11 @@ use majordomo::{majordomo_broker, majordomo_request, majordomo_worker};
 const BEAT: Duration = Duration::from_millis(50);
 /// The guide's `HEARTBEAT_LIVENESS`.
 const LIVENESS: u32 = 3;
-/// A reply this library cannot produce in this long is a bug, not a slow
-/// machine.
+/// How long a wait runs before it reports; it never fails a test.
 const PATIENCE: Duration = Duration::from_secs(5);
+/// The patience handed to a request whose expiry is not the claim: it cannot
+/// fire in practice, and [`patient`] reports a slow call instead.
+const FOREVER: Duration = Duration::from_secs(3600);
 
 fn context() -> Result<Context> {
     Context::new(ContextConfig::default())
@@ -71,13 +73,16 @@ async fn a_request_reaches_the_worker_that_registered_the_service() -> Result<()
     let other = majordomo_worker(&context, &broker.endpoint, "reverse", BEAT)?;
     until(|| broker.ready_seen.load(Ordering::Relaxed) >= 2).await;
 
-    let reply = majordomo_request(
-        &context,
-        &broker.endpoint,
-        "echo",
-        "Hello world",
-        PATIENCE,
-        3,
+    let reply = patient(
+        "the echo reply",
+        majordomo_request(
+            &context,
+            &broker.endpoint,
+            "echo",
+            "Hello world",
+            FOREVER,
+            3,
+        ),
     )
     .await?;
     assert_eq!(
@@ -108,8 +113,11 @@ async fn two_workers_of_one_service_share_the_work_least_recently_used() -> Resu
     until(|| broker.ready_seen.load(Ordering::Relaxed) >= 2).await;
 
     for request in ["one", "two"] {
-        let reply =
-            majordomo_request(&context, &broker.endpoint, "echo", request, PATIENCE, 3).await?;
+        let reply = patient(
+            "the reply",
+            majordomo_request(&context, &broker.endpoint, "echo", request, FOREVER, 3),
+        )
+        .await?;
         assert_eq!(reply.as_deref(), Some(request), "each request answered");
     }
     assert_eq!(
@@ -135,22 +143,28 @@ async fn mmi_service_answers_two_hundred_for_a_live_service_and_four_oh_four_oth
     let _worker = majordomo_worker(&context, &broker.endpoint, "echo", BEAT)?;
     until(|| broker.ready_seen.load(Ordering::Relaxed) >= 1).await;
 
-    let live = majordomo_request(
-        &context,
-        &broker.endpoint,
-        "mmi.service",
-        "echo",
-        PATIENCE,
-        3,
+    let live = patient(
+        "the live answer",
+        majordomo_request(
+            &context,
+            &broker.endpoint,
+            "mmi.service",
+            "echo",
+            FOREVER,
+            3,
+        ),
     )
     .await?;
-    let absent = majordomo_request(
-        &context,
-        &broker.endpoint,
-        "mmi.service",
-        "nosuchservice",
-        PATIENCE,
-        3,
+    let absent = patient(
+        "the 404 answer",
+        majordomo_request(
+            &context,
+            &broker.endpoint,
+            "mmi.service",
+            "nosuchservice",
+            FOREVER,
+            3,
+        ),
     )
     .await?;
     assert_eq!(live.as_deref(), Some("200"), "a registered service");
@@ -177,7 +191,11 @@ async fn a_silent_worker_is_disconnected_and_registers_again() -> Result<()> {
     until(|| worker.registrations.load(Ordering::Relaxed) >= 2).await;
     //  A fresh socket, a fresh registration - and still able to work, which
     //  is the point of re-registering rather than exiting.
-    let reply = majordomo_request(&context, &broker.endpoint, "echo", "after", PATIENCE, 5).await?;
+    let reply = patient(
+        "the reply after reconnecting",
+        majordomo_request(&context, &broker.endpoint, "echo", "after", FOREVER, 5),
+    )
+    .await?;
     assert_eq!(reply.as_deref(), Some("after"), "served after reconnecting");
     Ok(())
 }
@@ -188,12 +206,16 @@ async fn a_silent_worker_is_disconnected_and_registers_again() -> Result<()> {
 #[tokio::test]
 async fn a_beating_worker_is_never_disconnected() -> Result<()> {
     let context = context()?;
-    let broker = majordomo_broker(&context, BEAT, LIVENESS).await?;
+    //  The broker's liveness window is 1.5 s against a worker beating every
+    //  50 ms, so only a stall thirty times the beat can evict the worker. That
+    //  margin is the one remaining real-clock dependency of this test.
+    let patient_interval = BEAT * 10;
+    let broker = majordomo_broker(&context, patient_interval, LIVENESS).await?;
     let worker = majordomo_worker(&context, &broker.endpoint, "echo", BEAT)?;
     until(|| broker.ready_seen.load(Ordering::Relaxed) >= 1).await;
 
-    //  Four lifetimes with no work at all.
-    tokio::time::sleep(BEAT * LIVENESS * 4).await;
+    //  Two lifetimes with no work at all.
+    tokio::time::sleep(patient_interval * LIVENESS * 2).await;
     assert_eq!(
         broker.disconnects_sent.load(Ordering::Relaxed),
         0,
@@ -204,7 +226,11 @@ async fn a_beating_worker_is_never_disconnected() -> Result<()> {
         1,
         "it never had to register twice"
     );
-    let reply = majordomo_request(&context, &broker.endpoint, "echo", "still", PATIENCE, 3).await?;
+    let reply = patient(
+        "the reply",
+        majordomo_request(&context, &broker.endpoint, "echo", "still", FOREVER, 3),
+    )
+    .await?;
     assert_eq!(reply.as_deref(), Some("still"), "and it still works");
     Ok(())
 }
@@ -219,7 +245,9 @@ async fn freelance_model_one_walks_past_a_dead_endpoint() -> Result<()> {
     let live = freelance_server(&context, "live", None).await?;
     let endpoints = vec!["tcp://127.0.0.1:1".to_owned(), live.endpoint.clone()];
 
-    let reply = freelance_model_one(&context, &endpoints, "name", Duration::from_millis(300))
+    //  The dead endpoint costs one timeout (that is the claim), and the live
+    //  one is bound by the same value, so it is generous rather than tight.
+    let reply = freelance_model_one(&context, &endpoints, "name", Duration::from_secs(3))
         .await?
         .expect("the live server answered");
     assert_eq!(reply.body, "name live", "the live server's echo");
@@ -247,8 +275,7 @@ async fn freelance_model_two_discards_a_stale_reply() -> Result<()> {
     let context = context()?;
     let quick = freelance_server(&context, "quick", None).await?;
     let mut client = FreelanceClient::new(&context, std::slice::from_ref(&quick.endpoint))?;
-    let answered = client
-        .request("one", PATIENCE)
+    let answered = patient("request one", client.request("one", FOREVER))
         .await?
         .expect("the quick server answered");
     assert_eq!(answered.body, "one quick", "the ordinary case first");
@@ -268,8 +295,7 @@ async fn freelance_model_two_discards_a_stale_reply() -> Result<()> {
     assert!(abandoned.is_none(), "request one timed out, as arranged");
 
     //  Request two: the reply to request one arrives first and is not it.
-    let second = client
-        .request("two", PATIENCE)
+    let second = patient("request two", client.request("two", FOREVER))
         .await?
         .expect("request two was answered");
     assert_eq!(
@@ -283,11 +309,13 @@ async fn freelance_model_two_discards_a_stale_reply() -> Result<()> {
     Ok(())
 }
 
-/// Waits for a condition, failing the test rather than hanging the suite.
-async fn until(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
-    while !ready() {
-        assert!(Instant::now() < deadline, "the condition never held");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+/// Waits for a condition, reporting past `PATIENCE` instead of failing.
+async fn until(ready: impl FnMut() -> bool) {
+    weida_testkit::until("the condition", PATIENCE, ready).await;
+}
+
+/// Awaits a call that was given [`FOREVER`], reporting past `PATIENCE`
+/// instead of failing.
+async fn patient<T>(what: &str, call: impl Future<Output = T>) -> T {
+    weida_testkit::within(what, PATIENCE, call).await
 }

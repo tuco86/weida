@@ -8,7 +8,8 @@
 //! blocked with no peer at all, and a ROUTER waiting for a peer it has not
 //! learned yet. Each round is a brand-new socket and a brand-new peer, so
 //! the timing differs every time; a wait that sleeps through its event
-//! fails the round after its bound rather than hanging the run.
+//! never ends, which the wait helper reports as it goes on waiting and the
+//! job's own budget finally ends.
 //!
 //! The deterministic form of the same claims, with the interleaving forced
 //! by a hook, is in `src/socket.rs`; this is the one that needs real threads.
@@ -23,7 +24,8 @@ use weida_zmq::{
 /// enough that a run is a second or two.
 const ROUNDS: usize = 200;
 
-/// The longest any one wait may take before the round is declared lost.
+/// How long one wait is expected to take; past it the wait reports and
+/// keeps waiting, since a limit on a real clock would fail a slow run.
 const BOUND: Duration = Duration::from_secs(10);
 
 fn context() -> Context {
@@ -40,7 +42,7 @@ async fn a_parked_receive_wakes_for_a_peer_that_arrives_and_sends() {
         let mut sink = PullSocket::new(&ctx).expect("pull");
         sink.bind(&name).await.expect("bind");
         let receiving = tokio::spawn(async move {
-            let got = sink.recv_timeout(BOUND).await;
+            let got = sink.recv().await;
             (sink, got)
         });
         tokio::task::yield_now().await;
@@ -49,9 +51,8 @@ async fn a_parked_receive_wakes_for_a_peer_that_arrives_and_sends() {
         source.connect(&name).expect("connect");
         source.send("hello").await.expect("send");
 
-        let (_sink, got) = tokio::time::timeout(BOUND * 2, receiving)
+        let (_sink, got) = weida_testkit::within("the receiving task", BOUND, receiving)
             .await
-            .expect("the receiving task ended")
             .expect("the task");
         let message = got.unwrap_or_else(|e| panic!("round {round}: the receive slept: {e}"));
         assert_eq!(message.frames()[0].as_slice(), b"hello");
@@ -67,22 +68,20 @@ async fn a_blocked_send_wakes_for_a_peer_that_arrives() {
         let mut source = PushSocket::new(&ctx).expect("push");
         source.bind(&name).await.expect("bind");
         let sending = tokio::spawn(async move {
-            let sent = source.send_timeout("work", BOUND).await;
+            let sent = source.send("work").await;
             (source, sent)
         });
         tokio::task::yield_now().await;
 
         let mut sink = PullSocket::new(&ctx).expect("pull");
         sink.connect(&name).expect("connect");
-        let message = sink
-            .recv_timeout(BOUND)
+        let message = weida_testkit::within("the work to arrive", BOUND, sink.recv())
             .await
             .unwrap_or_else(|e| panic!("round {round}: the work never arrived: {e}"));
         assert_eq!(message.frames()[0].as_slice(), b"work");
 
-        let (_source, sent) = tokio::time::timeout(BOUND * 2, sending)
+        let (_source, sent) = weida_testkit::within("the sending task", BOUND, sending)
             .await
-            .expect("the sending task ended")
             .expect("the task");
         sent.unwrap_or_else(|e| panic!("round {round}: the send slept: {e}"));
     }
@@ -98,7 +97,7 @@ async fn a_router_waiting_hears_a_peer_that_arrives_and_speaks() {
         let mut router = RouterSocket::new(&ctx).expect("router");
         router.bind(&name).await.expect("bind");
         let listening = tokio::spawn(async move {
-            let got = router.recv_timeout(BOUND).await;
+            let got = router.recv().await;
             (router, got)
         });
         tokio::task::yield_now().await;
@@ -108,9 +107,8 @@ async fn a_router_waiting_hears_a_peer_that_arrives_and_speaks() {
         dealer.connect(&name).expect("connect");
         dealer.send("hello").await.expect("send");
 
-        let (_router, got) = tokio::time::timeout(BOUND * 2, listening)
+        let (_router, got) = weida_testkit::within("the listening task", BOUND, listening)
             .await
-            .expect("the listening task ended")
             .expect("the task");
         let message = got.unwrap_or_else(|e| panic!("round {round}: the ROUTER slept: {e}"));
         assert_eq!(message.len(), 2, "routing id and body");

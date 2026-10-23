@@ -146,7 +146,9 @@ def a_connect_to_nothing_is_named_and_not_a_hang():
             return failed.errno
         raise AssertionError("a connect to a closed port should fail")
 
-    errno = asyncio.run(asyncio.wait_for(run(), timeout=10))
+    # No outer deadline: `connect_timeout` above is the expected end of a
+    # connect that nothing answers, and the CI job's budget is the hang guard.
+    errno = asyncio.run(run())
     print(f"a connect to nothing raised {errno} rather than hanging")
 
 

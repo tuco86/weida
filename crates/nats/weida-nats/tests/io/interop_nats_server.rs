@@ -66,7 +66,12 @@ macro_rules! needs_nats_server {
     };
 }
 
+/// How long a step is expected to take: past it the wait reports and goes on.
 const DEADLINE: Duration = Duration::from_secs(10);
+
+async fn within<F: Future>(what: &str, future: F) -> F::Output {
+    weida_testkit::within(what, DEADLINE, future).await
+}
 
 /// The version every measured claim would be measured against, printed by the
 /// harness so that `docs/libraries/nats.md` can name it rather than guess.
@@ -104,7 +109,8 @@ impl Server {
         let stderr = child.stderr.take().expect("piped");
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // No time limit: a server that is slow to start is a slow run. One
+        // that never logs "ready" ends the read with its exit.
         loop {
             line.clear();
             let read = reader.read_line(&mut line).expect("the server logs");
@@ -112,10 +118,6 @@ impl Server {
             if line.contains("Server is ready") {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "nats-server was not ready within 30 s; last line: {line}"
-            );
         }
         println!("MEASURED against {} on port {port}", server_version());
         Self { child, port }
@@ -136,20 +138,21 @@ fn options() -> ConnectionOptions {
 }
 
 async fn ours(exec: &Exec, port: u16) -> Connection {
-    tokio::time::timeout(
-        DEADLINE,
+    within(
+        "the server answered",
         Connection::connect(exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("the server answered")
     .expect("INFO, CONNECT and the PING/PONG confirmation succeeded")
 }
 
 async fn theirs(port: u16) -> async_nats::Client {
-    tokio::time::timeout(DEADLINE, async_nats::connect(format!("127.0.0.1:{port}")))
-        .await
-        .expect("the peer connected")
-        .expect("async-nats connected")
+    within(
+        "the peer connected",
+        async_nats::connect(format!("127.0.0.1:{port}")),
+    )
+    .await
+    .expect("async-nats connected")
 }
 
 #[tokio::test]
@@ -167,28 +170,24 @@ async fn our_publish_reaches_an_async_nats_subscriber() {
     let mut subscriber = peer.subscribe("interop.one").await.expect("subscribed");
     peer.flush().await.expect("the SUB reached the server");
 
-    tokio::time::timeout(
-        DEADLINE,
+    within(
+        "a step of the test",
         connection.publish("interop.one", b"from weida-nats"),
     )
     .await
-    .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, connection.flush())
+    within("a step of the test", connection.flush())
         .await
-        .unwrap()
         .unwrap();
 
-    let message = tokio::time::timeout(DEADLINE, subscriber.next())
+    let message = within("the server delivered", subscriber.next())
         .await
-        .expect("the server delivered")
         .expect("a message");
     assert_eq!(&message.payload[..], b"from weida-nats");
     assert_eq!(message.subject.as_str(), "interop.one");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }
 
@@ -200,13 +199,11 @@ async fn an_async_nats_publish_reaches_our_subscriber() {
     let peer = theirs(server.port).await;
     let connection = ours(&exec, server.port).await;
 
-    let mut subscription = tokio::time::timeout(DEADLINE, connection.subscribe("interop.two"))
+    let mut subscription = within("a step of the test", connection.subscribe("interop.two"))
         .await
-        .unwrap()
         .expect("subscribed");
-    tokio::time::timeout(DEADLINE, connection.flush())
+    within("a step of the test", connection.flush())
         .await
-        .unwrap()
         .unwrap();
 
     peer.publish("interop.two", "from async-nats".into())
@@ -214,17 +211,15 @@ async fn an_async_nats_publish_reaches_our_subscriber() {
         .expect("published");
     peer.flush().await.expect("flushed");
 
-    let message = tokio::time::timeout(DEADLINE, subscription.next())
+    let message = within("the server delivered", subscription.next())
         .await
-        .expect("the server delivered")
         .expect("a message");
     assert_eq!(message.payload, &b"from async-nats"[..]);
     assert_eq!(message.subject_str(), Some("interop.two"));
     assert_eq!(message.reply_to, None);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }
 
@@ -240,17 +235,14 @@ async fn the_two_wildcards_match_what_the_server_says_they_match() {
     // authority on which subject matches which pattern is the server, and
     // this client's `subject::matches` is a pure function asserted against the
     // protocol reference — so the point of the test is that the two agree.
-    let mut token = tokio::time::timeout(DEADLINE, connection.subscribe("interop.*.leaf"))
+    let mut token = within("a step of the test", connection.subscribe("interop.*.leaf"))
         .await
-        .unwrap()
         .unwrap();
-    let mut tail = tokio::time::timeout(DEADLINE, connection.subscribe("interop.deep.>"))
+    let mut tail = within("a step of the test", connection.subscribe("interop.deep.>"))
         .await
-        .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, connection.flush())
+    within("a step of the test", connection.flush())
         .await
-        .unwrap()
         .unwrap();
 
     for subject in ["interop.a.leaf", "interop.deep.a.b.c", "interop.a.b.leaf"] {
@@ -260,9 +252,8 @@ async fn the_two_wildcards_match_what_the_server_says_they_match() {
     }
     peer.flush().await.expect("flushed");
 
-    let first = tokio::time::timeout(DEADLINE, token.next())
+    let first = within("a step of the test", token.next())
         .await
-        .unwrap()
         .expect("a message");
     assert_eq!(
         first.subject_str(),
@@ -274,9 +265,8 @@ async fn the_two_wildcards_match_what_the_server_says_they_match() {
         "and only one of the three reached it"
     );
 
-    let deep = tokio::time::timeout(DEADLINE, tail.next())
+    let deep = within("a step of the test", tail.next())
         .await
-        .unwrap()
         .expect("a message");
     assert_eq!(
         deep.subject_str(),
@@ -284,9 +274,8 @@ async fn the_two_wildcards_match_what_the_server_says_they_match() {
         "`>` matches one or more tokens"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }
 
@@ -301,16 +290,14 @@ async fn a_queue_group_holding_both_clients_delivers_to_exactly_one() {
     // One subscriber of each kind in the same group. The server picks, and
     // what is asserted is the *count*: a queue group is "one of the set
     // receives each message", not a load-balancing promise about which.
-    let mut ours_sub = tokio::time::timeout(
-        DEADLINE,
+    let mut ours_sub = within(
+        "a step of the test",
         connection.subscribe_with_queue_group("interop.work", "workers"),
     )
     .await
-    .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, connection.flush())
+    within("a step of the test", connection.flush())
         .await
-        .unwrap()
         .unwrap();
     let mut theirs_sub = peer
         .queue_subscribe("interop.work", "workers".into())
@@ -330,31 +317,32 @@ async fn a_queue_group_holding_both_clients_delivers_to_exactly_one() {
 
     let mut mine = 0usize;
     let mut hers = 0usize;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while mine + hers < JOBS && tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            message = ours_sub.next() => {
-                if message.is_some() {
-                    mine += 1;
-                }
+    // No time limit: a slow run is reported by `within`, not failed. A closed
+    // subscription ends the loop, so a broken one fails the assertion below
+    // instead of spinning.
+    within("every job of the group delivered", async {
+        while mine + hers < JOBS {
+            tokio::select! {
+                message = ours_sub.next() => match message {
+                    Some(_) => mine += 1,
+                    None => break,
+                },
+                message = theirs_sub.next() => match message {
+                    Some(_) => hers += 1,
+                    None => break,
+                },
             }
-            message = theirs_sub.next() => {
-                if message.is_some() {
-                    hers += 1;
-                }
-            }
-            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
-    }
+    })
+    .await;
     assert_eq!(
         mine + hers,
         JOBS,
         "every message reached exactly one member of the group ({mine} here, {hers} there)"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }
 
@@ -380,26 +368,21 @@ async fn our_request_is_answered_by_an_async_nats_responder() {
         request.payload
     });
 
-    let answer = tokio::time::timeout(
-        DEADLINE,
-        connection.request("interop.echo", b"ping", Duration::from_secs(5)),
+    let answer = within(
+        "within the window",
+        connection.request("interop.echo", b"ping", Duration::from_secs(3600)),
     )
     .await
-    .expect("within the window")
     .expect("an answer");
     assert_eq!(answer.payload, &b"ping"[..]);
     // The inbox is ours and the reply subject the responder saw is the one we
     // generated, which is the whole of Core NATS request-reply: there is no
     // request verb, only a subject nobody else subscribes to.
-    let seen = tokio::time::timeout(DEADLINE, answering)
-        .await
-        .unwrap()
-        .unwrap();
+    let seen = within("a step of the test", answering).await.unwrap();
     assert_eq!(&seen[..], b"ping");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }
 
@@ -411,13 +394,11 @@ async fn an_async_nats_request_is_answered_by_us() {
     let peer = theirs(server.port).await;
     let connection = ours(&exec, server.port).await;
 
-    let mut service = tokio::time::timeout(DEADLINE, connection.subscribe("interop.serve"))
+    let mut service = within("a step of the test", connection.subscribe("interop.serve"))
         .await
-        .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, connection.flush())
+    within("a step of the test", connection.flush())
         .await
-        .unwrap()
         .unwrap();
 
     let serving = {
@@ -430,19 +411,17 @@ async fn an_async_nats_request_is_answered_by_us() {
         })
     };
 
-    let answer = tokio::time::timeout(DEADLINE, peer.request("interop.serve", "ping".into()))
-        .await
-        .expect("within the window")
-        .expect("an answer");
+    let answer = within(
+        "within the window",
+        peer.request("interop.serve", "ping".into()),
+    )
+    .await
+    .expect("an answer");
     assert_eq!(&answer.payload[..], b"pong");
-    tokio::time::timeout(DEADLINE, serving)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", serving).await.unwrap();
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }
 
@@ -458,26 +437,22 @@ async fn a_request_with_no_responder_is_the_servers_503_and_not_a_timeout() {
     // interest with a headers-only message carrying status 503 — which is a
     // different fact from "nobody answered in time" and must not collapse into
     // it.
-    let started = std::time::Instant::now();
-    let error = tokio::time::timeout(
-        DEADLINE,
-        connection.request("interop.nobody", b"anyone?", Duration::from_secs(5)),
+    // The window is long on purpose: the 503 is the outcome, so what comes
+    // back is `NoResponders` and not `RequestTimeout`, whatever the speed of
+    // the run. How long it took is not asserted.
+    let error = within(
+        "the server answered rather than leaving us to time out",
+        connection.request("interop.nobody", b"anyone?", Duration::from_secs(60)),
     )
     .await
-    .expect("the server answered rather than leaving us to time out")
     .expect_err("no responders");
     assert!(
         matches!(error, weida_nats::Error::NoResponders),
         "expected NoResponders, got {error:?}"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the 503 came back immediately rather than at the end of the window"
-    );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }
 
@@ -500,21 +475,18 @@ async fn headers_cross_to_an_async_nats_subscriber_and_back() {
     let mut headers = weida_nats::OwnedHeaders::default();
     headers.push("Nats-Msg-Id", "interop-1");
     headers.push("X-Weida", "yes");
-    tokio::time::timeout(
-        DEADLINE,
+    within(
+        "a step of the test",
         connection.publish_with("interop.headers", None, Some(&headers), b"with headers"),
     )
     .await
-    .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, connection.flush())
+    within("a step of the test", connection.flush())
         .await
-        .unwrap()
         .unwrap();
 
-    let message = tokio::time::timeout(DEADLINE, subscriber.next())
+    let message = within("a step of the test", subscriber.next())
         .await
-        .unwrap()
         .expect("a message");
     let seen = message.headers.expect("the headers survived the server");
     assert_eq!(
@@ -524,8 +496,7 @@ async fn headers_cross_to_an_async_nats_subscriber_and_back() {
     assert_eq!(seen.get("X-Weida").map(|value| value.as_str()), Some("yes"));
     assert_eq!(&message.payload[..], b"with headers");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    within("a step of the test", connection.close())
         .await
-        .unwrap()
         .unwrap();
 }

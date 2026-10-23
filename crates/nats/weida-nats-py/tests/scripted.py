@@ -19,17 +19,16 @@ None of it is client behaviour: nothing here decodes what the client decodes
 or decides what the client decides.
 
 The server runs its own asyncio loop in a daemon thread, so the same object
-serves the coroutine tests and the blocking ones. Every call from the test
-thread is bounded by `DEADLINE`, so a wrong turn fails the test rather than
-hanging the suite.
+serves the coroutine tests and the blocking ones. Every wait from the test
+thread goes through `waits`: a slow run is reported and goes on, because no
+test has a hard time limit on a real clock.
 """
 
 import asyncio
 import json
 import threading
 
-# Every wait in a test is bounded by this.
-DEADLINE = 5.0
+import waits
 
 # An INFO that offers everything this client can claim: headers, so
 # `no_responders` is negotiable, and protocol level 1.
@@ -182,8 +181,7 @@ class Server:
         server = cls(info=info)
         server._thread = threading.Thread(target=server._run, daemon=True)
         server._thread.start()
-        if not server._ready.wait(DEADLINE):
-            raise AssertionError("the scripted server did not start")
+        waits.wait_set(server._ready, "the scripted server to start")
         return server
 
     def stop(self):
@@ -201,7 +199,7 @@ class Server:
                 pass
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
-            self._thread.join(DEADLINE)
+            waits.join(self._thread, "the scripted server's thread to end")
 
     async def _shutdown(self):
         if self._serving is not None:
@@ -365,9 +363,8 @@ class Server:
 
     # -- what a test drives -------------------------------------------
 
-    def wait_connected(self, timeout=DEADLINE):
-        if not self._connected.wait(timeout):
-            raise AssertionError("no client connected")
+    def wait_connected(self):
+        waits.wait_set(self._connected, "a client to connect")
 
     def respond_to(self, subject, payload=b"", headers=None):
         """Answer every request published to `subject` with `payload`.
@@ -377,19 +374,19 @@ class Server:
         """
         self._responders.append((subject.encode(), payload, headers))
 
-    def op(self, timeout=DEADLINE):
+    def op(self):
         """The next operation the client sent."""
-        return self.ops(1, timeout)[0]
+        return self.ops(1)[0]
 
-    def ops(self, count=1, timeout=DEADLINE):
+    def ops(self, count=1):
         """The next `count` operations, in order."""
         got = []
         for _ in range(count):
             future = asyncio.run_coroutine_threadsafe(self._ops.get(), self._loop)
-            got.append(future.result(timeout))
+            got.append(waits.result(future, "the next operation from the client"))
         return got
 
-    def ops_until(self, verb, timeout=DEADLINE):
+    def ops_until(self, verb):
         """Operations up to and including the first with this verb.
 
         The handshake writes a `CONNECT` and a `PING` before anything a test
@@ -397,7 +394,7 @@ class Server:
         """
         got = []
         while True:
-            got.append(self.op(timeout))
+            got.append(self.op())
             if got[-1].verb == verb:
                 return got
 
@@ -422,19 +419,22 @@ class Server:
         self._writer.write(data)
         await self._writer.drain()
 
-    def _call(self, coroutine, timeout=DEADLINE):
-        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result(timeout)
+    def _call(self, coroutine):
+        return waits.result(
+            asyncio.run_coroutine_threadsafe(coroutine, self._loop),
+            "the scripted server's loop to run a call",
+        )
 
     # -- the same, for a caller that is inside an event loop ----------
 
-    async def aop(self, timeout=DEADLINE):
-        return await asyncio.to_thread(self.op, timeout)
+    async def aop(self):
+        return await asyncio.to_thread(self.op)
 
-    async def aops(self, count=1, timeout=DEADLINE):
-        return await asyncio.to_thread(self.ops, count, timeout)
+    async def aops(self, count=1):
+        return await asyncio.to_thread(self.ops, count)
 
-    async def aops_until(self, verb, timeout=DEADLINE):
-        return await asyncio.to_thread(self.ops_until, verb, timeout)
+    async def aops_until(self, verb):
+        return await asyncio.to_thread(self.ops_until, verb)
 
 
 def _msg(subject, sid, payload, reply_to=None):

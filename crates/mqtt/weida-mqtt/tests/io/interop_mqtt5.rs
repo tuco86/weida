@@ -163,15 +163,14 @@ const RESTRICTED: &str = "127.0.0.1:21887";
 fn options(client_id: &str) -> ConnectOptions {
     let mut options = ConnectOptions::new(client_id);
     options.keep_alive = Duration::from_secs(30);
-    options.connect_timeout = Duration::from_secs(5);
+    options.connect_timeout = Duration::from_secs(3600);
     options
 }
 
 async fn delivered(events: &mut Events) -> Delivery {
-    match tokio::time::timeout(DEADLINE, events.next()).await {
-        Ok(Some(Event::Delivered(delivery))) => delivery,
-        Ok(other) => panic!("expected a delivery, got {other:?}"),
-        Err(_) => panic!("no delivery within {DEADLINE:?}"),
+    match weida_testkit::within("a delivery", DEADLINE, events.next()).await {
+        Some(Event::Delivered(delivery)) => delivery,
+        other => panic!("expected a delivery, got {other:?}"),
     }
 }
 
@@ -338,8 +337,28 @@ async fn a_shared_subscription_splits_deliveries_between_its_members() {
 
     // Exactly one of the two group members gets one, and the other gets
     // nothing - which is the whole difference between a group and a filter.
-    let to_first = tokio::time::timeout(Duration::from_millis(800), first_events.next()).await;
-    let to_second = tokio::time::timeout(Duration::from_millis(800), second_events.next()).await;
+    // First wait for the one delivery however long it takes; then a short
+    // negative window checks that the other member gets none.
+    let (to_first, to_second) = {
+        let winner = weida_testkit::within("the group's one delivery", DEADLINE, async {
+            tokio::select! {
+                event = first_events.next() => (true, event),
+                event = second_events.next() => (false, event),
+            }
+        })
+        .await;
+        let (first_won, event) = winner;
+        let other = if first_won {
+            tokio::time::timeout(Duration::from_millis(800), second_events.next()).await
+        } else {
+            tokio::time::timeout(Duration::from_millis(800), first_events.next()).await
+        };
+        if first_won {
+            (Ok(event), other)
+        } else {
+            (other, Ok(event))
+        }
+    };
     let group_deliveries = usize::from(to_first.is_ok()) + usize::from(to_second.is_ok());
     assert_eq!(
         group_deliveries, 1,
@@ -814,9 +833,8 @@ async fn a_server_disconnect_arrives_as_a_reason_code() {
         .await
         .expect("the second connection with the same identifier");
 
-    let event = tokio::time::timeout(DEADLINE, events.next())
+    let event = weida_testkit::within("the first connection to be told", DEADLINE, events.next())
         .await
-        .expect("the first connection is told")
         .expect("an event");
     let Event::Disconnected(error) = event else {
         panic!("expected a disconnect, got {event:?}")

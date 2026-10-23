@@ -47,9 +47,11 @@ pub(crate) fn pki(name: &str) -> Pki {
 pub(crate) fn options(tls: TlsConfig) -> SocketOptions {
     SocketOptions {
         tls: Some(tls),
-        recv_timeout: Some(Duration::from_secs(5)),
-        send_timeout: Some(Duration::from_secs(5)),
-        handshake_timeout: Duration::from_secs(5),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The handshake bound is an hour.
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         ..SocketOptions::default()
     }
@@ -77,7 +79,7 @@ async fn a_tls_dial_with_no_name_to_check_is_refused() {
     assert!(err.cause().contains("NNG_OPT_TLS_SERVER_NAME"));
 }
 
-/// The bound on every await in the tests below.
+/// The expected time of every await in the tests below.
 pub(crate) const BOUND: Duration = Duration::from_secs(10);
 
 /// The listening side of a configuration that requires the client's
@@ -111,53 +113,54 @@ pub(crate) fn tcp_address(url: &str) -> &str {
 /// Waits for the listener to close `stream` and returns how long that took.
 /// End of stream and a reset both count as closed. Bytes arriving first mean
 /// the listener spoke to a connection it had not admitted, which is a failure.
-pub(crate) async fn closed_by_listener(stream: &mut TcpStream, budget: Duration) -> Duration {
+/// A close that takes longer than `expected` is reported, not failed.
+pub(crate) async fn closed_by_listener(stream: &mut TcpStream, expected: Duration) -> Duration {
     let started = Instant::now();
     let mut byte = [0u8; 1];
-    match tokio::time::timeout(budget, stream.read(&mut byte)).await {
-        Ok(Ok(0)) | Ok(Err(_)) => started.elapsed(),
-        Ok(Ok(count)) => {
+    match weida_testkit::within(
+        "the listener closing the connection",
+        expected,
+        stream.read(&mut byte),
+    )
+    .await
+    {
+        Ok(0) | Err(_) => started.elapsed(),
+        Ok(count) => {
             panic!("the listener sent {count} byte(s) to a connection it had not admitted")
         }
-        Err(_) => panic!("the listener did not close the connection within {budget:?}"),
     }
 }
 
-/// One request and its reply over an admitted pair, every await bounded.
+/// One request and its reply over an admitted pair, every await reported when
+/// it takes longer than [`BOUND`].
 pub(crate) async fn exchange_once(req: &ReqSocket, rep: &RepSocket) {
-    tokio::time::timeout(BOUND, req.send(b"ping".to_vec()))
+    weida_testkit::within("the request being sent", BOUND, req.send(b"ping".to_vec()))
         .await
-        .expect("the request was sent in time")
         .expect("send");
-    let request = tokio::time::timeout(BOUND, rep.recv())
+    let request = weida_testkit::within("the request arriving", BOUND, rep.recv())
         .await
-        .expect("the request arrived in time")
         .expect("recv");
     assert_eq!(request.body(), b"ping");
-    tokio::time::timeout(BOUND, rep.send(b"pong".to_vec()))
+    weida_testkit::within("the reply being sent", BOUND, rep.send(b"pong".to_vec()))
         .await
-        .expect("the reply was sent in time")
         .expect("reply");
-    let reply = tokio::time::timeout(BOUND, req.recv())
+    let reply = weida_testkit::within("the reply arriving", BOUND, req.recv())
         .await
-        .expect("the reply arrived in time")
         .expect("recv");
     assert_eq!(reply.body(), b"pong");
 }
 
-/// Dials until the listener admits the connection or `budget` runs out. A
-/// listener frees a slot a moment after the peer holding it has closed, so a
-/// single attempt can still meet that slot as taken.
+/// Dials until the listener admits the connection, reporting a wait past
+/// `budget`. A listener frees a slot a moment after the peer holding it has
+/// closed, so a single attempt can still meet that slot as taken.
 pub(crate) async fn dial_until_admitted(req: &ReqSocket, url: &str, budget: Duration) {
-    let started = Instant::now();
-    loop {
-        if let Ok(Ok(_dialer)) = tokio::time::timeout(BOUND, req.dial(url)).await {
-            return;
+    weida_testkit::within("the listener admitting a connection", budget, async {
+        loop {
+            if req.dial(url).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            started.elapsed() < budget,
-            "the listener admitted no connection within {budget:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await;
 }

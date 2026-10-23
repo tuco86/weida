@@ -40,7 +40,7 @@ async def exchange():
         connection = await weida_amqp.connect("127.0.0.1", port, container_id="smoke")
         session = await connection.begin()
         sender = await session.attach("orders", "sender", "/queues/orders")
-        outcome = await asyncio.wait_for(sender.send(b"from the wheel"), 10)
+        outcome = await broker.within("the outcome", sender.send(b"from the wheel"))
         assert outcome == "accepted", outcome
         await connection.close()
 

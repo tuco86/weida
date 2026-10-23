@@ -41,7 +41,7 @@ def metadata():
 
 def main():
     version = metadata()
-    asyncio.run(asyncio.wait_for(round_trip(), 10))
+    asyncio.run(round_trip())
     # The surfaces the wheel is supposed to carry, not only the one exercised.
     for name in ["Context", "ReqSocket", "PairSocket", "Multipart", "ZmqError", "EAGAIN"]:
         assert hasattr(weida_zmq, name), name

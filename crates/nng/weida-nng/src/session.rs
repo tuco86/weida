@@ -387,7 +387,7 @@ mod tests {
             context,
             protocol,
             SocketOptions {
-                handshake_timeout: Duration::from_millis(500),
+                handshake_timeout: Duration::from_secs(3600),
                 ..SocketOptions::default()
             },
             SpSession::shared(),
@@ -415,14 +415,14 @@ mod tests {
         (stream, url)
     }
 
-    /// A socket of `protocol` under `options`, with a handshake deadline
-    /// short enough for a test.
+    /// A socket of `protocol` under `options`, with a handshake deadline no
+    /// run reaches: no test here is about it.
     fn socket_under(context: &Context, protocol: EndpointType, options: SocketOptions) -> Engine {
         Engine::new(
             context,
             protocol,
             SocketOptions {
-                handshake_timeout: Duration::from_millis(500),
+                handshake_timeout: Duration::from_secs(3600),
                 ..options
             },
             SpSession::shared(),
@@ -439,13 +439,11 @@ mod tests {
         peer.write_all(&ProtocolHeader::new(as_protocol).encode())
             .await
             .expect("write");
-        for _ in 0..400 {
-            if !engine.pipes().is_empty() {
-                return peer;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("the pipe was not admitted");
+        weida_testkit::until("the pipe being admitted", Duration::from_secs(2), || {
+            !engine.pipes().is_empty()
+        })
+        .await;
+        peer
     }
 
     /// Claim: whole messages come out of the read loop however the stream
@@ -485,11 +483,12 @@ mod tests {
                 peer.write_all(&wire[cut..]).await.expect("second part");
                 drop(peer);
             };
-            let (ended, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(reading, feeding)
-            })
-            .await
-            .expect("the loop ends when the stream does");
+            let (ended, ()) = weida_testkit::within(
+                "the loop ending when the stream does",
+                Duration::from_secs(5),
+                async { tokio::join!(reading, feeding) },
+            )
+            .await;
             assert!(
                 matches!(ended, Err(Error::ECONNRESET(_))),
                 "cut {cut}: {ended:?}"
@@ -552,10 +551,13 @@ mod tests {
                 .expect("write");
 
             let mut after = Vec::new();
-            let read = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
-                .await
-                .expect("the connection is closed rather than left hanging")
-                .expect("read to end");
+            let read = weida_testkit::within(
+                "the connection being closed rather than left hanging",
+                Duration::from_secs(2),
+                peer.read_to_end(&mut after),
+            )
+            .await
+            .expect("read to end");
             assert_eq!(read, 0, "a refusal sent {after:?} instead of nothing");
             assert!(engine.pipes().is_empty(), "no pipe from a mispaired peer");
         }
@@ -581,11 +583,13 @@ mod tests {
                 peer.write_all(&bad).await.expect("write");
 
                 let mut after = Vec::new();
-                let read =
-                    tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
-                        .await
-                        .expect("closed rather than hanging")
-                        .expect("read to end");
+                let read = weida_testkit::within(
+                    "the connection being closed rather than left hanging",
+                    Duration::from_secs(2),
+                    peer.read_to_end(&mut after),
+                )
+                .await
+                .expect("read to end");
                 assert_eq!(read, 0, "{bad:02x?} was answered with {after:02x?}");
                 assert!(engine.pipes().is_empty());
                 engine.close();
@@ -683,7 +687,7 @@ mod tests {
                 EndpointType::Bus,
                 SocketOptions {
                     recv_max_size: 64,
-                    handshake_timeout: Duration::from_millis(500),
+                    handshake_timeout: Duration::from_secs(3600),
                     ..SocketOptions::default()
                 },
                 SpSession::shared(),
@@ -701,18 +705,20 @@ mod tests {
 
             peer.write_all(&[0xFFu8; 8]).await.expect("a huge claim");
             let mut after = Vec::new();
-            let read = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut after))
-                .await
-                .expect("the pipe is closed rather than left waiting for 2^64 octets")
-                .expect("read to end");
+            let read = weida_testkit::within(
+                "the pipe being closed rather than left waiting for 2^64 octets",
+                Duration::from_secs(2),
+                peer.read_to_end(&mut after),
+            )
+            .await
+            .expect("read to end");
             assert_eq!(read, 0);
-            for _ in 0..200 {
-                if engine.pipes().is_empty() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            panic!("the pipe survived a declaration it could never satisfy");
+            weida_testkit::until(
+                "the pipe going after a declaration it could never satisfy",
+                Duration::from_secs(1),
+                || engine.pipes().is_empty(),
+            )
+            .await;
         }
         /// Claim: a message that is declared and then trickled closes the pipe
         /// after `message_timeout`, and a connection that is merely quiet does
@@ -744,10 +750,13 @@ mod tests {
                 .await
                 .expect("write");
             let pipe = engine.pipes().first().cloned().expect("pipe");
-            let message = tokio::time::timeout(Duration::from_secs(2), pipe.incoming().recv())
-                .await
-                .expect("delivered")
-                .expect("a message");
+            let message = weida_testkit::within(
+                "the message being delivered",
+                Duration::from_secs(2),
+                pipe.incoming().recv(),
+            )
+            .await
+            .expect("a message");
             assert_eq!(message.body(), b"still here");
 
             // A kilobyte declared, ten octets sent, then nothing.
@@ -755,10 +764,13 @@ mod tests {
             quiet.write_all(&1024u64.to_be_bytes()).await.expect("size");
             quiet.write_all(&[1u8; 10]).await.expect("a few octets");
             let mut after = Vec::new();
-            let read = tokio::time::timeout(Duration::from_secs(3), quiet.read_to_end(&mut after))
-                .await
-                .expect("the pipe is closed rather than held for a message that never finishes")
-                .expect("read to end");
+            let read = weida_testkit::within(
+                "the pipe being closed rather than held for a message that never finishes",
+                Duration::from_secs(3),
+                quiet.read_to_end(&mut after),
+            )
+            .await
+            .expect("read to end");
             assert_eq!(read, 0);
             assert!(
                 started.elapsed() >= timeout / 2,
@@ -772,7 +784,11 @@ mod tests {
         #[tokio::test]
         async fn an_idle_pipe_is_closed_and_one_being_written_to_is_not() {
             let ctx = Context::new(ContextConfig::default()).expect("context");
-            let idle = Duration::from_millis(300);
+            // Not-closing is claimed while the pipe is written to every 100 ms,
+            // so the idle limit is thirty times that: only a stall of seconds
+            // can close the live pipe. This test keeps a real-clock dependency
+            // that no paused clock can replace, because it uses real sockets.
+            let idle = Duration::from_secs(3);
             let options = SocketOptions {
                 idle_timeout: Some(idle),
                 ..SocketOptions::default()
@@ -781,10 +797,13 @@ mod tests {
             let engine = socket_under(&ctx, EndpointType::Bus, options.clone());
             let mut silent = handshaken_peer(&engine, EndpointType::Bus).await;
             let mut after = Vec::new();
-            let read = tokio::time::timeout(Duration::from_secs(3), silent.read_to_end(&mut after))
-                .await
-                .expect("an idle pipe is closed")
-                .expect("read to end");
+            let read = weida_testkit::within(
+                "an idle pipe being closed",
+                Duration::from_secs(10),
+                silent.read_to_end(&mut after),
+            )
+            .await
+            .expect("read to end");
             assert_eq!(read, 0);
 
             let engine = socket_under(&ctx, EndpointType::Bus, options);
@@ -821,10 +840,13 @@ mod tests {
 
             let wire = Message::from_body(vec![1u8; 1024 * 1024]).encode();
             for _ in 0..20 {
-                tokio::time::timeout(Duration::from_secs(5), peer.write_all(&wire))
-                    .await
-                    .expect("the PUB keeps reading")
-                    .expect("write");
+                weida_testkit::within(
+                    "the PUB reading what a peer writes",
+                    Duration::from_secs(5),
+                    peer.write_all(&wire),
+                )
+                .await
+                .expect("write");
             }
             assert_eq!(
                 pipe.incoming().queued_bytes(),
@@ -834,12 +856,12 @@ mod tests {
             assert!(pipe.incoming().is_empty());
 
             drop(peer);
-            for _ in 0..400 {
-                if engine.pipes().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            weida_testkit::until(
+                "the pipe going with its peer",
+                Duration::from_secs(2),
+                || engine.pipes().is_empty(),
+            )
+            .await;
             assert!(engine.pipes().is_empty(), "the pipe went with its peer");
             assert!(
                 !engine.has_arrived(),

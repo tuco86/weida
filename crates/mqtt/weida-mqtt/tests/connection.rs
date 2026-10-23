@@ -35,12 +35,12 @@ async fn an_authenticator_without_an_authentication_method_is_refused() {
     }
 
     let context = Context::new().expect("ambient");
-    let error = tokio::time::timeout(
+    let error = weida_testkit::within(
+        "the refusal of an authenticator without a method",
         Duration::from_secs(10),
         Client::connect_with(&context, "127.0.0.1:1", options(), Arc::new(Verifier)),
     )
     .await
-    .expect("the refusal is immediate")
     .expect_err("refused");
     assert!(matches!(error, Error::Configuration(_)), "{error}");
 }
@@ -59,12 +59,12 @@ async fn a_timeout_that_cannot_be_a_deadline_is_refused_at_connect() {
     ] {
         let mut options = options();
         set(&mut options);
-        let error = tokio::time::timeout(
+        let error = weida_testkit::within(
+            "the refusal of a timeout that cannot be a deadline",
             Duration::from_secs(10),
             Client::connect(&context, "127.0.0.1:1", options),
         )
         .await
-        .expect("the refusal is immediate")
         .expect_err("refused");
         assert!(matches!(error, Error::Configuration(_)), "{error}");
     }

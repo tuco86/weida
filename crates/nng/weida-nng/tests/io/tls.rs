@@ -159,12 +159,12 @@ async fn an_allow_list_on_the_alt_names_refuses_a_peer() {
     // as a reset or abort on Linux, as an unexpected EOF (`ESYSERR`) on
     // Windows. All of them are the same refusal seen from the other end.
     let dialled = req.dial(&url).await;
-    for _ in 0..200 {
-        if refusals.load(Ordering::SeqCst) >= 1 && req.pipe_count() == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    weida_testkit::until(
+        "the refusal being counted and the dialler's pipe gone",
+        Duration::from_secs(2),
+        || refusals.load(Ordering::SeqCst) >= 1 && req.pipe_count() == 0,
+    )
+    .await;
     if let Err(error) = dialled {
         assert!(
             matches!(
@@ -310,10 +310,13 @@ async fn a_silent_tcp_connection_does_not_stop_the_listener_from_accepting() {
         .expect("connect");
 
     let req = ReqSocket::with_options(&ctx, options(dialer_tls(&server, &client))).expect("req");
-    tokio::time::timeout(Duration::from_secs(3), req.dial(&url))
-        .await
-        .expect("the TLS client was admitted within 3 s")
-        .expect("dial");
+    weida_testkit::within(
+        "the TLS client being admitted",
+        Duration::from_secs(3),
+        req.dial(&url),
+    )
+    .await
+    .expect("dial");
     exchange_once(&req, &rep).await;
 }
 /// Claim: a connection that never completes its handshake is closed when
@@ -382,16 +385,16 @@ async fn a_dial_to_a_peer_that_never_answers_the_tls_hello_times_out() {
         },
     )
     .expect("req");
-    let outcome = tokio::time::timeout(
+    let outcome = weida_testkit::within(
+        "the dial giving up",
         Duration::from_secs(3),
         req.dial(&format!("tls+tcp://{address}")),
     )
     .await;
     holder.abort();
     match outcome {
-        Ok(Err(error)) => assert!(matches!(error, Error::ETIMEDOUT(_)), "{error:?}"),
-        Ok(Ok(_)) => panic!("a dial to a peer that never answered was admitted"),
-        Err(_) => panic!("the dial did not give up within 3 s"),
+        Err(error) => assert!(matches!(error, Error::ETIMEDOUT(_)), "{error:?}"),
+        Ok(_) => panic!("a dial to a peer that never answered was admitted"),
     }
 }
 /// Claim: a listener runs at most `max_tls_handshakes` handshakes at once. A
@@ -409,7 +412,7 @@ async fn tls_handshakes_in_flight_are_capped() {
         &ctx,
         SocketOptions {
             max_tls_handshakes: 1,
-            handshake_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(3600),
             ..options(listener_tls(&server, &client))
         },
     )
@@ -460,7 +463,7 @@ async fn a_connection_over_the_pipe_ceiling_is_refused_before_any_handshake() {
         &ctx,
         SocketOptions {
             max_pipes: 1,
-            handshake_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(3600),
             ..options(listener_tls(&server, &client))
         },
     )
@@ -473,9 +476,8 @@ async fn a_connection_over_the_pipe_ceiling_is_refused_before_any_handshake() {
         .to_string();
 
     let req = ReqSocket::with_options(&ctx, options(dialer_tls(&server, &client))).expect("req");
-    tokio::time::timeout(BOUND, req.dial(&url))
+    weida_testkit::within("the TLS client being admitted", BOUND, req.dial(&url))
         .await
-        .expect("the TLS client was admitted in time")
         .expect("dial");
     exchange_once(&req, &rep).await;
     assert_eq!(rep.pipe_count(), 1);
@@ -484,9 +486,12 @@ async fn a_connection_over_the_pipe_ceiling_is_refused_before_any_handshake() {
         .await
         .expect("connect");
     let mut byte = [0u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(1), extra.read(&mut byte))
-        .await
-        .expect("the listener closed the extra connection within 1 s");
+    let read = weida_testkit::within(
+        "the listener closing the extra connection",
+        Duration::from_secs(1),
+        extra.read(&mut byte),
+    )
+    .await;
     assert_eq!(
         read.expect("a clean close"),
         0,

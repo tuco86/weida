@@ -9,8 +9,7 @@ pub(crate) mod support;
 
 use std::time::Duration;
 
-use support::{DEADLINE, Server, options};
-use tokio::time::timeout;
+use support::{DEADLINE, Server, options, timeout};
 use weida_amqp::{Connection, ConnectionOptions, Error, Source, Target};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::performative::{

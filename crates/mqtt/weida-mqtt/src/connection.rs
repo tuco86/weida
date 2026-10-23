@@ -901,9 +901,7 @@ mod tests {
 
     /// Every await in these tests is bounded.
     async fn bounded<F: Future>(future: F) -> F::Output {
-        tokio::time::timeout(Duration::from_secs(10), future)
-            .await
-            .expect("the await finished")
+        weida_testkit::within("a step of the test", Duration::from_secs(10), future).await
     }
 
     /// A reader and a writer over one end of a loopback connection, and the

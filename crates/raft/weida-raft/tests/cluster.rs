@@ -2,7 +2,7 @@
 //! runtime, one identity and one QUIC binding per node.
 
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use weida::{ClientTls, Fingerprint, Identity, Network, Runtime, RuntimeConfig, SimNet, Trust};
 use weida_raft::codec::{ENTRY_ENVELOPE_OVERHEAD, MIN_RPC_BYTES};
@@ -78,11 +78,12 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = Instant::now() + DEADLINE;
-    while !check().await {
-        assert!(Instant::now() < deadline, "timed out waiting until {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    weida_testkit::within(what, DEADLINE, async {
+        while !check().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }
 
 fn count(n: u64) -> Response {
@@ -542,7 +543,7 @@ mod io {
         let (tx, rx) = std::sync::mpsc::channel();
         let inner = runtime.clone();
         runtime.exec().spawn(async move {
-            let outcome = async {
+            let outcome: Result<u64, String> = async {
                 let identity = Identity::generate().map_err(|e| e.to_string())?;
                 let store = MemoryStore::default();
                 let consensus = Consensus::start(&inner, identity, store.clone(), store, config())
@@ -550,13 +551,10 @@ mod io {
                     .map_err(|e| e.to_string())?;
                 consensus.bootstrap().await.map_err(|e| e.to_string())?;
                 let id = consensus.id();
-                let deadline = Instant::now() + DEADLINE;
-                while consensus.leader() != Some(id) {
-                    if Instant::now() >= deadline {
-                        return Err("never elected".to_owned());
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+                weida_testkit::until("the node to lead", DEADLINE, || {
+                    consensus.leader() == Some(id)
+                })
+                .await;
                 let response = consensus
                     .write(Request(b"a".to_vec()))
                     .await
@@ -572,8 +570,7 @@ mod io {
             let _ = tx.send(outcome);
         });
 
-        let outcome = rx
-            .recv_timeout(Duration::from_secs(15))
+        let outcome = weida_testkit::recv(&rx, "the engine to report", DEADLINE)
             .expect("the engine reported nothing: it never ran");
         assert_eq!(outcome, Ok(1));
     }

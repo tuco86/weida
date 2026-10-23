@@ -21,23 +21,29 @@ use weida_sp::message;
 
 fn options() -> SocketOptions {
     SocketOptions {
-        // Short enough that a test can watch a resend, long enough that a
-        // healthy exchange never sees one.
-        resend_time: Duration::from_millis(150),
-        recv_timeout: Some(Duration::from_secs(5)),
-        send_timeout: Some(Duration::from_secs(5)),
-        handshake_timeout: Duration::from_secs(2),
+        // An hour: no test but the one that claims the resend timer sees a
+        // resend, however slow the run is.
+        resend_time: Duration::from_secs(3600),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The handshake bound is an hour.
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         ..SocketOptions::default()
     }
 }
 
 async fn pair() -> (Context, ReqSocket, RepSocket, String) {
+    pair_with(options()).await
+}
+
+async fn pair_with(options: SocketOptions) -> (Context, ReqSocket, RepSocket, String) {
     let ctx = Context::new(ContextConfig::default()).expect("context");
-    let rep = RepSocket::with_options(&ctx, options()).expect("rep");
+    let rep = RepSocket::with_options(&ctx, options.clone()).expect("rep");
     let listener = rep.listen("tcp://127.0.0.1:0").await.expect("listen");
     let url = listener.url().to_string();
-    let req = ReqSocket::with_options(&ctx, options()).expect("req");
+    let req = ReqSocket::with_options(&ctx, options).expect("req");
     req.dial(&url).await.expect("dial");
     (ctx, req, rep, url)
 }
@@ -184,17 +190,26 @@ async fn a_newer_request_discards_the_older_reply_without_withdrawing_it() {
 /// which is a cost of the pattern rather than a hidden repair.
 #[tokio::test]
 async fn the_resend_timer_makes_the_replier_see_a_duplicate() {
-    let (_ctx, req, rep, _url) = pair().await;
+    // The one test whose claim is the timer firing: a short resend time, and
+    // the wait for the duplicate is reported, not limited.
+    let (_ctx, req, rep, _url) = pair_with(SocketOptions {
+        resend_time: Duration::from_millis(150),
+        ..options()
+    })
+    .await;
 
     req.send(b"work".to_vec()).await.expect("send");
     let first = rep.context().recv().await.expect("the request");
     assert_eq!(first.body(), b"work");
 
     // Nobody replies. The requester's clock runs out and sends it again.
-    let duplicate = tokio::time::timeout(Duration::from_secs(5), rep.context().recv())
-        .await
-        .expect("the resend arrives")
-        .expect("a second request");
+    let duplicate = weida_testkit::within(
+        "the resend arriving",
+        Duration::from_secs(5),
+        rep.context().recv(),
+    )
+    .await
+    .expect("a second request");
     assert_eq!(duplicate.body(), b"work", "the same work, twice");
     assert_eq!(
         duplicate.header(),
@@ -242,10 +257,13 @@ async fn a_disconnect_and_a_new_peer_both_resend_the_request() {
     let rescuer = RepSocket::with_options(&ctx, options()).expect("rep");
     rescuer.listen(&spare_url).await.expect("listen");
 
-    let resent = tokio::time::timeout(Duration::from_secs(10), rescuer.recv())
-        .await
-        .expect("the request is resent to the peer that appeared")
-        .expect("a request");
+    let resent = weida_testkit::within(
+        "the request being resent to the peer that appeared",
+        Duration::from_secs(10),
+        rescuer.recv(),
+    )
+    .await
+    .expect("a request");
     assert_eq!(resent.body(), b"work");
     assert_eq!(
         resent.header(),
@@ -321,8 +339,8 @@ async fn requests_are_spread_over_the_available_repliers() {
     );
 }
 
-/// Every wait on a peer in these tests is bounded by this, so a replier that
-/// stops answering fails its test instead of hanging the run.
+/// Every wait on a peer in these tests reports a step that takes longer than
+/// this instead of failing the test for it.
 const PATIENCE: Duration = Duration::from_secs(10);
 
 /// The size of one reply in the stalled-requester test. A few of them fill the
@@ -330,25 +348,16 @@ const PATIENCE: Duration = Duration::from_secs(10);
 /// observable at all.
 const REPLY_BYTES: usize = 256 * 1024;
 
-/// Awaits `future` for at most [`PATIENCE`].
+/// Awaits `future`, reporting past [`PATIENCE`].
 async fn patiently<T>(what: &str, future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(PATIENCE, future)
-        .await
-        .unwrap_or_else(|_| panic!("{what} did not finish within {PATIENCE:?}"))
+    weida_testkit::within(what, PATIENCE, future).await
 }
 
-/// Polls `holds` until it is true, for at most two seconds. For a state that a
-/// background task brings about: the property is that it comes about, and the
-/// poll is the time it is allowed to take.
-async fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while !holds() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{what} did not happen within two seconds"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+/// Polls `holds` until it is true. For a state that a background task brings
+/// about: the property is that it comes about, and a wait past two seconds is
+/// reported rather than failed.
+async fn eventually(what: &str, holds: impl FnMut() -> bool) {
+    weida_testkit::until(what, Duration::from_secs(2), holds).await;
 }
 
 /// The final tag of a stack: a request ID with the terminal bit set, which is
@@ -400,25 +409,33 @@ async fn next_message(stream: &mut TcpStream) -> Vec<u8> {
     body
 }
 
-/// Requires the replier to end `stream`: an end of file or a reset within two
-/// seconds. An octet arriving instead means the connection is still in use.
+/// Requires the replier to end `stream`: an end of file or a reset. An octet
+/// arriving instead means the connection is still in use.
 async fn expect_closed(stream: &mut TcpStream, what: &str) {
     let mut octet = [0u8; 1];
-    match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut octet)).await {
-        Ok(Ok(0) | Err(_)) => {}
-        Ok(Ok(_)) => panic!("{what}: the replier sent data on a connection it should have closed"),
-        Err(_) => panic!("{what}: the connection was still open two seconds later"),
+    let read = weida_testkit::within(
+        &format!("{what}: the connection being closed"),
+        Duration::from_secs(2),
+        stream.read(&mut octet),
+    )
+    .await;
+    match read {
+        Ok(0) | Err(_) => {}
+        Ok(_) => panic!("{what}: the replier sent data on a connection it should have closed"),
     }
 }
 
-/// Requires `receive` to answer `NNG_ECLOSED` within a second of the close.
+/// Requires `receive` to answer `NNG_ECLOSED` once the socket is closed.
 async fn answers_closed<T: std::fmt::Debug>(
     what: &str,
     receive: impl Future<Output = weida_nng::Result<T>>,
 ) {
-    let outcome = tokio::time::timeout(Duration::from_secs(1), receive)
-        .await
-        .unwrap_or_else(|_| panic!("{what}: no answer a second after the close"));
+    let outcome = weida_testkit::within(
+        &format!("{what} answering after the close"),
+        Duration::from_secs(1),
+        receive,
+    )
+    .await;
     assert!(
         matches!(outcome, Err(Error::ECLOSED(_))),
         "{what}: {outcome:?}"
@@ -479,24 +496,24 @@ async fn a_requester_that_stops_reading_cannot_freeze_the_replier() {
     // A has sent everything it is going to send, and it never reads again.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Peer B: an ordinary requester, which must be answered within five seconds.
+    // Peer B: an ordinary requester, which must be answered. A frozen replier
+    // is reported by `patiently` once the wait passes its expected time.
     let req = ReqSocket::with_options(
         &ctx,
         SocketOptions {
-            recv_timeout: Some(Duration::from_secs(5)),
-            send_timeout: Some(Duration::from_secs(5)),
+            recv_timeout: None,
+            send_timeout: None,
             ..SocketOptions::default()
         },
     )
     .expect("req");
     patiently("dial B", req.dial(&url)).await.expect("dial B");
-    req.send(b"ping".to_vec())
+    patiently("B's request being accepted", req.send(b"ping".to_vec()))
         .await
         .expect("B's request is accepted");
-    let reply = req
-        .recv()
+    let reply = patiently("B's reply", req.recv())
         .await
-        .expect("B's request is answered within 5 s");
+        .expect("B's request is answered");
     assert_eq!(reply.body().len(), REPLY_BYTES);
 
     server.abort();
@@ -643,7 +660,7 @@ async fn the_payload_limit_is_judged_after_the_stack_is_taken_off() {
         &ctx,
         SocketOptions {
             recv_max_size: LIMIT as u64,
-            recv_timeout: Some(Duration::from_secs(5)),
+            recv_timeout: None,
             ..SocketOptions::default()
         },
     )
@@ -883,15 +900,16 @@ async fn dropping_sockets_without_closing_them_gives_their_slots_back() {
 
     // The first replier's port is free again: a new replier listens on it.
     let rebound = RepSocket::new(&ctx).expect("a replying socket");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while let Err(error) = patiently("listen again", rebound.listen(&urls[0])).await {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{} is still bound two seconds after its socket was dropped: {error:?}",
-            urls[0]
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    weida_testkit::within(
+        "the first replier's port being free again",
+        Duration::from_secs(2),
+        async {
+            while rebound.listen(&urls[0]).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
     drop(rebound);
     eventually("the rebinding socket's slot comes back", || {
         ctx.socket_count() == 0

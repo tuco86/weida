@@ -72,14 +72,15 @@
 //! # Keeping the blocking calls off the reactor
 //!
 //! Every `nng` crate call is blocking, `Socket::recv` included, so each one
-//! runs on [`tokio::task::spawn_blocking`] and every NNG socket carries
-//! `RecvTimeout` and `SendTimeout`, which turns a stall into an error
-//! rather than a hung test [nanomsg-nng §13].
+//! runs on [`tokio::task::spawn_blocking`]. No socket, ours or NNG's, carries
+//! a `RecvTimeout` or `SendTimeout` here: a stall is reported by the waits of
+//! the test and ended by the CI job's budget, and no option fails a slow run
+//! [nanomsg-nng §13].
 
 use std::time::Duration;
 
+use nng::options::Options;
 use nng::options::protocol::{pubsub, survey};
-use nng::options::{Options, RecvTimeout, SendTimeout};
 use nng::{Protocol, Socket};
 use weida_nng::{
     BusSocket, Context, ContextConfig, Message, Pair0Socket, Pair1Socket, PubSocket, PullSocket,
@@ -88,19 +89,13 @@ use weida_nng::{
 };
 use weida_sp::{EndpointType, HEADER_LEN, ProtocolHeader, backtrace};
 
-/// Long enough that a loaded machine does not fail the test, short enough
-/// that a genuine stall is an error rather than a hang.
+/// How long a wait goes on before it reports itself. A report, never a failure.
 const PATIENCE: Duration = Duration::from_secs(5);
 
 fn nng_cooked(protocol: Protocol) -> Socket {
-    let socket = Socket::new(protocol).expect("an NNG socket");
-    socket
-        .set_opt::<RecvTimeout>(Some(PATIENCE))
-        .expect("RecvTimeout");
-    socket
-        .set_opt::<SendTimeout>(Some(PATIENCE))
-        .expect("SendTimeout");
-    socket
+    // NNG's receive and send timeouts default to forever, which is what a
+    // slow run needs.
+    Socket::new(protocol).expect("an NNG socket")
 }
 
 /// Runs one blocking `nng` call off the reactor's threads.
@@ -112,9 +107,9 @@ async fn off_reactor<T: Send + 'static>(what: impl FnOnce() -> T + Send + 'stati
 
 fn options() -> SocketOptions {
     SocketOptions {
-        recv_timeout: Some(PATIENCE),
-        send_timeout: Some(PATIENCE),
-        handshake_timeout: PATIENCE,
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         resend_time: Duration::from_secs(30),
         survey_time: Duration::from_secs(2),
@@ -490,14 +485,10 @@ async fn survey_interoperates_in_both_roles() {
         answer.push_back(b"nng");
         peer.send(answer).expect("answer");
     });
-    let arrival = std::time::Instant::now();
-    while surveyor.pipe_count() == 0 {
-        assert!(
-            arrival.elapsed() < PATIENCE,
-            "the NNG respondent never connected"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    weida_testkit::until("the NNG respondent connecting", PATIENCE, || {
+        surveyor.pipe_count() > 0
+    })
+    .await;
     surveyor
         .send(b"who is there".to_vec())
         .await
@@ -514,31 +505,21 @@ async fn survey_interoperates_in_both_roles() {
             let peer = nng_cooked(Protocol::Surveyor0);
             // A survey sent before the respondent's pipe exists reaches
             // nobody, which is the pattern, so NNG surveys again until one
-            // answers. The survey time is what paces that loop, and it
-            // MUST be well under our respondent's receive timeout: with the
-            // two equal, a first survey that missed the pipe left our
-            // receive and NNG's next survey racing on the same clock, and
-            // on Windows — where the dial takes longer — our side lost
-            // often enough to make the test flaky.
+            // answers. The survey time is what paces that loop; our
+            // respondent has no receive timeout to race it.
             peer.set_opt::<survey::SurveyTime>(Some(Duration::from_millis(250)))
                 .expect("SurveyTime");
             peer.listen(&url).expect("listen");
-            // Bounded, because a `spawn_blocking` that never returns holds
-            // the runtime's shutdown, and the test then hangs instead of
-            // failing on the receive that actually timed out.
-            let started = std::time::Instant::now();
-            loop {
+            // Reported rather than failed when it goes on: the answer comes
+            // from our respondent, whose own wait is what the test asserts.
+            let mut answer = None;
+            weida_testkit::poll_until("a respondent answering a survey", 2 * PATIENCE, || {
                 peer.send(nng::Message::from(&b"anybody"[..]))
                     .expect("send");
-                if let Ok(answer) = peer.recv() {
-                    assert_eq!(&answer[..], b"here");
-                    return;
-                }
-                assert!(
-                    started.elapsed() < 2 * PATIENCE,
-                    "no respondent answered any survey"
-                );
-            }
+                answer = peer.recv().ok();
+                answer.is_some()
+            });
+            assert_eq!(&answer.expect("an answer")[..], b"here");
         })
     };
     for _ in 0..50 {

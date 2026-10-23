@@ -392,11 +392,14 @@ mod tests {
             UnixStream::connect(&path)
                 .await
                 .expect("the first listener still owns the path");
-            tokio::time::timeout(std::time::Duration::from_secs(5), accepting)
-                .await
-                .expect("the first listener accepts")
-                .expect("the accept task ran")
-                .expect("an accepted connection");
+            weida_testkit::within(
+                "the first listener to accept",
+                std::time::Duration::from_secs(5),
+                accepting,
+            )
+            .await
+            .expect("the accept task ran")
+            .expect("an accepted connection");
         }
         /// Claim: `bind_replacing` takes the path from a live listener: new
         /// connections reach the second binder, in mode `0600`, and dropping the
@@ -418,11 +421,14 @@ mod tests {
             UnixStream::connect(&path)
                 .await
                 .expect("the second binder owns the path");
-            tokio::time::timeout(std::time::Duration::from_secs(5), accepting)
-                .await
-                .expect("the second binder accepts")
-                .expect("the accept task ran")
-                .expect("an accepted connection");
+            weida_testkit::within(
+                "the second binder to accept",
+                std::time::Duration::from_secs(5),
+                accepting,
+            )
+            .await
+            .expect("the accept task ran")
+            .expect("an accepted connection");
         }
         /// Claim: taking a live node over still leaves nothing behind, still
         /// refuses what is not a socket, and still honours the path budget.
@@ -504,11 +510,14 @@ mod tests {
             UnixStream::connect(&path)
                 .await
                 .expect("the successor still owns the path");
-            tokio::time::timeout(std::time::Duration::from_secs(5), accepting)
-                .await
-                .expect("the successor accepts")
-                .expect("the accept task ran")
-                .expect("an accepted connection");
+            weida_testkit::within(
+                "the successor to accept",
+                std::time::Duration::from_secs(5),
+                accepting,
+            )
+            .await
+            .expect("the accept task ran")
+            .expect("an accepted connection");
         }
         /// Claim: no one can find the node in a mode `umask` chose while it is
         /// being bound. A reader polls the paths that are about to be bound for

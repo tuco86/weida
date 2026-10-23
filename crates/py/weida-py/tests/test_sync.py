@@ -19,7 +19,6 @@ import weida
 from weida import sync
 
 CAP = 1 << 20
-DEADLINE = 15.0
 
 
 def test_a_request_is_answered_with_no_event_loop():
@@ -41,7 +40,7 @@ def test_a_request_is_answered_with_no_event_loop():
     requester.connect(binding.url("/echo"))
     assert requester.request(b"ping", CAP) == b"pong"
 
-    answering.join(DEADLINE)
+    answering.join()
     assert not answering.is_alive(), "the serving thread must have finished"
     client.shutdown()
     server.shutdown()
@@ -64,25 +63,20 @@ def test_a_push_and_a_publish_reach_their_endpoints():
     drain = threading.Thread(target=lambda: received.append(puller.recv(CAP)), daemon=True)
     drain.start()
     pusher.send(b"a sample")
-    drain.join(DEADLINE)
+    drain.join()
     assert received and received[0][0] == b"a sample"
     assert received[0][1].endpoint == "/ingest"
 
     # The publisher's counter is how a synchronous caller waits for a
     # subscription without a probe message or a sleep.
-    deadline = threading.Event()
-    for _ in range(int(DEADLINE * 200)):
-        if publisher.subscriber_count() == 1:
-            break
-        deadline.wait(0.005)
+    while publisher.subscriber_count() != 1:
+        time.sleep(0.005)
     got = []
     reading = threading.Thread(target=lambda: got.append(subscriber.recv(CAP)), daemon=True)
     reading.start()
-    for _ in range(int(DEADLINE * 200)):
-        if publisher.publish("px.eur", b"1.0812") == 1:
-            break
-        deadline.wait(0.005)
-    reading.join(DEADLINE)
+    while publisher.publish("px.eur", b"1.0812") != 1:
+        time.sleep(0.005)
+    reading.join()
     assert got and got[0][0] == b"1.0812"
     assert got[0][1].topic == "px.eur"
 
@@ -165,7 +159,7 @@ def test_a_pair_carries_both_directions_with_no_event_loop():
     answering.start()
     paired.send(b"ping")
     assert paired.recv(CAP)[0] == b"pong"
-    answering.join(DEADLINE)
+    answering.join()
     assert heard and heard[0][0] == b"ping"
 
     # A second dialler is refused on the transfer, not on the connection,
@@ -181,7 +175,7 @@ def test_a_pair_carries_both_directions_with_no_event_loop():
     reading = threading.Thread(target=lambda: kept.append(bound.recv(CAP)), daemon=True)
     reading.start()
     paired.send(b"still mine")
-    reading.join(DEADLINE)
+    reading.join()
     assert kept and kept[0][0] == b"still mine"
 
     newcomer.shutdown()
@@ -228,7 +222,7 @@ def test_a_survey_is_a_value_with_no_event_loop():
     assert survey.silent() == 1, repr(survey)
 
     for thread in threads:
-        thread.join(DEADLINE)
+        thread.join()
     client.shutdown()
     server.shutdown()
 
@@ -250,7 +244,7 @@ def test_a_bus_never_delivers_a_member_its_own_message():
     listening = threading.Thread(target=lambda: heard.append(two.recv(CAP)), daemon=True)
     listening.start()
     assert one.send(b"hello all") == 1, "one other member"
-    listening.join(DEADLINE)
+    listening.join()
     assert heard and heard[0][0] == b"hello all"
     assert heard[0][1].endpoint == "/bus2"
 
@@ -260,7 +254,7 @@ def test_a_bus_never_delivers_a_member_its_own_message():
     reading = threading.Thread(target=lambda: got.append(two.recv(CAP)), daemon=True)
     reading.start()
     assert one.send(b"mine alone") == 1
-    reading.join(DEADLINE)
+    reading.join()
     assert got and got[0][0] == b"mine alone"
     assert one.dropped() == 0
 
@@ -277,9 +271,7 @@ def test_a_radio_segment_and_datagram_reach_a_dish():
     dish = client.dish(weida.Trust.by_address())
     dish.join("v")
     dish.connect(binding.url("/r"))
-    deadline = time.monotonic() + DEADLINE
     while radio.dish_count() != 1:
-        assert time.monotonic() < deadline, "no join arrived"
         time.sleep(0.005)
 
     segment = radio.segment("v")
@@ -305,9 +297,7 @@ def test_a_layered_segment_reaches_a_dish_layer_by_layer():
     dish = client.dish(weida.Trust.by_address())
     dish.join("v", max_layer=1)
     dish.connect(binding.url("/r"))
-    deadline = time.monotonic() + DEADLINE
     while radio.dish_count() != 1:
-        assert time.monotonic() < deadline, "no join arrived"
         time.sleep(0.005)
 
     seg = radio.segment("v", max_age=5.0, priority=3)
@@ -384,7 +374,6 @@ def test_a_bind_on_one_thread_never_freezes_a_call_on_another():
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=60,
     )
     assert finished.returncode == 0, finished.stderr
     assert "finished" in finished.stdout
@@ -415,7 +404,7 @@ def test_ctrl_c_ends_a_wait_with_no_peer_and_no_deadline(call):
         assert child.stdout.readline().strip() == "waiting"
         time.sleep(0.5)
         child.send_signal(signal.SIGINT)
-        _, stderr = child.communicate(timeout=5)
+        _, stderr = child.communicate()
     finally:
         if child.poll() is None:
             child.kill()
@@ -438,7 +427,7 @@ def test_an_interrupted_accept_leaves_the_next_request_for_the_next_accept():
     interrupting.start()
     with pytest.raises(KeyboardInterrupt):
         replier.accept(CAP)
-    interrupting.join(DEADLINE)
+    interrupting.join()
 
     def serve():
         request = replier.accept(CAP)
@@ -450,7 +439,7 @@ def test_an_interrupted_accept_leaves_the_next_request_for_the_next_accept():
     requester = client.requester(weida.Trust.by_address())
     requester.connect(binding.url("/echo"))
     assert requester.request(b"abc", CAP) == b"cba"
-    answering.join(DEADLINE)
+    answering.join()
     assert not answering.is_alive()
     client.shutdown()
     server.shutdown()

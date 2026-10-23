@@ -27,11 +27,10 @@ from broker import (
     Peer,
     data_section,
     value_section,
+    within,
 )
 
 pytestmark = pytest.mark.asyncio
-
-DEADLINE = 5.0
 
 
 async def with_peer(script):
@@ -66,7 +65,7 @@ async def test_await_send_returns_the_outcome_the_peer_committed_to():
         session = await connection.begin()
         sender = await session.attach("orders", "sender", "/queues/orders")
 
-        outcome = await asyncio.wait_for(sender.send(b"an order"), DEADLINE)
+        outcome = await within("the outcome of the send", sender.send(b"an order"))
         # The whole point: an outcome, not a boolean.
         assert outcome is not None
         assert outcome.name == "accepted"
@@ -93,7 +92,7 @@ async def test_a_rejection_arrives_as_an_outcome_with_its_reason():
         session = await connection.begin()
         sender = await session.attach("orders", "sender", "/queues/orders")
 
-        outcome = await asyncio.wait_for(sender.send(b"bad"), DEADLINE)
+        outcome = await within("the outcome of the send", sender.send(b"bad"))
         assert outcome.name == "rejected"
         # What it proves: the message will not come back, and this attempt
         # counts against a redelivery limit.
@@ -129,7 +128,7 @@ async def test_nothing_arrives_before_credit_is_granted():
         assert not granted.is_set(), "and this binding granted none by itself"
 
         await receiver.grant_credit(5)
-        delivery = await asyncio.wait_for(receiver.next_delivery(), DEADLINE)
+        delivery = await within("a delivery", receiver.next_delivery())
         assert delivery is not None
         assert delivery.body() == b"an invoice"
         assert delivery.delivery_id == 0
@@ -244,7 +243,7 @@ async def test_a_condition_is_its_own_exception_class():
         # The condition reaches Python as its own class, under the base, with
         # the symbol recoverable from the module's table.
         with pytest.raises(weida_amqp.ResourceLimitExceeded) as raised:
-            await asyncio.wait_for(connection.begin(), DEADLINE)
+            await within("the answer to begin", connection.begin())
         assert issubclass(weida_amqp.ResourceLimitExceeded, weida_amqp.AmqpError)
         assert raised.value.errno == "ResourceLimitExceeded"
         assert "too many connections" in str(raised.value)
@@ -297,7 +296,7 @@ async def test_a_receive_cancelled_while_waiting_loses_no_delivery():
         cancelled.set()
         await asyncio.sleep(0.1)
 
-        delivery = await asyncio.wait_for(receiver.next_delivery(), DEADLINE)
+        delivery = await within("a delivery", receiver.next_delivery())
         assert delivery is not None
         assert delivery.body() == b"kept"
         await connection.close()
@@ -319,7 +318,7 @@ async def test_a_delivery_hands_back_the_same_objects_on_every_access():
         receiver = await session.attach("invoices", "receiver", "/queues/invoices")
         await receiver.grant_credit(1)
 
-        delivery = await asyncio.wait_for(receiver.next_delivery(), DEADLINE)
+        delivery = await within("a delivery", receiver.next_delivery())
         assert delivery.payload is delivery.payload
         assert delivery.body() is delivery.body()
         assert delivery.delivery_tag is delivery.delivery_tag

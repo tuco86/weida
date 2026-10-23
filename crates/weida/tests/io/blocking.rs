@@ -29,21 +29,16 @@ fn a_published_message_reaches_a_blocking_subscriber() {
     // Publishing never waits for a subscriber, so the publisher may run
     // before the subscription has arrived: retry until it has, exactly as the
     // asynchronous Pub/Sub tests do, because a sleep would only be a guess.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the subscription never reached the publisher"
-        );
-        if publisher
-            .publish("px.eur", &b"1.0812"[..])
-            .expect("publish")
-            > 0
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    weida_testkit::poll_until(
+        "the subscription to reach the publisher",
+        Duration::from_secs(15),
+        || {
+            publisher
+                .publish("px.eur", &b"1.0812"[..])
+                .expect("publish")
+                > 0
+        },
+    );
 
     let message = subscriber.recv(CAP).expect("recv");
     assert_eq!(message.payload, b"1.0812");
@@ -82,14 +77,9 @@ fn a_radio_segment_and_datagram_reach_a_blocking_dish() {
         binding.local_addr().expect("a QUIC binding")
     ))
     .expect("connect");
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while radio.dish_count() < 1 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the join never arrived"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    weida_testkit::poll_until("the join to arrive", Duration::from_secs(15), || {
+        radio.dish_count() >= 1
+    });
 
     let mut segment = radio
         .segment("v", weida::SegmentTerms::default())
@@ -138,10 +128,12 @@ fn a_survey_collects_what_answers_and_counts_what_does_not() {
         question.reply(b"me").expect("reply");
     });
     // Accepts the question and never answers it: not unreachable, not
-    // refusing, just silent — which is what a deadline exists for.
+    // refusing, just silent — which is what a deadline exists for. It holds
+    // the question until the survey is over, however long that takes.
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let holding = std::thread::spawn(move || {
         let question = silent.accept(CAP).expect("accept");
-        std::thread::sleep(Duration::from_secs(3));
+        let _ = released.recv();
         drop(question);
     });
 
@@ -156,9 +148,12 @@ fn a_survey_collects_what_answers_and_counts_what_does_not() {
         .connect(&quiet_url)
         .expect("connect the silent one");
 
+    // The window is the claim (the silent one must expire), so it stays; it
+    // is wide enough that only a stall of seconds makes the answer late.
     let survey = surveyor
-        .survey(b"who is there", Duration::from_millis(500), CAP)
+        .survey(b"who is there", Duration::from_secs(5), CAP)
         .expect("the survey ran");
+    release.send(()).expect("release the silent respondent");
     assert_eq!(survey.asked, 2, "both respondents were asked: {survey:?}");
     assert_eq!(
         survey.replies,
@@ -206,26 +201,28 @@ fn a_stalled_body_expires_and_the_next_message_still_arrives() {
             .expect("the peer's reactor")
             .block_on(async move {
                 let endpoint = pinging_client(&peer_cert);
-                // Bounded, so that a handshake that never completes fails the
-                // test instead of hanging it.
-                let (conn, stream) = tokio::time::timeout(Duration::from_secs(10), async {
-                    let conn = endpoint
-                        .connect(addr, "127.0.0.1")
-                        .expect("connect")
-                        .await
-                        .expect("handshake");
-                    common::raw::send_hello(&conn).await;
-                    let mut stream = conn.open_uni().await.expect("open uni");
-                    let header = DataHeader::addressed("/in").encode();
-                    stream
-                        .write_all(&encode_frame(FrameKind::Data, &header))
-                        .await
-                        .expect("write the header");
-                    stream.write_all(&[7]).await.expect("write one byte");
-                    (conn, stream)
-                })
-                .await
-                .expect("the stalling peer set up in time");
+                // The setup is waited for with a report, not a limit.
+                let (conn, stream) = weida_testkit::within(
+                    "the stalling peer's setup",
+                    Duration::from_secs(10),
+                    async {
+                        let conn = endpoint
+                            .connect(addr, "127.0.0.1")
+                            .expect("connect")
+                            .await
+                            .expect("handshake");
+                        common::raw::send_hello(&conn).await;
+                        let mut stream = conn.open_uni().await.expect("open uni");
+                        let header = DataHeader::addressed("/in").encode();
+                        stream
+                            .write_all(&encode_frame(FrameKind::Data, &header))
+                            .await
+                            .expect("write the header");
+                        stream.write_all(&[7]).await.expect("write one byte");
+                        (conn, stream)
+                    },
+                )
+                .await;
                 stalled_tx.send(()).expect("the test is waiting");
                 // Stalled until the test releases it. A test that panics drops
                 // the sender, which releases the peer just the same.
@@ -234,9 +231,12 @@ fn a_stalled_body_expires_and_the_next_message_still_arrives() {
                 conn.close(0u32.into(), b"done");
             });
     });
-    stalled_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the stalling peer sent its header");
+    weida_testkit::recv(
+        &stalled_rx,
+        "the stalling peer's header",
+        Duration::from_secs(10),
+    )
+    .expect("the stalling peer sent its header");
     let started = Instant::now();
 
     // The receiver is a synchronous consumer on its own thread: a first
@@ -265,21 +265,20 @@ fn a_stalled_body_expires_and_the_next_message_still_arrives() {
         client.shutdown().expect("client shutdown");
     });
 
-    let first = results_rx
-        .recv_timeout(Duration::from_secs(10))
+    let first = weida_testkit::recv(&results_rx, "the first receive", Duration::from_secs(10))
         .expect("the first receive returned");
     let elapsed = started.elapsed();
+    // The peer is still stalled here (it is released only below), so the
+    // first receive returned because the receive deadline expired it, not
+    // because the peer finished: that is the order the claim is about. The
+    // time it took is a measurement, not a bound.
+    eprintln!("the stalled receive expired after {elapsed:?}");
     assert!(
         matches!(first, Err(Error::Expired)),
         "a stalled body must expire, got {first:?}"
     );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "the expiry took {elapsed:?}"
-    );
 
-    let second = results_rx
-        .recv_timeout(Duration::from_secs(10))
+    let second = weida_testkit::recv(&results_rx, "the next receive", Duration::from_secs(10))
         .expect("the next receive returned");
     assert_eq!(
         second.expect("the next message arrives"),

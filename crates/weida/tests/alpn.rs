@@ -75,18 +75,15 @@ async fn a_raft_binding_refuses_an_application_dial() {
     })
     .expect("client runtime");
     let plain = client.requester(ClientTls::new(Trust::by_address()));
-    let refused = tokio::time::timeout(DEADLINE, plain.connect(&url))
-        .await
-        .expect("the handshake ends within the deadline");
+    let refused = weida_testkit::within("the handshake", DEADLINE, plain.connect(&url)).await;
     assert!(
         refused.is_err(),
         "a weida/0 dial reached a weida-raft/0 binding"
     );
 
     let raft = client.requester(ClientTls::new(Trust::by_address()).with_alpn(Alpn::Raft));
-    tokio::time::timeout(DEADLINE, raft.connect(&url))
+    weida_testkit::within("the connect", DEADLINE, raft.connect(&url))
         .await
-        .expect("connect within the deadline")
         .expect("a weida-raft/0 dial reaches a weida-raft/0 binding");
     let reply = raft.request(b"ping").await.expect("request");
     assert_eq!(reply.collect(16).await.expect("collect"), b"ping");
@@ -107,9 +104,7 @@ async fn an_application_binding_refuses_a_raft_dial() {
     })
     .expect("client runtime");
     let raft = client.requester(ClientTls::new(Trust::by_address()).with_alpn(Alpn::Raft));
-    let refused = tokio::time::timeout(DEADLINE, raft.connect(&url))
-        .await
-        .expect("the handshake ends within the deadline");
+    let refused = weida_testkit::within("the handshake", DEADLINE, raft.connect(&url)).await;
     assert!(
         refused.is_err(),
         "a weida-raft/0 dial reached a weida/0 binding"

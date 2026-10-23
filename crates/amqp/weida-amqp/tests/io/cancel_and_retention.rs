@@ -1,9 +1,8 @@
 //! The tests of `tests/cancel_and_retention.rs` that need the network, a process or real time.
 
-use crate::cancel_and_retention::support::{DEADLINE, accept, options, scripted};
+use crate::cancel_and_retention::support::{DEADLINE, accept, options, scripted, timeout};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
 use weida_amqp::link::{LinkEvent, LinkOptions};
 use weida_amqp::session::SessionOptions;
 use weida_amqp::{Outcome, Source, Target};
@@ -67,7 +66,7 @@ async fn a_send_dropped_while_it_waits_for_window_has_taken_nothing() {
     .expect("the grant arrived");
 
     assert!(
-        timeout(
+        tokio::time::timeout(
             Duration::from_millis(300),
             sender.send(&Message::data(b"one"))
         )
@@ -165,7 +164,7 @@ async fn a_send_dropped_between_frames_aborts_its_delivery() {
 
     let long = vec![b'y'; 1600];
     assert!(
-        timeout(Duration::from_millis(300), sender.send_payload(&long))
+        tokio::time::timeout(Duration::from_millis(300), sender.send_payload(&long))
             .await
             .is_err(),
         "two frames of room for five: the send is waiting when it is dropped"

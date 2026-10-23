@@ -7,7 +7,6 @@ use crate::common;
 use std::time::Duration;
 
 use common::{Certs, Restartable, Server};
-use tokio::time::timeout;
 use weida::{
     Limits, Network, PeerEvent, PeerEvents, ReconnectPolicy, Runtime, RuntimeConfig, SimNet,
 };
@@ -15,7 +14,7 @@ use weida::{
 pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    timeout(DEADLINE, f).await.expect("operation timed out")
+    weida_testkit::within("a stats step", DEADLINE, f).await
 }
 
 /// The next event that is not `Retrying`.

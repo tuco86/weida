@@ -324,18 +324,13 @@ mod tests {
         message.frames()[0].as_slice().to_vec()
     }
 
-    async fn wait_for(mut done: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(std::time::Instant::now() < deadline, "condition never held");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    async fn wait_for(done: impl FnMut() -> bool) {
+        weida_testkit::until("the condition", weida_testkit::EXPECTED, done).await;
     }
 
     async fn next(socket: &mut XPubSocket) -> Vec<u8> {
-        let message = tokio::time::timeout(Duration::from_secs(10), socket.recv())
+        let message = weida_testkit::within("an event", weida_testkit::EXPECTED, socket.recv())
             .await
-            .expect("an event arrived")
             .expect("event");
         bytes(&message)
     }
@@ -509,7 +504,12 @@ mod tests {
 
             drop(subscriber);
             assert_eq!(next(&mut verbose).await, b"\x00a".to_vec());
-            let second = verbose.recv_timeout(Duration::from_secs(2)).await;
+            let second = weida_testkit::within(
+                "the second unsubscribe",
+                Duration::from_secs(2),
+                verbose.recv(),
+            )
+            .await;
             assert_eq!(
                 second.map(|message| bytes(&message)).ok(),
                 Some(b"\x00a".to_vec()),
@@ -570,10 +570,10 @@ mod tests {
 
             let mut subscriber = SubSocket::new(&ctx).expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            let greeting = tokio::time::timeout(Duration::from_secs(10), subscriber.recv())
-                .await
-                .expect("the welcome arrived")
-                .expect("welcome");
+            let greeting =
+                weida_testkit::within("the welcome", weida_testkit::EXPECTED, subscriber.recv())
+                    .await
+                    .expect("welcome");
             assert_eq!(bytes(&greeting), b"welcome".to_vec());
         }
         /// Claim: when a subscriber disconnects, its subscriptions come back to
@@ -653,10 +653,13 @@ mod tests {
 
             let mut handed = BTreeSet::new();
             while handed.len() < 50 {
-                let event = broker
-                    .recv_timeout(Duration::from_secs(10))
-                    .await
-                    .expect("every notification arrives");
+                let event = weida_testkit::within(
+                    "every notification",
+                    weida_testkit::EXPECTED,
+                    broker.recv(),
+                )
+                .await
+                .expect("every notification arrives");
                 let frame = event.frames()[0].as_slice();
                 assert_eq!(frame[0], 1, "only subscribes so far");
                 handed.insert(frame[1..].to_vec());
@@ -666,13 +669,25 @@ mod tests {
             drop(subscriber);
             wait_for(|| broker.subscriber_count() == 0).await;
             let mut released = BTreeSet::new();
-            // Margin: 300 ms of silence ends the drain. The unsubscribes are
-            // generated in memory, so the interval only has to exceed the time
-            // that takes, which is microseconds.
-            while let Ok(event) = broker.recv_timeout(Duration::from_millis(300)).await {
+            let mut take = |event: Multipart| {
                 let frame = event.frames()[0].as_slice();
                 assert_eq!(frame[0], 0, "only unsubscribes now");
                 released.insert(frame[1..].to_vec());
+            };
+            // First wait for every unsubscribe owed, however long that takes.
+            for _ in 0..handed.len() {
+                let event = weida_testkit::within(
+                    "every unsubscribe owed",
+                    weida_testkit::EXPECTED,
+                    broker.recv(),
+                )
+                .await
+                .expect("an unsubscribe");
+                take(event);
+            }
+            // Then a short negative window: nothing beyond those arrives.
+            while let Ok(event) = broker.recv_timeout(Duration::from_millis(300)).await {
+                take(event);
             }
             assert_eq!(
                 released, handed,

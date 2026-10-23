@@ -24,9 +24,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 const WINDOW: Duration = Duration::from_millis(200);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a dedup step", DEADLINE, f).await
 }
 
 fn bounded() -> GuaranteeSet {

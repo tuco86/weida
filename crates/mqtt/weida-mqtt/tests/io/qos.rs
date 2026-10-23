@@ -604,13 +604,17 @@ async fn the_quota_stalls_the_sender_rather_than_being_exceeded() {
         .await
         .expect("QoS 0 never stalls");
 
-    let mut recorded = server.seen_bytes().await;
-    let mut waited = Duration::ZERO;
-    while recorded.len() < 4 && waited < Duration::from_secs(5) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        waited += Duration::from_millis(20);
-        recorded = server.seen_bytes().await;
-    }
+    weida_testkit::within(
+        "the QoS 0 publish to reach the server",
+        Duration::from_secs(5),
+        async {
+            while server.seen_bytes().await.len() < 4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await;
+    let recorded = server.seen_bytes().await;
     let Packet::Publish(third) = decode(&recorded[3]) else {
         panic!("a publish")
     };
@@ -746,11 +750,12 @@ async fn an_inbound_qos_2_repeat_is_answered_again_and_not_delivered_twice() {
     // the connection before the second PUBREC and the PUBCOMP.
     // The PUBREL releasing the identifier is the observable end of it
     // ([MQTT-4.3.3-12]).
-    let mut waited = Duration::ZERO;
-    while session.holds_inbound_qos2(9) && waited < Duration::from_secs(5) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        waited += Duration::from_millis(20);
-    }
+    weida_testkit::until(
+        "the PUBREL to release the identifier",
+        Duration::from_secs(5),
+        || !session.holds_inbound_qos2(9),
+    )
+    .await;
     assert!(
         !session.holds_inbound_qos2(9),
         "the PUBREL released the identifier ([MQTT-4.3.3-12])"

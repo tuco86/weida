@@ -84,7 +84,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             let after = budget.remaining();
             assert!(after < before, "{after:?} must be less than {before:?}");
-            assert!(!budget.is_spent());
+            // Whether it is spent follows what is left, however slow the run.
+            assert_eq!(budget.is_spent(), after.is_zero());
         }
         /// Claim: an overrun leaves zero rather than wrapping, so the next phase
         /// is still bounded.

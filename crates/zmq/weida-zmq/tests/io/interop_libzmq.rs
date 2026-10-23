@@ -103,9 +103,10 @@ use weida_zmq::{
     XSubSocket, ZapReply, ZapRequest, ZapStatus,
 };
 
-/// The same bound as `common::DEADLINE`, inside libzmq, so its blocking calls
-/// report rather than hang.
-const LIBZMQ_TIMEOUT_MS: i32 = 10_000;
+/// libzmq's own blocking calls wait without a limit (`-1`): a limit inside
+/// libzmq would fail a slow run, and the outer `within` reports a call that
+/// takes long instead.
+const LIBZMQ_TIMEOUT_MS: i32 = -1;
 
 /// What every `#[ignore]` says, so that the install command is one grep away
 /// from a skipped test.

@@ -21,9 +21,7 @@ use weida::{
 const DEADLINE: Duration = Duration::from_secs(15);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a bus step", DEADLINE, f).await
 }
 
 /// One bus member on a loopback port, with everything it needs held alive.
@@ -238,14 +236,19 @@ async fn a_slow_member_is_dropped_and_counted_rather_than_blocking() {
     let payload = vec![0x5au8; 1024 * 1024];
     let mut reached = 0usize;
     for _ in 0..16u32 {
-        match tokio::time::timeout(Duration::from_secs(2), bus[0].member.send(&payload)).await {
-            Ok(Ok(n)) => reached += n,
-            Ok(Err(e)) => panic!("a bus send failed: {e:?}"),
-            // A send that cannot return inside two seconds is exactly the
-            // blocking this test forbids: the whole point of a writer per
-            // member is that a slow one costs its own copies, not the
-            // sender's time.
-            Err(_) => panic!("a slow member blocked the sender"),
+        // A send that blocks is exactly what this test forbids: the whole
+        // point of a writer per member is that a slow one costs its own
+        // copies, not the sender's time. `within` reports a send that takes
+        // long; a send that never returns hangs until the job's budget.
+        match weida_testkit::within(
+            "a bus send past a slow member",
+            Duration::from_secs(2),
+            bus[0].member.send(&payload),
+        )
+        .await
+        {
+            Ok(n) => reached += n,
+            Err(e) => panic!("a bus send failed: {e:?}"),
         }
     }
 
@@ -328,10 +331,15 @@ async fn a_slow_member_is_bounded_in_bytes_before_its_message_count() {
     let payload = vec![0x5au8; 32 * 1024];
     let mut reached = 0usize;
     for _ in 0..16u32 {
-        match tokio::time::timeout(Duration::from_secs(2), bus[0].member.send(&payload)).await {
-            Ok(Ok(n)) => reached += n,
-            Ok(Err(e)) => panic!("a bus send failed: {e:?}"),
-            Err(_) => panic!("a slow member blocked the sender"),
+        match weida_testkit::within(
+            "a bus send past a slow member",
+            Duration::from_secs(2),
+            bus[0].member.send(&payload),
+        )
+        .await
+        {
+            Ok(n) => reached += n,
+            Err(e) => panic!("a bus send failed: {e:?}"),
         }
     }
 

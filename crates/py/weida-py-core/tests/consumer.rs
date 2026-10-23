@@ -217,7 +217,7 @@ async def main():
     time.sleep(0.2)
     await asyncio.sleep(0.05)
     assert task.cancelled()
-    assert await asyncio.wait_for(demo.take(), 5) == 7, "the value was lost"
+    assert await demo.take() == 7, "the value was lost"
 
     # (b) The completion is delivered and the task is cancelled before the
     # coroutine resumes: `call_soon` queues the cancel behind the completion,
@@ -229,13 +229,13 @@ async def main():
     asyncio.get_running_loop().call_soon(task.cancel)
     await asyncio.sleep(0.05)
     assert task.cancelled()
-    assert await asyncio.wait_for(demo.take(), 5) == 8, "the value was lost"
+    assert await demo.take() == 8, "the value was lost"
 
     # A value that was taken is not given back.
     task = asyncio.ensure_future(demo.take())
     await asyncio.sleep(0.05)
     demo.feed(9)
-    assert await asyncio.wait_for(task, 5) == 9
+    assert await task == 9
     try:
         await asyncio.wait_for(demo.take(), 0.1)
         raise AssertionError("nothing is left to take")

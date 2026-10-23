@@ -24,6 +24,18 @@ use weida_mqtt::blocking::BlockingContext;
 use weida_mqtt::{ConnectOptions, DisconnectReasonCode, Error, Message, QoS, Subscription};
 use weida_mqtt_codec::{Connack, ConnectReasonCode, Packet, Properties, Publish};
 
+/// The next delivery. A receive deadline that failed the test for being slow
+/// would be a time limit, so this waits on and reports past its expected time.
+fn next_delivery(deliveries: &mut weida_mqtt::blocking::Deliveries) -> weida_mqtt::Delivery {
+    loop {
+        match deliveries.recv_timeout(Duration::from_secs(5)) {
+            Ok(delivery) => return delivery,
+            Err(Error::Timeout(_)) => eprintln!("still waiting for a delivery"),
+            Err(error) => panic!("a delivery: {error}"),
+        }
+    }
+}
+
 fn delivery(topic: &str, payload: &[u8]) -> Vec<u8> {
     bytes(&Packet::Publish(Publish {
         topic,
@@ -73,7 +85,11 @@ impl ScriptedServer {
     }
 
     fn finished(&self) {
-        let _ = self.done.recv_timeout(Duration::from_secs(10));
+        let _ = weida_testkit::recv(
+            &self.done,
+            "the server's script to finish",
+            Duration::from_secs(10),
+        );
     }
 }
 
@@ -153,9 +169,7 @@ fn a_deadline_expires_without_disturbing_the_connection() {
 
     // The connection is untouched: the delivery that arrives later is still
     // there to be read.
-    let delivered = deliveries
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the delivery that arrived after the deadline");
+    let delivered = next_delivery(&mut deliveries);
     assert_eq!(delivered.payload, &b"late"[..]);
 
     client
@@ -319,8 +333,8 @@ fn a_publish_returns_while_the_delivery_queue_is_full_on_one_thread() {
     // Long enough for the flood to arrive and fill the queue.
     std::thread::sleep(Duration::from_millis(500));
 
-    // On a thread of its own, so that a hang is a failed assertion and not a
-    // hung test run.
+    // On a thread of its own, so that a hang is a reported wait and not a
+    // blocked test thread.
     let (tx, rx) = std::sync::mpsc::channel();
     let publisher = std::thread::spawn(move || {
         let published = client.publish(Message::new("t", "x"));
@@ -328,16 +342,14 @@ fn a_publish_returns_while_the_delivery_queue_is_full_on_one_thread() {
         client
     });
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)),
+        weida_testkit::recv(&rx, "the publish to return", Duration::from_secs(10)),
         Ok(true),
         "publish returned with 1,100 deliveries waiting"
     );
     let client = publisher.join().expect("the publishing thread");
 
     // Nothing was lost to get there: the deliveries are still to be read.
-    let first = deliveries
-        .recv_timeout(Duration::from_secs(5))
-        .expect("a delivery");
+    let first = next_delivery(&mut deliveries);
     assert_eq!(first.payload, b"x");
     client
         .disconnect(DisconnectReasonCode::NormalDisconnection)

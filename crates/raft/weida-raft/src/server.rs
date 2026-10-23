@@ -448,7 +448,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use openraft::raft::{AppendEntriesRequest, VoteRequest};
     use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership, SnapshotMeta, Vote};
@@ -499,11 +499,10 @@ mod tests {
     }
 
     async fn leads(consensus: &Consensus) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while consensus.leader() != Some(consensus.id()) {
-            assert!(Instant::now() < deadline, "the node never led");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        weida_testkit::until("the node to lead", Duration::from_secs(10), || {
+            consensus.leader() == Some(consensus.id())
+        })
+        .await;
     }
 
     /// A stranger with a fresh key: its id and a requester connected to
@@ -1085,23 +1084,21 @@ mod tests {
             });
             let reply = send(&requester, &append).await.expect("an append");
             codec::decode_append_response(&reply).expect("an AppendEntriesResponse");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while follower.leader() != Some(s_id) {
-                assert!(
-                    Instant::now() < deadline,
-                    "the follower never saw its leader"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            weida_testkit::until(
+                "the follower to see its leader",
+                Duration::from_secs(10),
+                || follower.leader() == Some(s_id),
+            )
+            .await;
 
             // Told "the leader is S, at the trap", it asks S where the group
             // lists it, and is answered there.
-            let written = tokio::time::timeout(
+            let written = weida_testkit::within(
+                "the first write",
                 Duration::from_secs(10),
                 follower.write(Request(b"one".to_vec())),
             )
             .await
-            .expect("the write finished")
             .expect("followed to S by its listed address");
             assert_eq!(written.0, b"ok");
             assert_eq!(script.requests.load(Ordering::SeqCst), 2);
@@ -1111,12 +1108,12 @@ mod tests {
             );
 
             // Told "the leader is U", which it does not list, it follows nothing.
-            let refused = tokio::time::timeout(
+            let refused = weida_testkit::within(
+                "the second write",
                 Duration::from_secs(10),
                 follower.write(Request(b"two".to_vec())),
             )
-            .await
-            .expect("the write finished");
+            .await;
             assert!(matches!(refused, Err(Error::NoLeader)), "{refused:?}");
             assert_eq!(
                 script.requests.load(Ordering::SeqCst),

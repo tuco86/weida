@@ -1,4 +1,4 @@
-//! What every test of this crate needs: a deadline and a certificate.
+//! What every test of this crate needs: a reporting wait and a certificate.
 
 #![allow(dead_code)]
 
@@ -8,11 +8,11 @@ use std::time::Duration;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 
-/// Bounds every await of a test: ten seconds, then a panic naming the step.
+/// Waits for one step of a test. Ten seconds is how long a step is expected to
+/// take at most; past it the wait reports and goes on rather than failing
+/// (`weida_testkit::within`).
 pub async fn within<F: Future>(what: &str, f: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(10), f)
-        .await
-        .unwrap_or_else(|_| panic!("{what} did not finish within 10 s"))
+    weida_testkit::within(what, Duration::from_secs(10), f).await
 }
 
 /// A self-signed certificate for `localhost` and `127.0.0.1`, with a client

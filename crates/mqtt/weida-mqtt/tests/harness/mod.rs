@@ -542,7 +542,9 @@ pub fn connack_session(session_present: bool, properties: Properties<'_>) -> Vec
 pub fn options(client_id: &str) -> ConnectOptions {
     let mut options = ConnectOptions::new(client_id);
     options.keep_alive = Duration::ZERO;
-    options.connect_timeout = Duration::from_secs(5);
+    // Not the claim of any test using these options: so long that it cannot
+    // fire; a test about the expiry sets its own.
+    options.connect_timeout = Duration::from_secs(3600);
     options
 }
 

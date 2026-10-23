@@ -13,25 +13,24 @@ import struct
 
 import pytest
 
+import waits
 import weida_zmq
 
 DEADLINE = 15.0
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine, DEADLINE)
 
 
 async def until(predicate, what):
-    """Waits for something another task must do, with a bound rather than forever."""
-    for _ in range(300):
-        if await predicate():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(what)
+    """Waits for something another task must do, reporting while it takes long."""
+
+    async def poll():
+        while not await predicate():
+            await asyncio.sleep(0.01)
+
+    await waits.within(what, poll(), 3.0)
 
 
 def test_the_monitor_is_an_async_iterator_of_typed_events():
@@ -44,7 +43,7 @@ def test_the_monitor_is_an_async_iterator_of_typed_events():
         client = weida_zmq.PushSocket(context)
         await client.connect(endpoint)
         await client.send(b"hello")
-        assert await server.recv(timeout=5.0) == [b"hello"]
+        assert await server.recv() == [b"hello"]
 
         seen = []
         async for event in events:
@@ -96,9 +95,9 @@ def test_the_same_events_arrive_over_the_inproc_pair_form():
         source = weida_zmq.PushSocket(context)
         await source.connect(endpoint)
         await source.send(b"brew")
-        assert await watched.recv(timeout=5.0) == [b"brew"]
+        assert await watched.recv() == [b"brew"]
 
-        message = await reader.recv(timeout=5.0)
+        message = await reader.recv()
         assert len(message) == 2, "libzmq's monitor form is two frames"
         event_id, value = struct.unpack("<HI", bytes(message[0]))
         assert event_id != 0
@@ -149,14 +148,14 @@ def test_an_xsub_xpub_proxy_with_a_capture_socket():
         await until(published, "the subscription never reached the publisher")
 
         # Direction two: the message itself, all the way to the subscriber.
-        assert await subscriber.recv(timeout=5.0) == [b"weather.eu", b"rain"]
+        assert await subscriber.recv() == [b"weather.eu", b"rain"]
 
         # And the capture socket got a copy of what crossed — in **both**
         # directions, which is what a capture socket is for: the subscription
         # travelling upstream is a message too, and it crossed first.
         captured = []
         for _ in range(10):
-            captured.append(list(await trace.recv(timeout=5.0)))
+            captured.append(list(await trace.recv()))
             if [b"weather.eu", b"rain"] in captured:
                 break
         assert [b"weather.eu", b"rain"] in captured, captured
@@ -202,7 +201,7 @@ def test_a_steerable_proxy_pauses_resumes_reports_and_terminates():
 
         # STATISTICS answers on the control socket with the eight counters.
         await steering.send(weida_zmq.CONTROL_STATISTICS)
-        counters = await steering.recv(timeout=5.0)
+        counters = await steering.recv()
         assert len(counters) == 8
         assert struct.unpack("<Q", bytes(counters[0]))[0] >= 1
 
@@ -214,11 +213,11 @@ def test_a_steerable_proxy_pauses_resumes_reports_and_terminates():
         with pytest.raises(weida_zmq.EAGAIN):
             await sink.recv(timeout=0.2)
         await steering.send(weida_zmq.CONTROL_RESUME)
-        assert await sink.recv(timeout=5.0) == [b"two"]
+        assert await sink.recv() == [b"two"]
 
         # TERMINATE ends the proxy and hands back the counters.
         await steering.send(weida_zmq.CONTROL_TERMINATE)
-        statistics = await asyncio.wait_for(running, 5.0)
+        statistics = await waits.within("the proxy to end", running, 5.0)
         assert isinstance(statistics, weida_zmq.ProxyStatistics)
         assert statistics.frontend_messages_in >= 2
         assert statistics.backend_messages_out >= 2
@@ -266,8 +265,8 @@ def test_a_streamer_device_forwards():
         running = asyncio.create_task(weida_zmq.proxy(frontend, backend, capture))
 
         await producer.send(b"job 1")
-        assert await consumer.recv(timeout=5.0) == [b"job 1"]
-        assert await trace.recv(timeout=5.0) == [b"job 1"]
+        assert await consumer.recv() == [b"job 1"]
+        assert await trace.recv() == [b"job 1"]
         assert not running.done(), "a streamer does not die at its first poll"
         running.cancel()
         try:

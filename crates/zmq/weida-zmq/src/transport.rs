@@ -279,11 +279,11 @@ mod tests {
     async fn pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("address");
-        let (dialled, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(TcpStream::connect(addr), listener.accept())
-        })
-        .await
-        .expect("the pair connected in time");
+        let (dialled, accepted) =
+            weida_testkit::within("the pair to connect", weida_testkit::EXPECTED, async {
+                tokio::join!(TcpStream::connect(addr), listener.accept())
+            })
+            .await;
         (dialled.expect("connect"), accepted.expect("accept").0)
     }
 

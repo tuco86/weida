@@ -556,8 +556,14 @@ mod tests {
 
     use super::*;
 
-    /// The bound on every await in these tests.
+    /// The expected time of every await in these tests: past it a wait
+    /// reports, it never fails (a paused clock panics there).
     const WAIT: Duration = Duration::from_secs(10);
+
+    async fn within<F: Future>(what: &str, f: F) -> F::Output {
+        weida_testkit::within(what, WAIT, f).await
+    }
+
     const WIRE_CAP: usize = 64 * 1024;
 
     fn exec() -> Exec {
@@ -598,9 +604,7 @@ mod tests {
         tx.write_all(wire).await.expect("write");
         drop(tx);
         let mut reader = ChunkReader::new(rx, exec.clone());
-        exec.within(WAIT, read_all(&mut reader, 64 * 1024))
-            .await
-            .expect("bounded")
+        within("the wire to be read", read_all(&mut reader, 64 * 1024)).await
     }
 
     /// Writes `payload` through a `ChunkWriter` in `piece`-byte writes and
@@ -618,14 +622,11 @@ mod tests {
             writer.shutdown().await
         });
         let mut reader = ChunkReader::new(rx, exec.clone());
-        let out = exec
-            .within(WAIT, read_all(&mut reader, size))
+        let out = within("the round-trip read", read_all(&mut reader, size))
             .await
-            .expect("bounded")
             .expect("read");
-        exec.within(WAIT, writer)
+        within("the round-trip writer", writer)
             .await
-            .expect("bounded")
             .expect("join")
             .expect("write");
         out
@@ -662,10 +663,8 @@ mod tests {
             reads: Arc::clone(&reads),
         };
         let mut reader = ChunkReader::new(counted, exec.clone());
-        let out = exec
-            .within(WAIT, read_all(&mut reader, 64 * 1024))
+        let out = within("a one-chunk read", read_all(&mut reader, 64 * 1024))
             .await
-            .expect("bounded")
             .expect("read");
         assert_eq!(out, b"a short message");
         let reads = reads.load(Ordering::SeqCst);
@@ -807,13 +806,12 @@ mod tests {
         let code = 0x0102_0304_0506_0708_u64;
         writer.end(Marker::Reset(code), ());
         assert_eq!(taken.lock().expect("sink").len(), 4);
-        exec.within(WAIT, async {
+        within("the remainder of the marker to be written", async {
             while taken.lock().expect("sink").len() < 9 {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("the remainder of the marker was written");
+        .await;
         let mut expected = vec![CHUNK_RESET];
         expected.extend_from_slice(&code.to_le_bytes());
         assert_eq!(*taken.lock().expect("sink"), expected);
@@ -866,10 +864,8 @@ mod tests {
             exec.clone(),
         );
         reader.drain_within(Duration::from_millis(50), ());
-        let delivered = exec
-            .within(WAIT, dropped)
+        let delivered = within("the drain to give up on the stalled peer", dropped)
             .await
-            .expect("the drain gave up on the stalled peer")
             .expect("the reader was dropped");
         assert_eq!(delivered, 8);
         drop(tx);
@@ -901,15 +897,12 @@ mod tests {
             exec.clone(),
         );
         reader.drain_within(Duration::from_millis(200), ());
-        let delivered = exec
-            .within(WAIT, dropped)
+        let delivered = within("the drain to reach the FIN", dropped)
             .await
-            .expect("the drain reached the FIN")
             .expect("the reader was dropped");
         assert_eq!(delivered, PIECES * (HEADER_DATA + PIECE) + 1);
-        exec.within(WAIT, writer)
+        within("the paced writer", writer)
             .await
-            .expect("bounded")
             .expect("join")
             .expect("write");
     }
@@ -975,9 +968,7 @@ mod tests {
             log.lock().expect("log").is_empty(),
             "the task still owns the stream, so it still holds"
         );
-        exec.within(WAIT, logged(&log, 1))
-            .await
-            .expect("the task finished the marker and let go");
+        within("the task to finish the marker and let go", logged(&log, 1)).await;
         assert_eq!(taken.lock().expect("sink").len(), 9);
     }
 
@@ -1007,9 +998,7 @@ mod tests {
                 log.lock().expect("log").is_empty(),
                 "the drain owns both until it ends"
             );
-            exec.within(WAIT, logged(&log, 2))
-                .await
-                .expect("the drain gave up on the stalled peer");
+            within("the drain to give up on the stalled peer", logged(&log, 2)).await;
             assert_eq!(*log.lock().expect("log"), ["handle", "hold"]);
             drop(tx);
         }

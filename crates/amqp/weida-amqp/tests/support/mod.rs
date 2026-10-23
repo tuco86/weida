@@ -6,8 +6,9 @@
 //! `tests/interop_rabbitmq.rs`) proves interoperability; these tests prove the
 //! sequence.
 //!
-//! Every await in every test that uses this is bounded by [`DEADLINE`], so a
-//! wrong turn fails the test rather than hanging the suite.
+//! Every await in every test that uses this goes through [`timeout`], which
+//! never fails a slow run: it reports a step that takes longer than
+//! [`DEADLINE`] and keeps waiting (see `weida-testkit`).
 //!
 //! Each test file is its own crate and includes this module, so a helper that
 //! one file does not use is dead code in that crate: it carries its own
@@ -26,6 +27,23 @@ use weida_amqp_codec::protocol_header::{self, ProtocolHeader};
 
 /// Every await in a test is bounded by this.
 pub const DEADLINE: Duration = Duration::from_secs(5);
+
+/// A bounded wait that cannot fail a test for being slow. It has the shape of
+/// `tokio::time::timeout(..)`, so the call sites keep their `.await.unwrap()`,
+/// but the error is never produced: past `expected` the step is reported by
+/// `weida_testkit::within`, naming the calling line, and the wait goes on.
+#[allow(dead_code)]
+#[track_caller]
+pub fn timeout<F: Future>(
+    expected: Duration,
+    future: F,
+) -> impl Future<Output = Result<F::Output, std::convert::Infallible>> {
+    let at = std::panic::Location::caller();
+    async move {
+        let what = format!("the step at {}:{}", at.file(), at.line());
+        Ok(weida_testkit::within(&what, expected, future).await)
+    }
+}
 
 /// The server half of a scripted exchange.
 pub struct Server {
@@ -104,12 +122,15 @@ pub async fn accept(listener: &TcpListener) -> Server {
     }
 }
 
-/// Test options: short deadlines, and no keep-alive unless a test asks for
-/// one.
+/// Test options: no keep-alive unless a test asks for one, and a handshake
+/// deadline an hour long so that it cannot fire in a test whose claim is not
+/// its expiry (a test that is about it sets it itself). The close budget stays
+/// short: with a peer that has stopped reading, it is the only thing that ends
+/// a close, so those tests need it to expire.
 pub fn options() -> ConnectionOptions {
     let mut options = ConnectionOptions::new("client-1");
     options.idle_time_out = None;
-    options.handshake_timeout = Duration::from_secs(2);
+    options.handshake_timeout = Duration::from_secs(3600);
     options.close_budget = Duration::from_secs(2);
     options
 }

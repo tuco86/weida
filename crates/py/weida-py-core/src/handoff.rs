@@ -342,7 +342,10 @@ mod tests {
             let inside = gate.enter().expect("open");
             gate.close();
             std::thread::scope(|scope| {
-                let waiter = scope.spawn(|| gate.wait_until_idle(Duration::from_secs(5)));
+                // The limit is the gate's own parameter, not a test limit: it
+                // is far past anything a slow machine takes, so only a hang
+                // reaches it.
+                let waiter = scope.spawn(|| gate.wait_until_idle(Duration::from_secs(3600)));
                 std::thread::sleep(Duration::from_millis(20));
                 drop(inside);
                 assert!(waiter.join().expect("the waiter finished"));

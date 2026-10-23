@@ -1,4 +1,4 @@
-//! The bound the suites that wait on a peer put on every await.
+//! The expected time of the suites that wait on a peer, and the wait itself.
 //!
 //! Each test file is its own crate and includes this module, so an item that
 //! a file does not use would be dead code in that crate. `split.rs`,
@@ -6,14 +6,11 @@
 
 use std::time::Duration;
 
-/// Long enough that a loaded machine is not a failure, short enough that a
-/// hang is not a hung suite.
+/// What one await takes on an idle machine, with room to spare. Past it the
+/// wait reports and keeps waiting: a slow run is not a failed one.
 pub const DEADLINE: Duration = Duration::from_secs(10);
 
-/// Bounds `future` by [`DEADLINE`], so a wrong turn fails the test rather than
-/// hanging the suite.
+/// Waits for `future`, reporting past [`DEADLINE`] instead of failing.
 pub async fn within<F: Future>(future: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, future)
-        .await
-        .expect("the operation timed out")
+    weida_testkit::within("the operation", DEADLINE, future).await
 }

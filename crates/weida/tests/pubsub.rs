@@ -17,9 +17,7 @@ use weida::{Error, GuaranteeSet, Limits, OrderingMode, Publisher, RuntimeConfig,
 pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a Pub/Sub step", DEADLINE, f).await
 }
 
 /// Waits until the publisher observes `count` filters.

@@ -4,7 +4,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use weida_amqp::session::{SessionEvent, SessionOptions, SessionState};
 use weida_amqp::{Condition, Connection, State};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
@@ -72,7 +72,7 @@ async fn a_session_is_begun_on_the_lowest_free_channel_and_answered_on_another()
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
@@ -80,7 +80,7 @@ async fn a_session_is_begun_on_the_lowest_free_channel_and_answered_on_another()
     .unwrap()
     .unwrap();
 
-    let first = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let first = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .expect("the first session");
@@ -92,7 +92,7 @@ async fn a_session_is_begun_on_the_lowest_free_channel_and_answered_on_another()
     );
     assert_eq!(first.state(), SessionState::Begun);
 
-    let second = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let second = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .expect("the second session");
@@ -107,27 +107,18 @@ async fn a_session_is_begun_on_the_lowest_free_channel_and_answered_on_another()
     assert!(first.may_send());
 
     let mut first = first;
-    tokio::time::timeout(DEADLINE, first.end())
-        .await
-        .unwrap()
-        .unwrap();
-    match tokio::time::timeout(DEADLINE, first.next_event())
-        .await
-        .unwrap()
-    {
+    timeout(DEADLINE, first.end()).await.unwrap().unwrap();
+    match timeout(DEADLINE, first.next_event()).await.unwrap() {
         Some(SessionEvent::Ended(None)) => {}
         other => panic!("expected Ended(None), got {other:?}"),
     }
     assert_eq!(first.state(), SessionState::Ended(None));
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -169,14 +160,14 @@ async fn an_end_carrying_an_error_discards_input_until_the_partners_end() {
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let mut session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let mut session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
@@ -184,7 +175,7 @@ async fn an_end_carrying_an_error_discards_input_until_the_partners_end() {
 
     let condition =
         Condition::described(condition::DECODE_ERROR, "a list header we could not read");
-    tokio::time::timeout(DEADLINE, session.end_with(Some(condition.clone())))
+    timeout(DEADLINE, session.end_with(Some(condition.clone())))
         .await
         .unwrap()
         .unwrap();
@@ -194,10 +185,7 @@ async fn an_end_carrying_an_error_discards_input_until_the_partners_end() {
     );
 
     // The partner's `end` is the one frame DISCARDING does act on.
-    match tokio::time::timeout(DEADLINE, session.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, session.next_event()).await.unwrap() {
         Some(SessionEvent::Ended(None)) => {}
         other => panic!("expected Ended, got {other:?}"),
     }
@@ -207,14 +195,11 @@ async fn an_end_carrying_an_error_discards_input_until_the_partners_end() {
         "the flow that arrived while discarding changed nothing"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -244,26 +229,20 @@ async fn a_frame_on_an_in_range_but_unmapped_channel_closes_the_connection() {
         }
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(condition)) => {
             assert_eq!(condition.condition, condition::NOT_ALLOWED);
         }
         other => panic!("expected Closed with a condition, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -290,26 +269,20 @@ async fn a_channel_above_our_channel_max_is_a_framing_error() {
 
     let mut options = options();
     options.channel_max = 3;
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
     .unwrap()
     .unwrap();
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(condition)) => {
             assert_eq!(condition.condition, condition::CONNECTION_FRAMING_ERROR);
         }
         other => panic!("expected Closed, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -331,7 +304,7 @@ async fn the_peers_channel_max_bounds_how_many_sessions_we_may_begin() {
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
@@ -339,12 +312,12 @@ async fn the_peers_channel_max_bounds_how_many_sessions_we_may_begin() {
     .unwrap()
     .unwrap();
     assert_eq!(connection.remote().channel_max, 0);
-    let _first = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let _first = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .expect("the one session the peer admits");
 
-    let error = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let error = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .expect_err("no channel left");
@@ -353,14 +326,11 @@ async fn the_peers_channel_max_bounds_how_many_sessions_we_may_begin() {
         "the refusal names the bound: {error}"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -389,22 +359,19 @@ async fn a_connection_close_ends_every_session_on_it() {
         assert_eq!(name, "close");
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let mut session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let mut session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
 
-    match tokio::time::timeout(DEADLINE, session.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, session.next_event()).await.unwrap() {
         Some(SessionEvent::Ended(Some(condition))) => {
             assert_eq!(condition.condition, condition::CONNECTION_FORCED);
         }
@@ -415,8 +382,5 @@ async fn a_connection_close_ends_every_session_on_it() {
         !session.may_send(),
         "a session whose connection went cannot send"
     );
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }

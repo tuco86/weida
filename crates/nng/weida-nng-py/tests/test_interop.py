@@ -21,6 +21,7 @@ import asyncio
 
 import pytest
 
+import waits
 import weida_nng
 
 pynng = pytest.importorskip(
@@ -29,22 +30,14 @@ pynng = pytest.importorskip(
     "uv pip install --python .venv pynng",
 )
 
-DEADLINE = 15.0
-# pynng's own timeouts, in milliseconds, so a disagreement between the two
-# implementations is a failed assertion rather than a hung suite.
-TIMEOUT_MS = 5000
-
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine)
 
 
 def options(**kwargs):
-    kwargs.setdefault("recv_timeout", 5.0)
-    kwargs.setdefault("send_timeout", 5.0)
+    # No timeouts here or on the pynng side: NNG's default is to wait, and
+    # the CI job's budget is the hang guard.
     return weida_nng.SocketOptions(**kwargs)
 
 
@@ -71,7 +64,7 @@ def test_a_request_from_the_c_library_is_answered_by_this_binding():
         server = weida_nng.RepSocket(ctx, options())
         url = await server.listen("tcp://127.0.0.1:0")
 
-        with pynng.Req0(dial=url, recv_timeout=TIMEOUT_MS, send_timeout=TIMEOUT_MS) as peer:
+        with pynng.Req0(dial=url) as peer:
             await asyncio.to_thread(peer.send, b"from C")
             assert await server.recv() == b"from C"
             await server.send(b"from Rust")
@@ -88,7 +81,7 @@ def test_a_request_from_this_binding_is_answered_by_the_c_library():
     async def exchange():
         ctx = weida_nng.Context()
         url = free_url()
-        with pynng.Rep0(listen=url, recv_timeout=TIMEOUT_MS, send_timeout=TIMEOUT_MS) as peer:
+        with pynng.Rep0(listen=url) as peer:
             client = weida_nng.ReqSocket(ctx, options())
             await client.dial(url)
 
@@ -108,9 +101,9 @@ def test_a_publication_from_the_c_library_is_filtered_by_this_subscriber():
     async def prefix_match():
         ctx = weida_nng.Context()
         url = free_url()
-        with pynng.Pub0(listen=url, send_timeout=TIMEOUT_MS) as peer:
+        with pynng.Pub0(listen=url) as peer:
             subscriber = weida_nng.SubSocket(
-                ctx, options(recv_timeout=3.0, subscribe=b"weather.")
+                ctx, options(subscribe=b"weather.")
             )
             await subscriber.dial(url)
             # Give the C library's accept loop a moment: a publication sent
@@ -132,7 +125,7 @@ def test_work_pushed_by_this_binding_is_pulled_by_the_c_library():
     async def pipeline():
         ctx = weida_nng.Context()
         url = free_url()
-        with pynng.Pull0(listen=url, recv_timeout=TIMEOUT_MS) as peer:
+        with pynng.Pull0(listen=url) as peer:
             pusher = weida_nng.PushSocket(ctx, options())
             await pusher.dial(url)
             await pusher.send(b"task")
@@ -147,8 +140,11 @@ def test_a_survey_from_the_c_library_is_answered_by_this_respondent():
     async def survey():
         ctx = weida_nng.Context()
         url = free_url()
+        # No pynng timeouts: a blocking call waits as long as the peer needs.
+        # The survey window is wide for the same reason; the answer ends the
+        # wait early, so a wide window costs nothing.
         with pynng.Surveyor0(
-            listen=url, recv_timeout=TIMEOUT_MS, send_timeout=TIMEOUT_MS, survey_time=3000
+            listen=url, survey_time=30000
         ) as peer:
             respondent = weida_nng.RespondentSocket(ctx, options())
             await respondent.dial(url)

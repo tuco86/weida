@@ -19,10 +19,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
 
 import scripted  # noqa: E402
+import waits  # noqa: E402
 
 import weida_nats  # noqa: E402
-
-DEADLINE = 10.0
 
 
 async def round_trip(server):
@@ -30,7 +29,7 @@ async def round_trip(server):
     orders = await nats.subscribe("orders.*")
 
     await nats.publish("orders.created", b"from the wheel")
-    message = await asyncio.wait_for(orders.next(), DEADLINE)
+    message = await orders.next()
     assert message is not None, "the subscription received nothing"
     # A subject is bytes on the wire and bytes here: the protocol calls it a
     # name and never a string, and this binding does not guess an encoding.
@@ -40,12 +39,12 @@ async def round_trip(server):
     # A request is the inbox round trip: a reply subject on the wire, a
     # subscription under `_INBOX.`, and an answer routed back to it.
     server.respond_to("service.echo", b"answered")
-    reply = await asyncio.wait_for(nats.request("service.echo", b"ask", timeout=DEADLINE), DEADLINE)
+    reply = await nats.request("service.echo", b"ask", timeout=waits.PATIENT)
     assert reply.payload == b"answered", reply.payload
 
     # And the no-responder status is its own class rather than a timeout.
     try:
-        await nats.request("nobody.here", b"ask", timeout=DEADLINE)
+        await nats.request("nobody.here", b"ask", timeout=waits.PATIENT)
     except weida_nats.NoResponders:
         pass
     else:
@@ -69,7 +68,7 @@ def main():
     version = metadata()
     server = scripted.Server.start()
     try:
-        asyncio.run(round_trip(server))
+        waits.run(round_trip(server))
     finally:
         server.stop()
 

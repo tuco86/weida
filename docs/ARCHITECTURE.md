@@ -486,6 +486,8 @@ crates/
     http/weida-http/           →  weida-http        the HTTP client and server (h1, h2, h3)
     py/weida-py-core/          →  weida-py-core     the shared PyO3 foundation
     py/weida-py/               →  weida-py          weida's own Python binding
+    testkit/                   →  weida-testkit     test waits that report instead of
+                                                    killing; dev-only, never published
 ```
 
 This is the family layout [decisions/0013](decisions/0013-competitor-libraries.md) §4 chose:

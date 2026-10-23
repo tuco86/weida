@@ -184,12 +184,8 @@ mod tests {
         String::from_utf8_lossy(message.frames()[0].as_slice()).into_owned()
     }
 
-    async fn wait_for(mut done: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(std::time::Instant::now() < deadline, "condition never held");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    async fn wait_for(done: impl FnMut() -> bool) {
+        weida_testkit::until("the condition", weida_testkit::EXPECTED, done).await;
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the
@@ -223,10 +219,10 @@ mod tests {
             for worker in &mut workers {
                 let mut taken = Vec::new();
                 for _ in 0..3 {
-                    let task = tokio::time::timeout(Duration::from_secs(10), worker.recv())
-                        .await
-                        .expect("a task arrived")
-                        .expect("task");
+                    let task =
+                        weida_testkit::within("a task", weida_testkit::EXPECTED, worker.recv())
+                            .await
+                            .expect("task");
                     taken.push(text(&task));
                 }
                 assert_eq!(taken.len(), 3, "each worker takes its third: {taken:?}");
@@ -254,9 +250,8 @@ mod tests {
 
             let mut worker = PullSocket::new(&ctx).expect("pull");
             worker.connect(&endpoint.to_string()).expect("connect");
-            let task = tokio::time::timeout(Duration::from_secs(10), worker.recv())
+            let task = weida_testkit::within("the task", weida_testkit::EXPECTED, worker.recv())
                 .await
-                .expect("the task survived the wait")
                 .expect("task");
             assert_eq!(text(&task), "work");
             let ventilator = sending.await.expect("the sender completed");

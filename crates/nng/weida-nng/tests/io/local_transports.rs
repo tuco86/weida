@@ -35,12 +35,12 @@ async fn tcp_enforces_the_limit_inproc_ignores() {
     }
 
     source.send(vec![0u8; 1024]).await.expect("send");
-    for _ in 0..200 {
-        if sink.pipe_count() == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    weida_testkit::until(
+        "the pipe being closed for the oversize message",
+        Duration::from_secs(2),
+        || sink.pipe_count() == 0,
+    )
+    .await;
     assert_eq!(
         sink.pipe_count(),
         0,
@@ -140,12 +140,12 @@ async fn closing_an_ipc_listener_removes_its_node() {
     assert!(path.exists());
 
     listener.close();
-    for _ in 0..200 {
-        if !path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    weida_testkit::until(
+        "the node going with the listener",
+        Duration::from_secs(2),
+        || !path.exists(),
+    )
+    .await;
     assert!(!path.exists(), "the node went with the listener");
 
     // And the path is bindable again.

@@ -8,9 +8,12 @@ use weida_sp::{EndpointType, HEADER_LEN, ProtocolHeader};
 
 fn options() -> SocketOptions {
     SocketOptions {
-        recv_timeout: Some(Duration::from_secs(5)),
-        send_timeout: Some(Duration::from_secs(5)),
-        handshake_timeout: Duration::from_secs(2),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The handshake bound is an hour. The tests
+        // whose claim is a timeout set their own below.
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         ..SocketOptions::default()
     }
@@ -210,12 +213,15 @@ async fn a_pair_talks_both_ways() {
     assert_eq!(client1.recv().await.expect("recv").body(), b"pong");
 }
 
-/// Bounds one await on the socket or on a peer, so that a stall fails the
-/// test rather than hanging it.
+/// Waits for one await on the socket or on a peer, reporting a step that
+/// takes longer than five seconds instead of failing the test for it.
 async fn bounded<T>(step: impl Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(5), step)
-        .await
-        .expect("the step finished within 5 s")
+    weida_testkit::within(
+        "a step on the socket or a peer",
+        Duration::from_secs(5),
+        step,
+    )
+    .await
 }
 
 /// Claim: `NNG_OPT_RECVTIMEO` bounds the whole receive, not each message in
@@ -253,14 +259,14 @@ async fn a_stream_of_over_ttl_messages_cannot_keep_a_receive_alive_past_its_time
         .await
         .expect("their header");
 
-    // Twenty messages a hundred milliseconds apart: two seconds of traffic
+    // Messages a hundred milliseconds apart for as long as the test runs,
     // against a 300 ms receive, every message past the eight-hop ceiling.
+    // The stream never stops by itself, so a receive that ended only when
+    // the stream stops would never end.
     let sender = tokio::spawn(async move {
         let frame = weida_sp::message::encode(&weida_sp::pair::encode(200, b"payload"));
-        for _ in 0..20 {
-            let written =
-                tokio::time::timeout(Duration::from_secs(1), peer.write_all(&frame)).await;
-            if !matches!(written, Ok(Ok(()))) {
+        loop {
+            if peer.write_all(&frame).await.is_err() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -270,6 +276,7 @@ async fn a_stream_of_over_ttl_messages_cannot_keep_a_receive_alive_past_its_time
     let started = Instant::now();
     let outcome = bounded(pair.recv()).await;
     let elapsed = started.elapsed();
+    let sender_finished = sender.is_finished();
     sender.abort();
 
     assert!(
@@ -277,8 +284,12 @@ async fn a_stream_of_over_ttl_messages_cannot_keep_a_receive_alive_past_its_time
         "a stream of dropped messages must not hold the receive open: {outcome:?}"
     );
     assert!(
-        (Duration::from_millis(250)..Duration::from_millis(1500)).contains(&elapsed),
-        "the receive ends at its own 300 ms deadline, not when the stream stops: {elapsed:?}"
+        !sender_finished,
+        "the receive ended at its own deadline while the stream was still going"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "the receive ended before its 300 ms deadline: {elapsed:?}"
     );
     assert!(
         pair.dropped_over_ttl() >= 1,

@@ -13,6 +13,17 @@ tests live in a `mod io { use super::*; .. }` nested in the test module; in a
 `tests/main.rs` binary, an io file is `tests/io/<file>.rs`, declared inside
 one `mod io { .. }` block of `tests/main.rs`.
 
+No hard time limit in a test on a real clock: a limit that fires on a loaded
+runner turns a healthy test red. Waits go through `weida-testkit`
+(`within`, `until`, `poll_until`, `recv`), which take an expected time,
+print "still waiting for ..." at each multiple of it and keep waiting; on a
+paused clock the same `within` fails at the expected time, because there it
+can only mean a hang. A test does not assert a wall-clock bound
+(`elapsed() < x`): it runs on a paused clock where the code times itself on
+the Tokio clock, and otherwise asserts the order of events. A negative window
+("nothing arrives within 200 ms") is fine. nextest kills nothing
+(`.config/nextest.toml`), and the CI job budget is the only hang guard.
+
 Before a push: `cargo nextest run -p <crate>` for each crate the change
 touches (the unit tier), plus the feature rows of docs/LOOP.md §6 for those
 crates. The pipelines run the rest: a push to `main` runs the unit tier and

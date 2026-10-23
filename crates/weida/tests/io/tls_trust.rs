@@ -104,9 +104,20 @@ fn missing_anchor(name: &str) -> PathBuf {
     ))
 }
 
-/// Counts the `RenewalFailed` events that arrive within a short quiet window.
+/// Counts the `RenewalFailed` events of one change of the source: waits
+/// until the first one has arrived, then keeps a short quiet window only to
+/// see whether a second one follows.
 async fn renewal_failures(events: &mut IdentityEvents) -> usize {
-    let mut failures = 0;
+    weida_testkit::within("the first RenewalFailed event", DEADLINE, async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, IdentityEvent::RenewalFailed(_)) {
+                return;
+            }
+        }
+        panic!("the event stream ended before a RenewalFailed event");
+    })
+    .await;
+    let mut failures = 1;
     while let Ok(Some(event)) =
         tokio::time::timeout(Duration::from_millis(300), events.recv()).await
     {
@@ -130,9 +141,8 @@ async fn connect_held(
         let connecting = endpoint
             .connect_with(config.clone(), addr, "localhost")
             .expect("start a connection");
-        let conn = tokio::time::timeout(DEADLINE, connecting)
+        let conn = weida_testkit::within("the handshake", DEADLINE, connecting)
             .await
-            .expect("handshake within the deadline")
             .expect("handshake accepted");
         held.push(conn);
     }
@@ -166,14 +176,14 @@ async fn a_withdrawn_client_trust_refuses_a_resumed_session() {
 
     // Control: while the pin is in force the first connection is accepted and
     // stays open.
-    let first = tokio::time::timeout(
+    let first = weida_testkit::within(
+        "the pinned client's handshake",
         DEADLINE,
         endpoint
             .connect_with(config.clone(), addr, "localhost")
             .expect("start a connection"),
     )
     .await
-    .expect("handshake within the deadline")
     .expect("the pinned client is accepted");
     // Keep the connection open long enough for the server's session ticket to
     // reach the client's store.
@@ -191,21 +201,22 @@ async fn a_withdrawn_client_trust_refuses_a_resumed_session() {
     let second = endpoint
         .connect_with(config, addr, "localhost")
         .expect("start a connection");
-    let accepted = match tokio::time::timeout(DEADLINE, second)
-        .await
-        .expect("handshake within the deadline")
-    {
-        Err(_) => false,
-        // The client finishes its side first; a refusal by the binding then
-        // arrives as a close, so an accepted connection stays open.
-        Ok(conn) => tokio::time::timeout(Duration::from_secs(2), conn.closed())
-            .await
-            .is_err(),
-    };
-    assert!(
-        !accepted,
-        "a reconnect after the trust was withdrawn must be refused"
-    );
+    //
+    // The client finishes its side first; a refusal by the binding then
+    // arrives as a close. A binding that wrongly accepted would never close
+    // the connection, so this wait would report "still waiting" and run into
+    // the job's budget: the hang is the failure.
+    match weida_testkit::within("the second handshake", DEADLINE, second).await {
+        Err(_) => {}
+        Ok(conn) => {
+            weida_testkit::within(
+                "the binding to close a reconnect after the trust was withdrawn",
+                Duration::from_secs(2),
+                conn.closed(),
+            )
+            .await;
+        }
+    }
 
     drop(first);
     drop(binding);

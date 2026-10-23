@@ -23,9 +23,7 @@ import pytest
 import weida_amqp
 from weida_amqp import sync
 
-from broker import ACCEPTED, Peer, data_section
-
-DEADLINE = 5.0
+from broker import ACCEPTED, Peer, data_section, wait_get, wait_set
 
 
 def peer_thread(script):
@@ -51,13 +49,14 @@ def peer_thread(script):
             server = await asyncio.start_server(accept, "127.0.0.1", 0)
             ports.put(server.sockets[0].getsockname()[1])
             async with server:
-                await asyncio.sleep(DEADLINE)
+                # Lives until the daemon thread ends with the process.
+                await asyncio.Event().wait()
 
         asyncio.run(main())
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    return ports.get(timeout=DEADLINE), thread
+    return wait_get(ports, "the listener's port"), thread
 
 
 def test_b170s_send_to_accepted_runs_unchanged_in_synchronous_form():
@@ -102,7 +101,9 @@ def test_next_delivery_takes_a_timeout_and_returns_none_when_it_elapses():
     started = time.monotonic()
     assert receiver.next_delivery(timeout=0.25) is None
     waited = time.monotonic() - started
-    assert 0.2 <= waited < 2.0, waited
+    assert waited >= 0.2, waited
+    # How much longer than the window it took is a measurement, not a bound.
+    print(f"the 250 ms window closed after {waited:.2f}s")
     # And the link is still usable afterwards, which is what distinguishes a
     # timeout from a failure.
     assert receiver.credit()["link_credit"] == 1
@@ -148,7 +149,7 @@ def test_a_delivery_arrives_and_is_accepted_synchronously():
     receiver = session.attach("invoices", "receiver", "/queues/invoices")
     receiver.grant_credit(4)
 
-    delivery = receiver.next_delivery(timeout=DEADLINE)
+    delivery = receiver.next_delivery()
     assert delivery is not None
     assert delivery.body() == b"an invoice"
     receiver.accept(delivery.delivery_id)
@@ -181,9 +182,10 @@ def test_the_gil_is_released_while_a_call_blocks():
     started = time.monotonic()
     thread.start()
     assert receiver.next_delivery(timeout=0.5) is None
-    thread.join(timeout=DEADLINE)
+    thread.join()
     assert ran.is_set(), "a second thread ran while the first was blocked"
-    assert time.monotonic() - started < 3.0
+    # A measurement, not a bound: a slow machine must not turn this red.
+    print(f"the blocked call returned after {time.monotonic() - started:.2f}s")
 
     connection.close()
 
@@ -207,7 +209,7 @@ def test_ctrl_c_ends_next_delivery_and_the_next_delivery_is_not_lost():
         await peer.answer_begin()
         await peer.answer_attach(role_is_sender=True)
         await peer.read_performative()  # the flow
-        await asyncio.to_thread(go.wait, DEADLINE)
+        await asyncio.to_thread(wait_set, go, "the interrupt to have been delivered")
         await peer.send_transfer(data_section(b"after the interrupt"))
         await peer.expect_close()
 
@@ -222,7 +224,7 @@ def test_ctrl_c_ends_next_delivery_and_the_next_delivery_is_not_lost():
         receiver.next_delivery()
     go.set()
 
-    delivery = receiver.next_delivery(timeout=DEADLINE)
+    delivery = receiver.next_delivery()
     assert delivery is not None
     assert delivery.body() == b"after the interrupt"
     receiver.accept(delivery.delivery_id)

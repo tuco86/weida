@@ -13,7 +13,7 @@
 
 use crate::support;
 
-use support::{DEADLINE, Server, options};
+use support::{Server, options, within};
 use weida_nats::{Connection, Error};
 use weida_runtime::Exec;
 
@@ -40,12 +40,11 @@ async fn a_sub_carries_a_client_chosen_sid_and_the_msg_comes_back_on_it() {
         server
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
     let mut orders = nats.subscribe("orders.>").await.expect("subscribed");
@@ -53,13 +52,9 @@ async fn a_sub_carries_a_client_chosen_sid_and_the_msg_comes_back_on_it() {
     assert_eq!(orders.subject(), b"orders.>");
     assert!(orders.queue_group().is_none());
 
-    let mut server = tokio::time::timeout(DEADLINE, server)
+    let mut server = within("a step of the test", server).await.unwrap();
+    let message = within("a message arrived", orders.next())
         .await
-        .unwrap()
-        .unwrap();
-    let message = tokio::time::timeout(DEADLINE, orders.next())
-        .await
-        .expect("a message arrived")
         .expect("the subscription is live");
     assert_eq!(message.sid, 1);
     assert_eq!(
@@ -74,10 +69,7 @@ async fn a_sub_carries_a_client_chosen_sid_and_the_msg_comes_back_on_it() {
     drop(orders);
     // Dropping the handle is the subscription's end, and that is an `UNSUB`.
     assert_eq!(server.read_op().await, "UNSUB 1 -");
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// `HMSG` arrives with its block, and it is dispatched exactly like a `MSG`:
@@ -97,22 +89,17 @@ async fn an_hmsg_is_dispatched_with_its_header_block() {
         server
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut events = nats.subscribe("events").await.expect("subscribed");
-    let _server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
 
-    let message = tokio::time::timeout(DEADLINE, events.next())
+    let message = within("a message arrived", events.next())
         .await
-        .expect("a message arrived")
         .expect("live");
     let headers = message.headers.as_ref().expect("a header block");
     assert_eq!(headers.get("Nats-Msg-Id"), Some("abc-1"));
@@ -124,10 +111,7 @@ async fn an_hmsg_is_dispatched_with_its_header_block() {
     assert_eq!(message.payload, &b"body"[..]);
     assert!(message.status().is_none());
 
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// Two subscriptions on one connection matching the same subject each get
@@ -157,37 +141,26 @@ async fn a_delivery_reaches_the_sid_it_names_and_no_other() {
         server
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut one_token = nats.subscribe("orders.*").await.expect("subscribed");
     let mut trailing = nats.subscribe("orders.>").await.expect("subscribed");
     assert_eq!((one_token.sid(), trailing.sid()), (1, 2));
 
-    let _server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
 
-    let first = tokio::time::timeout(DEADLINE, one_token.next())
+    let first = within("a step of the test", one_token.next())
         .await
-        .unwrap()
         .unwrap();
     assert_eq!((first.sid, &first.payload[..]), (1, &b"first"[..]));
 
-    let second = tokio::time::timeout(DEADLINE, trailing.next())
-        .await
-        .unwrap()
-        .unwrap();
+    let second = within("a step of the test", trailing.next()).await.unwrap();
     assert_eq!((second.sid, &second.payload[..]), (2, &b"second"[..]));
-    let nested = tokio::time::timeout(DEADLINE, trailing.next())
-        .await
-        .unwrap()
-        .unwrap();
+    let nested = within("a step of the test", trailing.next()).await.unwrap();
     assert_eq!(nested.subject_str(), Some("orders.eu.created"));
 
     assert!(
@@ -195,10 +168,7 @@ async fn a_delivery_reaches_the_sid_it_names_and_no_other() {
         "`orders.*` is one token, and nothing else was addressed to sid 1"
     );
 
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// Two subscriptions in one queue group beside one ordinary subscription.
@@ -239,12 +209,11 @@ async fn a_queue_group_is_one_argument_between_subject_and_sid() {
         server
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
     let mut worker_a = nats
@@ -270,30 +239,18 @@ async fn a_queue_group_is_one_argument_between_subject_and_sid() {
         "three distinct sids, all chosen by this client"
     );
 
-    let _server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
 
-    let to_a = tokio::time::timeout(DEADLINE, worker_a.next())
-        .await
-        .unwrap()
-        .unwrap();
+    let to_a = within("a step of the test", worker_a.next()).await.unwrap();
     assert_eq!(to_a.payload, &b"to-worker-a"[..]);
-    let to_observer = tokio::time::timeout(DEADLINE, observer.next())
-        .await
-        .unwrap()
-        .unwrap();
+    let to_observer = within("a step of the test", observer.next()).await.unwrap();
     assert_eq!(to_observer.payload, &b"to-the-observer"[..]);
     assert!(
         worker_b.try_next().is_none(),
         "the copy addressed to sid 1 is not delivered to sid 2"
     );
 
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// An empty queue-group name is refused where it was given: on the wire it
@@ -311,12 +268,11 @@ async fn an_unusable_queue_group_is_refused_before_the_wire() {
         server.expect_silence().await;
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
     assert!(matches!(
@@ -337,14 +293,8 @@ async fn an_unusable_queue_group_is_refused_before_the_wire() {
         Err(Error::InvalidSubject { .. })
     ));
 
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// `UNSUB <sid>` with no count: the subscription ends now.
@@ -367,35 +317,25 @@ async fn unsub_without_a_count_ends_the_subscription() {
         server
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut events = nats.subscribe("events").await.expect("subscribed");
     events.unsubscribe().await;
 
     // The flush goes out first: the server's script reads that PING, so
     // joining before issuing it would wait on each other.
-    tokio::time::timeout(DEADLINE, nats.flush())
-        .await
-        .unwrap()
-        .unwrap();
-    let _server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
     assert!(
         events.try_next().is_none(),
         "a message written before the UNSUB was read is not delivered after it"
     );
 
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// `UNSUB <sid> <max_msgs>` is auto-unsubscribe-after-N, and the count is
@@ -427,12 +367,11 @@ async fn unsub_with_a_count_is_honoured_locally_as_well_as_sent() {
         server
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut events = nats.subscribe("events").await.expect("subscribed");
     events.unsubscribe_after(3).await;
@@ -440,14 +379,8 @@ async fn unsub_with_a_count_is_honoured_locally_as_well_as_sent() {
     // The flush goes out first: its PING is what the server's script reads
     // last, and it is what establishes that all four MSG lines have been
     // read by the driver before the assertion below.
-    tokio::time::timeout(DEADLINE, nats.flush())
-        .await
-        .unwrap()
-        .unwrap();
-    let _server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
 
     let mut seen = Vec::new();
     while let Some(message) = events.try_next() {
@@ -460,10 +393,7 @@ async fn unsub_with_a_count_is_honoured_locally_as_well_as_sent() {
          delivered"
     );
 
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// The count in `UNSUB <sid> <max_msgs>` is what the *server* sent, so a copy
@@ -491,45 +421,36 @@ async fn a_dropped_copy_still_counts_toward_the_auto_unsubscribe_count() {
 
     let mut options = options();
     options.subscription_queue = 1;
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut events = nats.subscribe("events").await.expect("subscribed");
     events.unsubscribe_after(3).await;
 
     // The PONG establishes that all three MSG lines reached the driver while
     // nobody was reading, which is what makes two of them drops.
-    tokio::time::timeout(DEADLINE, nats.flush())
-        .await
-        .unwrap()
-        .unwrap();
-    let _server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
     assert_eq!(events.dropped(), 2, "the queue held one copy of three");
 
-    let first = tokio::time::timeout(DEADLINE, events.next())
+    let first = within("the queued copy is readable", events.next())
         .await
-        .expect("the queued copy is readable")
         .expect("it is a message");
     assert_eq!(first.payload, &b"0"[..]);
     assert!(
-        tokio::time::timeout(DEADLINE, events.next())
-            .await
-            .expect("the subscription ended rather than waiting for a fourth")
-            .is_none(),
+        within(
+            "the subscription ended rather than waiting for a fourth",
+            events.next()
+        )
+        .await
+        .is_none(),
         "three copies were sent, so the count is reached"
     );
 
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// The subscription table is bounded, and the bound is ours because the `sid`
@@ -550,12 +471,11 @@ async fn the_subscription_table_is_bounded() {
 
     let mut options = options();
     options.max_subscriptions = 2;
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
     let _first = nats.subscribe("a").await.expect("subscribed");
@@ -566,14 +486,8 @@ async fn the_subscription_table_is_bounded() {
         "{error}"
     );
 
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// A publish subject is literal. Publishing to a pattern is refused before
@@ -595,12 +509,11 @@ async fn publishing_to_a_pattern_is_refused_before_the_wire() {
         server.write(b"PONG\r\n").await;
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
     for pattern in ["orders.*", "orders.>", "", ".orders", "orders."] {
@@ -614,26 +527,14 @@ async fn publishing_to_a_pattern_is_refused_before_the_wire() {
     }
     // Ordered by a channel, not a sleep: the server has established the
     // silence before the legal publish goes out.
-    tokio::time::timeout(DEADLINE, wait.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", wait.recv()).await.unwrap();
     nats.publish("orders.created", b"{}")
         .await
         .expect("a literal subject");
-    tokio::time::timeout(DEADLINE, nats.flush())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
 
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// A header block on a server that did not advertise `headers`: refused
@@ -653,12 +554,11 @@ async fn headers_against_a_server_without_them_are_refused() {
         server.expect_silence().await;
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     assert!(!nats.headers_supported());
 
@@ -670,14 +570,8 @@ async fn headers_against_a_server_without_them_are_refused() {
         .expect_err("no headers on this server");
     assert!(matches!(error, Error::HeadersUnsupported), "{error}");
 
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 
 /// Every subscription ends when the connection does: "core subscriptions
@@ -697,30 +591,24 @@ async fn subscriptions_end_with_the_connection() {
         drop(server);
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut events = nats.subscribe("events").await.expect("subscribed");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 
     assert!(
-        tokio::time::timeout(DEADLINE, events.next())
+        within("the subscription ended within the deadline", events.next())
             .await
-            .expect("the subscription ended within the deadline")
             .is_none(),
         "the subscription ends rather than hanging"
     );
     assert!(
-        !tokio::time::timeout(DEADLINE, nats.closed())
+        !within("the connection reported", nats.closed())
             .await
-            .expect("the connection reported")
             .is_usable()
     );
     assert!(matches!(
@@ -756,26 +644,19 @@ async fn a_full_subscription_queue_drops_copies_rather_than_the_connection() {
 
     let mut options = options();
     options.subscription_queue = 2;
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
     let mut events = nats.subscribe("events").await.expect("subscribed");
 
     // The flush goes out first: its PING is what the server's script reads
     // last, and the PONG establishes that all five MSG lines reached the
     // driver before the count below.
-    tokio::time::timeout(DEADLINE, nats.flush())
-        .await
-        .unwrap()
-        .unwrap();
-    let _server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
+    let _server = within("a step of the test", server).await.unwrap();
 
     let mut seen = 0;
     while events.try_next().is_some() {
@@ -790,8 +671,5 @@ async fn a_full_subscription_queue_drops_copies_rather_than_the_connection() {
     // The subscription is still in the table: a drop is one lost copy, not a
     // removal, so a further publish is accepted rather than refused.
     nats.publish("events", b"still here").await.expect("usable");
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }

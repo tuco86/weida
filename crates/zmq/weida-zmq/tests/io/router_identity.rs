@@ -20,19 +20,14 @@ fn context() -> Context {
     Context::new(ContextConfig::default()).expect("context")
 }
 
-/// Bounds one await: a hang becomes a failure that names the step.
+/// Waits for one await, reporting past ten seconds instead of failing: a hang
+/// is named by the step.
 async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10), future)
-        .await
-        .unwrap_or_else(|_| panic!("{what} did not finish within 10 s"))
+    weida_testkit::within(what, Duration::from_secs(10), future).await
 }
 
-async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(std::time::Instant::now() < deadline, "{what}: never held");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+async fn wait_for(what: &str, done: impl FnMut() -> bool) {
+    weida_testkit::until(what, Duration::from_secs(10), done).await;
 }
 
 /// A ZAP handler that admits any PLAIN client whose password is `pw` and

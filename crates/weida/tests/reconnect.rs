@@ -25,7 +25,7 @@ use weida::{
 pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    timeout(DEADLINE, f).await.expect("operation timed out")
+    weida_testkit::within("a reconnect step", DEADLINE, f).await
 }
 
 /// A client configuration whose redial is fast enough to test and still

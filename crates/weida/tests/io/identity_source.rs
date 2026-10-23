@@ -19,7 +19,7 @@ use weida::{
 const DEADLINE: Duration = Duration::from_secs(15);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    timeout(DEADLINE, f).await.expect("operation timed out")
+    weida_testkit::within("an identity-source step", DEADLINE, f).await
 }
 
 /// A private directory for one test.

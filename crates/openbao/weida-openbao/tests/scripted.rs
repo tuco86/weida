@@ -9,14 +9,18 @@ use std::time::Duration;
 
 use common::Bao;
 use serde_json::json;
-use tokio::time::timeout;
 use weida::{FilesOptions, IdentitySource};
 use weida_openbao::{Auth, Config, Error, OpenBao};
 
-pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    timeout(Duration::from_secs(10), f)
-        .await
-        .expect("timed out")
+/// One step of a test, expected within ten seconds. Past that the wait
+/// reports and goes on instead of failing (`weida_testkit::within`).
+#[track_caller]
+pub(crate) fn within<F: Future>(f: F) -> impl Future<Output = F::Output> {
+    let at = std::panic::Location::caller();
+    async move {
+        let what = format!("the step at {}:{}", at.file(), at.line());
+        weida_testkit::within(&what, Duration::from_secs(10), f).await
+    }
 }
 
 /// The scripted server speaks `http://` on this host, which the client only
@@ -98,7 +102,7 @@ async fn plain_http_is_refused_unless_it_is_allowed() {
 
 // --- the token's renewal ----------------------------------------------------
 
-/// Polls `done` until it holds, or fails at ten seconds.
+/// Polls `done` until it holds; reports at ten seconds and goes on.
 pub(crate) async fn until(mut done: impl FnMut() -> bool) {
     within(async {
         while !done() {

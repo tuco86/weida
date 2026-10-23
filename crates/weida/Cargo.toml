@@ -63,6 +63,8 @@ futures = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Waits that report instead of killing (B-389).
+weida-testkit.workspace = true
 # Tests, examples and benches generate throwaway identities even when a
 # downstream build turns the feature off, and run on a `SimNet` (`test-util`).
 weida = { path = ".", features = ["generate", "test-util"] }

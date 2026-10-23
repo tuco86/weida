@@ -1046,9 +1046,8 @@ mod tests {
         // Draining one message is what lets it through.
         assert_eq!(q.recv().await.expect("first out"), message("first"));
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), sender)
+            weida_testkit::within("the sender", Duration::from_secs(5), sender)
                 .await
-                .expect("the sender completed")
                 .expect("the task")
                 .expect("the send"),
             Sent::Queued
@@ -1121,9 +1120,8 @@ mod tests {
         assert!(!receiver.is_finished());
         q.send(message("late")).await.expect("send");
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), receiver)
+            weida_testkit::within("the receiver", Duration::from_secs(5), receiver)
                 .await
-                .expect("the receiver completed")
                 .expect("the task")
                 .expect("the recv"),
             message("late")
@@ -1425,9 +1423,8 @@ mod tests {
         assert!(!blocked.is_finished());
 
         assert_eq!(q.close(), 2, "both queued messages are discarded");
-        let err = tokio::time::timeout(Duration::from_secs(5), blocked)
+        let err = weida_testkit::within("the blocked sender", Duration::from_secs(5), blocked)
             .await
-            .expect("the blocked sender was woken")
             .expect("the task")
             .unwrap_err();
         assert_eq!(err.errno(), "EHOSTUNREACH", "{err}");

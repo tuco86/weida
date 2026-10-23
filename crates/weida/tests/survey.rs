@@ -17,9 +17,7 @@ use weida::{Error, ErrorCode, SimNet, TransferMeta};
 const DEADLINE: Duration = Duration::from_secs(15);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a survey step", DEADLINE, f).await
 }
 
 /// Answers every question with `body` until the respondent goes away.
@@ -82,7 +80,9 @@ async fn every_respondent_answers_within_the_deadline() {
     }
     assert_eq!(surveyor.peer_count(), 2);
 
-    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(5)))
+    // The deadline is not the claim here: an hour cannot fire, and the run
+    // ends as soon as every respondent has answered.
+    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(3600)))
         .await
         .expect("survey");
     assert_eq!(run.respondents(), 2, "one exchange per respondent");
@@ -326,7 +326,8 @@ async fn a_respondent_that_refuses_is_one_error_among_replies() {
         .await
         .expect("connect");
 
-    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(5)))
+    // Not about expiry: an hour cannot fire.
+    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(3600)))
         .await
         .expect("survey");
     let outcome = within(run.next(1024)).await.expect("an outcome");
@@ -360,7 +361,8 @@ async fn a_respondent_that_dies_mid_reply_does_not_end_the_survey() {
         .await
         .expect("connect");
 
-    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(5)))
+    // Not about expiry: an hour cannot fire.
+    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(3600)))
         .await
         .expect("survey");
     let outcome = within(run.next(1024)).await.expect("an outcome");

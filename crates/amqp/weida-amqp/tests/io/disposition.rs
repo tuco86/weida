@@ -12,7 +12,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use weida_amqp::link::{LinkEvent, LinkOptions};
 use weida_amqp::session::SessionOptions;
 use weida_amqp::{Condition, Connection, Outcome, Source, Target};
@@ -201,7 +201,7 @@ impl Server {
 }
 
 async fn connect(exec: &Exec, port: u16) -> Connection {
-    tokio::time::timeout(
+    timeout(
         DEADLINE,
         Connection::connect(exec, "127.0.0.1", port, options()),
     )
@@ -242,18 +242,18 @@ async fn settled_on_send_leaves_no_state_and_proves_nothing() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut link = LinkOptions::sender("orders", Target::at("q"));
     link.snd_settle_mode = SenderSettleMode::Settled;
-    let mut sender = tokio::time::timeout(DEADLINE, session.attach(link))
+    let mut sender = timeout(DEADLINE, session.attach(link))
         .await
         .unwrap()
         .unwrap();
 
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
+    let sent = timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
         .await
         .unwrap()
         .unwrap();
@@ -264,20 +264,17 @@ async fn settled_on_send_leaves_no_state_and_proves_nothing() {
     );
     // And the application cannot wait for an answer that is not coming: this
     // is the whole cost of the mode.
-    let error = tokio::time::timeout(DEADLINE, sender.settled(sent.delivery_id))
+    let error = timeout(DEADLINE, sender.settled(sent.delivery_id))
         .await
         .unwrap()
         .expect_err("nothing to wait for");
     assert!(error.to_string().contains("settled on send"), "{error}");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 /// One scripted exchange: the client sends one message unsettled, the server
@@ -314,17 +311,17 @@ async fn outcome_of(exec: &Exec, state: DeliveryState<'static>) -> (Outcome, usi
     });
 
     let connection = connect(exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut link = LinkOptions::sender("orders", Target::at("q"));
     link.snd_settle_mode = SenderSettleMode::Unsettled;
-    let mut sender = tokio::time::timeout(DEADLINE, session.attach(link))
+    let mut sender = timeout(DEADLINE, session.attach(link))
         .await
         .unwrap()
         .unwrap();
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
+    let sent = timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
         .await
         .unwrap()
         .unwrap();
@@ -333,19 +330,16 @@ async fn outcome_of(exec: &Exec, state: DeliveryState<'static>) -> (Outcome, usi
         1,
         "unsettled here until the receiver answers"
     );
-    let outcome = tokio::time::timeout(DEADLINE, sender.settled(sent.delivery_id))
+    let outcome = timeout(DEADLINE, sender.settled(sent.delivery_id))
         .await
         .unwrap()
         .unwrap();
     let left = sender.unsettled().len();
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
     (outcome, left)
 }
 
@@ -477,19 +471,19 @@ async fn one_disposition_settles_every_delivery_in_its_range() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut link = LinkOptions::sender("orders", Target::at("q"));
     link.snd_settle_mode = SenderSettleMode::Unsettled;
-    let mut sender = tokio::time::timeout(DEADLINE, session.attach(link))
+    let mut sender = timeout(DEADLINE, session.attach(link))
         .await
         .unwrap()
         .unwrap();
 
     for n in 0..3u32 {
-        let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"order")))
+        let sent = timeout(DEADLINE, sender.send(&Message::data(b"order")))
             .await
             .unwrap()
             .unwrap();
@@ -500,7 +494,7 @@ async fn one_disposition_settles_every_delivery_in_its_range() {
     // Every one of the three is answered by the single frame.
     let mut settled = Vec::new();
     while settled.len() < 3 {
-        match tokio::time::timeout(DEADLINE, sender.next_event())
+        match timeout(DEADLINE, sender.next_event())
             .await
             .unwrap()
             .expect("an event")
@@ -521,14 +515,11 @@ async fn one_disposition_settles_every_delivery_in_its_range() {
     assert_eq!(settled, vec![0, 1, 2]);
     assert!(sender.unsettled().is_empty());
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -578,21 +569,21 @@ async fn a_repeated_disposition_is_nothing_rather_than_an_error() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut link = LinkOptions::sender("orders", Target::at("q"));
     link.snd_settle_mode = SenderSettleMode::Unsettled;
-    let mut sender = tokio::time::timeout(DEADLINE, session.attach(link))
+    let mut sender = timeout(DEADLINE, session.attach(link))
         .await
         .unwrap()
         .unwrap();
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
+    let sent = timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
         .await
         .unwrap()
         .unwrap();
-    let outcome = tokio::time::timeout(DEADLINE, sender.settled(sent.delivery_id))
+    let outcome = timeout(DEADLINE, sender.settled(sent.delivery_id))
         .await
         .unwrap()
         .unwrap();
@@ -609,14 +600,11 @@ async fn a_repeated_disposition_is_nothing_rather_than_an_error() {
     );
     assert!(sender.unsettled().is_empty());
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -670,14 +658,14 @@ async fn under_second_the_sender_settles_before_the_receiver_does() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut link = LinkOptions::sender("orders", Target::at("q"));
     link.snd_settle_mode = SenderSettleMode::Unsettled;
     link.rcv_settle_mode = ReceiverSettleMode::Second;
-    let mut sender = tokio::time::timeout(DEADLINE, session.attach(link))
+    let mut sender = timeout(DEADLINE, session.attach(link))
         .await
         .unwrap()
         .unwrap();
@@ -687,28 +675,25 @@ async fn under_second_the_sender_settles_before_the_receiver_does() {
         "the answering attach is what says the mode is actually in force"
     );
 
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
+    let sent = timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
         .await
         .unwrap()
         .unwrap();
     // What the mode proves: when this returns, the receiver knows the outcome
     // *and* knows that this end knows it. That is the whole difference from
     // `first`, and it costs a round trip in each direction.
-    let outcome = tokio::time::timeout(DEADLINE, sender.settled(sent.delivery_id))
+    let outcome = timeout(DEADLINE, sender.settled(sent.delivery_id))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(outcome, Outcome::Accepted);
     assert!(sender.unsettled().is_empty(), "settled here too");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -752,23 +737,23 @@ async fn a_receiver_under_first_settles_with_its_own_disposition() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(2))
+    timeout(DEADLINE, receiver.grant_credit(2))
         .await
         .unwrap()
         .unwrap();
 
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("a delivery");
@@ -780,7 +765,7 @@ async fn a_receiver_under_first_settles_with_its_own_disposition() {
     );
     assert_eq!(receiver.unsettled()[0].delivery_tag, b"t-7");
 
-    tokio::time::timeout(DEADLINE, receiver.accept(delivery.delivery_id))
+    timeout(DEADLINE, receiver.accept(delivery.delivery_id))
         .await
         .unwrap()
         .unwrap();
@@ -790,19 +775,16 @@ async fn a_receiver_under_first_settles_with_its_own_disposition() {
     );
     // Settling twice writes nothing at all, which the server asserts by
     // seeing no second disposition before the close.
-    tokio::time::timeout(DEADLINE, receiver.accept(delivery.delivery_id))
+    timeout(DEADLINE, receiver.accept(delivery.delivery_id))
         .await
         .unwrap()
         .unwrap();
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -853,26 +835,26 @@ async fn a_receiver_under_second_waits_for_the_senders_settlement() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut link = LinkOptions::receiver("invoices", Source::at("q"));
     link.rcv_settle_mode = ReceiverSettleMode::Second;
-    let mut receiver = tokio::time::timeout(DEADLINE, session.attach(link))
+    let mut receiver = timeout(DEADLINE, session.attach(link))
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(2))
+    timeout(DEADLINE, receiver.grant_credit(2))
         .await
         .unwrap()
         .unwrap();
 
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("a delivery");
-    tokio::time::timeout(DEADLINE, receiver.accept(delivery.delivery_id))
+    timeout(DEADLINE, receiver.accept(delivery.delivery_id))
         .await
         .unwrap()
         .unwrap();
@@ -881,7 +863,7 @@ async fn a_receiver_under_second_waits_for_the_senders_settlement() {
     assert_eq!(pending[0].ours, Some(Outcome::Accepted));
     assert!(!pending[0].settled_here, "and this end has not settled");
 
-    let outcome = tokio::time::timeout(DEADLINE, receiver.settled(delivery.delivery_id))
+    let outcome = timeout(DEADLINE, receiver.settled(delivery.delivery_id))
         .await
         .unwrap()
         .unwrap();
@@ -892,14 +874,11 @@ async fn a_receiver_under_second_waits_for_the_senders_settlement() {
     );
     assert!(receiver.unsettled().is_empty());
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -936,23 +915,23 @@ async fn a_delivery_that_arrived_settled_is_not_answerable() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(2))
+    timeout(DEADLINE, receiver.grant_credit(2))
         .await
         .unwrap()
         .unwrap();
 
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("a delivery");
@@ -962,19 +941,16 @@ async fn a_delivery_that_arrived_settled_is_not_answerable() {
     );
     assert!(receiver.unsettled().is_empty());
     // Accepting it writes nothing: there is no delivery here to settle.
-    tokio::time::timeout(DEADLINE, receiver.accept(delivery.delivery_id))
+    timeout(DEADLINE, receiver.accept(delivery.delivery_id))
         .await
         .unwrap()
         .unwrap();
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1024,24 +1000,24 @@ async fn a_receiver_may_reject_release_and_modify_over_a_range() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(3))
+    timeout(DEADLINE, receiver.grant_credit(3))
         .await
         .unwrap()
         .unwrap();
 
     for _ in 0..3 {
-        let _ = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+        let _ = timeout(DEADLINE, receiver.next_delivery())
             .await
             .unwrap()
             .expect("a delivery");
@@ -1050,7 +1026,7 @@ async fn a_receiver_may_reject_release_and_modify_over_a_range() {
 
     // "Available again, with a note", for a batch, in one frame: this
     // consumer cannot process any of them and says so about all three.
-    tokio::time::timeout(
+    timeout(
         DEADLINE,
         receiver.settle(
             0,
@@ -1067,14 +1043,11 @@ async fn a_receiver_may_reject_release_and_modify_over_a_range() {
     .unwrap();
     assert!(receiver.unsettled().is_empty());
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1121,26 +1094,26 @@ async fn a_rejection_from_the_receiver_carries_the_reason_it_was_given() {
     });
 
     let connection = connect(&exec, port).await;
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(1))
+    timeout(DEADLINE, receiver.grant_credit(1))
         .await
         .unwrap()
         .unwrap();
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("a delivery");
-    tokio::time::timeout(
+    timeout(
         DEADLINE,
         receiver.reject(
             delivery.delivery_id,
@@ -1154,12 +1127,9 @@ async fn a_rejection_from_the_receiver_carries_the_reason_it_was_given() {
     .unwrap()
     .unwrap();
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }

@@ -780,10 +780,13 @@ async fn an_endless_re_authentication_is_cut_off() {
     .await
     .expect("connects");
 
-    let error = tokio::time::timeout(Duration::from_secs(8), client.reauthenticate())
-        .await
-        .expect("the re-authentication ends")
-        .expect_err("never finishes");
+    let error = weida_testkit::within(
+        "the re-authentication to end",
+        Duration::from_secs(8),
+        client.reauthenticate(),
+    )
+    .await
+    .expect_err("never finishes");
     assert!(matches!(error, Error::Timeout(_)), "{error}");
     assert!(
         authenticator.calls() <= 9,

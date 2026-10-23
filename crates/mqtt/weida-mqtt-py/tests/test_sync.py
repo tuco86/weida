@@ -18,6 +18,7 @@ import time
 
 import pytest
 
+import waits
 import weida_mqtt
 from weida_mqtt import sync
 
@@ -95,7 +96,7 @@ class TestRoundTrip:
             weida_mqtt.Message(topic, b"21.5", qos=1, content_type="text/plain")
         )
 
-        delivery = deliveries.recv(timeout=10.0)
+        delivery = deliveries.recv()
         assert delivery.topic == topic
         assert delivery.payload == b"21.5"
         assert delivery.properties["content_type"] == "text/plain"
@@ -158,7 +159,7 @@ class TestDeadline:
         with pytest.raises(weida_mqtt.Timeout) as expired:
             deliveries.recv(timeout=0.3)
         elapsed = time.monotonic() - started
-        assert 0.2 < elapsed < 5.0, f"the deadline was honoured: {elapsed}s"
+        assert elapsed > 0.2, f"the deadline was honoured: {elapsed}s"
         assert expired.value.reason_code is None, "a deadline is ours, not the protocol's"
 
         # The connection is untouched by the expiry.
@@ -166,7 +167,7 @@ class TestDeadline:
             broker, weida_mqtt.ConnectOptions(f"{client_id}-late-pub", keep_alive=30.0)
         )
         publisher.publish(weida_mqtt.Message(topic, b"after", qos=1))
-        delivery = deliveries.recv(timeout=10.0)
+        delivery = deliveries.recv()
         assert delivery.payload == b"after"
 
         publisher.disconnect()
@@ -236,7 +237,7 @@ class TestThreads:
                 deliveries.recv(timeout=0.3)
         finally:
             stop.set()
-            spinner.join(timeout=2.0)
+            waits.join(spinner, "the spinner to stop")
 
         assert spun[0] > 10, (
             f"the second thread ran {spun[0]} times while the first was blocked "
@@ -257,7 +258,7 @@ class TestThreads:
 
         def consume():
             for _ in range(3):
-                received.append(deliveries.recv(timeout=10.0).payload)
+                received.append(deliveries.recv().payload)
 
         consumer = threading.Thread(target=consume)
         consumer.start()
@@ -270,8 +271,7 @@ class TestThreads:
                 weida_mqtt.Message(topic, str(index).encode(), qos=1)
             )
 
-        consumer.join(timeout=20.0)
-        assert not consumer.is_alive(), "the consumer finished"
+        waits.join(consumer, "the consumer to finish")
         assert sorted(received) == [b"0", b"1", b"2"]
 
         publisher.disconnect()

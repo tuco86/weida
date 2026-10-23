@@ -1424,13 +1424,15 @@ mod tests {
             let _ = done_tx.send(());
         });
 
-        let deadline = Instant::now() + Duration::from_secs(10);
         let mut sent = 0;
+        let started = Instant::now();
+        let mut reported = Duration::ZERO;
         while sent < chunks {
-            assert!(
-                Instant::now() < deadline,
-                "the writer stopped returning budget"
-            );
+            // Reports instead of failing: a slow machine is not a stuck writer.
+            if started.elapsed() >= reported + Duration::from_secs(10) {
+                reported = started.elapsed();
+                eprintln!("still waiting for the writer to return budget: {reported:.1?}");
+            }
             let Ok(permit) = Arc::clone(&budget).try_acquire_many_owned(1) else {
                 std::thread::yield_now();
                 continue;
@@ -1444,9 +1446,12 @@ mod tests {
         }
         let queued = Arc::clone(&layer.queued);
         drop(layer);
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the writer drained the queue");
+        let drained = weida_testkit::recv(
+            &done_rx,
+            "the writer to drain the queue",
+            Duration::from_secs(10),
+        );
+        drained.expect("the writer drained the queue");
         writer.join().expect("the writer thread");
         (queued.load(Ordering::Acquire), budget.available_permits())
     }

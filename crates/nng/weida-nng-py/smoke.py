@@ -17,11 +17,10 @@ import sys
 
 import weida_nng
 
-DEADLINE = 10.0
-
 
 def options():
-    return weida_nng.SocketOptions(recv_timeout=5.0, send_timeout=5.0)
+    # No timeouts: NNG waits, and the CI job's budget is the hang guard.
+    return weida_nng.SocketOptions()
 
 
 async def round_trip():
@@ -32,10 +31,10 @@ async def round_trip():
     await client.dial(url)
 
     await client.send(b"from the wheel")
-    request = await asyncio.wait_for(server.recv(), DEADLINE)
+    request = await server.recv()
     assert request == b"from the wheel", request
     await server.send(b"answered")
-    reply = await asyncio.wait_for(client.recv(), DEADLINE)
+    reply = await client.recv()
     assert reply == b"answered", reply
 
     await ctx.shutdown()

@@ -42,6 +42,9 @@ members = [
     # crate because of the two dependencies below
     # ([decisions/0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3).
     "crates/openbao/weida-openbao",
+    # Test support for every crate above, never published: waits that report
+    # instead of killing (`crates/testkit/src/lib.rs`).
+    "crates/testkit",
 ]
 
 [workspace.package]
@@ -94,6 +97,8 @@ weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0-alpha.9-d
 weida-http-codec = { path = "crates/http/weida-http-codec", version = "0.1.0-alpha.9-dev" }
 weida-http = { path = "crates/http/weida-http", version = "0.1.0-alpha.9-dev" }
 weida-openbao = { path = "crates/openbao/weida-openbao", version = "0.1.0-alpha.9-dev" }
+# Path only, no version: a dev-dependency `cargo publish` drops.
+weida-testkit = { path = "crates/testkit" }
 # The JSON of the OpenBao API, `Value` only, no derive; `weida-openbao` alone.
 serde_json = "1"
 # Public roots for an OpenBao behind a public certificate when no CA is

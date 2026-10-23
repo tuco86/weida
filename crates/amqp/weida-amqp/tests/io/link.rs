@@ -7,7 +7,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use weida_amqp::link::{LinkEvent, LinkOptions, LinkState};
 use weida_amqp::session::{SessionOptions, SessionState};
 use weida_amqp::{
@@ -190,19 +190,19 @@ async fn a_link_is_attached_in_each_direction_and_the_handles_do_not_agree() {
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
 
-    let sender = tokio::time::timeout(
+    let sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender(
             "orders",
@@ -227,7 +227,7 @@ async fn a_link_is_attached_in_each_direction_and_the_handles_do_not_agree() {
         "the answering attach reports what was actually created"
     );
 
-    let receiver = tokio::time::timeout(
+    let receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver(
             "invoices",
@@ -245,14 +245,11 @@ async fn a_link_is_attached_in_each_direction_and_the_handles_do_not_agree() {
         "we are the receiver, so snd-settle-mode is the peer's"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -299,19 +296,19 @@ async fn the_five_terminus_fields_reach_the_wire() {
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
 
-    let link = tokio::time::timeout(
+    let link = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver(
             "durable",
@@ -335,14 +332,11 @@ async fn the_five_terminus_fields_reach_the_wire() {
     assert_eq!(remote.expiry_policy, TerminusExpiryPolicy::Never);
     assert_eq!(remote.timeout, 600);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -410,19 +404,19 @@ async fn a_second_attach_of_the_same_name_steals_the_first() {
         second.handle
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
 
-    let mut incumbent = tokio::time::timeout(
+    let mut incumbent = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -431,7 +425,7 @@ async fn a_second_attach_of_the_same_name_steals_the_first() {
     .expect("the first attach");
     assert_eq!(incumbent.output_handle(), 0);
 
-    let newcomer = tokio::time::timeout(
+    let newcomer = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -440,10 +434,7 @@ async fn a_second_attach_of_the_same_name_steals_the_first() {
     .expect("the second attach wins");
 
     // The loser is told, with the condition the specification names.
-    match tokio::time::timeout(DEADLINE, incumbent.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, incumbent.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(Some(condition))) => {
             assert_eq!(condition.condition, condition::LINK_STOLEN);
         }
@@ -451,10 +442,7 @@ async fn a_second_attach_of_the_same_name_steals_the_first() {
     }
     assert!(!incumbent.state().is_usable());
 
-    let handle = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    let handle = timeout(DEADLINE, server).await.unwrap().unwrap();
     assert_eq!(newcomer.output_handle(), handle);
     assert_ne!(newcomer.output_handle(), 0);
 }
@@ -507,18 +495,18 @@ async fn an_attach_on_a_handle_already_in_use_closes_the_connection() {
         }
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let _link = tokio::time::timeout(
+    let _link = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -526,19 +514,13 @@ async fn an_attach_on_a_handle_already_in_use_closes_the_connection() {
     .unwrap()
     .expect("attached");
 
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(condition)) => {
             assert_eq!(condition.condition, condition::SESSION_HANDLE_IN_USE);
         }
         other => panic!("expected Closed with handle-in-use, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -596,18 +578,18 @@ async fn an_errored_detach_poisons_its_handle_for_the_life_of_the_session() {
         second.handle
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut first = tokio::time::timeout(
+    let mut first = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -615,10 +597,7 @@ async fn an_errored_detach_poisons_its_handle_for_the_life_of_the_session() {
     .unwrap()
     .expect("attached");
 
-    match tokio::time::timeout(DEADLINE, first.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, first.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(Some(condition))) => {
             assert_eq!(condition.condition, condition::LINK_DETACH_FORCED);
             assert_eq!(condition.description.as_deref(), Some("evicted"));
@@ -638,10 +617,7 @@ async fn an_errored_detach_poisons_its_handle_for_the_life_of_the_session() {
     // handle the server saw.
     let second = session.attach(LinkOptions::sender("invoices", Target::at("q")));
     let _ = tokio::time::timeout(Duration::from_millis(500), second).await;
-    let handle = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    let handle = timeout(DEADLINE, server).await.unwrap().unwrap();
     assert_eq!(handle, 1, "handle 0 stays poisoned");
 }
 
@@ -678,18 +654,18 @@ async fn the_peers_handle_max_bounds_the_link_table() {
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let _first = tokio::time::timeout(
+    let _first = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -697,7 +673,7 @@ async fn the_peers_handle_max_bounds_the_link_table() {
     .unwrap()
     .expect("the one link the peer admits");
 
-    let error = tokio::time::timeout(
+    let error = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("invoices", Target::at("q"))),
     )
@@ -709,14 +685,11 @@ async fn the_peers_handle_max_bounds_the_link_table() {
         "the refusal names the bound: {error}"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -754,14 +727,14 @@ async fn a_frame_on_an_unattached_handle_ends_the_session() {
         }
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
@@ -769,11 +742,8 @@ async fn a_frame_on_an_unattached_handle_ends_the_session() {
     // whether the client still sees `Begun` here is a race the transport
     // decides (Windows delivers both frames in one read). The claim is the
     // state after the server's turn: ended by us, with the condition named.
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    let ended = tokio::time::timeout(DEADLINE, async {
+    timeout(DEADLINE, server).await.unwrap().unwrap();
+    let ended = timeout(DEADLINE, async {
         loop {
             match session.state() {
                 SessionState::Discarding(c) | SessionState::Ended(Some(c)) => break c,
@@ -838,21 +808,18 @@ async fn an_unsolicited_attach_is_refused_with_a_null_terminus_and_a_detach() {
         assert_eq!(name, "detach", "and MUST then immediately detach");
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let _session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let _session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -891,18 +858,18 @@ async fn a_detach_we_send_is_answered_and_the_handle_comes_back() {
         assert_eq!(second.handle, 0, "a cleanly closed handle is reusable");
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut link = tokio::time::timeout(
+    let mut link = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -910,14 +877,8 @@ async fn a_detach_we_send_is_answered_and_the_handle_comes_back() {
     .unwrap()
     .expect("attached");
 
-    tokio::time::timeout(DEADLINE, link.detach())
-        .await
-        .unwrap()
-        .unwrap();
-    match tokio::time::timeout(DEADLINE, link.next_event())
-        .await
-        .unwrap()
-    {
+    timeout(DEADLINE, link.detach()).await.unwrap().unwrap();
+    match timeout(DEADLINE, link.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(None)) => {}
         other => panic!("expected Detached(None), got {other:?}"),
     }
@@ -926,10 +887,7 @@ async fn a_detach_we_send_is_answered_and_the_handle_comes_back() {
 
     let second = session.attach(LinkOptions::sender("invoices", Target::at("q")));
     let _ = tokio::time::timeout(Duration::from_millis(500), second).await;
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 /// A `flow` naming `handle`, with the session fields every `flow` must carry.
@@ -1002,39 +960,33 @@ async fn a_frame_for_a_cleanly_detached_handle_is_discarded_rather_than_ending_t
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let link = tokio::time::timeout(
+    let link = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
     .await
     .unwrap()
     .expect("attached");
-    tokio::time::timeout(DEADLINE, link.detach())
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, link.detach()).await.unwrap().unwrap();
 
     // The session survives the late frame, which is what the assertion in the
     // server half is about; here it is enough that a clean close still works.
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1085,18 +1037,18 @@ async fn a_frame_for_an_errored_handle_ends_the_session_with_errant_link() {
         }
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut link = tokio::time::timeout(
+    let mut link = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -1104,19 +1056,13 @@ async fn a_frame_for_an_errored_handle_ends_the_session_with_errant_link() {
     .unwrap()
     .expect("attached");
     // The errored detach reaches the application with its condition.
-    match tokio::time::timeout(DEADLINE, link.next_event())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, link.next_event()).await.unwrap() {
         Some(LinkEvent::Detached(Some(condition))) => {
             assert_eq!(condition.condition, condition::LINK_DETACH_FORCED);
         }
         other => panic!("expected a Detached with its error, got {other:?}"),
     }
 
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
     drop(connection);
 }

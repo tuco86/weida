@@ -21,9 +21,7 @@ use weida_protocol::{DataHeader, FrameKind, SubscriptionHeader, encode_frame};
 const DEADLINE: Duration = Duration::from_secs(10);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("an accept-limits step", DEADLINE, f).await
 }
 
 /// A UDP relay in front of the server for exactly one dialler.
@@ -122,22 +120,22 @@ async fn a_binding_at_its_connection_limit_refuses_before_the_handshake() {
     // The first one was not disturbed, and a place that frees up is taken.
     assert!(first.close_reason().is_none());
     first.close(quinn::VarInt::from_u32(0), b"done");
-    let mut freed = false;
-    for _ in 0..50 {
-        match endpoint
-            .connect(server.addr, "127.0.0.1")
-            .expect("connect")
-            .await
-        {
-            Ok(_) => {
-                freed = true;
-                break;
+    // The server learns of the close as a network event, so the place frees
+    // up after a delay; dial until it is given out again.
+    within(async {
+        loop {
+            match endpoint
+                .connect(server.addr, "127.0.0.1")
+                .expect("connect")
+                .await
+            {
+                Ok(_) => break,
+                Err(e) => assert!(is_refused(&e), "{e:?}"),
             }
-            Err(e) => assert!(is_refused(&e), "{e:?}"),
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(freed, "the freed place was never given out again");
+    })
+    .await;
 }
 
 /// Handshakes in progress are counted and capped: with two of them stuck

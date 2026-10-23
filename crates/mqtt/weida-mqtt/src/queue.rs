@@ -223,12 +223,10 @@ mod tests {
 
     use super::*;
 
-    /// Every await in these tests is bounded, so a wake that never comes ends
-    /// a test instead of hanging it.
+    /// Every await in these tests is reported when it runs long, so a wake
+    /// that never comes is seen; on a paused clock it fails at once.
     async fn bounded<F: Future>(future: F) -> F::Output {
-        tokio::time::timeout(Duration::from_secs(5), future)
-            .await
-            .expect("the await finished")
+        weida_testkit::within("a step of the test", Duration::from_secs(5), future).await
     }
 
     #[tokio::test]

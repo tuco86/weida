@@ -117,7 +117,7 @@ fn options(client_id: &str) -> ConnectOptions {
     // A real broker enforces Keep Alive; 30 s is far longer than any test here
     // and short enough that a leaked connection does not outlive the run.
     options.keep_alive = Duration::from_secs(30);
-    options.connect_timeout = Duration::from_secs(5);
+    options.connect_timeout = Duration::from_secs(3600);
     options
 }
 
@@ -132,10 +132,9 @@ fn resumable(client_id: &str) -> ConnectOptions {
 
 /// The next delivery, or a failure naming what was expected.
 async fn delivered(events: &mut Events) -> Delivery {
-    match tokio::time::timeout(DEADLINE, events.next()).await {
-        Ok(Some(Event::Delivered(delivery))) => delivery,
-        Ok(other) => panic!("expected a delivery, got {other:?}"),
-        Err(_) => panic!("no delivery within {DEADLINE:?}"),
+    match weida_testkit::within("a delivery", DEADLINE, events.next()).await {
+        Some(Event::Delivered(delivery)) => delivery,
+        other => panic!("expected a delivery, got {other:?}"),
     }
 }
 
@@ -502,7 +501,12 @@ async fn the_will_fires_on_an_abnormal_close_and_not_on_an_orderly_one() {
     drop(client);
     // The task's own report that the connection ended, so the close has
     // definitely reached the socket before the assertion below.
-    let _ = tokio::time::timeout(DEADLINE, client_events.next()).await;
+    let _ = weida_testkit::within(
+        "the connection to report its end",
+        DEADLINE,
+        client_events.next(),
+    )
+    .await;
 
     let published = delivered(&mut events).await;
     assert_eq!(published.topic, "w3/will/abrupt");

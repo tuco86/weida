@@ -529,9 +529,8 @@ mod tests {
         // The slot is returned when both halves of that stream are gone.
         let accepted = b.accept_uni().await.expect("accept");
         drop(accepted);
-        tokio::time::timeout(Duration::from_secs(5), third)
+        weida_testkit::within("a slot came free", Duration::from_secs(5), third)
             .await
-            .expect("a slot came free")
             .expect("the waiting open completed");
     }
 

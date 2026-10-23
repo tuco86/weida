@@ -155,10 +155,13 @@ async fn streaming_overlap() {
     transfer.write_all(&payload[..HALF]).await.expect("write 1");
 
     // Proof of overlap: a reply byte exists before the request reaches FIN.
-    let first = tokio::time::timeout(Duration::from_secs(30), first_byte_rx)
-        .await
-        .expect("a reply byte must arrive before the request is finished")
-        .expect("reader task alive");
+    let first = weida_testkit::within(
+        "a reply byte before the request is finished",
+        Duration::from_secs(30),
+        first_byte_rx,
+    )
+    .await
+    .expect("reader task alive");
     assert_eq!(first, payload[0].to_ascii_uppercase());
 
     transfer.write_all(&payload[HALF..]).await.expect("write 2");
@@ -298,10 +301,13 @@ async fn reply_abort_when_reply_stream_dropped() {
     // CANCEL frame and no correlation id are involved.
     drop(reply);
 
-    tokio::time::timeout(Duration::from_secs(10), handler)
-        .await
-        .expect("handler must notice the cancellation")
-        .expect("handler");
+    weida_testkit::within(
+        "the handler to notice the cancellation",
+        Duration::from_secs(10),
+        handler,
+    )
+    .await
+    .expect("handler");
     assert!(*saw_cancel.lock().await);
 
     // The connection survives.
@@ -366,10 +372,13 @@ async fn canceled_resolves_when_the_requester_walks_away() {
     // observes.
     drop(body);
 
-    tokio::time::timeout(Duration::from_secs(10), handler)
-        .await
-        .expect("canceled() must resolve when the requester walks away")
-        .expect("handler");
+    weida_testkit::within(
+        "canceled() to resolve when the requester walks away",
+        Duration::from_secs(10),
+        handler,
+    )
+    .await
+    .expect("handler");
 
     client.shutdown().await;
 }
@@ -556,18 +565,21 @@ async fn a_reply_refused_before_its_head_reports_no_reply() {
 
     let client = server.client_runtime();
     let requester = client.requester(server.trust());
-    tokio::time::timeout(
+    weida_testkit::within(
+        "the connect",
         Duration::from_secs(10),
         requester.connect(&server.url("/strict")),
     )
     .await
-    .expect("in time")
     .expect("connect");
 
-    let err = tokio::time::timeout(Duration::from_secs(10), requester.request(b"please"))
-        .await
-        .expect("in time")
-        .expect_err("the reply never came");
+    let err = weida_testkit::within(
+        "the request",
+        Duration::from_secs(10),
+        requester.request(b"please"),
+    )
+    .await
+    .expect_err("the reply never came");
     assert!(
         matches!(err, Error::NoReply),
         "expected NoReply, got {err:?}"

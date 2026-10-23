@@ -25,16 +25,12 @@ import time
 import pytest
 
 import scripted
+import waits
 import weida_nats
-
-DEADLINE = 10.0
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine)
 
 
 @pytest.fixture
@@ -199,7 +195,7 @@ def test_request_is_answered(server):
             await nats.publish(request.reply_to, b"pong:" + request.payload)
 
         answering = asyncio.create_task(responder())
-        reply = await nats.request("service.echo", b"ping", 2.0)
+        reply = await nats.request("service.echo", b"ping", waits.PATIENT)
         await answering
 
         assert reply.payload == b"pong:ping"
@@ -232,10 +228,10 @@ def test_a_503_is_no_responders_and_not_the_timeout_class(server):
         nats = await connected(server)
         started = asyncio.get_running_loop().time()
         with pytest.raises(weida_nats.NoResponders) as refused:
-            # A generous window: the point is that the answer does not wait
-            # for it. 503 means "nobody was listening, now".
-            await nats.request("nobody.listening", b"ping", 30.0)
-        assert asyncio.get_running_loop().time() - started < 5.0
+            # A window nobody reaches: the answer does not wait for it. 503
+            # means "nobody was listening, now".
+            await nats.request("nobody.listening", b"ping", waits.PATIENT)
+        print(f"the 503 arrived after {asyncio.get_running_loop().time() - started:.2f}s")
         assert refused.value.errno == "NoResponders"
         assert not isinstance(refused.value, weida_nats.RequestTimeout)
         assert isinstance(refused.value, weida_nats.NatsError)
@@ -255,7 +251,7 @@ def test_request_many_collects_what_arrived_in_the_window(server):
             await nats.publish(request.reply_to, b"second")
 
         answering = asyncio.create_task(responder())
-        replies = await nats.request_many("service.fan", b"ping", 2.0, 2)
+        replies = await nats.request_many("service.fan", b"ping", waits.PATIENT, 2)
         await answering
 
         assert [reply.payload for reply in replies] == [b"first", b"second"]
@@ -514,7 +510,7 @@ def test_a_message_taken_by_a_cancelled_next_is_not_lost(server):
         server.send_msg("orders.created", orders.sid(), b"kept")
         time.sleep(0.1)
         await asyncio.sleep(0.05)
-        message = await asyncio.wait_for(orders.next(), 2)
+        message = await orders.next()
         assert message.payload == b"kept"
         await nats.close()
 

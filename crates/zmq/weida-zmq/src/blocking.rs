@@ -521,9 +521,7 @@ mod tests {
             requester.connect(&bound.to_string()).expect("connect");
             for _ in 0..3 {
                 requester.send(Multipart::single("Hello")).expect("send");
-                let reply = requester
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("a reply");
+                let reply = requester.recv().expect("a reply");
                 assert_eq!(reply.frames()[0].as_slice(), b"World");
             }
         }
@@ -534,11 +532,7 @@ mod tests {
             let context = BlockingContext::new().expect("context");
             let mut puller = PullSocket::new(&context).expect("pull");
             let bound = puller.bind("tcp://127.0.0.1:0").expect("bind");
-            let worker = std::thread::spawn(move || {
-                puller
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("a task")
-            });
+            let worker = std::thread::spawn(move || puller.recv().expect("a task"));
 
             let mut pusher = PushSocket::new(&context).expect("push");
             pusher.connect(&bound.to_string()).expect("connect");
@@ -588,15 +582,13 @@ mod tests {
             // facade does not wrap it.
             subscriber.socket().subscribe("px").expect("subscribe");
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let delivered = loop {
+            let mut delivered = None;
+            weida_testkit::poll_until("a published message", weida_testkit::EXPECTED, || {
                 publisher.publish(Multipart::single("px.eur 1.09"));
-                if let Ok(message) = subscriber.try_recv() {
-                    break message;
-                }
-                assert!(std::time::Instant::now() < deadline, "nothing arrived");
-                std::thread::sleep(Duration::from_millis(20));
-            };
+                delivered = subscriber.try_recv().ok();
+                delivered.is_some()
+            });
+            let delivered = delivered.expect("a message");
             assert_eq!(delivered.frames()[0].as_slice(), b"px.eur 1.09");
         }
     }

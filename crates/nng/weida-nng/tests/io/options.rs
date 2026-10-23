@@ -12,8 +12,10 @@ async fn recvmaxsz_is_settable_per_endpoint() {
     let ctx = Context::new(ContextConfig::default()).expect("context");
     let generous = SocketOptions {
         recv_max_size: 1024 * 1024,
-        recv_timeout: Some(Duration::from_millis(500)),
-        handshake_timeout: Duration::from_secs(2),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The handshake bound is an hour.
+        recv_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         ..SocketOptions::default()
     };
 
@@ -38,12 +40,12 @@ async fn recvmaxsz_is_settable_per_endpoint() {
     let over = PushSocket::with_options(&ctx, generous.clone()).expect("push");
     over.dial(&tight_url).await.expect("dial");
     over.send(vec![0u8; 4096]).await.expect("send");
-    for _ in 0..200 {
-        if over.pipe_count() == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    weida_testkit::until(
+        "the pipe being closed for the oversize message",
+        Duration::from_secs(2),
+        || over.pipe_count() == 0,
+    )
+    .await;
     assert_eq!(
         over.pipe_count(),
         0,

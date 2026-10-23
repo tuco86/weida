@@ -13,7 +13,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use weida_amqp::link::{LinkEvent, LinkOptions};
 use weida_amqp::session::SessionOptions;
 use weida_amqp::{Connection, Source, Target};
@@ -290,18 +290,18 @@ async fn a_receivers_grant_reaches_the_wire_as_a_limit_and_a_delivery_spends_one
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
@@ -316,13 +316,13 @@ async fn a_receivers_grant_reaches_the_wire_as_a_limit_and_a_delivery_spends_one
     );
     assert_eq!(receiver.credit().delivery_count(), 7);
 
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(2))
+    timeout(DEADLINE, receiver.grant_credit(2))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(receiver.credit().delivery_limit(), 9);
 
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("a delivery arrived");
@@ -344,14 +344,11 @@ async fn a_receivers_grant_reaches_the_wire_as_a_limit_and_a_delivery_spends_one
         "the limit is what does not move"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -385,30 +382,30 @@ async fn a_multi_frame_delivery_reassembles_and_spends_credit_once() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(4))
+    timeout(DEADLINE, receiver.grant_credit(4))
         .await
         .unwrap()
         .unwrap();
 
-    let delivery = tokio::time::timeout(DEADLINE, receiver.next_delivery())
+    let delivery = timeout(DEADLINE, receiver.next_delivery())
         .await
         .unwrap()
         .expect("one delivery, not three");
@@ -428,14 +425,11 @@ async fn a_multi_frame_delivery_reassembles_and_spends_credit_once() {
     );
     assert_eq!(credit.delivery_count(), 1);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -480,32 +474,32 @@ async fn a_second_delivery_before_the_first_completes_detaches_the_link() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(4))
+    timeout(DEADLINE, receiver.grant_credit(4))
         .await
         .unwrap()
         .unwrap();
 
     // Neither half-message is handed over: the octets of two messages
     // concatenated are not a message, and the link is gone instead.
-    let event = tokio::time::timeout(DEADLINE, receiver.next_event())
+    let event = timeout(DEADLINE, receiver.next_event())
         .await
         .unwrap()
         .expect("an event");
@@ -522,14 +516,11 @@ async fn a_second_delivery_before_the_first_completes_detaches_the_link() {
         other => panic!("expected a detach, got {other:?}"),
     }
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -581,29 +572,29 @@ async fn a_message_above_max_message_size_is_refused_with_the_condition() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
     let mut link = LinkOptions::receiver("invoices", Source::at("q"));
     link.max_message_size = Some(64);
-    let mut receiver = tokio::time::timeout(DEADLINE, session.attach(link))
+    let mut receiver = timeout(DEADLINE, session.attach(link))
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(4))
+    timeout(DEADLINE, receiver.grant_credit(4))
         .await
         .unwrap()
         .unwrap();
 
-    let event = tokio::time::timeout(DEADLINE, receiver.next_event())
+    let event = timeout(DEADLINE, receiver.next_event())
         .await
         .unwrap()
         .expect("an event");
@@ -614,14 +605,11 @@ async fn a_message_above_max_message_size_is_refused_with_the_condition() {
         other => panic!("expected a detach, got {other:?}"),
     }
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -688,18 +676,18 @@ async fn a_sender_with_no_credit_stalls_until_the_flow_arrives() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let sender = tokio::time::timeout(
+    let sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -708,7 +696,7 @@ async fn a_sender_with_no_credit_stalls_until_the_flow_arrives() {
     .unwrap();
     assert!(!sender.may_send(), "no credit yet");
 
-    let first = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
+    let first = timeout(DEADLINE, sender.send(&Message::data(b"order-1")))
         .await
         .expect("the send completed once credit arrived")
         .unwrap();
@@ -718,20 +706,17 @@ async fn a_sender_with_no_credit_stalls_until_the_flow_arrives() {
     assert_eq!(sender.credit().delivery_count(), 1);
     assert_eq!(sender.credit().link_credit(), 0, "spent");
 
-    let second = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"order-2")))
+    let second = timeout(DEADLINE, sender.send(&Message::data(b"order-2")))
         .await
         .expect("the second send completed once the second grant arrived")
         .unwrap();
     assert_eq!(second.delivery_id, 1);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -785,18 +770,18 @@ async fn a_message_larger_than_a_frame_goes_out_in_several_transfers() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let sender = tokio::time::timeout(
+    let sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -804,7 +789,7 @@ async fn a_message_larger_than_a_frame_goes_out_in_several_transfers() {
     .unwrap()
     .unwrap();
 
-    let sent = tokio::time::timeout(DEADLINE, sender.send(&Message::data(&[b'y'; 1600])))
+    let sent = timeout(DEADLINE, sender.send(&Message::data(&[b'y'; 1600])))
         .await
         .unwrap()
         .unwrap();
@@ -816,14 +801,11 @@ async fn a_message_larger_than_a_frame_goes_out_in_several_transfers() {
         "one message however many frames: the two schemes count different things"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -895,18 +877,18 @@ async fn the_session_window_stalls_a_sender_that_still_has_link_credit() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let sender = tokio::time::timeout(
+    let sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -914,27 +896,24 @@ async fn the_session_window_stalls_a_sender_that_still_has_link_credit() {
     .unwrap()
     .unwrap();
 
-    tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"one")))
+    timeout(DEADLINE, sender.send(&Message::data(b"one")))
         .await
         .unwrap()
         .unwrap();
     // Link credit remains; the window is what is missing, and the send parks
     // until the `flow` refreshes it.
     assert!(sender.credit().may_send(), "credit is not the constraint");
-    let second = tokio::time::timeout(DEADLINE, sender.send(&Message::data(b"two")))
+    let second = timeout(DEADLINE, sender.send(&Message::data(b"two")))
         .await
         .expect("the second send completed once the window reopened")
         .unwrap();
     assert_eq!(second.delivery_id, 1);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -973,18 +952,18 @@ async fn a_drain_makes_the_sender_consume_its_credit_and_report() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut sender = tokio::time::timeout(
+    let mut sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -992,7 +971,7 @@ async fn a_drain_makes_the_sender_consume_its_credit_and_report() {
     .unwrap()
     .unwrap();
 
-    let event = tokio::time::timeout(DEADLINE, sender.next_event())
+    let event = timeout(DEADLINE, sender.next_event())
         .await
         .unwrap()
         .expect("the flow was reported");
@@ -1006,14 +985,11 @@ async fn a_drain_makes_the_sender_consume_its_credit_and_report() {
     }
     assert!(!sender.may_send(), "drained");
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1073,32 +1049,32 @@ async fn an_echo_is_answered_once_with_this_ends_own_state() {
             .await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(2))
+    timeout(DEADLINE, receiver.grant_credit(2))
         .await
         .unwrap()
         .unwrap();
 
     // The barrier: the sender's `flow` has been seen, so its answer has been
     // written, and the stop below cannot reach the wire first.
-    let event = tokio::time::timeout(DEADLINE, receiver.next_event())
+    let event = timeout(DEADLINE, receiver.next_event())
         .await
         .unwrap()
         .expect("the sender's flow");
@@ -1106,20 +1082,14 @@ async fn an_echo_is_answered_once_with_this_ends_own_state() {
         LinkEvent::Flow(credit) => assert_eq!(credit.link_credit(), 2),
         other => panic!("expected a flow, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, receiver.stop())
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, receiver.stop()).await.unwrap().unwrap();
     assert_eq!(receiver.credit().link_credit(), 0);
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1152,34 +1122,31 @@ async fn a_receivers_drain_reaches_the_wire_and_the_answer_zeroes_its_credit() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let mut receiver = tokio::time::timeout(
+    let mut receiver = timeout(
         DEADLINE,
         session.attach(LinkOptions::receiver("invoices", Source::at("q"))),
     )
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.grant_credit(1))
+    timeout(DEADLINE, receiver.grant_credit(1))
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, receiver.drain())
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, receiver.drain()).await.unwrap().unwrap();
 
-    let event = tokio::time::timeout(DEADLINE, receiver.next_event())
+    let event = timeout(DEADLINE, receiver.next_event())
         .await
         .unwrap()
         .expect("the sender reported");
@@ -1195,14 +1162,11 @@ async fn a_receivers_drain_reaches_the_wire_and_the_answer_zeroes_its_credit() {
         other => panic!("expected a flow, got {other:?}"),
     }
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1224,18 +1188,18 @@ async fn a_receiver_may_not_send_and_a_sender_may_not_grant() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+    let session = timeout(DEADLINE, connection.begin(SessionOptions::default()))
         .await
         .unwrap()
         .unwrap();
-    let sender = tokio::time::timeout(
+    let sender = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("orders", Target::at("q"))),
     )
@@ -1246,7 +1210,7 @@ async fn a_receiver_may_not_send_and_a_sender_may_not_grant() {
     // Credit is granted by the receiver and only by the receiver: a sender
     // granting itself credit is the one thing the scheme has to make
     // impossible.
-    let error = tokio::time::timeout(DEADLINE, sender.grant_credit(5))
+    let error = timeout(DEADLINE, sender.grant_credit(5))
         .await
         .unwrap()
         .expect_err("refused");
@@ -1254,7 +1218,7 @@ async fn a_receiver_may_not_send_and_a_sender_may_not_grant() {
         error.to_string().contains("only the receiver may grant"),
         "{error}"
     );
-    let error = tokio::time::timeout(DEADLINE, sender.drain())
+    let error = timeout(DEADLINE, sender.drain())
         .await
         .unwrap()
         .expect_err("refused");
@@ -1263,12 +1227,9 @@ async fn a_receiver_may_not_send_and_a_sender_may_not_grant() {
         "{error}"
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }

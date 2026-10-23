@@ -277,12 +277,8 @@ mod tests {
             .collect()
     }
 
-    async fn wait_for(mut done: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(std::time::Instant::now() < deadline, "condition never held");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    async fn wait_for(done: impl FnMut() -> bool) {
+        weida_testkit::until("the condition", weida_testkit::EXPECTED, done).await;
     }
 
     fn dealer_options(routing_id: &[u8]) -> SocketOptions {
@@ -865,8 +861,7 @@ mod tests {
             .expect("router");
             let engine = router.core.engine().clone();
             let (_send, mut recv) = router.split();
-            let waiting =
-                tokio::spawn(async move { recv.recv_timeout(Duration::from_secs(5)).await });
+            let waiting = tokio::spawn(async move { recv.recv().await });
             // The receive reaches its wait before either peer exists.
             tokio::task::yield_now().await;
 
@@ -889,10 +884,11 @@ mod tests {
                     .expect("queued");
             }
 
-            let heard = waiting
-                .await
-                .expect("the receive task")
-                .expect("the owner's message");
+            let heard =
+                weida_testkit::within("the owner's message", weida_testkit::EXPECTED, waiting)
+                    .await
+                    .expect("the receive task")
+                    .expect("the owner's message");
             assert_eq!(
                 body(&heard),
                 vec![b"alpha".to_vec(), b"hello".to_vec()],

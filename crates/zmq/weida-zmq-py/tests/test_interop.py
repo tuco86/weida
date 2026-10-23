@@ -21,6 +21,7 @@ import time
 import pytest
 
 import weida_zmq
+import waits
 from weida_zmq import sync
 
 zmq = pytest.importorskip(
@@ -29,10 +30,12 @@ zmq = pytest.importorskip(
     "uv pip install --python .venv pyzmq",
 )
 
-# libzmq's own timeouts, so that a disagreement between the two
-# implementations is a failed assertion rather than a hung suite.
-TIMEOUT_MS = 5000
-TIMEOUT_S = 5.0
+# libzmq's own blocking calls wait without a limit (-1), and so do ours: a
+# limit would fail a slow run. A disagreement between the two implementations
+# that leaves a call waiting is reported by `waits` and ended by the job's
+# budget.
+TIMEOUT_MS = -1
+TIMEOUT_S = 10.0
 
 # The socket type names, as each side spells them.
 WEIDA_CLASSES = {
@@ -108,7 +111,7 @@ class Native:
         return self.socket.send(frames)
 
     def recv(self):
-        return [bytes(frame) for frame in self.socket.recv(timeout=TIMEOUT_S)]
+        return [bytes(frame) for frame in self.socket.recv()]
 
     def try_recv(self):
         try:
@@ -160,8 +163,8 @@ def exchange(initiator, responder):
         # The slow joiner, which applies to the subscription too: an XSUB's
         # subscription is a *message* sent upstream, and a publisher with no
         # peer yet drops what it is given rather than blocking. So both the
-        # subscription and the payload are retried, bounded.
-        for _ in range(300):
+        # subscription and the payload are retried until something crosses.
+        while True:
             if subscriber.kind == "XSUB":
                 subscriber.send([b"\x01topic"])
             publisher.send([b"topic", b"payload"])
@@ -170,7 +173,6 @@ def exchange(initiator, responder):
                 assert received == [b"topic", b"payload"]
                 return
             time.sleep(0.01)
-        raise AssertionError(f"nothing crossed for {pattern}")
 
     if pattern == ("PUSH", "PULL"):
         initiator.send([b"task"])
@@ -232,7 +234,7 @@ def test_plain_with_this_module_as_the_server(native, foreign):
     answered = threading.Event()
 
     def serve():
-        request = handler.recv(timeout=TIMEOUT_S)
+        request = handler.recv()
         assert bytes(request[5]) == b"PLAIN"
         assert bytes(request[6]) == b"admin"
         assert bytes(request[7]) == b"secret"
@@ -254,10 +256,10 @@ def test_plain_with_this_module_as_the_server(native, foreign):
         client.connect(endpoint)
         client.send(b"plain from libzmq")
 
-        assert server.recv(timeout=TIMEOUT_S) == [b"plain from libzmq"]
+        assert server.recv() == [b"plain from libzmq"]
         assert answered.is_set()
     finally:
-        thread.join(timeout=TIMEOUT_S)
+        waits.join(thread, "the ZAP handler thread", TIMEOUT_S)
 
 
 def test_plain_with_libzmq_as_the_server(native, foreign):
@@ -301,7 +303,7 @@ def test_curve_with_this_module_as_the_server(native, foreign):
     handler.bind(weida_zmq.ZAP_ENDPOINT)
 
     def serve():
-        request = handler.recv(timeout=TIMEOUT_S)
+        request = handler.recv()
         assert bytes(request[5]) == b"CURVE"
         assert bytes(request[6]) == client_public.bytes
         handler.send([b"1.0", bytes(request[1]), b"200", b"", b"curve-client", b""])
@@ -323,9 +325,9 @@ def test_curve_with_this_module_as_the_server(native, foreign):
         client.connect(endpoint)
         client.send(b"curve from libzmq")
 
-        assert server.recv(timeout=TIMEOUT_S) == [b"curve from libzmq"]
+        assert server.recv() == [b"curve from libzmq"]
     finally:
-        thread.join(timeout=TIMEOUT_S)
+        waits.join(thread, "the ZAP handler thread", TIMEOUT_S)
 
 
 def test_curve_with_libzmq_as_the_server(native, foreign):
@@ -378,8 +380,8 @@ def test_the_asyncio_surface_also_speaks_to_libzmq(foreign):
         client.connect(endpoint)
         client.send(b"from libzmq")
 
-        assert await server.recv(timeout=TIMEOUT_S) == [b"from libzmq"]
+        assert await server.recv() == [b"from libzmq"]
         await server.send(b"from weida")
         assert client.recv_multipart() == [b"from weida"]
 
-    asyncio.run(asyncio.wait_for(exchange_async(), TIMEOUT_S * 2))
+    waits.run(exchange_async(), TIMEOUT_S * 2)

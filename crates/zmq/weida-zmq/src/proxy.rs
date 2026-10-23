@@ -747,12 +747,10 @@ mod tests {
         assert_eq!(err.errno(), "ENOTSUP", "{err}");
     }
 
-    /// Bounds one await in a test: a hang becomes a failure that names the
-    /// step, not a test run that never ends.
+    /// Waits for one step of a test, reporting past ten seconds instead of
+    /// failing, and naming the step.
     async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(Duration::from_secs(10), future)
-            .await
-            .unwrap_or_else(|_| panic!("{what} did not finish within 10 s"))
+        weida_testkit::within(what, Duration::from_secs(10), future).await
     }
 
     /// Asks a running steerable proxy for its counters until its backend has
@@ -906,12 +904,8 @@ mod tests {
         message.frames()[0].as_slice().to_vec()
     }
 
-    async fn wait_for(mut done: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(std::time::Instant::now() < deadline, "condition never held");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    async fn wait_for(done: impl FnMut() -> bool) {
+        weida_testkit::until("the condition", weida_testkit::EXPECTED, done).await;
     }
 
     /// A pub-sub forwarder, running: an XSUB facing `upstream` and an XPUB
@@ -1000,7 +994,13 @@ mod tests {
         published_until_received(&mut publish, &mut first, "news 1").await;
         published_until_received(&mut publish, &mut second, "news 1").await;
 
-        let announced = events_within(&mut upstream, Duration::from_millis(300)).await;
+        // The first announcement is waited for as long as it takes; the window
+        // after it only checks that no second one follows.
+        let first_event = bounded("the first announcement", upstream.recv())
+            .await
+            .expect("an event");
+        let mut announced = vec![bytes_of(&first_event)];
+        announced.extend(events_within(&mut upstream, Duration::from_millis(300)).await);
         assert_eq!(
             announced,
             [b"\x01news".to_vec()],
@@ -1106,25 +1106,28 @@ mod tests {
             // The subscription reaches the publisher through the proxy, so a
             // message published after it arrives is matched. The publisher drops
             // what nobody wants, so this is retried until one lands.
-            let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    publisher.publish(Multipart::single(Message::from("px.eur 1.09")));
-                    if let Ok(message) = subscriber.try_recv() {
-                        return message;
+            let delivered =
+                weida_testkit::within("the subscriber's message", weida_testkit::EXPECTED, async {
+                    loop {
+                        publisher.publish(Multipart::single(Message::from("px.eur 1.09")));
+                        if let Ok(message) = subscriber.try_recv() {
+                            return message;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("the subscriber got a message");
+                })
+                .await;
             assert_eq!(delivered.frames()[0].as_slice(), b"px.eur 1.09");
 
             // The capture socket saw a copy of what went past — subscriptions
             // included, since a proxy forwards those too.
-            let seen = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.recv())
-                .await
-                .expect("a captured message")
-                .expect("a message");
+            let seen = weida_testkit::within(
+                "a captured message",
+                weida_testkit::EXPECTED,
+                watcher.recv(),
+            )
+            .await
+            .expect("a message");
             assert!(
                 !seen.frames().is_empty(),
                 "the capture socket received a copy"
@@ -1154,15 +1157,14 @@ mod tests {
             });
 
             client.send(Multipart::single("work")).await.expect("send");
-            let request = tokio::time::timeout(std::time::Duration::from_secs(10), worker.recv())
-                .await
-                .expect("the request arrived")
-                .expect("a request");
+            let request =
+                weida_testkit::within("the request", weida_testkit::EXPECTED, worker.recv())
+                    .await
+                    .expect("a request");
             assert_eq!(request.frames()[0].as_slice(), b"work");
             worker.send(Multipart::single("done")).await.expect("reply");
-            let reply = tokio::time::timeout(std::time::Duration::from_secs(10), client.recv())
+            let reply = weida_testkit::within("the reply", weida_testkit::EXPECTED, client.recv())
                 .await
-                .expect("the reply arrived")
                 .expect("a reply");
             assert_eq!(reply.frames()[0].as_slice(), b"done");
             device.abort();
@@ -1198,15 +1200,21 @@ mod tests {
                 .send(Multipart::single("job 1"))
                 .await
                 .expect("send");
-            let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
-                .await
-                .expect("the job crossed the streamer")
-                .expect("a job");
+            let crossed = weida_testkit::within(
+                "the job to cross the streamer",
+                weida_testkit::EXPECTED,
+                consumer.recv(),
+            )
+            .await
+            .expect("a job");
             assert_eq!(crossed.frames()[0].as_slice(), b"job 1");
-            let seen = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.recv())
-                .await
-                .expect("the capture socket saw it")
-                .expect("a copy");
+            let seen = weida_testkit::within(
+                "the capture socket's copy",
+                weida_testkit::EXPECTED,
+                watcher.recv(),
+            )
+            .await
+            .expect("a copy");
             assert_eq!(seen.frames()[0].as_slice(), b"job 1");
             assert!(
                 !device.is_finished(),
@@ -1248,20 +1256,23 @@ mod tests {
                 .send(Multipart::single("job 2"))
                 .await
                 .expect("send");
-            let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
-                .await
-                .expect("the job crossed the reversed streamer")
-                .expect("a job");
+            let crossed = weida_testkit::within(
+                "the job to cross the reversed streamer",
+                weida_testkit::EXPECTED,
+                consumer.recv(),
+            )
+            .await
+            .expect("a job");
             assert_eq!(crossed.frames()[0].as_slice(), b"job 2");
             steer
                 .send(Multipart::single(CONTROL_TERMINATE.to_vec()))
                 .await
                 .expect("terminate");
-            let statistics = tokio::time::timeout(std::time::Duration::from_secs(10), device)
-                .await
-                .expect("the proxy terminated")
-                .expect("the task")
-                .expect("the counters");
+            let statistics =
+                weida_testkit::within("the proxy to terminate", weida_testkit::EXPECTED, device)
+                    .await
+                    .expect("the task")
+                    .expect("the counters");
             assert_eq!(statistics.backend_in.messages, 1);
             assert_eq!(statistics.frontend_out.messages, 1);
             assert_eq!(
@@ -1310,10 +1321,10 @@ mod tests {
 
             // Running: a message goes through.
             sender.send(Multipart::single("first")).await.expect("send");
-            let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
-                .await
-                .expect("forwarded")
-                .expect("a message");
+            let arrived =
+                weida_testkit::within("the forward", weida_testkit::EXPECTED, receiver.recv())
+                    .await
+                    .expect("a message");
             assert_eq!(arrived.frames()[0].as_slice(), b"first");
 
             // Paused: the next message waits in the frontend's queue rather than
@@ -1329,10 +1340,10 @@ mod tests {
                 .send(Multipart::single(CONTROL_STATISTICS.to_vec()))
                 .await
                 .expect("ask");
-            let reply = tokio::time::timeout(std::time::Duration::from_secs(10), steer.recv())
-                .await
-                .expect("a statistics reply")
-                .expect("a reply");
+            let reply =
+                weida_testkit::within("a statistics reply", weida_testkit::EXPECTED, steer.recv())
+                    .await
+                    .expect("a reply");
             let statistics = ProxyStatistics::decode(&reply).expect("decode");
             assert_eq!(statistics.frontend_in.messages, 1);
             assert_eq!(statistics.backend_out.messages, 1);
@@ -1352,10 +1363,13 @@ mod tests {
                 .send(Multipart::single(CONTROL_RESUME.to_vec()))
                 .await
                 .expect("resume");
-            let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
-                .await
-                .expect("forwarded after the resume")
-                .expect("a message");
+            let arrived = weida_testkit::within(
+                "the forward after the resume",
+                weida_testkit::EXPECTED,
+                receiver.recv(),
+            )
+            .await
+            .expect("a message");
             assert_eq!(arrived.frames()[0].as_slice(), b"second");
 
             // Terminated: the proxy ends and hands back its counters.
@@ -1363,11 +1377,11 @@ mod tests {
                 .send(Multipart::single(CONTROL_TERMINATE.to_vec()))
                 .await
                 .expect("terminate");
-            let statistics = tokio::time::timeout(std::time::Duration::from_secs(10), device)
-                .await
-                .expect("the proxy ended")
-                .expect("the task")
-                .expect("the counters");
+            let statistics =
+                weida_testkit::within("the proxy to end", weida_testkit::EXPECTED, device)
+                    .await
+                    .expect("the task")
+                    .expect("the counters");
             assert_eq!(statistics.frontend_in.messages, 2);
             assert_eq!(statistics.backend_out.messages, 2);
             assert_eq!(statistics.frontend_in.bytes, 11, "five and six octets");

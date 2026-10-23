@@ -28,9 +28,7 @@ use weida::{
 pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a Radio/Dish step", DEADLINE, f).await
 }
 
 /// A client runtime whose streams stall after 64 KiB unread: a dish on it

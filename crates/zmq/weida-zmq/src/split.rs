@@ -1619,9 +1619,8 @@ mod tests {
             );
 
             let pipe = core.pipe_of(greedy).expect("the subscriber's pipe");
-            let reason = tokio::time::timeout(Duration::from_secs(10), pipe.refusal())
-                .await
-                .expect("the subscriber was told");
+            let reason =
+                weida_testkit::within("the refusal", weida_testkit::EXPECTED, pipe.refusal()).await;
             assert!(reason.contains("share"), "{reason}");
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), pipe.refusal())

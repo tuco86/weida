@@ -36,7 +36,17 @@ async fn a_puller_that_cannot_accept_is_skipped_rather_than_waited_for() {
     const STALLED_ABSORBS: usize = 5;
 
     let ctx = Context::new(ContextConfig::default()).expect("context");
-    let push = PushSocket::with_options(&ctx, options()).expect("push");
+    // The send timeout is the oracle of this test and runs on the paused
+    // clock, so a slow machine cannot trigger it: only a send that would wait
+    // for ever does.
+    let push = PushSocket::with_options(
+        &ctx,
+        SocketOptions {
+            send_timeout: Some(Duration::from_secs(5)),
+            ..options()
+        },
+    )
+    .expect("push");
     push.listen("inproc://work").await.expect("listen");
     let stalled = PullSocket::with_options(
         &ctx,

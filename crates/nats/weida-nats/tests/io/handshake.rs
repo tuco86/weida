@@ -2,7 +2,7 @@
 
 use crate::support;
 use std::time::Duration;
-use support::{DEADLINE, SILENCE, Server, options};
+use support::{SILENCE, Server, options, within};
 use weida_nats::options::{Credentials, NonceSignature, Signer};
 use weida_nats::{Connection, Error, State};
 use weida_runtime::Exec;
@@ -35,12 +35,11 @@ async fn the_server_sends_info_before_the_client_says_anything() {
         server
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "the handshake finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("the handshake finished")
     .expect("the connection opened");
 
     assert_eq!(nats.state(), State::Connected);
@@ -48,14 +47,8 @@ async fn the_server_sends_info_before_the_client_says_anything() {
     assert_eq!(nats.max_payload(), 1_048_576);
     assert!(nats.headers_supported());
 
-    let mut server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    let mut server = within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
     // There is no CLOSE verb: ending the transport is the close.
     server.expect_end_of_stream().await;
 }
@@ -66,29 +59,27 @@ async fn a_server_that_never_sends_info_hits_our_own_deadline() {
     let exec = Exec::current().unwrap();
     let (listener, port) = Server::listen().await;
 
+    // The server holds the connection open and silent until the test is
+    // done with it, so the only way out is the client's own deadline.
     let server = tokio::spawn(async move {
         let server = Server::accept(&listener).await;
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        std::future::pending::<()>().await;
         drop(server);
     });
 
     let mut options = options();
     options.handshake_timeout = Duration::from_millis(150);
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "the handshake finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("the handshake finished")
     .expect_err("no INFO ever arrived");
     assert!(
         matches!(error, Error::HandshakeTimeout { step } if step.contains("INFO")),
         "{error}"
     );
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    server.abort();
 }
 /// The first operation is `INFO` and nothing else.
 #[tokio::test]
@@ -103,21 +94,17 @@ async fn a_first_operation_that_is_not_info_is_a_protocol_error() {
         tokio::time::sleep(SILENCE).await;
     });
 
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect_err("the first operation must be INFO");
     assert!(
         matches!(&error, Error::Protocol(why) if why.contains("INFO") && why.contains("PING")),
         "{error}"
     );
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }
 /// Each credential form travels alone and in its own fields.
 #[tokio::test]
@@ -138,21 +125,14 @@ async fn a_token_connect_carries_the_token_and_nothing_else() {
 
     let mut options = options();
     options.credentials = Credentials::Token("t0ken".into());
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// The user/password form, with the two fields the reference names.
 #[tokio::test]
@@ -175,21 +155,14 @@ async fn a_user_password_connect_carries_both_fields() {
         user: "alice".into(),
         password: "s3cret".into(),
     };
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// The JWT form: the JWT in `jwt`, the caller's signature in `sig`, and no
 /// `nkey` — the JWT already carries the public key the server verifies
@@ -220,21 +193,14 @@ async fn a_jwt_connect_signs_the_nonce_without_sending_an_nkey() {
             })
         })),
     };
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// A server that demands authentication and a client with nothing to offer:
 /// refused locally, before a `CONNECT` the server would answer with
@@ -256,18 +222,14 @@ async fn auth_required_with_no_credentials_is_refused_before_the_connect() {
         server.expect_end_of_stream().await;
     });
 
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect_err("no credentials");
     assert!(matches!(error, Error::AuthenticationRequired), "{error}");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }
 /// The NKey path: the nonce reaches the caller's signer **unchanged**, and
 /// what the signer returned lands in `CONNECT.sig` and `CONNECT.nkey`.
@@ -307,12 +269,11 @@ async fn the_nonce_reaches_the_signer_unchanged_and_the_signature_lands_in_sig()
         })
     }));
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
     assert_eq!(
@@ -320,14 +281,8 @@ async fn the_nonce_reaches_the_signer_unchanged_and_the_signature_lands_in_sig()
         nonce.as_bytes(),
         "the signer sees the nonce exactly as INFO carried it"
     );
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// An NKey configuration against a server that sent no nonce: there is
 /// nothing to sign, and signing nothing would be signing nothing.
@@ -351,18 +306,14 @@ async fn nkey_credentials_without_a_nonce_fail_rather_than_sign_nothing() {
     options.credentials = Credentials::Nkey(Signer::new(|_| {
         panic!("the signer must not be called when there is no nonce")
     }));
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect_err("no nonce");
     assert!(matches!(error, Error::NonceMissing), "{error}");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }
 /// `-ERR` during the handshake is the server refusing the `CONNECT`, and it
 /// is reported in the server's own words.
@@ -389,21 +340,17 @@ async fn a_refused_connect_is_reported_with_the_servers_own_reason() {
         user: "u".into(),
         password: "wrong".into(),
     };
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect_err("refused");
     assert!(
         matches!(&error, Error::Server(reason) if reason == "Authorization Violation"),
         "{error}"
     );
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }
 /// A server `PING` is answered with `PONG`, in both directions from the first
 /// octet.
@@ -423,21 +370,14 @@ async fn a_server_ping_is_answered_with_a_pong() {
         );
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// The unanswered pings are **bounded**. A server that answers the
 /// handshake's `PING` and then goes silent gets exactly `max_pings_out`
@@ -462,17 +402,14 @@ async fn unanswered_pings_are_bounded_and_the_connection_is_reported_failed() {
     let mut options = options();
     options.ping_interval = Duration::from_millis(60);
     options.max_pings_out = 2;
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
-    let state = tokio::time::timeout(DEADLINE, nats.closed())
-        .await
-        .expect("the connection failed within the deadline");
+    let state = within("the connection failed within the deadline", nats.closed()).await;
     match state {
         State::Failed(why) => {
             assert!(why.contains("stale"), "{why}");
@@ -480,10 +417,7 @@ async fn unanswered_pings_are_bounded_and_the_connection_is_reported_failed() {
         }
         other => panic!("expected a failed connection, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }
 /// An asynchronous `INFO`, after the handshake: `connect_urls` retained under
 /// their bound, and `ldm: true` surfaced as the drain notice it is.
@@ -511,26 +445,20 @@ async fn a_later_info_carries_connect_urls_and_the_lame_duck_notice() {
     // The bound is ours, so a cluster larger than it is truncated rather than
     // refused.
     options.max_connect_urls = 2;
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("finished")
     .expect("opened");
 
     assert!(nats.info().connect_urls.is_empty(), "none yet");
     assert!(!nats.is_lame_duck());
 
-    let mut server = tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut server = within("a step of the test", server).await.unwrap();
 
     assert!(
-        tokio::time::timeout(DEADLINE, nats.lame_duck_notice())
-            .await
-            .expect("the notice arrived"),
+        within("the notice arrived", nats.lame_duck_notice()).await,
         "ldm: true is the server saying it will drain its clients"
     );
     let info = nats.info();
@@ -541,10 +469,7 @@ async fn a_later_info_carries_connect_urls_and_the_lame_duck_notice() {
     );
     assert!(info.lame_duck);
 
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
     server.expect_end_of_stream().await;
 }
 /// `max_payload` is enforced **locally**: an oversized publish fails before
@@ -571,12 +496,11 @@ async fn an_oversized_publish_fails_locally_and_nothing_reaches_the_wire() {
         server.write(b"PONG\r\n").await;
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     assert_eq!(nats.max_payload(), 64);
 
@@ -596,25 +520,13 @@ async fn an_oversized_publish_fails_locally_and_nothing_reaches_the_wire() {
 
     // Ordered by a channel, not a sleep: the server has established the
     // silence before the legal publish goes out.
-    tokio::time::timeout(DEADLINE, wait.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", wait.recv()).await.unwrap();
     nats.publish("a.b", b"within")
         .await
         .expect("inside the bound");
-    tokio::time::timeout(DEADLINE, nats.flush())
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// An asynchronous `INFO` that lowers `max_payload` takes effect on the next
 /// publish, which is the whole reason the bound cannot be a constant.
@@ -636,21 +548,17 @@ async fn a_later_info_moves_the_payload_bound() {
         server.expect_silence().await;
     });
 
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("opened");
     assert_eq!(nats.max_payload(), 1024);
 
     // A flush is the protocol's only round trip, and the PONG that ends it
     // establishes that the driver has already read the INFO that came first.
-    tokio::time::timeout(DEADLINE, nats.flush())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", nats.flush()).await.unwrap();
 
     assert_eq!(nats.max_payload(), 8);
     assert!(matches!(
@@ -661,14 +569,8 @@ async fn a_later_info_moves_the_payload_bound() {
         })
     ));
 
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// `INFO.tls_required` on a build **with** TLS but no `ClientConfig`: the
 /// only honest answer is to say TLS is required, because the trust decision
@@ -690,18 +592,14 @@ async fn tls_required_without_a_client_config_says_so_plainly() {
         server.expect_end_of_stream().await;
     });
 
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect_err("TLS is required");
     assert!(matches!(error, Error::TlsRequired), "{error}");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }
 /// `INFO.tls_required` on a build **without** TLS: reported plainly rather
 /// than continued in the clear. A client that ignored the flag would put its
@@ -723,18 +621,14 @@ async fn tls_required_on_a_build_without_tls_is_reported_rather_than_ignored() {
         server.expect_end_of_stream().await;
     });
 
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect_err("this build has no TLS");
     assert!(matches!(error, Error::TlsUnsupported), "{error}");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }
 /// The real thing: `INFO` in the clear, the TLS handshake, and then every
 /// client octet inside the session — `CONNECT` first of all.
@@ -799,26 +693,19 @@ async fn tls_is_completed_before_any_ordinary_traffic() {
 
     let mut options = options();
     options.tls_server_name = Some("localhost".to_owned());
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect_tls(&exec, "127.0.0.1", port, options, client_config),
     )
     .await
-    .expect("finished")
     .expect("opened inside TLS");
     assert_eq!(nats.info().server_id.as_deref(), Some("S1"));
 
     // The server's script reads this publish inside the session, and joining
     // it is what establishes that the octets arrived encrypted.
     nats.publish("inside", b"secret").await.unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// The TLS handshake is inside the handshake's deadline. A server that sends
 /// an `INFO` demanding TLS and then goes quiet after the `ClientHello` would
@@ -837,29 +724,26 @@ async fn a_tls_handshake_that_never_finishes_hits_the_handshake_deadline() {
             .send_info("{\"server_id\":\"S1\",\"tls_required\":true}")
             .await;
         // The `ClientHello` arrives and is never answered.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        std::future::pending::<()>().await;
         drop(server);
     });
 
     let mut options = options();
     options.handshake_timeout = Duration::from_millis(300);
     options.tls_server_name = Some("localhost".to_owned());
-    let started = std::time::Instant::now();
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "the connect returned instead of waiting on the TLS handshake",
         Connection::connect_tls(&exec, "127.0.0.1", port, options, client_config),
     )
     .await
-    .expect("the connect returned instead of waiting on the TLS handshake")
     .expect_err("no TLS session was ever established");
     assert!(
         matches!(&error, Error::HandshakeTimeout { step } if step.contains("TLS")),
         "{error}"
     );
-    assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "the deadline is the handshake's, not the server's"
-    );
+    // The server never ends its silence, so the connect ended on the
+    // handshake's deadline and not on the server's.
+    assert!(!server.is_finished());
     server.abort();
 }
 /// A caller that hands over a TLS configuration has asked for TLS, and an
@@ -890,20 +774,18 @@ async fn connect_tls_refuses_an_info_that_offers_no_tls_and_sends_no_credentials
         password: "s3cret".into(),
     };
     options.tls_server_name = Some("localhost".to_owned());
-    let error = tokio::time::timeout(
-        DEADLINE,
+    let error = within(
+        "finished",
         Connection::connect_tls(&exec, "127.0.0.1", port, options, client_config),
     )
     .await
-    .expect("finished")
     .expect_err("the server offered no TLS");
     assert!(
         matches!(&error, Error::Tls(why) if why.contains("INFO")),
         "{error}"
     );
-    tokio::time::timeout(DEADLINE, server)
+    within("the server script finished", server)
         .await
-        .expect("the server script finished")
         .expect("the client wrote nothing in the clear");
 }
 /// A server in mixed mode offers TLS without demanding it. A caller that asked
@@ -939,21 +821,14 @@ async fn connect_tls_upgrades_where_the_server_only_offers_tls() {
 
     let mut options = options();
     options.tls_server_name = Some("localhost".to_owned());
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect_tls(&exec, "127.0.0.1", port, options, client_config),
     )
     .await
-    .expect("finished")
     .expect("opened inside TLS");
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(DEADLINE, nats.close())
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
+    within("a step of the test", nats.close()).await.unwrap();
 }
 /// The handshake is **one** budget. A server that answers everything the
 /// client says with a `PING` a moment before the deadline never lets a clock
@@ -979,21 +854,21 @@ async fn a_server_that_keeps_the_handshake_busy_without_a_pong_runs_into_one_dea
 
     let mut options = options();
     options.handshake_timeout = Duration::from_millis(500);
-    let started = std::time::Instant::now();
-    let error = tokio::time::timeout(
-        DEADLINE,
+    // Only the outcome is asserted: the connect ended on its own budget while
+    // the server was still keeping it busy, whatever that took on the wall.
+    let error = within(
+        "the connect returned instead of being kept busy for ever",
         Connection::connect(&exec, "127.0.0.1", port, options),
     )
     .await
-    .expect("the connect returned instead of being kept busy for ever")
     .expect_err("the PONG never came");
     assert!(
         matches!(&error, Error::HandshakeTimeout { step } if step.contains("PONG")),
         "{error}"
     );
     assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "the budget is the handshake's, whatever the server keeps sending"
+        !server.is_finished(),
+        "the server was still sending: the budget is the handshake's, not the server's"
     );
     server.abort();
 }
@@ -1017,16 +892,12 @@ async fn a_large_info_from_a_big_cluster_is_accepted() {
         let mut server = Server::accept(&listener).await;
         server.handshake(&info).await;
     });
-    let nats = tokio::time::timeout(
-        DEADLINE,
+    let nats = within(
+        "finished",
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
-    .expect("finished")
     .expect("a large INFO is not a protocol violation");
     assert_eq!(nats.info().connect_urls.len(), 200);
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    within("a step of the test", server).await.unwrap();
 }

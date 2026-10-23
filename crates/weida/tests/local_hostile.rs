@@ -18,19 +18,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use weida::{Incoming, Limits, RuntimeConfig};
 use weida_protocol::{DataHeader, FrameKind, Hello, SubscriptionHeader, encode_frame};
 
-/// Ceiling on any single await in these tests.
+/// Expected time of any single await in these tests.
 const BOUND: Duration = Duration::from_secs(10);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(BOUND, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a local-socket step", BOUND, f).await
 }
 
 async fn within_for<F: Future>(bound: Duration, f: F) -> F::Output {
-    tokio::time::timeout(bound, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a local-socket step", bound, f).await
 }
 
 /// First byte of a control connection (`docs/PROTOCOL.md` §2.1).

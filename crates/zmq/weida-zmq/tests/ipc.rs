@@ -9,7 +9,6 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use weida_zmq::{Context, ContextConfig, Endpoint, MAX_IPC_ENDPOINT_BYTES, Multipart};
 
@@ -34,12 +33,8 @@ pub(crate) fn text(message: &Multipart) -> Vec<u8> {
     message.frames()[0].as_slice().to_vec()
 }
 
-pub(crate) async fn wait_for(mut done: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(std::time::Instant::now() < deadline, "condition never held");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+pub(crate) async fn wait_for(done: impl FnMut() -> bool) {
+    weida_testkit::until("the condition", weida_testkit::EXPECTED, done).await;
 }
 
 /// Claim: the endpoint string is bounded where libzmq bounds it — 113 bytes

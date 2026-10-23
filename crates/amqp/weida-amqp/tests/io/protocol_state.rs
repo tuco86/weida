@@ -13,7 +13,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{DEADLINE, Server, accept, options, scripted};
+use support::{DEADLINE, Server, accept, options, scripted, timeout};
 use tokio::io::AsyncReadExt;
 use weida_amqp::{Connection, State};
 use weida_amqp_codec::Limits;
@@ -97,26 +97,20 @@ async fn a_frame_of_the_sasl_type_after_open_is_a_framing_error() {
         );
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(closed)) => {
             assert_eq!(closed.condition, condition::CONNECTION_FRAMING_ERROR);
         }
         other => panic!("expected Closed with framing-error, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -139,26 +133,20 @@ async fn an_empty_sasl_type_frame_after_open_is_a_framing_error() {
         );
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(closed)) => {
             assert_eq!(closed.condition, condition::CONNECTION_FRAMING_ERROR);
         }
         other => panic!("expected Closed with framing-error, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -183,26 +171,20 @@ async fn close_on_a_channel_other_than_zero_is_a_framing_error() {
         );
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(closed)) => {
             assert_eq!(closed.condition, condition::CONNECTION_FRAMING_ERROR);
         }
         other => panic!("expected Closed with framing-error, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -224,26 +206,20 @@ async fn a_second_open_is_illegal_state() {
         assert_eq!(condition.as_deref(), Some(condition::ILLEGAL_STATE));
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Closed(Some(closed)) => {
             assert_eq!(closed.condition, condition::ILLEGAL_STATE);
         }
         other => panic!("expected Closed with illegal-state, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -267,31 +243,25 @@ async fn a_frame_declaring_more_than_we_accept_is_answered_with_a_close() {
 
         // The transport is dropped after the close, so the next read is EOF.
         let mut byte = [0u8; 1];
-        let read = tokio::time::timeout(DEADLINE, server.stream.read(&mut byte))
+        let read = timeout(DEADLINE, server.stream.read(&mut byte))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(read, 0, "the client drops the transport after its close");
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    match tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap()
-    {
+    match timeout(DEADLINE, connection.closed()).await.unwrap() {
         State::Failed(_) => {}
         other => panic!("expected Failed, got {other:?}"),
     }
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -313,24 +283,19 @@ async fn a_sound_frame_with_an_unreadable_body_is_answered_with_decode_error() {
         assert_eq!(condition.as_deref(), Some(condition::DECODE_ERROR));
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
     .await
     .unwrap()
     .unwrap();
-    let state = tokio::time::timeout(DEADLINE, connection.closed())
-        .await
-        .unwrap();
+    let state = timeout(DEADLINE, connection.closed()).await.unwrap();
     assert!(
         !state.is_usable(),
         "a frame that does not decode ends the connection, got {state:?}"
     );
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -350,7 +315,7 @@ async fn a_valid_keepalive_is_still_accepted() {
         server.expect_close().await;
     });
 
-    let connection = tokio::time::timeout(
+    let connection = timeout(
         DEADLINE,
         Connection::connect(&exec, "127.0.0.1", port, options()),
     )
@@ -364,12 +329,9 @@ async fn a_valid_keepalive_is_still_accepted() {
         connection.state()
     );
 
-    tokio::time::timeout(DEADLINE, connection.close())
+    timeout(DEADLINE, connection.close())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(DEADLINE, server)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
 }

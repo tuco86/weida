@@ -14,9 +14,12 @@ use weida_sp::{Backtrace, EndpointType, message};
 
 pub(crate) fn options() -> SocketOptions {
     SocketOptions {
-        recv_timeout: Some(Duration::from_secs(5)),
-        send_timeout: Some(Duration::from_secs(5)),
-        handshake_timeout: Duration::from_secs(2),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The handshake bound is an hour, not the
+        // library's ten seconds.
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         resend_time: Duration::from_secs(30),
         ..SocketOptions::default()
@@ -43,10 +46,13 @@ async fn a_raw_socket_refuses_a_context() {
 }
 
 pub(crate) async fn server_reply(client: &ReqSocket) -> Message {
-    tokio::time::timeout(Duration::from_secs(5), client.recv())
-        .await
-        .expect("the reply came back through the device")
-        .expect("a reply")
+    weida_testkit::within(
+        "the reply coming back through the device",
+        Duration::from_secs(5),
+        client.recv(),
+    )
+    .await
+    .expect("a reply")
 }
 
 /// Claim: a device between sockets that cannot pair is refused, because it
@@ -68,24 +74,26 @@ pub(crate) const LIMIT: u64 = 1024;
 pub(crate) const REPLY_BYTES: usize = 256 * 1024;
 /// The request the backend answers late, and the one the honest client sends.
 pub(crate) const HONEST: &[u8] = b"honest";
-/// How long the request flood keeps writing.
-pub(crate) const FLOOD: Duration = Duration::from_secs(3);
 
-/// Bounds one await on a socket or a hand-driven peer, so that a stalled
-/// operation fails the test instead of hanging it.
+/// Waits for one await on a socket or a hand-driven peer, reporting an
+/// operation that takes longer than ten seconds instead of failing the test
+/// for it.
 pub(crate) async fn bounded<T>(operation: impl Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10), operation)
-        .await
-        .expect("the operation finished within 10 s")
+    weida_testkit::within(
+        "an operation on a socket or a peer",
+        Duration::from_secs(10),
+        operation,
+    )
+    .await
 }
 
-/// Polls `condition` every 5 ms until it holds, for at most 10 s.
-pub(crate) async fn eventually(mut condition: impl FnMut() -> bool) {
-    bounded(async {
-        while !condition() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+/// Polls `condition` every 5 ms until it holds, reporting past 10 s.
+pub(crate) async fn eventually(condition: impl FnMut() -> bool) {
+    weida_testkit::until(
+        "a condition on the sockets",
+        Duration::from_secs(10),
+        condition,
+    )
     .await;
 }
 
@@ -155,20 +163,17 @@ pub(crate) fn spawn_device(
     tokio::spawn(async move { raw::device(&front, &back).await })
 }
 
-/// Writes requests over a hand-driven REQ connection for `for_how_long` and
-/// never reads a reply. The deadline ends the writes even while the device has
-/// stopped reading them, which is exactly when they would otherwise block.
-pub(crate) async fn flood(addr: SocketAddr, for_how_long: Duration) {
+/// Writes requests over a hand-driven REQ connection until the task is
+/// aborted and never reads a reply. The test ends the flood, so the traffic
+/// lasts exactly as long as the claim needs it, however slow the machine is.
+pub(crate) async fn flood(addr: SocketAddr) {
     let (_replies_never_read, mut requests) = peer(addr, EndpointType::Req).await.into_split();
-    let writing = async {
-        for id in 1u32.. {
-            let body = Backtrace::direct(id).encode_message(b"x");
-            if requests.write_all(&message::encode(&body)).await.is_err() {
-                break;
-            }
+    for id in 1u32.. {
+        let body = Backtrace::direct(id).encode_message(b"x");
+        if requests.write_all(&message::encode(&body)).await.is_err() {
+            break;
         }
-    };
-    let _ = tokio::time::timeout(for_how_long, writing).await;
+    }
 }
 
 /// One device with a client and a backend connected on both sides and one
@@ -199,9 +204,12 @@ pub(crate) async fn device_ends_after_closing(ctx: &Context, close_front: bool) 
     } else {
         back.close();
     }
-    tokio::time::timeout(Duration::from_secs(2), forwarding)
-        .await
-        .expect("the device ends within 2 s of one of its sockets closing")
-        .expect("the device task did not panic")
-        .expect("the device ends without an error");
+    weida_testkit::within(
+        "the device ending after one of its sockets closed",
+        Duration::from_secs(2),
+        forwarding,
+    )
+    .await
+    .expect("the device task did not panic")
+    .expect("the device ends without an error");
 }

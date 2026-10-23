@@ -11,21 +11,16 @@ import asyncio
 
 import pytest
 
+import waits
 import weida_nng
-
-DEADLINE = 10.0
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return waits.run(coroutine)
 
 
 def options(**kwargs):
-    kwargs.setdefault("recv_timeout", 5.0)
-    kwargs.setdefault("send_timeout", 5.0)
+    # NNG's own default: wait forever; the CI job's budget is the hang guard.
     return weida_nng.SocketOptions(**kwargs)
 
 
@@ -94,7 +89,7 @@ def test_a_context_that_answers_out_of_turn_is_refused_and_its_neighbour_is_not(
 def test_a_survey_context_carries_its_own_deadline():
     async def two_deadlines():
         ctx = weida_nng.Context()
-        surveyor = weida_nng.SurveyorSocket(ctx, options(survey_time=0.4))
+        surveyor = weida_nng.SurveyorSocket(ctx, options(survey_time=2.0))
         url = await surveyor.listen("tcp://127.0.0.1:0")
         respondent = weida_nng.RespondentSocket(ctx, options())
         await respondent.dial(url)

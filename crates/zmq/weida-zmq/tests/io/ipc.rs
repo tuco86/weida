@@ -2,7 +2,6 @@
 
 #![cfg(unix)]
 
-use std::time::Duration;
 use weida_zmq::{PubSocket, PullSocket, PushSocket, RepSocket, ReqSocket, SubSocket};
 
 use crate::ipc::*;
@@ -113,10 +112,13 @@ async fn a_second_bind_takes_the_endpoint_over() {
         .await
         .expect("send");
 
-    let received = tokio::time::timeout(Duration::from_secs(10), thief.recv())
-        .await
-        .expect("the second binder receives in time")
-        .expect("a message");
+    let received = weida_testkit::within(
+        "the second binder to receive",
+        weida_testkit::EXPECTED,
+        thief.recv(),
+    )
+    .await
+    .expect("a message");
     assert_eq!(text(&received), b"for whoever holds the name");
     assert!(
         incumbent.try_recv().is_err(),

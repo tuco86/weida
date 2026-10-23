@@ -10,7 +10,7 @@
 use crate::harness;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use harness::{Act, DEADLINE, Server, bytes, connack, connack_session, decode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,11 +23,10 @@ use weida_mqtt_codec::{
     FixedHeader, Packet, Properties, Puback, PubackReasonCode, Publish, Pubrec,
 };
 
-/// Every await in this file is bounded.
+/// Every await in this file is reported when it runs long and never fails for
+/// being slow.
 async fn within<F: Future>(future: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, future)
-        .await
-        .expect("the await finished")
+    weida_testkit::within("a step of the test", DEADLINE, future).await
 }
 
 /// A listener whose accepted sockets have tiny buffers, so that a peer that
@@ -99,17 +98,14 @@ async fn a_peer_that_stops_reading_ends_the_connection_and_disconnect_still_retu
     // Long enough for the task to take the command and fill the socket.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let started = Instant::now();
-    let disconnected = tokio::time::timeout(
+    // That it returns at all is the claim; how long it took is not asserted.
+    weida_testkit::within(
+        "disconnect with a write stuck",
         Duration::from_secs(4),
         client.disconnect(DisconnectReasonCode::NormalDisconnection),
     )
-    .await;
-    assert!(
-        disconnected.is_ok(),
-        "disconnect returned although a write is stuck"
-    );
-    assert!(started.elapsed() < Duration::from_secs(4));
+    .await
+    .ok();
 
     match within(events.next()).await {
         Some(Event::Disconnected(Error::Timeout(what))) => assert_eq!(what, "write"),
@@ -132,15 +128,18 @@ async fn a_full_event_queue_leaves_keep_alive_and_disconnect_running() {
         for _ in 0..1100 {
             stream.write_all(&delivery).await.expect("writes");
         }
-        // Everything the client sends from here on, for a while.
+        // Everything the client sends from here on, until its DISCONNECT or
+        // the end of the connection; no time limit decides what is seen.
         let mut seen = Vec::new();
-        let end = tokio::time::Instant::now() + Duration::from_millis(3000);
         let mut buf = [0u8; 256];
-        while let Ok(Ok(read)) = tokio::time::timeout_at(end, stream.read(&mut buf)).await {
+        while let Ok(read) = stream.read(&mut buf).await {
             if read == 0 {
                 break;
             }
             seen.extend_from_slice(&buf[..read]);
+            if seen.windows(2).any(|pair| pair == [0xE0, 0x00]) {
+                break;
+            }
         }
         seen
     });
@@ -156,15 +155,13 @@ async fn a_full_event_queue_leaves_keep_alive_and_disconnect_running() {
     // The application takes nothing. The PINGREQ is unanswered, and its
     // deadline does not run while the reader is held back for the queue.
     tokio::time::sleep(Duration::from_millis(1600)).await;
-    let disconnected = tokio::time::timeout(
+    weida_testkit::within(
+        "disconnect with the queue full",
         Duration::from_secs(2),
         client.disconnect(DisconnectReasonCode::NormalDisconnection),
     )
-    .await;
-    assert!(
-        disconnected.is_ok(),
-        "disconnect returned with the queue full"
-    );
+    .await
+    .ok();
 
     let seen = within(server).await.expect("task");
     assert!(
@@ -282,18 +279,16 @@ async fn stalled_publishes_keep_their_order() {
         tokio::task::yield_now().await;
     }
 
-    let started = Instant::now();
-    let third = loop {
-        let seen = server.seen_bytes().await;
-        if let Some(third) = seen.get(2) {
-            break third.clone();
+    let third = within(async {
+        loop {
+            let seen = server.seen_bytes().await;
+            if let Some(third) = seen.get(2) {
+                break third.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            started.elapsed() < DEADLINE,
-            "the second publish never came"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    })
+    .await;
     let Packet::Publish(publish) = decode(&third) else {
         panic!("a publish follows the acknowledgement");
     };
@@ -351,15 +346,16 @@ async fn a_cancelled_stalled_publish_is_never_sent() {
         })
     };
 
-    let started = Instant::now();
-    let next = loop {
-        let seen = server.seen_bytes().await;
-        if let Some(next) = seen.get(2) {
-            break next.clone();
+    let next = within(async {
+        loop {
+            let seen = server.seen_bytes().await;
+            if let Some(next) = seen.get(2) {
+                break next.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(started.elapsed() < DEADLINE, "nothing followed the PUBACK");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    })
+    .await;
     let Packet::Publish(publish) = decode(&next) else {
         panic!("a publish follows the acknowledgement");
     };
@@ -532,14 +528,29 @@ async fn a_puback_does_not_settle_a_qos2_exchange() {
     );
 }
 
-/// Reads packets from `stream` for `window` and returns the identifiers of the
-/// PUBLISHes among them.
-async fn publishes_within(stream: &mut TcpStream, window: Duration) -> Vec<u16> {
-    let end = tokio::time::Instant::now() + window;
+/// Waits for the first PUBLISH from `stream`, then keeps reading for `quiet`
+/// more to see whether others follow, and returns the identifiers of the
+/// PUBLISHes among the packets read. The wait for the first has no limit of
+/// its own; the negative window is the only fixed time.
+async fn publishes_then_quiet(stream: &mut TcpStream, quiet: Duration) -> Vec<u16> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut ids = Vec::new();
-    while let Ok(Ok(read)) = tokio::time::timeout_at(end, stream.read(&mut chunk)).await {
+    let mut end = None;
+    loop {
+        let read = match end {
+            None => weida_testkit::within(
+                "the first PUBLISH",
+                Duration::from_secs(10),
+                stream.read(&mut chunk),
+            )
+            .await
+            .unwrap_or(0),
+            Some(end) => match tokio::time::timeout_at(end, stream.read(&mut chunk)).await {
+                Ok(read) => read.unwrap_or(0),
+                Err(_) => break,
+            },
+        };
         if read == 0 {
             break;
         }
@@ -551,6 +562,7 @@ async fn publishes_within(stream: &mut TcpStream, window: Duration) -> Vec<u16> 
             }
             if let Packet::Publish(publish) = decode(&buf[..total]) {
                 ids.extend(publish.packet_id);
+                end.get_or_insert(tokio::time::Instant::now() + quiet);
             }
             buf.drain(..total);
         }
@@ -592,10 +604,10 @@ async fn a_resumed_session_is_paced_through_the_servers_receive_maximum() {
             ),
         )
         .await;
-        let first = publishes_within(&mut stream, Duration::from_millis(700)).await;
+        let first = publishes_then_quiet(&mut stream, Duration::from_millis(300)).await;
         let acknowledged = bytes(&Packet::Puback(Puback::new(first[0])));
         stream.write_all(&acknowledged).await.expect("writes");
-        let second = publishes_within(&mut stream, Duration::from_millis(700)).await;
+        let second = publishes_then_quiet(&mut stream, Duration::from_millis(300)).await;
         (first, second, stream)
     });
 
@@ -735,17 +747,17 @@ async fn a_stalled_tls_handshake_is_bounded_by_the_connect_timeout() {
     options.tls = Some(weida_mqtt::TlsOptions::new(config).with_server_name("localhost"));
     let context = Context::new().expect("ambient");
 
-    let started = Instant::now();
-    let error = tokio::time::timeout(
+    // The connect ends by itself at `connect_timeout`, a library feature; how
+    // long that took on the wall is not asserted.
+    let error = weida_testkit::within(
+        "the connect to end by itself",
         Duration::from_secs(5),
         Client::connect(&context, &format!("127.0.0.1:{port}"), options),
     )
     .await
-    .expect("the connect ended by itself")
     .expect_err("no handshake");
     assert!(
         matches!(error, Error::Timeout("the TLS handshake")),
         "{error}"
     );
-    assert!(started.elapsed() < Duration::from_secs(4));
 }

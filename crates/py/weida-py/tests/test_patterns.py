@@ -12,15 +12,16 @@ import pytest
 
 import weida
 
-DEADLINE = 15.0
+# A deadline the binding takes as an argument (`write_within`) or a silence a
+# case holds on purpose is not a test limit: it is far past anything a slow
+# machine takes, so only a hang reaches it. Nothing here fails for being slow;
+# the CI job's own budget is the hang guard.
+PATIENCE = 3600.0
 CAP = 1 << 20
 
 
 def run(coroutine):
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    return asyncio.run(coroutine)
 
 
 async def served(path):
@@ -47,9 +48,7 @@ async def await_filters(publisher, count):
     counter is exact; publishing a probe would leave copies in the
     subscribers' queues and a sleep would be a guess.
     """
-    deadline = asyncio.get_running_loop().time() + DEADLINE
     while publisher.filter_count() != count:
-        assert asyncio.get_running_loop().time() < deadline, "no subscription arrived"
         await asyncio.sleep(0.005)
 
 
@@ -123,7 +122,7 @@ def test_a_streamed_publish_carries_what_publish_cannot():
         assert fan.topic == "px.eur"
         assert await fan.subscribers() == 2
         for _ in range(chunks):
-            left = await fan.write_within(chunk, DEADLINE)
+            left = await fan.write_within(chunk, PATIENCE)
             assert left == 2, "a reading subscriber must not lose the transfer"
         assert await fan.finish() == 2
 
@@ -309,7 +308,7 @@ def test_a_survey_collects_what_answers_and_counts_the_silence():
             # request is held, because dropping it would report NO_REPLY and
             # that would be a failure rather than silence.
             question = await quiet.accept(CAP)
-            await asyncio.sleep(DEADLINE)
+            await asyncio.sleep(PATIENCE)
             return question
 
         answered = asyncio.create_task(answer())
@@ -374,9 +373,7 @@ def test_a_radio_segment_and_datagram_reach_a_dish():
         dish = client.dish(weida.Trust.by_address())
         await dish.join("v", 0.5)
         await dish.connect(binding.url("/r"))
-        deadline = asyncio.get_running_loop().time() + DEADLINE
         while radio.dish_count() != 1:
-            assert asyncio.get_running_loop().time() < deadline, "no join arrived"
             await asyncio.sleep(0.005)
 
         segment = radio.segment("v")
@@ -405,9 +402,7 @@ def test_a_layered_segment_reaches_a_dish_layer_by_layer():
         dish = client.dish(weida.Trust.by_address())
         await dish.join("v", max_layer=1)
         await dish.connect(binding.url("/r"))
-        deadline = asyncio.get_running_loop().time() + DEADLINE
         while radio.dish_count() != 1:
-            assert asyncio.get_running_loop().time() < deadline, "no join arrived"
             await asyncio.sleep(0.005)
 
         seg = radio.segment("v", max_age=5.0, priority=3)
@@ -417,7 +412,7 @@ def test_a_layered_segment_reaches_a_dish_layer_by_layer():
         assert seg.finish() == 1
         heard = set()
         for _ in range(2):
-            kind, payload, meta = await asyncio.wait_for(dish.recv(CAP), DEADLINE)
+            kind, payload, meta = await dish.recv(CAP)
             assert kind == "segment"
             assert meta.segment == 0
             heard.add((meta.layer, payload))

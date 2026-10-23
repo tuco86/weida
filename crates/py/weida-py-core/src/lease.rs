@@ -590,9 +590,9 @@ mod tests {
             drop(held);
             let mut retirements = 0;
             for _ in 0..3 {
-                let (retires, handed) = finished
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("a parked call was never answered");
+                // No limit: the CI job's own budget is the hang guard, and
+                // this crate has no testkit to report a slow wait with.
+                let (retires, handed) = finished.recv().expect("a parked call was never answered");
                 if retires {
                     assert!(handed, "the one retirement got the handle");
                     retirements += 1;

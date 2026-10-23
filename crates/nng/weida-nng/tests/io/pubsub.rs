@@ -6,9 +6,11 @@ use weida_nng::{Context, ContextConfig, Error, PubSocket, SocketOptions, SubSock
 
 fn options() -> SocketOptions {
     SocketOptions {
-        recv_timeout: Some(Duration::from_secs(5)),
-        send_timeout: Some(Duration::from_secs(5)),
-        handshake_timeout: Duration::from_secs(2),
+        // No socket timeout: a slow run is reported by the test's own waits,
+        // not failed by an option. The handshake bound is an hour.
+        recv_timeout: None,
+        send_timeout: None,
+        handshake_timeout: Duration::from_secs(3600),
         reconnect_min: Duration::from_millis(10),
         ..SocketOptions::default()
     }
@@ -60,12 +62,12 @@ async fn a_subscriber_is_sent_what_it_did_not_ask_for_and_throws_it_away() {
     let admitted = picky.recv().await.expect("the subscribed one");
     assert_eq!(admitted.body(), b"weather.rain");
 
-    for _ in 0..200 {
-        if picky.discarded() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    weida_testkit::until(
+        "both unsubscribed publications being thrown away",
+        Duration::from_secs(2),
+        || picky.discarded() >= 2,
+    )
+    .await;
     assert_eq!(
         picky.discarded(),
         2,

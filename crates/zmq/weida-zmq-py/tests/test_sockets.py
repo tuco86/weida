@@ -7,8 +7,9 @@ context constructors, the endpoint surface of all eleven socket types, and
 failures arriving as exception classes that carry libzmq's errno name rather
 than as one `RuntimeError`.
 
-Every test runs its coroutine under a wall-clock bound, so a binding that
-deadlocks fails the suite instead of hanging it (docs/LOOP.md 2).
+Every test runs its coroutine under a wait that reports when it takes long
+and goes on waiting (docs/LOOP.md 2): a binding that deadlocks is ended by
+the CI job's budget, and a slow machine is not a failure.
 """
 
 import asyncio
@@ -17,20 +18,16 @@ import tempfile
 
 import pytest
 
+import waits
 import weida_zmq
 
-# Long enough for a TCP handshake on a loaded machine, short enough that a
-# deadlock is a failure rather than a coffee break.
+# How long a test is expected to take; past it the wait reports and goes on.
 DEADLINE = 10.0
 
 
 def run(coroutine):
-    """Runs one coroutine to completion, under a deadline."""
-
-    async def bounded():
-        return await asyncio.wait_for(coroutine, DEADLINE)
-
-    return asyncio.run(bounded())
+    """Runs one coroutine to completion, reporting past the expected time."""
+    return waits.run(coroutine, DEADLINE)
 
 
 ALL_SOCKET_TYPES = [

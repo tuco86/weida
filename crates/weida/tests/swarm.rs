@@ -20,9 +20,7 @@ use weida::{
 const DEADLINE: Duration = Duration::from_secs(10);
 
 async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a swarm step", DEADLINE, f).await
 }
 
 /// A HAVE ask built from the wire table of 0040 §4.2 by hand, not by the

@@ -770,10 +770,10 @@ mod tests {
             // handshake.
             let mut seen = Vec::new();
             while seen.len() < 3 {
-                let event = tokio::time::timeout(Duration::from_secs(10), typed.recv())
-                    .await
-                    .expect("an event")
-                    .expect("an event");
+                let event =
+                    weida_testkit::within("an event", weida_testkit::EXPECTED, typed.recv())
+                        .await
+                        .expect("an event");
                 seen.push(event);
             }
             assert_eq!(
@@ -785,10 +785,13 @@ mod tests {
 
             // The same three, off the PAIR socket, decoded from the octets.
             for expected in &seen {
-                let message = tokio::time::timeout(Duration::from_secs(10), reader.recv())
-                    .await
-                    .expect("a rendered event")
-                    .expect("a message");
+                let message = weida_testkit::within(
+                    "a rendered event",
+                    weida_testkit::EXPECTED,
+                    reader.recv(),
+                )
+                .await
+                .expect("a message");
                 assert_eq!(
                     &MonitorEvent::decode(&message).expect("decode"),
                     expected,
@@ -800,8 +803,8 @@ mod tests {
             // reader sees rather than a stream that simply stops.
             puller.close();
             let mut stopped = false;
-            while let Ok(Ok(event)) =
-                tokio::time::timeout(Duration::from_secs(10), typed.recv()).await
+            while let Ok(event) =
+                weida_testkit::within("the stop event", weida_testkit::EXPECTED, typed.recv()).await
             {
                 if event.id() == EVENT_MONITOR_STOPPED {
                     stopped = true;

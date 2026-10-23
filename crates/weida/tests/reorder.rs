@@ -20,9 +20,7 @@ use weida_protocol::{DataHeader, FrameKind, Hello, encode_frame};
 pub(crate) const DEADLINE: Duration = Duration::from_secs(15);
 
 pub(crate) async fn within<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(DEADLINE, f)
-        .await
-        .expect("operation timed out")
+    weida_testkit::within("a reorder step", DEADLINE, f).await
 }
 
 pub(crate) fn reassemble() -> GuaranteeSet {

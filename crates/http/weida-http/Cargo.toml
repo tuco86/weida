@@ -40,6 +40,8 @@ rustls = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Waits that report instead of killing (B-389).
+weida-testkit.workspace = true
 # A certificate for the TLS tests. The trust anchors are the caller's
 # everywhere else; here the test is the caller.
 rcgen.workspace = true

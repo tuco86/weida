@@ -892,11 +892,11 @@ mod tests {
             );
 
             pipe.outgoing().try_recv().expect("queued");
-            let delivered = tokio::time::timeout(Duration::from_secs(10), sending)
-                .await
-                .expect("the send ended once there was room for it")
-                .expect("the task")
-                .expect("the send");
+            let delivered =
+                weida_testkit::within("the send to end", weida_testkit::EXPECTED, sending)
+                    .await
+                    .expect("the task")
+                    .expect("the send");
             assert_eq!(delivered.peer, Some(peer));
             assert_eq!(
                 pipe.outgoing().try_recv().expect("the large one arrived"),
