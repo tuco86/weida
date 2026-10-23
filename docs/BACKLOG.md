@@ -76,6 +76,10 @@ acceptance: `SimNet::endpoint(addr, server)` (feature `test-util`) gives a test 
 kind: code | size: 90 | status: done c4690c4 | needs: [B-376]
 acceptance: under `Network::sim(&net)` a `weida+unix://` binding and dial run over in-memory connections the `SimNet` keeps by path (no socket file, a fixed simulated principal, `AddrInUse` while a live listener holds the path, `ConnectionLost(PeerClosed)` where none does), through the production `UnixLocal`, grouping, chunk framing and listener code; `docs/decisions/0042` and ARCHITECTURE say so; the tests of `io::transports` and `io::local_hostile` whose claim is not the kernel's (socket files, `SO_PEERCRED`, the OS backlog) run in the unit tier on a paused clock, stress-run; the kernel ones stay in io.
 
+### B-378 — The last io tests a `SimNet` fault could replace
+kind: code | size: 60 | status: ready | needs: [B-377]
+acceptance: `io::drain` (4: a peer frozen on its own thread so nothing is acknowledged for 2 s) and `io::accept_limits` (5: a UDP relay that rewrites source addresses to trigger address validation and the handshake cap) run in the unit tier on a paused clock, through a `SimNet` fault that holds a port's datagrams without dropping them (a frozen peer) and one that presents a socket under a second source address (the relay), each named in 0042; or, for any test the sim cannot express, a line in its module doc saying why it stays in io. Found in the review pass after B-377.
+
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
