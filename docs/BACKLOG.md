@@ -133,7 +133,7 @@ kind: measure | size: 90 | status: done d2607ca | needs: []
 acceptance: unpublished crate `crates/perf` (`weida-perf serve|client`) with a fixed perf identity, the weida endpoints `/sink`, `/source`, `/blob`, `/swarm` (four bindings), `/up` relayed to the radio `/live` as griasdi's screen share does, a raw quinn and a plain TCP baseline; the client prints one markdown table of push, pull, SWARM and video cases; the job `.zeughaus-ci/perf-windows-amd64.ps1` runs the client on wohnzimmer; unit tests for the frame parser and the percentile.
 
 ### B-391 — LAN and loopback baselines between wohnzimmer and tuco-pc
-kind: measure | size: 45 | status: in_progress 2026-10-23T06:51Z | needs: [B-390]
+kind: measure | size: 45 | status: done 2beb952 | needs: [B-390]
 acceptance: the `weida-perf` table on tuco-pc loopback and on the 1 GbE LAN from wohnzimmer recorded in `docs/IMPLEMENTATION.md` §4 "LAN and loopback throughput" with commands, CPUs and NIC speeds, and the targets of the throughput plan written there; one line in NIGHTLOG `## Numbers`.
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
