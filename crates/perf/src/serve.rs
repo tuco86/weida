@@ -23,8 +23,11 @@ pub async fn run(
     bind: IpAddr,
     ports: &Ports,
     lifetime: Option<std::time::Duration>,
+    congestion: weida::Congestion,
 ) -> Result<(), Box<dyn Error>> {
-    let runtime = Runtime::new(RuntimeConfig::default())?;
+    let mut config = RuntimeConfig::default();
+    config.limits.congestion = congestion;
+    let runtime = Runtime::new(config)?;
     let main = runtime.listener();
     let _main_binding = main
         .bind_quic(SocketAddr::new(bind, ports.main), identity())
@@ -107,7 +110,7 @@ pub async fn run(
         extra.push((listener, binding));
     }
 
-    crate::raw::serve_quinn(SocketAddr::new(bind, ports.quinn))
+    crate::raw::serve_quinn(SocketAddr::new(bind, ports.quinn), congestion)
         .await
         .map_err(|e| e.to_string())?;
     crate::raw::serve_tcp(SocketAddr::new(bind, ports.tcp))

@@ -145,7 +145,7 @@ pub fn cpu_times() -> Option<(f64, f64)> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: weida-perf serve [--bind IP] [--ports SPEC] [--for SECS]\n       \
+        "usage: weida-perf serve [--bind IP] [--ports SPEC] [--for SECS] [--congestion cubic|newreno|bbr]\n       \
          weida-perf client --server HOST [--ports SPEC] [--only a,b] [--mib N] \
          [--swarm-depth P/I] [--video-mbit 8,25,50] [--video-secs S]\n\
          SPEC: main=P,swarm=P+P+P,quinn=P,tcp=P (any subset; swarm= for none)"
@@ -186,10 +186,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut bind: IpAddr = [0, 0, 0, 0].into();
             let mut ports = Ports::default();
             let mut lifetime = None;
+            let mut congestion = weida::Congestion::default();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--bind" => bind = parsed(&value(&mut args, "--bind"), "--bind"),
                     "--ports" => ports = Ports::parse(&value(&mut args, "--ports")),
+                    "--congestion" => {
+                        congestion = match value(&mut args, "--congestion").as_str() {
+                            "cubic" => weida::Congestion::Cubic,
+                            "newreno" => weida::Congestion::NewReno,
+                            "bbr" => weida::Congestion::Bbr,
+                            _ => usage(),
+                        };
+                    }
                     "--for" => {
                         lifetime = Some(std::time::Duration::from_secs(parsed(
                             &value(&mut args, "--for"),
@@ -199,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => usage(),
                 }
             }
-            serve::run(bind, &ports, lifetime).await
+            serve::run(bind, &ports, lifetime, congestion).await
         }
         Some("client") => {
             let mut options = client::Options::default();

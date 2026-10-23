@@ -41,18 +41,23 @@ fn certificates() -> Res<Vec<CertificateDer<'static>>> {
 
 /// quinn's transport settings as weida's `transport_config` sets them for
 /// the default `Limits`: windows and the congestion controller.
-fn transport(dialling: bool) -> Res<quinn::TransportConfig> {
+fn transport(dialling: bool, congestion: weida::Congestion) -> Res<quinn::TransportConfig> {
     let limits = Limits::default();
     let mut tc = quinn::TransportConfig::default();
     tc.stream_receive_window(VarInt::from_u64(limits.stream_receive_window)?);
     tc.receive_window(VarInt::from_u64(limits.connection_receive_window)?);
     tc.keep_alive_interval(dialling.then_some(limits.keep_alive));
-    tc.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+    let controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> = match congestion {
+        weida::Congestion::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+        weida::Congestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        _ => Arc::new(quinn::congestion::CubicConfig::default()),
+    };
+    tc.congestion_controller_factory(controller);
     Ok(tc)
 }
 
 /// Serves raw quinn on `addr` until the process ends.
-pub async fn serve_quinn(addr: SocketAddr) -> Res<()> {
+pub async fn serve_quinn(addr: SocketAddr, congestion: weida::Congestion) -> Res<()> {
     let key = PrivateKeyDer::from_pem_slice(identity_pem())?;
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -61,7 +66,7 @@ pub async fn serve_quinn(addr: SocketAddr) -> Res<()> {
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(Arc::new(transport(false)?));
+    config.transport_config(Arc::new(transport(false, congestion)?));
     let endpoint = quinn::Endpoint::server(config, addr)?;
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
@@ -179,7 +184,8 @@ pub async fn quinn_transfer(server: SocketAddr, up: bool, len: u64) -> Res<Measu
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport(true)?));
+    // The sender's controller decides a download; the client's stays the default.
+    config.transport_config(Arc::new(transport(true, weida::Congestion::default())?));
     let local: SocketAddr = if server.is_ipv4() {
         "0.0.0.0:0".parse()?
     } else {

@@ -5,6 +5,7 @@
 # timeout_minutes = 60
 # [env]
 # WEIDA_PERF_SECONDS = "1800"
+# WEIDA_PERF_CONGESTION = "cubic"
 # ///
 # The server side of the weida-perf internet chain on sadala (crates/perf):
 # two SWARM seeders and the TCP and raw quinn baselines on the ports the
@@ -19,4 +20,5 @@ cargo_env
 step cargo build --locked --release -p weida-perf
 "$CARGO_TARGET_DIR/release/weida-perf" serve \
     --ports main=2334,swarm=2335,quinn=2336,tcp=2336 \
+    --congestion "$WEIDA_PERF_CONGESTION" \
     --for "$WEIDA_PERF_SECONDS"
