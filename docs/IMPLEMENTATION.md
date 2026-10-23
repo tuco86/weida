@@ -1217,7 +1217,8 @@ nothing about a fetch under loss; griasdi's measurement against its server is th
 ### 4.19 LAN and loopback throughput (B-391)
 
 weida's streaming paths against plain TCP and raw quinn on the same path, with the harness
-`weida-perf` (`crates/perf`, B-390). Hosts: the server tuco-pc (AMD Ryzen 7 5800X, Linux,
+`weida-perf` (`crates/perf`, B-390; removed after these runs, its last state is commit
+`12531dc`, with the job scripts named below). Hosts: the server tuco-pc (AMD Ryzen 7 5800X, Linux,
 `enp42s0` 2.5 GbE, 10.0.0.8), the LAN client wohnzimmer (AMD Ryzen 5 2600, Windows 10,
 on-board Realtek GbE at 1 Gbit/s, which limits the path; cable and switch are 2.5 GbE). Release
 builds, 1 GiB per throughput case, 20 s per video row at 60 fps with one segment per GOP of 60

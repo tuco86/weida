@@ -45,9 +45,6 @@ members = [
     # Test support for every crate above, never published: waits that report
     # instead of killing (`crates/testkit/src/lib.rs`).
     "crates/testkit",
-    # Throughput and latency harness between two hosts or over loopback;
-    # never published (B-390).
-    "crates/perf",
 ]
 
 [workspace.package]
