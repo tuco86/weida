@@ -31,7 +31,7 @@ Three verdicts and no fourth:
 "Partial" is not a verdict. Where something is present in part, the row says which part is
 missing (0013 §4.7 clause 6).
 
-**Versions every measured claim was measured against.** `fe2o3-amqp` **0.17.0**, the pure-Rust
+**Versions every measured claim was measured against.** `fe2o3-amqp` **0.18.4**, the pure-Rust
 peer, through its `acceptor` module over loopback TCP, by
 `crates/amqp/weida-amqp/tests/interop_fe2o3.rs` — eight tests, nothing `#[ignore]`d. **RabbitMQ
 4.x is not run**: no `rabbitmq-server` is available to the tests, and neither is `docker` or
@@ -104,7 +104,7 @@ arrived.
 | `snd-settle-mode=settled` | present — settled on send, recorded nowhere, and `Link::settled` refuses with a message saying so, because an application that could wait for that answer would wait forever |
 | `snd-settle-mode=mixed` | present — the per-delivery choice, and this client's choice for a `mixed` link is *unsettled*, because a settled transfer is one the receiver cannot report anything about |
 | `rcv-settle-mode=first` | present — the receiver settles as it reports: one frame, done |
-| `rcv-settle-mode=second` | present — the three-frame dance, driven by the **driver** rather than the application: when the receiver publishes an outcome without settling, the sender owes a settling `disposition` and nothing is left to decide. Measured against `fe2o3-amqp` 0.17.0, which **honours** it with `SupportedReceiverSettleModes::Both` — so the sheet's §13 "implementations refuse it" is not universal. RabbitMQ: not run; its documentation lists exactly-once unsupported (sheet source [16]), which is a claim and not a measurement |
+| `rcv-settle-mode=second` | present — the three-frame dance, driven by the **driver** rather than the application: when the receiver publishes an outcome without settling, the sender owes a settling `disposition` and nothing is left to decide. Measured against `fe2o3-amqp` 0.18.4, which **honours** it with `SupportedReceiverSettleModes::Both` — so the sheet's §13 "implementations refuse it" is not universal. RabbitMQ: not run; its documentation lists exactly-once unsupported (sheet source [16]), which is a claim and not a measurement |
 
 | Delivery state | Descriptor | Verdict |
 | --- | --- | --- |
@@ -171,10 +171,12 @@ second `attach` of a name carries **no `unsettled` map at all**, which is exactl
 distinguishes a re-attach from a resuming attach (Part 2 §2.6.13), so a peer is never told that
 state is being recovered when it is not. The delivery-**tag** is kept in the unsettled map
 beside the delivery-id precisely because the tag is what a resumption would key on, so the data
-a later implementation needs is already there. Measured: `fe2o3-amqp` 0.17.0 accepts a
-re-attach of a name it has let go as a new link, and **refuses** a second attach of a name it
-still holds rather than implementing Part 2 §2.6.1's steal — so a client cannot rely on the
-steal against that peer.
+a later implementation needs is already there. Measured: `fe2o3-amqp` 0.18.4 accepts a
+re-attach of a name it has let go as a new link. A second attach of a name it still holds is
+where the peer's version shows: 0.17.0 **refused** it rather than implementing Part 2 §2.6.1's
+steal; 0.18.4 takes this client's steal — the `detach` with `amqp:link:stolen` that precedes the
+second `attach` frees the name — answers the new attach and may reuse the freed handle. The
+client reports whichever answer the peer gives.
 
 ### 7.3 The three coexisting filter families
 
@@ -227,11 +229,11 @@ library uses **the protocol's**, and where it does not, the bound is ours and sa
 ## 9. Interop
 
 `crates/amqp/weida-amqp/tests/interop_fe2o3.rs` — **8 tests, nothing ignored**, against
-`fe2o3-amqp` 0.17.0's `acceptor` over loopback. Both roles: our sender read by its receiver,
+`fe2o3-amqp` 0.18.4's `acceptor` over loopback. Both roles: our sender read by its receiver,
 our receiver reading its sender, and an 8 KiB message through a 1 KiB frame reassembled whole
 at the peer. Four probes rather than assumptions, each recorded above: `rcv-settle-mode=second`
-(§5), terminus expiry policy (echoed, not substituted), duplicate link name (refused, not
-stolen — §7.2), and transactions (§7.1). `cargo tree -p weida-amqp --no-dev-dependencies`
+(§5), terminus expiry policy (echoed, not substituted), duplicate link name (the steal taken by
+0.18.4, refused by 0.17.0 — §7.2), and transactions (§7.1). `cargo tree -p weida-amqp --no-dev-dependencies`
 reaches neither `weida` nor `weida-protocol`, and the peer brings no second TLS stack.
 
 `crates/amqp/weida-amqp/tests/interop_rabbitmq.rs` — **4 tests, all `#[ignore]`d**, because no
@@ -254,6 +256,11 @@ Each is a rule of the specification that a reader of this library would be likel
    of **cleanly** detached links are discarded; a handle detached **with an error** gets
    `amqp:session:errant-link`, which Part 2 §2.6.5 names and which is distinct from
    `amqp:session:unattached-handle`.
+   A handle this end detaches **with an error** is the exception's exception until the peer
+   answers: the peer's `flow` or `transfer` for it may already be on the wire when the `detach`
+   leaves, so frames on it are discarded until the peer's answering `detach` arrives, and only
+   input after that answer is errant. Found against `fe2o3-amqp` 0.18.4, whose `flow` crossed
+   the client's steal and ended the session.
 3. **A client that re-attaches a name does not steal its own just-detached link.** Sending
    `amqp:link:stolen` for a link the application had closed itself would poison the handle for
    the rest of the session, so links already detaching are not candidates for the steal.
@@ -272,7 +279,7 @@ it.
 | 1. Every performative of Part 2 §2.7 implemented or absent with a reason, with the specification's own field layouts asserted rather than described | **met** — §2: all nine present, with `tests/golden_performatives.rs` asserting the figures |
 | 2. The transports the specification defines, with the rest named absent | **met** — §6: TCP and both routes to TLS present; UDP and SCTP are reserved with no mapping *in the specification*; the WebSocket binding is absent with what is missing named |
 | 3. The security layers: SASL with the mechanisms a client can speak, and TLS | **met** — §6: `ANONYMOUS`, `PLAIN`, `EXTERNAL` and no-SASL present; the rest absent with the reason, and never offered |
-| 4. Interop in both roles against a foreign implementation | **met** — §9: 8 tests against `fe2o3-amqp` 0.17.0, both roles, four probed facts. RabbitMQ 4.x is `#[ignore]`d and stated as not run |
+| 4. Interop in both roles against a foreign implementation | **met** — §9: 8 tests against `fe2o3-amqp` 0.18.4, both roles, four probed facts. RabbitMQ 4.x is `#[ignore]`d and stated as not run |
 | 5. The message model: every section, both credit schemes, the settle modes and the delivery states | **met** — §3, §4, §5 |
 | 6. A feature-parity table, row by row, where no row says "partial" without saying what is missing | **met** — this document |
 

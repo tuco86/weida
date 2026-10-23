@@ -25,7 +25,7 @@
   <rect x="140" y="56" width="128" height="52" rx="4" class="built"/><text x="148" y="74" class="lbl">ZeroMQ peers</text><text x="148" y="88" class="sub">libzmq 4.3.5 (zmq)</text><text x="148" y="100" class="sub">zmq.rs 0.6, both roles</text>
   <rect x="274" y="56" width="128" height="52" rx="4" class="built"/><text x="282" y="74" class="lbl">NNG C library</text><text x="282" y="88" class="sub">1.4.0-rc.0, nng crate</text><text x="282" y="100" class="sub">11 tests, both roles</text>
   <rect x="408" y="56" width="128" height="52" rx="4" class="built"/><text x="416" y="74" class="lbl">MQTT 5 brokers</text><text x="416" y="88" class="sub">rumqttd 0.20.0</text><text x="416" y="100" class="sub">rmqtt 0.23.1</text>
-  <rect x="542" y="56" width="128" height="52" rx="4" class="built"/><text x="550" y="74" class="lbl">AMQP 1.0 peer</text><text x="550" y="88" class="sub">fe2o3-amqp 0.17.0</text><text x="550" y="100" class="sub">both roles</text>
+  <rect x="542" y="56" width="128" height="52" rx="4" class="built"/><text x="550" y="74" class="lbl">AMQP 1.0 peer</text><text x="550" y="88" class="sub">fe2o3-amqp 0.18.4</text><text x="550" y="100" class="sub">both roles</text>
   <rect x="676" y="56" width="128" height="52" rx="4" class="missing"/><text x="684" y="74" class="lbl">nats-server</text><text x="684" y="88" class="sub">needed by its interop</text><text x="684" y="100" class="sub">interop written, not run</text>
   <rect x="810" y="56" width="128" height="52" rx="4" class="built"/><text x="818" y="74" class="lbl">Python programs</text><text x="818" y="88" class="sub">six bindings, each</text><text x="818" y="100" class="sub">asyncio + synchronous</text>
 

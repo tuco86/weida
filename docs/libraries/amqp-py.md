@@ -20,7 +20,7 @@ Where this binding's shape differs from Proton's the row says so and §9 states 
 Measured against: python-qpid-proton 0.40.0 (the `proton`, `proton.reactor`,
 `proton.handlers` and `proton.utils` modules of the Apache Qpid Proton source), CPython
 3.13.14, PyO3 0.29.2, `abi3` from CPython 3.9, Linux x86-64. The interop evidence of §8 is
-against `fe2o3-amqp` 0.17.0, run by
+against `fe2o3-amqp` 0.18.4, run by
 `crates/amqp/weida-amqp-py/tests/test_interop.py`.
 
 ## 2. Getting a connection
@@ -111,7 +111,7 @@ against `fe2o3-amqp` 0.17.0, run by
 
 ## 8. Interop evidence
 
-`crates/amqp/weida-amqp-py/tests/test_interop.py`, against **`fe2o3-amqp` 0.17.0** - the peer of
+`crates/amqp/weida-amqp-py/tests/test_interop.py`, against **`fe2o3-amqp` 0.18.4** - the peer of
 the Rust interop suite, driven as a child process by `crates/amqp/weida-amqp/examples/fe2o3_peer.rs`. It needs
 no broker and no C toolchain, so the tests are not skipped on a normal run; where the example
 has not been built they skip with the one command that builds it.
@@ -179,7 +179,7 @@ no C library at install time is the one claim Proton cannot make.
 | An async iterator of deliveries with sections and annotations | yes, `async for` plus seven section accessors | §4 |
 | Credit granted explicitly from Python | yes, and nothing arrives before it | §3 |
 | AMQP conditions as distinct exception classes | yes, 28 conditions plus 16 client failures, exhaustively matched | §6 |
-| Send-to-`accepted` and a receive settled, against the `fe2o3-amqp` peer | yes, `fe2o3-amqp` 0.17.0 in both roles | §8 |
+| Send-to-`accepted` and a receive settled, against the `fe2o3-amqp` peer | yes, `fe2o3-amqp` 0.18.4 in both roles | §8 |
 | The synchronous surface over the same client, no second implementation | yes, and the asyncio surface's send runs unchanged in it | §9.4 |
 | No row says "partial" | yes: §7 and §9.5 name what a caller does not get | §7, §9 |
 

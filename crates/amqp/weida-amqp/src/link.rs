@@ -1367,6 +1367,12 @@ pub(crate) struct Links {
     /// requires later input on one to end the session with
     /// `amqp:session:errant-link`, which is the opposite treatment.
     errant: HashSet<u32>,
+    /// The subset of `errant` this end detached and the peer has not
+    /// answered yet. Until its answering `detach` arrives the peer does not
+    /// know, and its `flow` or `transfer` for the link may already be on the
+    /// wire: that is a crossing, not later input, and is discarded. Once the
+    /// answer lands, the strict rule applies.
+    unanswered: HashSet<u32>,
 }
 
 #[derive(Debug)]
@@ -1769,6 +1775,9 @@ impl Links {
     }
 
     pub(crate) fn map_input(&mut self, input: u32, output: u32) {
+        // A handle the peer attaches anew is no longer the errored link's:
+        // the peer may reuse it once both ends detached (Part 2 §2.6.4).
+        self.errant.remove(&input);
         self.input_to_output.insert(input, output);
     }
 
@@ -1808,7 +1817,7 @@ impl Links {
     /// every orderly link close a coin toss, and `fe2o3-amqp`'s acceptor
     /// really does send a `flow` for a handle it has just detached.
     pub(crate) fn was_detached(&self, input: u32) -> bool {
-        self.detached.contains(&input)
+        self.detached.contains(&input) || self.unanswered.contains(&input)
     }
 
     /// Whether the peer's handle names a link that was detached **with an
@@ -1819,6 +1828,29 @@ impl Links {
     /// session with `amqp:session:errant-link`".
     pub(crate) fn was_errant(&self, input: u32) -> bool {
         self.errant.contains(&input)
+    }
+
+    /// Marks the peer's handles of a link this end is detaching with an
+    /// error as not yet answered: see [`Links::unanswered`]. Called with
+    /// [`Links::inputs_of`] taken before [`Links::remove`] forgets them.
+    pub(crate) fn await_answer(&mut self, inputs: &[u32]) {
+        self.unanswered.extend(inputs.iter().copied());
+    }
+
+    /// The peer answered the `detach` of its handle `input`: from now on
+    /// input on it is errant, or it is the peer's again to attach anew.
+    /// `true` when the handle was waiting for that answer.
+    pub(crate) fn answered(&mut self, input: u32) -> bool {
+        self.unanswered.remove(&input)
+    }
+
+    /// The peer's handles mapped to the link `output`.
+    pub(crate) fn inputs_of(&self, output: u32) -> Vec<u32> {
+        self.input_to_output
+            .iter()
+            .filter(|(_, mapped)| **mapped == output)
+            .map(|(input, _)| *input)
+            .collect()
     }
 
     /// Wakes everything parked on any link of this session, which is what a
@@ -2060,6 +2092,34 @@ mod tests {
         links.insert(1, entry("b", Role::Sender, 1));
         links.remove(1, false);
         assert_eq!(links.lowest_free(255), Some(1), "a clean close frees it");
+    }
+
+    #[test]
+    fn frames_crossing_our_errored_detach_are_discarded_until_the_peer_answers() {
+        // Found against fe2o3-amqp 0.18: our steal detached a link with
+        // `amqp:link:stolen` while the peer's `flow` for it was on the wire,
+        // and treating that `flow` as errant input ended the session.
+        let mut links = Links::default();
+        links.insert(0, entry("a", Role::Sender, 0));
+        links.map_input(5, 0);
+        let inputs = links.inputs_of(0);
+        links.remove(0, true);
+        links.await_answer(&inputs);
+        assert!(links.was_detached(5), "a crossing frame is discarded");
+
+        assert!(links.answered(5));
+        assert!(!links.was_detached(5));
+        assert!(
+            links.was_errant(5),
+            "after the peer's answer, input on the handle ends the session"
+        );
+
+        links.insert(1, entry("a", Role::Sender, 1));
+        links.map_input(5, 1);
+        assert!(
+            !links.was_errant(5),
+            "the peer may attach its handle anew once both ends detached"
+        );
     }
 
     #[test]

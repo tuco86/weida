@@ -1262,10 +1262,7 @@ impl Driver {
                     options.name
                 ),
             );
-            let _ = write_detach(out, channel, incumbent, true, Some(&condition));
-            if let Some(loser) = entry.links.remove(incumbent, true) {
-                end_link(loser, Some(condition));
-            }
+            detach_with_error(entry, out, channel, incumbent, condition);
         }
 
         let Some(handle) = entry.links.lowest_free(handle_max) else {
@@ -1539,10 +1536,7 @@ impl Driver {
                 // detach(error=...) and destroyed", and its handle is
                 // poisoned for the life of the session so that a late frame
                 // for the dead link cannot land on a live one.
-                let _ = write_detach(out, outgoing, output, true, Some(&condition));
-                if let Some(link) = entry.links.remove(output, true) {
-                    end_link(link, Some(condition));
-                }
+                detach_with_error(entry, out, outgoing, output, condition);
             }
         }
         Ok(None)
@@ -1738,10 +1732,7 @@ impl Driver {
                 link::STOLEN,
                 format!("link {} was attached again by the peer", attach.name),
             );
-            let _ = write_detach(out, outgoing, ours, true, Some(&condition));
-            if let Some(loser) = entry.links.remove(ours, true) {
-                end_link(loser, Some(condition));
-            }
+            detach_with_error(entry, out, outgoing, ours, condition);
             // The new `attach` names a link this end no longer has.
             refuse_attach(out, outgoing, attach)?;
             let _ = write_detach(out, outgoing, attach.handle, true, None);
@@ -1817,10 +1808,17 @@ impl Driver {
         let outgoing = entry.shared.outgoing_channel;
         let condition = detach.error.as_ref().map(Condition::from_codec);
         let Some(link) = entry.links.by_input(detach.handle) else {
-            tracing::debug!(
-                handle = detach.handle,
-                "a detach for a handle that is not attached"
-            );
+            if entry.links.answered(detach.handle) {
+                tracing::debug!(
+                    handle = detach.handle,
+                    "the peer answered the detach of a link this end ended with an error"
+                );
+            } else {
+                tracing::debug!(
+                    handle = detach.handle,
+                    "a detach for a handle that is not attached"
+                );
+            }
             return Ok(None);
         };
         let output = link.shared.output_handle;
@@ -1988,6 +1986,26 @@ fn end_link(link: link::Entry, condition: Option<Condition>) {
     *link.shared.state.lock().expect("not poisoned") = LinkState::Detached(condition.clone());
     link.events.push(LinkEvent::Detached(condition));
     link.shared.flow.notify_waiters();
+}
+
+/// Detaches the link `output` with `condition` on this end's initiative,
+/// destroys it and poisons the peer's handles for it (Part 2 §2.6.5). Until
+/// the peer's answering `detach` arrives, its frames for the link are still
+/// crossing ours and are discarded rather than ending the session:
+/// [`link::Links::await_answer`].
+fn detach_with_error(
+    entry: &mut Entry,
+    out: &mut Outbox,
+    channel: u16,
+    output: u32,
+    condition: Condition,
+) {
+    let _ = write_detach(out, channel, output, true, Some(&condition));
+    let inputs = entry.links.inputs_of(output);
+    if let Some(link) = entry.links.remove(output, true) {
+        end_link(link, Some(condition));
+    }
+    entry.links.await_answer(&inputs);
 }
 
 /// Tells every link of an ending session, and then the session, that it is

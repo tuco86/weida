@@ -44,7 +44,7 @@ fn timeout<F: Future>(
 
 /// The peer's version, so that a measurement in `docs/libraries/amqp.md` names
 /// what it was measured against.
-const PEER: &str = "fe2o3-amqp 0.17.0";
+const PEER: &str = "fe2o3-amqp 0.18.4";
 
 fn options() -> ConnectionOptions {
     let mut options = ConnectionOptions::new("weida-amqp-interop");
@@ -526,10 +526,14 @@ async fn a_reattach_after_the_peer_let_go_is_a_new_link_and_not_a_resumption() {
 }
 
 #[tokio::test]
-async fn this_peer_refuses_a_duplicate_link_name_rather_than_stealing_it() {
+async fn a_duplicate_link_name_gets_the_peers_answer() {
     let exec = Exec::current().unwrap();
     let (listener, port) = bound().await;
-
+    // The peer answers the second attach, reports how, and tears down only
+    // once the client has its own answer: a peer that closed right away
+    // would make every client outcome look like a lost connection.
+    let (answered_tx, answered) = tokio::sync::oneshot::channel();
+    let (done, done_rx) = tokio::sync::oneshot::channel::<()>();
     let peer = tokio::spawn(async move {
         let acceptor = ConnectionAcceptor::new("fe2o3-listener");
         let (stream, _) = listener.accept().await.unwrap();
@@ -542,9 +546,9 @@ async fn this_peer_refuses_a_duplicate_link_name_rather_than_stealing_it() {
         // second attach arrives.
         let held = LinkAcceptor::new().accept(&mut session).await.unwrap();
         let second = LinkAcceptor::new().accept(&mut session).await;
-        // The measurement, from the peer's side: it refuses rather than
-        // treating the second attach as the steal of Part 2 §2.6.1.
-        let refusal = second.err().map(|error| error.to_string());
+        let _ = answered_tx.send(second.as_ref().err().map(|error| error.to_string()));
+        let _ = done_rx.await;
+        drop(second);
         match held {
             LinkEndpoint::Receiver(receiver) => {
                 let _ = receiver.close().await;
@@ -555,7 +559,6 @@ async fn this_peer_refuses_a_duplicate_link_name_rather_than_stealing_it() {
         }
         let _ = session.end().await;
         let _ = connection.close().await;
-        refusal
     });
 
     let connection = connect(&exec, port).await;
@@ -572,27 +575,37 @@ async fn this_peer_refuses_a_duplicate_link_name_rather_than_stealing_it() {
     .unwrap();
 
     // Our own second attach steals locally — that is Part 2 §2.6.1 and this
-    // client implements it — but what the *peer* does with it is the
-    // measurement, and this peer does not implement the steal.
+    // client implements it: it detaches the first link before it attaches
+    // the name again. What the *peer* then does is the peer's: fe2o3-amqp
+    // 0.17 refused the second attach of a name it still held, 0.18 lets the
+    // detach free the name and accepts the new attach. Either way the client
+    // must report the peer's answer rather than hang or invent one.
     let second = timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("stolen-probe", Target::at("q1"))),
     )
     .await
     .expect("the peer answered rather than hanging");
-    let refusal = timeout(DEADLINE, peer).await.unwrap().unwrap();
-    let refusal = refusal.expect("the peer refused the duplicate name");
-    assert!(
-        !refusal.is_empty(),
-        "{PEER} refuses a second attach of a name it still holds rather than \
-         implementing the steal, and says why"
+    let refusal = timeout(DEADLINE, answered).await.unwrap().unwrap();
+    eprintln!(
+        "{PEER}: refusal {refusal:?}, our attach {:?}",
+        second.as_ref().map(|_| "attached")
     );
-    // And the client is told, rather than left waiting: the refusal reaches
-    // it as an error on the attach or as the connection going away.
-    assert!(
-        second.is_err(),
-        "the peer's refusal has to reach the caller somehow"
-    );
+    match refusal {
+        Some(reason) => {
+            assert!(!reason.is_empty(), "{PEER} says why it refuses");
+            assert!(
+                second.is_err(),
+                "the peer's refusal has to reach the caller as an error"
+            );
+        }
+        None => assert!(
+            second.is_ok(),
+            "the peer accepted the name again, so the caller holds the new link"
+        ),
+    }
+    let _ = done.send(());
+    let _ = timeout(DEADLINE, peer).await;
     let _ = timeout(DEADLINE, connection.close()).await;
 }
 
