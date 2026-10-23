@@ -54,7 +54,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", 
 # needs no broker installed and no C toolchain — nothing here is `#[ignore]`d
 # on its account. It is a dev-dependency and appears in no build of this
 # library ([0014](../../../docs/decisions/0014-parallel-libraries.md) §3).
-fe2o3-amqp = { version = "0.17", features = ["acceptor"] }
+fe2o3-amqp = { version = "0.18", features = ["acceptor"] }
 
 [features]
 default = ["tls"]
