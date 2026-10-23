@@ -102,7 +102,7 @@ acceptance: a pooled QUIC client connection that no endpoint slot and no stream 
 note: the options, none taken without the owner: (a) close once no slot and no stream holds the connection — needs an explicit user count (a lease type for `SlotState::Live` and for every stream object, or the connection tasks holding it weakly), immediate, no reuse after the last endpoint goes; (b) as (a), after a linger of `Limits::idle_timeout`, so an endpoint created again right away (zeughaus' MCP client redials per call after a failure) still finds it; (c) a cap on pooled connections per runtime that closes the least recently used unused one. (b) matches the old comment's promise and adds no knob; the user count is the work, and the strong count of the connection context is not a safe stand-in, because the accept loops hold it too.
 
 ### B-384 — Decision 0017 §5's document edits
-kind: spec | size: 10 | status: in_progress 2026-10-23T01:08Z | needs: []
+kind: spec | size: 10 | status: done a178f49 | needs: []
 acceptance: what [0017](decisions/0017-subscription-verdict.md) §5 asks of four documents, which IMPLEMENTATION §6 listed as not made: PROTOCOL §6.4 says a SUBSCRIBE is never answered, what its silence means and what a subscriber must not infer, and that `LIMIT_EXCEEDED` answers overload only (§4.6's MUST NOT and SHOULD); PROTOCOL §9.5 says a subscriber cannot tell "nothing published yet" from "every copy declined", beside the sequence key that makes a drop observable; PATTERNS §4 says a subscription is never confirmed and a yes/no is asked over Req/Rep; GUARANTEES §6 gains the converse bullet. The debt entry goes.
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
