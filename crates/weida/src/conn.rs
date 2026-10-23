@@ -47,8 +47,15 @@ pub(crate) enum Ctl {
 }
 
 /// Shared, cheaply clonable handle to one connection.
+///
+/// The connection lives as long as a handle does: an endpoint's slot, the
+/// pool, a transfer, a receipt, the listener task that serves it, and on
+/// QUIC the path-report and datagram tasks when those are enabled. The
+/// connection's own accept loops and HELLO deadline hold only the link and
+/// a [`Weak`] handle, so a dialled local connection whose endpoint is gone
+/// is dropped, and dropping it closes the link.
 pub(crate) struct ConnCtx {
-    pub conn: Link,
+    pub conn: Arc<Link>,
     pub ctl: mpsc::Sender<Ctl>,
     pub limits: Limits,
     /// Endpoint routing table. Client connections get a fresh empty one rather
@@ -154,7 +161,7 @@ impl ConnCtx {
         let ctx = Arc::new(ConnCtx {
             peer: conn.peer(),
             peer_chain: conn.peer_chain(),
-            conn,
+            conn: Arc::new(conn),
             ctl: ctl_tx,
             limits,
             namespace,
@@ -193,9 +200,18 @@ impl ConnCtx {
         ctx.shared.drain.register(&ctx);
 
         exec.spawn(driver(Arc::downgrade(&ctx), ctl_rx, exec.clone()));
-        exec.spawn(hello_deadline(Arc::clone(&ctx), Arc::clone(&agreed_tx)));
-        exec.spawn(accept_uni_loop(Arc::clone(&ctx), agreed_tx));
-        exec.spawn(accept_bi_loop(Arc::clone(&ctx)));
+        exec.spawn(hello_deadline(
+            Arc::clone(&ctx.conn),
+            exec.clone(),
+            Duration::from_millis(limits.hello_timeout_ms),
+            Arc::clone(&agreed_tx),
+        ));
+        exec.spawn(accept_uni_loop(
+            Arc::downgrade(&ctx),
+            Arc::clone(&ctx.conn),
+            agreed_tx,
+        ));
+        exec.spawn(accept_bi_loop(Arc::downgrade(&ctx), Arc::clone(&ctx.conn)));
         exec.spawn(send_hello(Arc::clone(&ctx), limits, guarantees, sent_tx));
         // One reader per connection, and only where the profile enabled
         // flows: a connection that enables nothing runs no reader at all.
@@ -563,16 +579,23 @@ async fn send_hello(
 }
 
 /// Closes the connection if the peer's HELLO never arrives.
-async fn hello_deadline(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agreed>>>) {
+///
+/// Holds the link rather than the connection's handle, so a connection
+/// dropped while the deadline runs is not kept alive by it.
+async fn hello_deadline(
+    link: Arc<Link>,
+    exec: Exec,
+    timeout: Duration,
+    agreed_tx: Arc<watch::Sender<Option<Agreed>>>,
+) {
     tokio::select! {
-        () = ctx.exec.sleep(Duration::from_millis(ctx.limits.hello_timeout_ms)) => {}
-        // A connection that is already gone needs no deadline, and holding
-        // one would keep its state alive for the whole timeout.
-        _ = ctx.conn.closed() => return,
+        () = exec.sleep(timeout) => {}
+        // A connection that is already gone needs no deadline.
+        _ = link.closed() => return,
     }
     if agreed_tx.borrow().is_none() {
         tracing::debug!("peer HELLO did not arrive in time");
-        ctx.conn.close(codes::NEGOTIATION_FAILED, "hello timeout");
+        link.close(codes::NEGOTIATION_FAILED, "hello timeout");
     }
 }
 
@@ -582,17 +605,29 @@ async fn hello_deadline(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agr
 /// peer cannot create more parse tasks than the transport lets it open
 /// streams. What those tasks hold for their frame heads is bounded
 /// separately, by [`ConnCtx::header_slots`].
-async fn accept_uni_loop(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agreed>>>) {
+///
+/// Waits on the link, not on the connection's handle: the loop must not be
+/// what keeps a connection nothing else uses alive. A stream that arrives
+/// after the last handle went is refused; dropping that handle closed the
+/// link, so the next accept ends the loop.
+async fn accept_uni_loop(
+    ctx: Weak<ConnCtx>,
+    link: Arc<Link>,
+    agreed_tx: Arc<watch::Sender<Option<Agreed>>>,
+) {
     loop {
-        match ctx.conn.accept_uni().await {
+        match link.accept_uni().await {
             Ok(stream) => {
+                let Some(ctx) = ctx.upgrade() else {
+                    refuse_uni(stream);
+                    break;
+                };
                 // Admission stopped: the drain refuses new work rather than
                 // taking on more of it (`docs/decisions/0009-drain.md` §4.5).
                 if ctx.shared.drain.is_draining() {
                     refuse_uni(stream);
                     continue;
                 }
-                let ctx = Arc::clone(&ctx);
                 let agreed_tx = Arc::clone(&agreed_tx);
                 ctx.exec.clone().spawn(async move {
                     if let Err(e) = handle_stream(&ctx, &agreed_tx, stream).await {
@@ -610,17 +645,22 @@ async fn accept_uni_loop(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Ag
 
 /// Accepts inbound bidirectional streams: one exchange each.
 ///
-/// Bounded the same way, by `max_concurrent_bidi_streams`.
-async fn accept_bi_loop(ctx: ConnHandle) {
+/// Bounded the same way, by `max_concurrent_bidi_streams`, and waiting on
+/// the link for the same reason as [`accept_uni_loop`].
+async fn accept_bi_loop(ctx: Weak<ConnCtx>, link: Arc<Link>) {
     loop {
-        match ctx.conn.accept_bi().await {
+        match link.accept_bi().await {
             Ok((mut send, recv)) => {
+                let Some(ctx) = ctx.upgrade() else {
+                    refuse_uni(recv);
+                    send.reset(codes::SHUTDOWN);
+                    break;
+                };
                 if ctx.shared.drain.is_draining() {
                     refuse_uni(recv);
                     send.reset(codes::SHUTDOWN);
                     continue;
                 }
-                let ctx = Arc::clone(&ctx);
                 let by_path = ctx.conn.dispatch_by_path();
                 ctx.exec.clone().spawn(async move {
                     let outcome = if by_path {
@@ -637,6 +677,18 @@ async fn accept_bi_loop(ctx: ConnHandle) {
                 tracing::debug!(error = %e, "connection closed; bidi accept loop ending");
                 break;
             }
+        }
+    }
+}
+
+impl Drop for ConnCtx {
+    /// The last handle is gone: nothing can open, accept or answer anything
+    /// on this connection any more, so it is closed rather than left open
+    /// for nobody. A connection that already closed is not touched.
+    fn drop(&mut self) {
+        if self.conn.close_reason().is_none() {
+            self.conn
+                .close(codes::SHUTDOWN, "no endpoint uses this connection");
         }
     }
 }

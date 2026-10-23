@@ -1510,8 +1510,9 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   10 s, against the server's `max_connections`. Measured (B-383): four pushers dropped after
   one send each, three with a fresh identity, left four connections exchanging 96 datagrams
   per 120 s of silence. When an unused connection should close is the open question; B-383
-  lists the options. On the local transports nothing is pooled and nothing can reuse the
-  connection, yet a dropped endpoint's control connection also stays open for the runtime's
-  life and, on `AF_UNIX` and named pipes, keeps its place in the binding's
-  `max_connections`. Closing it at the last handle (B-385, on a branch) awaits an
-  explanation of one darwin failure before it lands.
+  lists the options. The local transports, where nothing is pooled, close a connection once
+  its last handle goes (B-385).
+- **A local send can be lost after its receipt.** On `AF_UNIX` a receipt means the kernel took
+  the bytes; when the dialler then exits, the accepting side closes the group 200 ms after
+  its control connection ends, and a transfer connection its accept loop has not admitted by
+  then is refused. Reproduced on darwin with 16 parallel CLI tests (B-392).

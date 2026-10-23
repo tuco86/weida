@@ -402,3 +402,37 @@ async fn unbounded_limits_are_held_at_the_semaphore_ceiling_over_unix() {
     limits_beyond_what_a_semaphore_counts_are_held_at_its_ceiling(&h).await;
     h.shutdown().await;
 }
+
+/// Claim: a local connection is closed once nothing can use it, so the
+/// binding's place it held comes back. A binding with two places serves a
+/// pusher that sends once and is dropped, then a second pusher: its control
+/// connection and its transfer need both places, which they get only if the
+/// first pusher's control connection is gone. Before the connection's accept
+/// loops stopped holding its handle, it stayed open for the runtime's life
+/// and the second body never arrived.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_dropped_unix_endpoint_gives_its_binding_place_back() {
+    let h = Harness::start_with(
+        Transport::SimUnix,
+        weida::RuntimeConfig {
+            max_connections: 2,
+            ..weida::RuntimeConfig::default()
+        },
+    )
+    .await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let client = h.client();
+    for body in [&b"first"[..], &b"second"[..]] {
+        let pusher = client.pusher(h.trust());
+        within(pusher.connect(&h.url("/jobs")))
+            .await
+            .expect("connect");
+        within(pusher.send(body)).await.expect("send");
+        let got = within(puller.recv()).await.expect("recv");
+        assert_eq!(within(got.collect(64)).await.expect("collect"), body);
+        drop(pusher);
+    }
+    client.shutdown().await;
+    h.shutdown().await;
+}
