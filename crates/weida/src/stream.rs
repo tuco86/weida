@@ -518,10 +518,12 @@ impl Peer {
     /// Forgets `url`: the slot is removed and its redial task ends.
     ///
     /// The connection itself is pooled and may be serving another endpoint,
-    /// so it is not closed here; an idle one goes when the pool reaps it.
-    /// What this endpoint holds on it is released: a subscriber's route and
-    /// subscriptions, so the peer stops sending and the address can be
-    /// dialled again. Returns whether the address was known.
+    /// so it is not closed here, and today nothing closes it later either: it
+    /// stays open, kept alive, until the runtime shuts down or the peer
+    /// closes it (`docs/IMPLEMENTATION.md` §6, B-383). What this endpoint
+    /// holds on it is released: a subscriber's route and subscriptions, so
+    /// the peer stops sending and the address can be dialled again. Returns
+    /// whether the address was known.
     pub fn disconnect(&self, url: &str) -> bool {
         let mut slots = self.shared.slots.lock().expect("peer list poisoned");
         let before = slots.len();

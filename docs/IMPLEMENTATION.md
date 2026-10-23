@@ -1429,3 +1429,14 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   [0017](decisions/0017-subscription-verdict.md) §5 asks [PROTOCOL.md](PROTOCOL.md) §6.4 and
   §9.5, [PATTERNS.md](PATTERNS.md) §4 and [GUARANTEES.md](GUARANTEES.md) §6 to say that a
   SUBSCRIBE is never answered and what its silence means; none of the four says it.
+- **A pooled client connection outlives every endpoint that used it.** The pool
+  (`crates/weida/src/pool.rs`) keeps a connection until it closes, and a dialling connection
+  sends keep-alives, so a connection no endpoint holds any more is never closed while the
+  runtime lives: `Peer::disconnect` and dropping the endpoint release the endpoint's slot and
+  routes, not the connection. A connection whose key is dialled again is reused, which is the
+  pool's purpose; one whose key never comes back — a `ClientTls` with a throwaway identity, as
+  griasdi's `OpenDial` and swarm make per dial — stays open on both sides, keep-alive every
+  10 s, against the server's `max_connections`. Measured (B-383): four pushers dropped after
+  one send each, three with a fresh identity, left four connections exchanging 96 datagrams
+  per 120 s of silence. When an unused connection should close is the open question; B-383
+  lists the options.
