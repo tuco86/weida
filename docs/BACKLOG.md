@@ -80,6 +80,10 @@ acceptance: under `Network::sim(&net)` a `weida+unix://` binding and dial run ov
 kind: code | size: 60 | status: ready | needs: [B-377]
 acceptance: `io::drain` (4: a peer frozen on its own thread so nothing is acknowledged for 2 s) and `io::accept_limits` (5: a UDP relay that rewrites source addresses to trigger address validation and the handshake cap) run in the unit tier on a paused clock, through a `SimNet` fault that holds a port's datagrams without dropping them (a frozen peer) and one that presents a socket under a second source address (the relay), each named in 0042; or, for any test the sim cannot express, a line in its module doc saying why it stays in io. Found in the review pass after B-377.
 
+### B-379 — A `send` into an outbox nobody will drain fails instead of hanging
+kind: code | size: 20 | status: in_progress 2026-10-23T00:19Z | needs: []
+acceptance: once every address of a `Pusher`/dialling `Pair` is given up (`PeerEvent::GaveUp`), `send` fails with `ConnectionLost(cause)` whether or not the outbox still holds bodies, as it already did on an empty outbox, and a sender blocked at the outbox bound (`OutboxFull::Block`) is woken with that error instead of waiting forever; bodies already queued stay for a later `connect` to drain. Test: unit tier, paused clock, a redial that gives up while a third `send` waits at a bound of two.
+
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
