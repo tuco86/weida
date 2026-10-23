@@ -1,45 +1,52 @@
 # Test tiers (see AGENTS.md, "Tests"). A test that touches the filesystem, the
 # network, a process, the environment or real time lives in a module named
 # `io`; everything else is a unit test. A paused Tokio clock is not real time.
+#
+# No profile kills a test or a run. `slow-timeout` is a test's expected time:
+# past it, and at every multiple of it, nextest prints `SLOW` and lets the test
+# run on. On a loaded runner a healthy test can take several times its usual
+# time, and a kill there turns a slow green run red (nightly #81: a 10 s kill
+# on atik while it ran two jobs at once). Whoever waits for the run decides
+# what a run past its expected time means; the job's own budget in
+# `.zeughaus-ci` is the only hang guard.
 nextest-version = { required = "0.9.115" }
 
 # Unit tier: `cargo nextest run`. No I/O, so a second per test is already slow.
 [profile.default]
 default-filter = 'not test(/(^|::)io::/)'
-slow-timeout = { period = "1s", terminate-after = 5 }
-global-timeout = "60s"
+slow-timeout = { period = "1s" }
 
 # I/O tier: `cargo nextest run --profile integration`.
 [profile.integration]
 default-filter = 'test(/(^|::)io::/)'
-slow-timeout = { period = "10s", terminate-after = 1 }
-global-timeout = "5m"
+slow-timeout = { period = "10s" }
 
 # Both tiers, as the nightly and release checks run them.
 [profile.ci]
 default-filter = 'all()'
-slow-timeout = { period = "10s", terminate-after = 1 }
-global-timeout = "6m"
+slow-timeout = { period = "10s" }
+
+# The tests below are expected to take longer than their tier's period, so a
+# `SLOW` line for them only means something past their own, measured time.
 
 # trybuild compiles its fixtures.
 [[profile.integration.overrides]]
 filter = '(package(weida-zmq) | package(weida-nng)) and test(/^io::(thread_rule|directions)::/)'
-slow-timeout = { period = "180s", terminate-after = 1 }
+slow-timeout = { period = "180s" }
 
-# trybuild compiles its fixtures.
 [[profile.ci.overrides]]
 filter = '(package(weida-zmq) | package(weida-nng)) and test(/^io::(thread_rule|directions)::/)'
-slow-timeout = { period = "180s", terminate-after = 1 }
+slow-timeout = { period = "180s" }
 
 # 63 nodes, 62 of which never answer, on a multi-threaded runtime: 8.5 s on
 # linux-amd64 and 15.3 s on windows-amd64, measured.
 [[profile.integration.overrides]]
 filter = 'package(weida-raft) and test(=io::two_adds_racing_for_the_last_place_cannot_both_have_it)'
-slow-timeout = { period = "50s", terminate-after = 1 }
+slow-timeout = { period = "50s" }
 
 [[profile.ci.overrides]]
 filter = 'package(weida-raft) and test(=io::two_adds_racing_for_the_last_place_cannot_both_have_it)'
-slow-timeout = { period = "50s", terminate-after = 1 }
+slow-timeout = { period = "50s" }
 
 # Arbitrary octets through a session, many rounds: 7.3 s on darwin-arm64 and
 # 5.3 s on windows-amd64, and 10 s on windows-amd64 beside the whole nightly.
@@ -47,12 +54,12 @@ slow-timeout = { period = "50s", terminate-after = 1 }
 # past 10 s there and on windows-amd64 in `-p weida --features blocking`,
 # where weida's heavy tests overlap. The guide's large payload: 6.7 s on
 # darwin-arm64, 4.1 s on windows-amd64, past 10 s in that same run. The CLI
-# tests start a child process that mints an identity and wait on it for up
-# to their own 20 s deadline, which a 10 s kill would never let them report.
+# tests start a child process that mints an identity and wait on it for up to
+# their own 20 s deadline.
 [[profile.integration.overrides]]
 filter = '(package(weida-zmq) and test(=session::tests::io::arbitrary_octets_are_never_a_panic)) | (package(weida) and (test(=segment::tests::io::a_writer_that_releases_at_once_never_strands_budget) | test(=io::guide::the_same_calls_carry_a_payload_no_cap_would_admit) | test(/^io::cli::/)))'
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "30s" }
 
 [[profile.ci.overrides]]
 filter = '(package(weida-zmq) and test(=session::tests::io::arbitrary_octets_are_never_a_panic)) | (package(weida) and (test(=segment::tests::io::a_writer_that_releases_at_once_never_strands_budget) | test(=io::guide::the_same_calls_carry_a_payload_no_cap_would_admit) | test(/^io::cli::/)))'
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "30s" }
