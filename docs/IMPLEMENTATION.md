@@ -1214,6 +1214,81 @@ moves 683 MiB/s. Peak RSS stays under a third of the payload, so
 nothing buffers the blob. One named limit: the proxy neither loses nor reorders, so this says
 nothing about a fetch under loss; griasdi's measurement against its server is the field check.
 
+### 4.19 LAN and loopback throughput (B-391)
+
+weida's streaming paths against plain TCP and raw quinn on the same path, with the harness
+`weida-perf` (`crates/perf`, B-390). Hosts: the server tuco-pc (AMD Ryzen 7 5800X, Linux,
+`enp42s0` 2.5 GbE, 10.0.0.8), the LAN client wohnzimmer (AMD Ryzen 5 2600, Windows 10,
+on-board Realtek GbE at 1 Gbit/s, which limits the path; cable and switch are 2.5 GbE). Release
+builds, 1 GiB per throughput case, 20 s per video row at 60 fps with one segment per GOP of 60
+frames (the I-frame 8 P-frames large) relayed as griasdi's screen share relays it. The second
+of two runs each is kept; in the first, throughput differed by under 1 % and the 50 Mbit
+video p99 read 11.43 ms instead of 10.51.
+
+```sh
+target/release/weida-perf serve                         # tuco-pc
+target/release/weida-perf client --server 127.0.0.1    # loopback
+run_jobs perf-windows-amd64                             # LAN, pipeline #88
+```
+
+`up` sends from the client to tuco-pc, `down` the other way. `push-8`/`pull-8` are eight
+concurrent transfers on one connection, `swarm-4` four seeders on four bindings.
+
+| case | LAN MB/s | LAN rtt ms | loopback MB/s |
+| --- | --- | --- | --- |
+| tcp-up | 88.4 | - | 8171.5 |
+| tcp-down | 118.7 | - | 8150.0 |
+| quinn-up | 86.1 | 0.98 | 774.5 |
+| quinn-down | 115.4 | 3.25 | 742.0 |
+| push-1 | 86.7 | 0.94 | 770.9 |
+| push-8 | 86.6 | 1.00 | 726.4 |
+| pull-1 | 116.8 | 3.21 | 766.1 |
+| pull-8 | 116.8 | 3.58 | 745.4 |
+| swarm-1 | 116.8 | 3.47 | 695.1 |
+| swarm-4 | 116.8 | 6.56 | 2121.5 |
+
+No packet was lost on the LAN. Every video row received every frame it sent after the first
+GOP (1140 of 1140), with no stale or overflowed segment and no uplink drop. Latency is send to
+parse in the client's one process, so it needs no clock sync:
+
+| row | Mbit | LAN p50 ms | LAN p99 ms | LAN max ms | loopback p99 ms |
+| --- | --- | --- | --- | --- | --- |
+| video | 8 | 1.23 | 2.93 | 3.23 | 0.50 |
+| video | 25 | 1.71 | 6.09 | 7.04 | 0.95 |
+| video | 50 | 2.31 | 10.51 | 13.46 | 1.57 |
+| video+push-same | 8 | 1.62 | 3.72 | 5.05 | 0.50 |
+| video+push-same | 25 | 2.44 | 9.62 | 11.31 | 0.99 |
+| video+push-same | 50 | 3.48 | 18.64 | 21.97 | 1.50 |
+| video+pull-other | 8 | 1.49 | 4.49 | 8.87 | 0.50 |
+| video+pull-other | 25 | 2.28 | 6.62 | 11.17 | 0.97 |
+| video+pull-other | 50 | 3.39 | 11.58 | 17.84 | 1.53 |
+
+Targets, fixed before the run:
+
+| where | case | target | result |
+| --- | --- | --- | --- |
+| LAN | every weida throughput case of a direction | ≥ 0.9 × `tcp-<dir>` of the same run | met: up 0.98, down 0.98 |
+| LAN | `swarm-1`, `swarm-4` | ≥ 0.9 × `tcp-down` | met: 0.98 |
+| loopback | every case | none; attribution only | weida equals raw quinn (726-771 against 742-775 MB/s) |
+| LAN | `video` at 50 Mbit | every frame, p99 ≤ 10 ms | every frame; p99 10.51 ms, missed: the link's |
+| LAN | `video+push-same` at 50 Mbit | no frame lost, p99 ≤ 30 ms | met: 18.64 ms |
+| LAN | `video+pull-other` at 50 Mbit | recorded | 11.58 ms |
+
+**weida runs at the line rate in both directions.** Upward the ceiling is wohnzimmer's
+Windows send path, which TCP shares (88 MB/s of a 1 Gbit/s link); downward all four weida
+paths sit within 2 % of TCP at 117 MB/s. On loopback every weida path matches raw quinn with
+the same windows, so the QUIC stack (quinn, rustls' AES-GCM, UDP) is the ceiling there, not
+weida; TCP runs ten times faster on loopback, which a 1 GbE path never sees.
+
+**The 50 Mbit video miss is the link's, not weida's.** The p99 of a GOP lands on its I-frame:
+one frame in 60 is 1.7 % of them, and at 50 Mbit it is 746 kB, which wohnzimmer's 88 MB/s
+uplink needs 8.4 ms to send before the relay's last chunk can follow at line rate. The loopback
+row, the same relay with the wire taken away, has a p99 of 1.57 ms, and a profile of the server
+during it (`perf record -g --call-graph dwarf`, line tables) shows no `weida` frame above
+2 % self time: AES-GCM and quinn's `poll_transmit` lead. A p99 of 10 ms at 50 Mbit needs a
+smaller I-frame or a faster link, which the 2.5 GbE adapter for wohnzimmer will test. Sharing
+the uplink's connection with a 1 GiB push costs the video 8 ms at p99, inside the 30 ms target.
+
 ---
 
 ## 5. Decisions
