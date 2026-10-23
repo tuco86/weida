@@ -85,11 +85,11 @@ kind: code | size: 20 | status: done 5842ff1 | needs: []
 acceptance: once every address of a `Pusher`/dialling `Pair` is given up (`PeerEvent::GaveUp`), `send` fails with `ConnectionLost(cause)` whether or not the outbox still holds bodies, as it already did on an empty outbox, and a sender blocked at the outbox bound (`OutboxFull::Block`) is woken with that error instead of waiting forever; bodies already queued stay for a later `connect` to drain. Test: unit tier, paused clock, a redial that gives up while a third `send` waits at a bound of two.
 
 ### B-380 — A swarm fetch costs linear time in its pieces, not quadratic
-kind: code | size: 30 | status: in_progress 2026-10-23T00:29Z | needs: []
+kind: code | size: 30 | status: done 6430a09 | needs: []
 acceptance: `swarm/schedule.rs` no longer scans every piece of the blob for every order: the scheduler keeps the free pieces (missing, no order fetching them) as a bit map with a count, a claim probes it at random and falls back to one pass over the free and HAVE maps only when the probes miss, keeps a seeder that held none of the free pieces out of the scan until a piece is freed again or it says HAVE anew, and takes endgame copies from the orders in flight; `Fetch::next` asks a count instead of reading the delivered map whole. 0040's rules stay: uniformly among free pieces the seeder holds, the endgame only when no piece is free, least-copied first. Tests: a seeded random walk over answered, failed and released orders, seeders gone and HAVE anew, checks after every step that a piece is free exactly when it is missing and unordered, then finishes the blob from one full seeder; a seeder with nothing free claims pieces once another seeder's orders fail.
 
 ### B-381 — The blocking push test asserts an order across streams
-kind: test | size: 5 | status: in_progress 2026-10-23T00:29Z | needs: []
+kind: test | size: 5 | status: done f07d803 | needs: []
 acceptance: `blocking::a_push_reaches_a_puller_and_the_receipt_comes_back` accepts the two bodies in either order: they are two streams, across which GUARANTEES §6 promises no order, and under load the receiving runtime handed "two" to the puller first (4 of 80 and 2 of 40 stress runs of the unit tier).
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
