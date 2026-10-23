@@ -730,6 +730,59 @@ async fn a_silent_seeder_does_not_hold_up_the_last_piece() {
     assert!(!a.pieces_asked().is_empty(), "the silent seeder was asked");
 }
 
+/// Claim: a seeder whose server goes away in the middle of a fetch costs the
+/// fetch nothing but time: its orders return to the free pieces the moment
+/// its connection is lost, the other seeder serves them, and the caller sees
+/// no error. Found as a scenario of a cross-host probe (a seeder process
+/// exiting mid-fetch over a real WAN path); here on a paused clock.
+#[tokio::test(start_paused = true)]
+async fn a_seeder_that_goes_away_mid_fetch_leaves_its_pieces_to_the_others() {
+    let net = SimNet::new();
+    let data = blob_bytes(LEN);
+    let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
+    let a = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Slow(Duration::from_millis(20)),
+    )
+    .await;
+    let b = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Slow(Duration::from_millis(20)),
+    )
+    .await;
+    let client = swarm_runtime(&net);
+    let swarm = client.swarm(Trust::by_address());
+    within(swarm.connect(&a.url())).await.expect("connect a");
+    within(swarm.connect(&b.url())).await.expect("connect b");
+
+    let started = tokio::time::Instant::now();
+    let mut fetch = swarm.fetch(blob, Bits::new(18), FetchOptions::default());
+    let mut out = vec![0; LEN];
+    let mut taken = 0;
+    while taken < 4 {
+        let piece = within(fetch.next())
+            .await
+            .expect("a piece")
+            .expect("verified");
+        out[span(&blob, piece.index)].copy_from_slice(&piece.bytes);
+        taken += 1;
+    }
+    let asked_before = a.pieces_asked().len();
+    a.server.binding.close().await;
+    gather(&mut fetch, &mut out).await;
+    assert_eq!(BlobId::of(&out), blob.root());
+    // Far below the 30 s answer deadline: nothing waited for the gone
+    // seeder's orders to time out.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(asked_before > 0, "the seeder that went away was used");
+}
+
 #[tokio::test]
 async fn a_blob_of_one_piece_needs_no_list_and_an_empty_blob_no_seeder() {
     let net = SimNet::new();
