@@ -141,11 +141,22 @@ impl PeerShared {
     /// one examined: an application deciding what to do next needs to tell
     /// an idle timeout from a peer that closed deliberately.
     fn try_pick(&self) -> Result<Option<(ConnHandle, Arc<str>)>, Error> {
+        self.scan(self.cursor.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// `Err` exactly when [`PeerShared::try_pick`] would fail — never
+    /// connected, or every slot given up — without moving the round-robin
+    /// cursor: a check must not steer which peer the next pick takes.
+    fn reachable(&self) -> Result<(), Error> {
+        self.scan(self.cursor.load(Ordering::Relaxed)).map(drop)
+    }
+
+    /// [`PeerShared::try_pick`]'s walk over the slots, from `start`.
+    fn scan(&self, start: usize) -> Result<Option<(ConnHandle, Arc<str>)>, Error> {
         let slots = self.slots.lock().expect("peer list poisoned");
         if slots.is_empty() {
             return Err(Error::NotConnected);
         }
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let mut cause = None;
         let mut pending = false;
         for offset in 0..slots.len() {
@@ -1026,7 +1037,7 @@ impl PeerShared {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            self.try_pick()?;
+            self.reachable()?;
             {
                 let mut queue = self.outbox.queue.lock().expect("outbox poisoned");
                 let bytes = self.outbox.bytes.load(Ordering::Relaxed);
