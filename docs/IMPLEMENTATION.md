@@ -1289,6 +1289,29 @@ during it (`perf record -g --call-graph dwarf`, line tables) shows no `weida` fr
 smaller I-frame or a faster link, which the 2.5 GbE adapter for wohnzimmer will test. Sharing
 the uplink's connection with a 1 GiB push costs the video 8 ms at p99, inside the 30 ms target.
 
+**Over the internet: two seeders on sadala, one fetch on tuco-pc (B-393).** sadala (Hetzner
+VPS, 2 ARM cores) serves with `.zeughaus-ci/perf-seed-sadala.sh` on the ports its Hetzner
+firewall opens for experiments (`--ports main=2334,swarm=2335,quinn=2336,tcp=2336`, both
+seeders on the one host); tuco-pc fetches over its home line, public addresses, no WireGuard,
+round trip 25-45 ms as measured. Three runs within 15 minutes, 256 MiB per stream case, the
+1 GiB blob for SWARM:
+
+| case | MB/s | | case | MB/s |
+| --- | --- | --- | --- | --- |
+| tcp-down | 7.6 | | swarm-1 (default 8/32) | 10.3 |
+| quinn-down | 10.7 | | swarm-2 (default 8/32) | 18.4 |
+| pull-1 | 7.4 | | swarm-1 / swarm-2 at depth 2/8 | 16.1 / 18.2 |
+| pull-8 | 10.2 | | swarm-1 / swarm-2 at depth 16/64 | 9.2 / 16.5 |
+
+One plain HTTPS download from Hetzner's fsn1 speed server reached 22.1 MB/s in the same
+window. **SWARM is not what limits this path:** one seeder runs at the rate of one raw quinn
+connection, two seeders nearly double it, and two connections reach 83 % of what the line
+gave HTTP. A single connection, TCP or QUIC, stays at 7-16 MB/s with its round trip growing
+from 25 to 45 ms under load and no loss counted: a queue in front of the home line, which
+one Cubic flow reads as the path's rate. The order depth does not move the result outside the
+run-to-run spread (9-16 MB/s for one seeder), so scheduling more orders per seeder is no lever
+here; more connections are.
+
 ---
 
 ## 5. Decisions

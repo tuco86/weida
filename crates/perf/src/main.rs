@@ -35,14 +35,53 @@ use weida::{Fingerprint, Identity};
 /// The perf-only identity: certificate, then key.
 const PERF_PEM: &str = include_str!("../perf-identity.pem");
 
-/// The main weida binding.
-pub const PORT_WEIDA: u16 = 47300;
-/// The three extra SWARM bindings start here.
-pub const PORT_SWARM_EXTRA: u16 = 47301;
-/// Raw quinn.
-pub const PORT_QUINN: u16 = 47304;
-/// Plain TCP.
-pub const PORT_TCP: u16 = 47305;
+/// The ports both sides use; `--ports main=P,swarm=P+P,quinn=P,tcp=P`
+/// overrides any of them, the same on both sides.
+#[derive(Clone, Debug)]
+pub struct Ports {
+    /// The main weida binding: every endpoint, `/swarm` included.
+    pub main: u16,
+    /// Further bindings with only `/swarm`; may be empty.
+    pub swarm: Vec<u16>,
+    /// Raw quinn (UDP).
+    pub quinn: u16,
+    /// Plain TCP; may equal `quinn`, they differ in protocol.
+    pub tcp: u16,
+}
+
+impl Default for Ports {
+    fn default() -> Ports {
+        Ports {
+            main: 47300,
+            swarm: vec![47301, 47302, 47303],
+            quinn: 47304,
+            tcp: 47305,
+        }
+    }
+}
+
+impl Ports {
+    fn parse(text: &str) -> Ports {
+        let mut ports = Ports::default();
+        for part in text.split(',') {
+            let (key, value) = part.split_once('=').unwrap_or_else(|| usage());
+            match key {
+                "main" => ports.main = parsed(value, "--ports main"),
+                "swarm" if value.is_empty() => ports.swarm.clear(),
+                "swarm" => {
+                    ports.swarm = value
+                        .split('+')
+                        .map(|p| parsed(p, "--ports swarm"))
+                        .collect();
+                }
+                "quinn" => ports.quinn = parsed(value, "--ports quinn"),
+                "tcp" => ports.tcp = parsed(value, "--ports tcp"),
+                _ => usage(),
+            }
+        }
+        ports
+    }
+}
 
 /// The size of the shared payload chunk and of a SWARM piece.
 pub const MIB: usize = 1 << 20;
@@ -106,9 +145,10 @@ pub fn cpu_times() -> Option<(f64, f64)> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: weida-perf serve [--bind IP]\n       \
-         weida-perf client --server HOST [--only a,b] [--mib N] [--swarm-depth P/I] \
-         [--video-mbit 8,25,50] [--video-secs S]"
+        "usage: weida-perf serve [--bind IP] [--ports SPEC] [--for SECS]\n       \
+         weida-perf client --server HOST [--ports SPEC] [--only a,b] [--mib N] \
+         [--swarm-depth P/I] [--video-mbit 8,25,50] [--video-secs S]\n\
+         SPEC: main=P,swarm=P+P+P,quinn=P,tcp=P (any subset; swarm= for none)"
     );
     std::process::exit(2);
 }
@@ -144,19 +184,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.next().as_deref() {
         Some("serve") => {
             let mut bind: IpAddr = [0, 0, 0, 0].into();
+            let mut ports = Ports::default();
+            let mut lifetime = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--bind" => bind = parsed(&value(&mut args, "--bind"), "--bind"),
+                    "--ports" => ports = Ports::parse(&value(&mut args, "--ports")),
+                    "--for" => {
+                        lifetime = Some(std::time::Duration::from_secs(parsed(
+                            &value(&mut args, "--for"),
+                            "--for",
+                        )));
+                    }
                     _ => usage(),
                 }
             }
-            serve::run(bind).await
+            serve::run(bind, &ports, lifetime).await
         }
         Some("client") => {
             let mut options = client::Options::default();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--server" => options.server = value(&mut args, "--server"),
+                    "--ports" => options.ports = Ports::parse(&value(&mut args, "--ports")),
                     "--only" => {
                         options.only = Some(
                             value(&mut args, "--only")

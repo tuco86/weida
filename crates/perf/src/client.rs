@@ -19,7 +19,7 @@ use weida::{
 
 use crate::frames::{Parser, encode};
 use crate::stats::percentile;
-use crate::{MIB, PORT_QUINN, PORT_SWARM_EXTRA, PORT_TCP, PORT_WEIDA, cpu_times, now_us, pattern};
+use crate::{MIB, Ports, cpu_times, now_us, pattern};
 
 type Res<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -35,6 +35,7 @@ const VIDEO_MAX_AGE: Duration = Duration::from_secs(3);
 
 pub struct Options {
     pub server: String,
+    pub ports: Ports,
     pub only: Option<Vec<String>>,
     pub mib: u64,
     pub swarm_depth: Option<(usize, usize)>,
@@ -46,6 +47,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             server: String::new(),
+            ports: Ports::default(),
             only: None,
             mib: 1024,
             swarm_depth: None,
@@ -119,7 +121,10 @@ fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
 pub async fn run(options: Arc<Options>) -> Result<(), Box<dyn Error>> {
     println!("| case | MiB | s | MB/s | rtt ms | lost pkts | user s | sys s |");
     println!("|---|---|---|---|---|---|---|---|");
-    let cases: [&str; 10] = [
+    // `swarm-N` fetches from every seeder the server's ports name: the main
+    // binding and each extra one.
+    let all_seeders = format!("swarm-{}", 1 + options.ports.swarm.len());
+    let mut cases = vec![
         "tcp-up",
         "tcp-down",
         "quinn-up",
@@ -129,8 +134,10 @@ pub async fn run(options: Arc<Options>) -> Result<(), Box<dyn Error>> {
         "pull-1",
         "pull-8",
         "swarm-1",
-        "swarm-4",
     ];
+    if !options.ports.swarm.is_empty() {
+        cases.push(&all_seeders);
+    }
     for case in cases {
         if !options.selected(case) {
             continue;
@@ -201,7 +208,7 @@ async fn throughput(o: &Options, case: &str) -> Res<Outcome> {
     let len = o.bytes();
     match case {
         "tcp-up" | "tcp-down" => {
-            let addr = o.addr(PORT_TCP).await?;
+            let addr = o.addr(o.ports.tcp).await?;
             let started = Instant::now();
             crate::raw::tcp_transfer(addr, case == "tcp-up", len).await?;
             Ok(Outcome {
@@ -212,7 +219,7 @@ async fn throughput(o: &Options, case: &str) -> Res<Outcome> {
             })
         }
         "quinn-up" | "quinn-down" => {
-            let addr = o.addr(PORT_QUINN).await?;
+            let addr = o.addr(o.ports.quinn).await?;
             let started = Instant::now();
             let m = crate::raw::quinn_transfer(addr, case == "quinn-up", len).await?;
             Ok(Outcome {
@@ -222,7 +229,7 @@ async fn throughput(o: &Options, case: &str) -> Res<Outcome> {
                 lost: m.lost,
             })
         }
-        "push-1" | "push-8" | "pull-1" | "pull-8" | "swarm-1" | "swarm-4" => {
+        "push-1" | "push-8" | "pull-1" | "pull-8" => {
             // Every weida case on a runtime of its own, so cases share no
             // pooled connection.
             let runtime = Runtime::new(RuntimeConfig::default())?;
@@ -230,10 +237,18 @@ async fn throughput(o: &Options, case: &str) -> Res<Outcome> {
                 "push-1" => push(&runtime, o, 1).await,
                 "push-8" => push(&runtime, o, 8).await,
                 "pull-1" => pull(&runtime, o, 1).await,
-                "pull-8" => pull(&runtime, o, 8).await,
-                "swarm-1" => swarm(&runtime, o, 1).await,
-                _ => swarm(&runtime, o, 4).await,
+                _ => pull(&runtime, o, 8).await,
             };
+            runtime.shutdown().await;
+            result
+        }
+        swarm_case if swarm_case.starts_with("swarm-") => {
+            let seeders: usize = swarm_case["swarm-".len()..].parse()?;
+            if seeders == 0 || seeders > 1 + o.ports.swarm.len() {
+                return Err(format!("{swarm_case}: the ports name fewer seeders").into());
+            }
+            let runtime = Runtime::new(RuntimeConfig::default())?;
+            let result = swarm(&runtime, o, seeders).await;
             runtime.shutdown().await;
             result
         }
@@ -245,7 +260,7 @@ async fn throughput(o: &Options, case: &str) -> Res<Outcome> {
 /// runs from the first open to the last delivery.
 async fn push(rt: &Runtime, o: &Options, n: u64) -> Res<Outcome> {
     let pusher = Arc::new(rt.pusher(trust()));
-    pusher.connect(&o.url(PORT_WEIDA, "/sink")).await?;
+    pusher.connect(&o.url(o.ports.main, "/sink")).await?;
     let per = o.mib / n;
     let started = Instant::now();
     let mut set = JoinSet::new();
@@ -275,7 +290,7 @@ async fn push(rt: &Runtime, o: &Options, n: u64) -> Res<Outcome> {
 /// Requests `o.mib` MiB from `/source` in `n` concurrent requests.
 async fn pull(rt: &Runtime, o: &Options, n: u64) -> Res<Outcome> {
     let requester = Arc::new(rt.requester(trust()));
-    requester.connect(&o.url(PORT_WEIDA, "/source")).await?;
+    requester.connect(&o.url(o.ports.main, "/source")).await?;
     let per = o.mib / n * MIB as u64;
     let started = Instant::now();
     let mut set = JoinSet::new();
@@ -310,10 +325,10 @@ async fn pull(rt: &Runtime, o: &Options, n: u64) -> Res<Outcome> {
     ))
 }
 
-/// Fetches the server's blob from `seeders` of its four SWARM bindings.
-async fn swarm(rt: &Runtime, o: &Options, seeders: u16) -> Res<Outcome> {
+/// Fetches the server's blob from its first `seeders` SWARM bindings.
+async fn swarm(rt: &Runtime, o: &Options, seeders: usize) -> Res<Outcome> {
     let requester = rt.requester(trust());
-    requester.connect(&o.url(PORT_WEIDA, "/blob")).await?;
+    requester.connect(&o.url(o.ports.main, "/blob")).await?;
     let mut reply = requester.request(&[]).await?;
     let mut described = Vec::new();
     reply.read_to_end(&mut described).await?;
@@ -326,11 +341,9 @@ async fn swarm(rt: &Runtime, o: &Options, seeders: u16) -> Res<Outcome> {
     let blob = Blob::new(root, size, piece).ok_or("bad blob")?;
 
     let swarm = rt.swarm(trust());
-    swarm.connect(&o.url(PORT_WEIDA, "/swarm")).await?;
-    for i in 1..seeders {
-        swarm
-            .connect(&o.url(PORT_SWARM_EXTRA + i - 1, "/swarm"))
-            .await?;
+    swarm.connect(&o.url(o.ports.main, "/swarm")).await?;
+    for &port in o.ports.swarm.iter().take(seeders - 1) {
+        swarm.connect(&o.url(port, "/swarm")).await?;
     }
     let mut options = FetchOptions::default();
     if let Some((per_peer, max_inflight)) = o.swarm_depth {
@@ -383,13 +396,13 @@ struct Seen {
 async fn video(o: &Options, mbit: u64, competitor: Competitor) -> Res<VideoRow> {
     let uplink = Runtime::new(RuntimeConfig::default())?;
     let peer = uplink.peer(trust());
-    peer.connect(&o.url(PORT_WEIDA, "/up")).await?;
+    peer.connect(&o.url(o.ports.main, "/up")).await?;
 
     let viewer = Runtime::new(RuntimeConfig::default())?;
     let dish = Arc::new(viewer.dish(trust()));
     dish.join("v", JoinTerms::default().with_max_age(VIDEO_MAX_AGE))
         .await?;
-    dish.connect(&o.url(PORT_WEIDA, "/live")).await?;
+    dish.connect(&o.url(o.ports.main, "/live")).await?;
 
     // Frames sent at or after this time count: the first GOP is excluded.
     let threshold = Arc::new(AtomicU64::new(u64::MAX));
@@ -439,7 +452,7 @@ async fn video(o: &Options, mbit: u64, competitor: Competitor) -> Res<VideoRow> 
         Competitor::None => None,
         Competitor::PushSame => {
             let pusher = Arc::new(uplink.pusher(trust()));
-            pusher.connect(&o.url(PORT_WEIDA, "/sink")).await?;
+            pusher.connect(&o.url(o.ports.main, "/sink")).await?;
             let mib = o.mib;
             Some(tokio::spawn(async move {
                 let mut transfer = pusher.open(TransferMeta::default()).await?;
@@ -453,7 +466,7 @@ async fn video(o: &Options, mbit: u64, competitor: Competitor) -> Res<VideoRow> 
         }
         Competitor::PullOther => {
             let requester = Arc::new(third.as_ref().expect("third runtime").requester(trust()));
-            requester.connect(&o.url(PORT_WEIDA, "/source")).await?;
+            requester.connect(&o.url(o.ports.main, "/source")).await?;
             let len = o.bytes();
             Some(tokio::spawn(async move {
                 let mut reply = requester.request(&len.to_be_bytes()).await?;

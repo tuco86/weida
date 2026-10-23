@@ -11,9 +11,7 @@ use weida::{
     SegmentTerms, TransferMeta, TreeHasher,
 };
 
-use crate::{
-    MIB, PORT_QUINN, PORT_SWARM_EXTRA, PORT_TCP, PORT_WEIDA, cpu_times, identity, pattern,
-};
+use crate::{MIB, Ports, cpu_times, identity, pattern};
 
 /// Pieces of the SWARM blob: 1 GiB of the 1 MiB pattern.
 pub const SWARM_PIECES: u32 = 1024;
@@ -21,11 +19,15 @@ pub const SWARM_PIECES: u32 = 1024;
 /// The relay's read size, as griasdi's screen share reads.
 const READ_CHUNK: usize = 64 * 1024;
 
-pub async fn run(bind: IpAddr) -> Result<(), Box<dyn Error>> {
+pub async fn run(
+    bind: IpAddr,
+    ports: &Ports,
+    lifetime: Option<std::time::Duration>,
+) -> Result<(), Box<dyn Error>> {
     let runtime = Runtime::new(RuntimeConfig::default())?;
     let main = runtime.listener();
     let _main_binding = main
-        .bind_quic(SocketAddr::new(bind, PORT_WEIDA), identity())
+        .bind_quic(SocketAddr::new(bind, ports.main), identity())
         .await?;
 
     let list = Arc::new(swarm_list());
@@ -93,28 +95,32 @@ pub async fn run(bind: IpAddr) -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Three more bindings, each its own listener with only `/swarm`, so a
-    // fetch sees four seeders on four connections.
+    // More bindings, each its own listener with only `/swarm`, so a fetch
+    // sees one seeder per binding on a connection of its own.
     let mut extra = Vec::new();
-    for i in 0..3 {
+    for &port in &ports.swarm {
         let listener = runtime.listener();
         let binding = listener
-            .bind_quic(SocketAddr::new(bind, PORT_SWARM_EXTRA + i), identity())
+            .bind_quic(SocketAddr::new(bind, port), identity())
             .await?;
         tokio::spawn(seed(listener.seeder("/swarm")?, Arc::clone(&list)));
         extra.push((listener, binding));
     }
 
-    crate::raw::serve_quinn(SocketAddr::new(bind, PORT_QUINN))
+    crate::raw::serve_quinn(SocketAddr::new(bind, ports.quinn))
         .await
         .map_err(|e| e.to_string())?;
-    crate::raw::serve_tcp(SocketAddr::new(bind, PORT_TCP))
+    crate::raw::serve_tcp(SocketAddr::new(bind, ports.tcp))
         .await
         .map_err(|e| e.to_string())?;
 
-    println!("READY");
-    std::future::pending::<()>().await;
-    drop((main, extra, runtime));
+    println!("READY {ports:?}");
+    match lifetime {
+        Some(lifetime) => tokio::time::sleep(lifetime).await,
+        None => std::future::pending::<()>().await,
+    }
+    drop((main, extra));
+    runtime.shutdown().await;
     Ok(())
 }
 
