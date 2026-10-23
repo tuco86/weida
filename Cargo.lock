@@ -3687,6 +3687,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-perf"
+version = "0.1.0-alpha.9-dev"
+dependencies = [
+ "bytes",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tracing-subscriber",
+ "weida",
+]
+
+[[package]]
 name = "weida-protocol"
 version = "0.1.0-alpha.9-dev"
 dependencies = [

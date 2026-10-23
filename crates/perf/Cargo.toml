@@ -1,0 +1,26 @@
+[package]
+name = "weida-perf"
+description = "Throughput and latency harness for weida between two hosts or over loopback"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+# A measuring tool for this repository only.
+publish = false
+
+[[bin]]
+name = "weida-perf"
+path = "src/main.rs"
+
+[dependencies]
+weida = { workspace = true, features = ["swarm"] }
+quinn.workspace = true
+rustls = { workspace = true, features = ["ring", "std"] }
+rustls-pki-types.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
