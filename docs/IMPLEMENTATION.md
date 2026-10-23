@@ -1438,5 +1438,5 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   lists the options. On the local transports nothing is pooled and nothing can reuse the
   connection, yet a dropped endpoint's control connection also stays open for the runtime's
   life and, on `AF_UNIX` and named pipes, keeps its place in the binding's
-  `max_connections`; closing it at the last handle lost a transfer the peer had not
-  dispatched yet (B-385), so it waits for a graceful close.
+  `max_connections`. Closing it at the last handle (B-385, on a branch) awaits an
+  explanation of one darwin failure before it lands.
