@@ -92,6 +92,10 @@ acceptance: `swarm/schedule.rs` no longer scans every piece of the blob for ever
 kind: test | size: 5 | status: done f07d803 | needs: []
 acceptance: `blocking::a_push_reaches_a_puller_and_the_receipt_comes_back` accepts the two bodies in either order: they are two streams, across which GUARANTEES §6 promises no order, and under load the receiving runtime handed "two" to the puller first (4 of 80 and 2 of 40 stress runs of the unit tier).
 
+### B-382 — SWARM across real hosts; a seeder lost mid-fetch as a unit test
+kind: test | size: 20 | status: in_progress 2026-10-23T01:02Z | needs: []
+acceptance: a throwaway probe (seeders with faults on tuco-pc, fetches of 256 MiB on atik/darwin over the 27 ms WireGuard path and on wohnzimmer/Windows, through `run_jobs` with the job scripts swapped in the working tree only) shows each fetch completing or failing as 0040/0041 say: one full seeder, full + corrupting + stalling (the bad two dropped, the blob completes), only the bad two (`NotConnected` after the 46 s answer deadline), full + slow + corrupting. What the sim tier did not cover becomes a unit test: `a_seeder_that_goes_away_mid_fetch_leaves_its_pieces_to_the_others` (a seeder's server closes after four pieces; the blob completes from the other well below the answer deadline, with no error to the caller). The probe, the temporary job scripts and the firewall rule are gone afterwards.
+
 ### B-351 — A busy seeder makes a session wait instead of dropping it
 kind: code | size: 45 | status: done d9fdd29 | needs: []
 acceptance: `swarm/seed.rs` `read_sessions` takes a place before it takes the next request, so the 65th pending session waits in the route's queue (`endpoint_queue`) and then on its stream, as a replier's request does, instead of being dropped and read by its fetch as a version-1 or failed seeder; integration test `a_busy_seeder_makes_a_session_wait_rather_than_drop_it` (MAX_PENDING_SESSIONS + 16 fetches against a seeder that accepts late, every fetch completes, exactly one session per fetch); 0041 §4.2, INVARIANTS, PATTERNS §6.5 say "waits"; full gate green.
