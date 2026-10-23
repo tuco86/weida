@@ -78,7 +78,9 @@ mod io {
     async fn a_session_fetch_keeps_up_with_a_normal_download() {
         let list = Arc::new(piece_list());
         let blob = list.blob();
-        let server = Server::start().await;
+        // On the OS network: the 27 ms path is `delay_proxy`, a real UDP
+        // forwarder, which a server on a simulated network never answers.
+        let server = Server::start_os().await;
 
         let seeder = server.listener.seeder("/swarm").expect("seeder");
         tokio::spawn(async move {
