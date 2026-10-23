@@ -1425,10 +1425,6 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   configuration time. `GuaranteeSet::validate` (`crates/protocol/src/header.rs`) checks the
   durability, replica and deduplication combinations and not this pair, and
   `Backpressure::Coalesce` is used nowhere beyond its definition.
-- **Decision 0017 §5's document edits are not made.**
-  [0017](decisions/0017-subscription-verdict.md) §5 asks [PROTOCOL.md](PROTOCOL.md) §6.4 and
-  §9.5, [PATTERNS.md](PATTERNS.md) §4 and [GUARANTEES.md](GUARANTEES.md) §6 to say that a
-  SUBSCRIBE is never answered and what its silence means; none of the four says it.
 - **A pooled client connection outlives every endpoint that used it.** The pool
   (`crates/weida/src/pool.rs`) keeps a connection until it closes, and a dialling connection
   sends keep-alives, so a connection no endpoint holds any more is never closed while the

@@ -775,6 +775,17 @@ Receiver behaviour:
   until negotiation completes; it is not a violation (§2.2).
 - A peer that registers no publishers MAY ignore these frames. Subscribing to a side that
   publishes nothing is useless, not hostile.
+- A SUBSCRIBE is **never answered**. One that does not close the connection has been received
+  and not refused, and that is all its silence says: recorded against a publisher, recorded
+  ahead of one, and ignored by a side that publishes nothing are indistinguishable by design.
+  A subscriber MUST NOT read a publisher at that path, a future message or an authorization
+  into it; one that needs a verdict asks on a companion Req/Rep path
+  ([decisions/0017](decisions/0017-subscription-verdict.md) §4.1, §4.2).
+- `LIMIT_EXCEEDED` answers overload and nothing else. A peer MUST NOT close the connection
+  with it to refuse one filter on authorization grounds, which would cost the subscriber its
+  other subscriptions and confirm that the path exists; a peer that does not want a
+  subscription and is not over `max_subscriptions` SHOULD record it and decline its copies
+  ([decisions/0017](decisions/0017-subscription-verdict.md) §4.6).
 
 ### 6.5 Guarantee set encoding
 
@@ -1493,7 +1504,10 @@ Delivery to a subscriber is best effort with **explicit drops**. A publisher bou
 payload bytes it will hold queued for one subscriber (`subscriber_buffer_bytes`); a message
 that does not fit is dropped for that subscriber alone, and the publisher continues. A slow
 consumer therefore cannot stall a publisher or its other subscribers. Publishing a payload
-larger than that bound fails locally rather than being dropped for everyone.
+larger than that bound fails locally rather than being dropped for everyone. SUBSCRIBE is
+never acknowledged (§6.4), so a subscriber cannot tell "subscribed, nothing published yet"
+from "every copy declined": the silence is the same. That is a different fact from the
+`PerProducer` sequence below, which makes a *drop* observable and never a refusal.
 
 **Ordering is `None` for both patterns in v0.** Every message is its own unidirectional
 stream, and QUIC does not order streams relative to each other. The per-pipe ordering of

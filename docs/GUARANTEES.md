@@ -579,6 +579,11 @@ Four points deserve emphasis, because each is easy to assume otherwise:
   goes out. A subscriber that parks nothing cannot receive fan-out at all and is refused
   when it subscribes, because silence is not an answer
   (`a_subscriber_that_parks_nothing_is_refused_at_connect`).
+- **No wire signal confirms a subscription either.** The converse of the drops above: a
+  SUBSCRIBE is never answered, and the connection staying up means only that it was received
+  and not refused ([decisions/0017](decisions/0017-subscription-verdict.md) §4.1). So
+  "silence is not an answer" holds on the wire in the other direction too: a subscriber that
+  needs a verdict asks for one over Req/Rep.
 - **Ordering across messages is `None` unless it is configured.** Each message is its
   own stream and QUIC does not order streams relative to each other. A publisher's
   per-subscriber writer enqueues copies in publication order, but that is an implementation

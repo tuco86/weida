@@ -575,6 +575,12 @@ Failure modes:
 | Message beyond the budget | `LimitExceeded`, nothing sent | — |
 | Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one, on every transport (§1.5) |
 
+A subscription is never confirmed either: SUBSCRIBE has no answer, so the silence after it
+means received and not refused, nothing more ([PROTOCOL.md](PROTOCOL.md) §6.4,
+[decisions/0017](decisions/0017-subscription-verdict.md)). An application that needs a yes or
+no asks on a companion Req/Rep path ([decisions/0015](decisions/0015-peer-authorization.md)
+§4.5).
+
 This is the one place weida answers overload by discarding, and it is confined to fan-out
 ([GUARANTEES.md](GUARANTEES.md) §6). Under `core` a subscriber cannot detect a drop; **subscriber-side
 drop detection is what the sequence key of [PROTOCOL.md](PROTOCOL.md) §6.2 exists for**
