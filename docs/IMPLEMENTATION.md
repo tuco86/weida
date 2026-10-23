@@ -1435,4 +1435,8 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   10 s, against the server's `max_connections`. Measured (B-383): four pushers dropped after
   one send each, three with a fresh identity, left four connections exchanging 96 datagrams
   per 120 s of silence. When an unused connection should close is the open question; B-383
-  lists the options.
+  lists the options. On the local transports nothing is pooled and nothing can reuse the
+  connection, yet a dropped endpoint's control connection also stays open for the runtime's
+  life and, on `AF_UNIX` and named pipes, keeps its place in the binding's
+  `max_connections`; closing it at the last handle lost a transfer the peer had not
+  dispatched yet (B-385), so it waits for a graceful close.
