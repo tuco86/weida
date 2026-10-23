@@ -805,6 +805,90 @@ async fn the_outbox_bound_blocks_or_drops_as_configured() {
     dropping.shutdown().await;
 }
 
+/// Claim: once every address is given up, nothing will drain the outbox, so
+/// a `send` fails with the loss as it would on an empty outbox: the sender
+/// blocked at the bound is woken with the error rather than left waiting
+/// forever, and a later `send` is refused rather than queued for nobody.
+#[tokio::test(start_paused = true)]
+async fn a_send_fails_once_every_address_is_given_up() {
+    let net = SimNet::new();
+    let certs = Certs::generate();
+    let server = Server::start(
+        Network::sim(&net),
+        &certs,
+        "127.0.0.1:0".parse().expect("loopback"),
+    )
+    .await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+    let client = Runtime::new(RuntimeConfig {
+        network: Network::sim(&net),
+        outbox_messages: 2,
+        reconnect: ReconnectPolicy {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(1),
+            max_attempts: Some(1),
+            ..client_config().reconnect
+        },
+        ..client_config()
+    })
+    .expect("client runtime");
+    let pusher = Arc::new(client.pusher(certs.client_tls()));
+    let mut events = pusher.events();
+    within(pusher.connect(&server.url("/jobs")))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        next_transition(&mut events).await,
+        PeerEvent::Connected { .. }
+    ));
+    drop(puller);
+    server.stop().await;
+    assert!(matches!(
+        next_transition(&mut events).await,
+        PeerEvent::Lost { .. }
+    ));
+
+    for body in [b"q0", b"q1"] {
+        within(pusher.send(body))
+            .await
+            .expect("queued while the redial runs");
+    }
+    let blocked = {
+        let pusher = Arc::clone(&pusher);
+        tokio::spawn(async move { pusher.send(b"q2").await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!blocked.is_finished(), "the third send blocks at the bound");
+
+    // The one redial reaches nobody and fails at the handshake timeout, which
+    // is longer than `within`'s deadline; the clock is paused, so waiting
+    // for it costs nothing.
+    let gave_up = timeout(Duration::from_secs(300), async {
+        loop {
+            match events.recv().await.expect("event stream open") {
+                PeerEvent::Retrying { .. } => continue,
+                event => return event,
+            }
+        }
+    });
+    assert!(matches!(
+        gave_up.await.expect("the slot is given up"),
+        PeerEvent::GaveUp { .. }
+    ));
+    let err = within(blocked)
+        .await
+        .expect("join")
+        .expect_err("nothing will ever make room");
+    assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
+    let err = within(pusher.send(b"q3"))
+        .await
+        .expect_err("no address is left to drain into");
+    assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
+
+    drop(pusher);
+    client.shutdown().await;
+}
+
 // --- 0031 §4.10: every scheme redials ----------------------------------------
 
 /// Claim: an in-process server that is shut down and bound again under the

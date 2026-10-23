@@ -714,7 +714,10 @@ impl Peer {
     /// (0031 §4.2, §4.3). A full outbox applies the configured backpressure:
     /// `Block` waits for room, `Drop` discards and counts, `Reject` fails
     /// with [`Error::LimitExceeded`]. A body larger than the outbox is
-    /// refused with [`Error::LimitExceeded`] rather than blocking forever.
+    /// refused with [`Error::LimitExceeded`] rather than blocking forever,
+    /// and once every address is given up `send` fails with
+    /// [`Error::ConnectionLost`] whether or not the outbox still holds
+    /// bodies: nothing would ever write them.
     pub async fn send(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
         let shared = &self.shared;
         if shared.outbox_is_empty()
@@ -1002,15 +1005,26 @@ impl PeerShared {
 
     /// Copies `body` into the outbox, applying the bound and the configured
     /// backpressure behaviour at it.
+    ///
+    /// An endpoint whose every address was given up has nothing that will
+    /// ever drain the outbox, so the body is refused with the loss, as a
+    /// `send` on an empty outbox would be, and a sender waiting at the
+    /// bound is woken with it rather than left waiting forever.
     async fn enqueue(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
         let config = &self.runtime.config;
         if body.len() > config.outbox_bytes {
             return Err(Error::LimitExceeded);
         }
         loop {
+            // Both registered before the checks, so neither a pop nor a
+            // give-up between a check and the await is missed.
             let room = self.outbox.room.notified();
             tokio::pin!(room);
             room.as_mut().enable();
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            self.try_pick()?;
             {
                 let mut queue = self.outbox.queue.lock().expect("outbox poisoned");
                 let bytes = self.outbox.bytes.load(Ordering::Relaxed);
@@ -1032,7 +1046,10 @@ impl PeerShared {
                     return Ok(());
                 }
                 OutboxFull::Reject => return Err(Error::LimitExceeded),
-                OutboxFull::Block => room.await,
+                OutboxFull::Block => tokio::select! {
+                    () = room => {}
+                    () = changed => {}
+                },
             }
         }
     }
