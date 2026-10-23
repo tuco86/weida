@@ -169,6 +169,9 @@ socket2 = "0.6"
 futures-io = "0.3"
 futures = "0.3"
 tracing = "0.1"
+# `getpeereid` for `weida-runtime` on Apple targets only, without `unsafe`
+# (B-392); it needs both `socket` and `user`.
+nix = { version = "0.30", default-features = false, features = ["socket", "user"] }
 rand = "0.9"
 minicbor = { version = "2", features = ["alloc"] }
 rustls-pki-types = { version = "1", features = ["std"] }

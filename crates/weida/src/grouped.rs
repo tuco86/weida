@@ -46,12 +46,12 @@
 //! that finds none drops that copy and counts it, which is the answer
 //! fan-out already gives an exhausted subscriber budget [0012 §4.4].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use weida_core::{Error, LossCause, PeerIdentity};
 use weida_protocol::codes;
 
@@ -145,12 +145,157 @@ pub(crate) type Place = OwnedSemaphorePermit;
 /// The peers a binding has admitted, keyed by their group token.
 pub(crate) struct Groups<S: Stream> {
     entries: StdMutex<HashMap<[u8; TOKEN_LEN], Group<S>>>,
+    /// What a link whose peer's control connection ended waits on before it
+    /// closes: every connection the binding had been handed by then is
+    /// admitted.
+    barrier: Arc<AcceptBarrier>,
+}
+
+impl<S: Stream> Groups<S> {
+    /// A registry whose links wait on `barrier`, which the binding's accept
+    /// loop serves.
+    pub(crate) fn new(barrier: Arc<AcceptBarrier>) -> Groups<S> {
+        Groups {
+            entries: StdMutex::new(HashMap::new()),
+            barrier,
+        }
+    }
 }
 
 impl<S: Stream> Default for Groups<S> {
+    /// A registry with no accept loop behind it: its barrier passes at once.
     fn default() -> Groups<S> {
-        Groups {
-            entries: StdMutex::new(HashMap::new()),
+        Groups::new(AcceptBarrier::new().0)
+    }
+}
+
+/// Orders a closing link after the connections its peer opened before it
+/// went ([B-392](../../../docs/BACKLOG.md)).
+///
+/// A local peer opens a transfer connection, writes its payload, takes the
+/// receipt (the kernel has the bytes) and exits, which ends its control
+/// connection. The transfer connection's `connect` returned before that, so
+/// it is already in the binding's hands: in the kernel's accept queue (a
+/// unix socket), connected to a listening instance (a named pipe), or
+/// accepted and reading its preamble. A link that closed when the control
+/// connection ended, or after a guessed quiet period, refused it once its
+/// token named no group any more, and the receipt had lied.
+///
+/// So the link asks the accept loop for a barrier: the loop takes every
+/// connection it was handed and can take now without waiting for a client
+/// (accept until the queue is empty, every instance a client connected to),
+/// numbers each, and answers with the last number; the link then waits until
+/// every connection up to that number has been admitted or turned away.
+/// Every connection numbered holds a [`Ticket`] until then.
+///
+/// Taking a connection takes a place of the binding's `max_connections`.
+/// The request brings the place of the control connection that ended, and
+/// the loop takes further ones only if they are free: waiting for one could
+/// wait for a link that is itself waiting on a barrier. A peer that went
+/// while the binding was full therefore gets its first queued connection
+/// for certain and the rest as far as places are free.
+pub(crate) struct AcceptBarrier {
+    requests: mpsc::UnboundedSender<BarrierRequest>,
+    /// Numbers of the connections accepted and not yet admitted.
+    in_flight: StdMutex<BTreeSet<u64>>,
+    /// The number the next accepted connection gets; numbers start at 1.
+    next: AtomicU64,
+    settled: Notify,
+}
+
+/// One closing link's request: answer with the last number once the
+/// queue is taken, spending `place` first.
+pub(crate) struct BarrierRequest {
+    pub(crate) answer: oneshot::Sender<u64>,
+    pub(crate) place: Option<Place>,
+}
+
+impl BarrierRequest {
+    /// A place to take the next queued connection with: the one the request
+    /// brought, then any free one; `None` when the binding is full.
+    pub(crate) fn next_place(&mut self, admitted: &Arc<Semaphore>) -> Option<Place> {
+        self.place
+            .take()
+            .or_else(|| Arc::clone(admitted).try_acquire_owned().ok())
+    }
+}
+
+/// The accept loop's end of an [`AcceptBarrier`]: one request per closing
+/// link, answered once the loop has taken what it was handed.
+pub(crate) type BarrierRequests = mpsc::UnboundedReceiver<BarrierRequest>;
+
+/// One accepted connection that has not been admitted yet; dropping it
+/// marks it settled.
+pub(crate) struct Ticket {
+    barrier: Arc<AcceptBarrier>,
+    number: u64,
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.barrier
+            .in_flight
+            .lock()
+            .expect("barrier poisoned")
+            .remove(&self.number);
+        self.barrier.settled.notify_waiters();
+    }
+}
+
+impl AcceptBarrier {
+    pub(crate) fn new() -> (Arc<AcceptBarrier>, BarrierRequests) {
+        let (requests, rx) = mpsc::unbounded_channel();
+        let barrier = Arc::new(AcceptBarrier {
+            requests,
+            in_flight: StdMutex::new(BTreeSet::new()),
+            next: AtomicU64::new(1),
+            settled: Notify::new(),
+        });
+        (barrier, rx)
+    }
+
+    /// Numbers a connection the accept loop just took.
+    pub(crate) fn ticket(self: &Arc<AcceptBarrier>) -> Ticket {
+        let mut in_flight = self.in_flight.lock().expect("barrier poisoned");
+        let number = self.next.fetch_add(1, Ordering::Relaxed);
+        in_flight.insert(number);
+        Ticket {
+            barrier: Arc::clone(self),
+            number,
+        }
+    }
+
+    /// The number of the last connection numbered so far, for the answer to
+    /// a request.
+    pub(crate) fn last(&self) -> u64 {
+        self.next.load(Ordering::Relaxed) - 1
+    }
+
+    /// Resolves once every connection the accept loop had been handed when
+    /// this was called is admitted or turned away. Passes at once when no
+    /// accept loop serves the barrier any more.
+    async fn wait(&self, place: Option<Place>) {
+        let (answer, answered) = oneshot::channel();
+        if self
+            .requests
+            .send(BarrierRequest { answer, place })
+            .is_err()
+        {
+            return;
+        }
+        let Ok(upto) = answered.await else { return };
+        loop {
+            let settled = self.settled.notified();
+            let pending = self
+                .in_flight
+                .lock()
+                .expect("barrier poisoned")
+                .first()
+                .is_some_and(|&first| first <= upto);
+            if !pending {
+                return;
+            }
+            settled.await;
         }
     }
 }
@@ -168,6 +313,12 @@ struct Group<S: Stream> {
     /// Connections this peer parked for streams in the other direction
     /// [0012 §4.4]. Shared with the peer's link, which is what spends them.
     reverse: Arc<ReversePool<S>>,
+    /// The binding's place the control connection holds. Once the peer's
+    /// control connection ends, its link hands it to the accept barrier, so
+    /// the connections the peer opened before it went can be accepted even
+    /// when the binding is at `max_connections`: the peer's count does not
+    /// grow, it moves from a connection that is gone to one it sent.
+    control_place: Option<Place>,
 }
 
 /// The connections one peer parked, and the two bounds they live under.
@@ -224,6 +375,7 @@ impl<S: Stream> Groups<S> {
         principal: S::Principal,
         transfers: mpsc::UnboundedSender<Halves<S>>,
         reverse: Arc<ReversePool<S>>,
+        control_place: Option<Place>,
     ) {
         self.entries
             .lock()
@@ -235,8 +387,18 @@ impl<S: Stream> Groups<S> {
                     live: Arc::new(Semaphore::new(LIVE_CAP)),
                     transfers,
                     reverse,
+                    control_place,
                 },
             );
+    }
+
+    /// The place the group's control connection held, taken once.
+    fn take_control_place(&self, token: &[u8; TOKEN_LEN]) -> Option<Place> {
+        self.entries
+            .lock()
+            .expect("group registry poisoned")
+            .get_mut(token)
+            .and_then(|group| group.control_place.take())
     }
 
     fn remove(&self, token: &[u8; TOKEN_LEN]) {
@@ -353,7 +515,9 @@ pub(crate) async fn read_accepted<S: Stream>(mut stream: S) -> Result<Accepted<S
 ///
 /// `exec` runs the watch over the peer's control connection, which is how
 /// the link learns that a peer left without saying so (see
-/// [`Grouped::accept_uni`]).
+/// [`Grouped::accept_uni`]). `place` is the binding's place the control
+/// connection holds; the group keeps it until the link closes
+/// ([`Group::control_place`]).
 pub(crate) async fn accept_control<S: Stream>(
     mut stream: S,
     principal: S::Principal,
@@ -361,6 +525,7 @@ pub(crate) async fn accept_control<S: Stream>(
     max_streams: usize,
     max_parked: usize,
     exec: Exec,
+    place: Option<Place>,
 ) -> Result<Grouped<S>, Error> {
     let token = random_token();
     let slots = stream_slots(max_streams);
@@ -372,7 +537,13 @@ pub(crate) async fn accept_control<S: Stream>(
     // connections the moment it reads the token, and the accept loop may
     // admit one on another thread before this task runs again. A token the
     // peer can read always names a group.
-    groups.insert(token, principal.clone(), transfers_tx, Arc::clone(&reverse));
+    groups.insert(
+        token,
+        principal.clone(),
+        transfers_tx,
+        Arc::clone(&reverse),
+        place,
+    );
     let registered = Registered {
         groups: &groups,
         token,
@@ -555,13 +726,11 @@ impl<S: Stream> Closing<S> {
 const LIVE_CAP: usize = Semaphore::MAX_PERMITS;
 
 /// The longest a link whose peer's control connection ended waits for the
-/// transfers the peer had already sent before it closes anyway.
+/// transfers the peer had already sent before it closes anyway: for the
+/// accept loop to reach them ([`AcceptBarrier`]), which waits for a place
+/// when the binding is at `max_connections`, and for the admitted ones to
+/// finish.
 const PEER_GONE_LINGER: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long nothing may have been admitted for such a link before it closes:
-/// the peer's last connections can still be between the kernel's accept queue
-/// and their admission when its control connection is seen to end.
-const PEER_GONE_QUIET: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// How often such a link looks at what is still admitted for it. It looks
 /// rather than waits for every permit, because a task waiting for all of them
@@ -607,23 +776,17 @@ impl<S: Stream> ControlWatch<S> {
             }
             // The peer's end is gone, and a sender that pushes and exits is
             // an ordinary peer: what it already sent is still delivered. The
-            // link closes once the transfers admitted for it are done and
-            // nothing more has arrived for a quiet moment, or after a bound
-            // for one that never completes.
-            let live = closing
-                .group
-                .as_ref()
-                .and_then(|(groups, token)| groups.live(token));
-            if let Some(live) = live {
+            // link closes once every connection the binding had been handed
+            // is admitted (the barrier) and the transfers admitted for it are
+            // done, or after a bound for one that never completes.
+            if let Some((groups, token)) = closing.group.as_ref() {
                 let settled = async {
-                    let mut idle = std::time::Duration::ZERO;
-                    while idle < PEER_GONE_QUIET {
+                    groups.barrier.wait(groups.take_control_place(token)).await;
+                    let Some(live) = groups.live(token) else {
+                        return;
+                    };
+                    while live.available_permits() != LIVE_CAP {
                         linger.sleep(PEER_GONE_TICK).await;
-                        if live.available_permits() == LIVE_CAP {
-                            idle += PEER_GONE_TICK;
-                        } else {
-                            idle = std::time::Duration::ZERO;
-                        }
                     }
                 };
                 let _ = linger.within(PEER_GONE_LINGER, settled).await;
@@ -1413,6 +1576,7 @@ mod tests {
             8,
             8,
             Exec::current().expect("a tokio runtime"),
+            None,
         )
         .await
         .expect("accepted");
@@ -1446,6 +1610,7 @@ mod tests {
             8,
             8,
             Exec::current().expect("a tokio runtime"),
+            None,
         ));
         let polled =
             std::future::poll_fn(|cx| Poll::Ready(accepting.as_mut().poll(cx).is_pending())).await;

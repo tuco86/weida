@@ -288,9 +288,15 @@ fn is_socket(meta: &std::fs::Metadata) -> bool {
 /// Taken at accept or connect time, which is when `SO_PEERCRED` captures
 /// them; they are **not** re-read per message, and re-reading would not help:
 /// the values are a snapshot of the peer as it was when the socket was
-/// created (`docs/research/ipc.md` §1.5). The pid is an `Option` because
-/// macOS's `LOCAL_PEERCRED` reports none, and because a pid is an
-/// observation — it may be reused — rather than an identity.
+/// created (`docs/research/ipc.md` §1.5). The pid is an `Option` because a
+/// pid is an observation — it may be reused — rather than an identity, and
+/// because macOS answers it only while the peer is still connected.
+///
+/// On macOS `LOCAL_PEEREPID` fails with `ENOTCONN` once the peer closed its
+/// end, and tokio's `peer_cred` fails with it, while the uid and gid
+/// (`getpeereid`, the connect-time `LOCAL_PEERCRED`) stay readable. A
+/// sender that wrote, got its receipt and exited is still the same user, so
+/// its credentials are then the uid and gid without a pid (B-392).
 ///
 /// A protocol that uses this as an authorization input should say so
 /// explicitly: libzmq's `ZMQ_IPC_FILTER_UID`/`_GID`/`_PID` did exactly this
@@ -298,14 +304,23 @@ fn is_socket(meta: &std::fs::Metadata) -> bool {
 /// authorization lives and not about whether the kernel's answer is true
 /// (`docs/research/zeromq.md` §10).
 pub fn peer_credentials(stream: &UnixStream) -> Result<LocalPrincipal, Error> {
-    let cred = stream.peer_cred().map_err(Error::Io)?;
-    Ok(LocalPrincipal {
-        uid: cred.uid(),
-        gid: cred.gid(),
-        // macOS reports no PID at all, and a PID is an observation even where
-        // it exists [0010 §4.4].
-        pid: cred.pid().map(|pid| pid as u32),
-    })
+    match stream.peer_cred() {
+        Ok(cred) => Ok(LocalPrincipal {
+            uid: cred.uid(),
+            gid: cred.gid(),
+            pid: cred.pid().map(|pid| pid as u32),
+        }),
+        #[cfg(target_vendor = "apple")]
+        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+            let (uid, gid) = nix::unistd::getpeereid(stream).map_err(|e| Error::Io(e.into()))?;
+            Ok(LocalPrincipal {
+                uid: uid.as_raw(),
+                gid: gid.as_raw(),
+                pid: None,
+            })
+        }
+        Err(e) => Err(Error::Io(e)),
+    }
 }
 
 #[cfg(test)]

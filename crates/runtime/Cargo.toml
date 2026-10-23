@@ -24,6 +24,12 @@ tokio.workspace = true
 # keeps `unsafe_code = "forbid"` on Windows too.
 weida-winpipe.workspace = true
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# `getpeereid` without `unsafe`: macOS keeps a peer's uid and gid readable
+# after it closed, but tokio's `peer_cred` also asks for its pid, which
+# macOS answers only while the peer is connected (B-392).
+nix.workspace = true
+
 [dev-dependencies]
 # Waits that report instead of killing (B-389).
 weida-testkit.workspace = true

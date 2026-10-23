@@ -1501,7 +1501,9 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   configuration time. `GuaranteeSet::validate` (`crates/protocol/src/header.rs`) checks the
   durability, replica and deduplication combinations and not this pair, and
   `Backpressure::Coalesce` is used nowhere beyond its definition.
-- **A local send can be lost after its receipt.** On `AF_UNIX` a receipt means the kernel took
-  the bytes; when the dialler then exits, the accepting side closes the group 200 ms after
-  its control connection ends, and a transfer connection its accept loop has not admitted by
-  then is refused. Reproduced on darwin with 16 parallel CLI tests (B-392).
+- **A full local binding delivers one queued transfer of a peer that went, not all.** Since
+  B-392 a link whose peer's control connection ended takes the connections waiting for it
+  before it closes, spending the control connection's place on the first; further ones need
+  free places, and at `max_connections` they are accepted after the group is gone and
+  refused, with the sender holding receipts for them. Waiting for places there could wait on
+  another closing link that waits the same way.

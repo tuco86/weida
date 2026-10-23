@@ -436,3 +436,55 @@ async fn a_dropped_unix_endpoint_gives_its_binding_place_back() {
     client.shutdown().await;
     h.shutdown().await;
 }
+
+/// Claim (B-392): a body whose receipt the sender got is delivered even when
+/// its transfer connection is still in the binding's queue as the sender's
+/// control connection ends. A binding with two places, both held by control
+/// connections: the first pusher's transfer connection waits in the queue,
+/// its receipt comes back (on a socket that is "the kernel took the bytes"),
+/// and the pusher is dropped. Before the closing link waited for the
+/// queue, it closed its group 200 ms after the control connection ended and
+/// the transfer, accepted with the place that freed, named no group any more.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_queued_transfer_is_delivered_after_its_sender_went() {
+    let h = Harness::start_with(
+        Transport::SimUnix,
+        weida::RuntimeConfig {
+            max_connections: 2,
+            ..weida::RuntimeConfig::default()
+        },
+    )
+    .await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let client = h.client();
+    let sender = client.pusher(h.trust());
+    within(sender.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    // Holds the binding's second place for the whole test.
+    let bystander = client.pusher(h.trust());
+    within(bystander.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+
+    let mut transfer = within(sender.open(weida::TransferMeta::default()))
+        .await
+        .expect("open");
+    within(transfer.write_all(b"sent before it went"))
+        .await
+        .expect("write");
+    within(transfer.finish().expect("finish").delivered())
+        .await
+        .expect("the receipt");
+    drop(sender);
+
+    let got = within(puller.recv()).await.expect("recv");
+    assert_eq!(
+        within(got.collect(64)).await.expect("collect"),
+        b"sent before it went"
+    );
+    drop(bystander);
+    client.shutdown().await;
+    h.shutdown().await;
+}

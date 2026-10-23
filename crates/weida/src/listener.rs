@@ -516,10 +516,8 @@ impl Listener {
         #[cfg(feature = "test-util")]
         if let Some(net) = self.inner.runtime.config.network.sim_net() {
             let crate::sim::LocalListener { incoming, lease } = net.bind_local(path)?;
-            exec.spawn(accept_sim_unix(
-                incoming,
-                self.local_accept(|link| Link::Unix(Box::new(link))),
-            ));
+            let (serve, requests) = self.local_accept(|link| Link::Unix(Box::new(link)));
+            exec.spawn(accept_sim_unix(incoming, requests, serve));
             tracing::info!(path = %path.display(), "simulated unix binding listening");
             return Ok(UnixBinding {
                 inner: UnixBound::Sim(lease),
@@ -537,10 +535,8 @@ impl Listener {
             // [0010 §4.5].
             weida_runtime::BoundUnixSocket::bind(path)?
         };
-        exec.spawn(accept_unix(
-            listener,
-            self.local_accept(|link| Link::Unix(Box::new(link))),
-        ));
+        let (serve, requests) = self.local_accept(|link| Link::Unix(Box::new(link)));
+        exec.spawn(accept_unix(listener, requests, serve));
         tracing::info!(path = %path.display(), "unix binding listening");
         Ok(UnixBinding {
             inner: UnixBound::Os(binding),
@@ -566,12 +562,8 @@ impl Listener {
         };
         let name = addr.name.clone();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        exec.spawn(accept_pipe(
-            binding,
-            first,
-            stop_rx,
-            self.local_accept(|link| Link::Pipe(Box::new(link))),
-        ));
+        let (serve, requests) = self.local_accept(|link| Link::Pipe(Box::new(link)));
+        exec.spawn(accept_pipe(binding, first, stop_rx, requests, serve));
         tracing::info!(pipe = %name, "pipe binding listening");
         Ok(PipeBinding {
             name,
@@ -580,15 +572,18 @@ impl Listener {
     }
 
     /// What every accepted connection of a grouped local transport is
-    /// served with.
+    /// served with, and the requests of its links' accept barrier, which the
+    /// accept loop answers.
     #[cfg(any(unix, windows))]
     fn local_accept<S: crate::grouped::Stream>(
         &self,
         link: fn(crate::grouped::Grouped<S>) -> Link,
-    ) -> LocalAccept<S> {
+    ) -> (LocalAccept<S>, crate::grouped::BarrierRequests) {
         let max_connections = self.inner.runtime.config.max_connections;
-        LocalAccept {
-            groups: Arc::new(crate::grouped::Groups::default()),
+        let (barrier, requests) = crate::grouped::AcceptBarrier::new();
+        let serve = LocalAccept {
+            groups: Arc::new(crate::grouped::Groups::new(Arc::clone(&barrier))),
+            barrier,
             namespace: Arc::clone(&self.inner.namespace),
             subs: Arc::clone(&self.inner.subs),
             limits: self.inner.runtime.config.limits,
@@ -602,7 +597,8 @@ impl Listener {
                 max_connections.clamp(1, Semaphore::MAX_PERMITS),
             )),
             refusals: Arc::new(LogThrottle::new(REFUSAL_LOG_INTERVAL)),
-        }
+        };
+        (serve, requests)
     }
 
     /// Registers a replier for `path`.
@@ -1039,6 +1035,9 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 #[cfg(any(unix, windows))]
 struct LocalAccept<S: crate::grouped::Stream> {
     groups: Arc<crate::grouped::Groups<S>>,
+    /// The barrier the groups' closing links wait on: every connection this
+    /// binding accepts holds a ticket of it until it is admitted.
+    barrier: Arc<crate::grouped::AcceptBarrier>,
     namespace: Arc<Namespace>,
     subs: Arc<SubRegistry>,
     limits: Limits,
@@ -1067,6 +1066,7 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
     fn clone_for(&self) -> LocalAccept<S> {
         LocalAccept {
             groups: Arc::clone(&self.groups),
+            barrier: Arc::clone(&self.barrier),
             namespace: Arc::clone(&self.namespace),
             subs: Arc::clone(&self.subs),
             limits: self.limits,
@@ -1080,11 +1080,20 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
         }
     }
 
+    /// Hands one accepted connection to a task of its own, numbered for the
+    /// barrier before the accept loop takes the next one.
+    fn spawn(&self, stream: S, place: OwnedSemaphorePermit) {
+        let ticket = self.barrier.ticket();
+        self.exec
+            .spawn(self.clone_for().serve(stream, place, ticket));
+    }
+
     /// Serves one accepted connection: a control connection becomes a
     /// peer, a transfer or reverse connection joins the peer its token
     /// names ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
-    /// §4.1, §4.2, §4.4).
-    async fn serve(self, stream: S, place: OwnedSemaphorePermit) {
+    /// §4.1, §4.2, §4.4). `ticket` is held until the connection is admitted
+    /// or turned away.
+    async fn serve(self, stream: S, place: OwnedSemaphorePermit, ticket: crate::grouped::Ticket) {
         use crate::grouped::{
             Accepted, accept_control, admit_reverse, admit_transfer, read_accepted,
         };
@@ -1104,8 +1113,11 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
         };
         match accepted {
             Accepted::Control(stream, principal) => {
+                // Not a transfer anyone's link waits for.
+                drop(ticket);
                 // A control connection is a peer, and keeps its place until
-                // it closes.
+                // its link closes; the group holds it, so a peer that went
+                // can spend it on the connections it sent before it went.
                 let link = match accept_control(
                     stream,
                     principal,
@@ -1113,6 +1125,7 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
                     self.limits.max_local_streams,
                     self.limits.max_parked_reverse,
                     self.exec.clone(),
+                    Some(place),
                 )
                 .await
                 {
@@ -1136,11 +1149,7 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
                 self.subs.remove_connection(conn_id);
                 let departure = crate::conn::take_departure(&ctx);
                 tracing::debug!(%reason, "local connection closed");
-                depart(departure, &self.departing, move || {
-                    drop(ctx);
-                    drop(place);
-                })
-                .await;
+                depart(departure, &self.departing, move || drop(ctx)).await;
             }
             Accepted::Transfer(token, stream, principal) => {
                 // The connection keeps its place until both of its halves are
@@ -1177,64 +1186,155 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
 /// and a dialler's `connect` fails visibly once that is full, instead of the
 /// connection being accepted and closed with its payload already written: a
 /// sender that outruns a slow consumer loses nothing.
+///
+/// A barrier request ([`crate::grouped::AcceptBarrier`]) is answered after
+/// the queue is empty: every connection a dialler's `connect` already
+/// returned for is accepted and numbered first.
 #[cfg(unix)]
 async fn accept_unix(
     listener: tokio::net::UnixListener,
+    mut requests: crate::grouped::BarrierRequests,
     serve: LocalAccept<crate::unix::UnixLocal>,
 ) {
     loop {
-        // The semaphore is never closed, so this only fails if it were.
-        let Ok(place) = Arc::clone(&serve.admitted).acquire_owned().await else {
-            return;
-        };
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                // Descriptor or memory exhaustion passes, and a socket that
-                // died before it was accepted concerns nobody but its peer:
-                // neither ends the binding, which would stay dead after the
-                // cause was gone.
-                if let Some(held_back) = serve.refusals.pass() {
-                    tracing::warn!(error = %e, held_back, "accepting a unix connection failed; retrying");
+        tokio::select! {
+            Some(request) = requests.recv() => drain_unix_queue(&listener, &serve, request, None),
+            place = Arc::clone(&serve.admitted).acquire_owned() => {
+                // The semaphore is never closed, so this only fails if it were.
+                let Ok(place) = place else { return };
+                tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => take_unix(&serve, stream, place),
+                        Err(e) => {
+                            // Descriptor or memory exhaustion passes, and a
+                            // socket that died before it was accepted concerns
+                            // nobody but its peer: neither ends the binding,
+                            // which would stay dead after the cause was gone.
+                            if let Some(held_back) = serve.refusals.pass() {
+                                tracing::warn!(error = %e, held_back, "accepting a unix connection failed; retrying");
+                            }
+                            serve.exec.sleep(ACCEPT_RETRY).await;
+                        }
+                    },
+                    Some(request) = requests.recv() => {
+                        drain_unix_queue(&listener, &serve, request, Some(place));
+                    }
                 }
-                serve.exec.sleep(ACCEPT_RETRY).await;
-                continue;
             }
-        };
-        if serve.shared.drain.is_draining() {
-            // Admission stopped: the same rule as on every other binding
-            // (`docs/decisions/0009-drain.md` §4.5).
-            continue;
         }
-        // The accepted socket carries the runtime its halves write their
-        // end-of-payload marker on, exactly as a pipe instance does.
-        let stream = crate::unix::UnixLocal::accepted(stream, serve.exec.clone());
-        serve.exec.spawn(serve.clone_for().serve(stream, place));
     }
 }
 
+/// Answers a barrier request: accepts every connection waiting in the
+/// kernel's queue now, with the place the loop held, the one the request
+/// brought and any free one ([`crate::grouped::AcceptBarrier`]), and stops
+/// once the queue is empty or no place is left.
+///
+/// The queue is asked with `accept(2)` itself, not through the reactor:
+/// the reactor's readiness can lag the queue, which is the very lag the
+/// barrier exists for, and an empty answer from it would not mean an empty
+/// queue.
+#[cfg(unix)]
+fn drain_unix_queue(
+    listener: &tokio::net::UnixListener,
+    serve: &LocalAccept<crate::unix::UnixLocal>,
+    mut request: crate::grouped::BarrierRequest,
+    mut held: Option<OwnedSemaphorePermit>,
+) {
+    use std::os::fd::AsFd;
+    // The same listening socket, non-blocking like the original: an empty
+    // queue answers `WouldBlock`.
+    let queue = match listener.as_fd().try_clone_to_owned() {
+        Ok(fd) => Some(std::os::unix::net::UnixListener::from(fd)),
+        Err(e) => {
+            tracing::debug!(error = %e, "the unix accept queue could not be read");
+            None
+        }
+    };
+    if let Some(queue) = queue {
+        while let Some(place) = held.take().or_else(|| request.next_place(&serve.admitted)) {
+            let stream = queue.accept().and_then(|(stream, _)| {
+                stream.set_nonblocking(true)?;
+                let _guard = serve.exec.enter();
+                tokio::net::UnixStream::from_std(stream)
+            });
+            match stream {
+                Ok(stream) => take_unix(serve, stream, place),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    tracing::debug!(error = %e, "accepting a queued unix connection failed");
+                    break;
+                }
+            }
+        }
+    }
+    let _ = request.answer.send(serve.barrier.last());
+}
+
+/// Serves one accepted unix connection under the drain rule.
+#[cfg(unix)]
+fn take_unix(
+    serve: &LocalAccept<crate::unix::UnixLocal>,
+    stream: tokio::net::UnixStream,
+    place: OwnedSemaphorePermit,
+) {
+    if serve.shared.drain.is_draining() {
+        // Admission stopped: the same rule as on every other binding
+        // (`docs/decisions/0009-drain.md` §4.5).
+        return;
+    }
+    // The accepted socket carries the runtime its halves write their
+    // end-of-payload marker on, exactly as a pipe instance does.
+    serve.spawn(
+        crate::unix::UnixLocal::accepted(stream, serve.exec.clone()),
+        place,
+    );
+}
+
 /// [`accept_unix`] for a binding on a simulated network: the same place
-/// before each accept and the same drain rule, over the connections the
-/// `SimNet` hands this path. Ends once the binding is dropped and no dial
-/// is still on its way in.
+/// before each accept, the same drain rule and the same barrier, over the
+/// connections the `SimNet` hands this path, whose channel is the queue.
+/// Ends once the binding is dropped and no dial is still on its way in.
 #[cfg(all(unix, feature = "test-util"))]
 async fn accept_sim_unix(
     mut incoming: tokio::sync::mpsc::Receiver<tokio::io::DuplexStream>,
+    mut requests: crate::grouped::BarrierRequests,
     serve: LocalAccept<crate::unix::UnixLocal>,
 ) {
-    loop {
-        // The semaphore is never closed, so this only fails if it were.
-        let Ok(place) = Arc::clone(&serve.admitted).acquire_owned().await else {
-            return;
-        };
-        let Some(stream) = incoming.recv().await else {
-            return;
-        };
-        if serve.shared.drain.is_draining() {
-            continue;
+    let take = |stream, place| {
+        if !serve.shared.drain.is_draining() {
+            serve.spawn(
+                crate::unix::UnixLocal::accepted_sim(stream, serve.exec.clone()),
+                place,
+            );
         }
-        let stream = crate::unix::UnixLocal::accepted_sim(stream, serve.exec.clone());
-        serve.exec.spawn(serve.clone_for().serve(stream, place));
+    };
+    let drain = |incoming: &mut tokio::sync::mpsc::Receiver<tokio::io::DuplexStream>,
+                 mut request: crate::grouped::BarrierRequest,
+                 mut held: Option<OwnedSemaphorePermit>| {
+        while let Some(place) = held.take().or_else(|| request.next_place(&serve.admitted)) {
+            match incoming.try_recv() {
+                Ok(stream) => take(stream, place),
+                Err(_) => break,
+            }
+        }
+        let _ = request.answer.send(serve.barrier.last());
+    };
+    loop {
+        tokio::select! {
+            Some(request) = requests.recv() => drain(&mut incoming, request, None),
+            place = Arc::clone(&serve.admitted).acquire_owned() => {
+                // The semaphore is never closed, so this only fails if it were.
+                let Ok(place) = place else { return };
+                tokio::select! {
+                    stream = incoming.recv() => {
+                        let Some(stream) = stream else { return };
+                        take(stream, place);
+                    }
+                    Some(request) = requests.recv() => drain(&mut incoming, request, Some(place)),
+                }
+            }
+        }
     }
 }
 
@@ -1249,46 +1349,62 @@ async fn accept_sim_unix(
 #[cfg(windows)]
 const PIPE_LISTENING: usize = 16;
 
-/// One pipe instance waiting for a client, with the place it holds.
+/// One pipe instance waiting for a client, with the place it holds. The
+/// server is shared with the pending connect, so a barrier can ask the
+/// instance itself whether a client is on it.
 #[cfg(windows)]
-type PipeListening = std::pin::Pin<
-    Box<
-        dyn Future<
-                Output = (
-                    tokio::net::windows::named_pipe::NamedPipeServer,
-                    OwnedSemaphorePermit,
-                    io::Result<()>,
-                ),
-            > + Send,
-    >,
->;
+struct PipeListening {
+    server: Arc<tokio::net::windows::named_pipe::NamedPipeServer>,
+    connect: std::pin::Pin<Box<dyn Future<Output = (OwnedSemaphorePermit, io::Result<()>)> + Send>>,
+}
+
+/// What a completed listen hands on: the instance, its place, how the
+/// connect ended.
+#[cfg(windows)]
+type PipeAccepted = (
+    tokio::net::windows::named_pipe::NamedPipeServer,
+    OwnedSemaphorePermit,
+    io::Result<()>,
+);
 
 #[cfg(windows)]
 fn pipe_listen(
     server: tokio::net::windows::named_pipe::NamedPipeServer,
     place: OwnedSemaphorePermit,
 ) -> PipeListening {
-    Box::pin(async move {
-        let connected = server.connect().await;
-        (server, place, connected)
-    })
+    let server = Arc::new(server);
+    let connecting = Arc::clone(&server);
+    PipeListening {
+        server,
+        connect: Box::pin(async move {
+            let connected = connecting.connect().await;
+            (place, connected)
+        }),
+    }
+}
+
+#[cfg(windows)]
+impl PipeListening {
+    /// The instance and its place once `connect` resolved to `out`: the
+    /// connect future has let go of its share of the server by then.
+    fn accepted(self, out: (OwnedSemaphorePermit, io::Result<()>)) -> Option<PipeAccepted> {
+        let PipeListening { server, connect } = self;
+        drop(connect);
+        let (place, connected) = out;
+        Arc::try_unwrap(server)
+            .ok()
+            .map(|server| (server, place, connected))
+    }
 }
 
 /// The first of `listening` a client connected to, taken out of the set.
 /// Never resolves while the set is empty.
 #[cfg(windows)]
-async fn pipe_connected(
-    listening: &mut Vec<PipeListening>,
-) -> (
-    tokio::net::windows::named_pipe::NamedPipeServer,
-    OwnedSemaphorePermit,
-    io::Result<()>,
-) {
+async fn pipe_connected(listening: &mut Vec<PipeListening>) -> Option<PipeAccepted> {
     std::future::poll_fn(|cx| {
         for i in 0..listening.len() {
-            if let std::task::Poll::Ready(out) = listening[i].as_mut().poll(cx) {
-                drop(listening.swap_remove(i));
-                return std::task::Poll::Ready(out);
+            if let std::task::Poll::Ready(out) = listening[i].connect.as_mut().poll(cx) {
+                return std::task::Poll::Ready(listening.swap_remove(i).accepted(out));
             }
         }
         std::task::Poll::Pending
@@ -1306,11 +1422,19 @@ async fn pipe_connected(
 /// instance taken sees the pipe busy rather than absent, and absent reads
 /// as the peer gone (`docs/research/ipc.md` §3.1). A client may connect to
 /// the spare before it holds a place; it is accepted with the next place.
+///
+/// A barrier request ([`crate::grouped::AcceptBarrier`]) is answered once
+/// every instance a client is on has been taken, the spare included. The
+/// instance itself is asked (`GetNamedPipeClientProcessId` answers only with
+/// a client on it), not the completion of its connect, which the reactor may
+/// not have seen yet: a client's `CreateFile` returns only once it holds an
+/// instance, so those are all the connections a dialler can have written to.
 #[cfg(windows)]
 async fn accept_pipe(
     binding: weida_runtime::BoundPipe,
     first: tokio::net::windows::named_pipe::NamedPipeServer,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    mut requests: crate::grouped::BarrierRequests,
     serve: LocalAccept<crate::pipe::PipeStream>,
 ) {
     let mut spare = Some(first);
@@ -1333,6 +1457,9 @@ async fn accept_pipe(
             }
         }
         tokio::select! {
+            Some(request) = requests.recv() => {
+                drain_pipe_instances(&binding, &mut spare, &mut listening, &serve, request).await;
+            }
             place = Arc::clone(&serve.admitted).acquire_owned(),
                 if listening.len() < PIPE_LISTENING =>
             {
@@ -1356,9 +1483,8 @@ async fn accept_pipe(
                 };
                 listening.push(pipe_listen(server, place));
             }
-            (accepted, place, connected) = pipe_connected(&mut listening),
-                if !listening.is_empty() =>
-            {
+            accepted = pipe_connected(&mut listening), if !listening.is_empty() => {
+                let Some((accepted, place, connected)) = accepted else { continue };
                 if let Err(e) = connected {
                     // A failed connect leaves this instance in no state to be
                     // trusted: it is dropped with its place, and the place is
@@ -1383,8 +1509,10 @@ async fn accept_pipe(
                     // which disconnects the client.
                     continue;
                 }
-                let stream = crate::pipe::PipeStream::accepted(accepted, serve.exec.clone());
-                serve.exec.spawn(serve.clone_for().serve(stream, place));
+                serve.spawn(
+                    crate::pipe::PipeStream::accepted(accepted, serve.exec.clone()),
+                    place,
+                );
             }
             _ = &mut stop => {
                 tracing::debug!("pipe binding dropped; accept loop ending");
@@ -1392,6 +1520,58 @@ async fn accept_pipe(
             }
         }
     }
+}
+
+/// Answers a barrier request on a pipe binding: takes every instance a
+/// client is on now, the spare with the place the request brought or a
+/// free one, each listening one once its connect completes (which it does,
+/// because the client is there), and leaves the rest listening. Keeps the
+/// rule that the pipe always has an instance.
+#[cfg(windows)]
+async fn drain_pipe_instances(
+    binding: &weida_runtime::BoundPipe,
+    spare: &mut Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    listening: &mut Vec<PipeListening>,
+    serve: &LocalAccept<crate::pipe::PipeStream>,
+    mut request: crate::grouped::BarrierRequest,
+) {
+    let has_client = |server: &tokio::net::windows::named_pipe::NamedPipeServer| {
+        weida_runtime::client_principal(server).is_ok()
+    };
+    if spare.as_ref().is_some_and(has_client)
+        && let Some(place) = request.next_place(&serve.admitted)
+        && let Some(server) = spare.take()
+    {
+        listening.push(pipe_listen(server, place));
+    }
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < listening.len() {
+        if !has_client(listening[i].server.as_ref()) {
+            i += 1;
+            continue;
+        }
+        let mut taken = listening.swap_remove(i);
+        let out = taken.connect.as_mut().await;
+        ready.extend(taken.accepted(out));
+    }
+    if listening.is_empty() && spare.is_none() {
+        *spare = binding.next_instance().ok();
+    }
+    for (accepted, place, connected) in ready {
+        if let Err(e) = connected {
+            tracing::debug!(error = %e, "a connected pipe instance failed");
+            continue;
+        }
+        if serve.shared.drain.is_draining() {
+            continue;
+        }
+        serve.spawn(
+            crate::pipe::PipeStream::accepted(accepted, serve.exec.clone()),
+            place,
+        );
+    }
+    let _ = request.answer.send(serve.barrier.last());
 }
 
 /// Accepts in-process connections until the bus is unbound.
