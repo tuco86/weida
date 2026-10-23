@@ -257,6 +257,20 @@ async fn a_peer_that_reconnects_in_a_loop_cannot_grow_the_buffer() {
         .url()
         .to_string();
     let addr = url.trim_start_matches("tcp://").to_owned();
+    // Each peer's message is stored before its pipe's removal is announced,
+    // so counting the removals is what orders the cycles. `pipe_count`
+    // could not: it is zero while a new pipe is still being admitted, and
+    // two pipes alive at once have no order between their messages (§4).
+    let removed = Arc::new(AtomicUsize::new(0));
+    pull.notify(Arc::new({
+        let removed = Arc::clone(&removed);
+        move |event: PipeEvent, _info: &PipeInfo| {
+            if event == PipeEvent::RemPost {
+                removed.fetch_add(1, Ordering::SeqCst);
+            }
+            Admission::Accept
+        }
+    }));
 
     // Four times the ceiling, and nobody receives while they arrive.
     let cycles = depth * 4;
@@ -274,9 +288,13 @@ async fn a_peer_that_reconnects_in_a_loop_cannot_grow_the_buffer() {
             .expect("the message");
         peer.shutdown().await.expect("close");
         drop(peer);
-        while pull.pipe_count() > 0 {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while removed.load(Ordering::SeqCst) <= n {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the pipe was retired");
     }
 
     let mut held = Vec::new();
