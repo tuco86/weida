@@ -113,7 +113,7 @@ note: implemented and withdrawn the same night (never pushed). The change made t
 note: the repro attempts after the withdrawal do not confirm that cause. With the change applied again: a throwaway test that awaits the receipt, drops the pusher and drains lost 0 of 50 bodies on `SimUnix`, 0 of 50 over OS unix sockets on a 4-thread runtime here, and 0 of 3000 on darwin-arm64 (#72, 60 stress runs); #71 ran both tiers on darwin with the change and the CLI test passed in all three of its runs. So the failure of #68 is either a rare race the change makes possible or an unrelated darwin flake of that test. The change itself is three functions and a `Drop` in `conn.rs`, kept with its test on the branch `wip/b-385-local-close` (commit `1c61f77`); landing it needs the CLI test stressed on darwin with and without it, and if the race is real, the graceful close above.
 
 ### B-386 — The SWARM benchmark dials its server again
-kind: test | size: 5 | status: in_progress 2026-10-23T01:42Z | needs: []
+kind: test | size: 5 | status: done 1430b50 | needs: []
 acceptance: `tests/swarm_large.rs` (ignored, 0041 §4.4's acceptance benchmark) starts its server with `Server::start_os` again: since B-376 made `Server::start` a `SimNet` server, the benchmark's `delay_proxy`, a real UDP forwarder, dialled nothing and `connect` failed after 30 s. Run after the fix: 256 MiB over a 26 ms RTT, download 44.0 MB/s, swarm 60.9 MB/s (1.39x, above the 0.7 floor), peak RSS 86 MiB under the 128 MiB bound. `tests/large.rs`, the other ignored own-process test, runs on the simulated network on purpose and passes (1 GiB each way, 18 MiB peak RSS).
 
 ### B-351 — A busy seeder makes a session wait instead of dropping it
