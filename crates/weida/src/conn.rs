@@ -216,7 +216,10 @@ impl ConnCtx {
         // One reader per connection, and only where the profile enabled
         // flows: a connection that enables nothing runs no reader at all.
         if limits.datagram_receive_bytes > 0 && ctx.conn.is_quic() {
-            exec.spawn(crate::flow::datagram_reader(Arc::clone(&ctx)));
+            exec.spawn(crate::flow::datagram_reader(
+                Arc::downgrade(&ctx),
+                Arc::clone(&ctx.conn),
+            ));
         }
         ctx
     }
@@ -630,7 +633,7 @@ async fn accept_uni_loop(
                 }
                 let agreed_tx = Arc::clone(&agreed_tx);
                 ctx.exec.clone().spawn(async move {
-                    if let Err(e) = handle_stream(&ctx, &agreed_tx, stream).await {
+                    if let Err(e) = handle_stream(ctx, &agreed_tx, stream).await {
                         tracing::debug!(error = %e, "inbound stream failed");
                     }
                 });
@@ -1083,10 +1086,11 @@ fn refuse_stream(mut stream: RecvHalf, error: Error) -> Result<(), Error> {
 /// Reads the preamble and header of one inbound unidirectional stream, then
 /// dispatches it.
 async fn handle_stream(
-    ctx: &ConnHandle,
+    owned: ConnHandle,
     agreed_tx: &watch::Sender<Option<Agreed>>,
     mut stream: RecvHalf,
 ) -> Result<(), Error> {
+    let ctx = &owned;
     // A parked reverse connection waits here for the peer's first byte, with
     // no header slot and no deadline: until the peer writes, it is a stream
     // the peer has not opened yet, not one whose frame head is late.
@@ -1131,7 +1135,9 @@ async fn handle_stream(
         Head::Credit(header) => handle_credit(ctx, header).await,
         Head::Cursor(header) => handle_cursor(ctx, stream, header).await,
         Head::Flow(header) => crate::flow::handle_flow(ctx, stream, header).await,
-        Head::Report => crate::report::receive_reports(ctx, stream).await,
+        // The one stream that lives as long as the connection: it keeps a
+        // weak handle only, so the handle is passed on rather than held here.
+        Head::Report => crate::report::receive_reports(owned, stream).await,
     }
 }
 
@@ -1388,8 +1394,10 @@ fn handle_hello(
                 "negotiated"
             );
             if agreed.path_report {
-                ctx.exec
-                    .spawn(crate::report::send_reports(ConnHandle::clone(ctx)));
+                ctx.exec.spawn(crate::report::send_reports(
+                    Arc::clone(&ctx.conn),
+                    ctx.exec.clone(),
+                ));
             }
             Ok(())
         }

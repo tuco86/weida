@@ -1395,6 +1395,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | `Limits` scope | a **per-connection** profile; runtime-level numbers live on `RuntimeConfig` | 0002 §6.4 wants one profile per tier. Two profiles are only honest if every field means something in both, so `max_connections`, `endpoint_queue` and `max_resolved_addresses` — per binding, per endpoint, per dial — live on `RuntimeConfig`, and `keep_alive`/`idle_timeout` live in `Limits`, because those *are* per connection. The second profile itself waits for the tier: a `Limits::CONTROL` nothing reads would be five numbers nobody has to justify. |
 | Peer binding | compare against the peer's **live** connections, refuse a mismatch with `Error::Untrusted(fp)` | The fingerprint is the only thing that binds a peer's connections ([decisions/0008](decisions/0008-session-identity.md) §4.2), and dialling a second path is dialling the same peer. Live connections rather than a remembered value, because a peer is this peer only while a connection to it lives: once the last one is gone, a replacement server with a new key is a new peer and nothing should still be objecting to it. Proved by swapping a raw server's identity between two handshakes on one socket — the load-balancer case, which two `quinn` endpoints cannot reproduce because they cannot share a port. |
 | `max_connections_per_peer` | 64, counted per proved fingerprint, released on close | One connection per path lets the dialling side choose the count, so `max_connections` alone would let one peer fill a binding. 64 is the number §4.8 measured (~50 MiB of transport state across both ends for 64 connections to one peer) and a sixteenth of the default `max_connections`. Anonymous connections are not counted together: two of them cannot be shown to be one peer, so counting them as one would refuse strangers for each other's traffic. |
+| Unused pooled connection | closed after `Limits::idle_timeout` (30 s) with nothing but the pool holding it | The owner's choice of 2026-10-23 among B-383's three options. Without it a connection whose key never came back (a throwaway `ClientTls` identity per dial, as griasdi makes) stayed open on both sides for the runtime's life, keep-alive every 10 s, against the server's `max_connections`. The linger keeps a connection for an endpoint created again right away, as a client that redials per call does. "Nothing holds it" is the handle's strong count read under the pool's lock: endpoint slots, transfers, receipts and streams hold a handle, while what a connection runs for itself (accept loops, HELLO deadline, path reports, the datagram reader) holds it weakly (B-385, B-383). A reaper per connection looks eight times per linger, so the close comes between 30 and about 34 s after the last use. |
 
 ### Connection statistics decisions
 
@@ -1500,18 +1501,6 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   configuration time. `GuaranteeSet::validate` (`crates/protocol/src/header.rs`) checks the
   durability, replica and deduplication combinations and not this pair, and
   `Backpressure::Coalesce` is used nowhere beyond its definition.
-- **A pooled client connection outlives every endpoint that used it.** The pool
-  (`crates/weida/src/pool.rs`) keeps a connection until it closes, and a dialling connection
-  sends keep-alives, so a connection no endpoint holds any more is never closed while the
-  runtime lives: `Peer::disconnect` and dropping the endpoint release the endpoint's slot and
-  routes, not the connection. A connection whose key is dialled again is reused, which is the
-  pool's purpose; one whose key never comes back — a `ClientTls` with a throwaway identity, as
-  griasdi's `OpenDial` and swarm make per dial — stays open on both sides, keep-alive every
-  10 s, against the server's `max_connections`. Measured (B-383): four pushers dropped after
-  one send each, three with a fresh identity, left four connections exchanging 96 datagrams
-  per 120 s of silence. When an unused connection should close is the open question; B-383
-  lists the options. The local transports, where nothing is pooled, close a connection once
-  its last handle goes (B-385).
 - **A local send can be lost after its receipt.** On `AF_UNIX` a receipt means the kernel took
   the bytes; when the dialler then exits, the accepting side closes the group 200 ms after
   its control connection ends, and a transfer connection its accept loop has not admitted by

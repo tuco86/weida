@@ -460,3 +460,91 @@ async fn a_bound_address_is_free_again_once_its_binding_closes() {
         .expect("free once the runtime shut down");
     third.shutdown().await;
 }
+
+/// Pushes one body on a fresh pusher with `tls`, waits for its receipt, drops the pusher, and
+/// returns the connection the server saw it on.
+async fn push_once(
+    client: &Runtime,
+    tls: ClientTls,
+    url: &str,
+    puller: &Puller,
+) -> weida::ConnectionId {
+    let pusher = client.pusher(tls);
+    within_paused(pusher.connect(url)).await.expect("connect");
+    let mut transfer = within_paused(pusher.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    transfer.write_all(b"once").await.expect("write");
+    within_paused(transfer.finish().expect("finish").delivered())
+        .await
+        .expect("delivered");
+    let inbound = within_paused(puller.recv()).await.expect("recv");
+    let connection = inbound.connection();
+    within_paused(inbound.collect(64)).await.expect("collect");
+    connection
+}
+
+/// Claim (B-383): a pooled connection nothing uses any more closes after the linger
+/// (`Limits::idle_timeout`), so endpoints dialled with throwaway identities and dropped leave
+/// the network silent instead of exchanging keep-alives for the runtime's life.
+#[tokio::test(start_paused = true)]
+async fn dropped_endpoints_leave_the_network_silent_after_the_linger() {
+    let net = SimNet::new();
+    let (server_id, server_fp) = identity();
+    let server = SimServer::start(&net, "127.0.0.1:0".parse().expect("addr"), server_id).await;
+    let puller = server.listener.puller("/sink").expect("puller");
+    let url = server.url("/sink", Some(server_fp));
+    let client = Runtime::new(on(&net)).expect("client");
+
+    push_once(&client, ClientTls::new(Trust::by_address()), &url, &puller).await;
+    for _ in 0..3 {
+        let throwaway = Identity::generate().expect("identity");
+        let tls = ClientTls::new(Trust::by_address()).with_identity(throwaway);
+        push_once(&client, tls, &url, &puller).await;
+    }
+
+    let linger = Limits::default().idle_timeout;
+    tokio::time::sleep(linger * 2).await;
+    let quiet_from = net.stats().delivered;
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(
+        net.stats().delivered,
+        quiet_from,
+        "no datagram crosses the network once every unused connection closed"
+    );
+
+    client.shutdown().await;
+    server.runtime.shutdown().await;
+}
+
+/// Claim (B-383): within the linger a new endpoint on the same terms reuses the pooled
+/// connection; after it, the connection is gone and the next endpoint dials a new one.
+#[tokio::test(start_paused = true)]
+async fn an_unused_connection_is_reused_within_the_linger_and_not_after() {
+    let net = SimNet::new();
+    let (server_id, server_fp) = identity();
+    let server = SimServer::start(&net, "127.0.0.1:0".parse().expect("addr"), server_id).await;
+    let puller = server.listener.puller("/sink").expect("puller");
+    let url = server.url("/sink", Some(server_fp));
+    let client = Runtime::new(on(&net)).expect("client");
+    let tls = || ClientTls::new(Trust::by_address());
+    let linger = Limits::default().idle_timeout;
+
+    let first = push_once(&client, tls(), &url, &puller).await;
+    tokio::time::sleep(linger / 2).await;
+    let again = push_once(&client, tls(), &url, &puller).await;
+    assert_eq!(
+        again, first,
+        "an endpoint within the linger reuses the connection"
+    );
+
+    tokio::time::sleep(linger * 2).await;
+    let later = push_once(&client, tls(), &url, &puller).await;
+    assert_ne!(
+        later, first,
+        "after the linger the unused connection was closed"
+    );
+
+    client.shutdown().await;
+    server.runtime.shutdown().await;
+}

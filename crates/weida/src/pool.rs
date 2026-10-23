@@ -54,7 +54,8 @@ fn dial_port(written: Option<u16>, discovery: Discovery, host: &str) -> Result<u
 }
 
 pub(crate) struct ClientPool {
-    state: Mutex<PoolState>,
+    /// Shared with each connection's reaper, which holds it weakly.
+    state: Arc<Mutex<PoolState>>,
     /// Handed to every connection this pool dials; owned by the runtime.
     shared: Arc<Shared>,
 }
@@ -77,7 +78,7 @@ struct PoolState {
 impl ClientPool {
     pub(crate) fn new(shared: Arc<Shared>) -> ClientPool {
         ClientPool {
-            state: Mutex::new(PoolState::default()),
+            state: Arc::new(Mutex::new(PoolState::default())),
             shared,
         }
     }
@@ -314,8 +315,77 @@ impl ClientPool {
                 .close(codes::SHUTDOWN, "a concurrent dial won this pool key");
             return Ok(winner);
         }
-        state.connections.insert(key, ConnHandle::clone(&handle));
+        state
+            .connections
+            .insert(key.clone(), ConnHandle::clone(&handle));
+        drop(state);
+        exec.spawn(reap(
+            Arc::downgrade(&self.state),
+            key,
+            Arc::downgrade(&handle),
+            Arc::clone(&handle.conn),
+            exec.clone(),
+            limits.idle_timeout,
+        ));
         Ok(handle)
+    }
+}
+
+/// How many looks a reaper takes per linger: an unused connection closes
+/// between one linger and one linger plus this fraction of it after its last
+/// user went.
+const REAP_LOOKS: u32 = 8;
+
+/// Closes the pooled connection `key` once nothing but the pool has held it
+/// for `linger` (`Limits::idle_timeout`): no endpoint slot, no transfer, no
+/// receipt, no stream ([B-383](../../../docs/BACKLOG.md), the owner's
+/// option (b)). The linger keeps it for an endpoint created again right
+/// away, as a redialling client does.
+///
+/// The pool's map holds one handle, so a strong count of one is "unused".
+/// The count is read under the pool's lock, and every other handle is cloned
+/// from one that already exists or from the map under that lock, so no
+/// caller can take the connection between the look and the close. Nothing
+/// the connection runs for itself holds a strong handle (accept loops,
+/// HELLO deadline, path reports, the datagram reader): those are not uses.
+async fn reap(
+    state: std::sync::Weak<Mutex<PoolState>>,
+    key: ConnKey,
+    conn: std::sync::Weak<ConnCtx>,
+    link: Arc<Link>,
+    exec: Exec,
+    linger: std::time::Duration,
+) {
+    let look = (linger / REAP_LOOKS).max(std::time::Duration::from_millis(1));
+    let mut unused = std::time::Duration::ZERO;
+    loop {
+        tokio::select! {
+            () = exec.sleep(look) => {}
+            _ = link.closed() => return,
+        }
+        let Some(state) = state.upgrade() else { return };
+        let mut state = state.lock().await;
+        let Some(held) = state.connections.get(&key) else {
+            return;
+        };
+        // The key may name a newer connection after this one closed.
+        if !std::ptr::eq(Arc::as_ptr(held), conn.as_ptr()) {
+            return;
+        }
+        if Arc::strong_count(held) > 1 {
+            unused = std::time::Duration::ZERO;
+            continue;
+        }
+        unused += look;
+        if unused >= linger {
+            let held = state.connections.remove(&key);
+            drop(state);
+            tracing::debug!(host = %key.0.0, path = %key.1, "closing an unused pooled connection");
+            if let Some(held) = held {
+                held.conn.close(codes::SHUTDOWN, "unused");
+            }
+            return;
+        }
     }
 }
 

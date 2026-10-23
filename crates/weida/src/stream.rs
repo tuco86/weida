@@ -529,9 +529,9 @@ impl Peer {
     /// Forgets `url`: the slot is removed and its redial task ends.
     ///
     /// A QUIC connection is pooled and may be serving another endpoint, so
-    /// it is not closed here, and today nothing closes it later either: it
-    /// stays open, kept alive, until the runtime shuts down or the peer
-    /// closes it (`docs/IMPLEMENTATION.md` §6, B-383). A local connection is
+    /// it is not closed here: the pool closes it once nothing else has used
+    /// it for [`crate::Limits::idle_timeout`], and an endpoint that dials
+    /// the same address within that time reuses it. A local connection is
     /// nobody else's and closes once the last transfer on it is done. What
     /// this endpoint holds on it is released: a subscriber's route and
     /// subscriptions, so the peer stops sending and the address can be

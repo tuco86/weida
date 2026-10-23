@@ -961,8 +961,17 @@ impl fmt::Debug for IncomingFlow {
 }
 
 /// Reads this connection's QUIC datagrams into their flows until it closes.
-pub(crate) async fn datagram_reader(ctx: ConnHandle) {
-    while let Ok(datagram) = ctx.conn.read_datagram().await {
+///
+/// Waits on the link and holds the connection only weakly: reading is not
+/// a use of the connection, so it must not keep an unused pooled one alive
+/// (B-383). A datagram that arrives after the last handle went has no flow
+/// left to go to.
+pub(crate) async fn datagram_reader(
+    ctx: std::sync::Weak<crate::conn::ConnCtx>,
+    link: Arc<crate::transport::Link>,
+) {
+    while let Ok(datagram) = link.read_datagram().await {
+        let Some(ctx) = ctx.upgrade() else { return };
         ctx.flows.deliver(datagram, ctx.exec.now());
     }
 }

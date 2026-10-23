@@ -9,7 +9,7 @@
 //! receiver keeps the latest record in one fixed-size slot and nothing else.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use weida_core::Error;
@@ -17,8 +17,9 @@ use weida_protocol::header::limits::MAX_PATH_RECORD_BYTES;
 use weida_protocol::{FrameKind, PathRecord, ReportHead, encode_frame};
 
 use crate::conn::{ConnHandle, violation};
+use crate::runtime::Exec;
 use crate::stats::{RemoteStats, TransportStats, UdpCounts};
-use crate::transport::RecvHalf;
+use crate::transport::{Link, RecvHalf};
 
 /// How often a side sends its record: a constant on its own clock, so the
 /// peer cannot choose the rate (`docs/PROTOCOL.md` §6.10 rule 2).
@@ -86,8 +87,11 @@ fn record_of(stats: &TransportStats) -> PathRecord {
 /// Sends this side's REPORT stream: the head frame, a record at once and
 /// then one every [`REPORT_INTERVAL`], until the connection goes. Spawned
 /// once, when negotiation agreed capability code `2`.
-pub(crate) async fn send_reports(ctx: ConnHandle) {
-    let mut stream = match ctx.conn.open_uni().await {
+///
+/// Holds the link, not the connection's handle: reporting is not a use of
+/// the connection, so it must not keep an unused pooled one alive (B-383).
+pub(crate) async fn send_reports(link: Arc<Link>, exec: Exec) {
+    let mut stream = match link.open_uni().await {
         Ok(stream) => stream,
         Err(e) => {
             tracing::debug!(error = %e, "could not open the REPORT stream");
@@ -97,7 +101,7 @@ pub(crate) async fn send_reports(ctx: ConnHandle) {
     let mut out = encode_frame(FrameKind::Report, &ReportHead.encode());
     loop {
         // Only a QUIC connection agrees code 2, so the statistics exist.
-        if let Some(stats) = ctx.conn.transport_stats() {
+        if let Some(stats) = link.transport_stats() {
             record_of(&stats).encode_into(&mut out);
         }
         if stream.write_all(&out).await.is_err() {
@@ -105,8 +109,8 @@ pub(crate) async fn send_reports(ctx: ConnHandle) {
         }
         out.clear();
         tokio::select! {
-            () = ctx.exec.sleep(REPORT_INTERVAL) => {}
-            _ = ctx.conn.closed() => return,
+            () = exec.sleep(REPORT_INTERVAL) => {}
+            _ = link.closed() => return,
         }
     }
 }
@@ -116,13 +120,25 @@ pub(crate) async fn send_reports(ctx: ConnHandle) {
 /// only REPORT stream, no record is longer than 256 bytes and none ends at
 /// FIN half written. Anything else closes the connection with
 /// `PROTOCOL_VIOLATION`.
-pub(crate) async fn receive_reports(ctx: &ConnHandle, mut stream: RecvHalf) -> Result<(), Error> {
+///
+/// Takes the handle and keeps only a weak one while it waits: the
+/// stream lives as long as the connection, and the peer's reports are not a
+/// use of it, so they must not keep an unused pooled one alive (B-383).
+pub(crate) async fn receive_reports(ctx: ConnHandle, mut stream: RecvHalf) -> Result<(), Error> {
     if !ctx.agreed_now().is_some_and(|agreed| agreed.path_report) {
-        return violation(ctx, "REPORT without agreed capability 2");
+        return violation(&ctx, "REPORT without agreed capability 2");
     }
     if ctx.remote.claimed.swap(true, Ordering::AcqRel) {
-        return violation(ctx, "a second REPORT stream on one connection");
+        return violation(&ctx, "a second REPORT stream on one connection");
     }
+    let weak = Arc::downgrade(&ctx);
+    drop(ctx);
+    // The connection is gone once the handle cannot be upgraded; dropping
+    // its last handle closed the link, so the read below ends too.
+    let violated = |reason: &str| match weak.upgrade() {
+        Some(ctx) => violation(&ctx, reason),
+        None => Ok(()),
+    };
     // A record is at most 256 bytes plus a two-byte prefix, and every
     // complete one is consumed at once, so `pending` never holds more than
     // one partial record and one read.
@@ -137,19 +153,22 @@ pub(crate) async fn receive_reports(ctx: &ConnHandle, mut stream: RecvHalf) -> R
                 let mut newest = None;
                 while let Some((record, used)) = match PathRecord::decode(&pending[at..]) {
                     Ok(record) => record,
-                    Err(e) => return violation(ctx, &e.to_string()),
+                    Err(e) => return violated(&e.to_string()),
                 } {
                     at += used;
                     newest = Some(record);
                 }
                 if let Some(record) = newest {
+                    let Some(ctx) = weak.upgrade() else {
+                        return Ok(());
+                    };
                     ctx.remote.store(record, ctx.exec.now());
                 }
                 pending.drain(..at);
             }
             Ok(None) => {
                 if !pending.is_empty() {
-                    return violation(ctx, "a REPORT record truncated at FIN");
+                    return violated("a REPORT record truncated at FIN");
                 }
                 return Ok(());
             }
