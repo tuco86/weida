@@ -50,7 +50,7 @@ members = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
-version = "0.1.0-alpha.9"
+version = "0.1.0-alpha.9-dev"
 # Dual, in the Rust ecosystem's own form: the MIT arm is the permissive
 # minimum every downstream already accepts, and the Apache-2.0 arm is the one
 # that carries an explicit patent grant, which is what a corporate reviewer
@@ -71,32 +71,32 @@ categories = ["network-programming", "asynchronous"]
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-weida-core = { path = "crates/core", version = "0.1.0-alpha.9" }
-weida-protocol = { path = "crates/protocol", version = "0.1.0-alpha.9" }
-weida-runtime = { path = "crates/runtime", version = "0.1.0-alpha.9" }
-weida-winpipe = { path = "crates/winpipe", version = "0.1.0-alpha.9" }
-weida = { path = "crates/weida", version = "0.1.0-alpha.9" }
-weida-broker = { path = "crates/broker", version = "0.1.0-alpha.9" }
-weida-raft = { path = "crates/raft/weida-raft", version = "0.1.0-alpha.9" }
-weida-zmtp = { path = "crates/zmq/weida-zmtp", version = "0.1.0-alpha.9" }
-weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0-alpha.9" }
-weida-sp = { path = "crates/nng/weida-sp", version = "0.1.0-alpha.9" }
-weida-nng = { path = "crates/nng/weida-nng", version = "0.1.0-alpha.9" }
-weida-py-core = { path = "crates/py/weida-py-core", version = "0.1.0-alpha.9" }
-weida-amqp-codec = { path = "crates/amqp/weida-amqp-codec", version = "0.1.0-alpha.9" }
-weida-zmq-py = { path = "crates/zmq/weida-zmq-py", version = "0.1.0-alpha.9" }
-weida-nng-py = { path = "crates/nng/weida-nng-py", version = "0.1.0-alpha.9" }
-weida-mqtt-codec = { path = "crates/mqtt/weida-mqtt-codec", version = "0.1.0-alpha.9" }
-weida-mqtt = { path = "crates/mqtt/weida-mqtt", version = "0.1.0-alpha.9" }
-weida-mqtt-py = { path = "crates/mqtt/weida-mqtt-py", version = "0.1.0-alpha.9" }
-weida-amqp = { path = "crates/amqp/weida-amqp", version = "0.1.0-alpha.9" }
-weida-amqp-py = { path = "crates/amqp/weida-amqp-py", version = "0.1.0-alpha.9" }
-weida-nats-codec = { path = "crates/nats/weida-nats-codec", version = "0.1.0-alpha.9" }
-weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0-alpha.9" }
-weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0-alpha.9" }
-weida-http-codec = { path = "crates/http/weida-http-codec", version = "0.1.0-alpha.9" }
-weida-http = { path = "crates/http/weida-http", version = "0.1.0-alpha.9" }
-weida-openbao = { path = "crates/openbao/weida-openbao", version = "0.1.0-alpha.9" }
+weida-core = { path = "crates/core", version = "0.1.0-alpha.9-dev" }
+weida-protocol = { path = "crates/protocol", version = "0.1.0-alpha.9-dev" }
+weida-runtime = { path = "crates/runtime", version = "0.1.0-alpha.9-dev" }
+weida-winpipe = { path = "crates/winpipe", version = "0.1.0-alpha.9-dev" }
+weida = { path = "crates/weida", version = "0.1.0-alpha.9-dev" }
+weida-broker = { path = "crates/broker", version = "0.1.0-alpha.9-dev" }
+weida-raft = { path = "crates/raft/weida-raft", version = "0.1.0-alpha.9-dev" }
+weida-zmtp = { path = "crates/zmq/weida-zmtp", version = "0.1.0-alpha.9-dev" }
+weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0-alpha.9-dev" }
+weida-sp = { path = "crates/nng/weida-sp", version = "0.1.0-alpha.9-dev" }
+weida-nng = { path = "crates/nng/weida-nng", version = "0.1.0-alpha.9-dev" }
+weida-py-core = { path = "crates/py/weida-py-core", version = "0.1.0-alpha.9-dev" }
+weida-amqp-codec = { path = "crates/amqp/weida-amqp-codec", version = "0.1.0-alpha.9-dev" }
+weida-zmq-py = { path = "crates/zmq/weida-zmq-py", version = "0.1.0-alpha.9-dev" }
+weida-nng-py = { path = "crates/nng/weida-nng-py", version = "0.1.0-alpha.9-dev" }
+weida-mqtt-codec = { path = "crates/mqtt/weida-mqtt-codec", version = "0.1.0-alpha.9-dev" }
+weida-mqtt = { path = "crates/mqtt/weida-mqtt", version = "0.1.0-alpha.9-dev" }
+weida-mqtt-py = { path = "crates/mqtt/weida-mqtt-py", version = "0.1.0-alpha.9-dev" }
+weida-amqp = { path = "crates/amqp/weida-amqp", version = "0.1.0-alpha.9-dev" }
+weida-amqp-py = { path = "crates/amqp/weida-amqp-py", version = "0.1.0-alpha.9-dev" }
+weida-nats-codec = { path = "crates/nats/weida-nats-codec", version = "0.1.0-alpha.9-dev" }
+weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0-alpha.9-dev" }
+weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0-alpha.9-dev" }
+weida-http-codec = { path = "crates/http/weida-http-codec", version = "0.1.0-alpha.9-dev" }
+weida-http = { path = "crates/http/weida-http", version = "0.1.0-alpha.9-dev" }
+weida-openbao = { path = "crates/openbao/weida-openbao", version = "0.1.0-alpha.9-dev" }
 # Path only, no version: a dev-dependency `cargo publish` drops.
 weida-testkit = { path = "crates/testkit" }
 # The JSON of the OpenBao API, `Value` only, no derive; `weida-openbao` alone.
