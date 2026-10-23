@@ -84,11 +84,17 @@ fn a_push_reaches_a_puller_and_the_receipt_comes_back() {
     let (server, binding, url) = served(&net, "/ingest");
     let puller = binding.puller("/ingest").expect("puller");
 
+    // Two pushes are two streams, and across streams there is no order of
+    // any kind (GUARANTEES §6, `Ordering::None`): even "two", opened only
+    // after "one"'s receipt, may reach the puller first when the receiving
+    // runtime is busy.
     let draining = std::thread::spawn(move || {
-        let first = puller.recv(CAP).expect("recv");
-        assert_eq!(first.payload, b"one");
-        let second = puller.recv(CAP).expect("recv");
-        assert_eq!(second.payload, b"two");
+        let mut got = [
+            puller.recv(CAP).expect("recv").payload,
+            puller.recv(CAP).expect("recv").payload,
+        ];
+        got.sort();
+        assert_eq!(got, [b"one".to_vec(), b"two".to_vec()]);
     });
 
     let client = Runtime::new(RuntimeConfig {
