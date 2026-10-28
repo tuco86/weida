@@ -31,8 +31,7 @@ use crate::endpoint::{
     Endpoint, PairState, Paired, PushState, Pusher, ReqState, Requester, SubState, Subscriber,
     SurveyState, Surveyor,
 };
-use crate::listener::Listener;
-use crate::network::AddrLease;
+use crate::listener::{Listener, ServedEndpoint};
 use crate::pool::ClientPool;
 use crate::stream::Peer;
 use crate::transport::Link;
@@ -64,18 +63,17 @@ pub(crate) struct RuntimeInner {
     /// Present only for a runtime created by [`Runtime::owned`]; dropped with
     /// the last handle.
     _owned: Option<OwnedReactor>,
-    /// Every QUIC endpoint this runtime owns, for shutdown, with the lease on
-    /// its address.
-    endpoints: Mutex<Vec<(quinn::Endpoint, AddrLease)>>,
+    /// Every QUIC binding this runtime owns, for shutdown.
+    endpoints: Mutex<Vec<Arc<ServedEndpoint>>>,
     pub(crate) shared: Arc<Shared>,
 }
 
 impl RuntimeInner {
-    pub(crate) fn track_endpoint(&self, endpoint: quinn::Endpoint, lease: AddrLease) {
+    pub(crate) fn track_endpoint(&self, served: Arc<ServedEndpoint>) {
         self.endpoints
             .lock()
             .expect("endpoint list poisoned")
-            .push((endpoint, lease));
+            .push(served);
     }
 
     /// Dials, or reuses a pooled connection to, `path` on `host:port` on
@@ -454,7 +452,7 @@ impl Runtime {
     /// Closes every binding and pooled connection and waits, for whatever is
     /// left of `budget`, for the sockets to go idle.
     async fn close(self, budget: CloseBudget) {
-        let (endpoints, leases): (Vec<quinn::Endpoint>, Vec<AddrLease>) = self
+        let served: Vec<Arc<ServedEndpoint>> = self
             .inner
             .endpoints
             .lock()
@@ -463,8 +461,14 @@ impl Runtime {
             .collect();
         let client = self.inner.pool.take_endpoint().await;
 
-        for endpoint in endpoints.iter().chain(client.iter()) {
-            endpoint.close(
+        for binding in &served {
+            binding.close(
+                VarInt::from_u32(codes::SHUTDOWN as u32),
+                b"runtime shutting down",
+            );
+        }
+        if let Some(client) = &client {
+            client.close(
                 VarInt::from_u32(codes::SHUTDOWN as u32),
                 b"runtime shutting down",
             );
@@ -481,8 +485,11 @@ impl Runtime {
         // One budget for the whole close, not one per endpoint: what a
         // caller cares about is when the call returns.
         let idle = async {
-            for endpoint in endpoints.iter().chain(client.iter()) {
-                endpoint.wait_idle().await;
+            for binding in &served {
+                binding.wait_idle().await;
+            }
+            if let Some(client) = &client {
+                client.wait_idle().await;
             }
         };
         let remaining = budget.remaining();
@@ -496,8 +503,8 @@ impl Runtime {
         }
         // The simulated addresses are free once their sockets went idle or
         // the budget ran out, as an OS frees a closed socket's port.
-        for lease in &leases {
-            lease.release();
+        for binding in &served {
+            binding.release();
         }
     }
 

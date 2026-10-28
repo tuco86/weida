@@ -7,7 +7,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -434,14 +434,13 @@ impl Listener {
             (endpoint, socket)
         };
         let local_addr = endpoint.local_addr().map_err(Error::Io)?;
-        self.inner
-            .runtime
-            .track_endpoint(endpoint.clone(), lease.clone());
+        let served = Arc::new(ServedEndpoint::new(endpoint, lease));
+        self.inner.runtime.track_endpoint(Arc::clone(&served));
 
         let peers = Arc::new(PeerConns::default());
         let open = Arc::new(OpenConns::default());
         exec.spawn(accept_connections(
-            endpoint.clone(),
+            Arc::clone(&served),
             Arc::clone(&self.inner),
             Arc::clone(&peers),
             Arc::clone(&open),
@@ -449,12 +448,11 @@ impl Listener {
 
         tracing::info!(%local_addr, "quic binding listening");
         Ok(Binding {
-            endpoint,
+            served,
             local_addr,
             peers,
             socket,
             handed,
-            lease,
             open,
             close_timeout: self.inner.runtime.config.shutdown_timeout,
             exec,
@@ -766,9 +764,51 @@ impl std::fmt::Debug for Listener {
     }
 }
 
+/// A QUIC binding's endpoint as both of its closers hold it: [`Binding::close`]
+/// and [`Binding::hand_over`], and the runtime's close.
+pub(crate) struct ServedEndpoint {
+    endpoint: quinn::Endpoint,
+    /// Frees the binding's address once it closed.
+    lease: AddrLease,
+    /// Set before the endpoint is closed. `quinn` still hands out an `Incoming`
+    /// that queued before the close, and accepts it without closing the
+    /// connection that makes, so the accept loop checks this as well.
+    closed: AtomicBool,
+}
+
+impl ServedEndpoint {
+    fn new(endpoint: quinn::Endpoint, lease: AddrLease) -> ServedEndpoint {
+        ServedEndpoint {
+            endpoint,
+            lease,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Closes every connection with `code` and `reason` and stops admitting:
+    /// the flag is set before `quinn`'s close takes the endpoint's lock, which
+    /// an accept takes too, so a connection inserted after the close sees it.
+    pub(crate) fn close(&self, code: VarInt, reason: &[u8]) {
+        self.closed.store(true, Ordering::Release);
+        self.endpoint.close(code, reason);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.lease.release();
+    }
+}
+
 /// One concrete transport binding of a [`Listener`].
 pub struct Binding {
-    endpoint: quinn::Endpoint,
+    served: Arc<ServedEndpoint>,
     local_addr: SocketAddr,
     peers: Arc<PeerConns>,
     /// The decorator under the endpoint, which `hand_over` makes hold.
@@ -776,8 +816,6 @@ pub struct Binding {
     /// A duplicate of the bound socket, for the successor; `None` on a
     /// simulated network.
     handed: Option<std::net::UdpSocket>,
-    /// Frees a simulated address once the binding closed.
-    lease: AddrLease,
     open: Arc<OpenConns>,
     exec: Exec,
     close_timeout: Duration,
@@ -801,11 +839,11 @@ impl Binding {
     /// `SHUTDOWN`, then waits for the socket to go idle for at most
     /// [`RuntimeConfig::shutdown_timeout`](crate::RuntimeConfig::shutdown_timeout).
     pub async fn close(&self) {
-        self.endpoint
+        self.served
             .close(VarInt::from_u32(codes::SHUTDOWN as u32), b"binding closed");
         if self
             .exec
-            .within(self.close_timeout, self.endpoint.wait_idle())
+            .within(self.close_timeout, self.served.wait_idle())
             .await
             .is_none()
         {
@@ -814,7 +852,7 @@ impl Binding {
                 "timeout reached before the binding's socket went idle"
             );
         }
-        self.lease.release();
+        self.served.release();
     }
 
     /// Hands this binding's socket over to a successor process, which tells
@@ -856,7 +894,7 @@ impl Binding {
             .into_iter()
             .filter(|conn| conn.close_reason().is_none())
             .collect();
-        self.endpoint.close(
+        self.served.close(
             VarInt::from_u32(codes::RESTARTING as u32),
             b"server restarting",
         );
@@ -1843,7 +1881,7 @@ async fn depart(
 /// an unvalidated address is answered with a stateless Retry, so a flood from
 /// spoofed sources allocates nothing and a real dialler pays one round trip.
 async fn accept_connections(
-    endpoint: quinn::Endpoint,
+    served: Arc<ServedEndpoint>,
     listener: Arc<ListenerInner>,
     peers: Arc<PeerConns>,
     open: Arc<OpenConns>,
@@ -1865,11 +1903,11 @@ async fn accept_connections(
     let departing = Arc::new(Semaphore::new(
         max_connections.clamp(1, Semaphore::MAX_PERMITS),
     ));
-    while let Some(incoming) = endpoint.accept().await {
-        // A draining runtime admits nothing new: the handshake is refused
-        // outright rather than accepted and then closed
+    while let Some(incoming) = served.endpoint.accept().await {
+        // A draining runtime or a closed binding admits nothing new: the
+        // handshake is refused outright rather than accepted and then closed
         // (`docs/decisions/0009-drain.md` §4.5).
-        if shared.drain.is_draining() {
+        if shared.drain.is_draining() || served.is_closed() {
             incoming.refuse();
             continue;
         }
@@ -1916,8 +1954,22 @@ async fn accept_connections(
         let open = Arc::clone(&open);
         let refusals = Arc::clone(&refusals);
         let departing = Arc::clone(&departing);
+        let served = Arc::clone(&served);
         exec.spawn(async move {
-            let connected = incoming.await;
+            let connecting = match incoming.accept() {
+                Ok(connecting) => connecting,
+                Err(e) => {
+                    tracing::debug!(error = %e, "handshake failed");
+                    return; // `handshake` and `live` drop with the task
+                }
+            };
+            // An `Incoming` taken before the close is accepted after it without
+            // the close reaching the connection; dropping the handshake closes it.
+            if served.is_closed() {
+                tracing::debug!("binding closed during the handshake; connection dropped");
+                return;
+            }
+            let connected = connecting.await;
             drop(handshake);
             match connected {
                 Ok(conn) => {
