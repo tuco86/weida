@@ -63,3 +63,13 @@ slow-timeout = { period = "30s" }
 [[profile.ci.overrides]]
 filter = '(package(weida-zmq) and test(=session::tests::io::arbitrary_octets_are_never_a_panic)) | (package(weida) and (test(=segment::tests::io::a_writer_that_releases_at_once_never_strands_budget) | test(=io::guide::the_same_calls_carry_a_payload_no_cap_would_admit) | test(/^io::cli::/)))'
 slow-timeout = { period = "30s" }
+
+# 200 rounds of bind, three connections, close and rebind: 48.5 s on
+# linux-amd64 and 62.5 s on windows-amd64, measured.
+[[profile.integration.overrides]]
+filter = 'package(weida) and test(=io::port_release::a_closed_binding_frees_its_port_while_its_connections_are_held)'
+slow-timeout = { period = "190s" }
+
+[[profile.ci.overrides]]
+filter = 'package(weida) and test(=io::port_release::a_closed_binding_frees_its_port_while_its_connections_are_held)'
+slow-timeout = { period = "190s" }

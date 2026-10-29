@@ -402,6 +402,11 @@ impl Runtime {
     /// times the current probe timeout, which grows with round-trip time and
     /// loss — so a process that must exit within a budget of its own could not
     /// use it [0009 §4.4].
+    ///
+    /// When it returns, every binding's port is free to bind again: its OS
+    /// socket is closed, even where the application or weida still holds a
+    /// handle on one of its connections, which from then on sends and
+    /// receives nothing.
     pub async fn shutdown(self) {
         let budget = CloseBudget::start(self.inner.config.shutdown_timeout);
         self.close(budget).await;
@@ -426,7 +431,11 @@ impl Runtime {
     ///    (`docs/decisions/0005-refusal-race.md` §4.2); there is no
     ///    `Processed` at L0 [0009 §4.2]. A transfer that was never finished
     ///    is not part of the drain: the application still owns it.
-    /// 3. The close runs, bounded by whatever is left of `deadline`.
+    /// 3. The close runs, bounded by whatever is left of `deadline`. When it
+    ///    returns, every binding's port is free to bind again: its OS socket
+    ///    is closed, even where the application or weida still holds a
+    ///    handle on one of its connections, which from then on sends and
+    ///    receives nothing.
     ///
     /// The deadline is mandatory and finite on purpose: an infinite drain is
     /// a hang with a rationale, which is the one thing every protocol in the
@@ -501,8 +510,8 @@ impl Runtime {
                 "timeout reached before the sockets went idle"
             ),
         }
-        // The simulated addresses are free once their sockets went idle or
-        // the budget ran out, as an OS frees a closed socket's port.
+        // Every binding's address is free once its socket went idle or the
+        // budget ran out: the OS socket is closed, the simulated one released.
         for binding in &served {
             binding.release();
         }

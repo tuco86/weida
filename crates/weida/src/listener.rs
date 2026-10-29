@@ -415,7 +415,6 @@ impl Listener {
         let BoundSocket {
             inner,
             runtime,
-            handed,
             lease,
         } = socket;
 
@@ -452,7 +451,6 @@ impl Listener {
             local_addr,
             peers,
             socket,
-            handed,
             open,
             close_timeout: self.inner.runtime.config.shutdown_timeout,
             exec,
@@ -804,6 +802,12 @@ impl ServedEndpoint {
     pub(crate) fn release(&self) {
         self.lease.release();
     }
+
+    /// The duplicate a handover passes on; `None` on a simulated network, or
+    /// once the binding closed.
+    fn take_handed(&self) -> Option<std::net::UdpSocket> {
+        self.lease.take_handed()
+    }
 }
 
 /// One concrete transport binding of a [`Listener`].
@@ -813,9 +817,6 @@ pub struct Binding {
     peers: Arc<PeerConns>,
     /// The decorator under the endpoint, which `hand_over` makes hold.
     socket: Arc<HandoverSocket>,
-    /// A duplicate of the bound socket, for the successor; `None` on a
-    /// simulated network.
-    handed: Option<std::net::UdpSocket>,
     open: Arc<OpenConns>,
     exec: Exec,
     close_timeout: Duration,
@@ -838,6 +839,11 @@ impl Binding {
     /// Stops accepting and closes this binding's connections with
     /// `SHUTDOWN`, then waits for the socket to go idle for at most
     /// [`RuntimeConfig::shutdown_timeout`](crate::RuntimeConfig::shutdown_timeout).
+    ///
+    /// When it returns, the binding's port is free to bind again: the OS
+    /// socket is closed, even where the application or weida still holds a
+    /// handle on one of its connections, which from then on sends and
+    /// receives nothing.
     pub async fn close(&self) {
         self.served
             .close(VarInt::from_u32(codes::SHUTDOWN as u32), b"binding closed");
@@ -882,10 +888,11 @@ impl Binding {
     /// # Panics
     ///
     /// On a binding on a simulated network, which has no OS socket to hand
-    /// over.
-    pub async fn hand_over(mut self) -> Handoff {
-        let handed = self.handed.take().expect(
-            "Binding::hand_over needs an OS socket; a binding on a simulated network has none",
+    /// over, or on a binding already closed by [`Binding::close`] or
+    /// [`Runtime::shutdown`](crate::Runtime::shutdown).
+    pub async fn hand_over(self) -> Handoff {
+        let handed = self.served.take_handed().expect(
+            "Binding::hand_over needs an open OS socket; a closed binding, or one on a simulated network, has none",
         );
         self.socket.hold();
         let pending: Vec<quinn::Connection> = self

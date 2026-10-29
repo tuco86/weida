@@ -57,6 +57,7 @@ mod io {
     mod drain;
     mod guide;
     mod identity_source;
+    mod port_release;
     mod pubsub;
     mod reconnect;
     mod streams;
