@@ -1,6 +1,6 @@
 #!/bin/bash
 # /// ci
-# needs = ["check-linux-amd64", "check-linux-arm64", "check-windows-amd64", "check-darwin-arm64"]
+# needs = ["check-linux-amd64", "check-linux-arm64", "check-windows-amd64", "check-darwin-arm64", "audit"]
 # channels = ["release"]
 # platform = "linux-amd64"
 # image = "trixie"

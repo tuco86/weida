@@ -1,0 +1,13 @@
+# cargo-deny, as the `audit` job runs it: `cargo deny --locked check advisories sources`.
+# docs/SECURITY.md says how a finding is handled; every ignore names why weida is not affected.
+[graph]
+# Feature-gated dependencies (h3, blocking, swarm, ...) are shipped too.
+all-features = true
+
+[advisories]
+# Each entry is { id = "RUSTSEC-...", reason = "why weida is not affected" }.
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,6 +1,6 @@
-# Sourced by the platform check jobs and by publish.sh; no header,
-# so not a job. Run from the workspace root, with CI_PLATFORM set by the
-# job's `platform`.
+# Sourced by the platform check jobs, publish.sh, audit.sh and fuzz.sh; no
+# header, so not a job. Run from the workspace root, with CI_PLATFORM set by
+# the job's `platform`.
 
 # Cargo's home and target directory live in the workspace, which the jobs of
 # one place share and keep warm.
