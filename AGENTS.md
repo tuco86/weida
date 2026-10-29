@@ -69,3 +69,9 @@ version and needs no edit.
 Check after the second commit: `git grep -n '0\.1\.0-alpha\.N"' -- '*.toml'
 '*Cargo.lock'` finds nothing, and `git log --oneline` shows the `-dev` bump
 on top of the release commit.
+
+## Security
+
+Advisories, fuzz crashes and agent security reviews follow
+[docs/SECURITY.md](docs/SECURITY.md); an `ignore` in `deny.toml` always
+names why weida is not affected.
