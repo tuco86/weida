@@ -54,7 +54,11 @@ fuzz_target!(|data: &[u8]| {
     let mut pieces = Vec::new();
     let mut d = ChunkedDecoder::new();
     let used = run(&mut d, &data[..split], &mut pieces).expect("a prefix is never a violation");
-    run(&mut d, &data[used..], &mut pieces).expect("the rest decodes");
+    // A body that already ended inside the first piece leaves the rest
+    // unread, as the one-piece run does.
+    if !d.is_done() {
+        run(&mut d, &data[used..], &mut pieces).expect("the rest decodes");
+    }
     assert!(d.is_done());
     assert_eq!(pieces, whole);
 });
