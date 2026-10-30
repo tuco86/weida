@@ -44,10 +44,10 @@ nextest_env() {
 features="weida:blocking weida:swarm weida-zmq:blocking weida-mqtt:blocking weida-nng:blocking weida-http:h3"
 
 # The nextest profile (`.config/nextest.toml`): a push or manual run takes the
-# unit tier; the nightly cron and a release tag take both tiers.
+# unit tier; the nightly and a release tag take both tiers.
 tier() {
     case "$CI_EVENT" in
-        cron | tag) echo ci ;;
+        nightly | tag) echo ci ;;
         *) echo default ;;
     esac
 }

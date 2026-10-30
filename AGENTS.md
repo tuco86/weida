@@ -27,7 +27,7 @@ the Tokio clock, and otherwise asserts the order of events. A negative window
 Before a push: `cargo nextest run -p <crate>` for each crate the change
 touches (the unit tier), plus the feature rows of docs/LOOP.md §6 for those
 crates. The pipelines run the rest: a push to `main` runs the unit tier and
-the doctests on four platforms, the nightly cron and a `v*` tag both tiers.
+the doctests on four platforms, the nightly and a `v*` tag both tiers.
 Never run `--profile integration` or `--profile ci` locally.
 
 ## Version cycle

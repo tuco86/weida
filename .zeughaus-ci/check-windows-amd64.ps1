@@ -1,10 +1,10 @@
 # /// ci
-# on = ["push main", "tag v*", "cron 0 4 * * *"]
+# on = ["push main", "tag v*", "nightly"]
 # machine = "wohnzimmer"
 # timeout_minutes = 180
 # ///
 # clippy, the tests and the doctests on the Windows runner's host: the unit
-# tier on a push or manual run, both tiers on the nightly cron and a release
+# tier on a push or manual run, both tiers on the nightly and a release
 # tag. `check_platform` of build.sh.
 . (Join-Path $env:CI_WORKSPACE '.zeughaus-ci\windows.ps1')
 
@@ -13,7 +13,7 @@ $features = @(
     @('weida', 'blocking'), @('weida', 'swarm'), @('weida-zmq', 'blocking'),
     @('weida-mqtt', 'blocking'), @('weida-nng', 'blocking'), @('weida-http', 'h3')
 )
-$tier = if ($env:CI_EVENT -eq 'cron' -or $env:CI_EVENT -eq 'tag') { 'ci' } else { 'default' }
+$tier = if ($env:CI_EVENT -eq 'nightly' -or $env:CI_EVENT -eq 'tag') { 'ci' } else { 'default' }
 
 Run 'cargo' (@('clippy', '--locked', '--workspace') + $exclude + @('--all-targets', '--', '-D', 'warnings'))
 Run 'cargo' @('clippy', '--locked', '-p', 'weida', '--no-default-features', '--all-targets', '--', '-D', 'warnings')

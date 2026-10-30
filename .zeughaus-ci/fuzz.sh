@@ -1,12 +1,12 @@
 #!/bin/bash
 # /// ci
-# on = ["cron 0 4 * * *"]
+# on = ["nightly"]
 # platform = "linux-amd64"
 # image = "fuzz"
 # timeout_minutes = 120
 # ///
 # Runs every cargo-fuzz target of the workspace's fuzz crates for a fixed
-# time on the nightly cron (docs/SECURITY.md). A manual run gives each target
+# time on the nightly (docs/SECURITY.md). A manual run gives each target
 # a few seconds, which proves they build and start. Every target runs even
 # after one failed; a crash input is printed as base64, because the job's
 # output directory is not kept and the log is.

@@ -123,7 +123,7 @@ Keep the failures block of the test output; a count without names is not a gate 
 
 The integration tier and every platform run in the CI after the push (`.zeughaus-ci/`): a
 push to `main` runs the unit tier and the doctests on linux-amd64, linux-arm64, darwin-arm64
-and windows-amd64, the nightly cron and a `v*` tag both tiers. Never run
+and windows-amd64, the nightly and a `v*` tag both tiers. Never run
 `cargo test --workspace`, `--profile integration` or `--profile ci` locally.
 
 **`--workspace` is not the whole workspace.** It builds every crate in its *default*
