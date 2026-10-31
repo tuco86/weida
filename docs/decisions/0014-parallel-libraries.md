@@ -1,6 +1,6 @@
 # 0014 — Four parallel library workstreams, and bindings that follow each library
 
-- **Status:** accepted
+- **Status:** accepted; §2's foundation rule superseded for weida's binding by [0045](0045-the-c-abi-is-the-boundary.md)
 - **Date:** 2026-09-12
 - **Related:** [0013](0013-competitor-libraries.md) §4.1, §4.4;
   [LOOP.md](../LOOP.md) §9 Phase B, Phase C, Phase D;
