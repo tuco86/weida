@@ -23,8 +23,8 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 
 **Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
 `weida-broker`, `weida-raft`, `weida-openbao`, `weida-http-codec` and `weida-http` are
-published on crates.io, all at `0.1.0-alpha.10`. The other seventeen members are not
-published: `weida-py-core`, every Python binding, the other five protocol libraries with
+published on crates.io, all at `0.1.0-alpha.10`. The other eighteen members are not
+published: `weida-c`, `weida-py-core`, every Python binding, the other five protocol libraries with
 their codecs, and `weida-testkit`, which only tests use. The one exception on crates.io,
 `weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI
 and there are no prebuilt binaries. Wire protocol version `0` is experimental and breaking
@@ -90,6 +90,8 @@ hand.
 | `crates/runtime` | `weida-runtime` | weida | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry, `AF_UNIX` bind hygiene with peer credentials and, on Windows, named-pipe hygiene with the client's SID |
 | `crates/winpipe` | `weida-winpipe` | weida | the Win32 calls a named pipe needs and nothing else — an owner-only DACL, the client's token SID, the pipe's owner SID, both process ids — behind a safe surface; the one crate that may use `unsafe`, and empty off Windows |
 | `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, all six patterns — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS — and the cursor back channel |
+| `crates/weida-c` | `weida-c` | weida | the C ABI every other language binds, `libweida` and `weida.h`: typed handles, status codes, readiness descriptors and `weida_poll`; so far the runtime, TLS values and streamed Req/Rep ([docs/c/](docs/c/README.md), [0045](docs/decisions/0045-the-c-abi-is-the-boundary.md), [docs/libraries/weida-c.md](docs/libraries/weida-c.md)) |
+| `crates/py/weida-py` | `weida` (Python) | binding | weida for Python over `libweida` with cffi, synchronous and asyncio; not a Cargo member ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
 | `crates/broker` | `weida-broker` | weida | L2, and a layer rather than a fork: queues at endpoint paths, the publisher confirm, the absolute per-subscription credit and consumer settlement with requeue; depends only on `weida`, and nothing depends on it ([0018](docs/decisions/0018-minimal-broker.md) §4.1) |
 | `crates/raft/weida-raft` | `weida-raft` | weida | openraft plus the I/O it deliberately does not have — weida's transport under it — so a Raft service supplies only its state machine and log store ([0021](docs/decisions/0021-consensus-openraft.md)) |
 | `crates/openbao/weida-openbao` | `weida-openbao` | weida | OpenBao/Vault for weida: token, AppRole and wrapped hand-off authentication, and identity sources signed by a PKI mount, anchored on its CA, or read from KV; its own crate because it carries the HTTP client and JSON the core does not ([0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3, [docs/libraries/weida-openbao.md](docs/libraries/weida-openbao.md)) |

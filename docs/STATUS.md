@@ -116,15 +116,16 @@ The two halves of that picture are the two products of
 dimensions, transports and patterns it offers, and the six standalone foreign-protocol
 libraries on the right. They share runtime foundations but no implicit semantic conversion.
 
-weida itself ships a library with an async API, the `weida` binary and a Python binding. Each of the six
+weida itself ships a library with an async API, the `weida` binary, a C ABI (`libweida`,
+[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python package on it. Each of the six
 libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0, Core NATS and HTTP — has a parity document in
 [libraries/](libraries/README.md) and, where a peer exists to measure against, an interop
 suite; the NATS suite is written and not run, which its parity table records as a clause **not
 met** rather than rounding up. HTTP speaks HTTP/1.1, HTTP/2 and HTTP/3 in both roles, and
-`weida-openbao` uses it in place of `reqwest`. There are **six Python bindings**: the first five
-libraries plus `weida-py`, each with an asyncio and a synchronous surface on the shared
-`weida-py-core` foundation, and `weida-py` is the one that reaches every weida pattern and its
-cursor surface; HTTP's binding is filed (B-371).
+`weida-openbao` uses it in place of `reqwest`. The first five libraries have **PyO3 bindings**,
+each with an asyncio and a synchronous surface on the shared `weida-py-core` foundation; HTTP's
+is filed (B-371). weida's own Python package is cffi over `libweida`, synchronous and asyncio,
+and reaches what the C ABI maps so far: the runtime, TLS values and streamed Req/Rep.
 
 ## 3. The measurements that decided something
 
@@ -167,9 +168,9 @@ The ready items of [BACKLOG.md](BACKLOG.md) fall into these themes:
   not.
 
 Behind them sit the phases of [IMPLEMENTATION.md](IMPLEMENTATION.md) §1 that are not built:
-persistence, consensus-backed clustering, the Web binding, and the language bindings after
-Python, whose order is Node, Erlang, C, Java
-([0030](decisions/0030-which-runtimes-and-in-which-order.md)).
+persistence, consensus-backed clustering, the Web binding, and the rest of weida in its C ABI,
+which every further language binds
+([0045](decisions/0045-the-c-abi-is-the-boundary.md) §5).
 
 What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
 announcer, a blob store, one identity per connection and following a Raft leader stay out of

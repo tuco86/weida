@@ -459,10 +459,12 @@ crates/
     protocol/                  →  weida-protocol    wire codec, no I/O
     runtime/                   →  weida-runtime     reactor, resolver, OS hygiene
     winpipe/                   →  weida-winpipe     the Win32 calls a named pipe needs;
-                                                    the one crate that may use `unsafe`,
+                                                    `unsafe` by hand, as in weida-c,
                                                     empty off Windows
     weida/                     →  weida             runtime + QUIC and local transports
                                                     + stream core + patterns
+    weida-c/                   →  weida-c           the C ABI, libweida and weida.h
+                                                    (decisions/0045); FFI `unsafe`
     broker/                    →  weida-broker      L2: queues at endpoint paths
     raft/weida-raft/           →  weida-raft        openraft plus the I/O it lacks
     zmq/weida-zmtp/            →  weida-zmtp        ZMTP 3.1 codec, no I/O and no
@@ -485,7 +487,8 @@ crates/
     http/weida-http-codec/     →  weida-http-codec  HTTP/1.1, HPACK, h2 and h3 framing, QPACK, no I/O
     http/weida-http/           →  weida-http        the HTTP client and server (h1, h2, h3)
     py/weida-py-core/          →  weida-py-core     the shared PyO3 foundation
-    py/weida-py/               →  weida-py          weida's own Python binding
+    py/weida-py/               →  weida (Python)    weida for Python, cffi over libweida;
+                                                    not a Cargo member
     testkit/                   →  weida-testkit     test waits that report instead of
                                                     killing; dev-only, never published
 ```
