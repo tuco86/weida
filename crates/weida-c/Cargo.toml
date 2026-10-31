@@ -15,6 +15,8 @@ publish = false
 
 # The library is `libweida.so`, `libweida.dylib` or `weida.dll`, linked with
 # `-lweida`. The `rlib` lets this crate's own tests call the exports directly.
+# On Windows its PDB would collide with the `weida` CLI's, which is why the
+# root manifest strips this package's debuginfo in the dev profile.
 [lib]
 name = "weida"
 crate-type = ["cdylib", "rlib"]

@@ -226,3 +226,10 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# The C ABI's DLL is `weida.dll`, and on Windows its PDB would be
+# `deps/weida.pdb`, the file the `weida` CLI's link writes too: two links at
+# once fail with LNK1201. MSVC writes a PDB even without debuginfo; stripping
+# it is what passes `/DEBUG:NONE`, so the DLL writes none.
+[profile.dev.package.weida-c]
+strip = "debuginfo"
