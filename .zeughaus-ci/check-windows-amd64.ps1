@@ -10,7 +10,7 @@
 
 # The feature rows of docs/LOOP.md §6: crate, feature.
 $features = @(
-    @('weida', 'blocking'), @('weida', 'swarm'), @('weida-zmq', 'blocking'),
+    @('weida', 'swarm'), @('weida-zmq', 'blocking'),
     @('weida-mqtt', 'blocking'), @('weida-nng', 'blocking'), @('weida-http', 'h3')
 )
 $tier = if ($env:CI_EVENT -eq 'nightly' -or $env:CI_EVENT -eq 'tag') { 'ci' } else { 'default' }

@@ -307,8 +307,8 @@ Responsibility is explicit and opt-in; a `core` connection writes nothing it doe
   [0024](decisions/0024-three-families-one-back-channel.md)). A completion is a level plus an
   absolute byte offset, reported on frame kind `6`, a unidirectional stream of its own that
   never shares a stream with payload. A sender orders levels per transfer with
-  `TransferMeta::with_report` and reads them from `Cursors` (`changed`, `changed_within`,
-  `CursorSet`, `Reported`); a receiver reports through `Reporter`. Levels `0..=15` are weida's
+  `TransferMeta::with_report` and reads them from `Cursors` (`changed`, `snapshot`, `offset`,
+  `CursorSet`); a receiver reports through `Reporter`. Levels `0..=15` are weida's
   ladder and `16` and above (`APPLICATION_FLOOR`) the application's, carried and ordered but
   never interpreted. Nothing waits on a cursor and no pattern's topology changes.
   `tests/cursors.rs`.
@@ -407,21 +407,12 @@ error variant, the bridge that drives a Rust future on the caller's event loop �
 inline and spawns only a future that has to wait, so a ready operation costs no loop wakeup
 (§4.15) — and the `bytes` boundary (§4.14). One `abi3` wheel serves CPython 3.9 and up.
 
-- `weida-py` (`crates/py/weida-py`) binds weida itself: `weida.Runtime` on a reactor of its
-  own, QUIC `bind`, all six patterns with their streamed forms, RADIO/DISH, the cursor surface
-  (levels are integers) and connection statistics, with a `weida.sync` module over
-  `weida::blocking` ([libraries/weida-py.md](libraries/weida-py.md)).
+- weida's own Python binding moves from PyO3 onto the C ABI with cffi
+  ([0045](decisions/0045-the-c-abi-is-the-boundary.md)); the PyO3 `weida-py` and the
+  `weida::blocking` facade it sat on are removed.
 - `weida-zmq-py`, `weida-nng-py`, `weida-mqtt-py`, `weida-amqp-py` and `weida-nats-py` bind the
   first five libraries, each following its own library, with a parity document in
   `docs/libraries/`.
-- `weida::blocking`, behind the non-default `blocking` feature of `weida`, is the synchronous
-  facade, in the shape the libraries' own `blocking` facades have: every method is a `block_on`
-  around the asynchronous endpoint's own, over a `Runtime::owned` reactor the caller never
-  sees, with payloads as `Vec<u8>` and an explicit byte ceiling on every receive. A call from
-  inside a Tokio runtime would block the worker that has to drive what it waits for, so every
-  entry point checks `Handle::try_current` and fails with `Error::Runtime` instead of
-  deadlocking (`tests/blocking.rs`). A synchronous wait always has a deadline
-  ([0009](decisions/0009-drain.md) §4.4): `Cursors::changed(deadline)` is mandatory-deadline.
 
 **Not built:** a binding for any other language. The order is Node, Erlang, C, Java
 ([0030](decisions/0030-which-runtimes-and-in-which-order.md)); the JVM design is
@@ -447,9 +438,9 @@ features are not in the library's dependency set and a binary is no reason to wi
 downstream crate compiles. `sub --framing line|raw|nul|length` separates payloads on stdout; a
 newline after each payload is readable and is not framing. `length` is the one form that holds
 a payload, so `--max-bytes` (64 MiB by default) caps the hold, and a payload above it ends the
-command with `LimitExceeded`; a received body that does not finish within
-`RuntimeConfig::receive_timeout` is abandoned by `serve --sink` and `serve --echo`, which
-answers at most 64 requests at a time. `tests/cli.rs` drives the binary the way a user does.
+command with `LimitExceeded`; a received body that does not finish within 30 s (`BODY_TIMEOUT`
+in the binary) is abandoned by `serve --sink` and `serve --echo`, which answers at most 64
+requests at a time. `tests/cli.rs` drives the binary the way a user does.
 
 **Not built:** broker and cluster inspection, and richer administration.
 
@@ -1392,7 +1383,6 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Client handshake placement | spawned **on** the runtime, awaited by the caller as a join handle | Completing a `quinn::Connecting` spawns the connection driver from inside the poll, so the polling thread would need an ambient reactor. Spawning it keeps `Runtime::connect` pollable from any executor and keeps the future `Send`, which holding an `EnterGuard` across the await would not. |
 | `futures-io` beside `tokio::io` | both trait pairs on `OutgoingTransfer`/`IncomingTransfer`, `futures-io` delegating to the tokio impl | A caller on `futures`, `smol` or `async-std` should not have to wrap a compat shim around a payload stream. Delegating keeps the end-of-payload bookkeeping in one place. |
 | `shutdown_timeout` | `RuntimeConfig::shutdown_timeout`, default 1 s | `shutdown` closes every endpoint and then waits for the sockets to go idle; **without a bound** the length of a process's exit would be decided by the path rather than by the caller: measured against a peer that has gone silent, the draining period alone is **96 ms** on loopback and grows with round-trip time and loss. One second is generous on any network where a clean close was possible at all. The bound is one budget for the whole shutdown, not one per endpoint, because what a caller waits for is the call ([decisions/0009](decisions/0009-drain.md) §4.4). The same bound caps `Binding::close` ([decisions/0038](decisions/0038-restart-handoff.md) §4.6), which would otherwise wait without a bound too, and `Binding::hand_over`'s wait for its held closes ([decisions/0039](decisions/0039-handover-says-when.md) §4.4). |
-| `receive_timeout` | `RuntimeConfig::receive_timeout`, default 30 s; `None` waits as long as the peer likes | The body of one received transfer, from its header to its end, must arrive within this, where the blocking receives and `weida serve` collect it. Without a bound one peer that sends a header and then stalls, or sends a byte inside every idle window, parks a single-threaded consumer and starves every other sender it has: a byte or a PING keeps the connection alive, so `idle_timeout` never fires. Expiry drops that transfer, which stops its stream, and fails the receive with `Error::Expired`; the next transfer is unaffected. |
 | Address selection | try every resolved address in order, capped by `RuntimeConfig::max_resolved_addresses` (8), each attempt but the last bounded by `RuntimeConfig::connect_attempt_timeout` (250 ms) | Taking the first address would make `weida://localhost:…` unreachable wherever `localhost` resolves to `::1` before `127.0.0.1`, which is the common Linux ordering. Sequential attempts with a per-attempt bound rather than RFC 8305's parallel happy-eyeballs: the failure to handle is an address that answers *nothing*, where QUIC has no refusal to observe, and 250 ms is RFC 8305's own Connection Attempt Delay for exactly that case. On the regression test the bound is the difference between **30 s and 1.3 s**. The last address keeps the full handshake budget, so an IP literal and a single-address name keep the whole budget of a plain dial. |
 | Loss cause | `Error::ConnectionLost(LossCause)` — `IdleTimeout`, `PeerClosed`, `PeerRestarting`, `LocallyClosed`, `Reset`, `TransportError` | A bare `ConnectionLost` would hide why a peer is gone: `TimedOut`, `Reset` and an unrecognized application close would map to the same value, so the distinction would exist nowhere in the API. A payload rather than new top-level variants: the *outcome* is identical in all six cases — nothing in flight completed, `is_definite_failure()` stays true — and only the next action differs, so a second outcome vocabulary would be the wrong shape ([FAILURE_MODEL.md](FAILURE_MODEL.md) §4). Each cause changes what an application should do, and `PeerSet::pick` reports the cause of the peer it rejected. `PeerRestarting` is a peer's close with `RESTARTING` ([decisions/0038](decisions/0038-restart-handoff.md) §4.3): it too leaves the outcome alone and changes only the next action, which is a redial with no first delay, whatever `stop_on_peer_closed` says. |
 

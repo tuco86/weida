@@ -128,12 +128,11 @@ and windows-amd64, the nightly and a `v*` tag both tiers. Never run
 
 **`--workspace` is not the whole workspace.** It builds every crate in its *default*
 configuration, so code behind a default-off feature is compiled by none of the four commands
-above — 909 tests and four synchronous facades, as of this writing. A commit that touches Rust
+above — the `swarm` pattern, HTTP/3 and three synchronous facades, as of this writing. A commit that touches Rust
 therefore also runs, for each crate whose sources it touched:
 
 | crate | feature | commands |
 | --- | --- | --- |
-| `weida` | `blocking` | `clippy -p weida --features blocking --all-targets -- -D warnings`, `nextest run -p weida --features blocking` |
 | `weida` | `swarm` | `clippy -p weida --features swarm --all-targets -- -D warnings`, `nextest run -p weida --features swarm` |
 | `weida-zmq` | `blocking` | the same two with `-p weida-zmq` |
 | `weida-mqtt` | `blocking` | the same two with `-p weida-mqtt` |
@@ -141,7 +140,7 @@ therefore also runs, for each crate whose sources it touched:
 | `weida-http` | `h3` | the same two with `-p weida-http --features h3` |
 
 A commit that touches the core (`weida`, `weida-protocol`, `weida-runtime`, `weida-core`) runs
-all four, because every facade sits on it.
+every row, because every library sits on it.
 
 Two features are **excluded on purpose**, with the reason: `nng-interop` and `libzmq-interop`
 need a foreign C library present at run time, so they belong to the item that touches them and

@@ -210,31 +210,6 @@ impl CursorSet {
     }
 }
 
-/// What a bounded wait for a cursor found.
-///
-/// Three outcomes rather than two, because a deadline and an ending are
-/// different facts about the same report: [`Reported::Waiting`] says nothing
-/// new arrived *yet*, [`Reported::Ended`] says nothing more will
-/// ([`Cursors::changed_within`]).
-///
-/// [`Reported::Changed`] carries no set, because the handle already has it:
-/// [`Cursors::snapshot`] and [`Cursors::offset`] read the latest values
-/// without waiting, so a variant holding a copy of a 272-byte
-/// [`CursorSet`] would make this answer large for no fact it does not already
-/// have.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reported {
-    /// Something moved: read it with [`Cursors::snapshot`] or
-    /// [`Cursors::offset`].
-    Changed,
-    /// The deadline passed. The report may still continue.
-    Waiting,
-    /// No further cursors are coming: the reporter finished, the stream was
-    /// reset, or the connection went away — three cases deliberately
-    /// indistinguishable, none of them a failure.
-    Ended,
-}
-
 /// The reader's end of one transfer's report.
 ///
 /// Independent of the transfer it came from, and deliberately so: the terminal
@@ -274,26 +249,6 @@ impl Cursors {
                 Some(*self.rx.borrow_and_update())
             }
             _ = self.guard.conn.conn.closed() => None,
-        }
-    }
-
-    /// [`Cursors::changed`], giving up after `deadline`.
-    ///
-    /// The three outcomes are distinct on purpose: a deadline that passes is
-    /// **not** the end of the report, and treating it as one would make a
-    /// caller stop reading a verdict that is still coming. An asynchronous
-    /// caller can wrap [`Cursors::changed`] in its own timeout and rarely
-    /// needs this; a **synchronous** one cannot — a parked thread is
-    /// interrupted by nothing — which is why the timer lives here, where the
-    /// runtime is: `weida::blocking::Cursors::changed` is this call, written
-    /// as text rather than as a link because a link to a feature-gated item
-    /// is a hard rustdoc error in the configuration that lacks it.
-    pub async fn changed_within(&mut self, deadline: Duration) -> Reported {
-        let exec = self.guard.conn.exec.clone();
-        match exec.within(deadline, self.changed()).await {
-            None => Reported::Waiting,
-            Some(None) => Reported::Ended,
-            Some(Some(_)) => Reported::Changed,
         }
     }
 }

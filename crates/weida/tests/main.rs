@@ -5,7 +5,6 @@
 mod common;
 
 mod alpn;
-mod blocking;
 mod bus;
 mod cursors;
 mod drain;
@@ -52,7 +51,6 @@ mod transports;
 /// integration tier (`.config/nextest.toml`).
 mod io {
     mod accept_limits;
-    mod blocking;
     mod cli;
     mod drain;
     mod guide;

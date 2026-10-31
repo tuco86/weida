@@ -47,14 +47,6 @@ exchange's publisher confirm stays the DATA key `8` reply. A level the broker ca
 `Stored`, with no store — is absent from the report rather than failed, which is
 [GUARANTEES.md](GUARANTEES.md) §1's prohibition seen from the reporting side.
 
-**A synchronous wait always has a deadline.** The blocking `Cursors::changed(deadline)` takes a
-mandatory one for the reason [0009](decisions/0009-drain.md) §4.4 gives: a peer that never
-reports opens no stream, a report that never starts never ends, and a connection both sides keep
-alive never closes, so a parked thread would wait forever. The library's
-`Cursors::changed_within(deadline)` answers `Reported::{Changed, Waiting, Ended}` — three
-outcomes, because a deadline is not an ending — and `weida.sync.Cursors.changed(seconds)`
-raises `TimeoutError`.
-
 **The broker owns a delivery until somebody reports it processed.** `weida-broker` admits and
 confirms at `Accepted`, registers ordinary subscribers and delivers under their cumulative
 credit, and moves each delivery into an `unsettled` table **without releasing its `queue_bytes`
@@ -124,8 +116,7 @@ The two halves of that picture are the two products of
 dimensions, transports and patterns it offers, and the six standalone foreign-protocol
 libraries on the right. They share runtime foundations but no implicit semantic conversion.
 
-weida itself ships a library with an async API and, behind the non-default `blocking` feature,
-a synchronous one (`weida::blocking`), the `weida` binary and a Python binding. Each of the six
+weida itself ships a library with an async API, the `weida` binary and a Python binding. Each of the six
 libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0, Core NATS and HTTP — has a parity document in
 [libraries/](libraries/README.md) and, where a peer exists to measure against, an interop
 suite; the NATS suite is written and not run, which its parity table records as a clause **not
@@ -182,8 +173,8 @@ Python, whose order is Node, Erlang, C, Java
 
 What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
 announcer, a blob store, one identity per connection and following a Raft leader stay out of
-weida ([0040](decisions/0040-swarm-pattern.md) §6), and mirrors of SWARM in `weida::blocking`
-and Python are filed when a caller needs them. griasdi moves its seeder onto sessions on its
+weida ([0040](decisions/0040-swarm-pattern.md) §6), and mirrors of SWARM in Python are filed
+when a caller needs them. griasdi moves its seeder onto sessions on its
 side (`PROPOSAL-weida-swarm-sessions.md` in its checkout).
 
 ## 5. What needs a human

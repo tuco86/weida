@@ -125,11 +125,6 @@ $ printf 'hello weida' | cargo run -q -p weida --bin weida -- request 'weida://s
 hello weida
 ```
 
-In a program with no reactor, the same shape is a library call: `weida::blocking` behind the
-non-default `blocking` feature wraps every endpoint, one `block_on` each, over a reactor it
-owns — and refuses to be called from inside a Tokio runtime, where blocking a worker would
-deadlock.
-
 Four verbs: `serve` (with `--echo`, `--sink` or `--pub`), `request`, `send` and `sub`. The
 payload is on stdin and stdout and nothing else is, so `weida request … | sha256sum` means
 what it looks like; addresses, receipts and topics go to stderr. The address `serve` printed

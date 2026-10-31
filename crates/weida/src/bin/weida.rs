@@ -24,8 +24,8 @@
 //! exactly as `transform_server` prints them.
 //!
 //! **Bounds.** A stalled sender cannot hold `serve`: each body that `--sink`
-//! or `--echo` receives is abandoned after `RuntimeConfig::receive_timeout`
-//! (30 s), and `--echo` answers at most 64 requests at a time. `sub
+//! or `--echo` receives is abandoned after `BODY_TIMEOUT` (30 s), and
+//! `--echo` answers at most 64 requests at a time. `sub
 //! --framing length` holds a whole payload, so `--max-bytes` caps that hold;
 //! the other framings stream and need no cap.
 //!
@@ -59,6 +59,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::io::{Read as _, Write as _};
 
@@ -656,6 +657,12 @@ fn bind_local(listener: &weida::Listener, url: &str) -> Result<(String, String),
     }
 }
 
+/// How long a body `serve --sink` or `serve --echo` collects may take, from
+/// its header to its end, so one stalled sender cannot hold `serve`: a peer
+/// that sends a header and then one byte inside every idle window keeps
+/// `idle_timeout` from ever firing.
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Echoes running at once. A request past this waits in the endpoint queue,
 /// where QUIC flow control holds it, instead of costing a task and a buffer.
 const MAX_ECHOES: usize = 64;
@@ -665,12 +672,11 @@ const ECHO_CHUNK: usize = 8 * 1024;
 
 /// Answers requests with their own bodies, at most `MAX_ECHOES` at a time.
 ///
-/// Each exchange is bounded by `RuntimeConfig::receive_timeout`, and the bound
+/// Each exchange is bounded by `BODY_TIMEOUT`, and the bound
 /// covers the reply as well as the request body: a requester that stops
 /// reading its reply holds its slot as surely as one that stops sending.
 async fn echo(runtime: &Runtime, replier: Replier) -> Result<(), Error> {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_ECHOES));
-    let limit = runtime.config().receive_timeout;
     let exec = runtime.exec().clone();
     loop {
         // Taken before the request is accepted, so a request past the bound is
@@ -684,13 +690,10 @@ async fn echo(runtime: &Runtime, replier: Replier) -> Result<(), Error> {
         tokio::spawn(async move {
             // Released when the task ends, however it ends.
             let _permit = permit;
-            let outcome = match limit {
-                Some(limit) => exec
-                    .within(limit, echo_one(request))
-                    .await
-                    .unwrap_or(Err(Error::Expired)),
-                None => echo_one(request).await,
-            };
+            let outcome = exec
+                .within(BODY_TIMEOUT, echo_one(request))
+                .await
+                .unwrap_or(Err(Error::Expired));
             if let Err(e) = outcome {
                 eprintln!("weida: request failed: {e}");
             }
@@ -720,28 +723,24 @@ async fn echo_one(mut request: IncomingRequest) -> Result<(), Error> {
 ///
 /// Sequential on purpose: two payloads written at once would interleave on
 /// stdout. A transfer whose body does not finish within
-/// `RuntimeConfig::receive_timeout` is dropped, which stops its stream, and the
+/// `BODY_TIMEOUT` is dropped, which stops its stream, and the
 /// next one is taken, so one stalled sender cannot hold the sink.
 async fn sink(runtime: &Runtime, puller: Puller) -> Result<(), Error> {
     let mut stdout = std::io::stdout();
     let mut chunk = vec![0u8; CHUNK];
-    let limit = runtime.config().receive_timeout;
     loop {
         let mut transfer = puller.recv().await?;
         let mut total = 0u64;
         let copy = copy_body(&mut transfer, &mut stdout, &mut chunk, &mut total);
-        let finished = match limit {
-            Some(limit) => runtime.exec().within(limit, copy).await.ok_or(limit),
-            None => Ok(copy.await),
-        };
+        let finished = runtime.exec().within(BODY_TIMEOUT, copy).await;
         match finished {
-            Ok(result) => {
+            Some(result) => {
                 result?;
                 stdout.flush().map_err(Error::Io)?;
                 eprintln!("received bytes={total}");
             }
-            Err(limit) => {
-                eprintln!("weida: transfer abandoned after {limit:?}, {total} bytes written");
+            None => {
+                eprintln!("weida: transfer abandoned after {BODY_TIMEOUT:?}, {total} bytes written");
             }
         }
     }

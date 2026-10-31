@@ -43,9 +43,6 @@
 //! payloads implement both the `tokio::io` and the `futures-io` traits for
 //! the same reason.
 
-#[cfg(feature = "blocking")]
-pub mod blocking;
-
 // The chunk framing both socket transports share: a named pipe has no
 // half-close and a unix socket has no abort, so the end of a payload is a
 // frame rather than a socket state.
@@ -92,7 +89,7 @@ mod swarm;
 pub use config::{
     Alpn, ClientTls, ClientTrust, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust,
 };
-pub use cursor::{CursorSet, Cursors, Reported, Reporter};
+pub use cursor::{CursorSet, Cursors, Reporter};
 pub use drain::Drained;
 pub use endpoint::{
     Bus, BusMember, Cast, Dish, Endpoint, Pair, Paired, Pattern, Pub, Publisher, Pull, Puller,

@@ -51,7 +51,7 @@ slow-timeout = { period = "50s" }
 # Arbitrary octets through a session, many rounds: 7.3 s on darwin-arm64 and
 # 5.3 s on windows-amd64, and 10 s on windows-amd64 beside the whole nightly.
 # The budget race spins two threads for ten rounds: 4.5 s on darwin-arm64,
-# past 10 s there and on windows-amd64 in `-p weida --features blocking`,
+# past 10 s there and on windows-amd64 in `-p weida --features swarm`,
 # where weida's heavy tests overlap. The guide's large payload: 6.7 s on
 # darwin-arm64, 4.1 s on windows-amd64, past 10 s in that same run. The CLI
 # tests start a child process that mints an identity and wait on it for up to
