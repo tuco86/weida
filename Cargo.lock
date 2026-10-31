@@ -3726,18 +3726,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "weida-py"
-version = "0.1.0-alpha.11-dev"
-dependencies = [
- "bytes",
- "pyo3",
- "tokio",
- "weida",
- "weida-core",
- "weida-py-core",
-]
-
-[[package]]
 name = "weida-py-core"
 version = "0.1.0-alpha.11-dev"
 dependencies = [

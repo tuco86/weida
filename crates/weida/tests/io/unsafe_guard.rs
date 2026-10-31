@@ -2,7 +2,7 @@
 //! says nothing about it.
 //!
 //! Most crates here inherit `unsafe_code = "forbid"` from the workspace lint
-//! table and are done. Seven cannot:
+//! table and are done. Six cannot:
 //! a PyO3 crate's `#[pyclass]`, `#[pymethods]` and `#[pyfunction]` expand to
 //! `unsafe impl`s of PyO3's type-object traits, and the lint does not care
 //! that the code came from a macro. So those manifests set
@@ -142,7 +142,7 @@ fn hand_written_unsafe(file: &Path) -> Vec<String> {
     offenders
 }
 
-/// The claim seven manifests make, tested once for all of them.
+/// The claim six manifests make, tested once for all of them.
 #[test]
 fn no_crate_that_allows_unsafe_writes_any_by_hand() {
     let root = workspace_root();
@@ -152,8 +152,8 @@ fn no_crate_that_allows_unsafe_writes_any_by_hand() {
         .collect();
 
     assert!(
-        allowing.len() >= 7,
-        "the seven PyO3 crates set the allowance; this walk found {}: {allowing:?}",
+        allowing.len() >= 6,
+        "the six PyO3 crates set the allowance; this walk found {}: {allowing:?}",
         allowing.len()
     );
 
@@ -193,7 +193,7 @@ fn no_crate_that_allows_unsafe_writes_any_by_hand() {
 ///
 /// `unsafe_code` defaults to `allow`, so a crate with no `[lints.rust]` stance
 /// permits hand-written `unsafe` and claims nothing — which is worse than the
-/// seven above, because there is no comment to falsify. Every crate in this
+/// six above, because there is no comment to falsify. Every crate in this
 /// tree takes a position; this is what keeps that true as crates are added.
 #[test]
 fn every_crate_takes_a_position_on_unsafe() {

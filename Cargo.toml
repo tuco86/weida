@@ -37,7 +37,6 @@ members = [
     # The shared PyO3 foundation every Python binding sits on, with nothing
     # protocol-specific in it (0014 §2).
     "crates/py/weida-py-core",
-    "crates/py/weida-py",
     # The OpenBao client and the identity sources it drives, in its own
     # crate because of the two dependencies below
     # ([decisions/0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3).

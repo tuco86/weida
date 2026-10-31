@@ -23,7 +23,7 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 
 **Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
 `weida-broker`, `weida-raft`, `weida-openbao`, `weida-http-codec` and `weida-http` are
-published on crates.io, all at `0.1.0-alpha.10`. The other eighteen members are not
+published on crates.io, all at `0.1.0-alpha.10`. The other seventeen members are not
 published: `weida-py-core`, every Python binding, the other five protocol libraries with
 their codecs, and `weida-testkit`, which only tests use. The one exception on crates.io,
 `weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI
@@ -95,7 +95,6 @@ hand.
 | `crates/openbao/weida-openbao` | `weida-openbao` | weida | OpenBao/Vault for weida: token, AppRole and wrapped hand-off authentication, and identity sources signed by a PKI mount, anchored on its CA, or read from KV; its own crate because it carries the HTTP client and JSON the core does not ([0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3, [docs/libraries/weida-openbao.md](docs/libraries/weida-openbao.md)) |
 | `crates/testkit` | `weida-testkit` | test support | waits for tests that report instead of killing: an expected time, a "still waiting" line at each multiple of it, and a hard limit only on a paused clock, where reaching it means a hang; a dev-dependency named by path, never published |
 | `crates/py/weida-py-core` | `weida-py-core` | foundation | the shared PyO3 foundation under every binding, with nothing protocol-specific in it: errno exception families, the asyncio bridge that drives a Rust future on the caller's loop, and the bytes boundary ([0014](docs/decisions/0014-parallel-libraries.md) §2) |
-| `crates/py/weida-py` | `weida-py` | binding | the Python surface of weida itself: every pattern including the streamed fan-out, asyncio and synchronous ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
 | `crates/zmq/weida-zmtp` | `weida-zmtp` | codec | ZMTP 3.1 — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
 | `crates/zmq/weida-zmq` | `weida-zmq` | library | the ZeroMQ implementation: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices, interop-tested against libzmq 4.3.5 in both roles ([docs/libraries/zmq.md](docs/libraries/zmq.md)) |
 | `crates/zmq/weida-zmq-py` | `weida-zmq-py` | binding | the Python ZeroMQ surface: all eleven socket types, the three transports, the option table, PLAIN/CURVE/ZAP with a handler in Python, and a synchronous surface beside the asyncio one ([docs/libraries/zmq-py.md](docs/libraries/zmq-py.md)) |

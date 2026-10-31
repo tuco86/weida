@@ -47,7 +47,7 @@ function Install-Nextest {
 
 # wohnzimmer has no Python; the bindings' test binaries link libpython.
 $exclude = @(
-    '--exclude', 'weida-py-core', '--exclude', 'weida-py', '--exclude', 'weida-zmq-py',
+    '--exclude', 'weida-py-core', '--exclude', 'weida-zmq-py',
     '--exclude', 'weida-nng-py', '--exclude', 'weida-mqtt-py', '--exclude', 'weida-amqp-py',
     '--exclude', 'weida-nats-py'
 )
