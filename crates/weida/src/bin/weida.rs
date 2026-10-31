@@ -740,7 +740,9 @@ async fn sink(runtime: &Runtime, puller: Puller) -> Result<(), Error> {
                 eprintln!("received bytes={total}");
             }
             None => {
-                eprintln!("weida: transfer abandoned after {BODY_TIMEOUT:?}, {total} bytes written");
+                eprintln!(
+                    "weida: transfer abandoned after {BODY_TIMEOUT:?}, {total} bytes written"
+                );
             }
         }
     }

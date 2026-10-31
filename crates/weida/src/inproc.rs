@@ -348,7 +348,7 @@ pub(crate) struct LocalSend {
 }
 
 impl LocalSend {
-    fn stop_code(&self) -> Option<u64> {
+    pub(crate) fn stop_code(&self) -> Option<u64> {
         let code = self.signal.stop.load(Ordering::Acquire);
         (code != NO_CODE).then_some(code)
     }

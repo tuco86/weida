@@ -596,10 +596,7 @@ impl AsyncWrite for OutgoingTransfer {
             && expiry.as_mut().poll(cx).is_ready()
         {
             self.expire();
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                Error::Expired,
-            )));
+            return Poll::Ready(Err(Error::Expired.into()));
         }
         AsyncWrite::poll_write(Pin::new(self.stream()), cx, buf)
     }

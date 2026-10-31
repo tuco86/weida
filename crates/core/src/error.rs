@@ -189,9 +189,37 @@ impl std::error::Error for Error {
     }
 }
 
+/// An `io::Error` that carries an [`Error`] (built by the reverse conversion
+/// below, which is how a stream reports weida's outcome through `AsyncRead`
+/// and `AsyncWrite`) gives that error back; any other is [`Error::Io`].
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
+        if e.get_ref().is_some_and(|inner| inner.is::<Error>()) {
+            let inner = e.into_inner().expect("checked above");
+            return *inner.downcast::<Error>().expect("checked above");
+        }
         Error::Io(e)
+    }
+}
+
+/// Carries the error inside an `io::Error`, so a reader of the I/O traits
+/// still learns weida's outcome with `Error::from`. The kind is the closest
+/// I/O reading of the outcome; [`Error::Io`] gives its own error back.
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        use std::io::ErrorKind;
+        let kind = match e {
+            Error::Io(io) => return io,
+            Error::Expired => ErrorKind::TimedOut,
+            Error::ConnectionLost(_) | Error::Indeterminate => ErrorKind::NotConnected,
+            Error::Rejected
+            | Error::Canceled
+            | Error::UnknownEndpoint
+            | Error::NoReply
+            | Error::LimitExceeded => ErrorKind::ConnectionReset,
+            _ => ErrorKind::Other,
+        };
+        std::io::Error::new(kind, e)
     }
 }
 
@@ -384,5 +412,19 @@ mod tests {
         let e = Error::Io(std::io::Error::other("boom"));
         assert!(e.source().is_some());
         assert!(Error::Canceled.source().is_none());
+    }
+
+    #[test]
+    fn an_outcome_survives_a_round_trip_through_io_error() {
+        let back = Error::from(std::io::Error::from(Error::Canceled));
+        assert!(matches!(back, Error::Canceled), "{back:?}");
+        assert_eq!(
+            std::io::Error::from(Error::Expired).kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(matches!(
+            Error::from(std::io::Error::other("x")),
+            Error::Io(_)
+        ));
     }
 }

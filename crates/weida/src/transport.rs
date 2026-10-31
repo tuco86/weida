@@ -33,6 +33,7 @@ use crate::conn::{conn_error, read_error, write_error};
 use crate::identity::PeerChain;
 use crate::inproc::{LocalConn, LocalRecv, LocalSend};
 use weida_protocol::LOCAL_MAX_DATAGRAM;
+use weida_protocol::codes::stop_reason;
 
 /// The next connection serial. One counter serves every transport, because
 /// one listener serves QUIC, in-process and local peers through the same
@@ -664,23 +665,40 @@ impl AsyncWrite for SendHalf {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            SendHalf::Quic(s) => AsyncWrite::poll_write(Pin::new(s), cx, buf),
-            SendHalf::Local(s) => match s.io_mut() {
-                Some(io) => Pin::new(io).poll_write(cx, buf),
-                None => Poll::Ready(Err(closed_io())),
-            },
+        let polled = match self.get_mut() {
+            // quinn's own `poll_write`, which keeps the `WriteError` the
+            // outcome is read from; its `AsyncWrite` impl flattens it.
+            SendHalf::Quic(s) => Pin::new(s).poll_write(cx, buf).map_err(write_error),
+            SendHalf::Local(s) => {
+                if let Some(code) = s.stop_code() {
+                    return Poll::Ready(Err(Error::from(stop_reason(code)).into()));
+                }
+                let Some(io) = s.io_mut() else {
+                    return Poll::Ready(Err(closed_io()));
+                };
+                Pin::new(io)
+                    .poll_write(cx, buf)
+                    .map_err(|e| match s.stop_code() {
+                        Some(code) => stop_reason(code).into(),
+                        None => Error::Transport(format!("local stream write failed: {e}")),
+                    })
+            }
             #[cfg(unix)]
             SendHalf::Unix(s) => match s.io_mut() {
-                Some(io) => Pin::new(io).poll_write(cx, buf),
-                None => Poll::Ready(Err(closed_io())),
+                Some(io) => Pin::new(io)
+                    .poll_write(cx, buf)
+                    .map_err(crate::grouped::write_failure),
+                None => return Poll::Ready(Err(closed_io())),
             },
             #[cfg(windows)]
             SendHalf::Pipe(s) => match s.io_mut() {
-                Some(io) => Pin::new(io).poll_write(cx, buf),
-                None => Poll::Ready(Err(closed_io())),
+                Some(io) => Pin::new(io)
+                    .poll_write(cx, buf)
+                    .map_err(crate::grouped::write_failure),
+                None => return Poll::Ready(Err(closed_io())),
             },
-        }
+        };
+        polled.map_err(std::io::Error::from)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -730,34 +748,43 @@ impl AsyncRead for RecvHalf {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            RecvHalf::Quic(r) => AsyncRead::poll_read(Pin::new(r), cx, buf),
-            RecvHalf::Local(r) => {
-                let reset = r.reset_code();
-                match r.io_mut() {
-                    Some(io) => match Pin::new(io).poll_read(cx, buf) {
-                        Poll::Ready(Ok(())) if buf.filled().is_empty() && reset.is_some() => {
-                            Poll::Ready(Err(std::io::Error::other("stream reset by the peer")))
-                        }
-                        other => other,
-                    },
-                    None => Poll::Ready(Ok(())),
+        let polled =
+            match self.get_mut() {
+                // quinn's own `poll_read_buf`, which keeps the `ReadError` the
+                // outcome is read from; its `AsyncRead` impl flattens it.
+                RecvHalf::Quic(r) => r.poll_read_buf(cx, buf).map_err(read_error),
+                RecvHalf::Local(r) => {
+                    let reset = r.reset_code();
+                    match r.io_mut() {
+                        Some(io) => match Pin::new(io).poll_read(cx, buf) {
+                            Poll::Ready(Ok(())) if buf.filled().is_empty() => match reset {
+                                Some(code) => Poll::Ready(Err(stop_reason(code).into())),
+                                None => Poll::Ready(Ok(())),
+                            },
+                            other => other.map_err(|e| {
+                                Error::Transport(format!("local stream read failed: {e}"))
+                            }),
+                        },
+                        None => Poll::Ready(Ok(())),
+                    }
                 }
-            }
-            #[cfg(unix)]
-            RecvHalf::Unix(r) => match r.io_mut() {
-                Some(io) => AsyncRead::poll_read(Pin::new(io), cx, buf),
-                None => Poll::Ready(Ok(())),
-            },
-            #[cfg(windows)]
-            RecvHalf::Pipe(r) => match r.io_mut() {
-                Some(io) => AsyncRead::poll_read(Pin::new(io), cx, buf),
-                None => Poll::Ready(Ok(())),
-            },
-        }
+                #[cfg(unix)]
+                RecvHalf::Unix(r) => match r.io_mut() {
+                    Some(io) => AsyncRead::poll_read(Pin::new(io), cx, buf)
+                        .map_err(crate::chunked::read_error),
+                    None => Poll::Ready(Ok(())),
+                },
+                #[cfg(windows)]
+                RecvHalf::Pipe(r) => match r.io_mut() {
+                    Some(io) => AsyncRead::poll_read(Pin::new(io), cx, buf)
+                        .map_err(crate::chunked::read_error),
+                    None => Poll::Ready(Ok(())),
+                },
+            };
+        polled.map_err(std::io::Error::from)
     }
 }
 
 fn closed_io() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream already closed")
+    Error::Transport("stream already closed".into()).into()
 }

@@ -681,6 +681,10 @@ async fn cancel_discards_unread_bytes_and_keeps_read_ones() {
         "quinn maps RESET_STREAM to ConnectionReset: {err:?}"
     );
     assert!(
+        matches!(weida::Error::from(err), weida::Error::Canceled),
+        "the outcome survives the io::Error"
+    );
+    assert!(
         after_cancel <= 4 * 1024,
         "the reset cannot deliver more than the payload's remainder"
     );
@@ -708,6 +712,39 @@ async fn cancel_discards_unread_bytes_and_keeps_read_ones() {
     within(pusher.send(b"next")).await.expect("send next");
     let next = within(puller.recv()).await.expect("recv next");
     assert_eq!(within(next.collect(64)).await.expect("collect"), b"next");
+
+    client.shutdown().await;
+}
+
+/// Claim: a receiver that drops a transfer unread refuses it, and a sender
+/// writing through `AsyncWrite` learns that outcome rather than a bare I/O
+/// error: `weida::Error::from` the failure is `Rejected`.
+#[tokio::test]
+async fn a_refused_payload_reports_rejected_through_async_write() {
+    let server = Server::start().await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+    let client = server.client_runtime();
+    let pusher = client.pusher(server.trust());
+    within(pusher.connect(&server.url("/jobs")))
+        .await
+        .expect("connect");
+
+    let mut transfer = within(pusher.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    let chunk = [7u8; 1024];
+    within(tokio::io::AsyncWriteExt::write(&mut transfer, &chunk))
+        .await
+        .expect("the first write fits the window");
+    drop(within(puller.recv()).await.expect("recv"));
+
+    let err = loop {
+        if let Err(e) = within(tokio::io::AsyncWriteExt::write(&mut transfer, &chunk)).await {
+            break e;
+        }
+    };
+    let outcome = weida::Error::from(err);
+    assert!(matches!(outcome, Error::Rejected), "{outcome:?}");
 
     client.shutdown().await;
 }

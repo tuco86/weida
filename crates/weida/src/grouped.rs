@@ -1199,6 +1199,16 @@ pub(crate) struct Claims {
     _place: Option<Arc<Place>>,
 }
 
+/// A local stream's write failure as an outcome: the peer closing its read
+/// side is the local equivalent of `STOP_SENDING`, without a code to carry
+/// [0012 §4.7].
+pub(crate) fn write_failure(e: std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => Error::Canceled,
+        _ => Error::Transport(format!("local stream write failed: {e}")),
+    }
+}
+
 /// The writing half of one local stream.
 pub(crate) struct LocalSend<S: Stream> {
     io: Option<S::Writer>,
@@ -1235,12 +1245,7 @@ impl<S: Stream> LocalSend<S> {
         let Some(io) = self.io.as_mut() else {
             return Err(Error::Transport("stream already closed".into()));
         };
-        io.write_all(buf).await.map_err(|e| match e.kind() {
-            // The peer closed its read side: the local equivalent of
-            // `STOP_SENDING`, without a code to carry [0012 §4.7].
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => Error::Canceled,
-            _ => Error::Transport(format!("local stream write failed: {e}")),
-        })
+        io.write_all(buf).await.map_err(write_failure)
     }
 
     /// Ends the payload: the FIN the reader sees.

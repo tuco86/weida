@@ -129,6 +129,10 @@ async fn a_reader_never_sees_an_interrupted_stream_as_complete() {
                     std::io::ErrorKind::ConnectionReset,
                     "AsyncRead reports a reset, not an end: {e:?}"
                 );
+                assert!(
+                    matches!(weida::Error::from(e), weida::Error::Canceled),
+                    "the outcome survives the io::Error"
+                );
                 break;
             }
         }
