@@ -5,3 +5,7 @@
 /.venv
 __pycache__/
 .pytest_cache/
+# What crates/py/weida-py/hatch_build.py builds into the package.
+crates/py/weida-py/src/weida/_ffi.py
+crates/py/weida-py/src/weida/libweida.*
+crates/py/weida-py/src/weida/weida.dll

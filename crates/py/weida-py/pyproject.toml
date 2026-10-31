@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.26", "cffi>=1.17", "tomli>=1.1; python_version < '3.11'"]
+build-backend = "hatchling.build"
+
+[project]
+name = "weida"
+description = "weida for Python over its C ABI: Req/Rep over QUIC with streamed bodies, synchronous and asyncio, on CPython and PyPy"
+requires-python = ">=3.9"
+dependencies = ["cffi>=1.17"]
+# The workspace version of Cargo.toml in PEP 440 spelling (hatch_build.py):
+# one version for the library and its binding, typed once.
+dynamic = ["version"]
+license = "MIT OR Apache-2.0"
+keywords = ["quic", "asyncio", "messaging", "rpc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Repository = "https://github.com/tuco86/weida"
+
+# Both hooks live in hatch_build.py: the version, and the build of libweida
+# plus the cffi module that loads it.
+[tool.hatch.metadata.hooks.custom]
+
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build]
+# Built by the hook and ignored by git, so named here to reach the wheel.
+artifacts = [
+    "src/weida/_ffi.py",
+    "src/weida/libweida.so",
+    "src/weida/libweida.dylib",
+    "src/weida/weida.dll",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/weida"]
+# An editable install is a `.pth` entry for `src`, which needs no
+# `editables` package in the environment.
+dev-mode-dirs = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
