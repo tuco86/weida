@@ -1,0 +1,13 @@
+# The declarations the Python package hands to `cffi.FFI.cdef`
+# (crates/py/weida-py/src/weida/_cdef.h): weida.h without includes, guards,
+# comments or C++ wrappers, which cffi's parser does not take.
+language = "C"
+sys_includes = []
+no_includes = true
+documentation = false
+style = "type"
+cpp_compat = false
+usize_is_size_t = true
+
+[export]
+include = ["weida_poll_item"]

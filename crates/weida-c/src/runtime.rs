@@ -26,7 +26,7 @@ pub struct weida_runtime {
     pub(crate) runtime: Runtime,
 }
 
-/// The pending `Runtime::shutdown` of [`weida_runtime_shutdown`].
+/// The pending `Runtime::shutdown` of `weida_runtime_shutdown`.
 pub struct weida_runtime_shutdown_op {
     pub(crate) op: Arc<Op<()>>,
 }
