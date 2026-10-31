@@ -3,7 +3,9 @@
 //! Properties: decoding never panics; an accepted operation's payload is
 //! exactly as long as the count its control line declared and is inside the
 //! cap; an accepted operation re-encodes, and the re-encoding decodes to the
-//! same value with the same octets.
+//! same value with the same octets. The re-encoding is read under the same
+//! bounds, except that a `-ERR` line may grow by the two quotes it is always
+//! written with (the crate docs, "`-ERR` is read quoted or bare").
 //!
 //! The cap is deliberately far below the server's documented 1 MiB default,
 //! because a NATS control line declares its payload in ASCII: twenty-six
@@ -24,6 +26,17 @@ const LIMITS: Limits = Limits {
     max_connect_urls: 4,
 };
 
+/// The bounds the canonical encoding of `op` is read back under.
+fn reread_limits(op: &Op<'_>) -> Limits {
+    match op {
+        Op::Err { .. } => Limits {
+            max_control_line: LIMITS.max_control_line + 2,
+            ..LIMITS
+        },
+        _ => LIMITS,
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let Ok((op, used)) = Op::decode(data, LIMITS) else {
         return;
@@ -40,7 +53,8 @@ fuzz_target!(|data: &[u8]| {
     let mut written = Vec::new();
     op.encode(&mut written)
         .expect("an accepted operation re-encodes");
-    let (again, used_again) = Op::decode(&written, LIMITS).expect("the re-encoding decodes");
+    let (again, used_again) =
+        Op::decode(&written, reread_limits(&op)).expect("the re-encoding decodes");
     assert_eq!(used_again, written.len());
     assert_eq!(again, op);
 

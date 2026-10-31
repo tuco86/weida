@@ -10,7 +10,9 @@
 //! Properties: every operation in the stream consumes at least one octet and
 //! at most what is left; the stream ends in `Incomplete` or in a violation,
 //! never in an infinite loop; re-encoding the whole stream and reading it
-//! back yields the same sequence of operations.
+//! back yields the same sequence of operations. The re-encoding is read under
+//! the same bounds, except that a `-ERR` line may grow by the two quotes it
+//! is always written with (the crate docs, "`-ERR` is read quoted or bare").
 
 #![no_main]
 
@@ -24,6 +26,17 @@ const LIMITS: Limits = Limits {
     max_header_entries: 8,
     max_connect_urls: 4,
 };
+
+/// The bounds the canonical encoding of `op` is read back under.
+fn reread_limits(op: &Op<'_>) -> Limits {
+    match op {
+        Op::Err { .. } => Limits {
+            max_control_line: LIMITS.max_control_line + 2,
+            ..LIMITS
+        },
+        _ => LIMITS,
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     let mut at = 0;
@@ -46,7 +59,8 @@ fuzz_target!(|data: &[u8]| {
 
     let mut at = 0;
     for op in &ops {
-        let (again, used) = Op::decode(&written[at..], LIMITS).expect("the re-encoding decodes");
+        let (again, used) =
+            Op::decode(&written[at..], reread_limits(op)).expect("the re-encoding decodes");
         assert_eq!(&again, op);
         at += used;
     }
