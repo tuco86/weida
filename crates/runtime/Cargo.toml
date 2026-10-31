@@ -24,11 +24,12 @@ tokio.workspace = true
 # keeps `unsafe_code = "forbid"` on Windows too.
 weida-winpipe.workspace = true
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
-# `getpeereid` without `unsafe`: macOS keeps a peer's uid and gid readable
-# after it closed, but tokio's `peer_cred` also asks for its pid, which
-# macOS answers only while the peer is connected (B-392).
-nix.workspace = true
+[target.'cfg(unix)'.dependencies]
+# `getpeereid` without `unsafe` on Apple targets: macOS keeps a peer's uid and
+# gid readable after it closed, but tokio's `peer_cred` also asks for its pid,
+# which macOS answers only while the peer is connected (B-392). On every Unix,
+# the signal mask of an owned reactor's threads (`Exec::owned`).
+nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 # Waits that report instead of killing (B-389).

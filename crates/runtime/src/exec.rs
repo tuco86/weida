@@ -68,6 +68,7 @@ impl Exec {
             .enable_all()
             .worker_threads(worker_threads)
             .thread_name(thread_name)
+            .on_thread_start(block_signals)
             .build()
             .map_err(Error::Io)?;
         let exec = Exec::from_handle(runtime.handle().clone());
@@ -197,6 +198,38 @@ impl std::fmt::Debug for OwnedReactor {
     }
 }
 
+/// Blocks every asynchronous signal on the calling thread, which is an owned
+/// reactor's worker or blocking-pool thread.
+///
+/// A process-directed signal goes to any thread that does not block it. If a
+/// reactor thread took it, a caller blocked in `poll` on a readiness
+/// descriptor would never see `EINTR` and Ctrl-C would not end its wait; with
+/// the reactor's threads masked, as libzmq masks its I/O threads, the signal
+/// lands on a caller thread ([decisions/0045], R12). The synchronous faults
+/// (SIGSEGV, SIGBUS, SIGILL, SIGFPE) stay deliverable, because they are
+/// raised on the thread that faulted and blocking them is undefined.
+///
+/// A failure leaves the default mask, which only costs `EINTR` delivery.
+///
+/// [decisions/0045]: ../../../docs/decisions/0045-the-c-abi-is-the-boundary.md
+#[cfg(unix)]
+fn block_signals() {
+    use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+    let mut set = SigSet::all();
+    for fault in [
+        Signal::SIGSEGV,
+        Signal::SIGBUS,
+        Signal::SIGILL,
+        Signal::SIGFPE,
+    ] {
+        set.remove(fault);
+    }
+    let _ = pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&set), None);
+}
+
+#[cfg(not(unix))]
+fn block_signals() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +255,25 @@ mod tests {
         let (exec, reactor) = Exec::owned(1, "test").expect("owned reactor");
         let joined = exec.spawn(async { 7u8 });
         assert_eq!(futures::executor::block_on(joined).expect("task"), 7);
+        drop(reactor);
+    }
+
+    /// R12 of the C ABI: a process signal must reach a caller thread, so no
+    /// thread of an owned reactor accepts one, while a fault stays deliverable.
+    #[cfg(unix)]
+    #[test]
+    fn an_owned_reactors_threads_block_signals() {
+        use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+        let (exec, reactor) = Exec::owned(1, "test").expect("owned reactor");
+        let mask = exec.spawn(async {
+            let mut old = SigSet::empty();
+            pthread_sigmask(SigmaskHow::SIG_BLOCK, None, Some(&mut old)).expect("read the mask");
+            old
+        });
+        let mask = futures::executor::block_on(mask).expect("task");
+        assert!(mask.contains(Signal::SIGINT));
+        assert!(mask.contains(Signal::SIGTERM));
+        assert!(!mask.contains(Signal::SIGSEGV));
         drop(reactor);
     }
 
