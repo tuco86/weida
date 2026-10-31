@@ -6,6 +6,8 @@ members = [
     "crates/protocol",
     "crates/runtime",
     "crates/weida",
+    # The C ABI every other language binds (decisions/0045).
+    "crates/weida-c",
     # L2, and a layer rather than a fork: it depends on `weida` and nothing
     # depends on it (0018 §4.1).
     "crates/broker",

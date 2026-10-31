@@ -3574,6 +3574,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-c"
+version = "0.1.0-alpha.11-dev"
+dependencies = [
+ "nix",
+ "tokio",
+ "weida",
+ "weida-core",
+ "weida-runtime",
+ "weida-testkit",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "weida-core"
 version = "0.1.0-alpha.11-dev"
 

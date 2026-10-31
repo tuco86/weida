@@ -1,0 +1,54 @@
+[package]
+name = "weida-c"
+description = "The C ABI of weida: libweida and weida.h, the boundary every non-Rust language crosses"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Shipped as a library file and a header, not as a crate
+# (docs/decisions/0045-the-c-abi-is-the-boundary.md).
+publish = false
+
+# The library is `libweida.so`, `libweida.dylib` or `weida.dll`, linked with
+# `-lweida`. The `rlib` lets this crate's own tests call the exports directly.
+[lib]
+name = "weida"
+crate-type = ["cdylib", "rlib"]
+doc = false
+doctest = false
+
+[dependencies]
+# The Rust crate itself, renamed so that it does not collide with this lib
+# target's own name.
+weida_rs = { package = "weida", path = "../weida" }
+weida-core.workspace = true
+weida-runtime.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `poll` on a handle's readiness descriptor (docs/c/README.md R11).
+nix = { workspace = true, features = ["poll"] }
+
+[target.'cfg(windows)'.dependencies]
+# `WSAPoll` on a handle's loopback readiness socket (R11).
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+# Waits that report instead of killing (B-389).
+weida-testkit.workspace = true
+# The paused clock of the op tests.
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The EINTR test installs a handler and signals one thread.
+nix = { workspace = true, features = ["poll", "signal"] }
+
+[lints.rust]
+# An FFI crate: every export is an `unsafe extern "C" fn`, and every `unsafe`
+# block in it states what it relies on. `unsafe_op_in_unsafe_fn` keeps a block
+# from hiding inside an `unsafe fn`.
+unsafe_op_in_unsafe_fn = "forbid"
