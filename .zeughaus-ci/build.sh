@@ -1,6 +1,7 @@
-# Sourced by the platform check jobs, publish.sh, audit.sh and fuzz.sh; no
-# header, so not a job. Run from the workspace root, with CI_PLATFORM set by
-# the job's `platform`.
+# Sourced by the platform check jobs, the c-abi jobs, the language jobs
+# (python-, js-, jvm-, beam-, go-linux-*, android-libweida), publish.sh,
+# audit.sh and fuzz.sh; no header, so not a job. Run from the workspace root,
+# with CI_PLATFORM set by the job's `platform`.
 
 # Cargo's home and target directory live in the workspace, which the jobs of
 # one place share and keep warm.
@@ -80,4 +81,52 @@ check_docs() {
         step cargo doc --locked -q -p "$c" --all-features --no-deps
     done
     unset RUSTDOCFLAGS
+}
+
+# The C ABI and the Python package on it (docs/decisions/0045): the committed
+# headers match what cbindgen derives from crates/weida-c, the Python tests
+# run against an editable install, and libweida, weida.h and the wheel are
+# handed on in $CI_OUTPUT for the language jobs (lib/, include/, wheels/).
+# The nightly and a release tag also run the C smoke program and the wheel's
+# smoke in a fresh virtualenv.
+c_abi() {
+    step crates/weida-c/header.sh --verify
+
+    venv="$CI_WORKSPACE/.ci-cache/venv"
+    step python3 -m venv "$venv"
+    step "$venv/bin/pip" install cffi hatchling pytest pytest-timeout pytest-socket
+    step "$venv/bin/pip" install --no-build-isolation -e crates/py/weida-py
+
+    case $(tier) in
+        ci) step "$venv/bin/python" -m pytest crates/py/weida-py/tests ;;
+        *) step "$venv/bin/python" -m pytest crates/py/weida-py/tests/unit ;;
+    esac
+
+    # The wheel build runs `cargo build --release -p weida-c` (hatch_build.py),
+    # so libweida.so exists afterwards.
+    mkdir -p "$CI_OUTPUT/lib" "$CI_OUTPUT/include" "$CI_OUTPUT/wheels"
+    step "$venv/bin/pip" wheel --no-build-isolation --no-deps -w "$CI_OUTPUT/wheels" crates/py/weida-py
+    cp "$CARGO_TARGET_DIR/release/libweida.so" "$CI_OUTPUT/lib/"
+    cp crates/weida-c/include/weida.h "$CI_OUTPUT/include/"
+
+    if [ "$(tier)" = ci ]; then
+        step crates/weida-c/smoke.sh
+        WEIDA_PY_PYTHON="$venv/bin/python" step crates/py/weida-py/package.sh
+    fi
+}
+
+# The libweida a c-abi job of this platform handed on (c_abi's layout).
+libweida_input() {
+    echo "$CI_INPUTS/c-abi-$CI_PLATFORM"
+}
+
+# Compiles crates/weida-c/tests/c/smoke.c with this image's C compiler
+# against the handed-on header and library and runs it: proves the C
+# toolchain every binding's glue needs, and that libweida, built on trixie,
+# loads with this image's libc. Prints "c smoke: ok".
+smoke_libweida() {
+    in=$(libweida_input)
+    step cc -std=c11 -Wall -Wextra -Werror -I "$in/include" \
+        crates/weida-c/tests/c/smoke.c -L "$in/lib" -lweida -o /tmp/weida-c-smoke
+    step env LD_LIBRARY_PATH="$in/lib" /tmp/weida-c-smoke
 }

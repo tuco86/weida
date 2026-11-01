@@ -72,9 +72,9 @@ right after the failing call on the same thread. Present;
 | One `py3-none-<platform>` wheel per platform, with `libweida` and the generated `_ffi.py` inside | present; `package.sh` refuses any other tag |
 | The version is the workspace version in PEP 440 spelling (`0.1.0-alpha.11-dev` is `0.1.0a11.dev0`) | present; `smoke.py` |
 | The wheel runs with no Rust toolchain on `PATH` | present; `package.sh` runs `smoke.py` with `PATH=/usr/bin:/bin` |
-| CPython 3.9 and up | present by `requires-python`; only 3.13 is run |
-| PyPy | absent: not run, no interpreter on the CI images |
-| Free-threaded CPython (3.13t, 3.14t) | absent: not run, no interpreter on the CI images |
+| CPython 3.9 and up | present by `requires-python`; 3.13 (the `c-abi-linux-*` jobs, editable install) and 3.14 (the `python-linux-*` jobs, the wheel) are run |
+| PyPy | present: PyPy 3.11 runs the tests against the wheel in the `python-linux-*` jobs, amd64 and arm64 |
+| Free-threaded CPython (3.13t, 3.14t) | 3.14t present: the `python-linux-*` jobs run the tests against the wheel and check that importing `weida` leaves the GIL disabled; 3.13t not run |
 | PyPI | absent: nothing of this repository is on PyPI |
 
 ## 6. What the PyO3 binding had and this one does not

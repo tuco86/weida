@@ -9,25 +9,10 @@
 # headers match what cbindgen derives from crates/weida-c, and the Python
 # tests run against an editable install (the unit tier on a push or manual
 # run, both tiers on the nightly and a release tag, which also run the C
-# smoke program and the wheel's smoke in a fresh virtualenv).
+# smoke program and the wheel's smoke in a fresh virtualenv). Hands
+# libweida.so, weida.h and the wheel on to the amd64 language jobs
+# (build.sh, c_abi).
 set -eu
-
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 cargo_env
-
-step crates/weida-c/header.sh --verify
-
-venv="$CI_WORKSPACE/.ci-cache/venv"
-step python3 -m venv "$venv"
-step "$venv/bin/pip" install cffi hatchling pytest pytest-timeout pytest-socket
-step "$venv/bin/pip" install --no-build-isolation -e crates/py/weida-py
-
-case $(tier) in
-    ci) step "$venv/bin/python" -m pytest crates/py/weida-py/tests ;;
-    *) step "$venv/bin/python" -m pytest crates/py/weida-py/tests/unit ;;
-esac
-
-if [ "$(tier)" = ci ]; then
-    step crates/weida-c/smoke.sh
-    WEIDA_PY_PYTHON="$venv/bin/python" step crates/py/weida-py/package.sh
-fi
+c_abi
