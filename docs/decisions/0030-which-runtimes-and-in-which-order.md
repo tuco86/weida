@@ -1,6 +1,6 @@
 # 0030 — Which runtimes Phase C reaches, and in which order
 
-- **Status:** provisional; superseded in part by [0045](0045-the-c-abi-is-the-boundary.md) (§3.1, §3.4, §5)
+- **Status:** provisional; superseded in part by [0045](0045-the-c-abi-is-the-boundary.md) (§3.1, §3.4, §5) and [0046](0046-how-each-language-binds-libweida.md) (§3)
 - **Date:** 2026-09-15
 - **Items:** B-264; orders B-266 and the unfiled Node, Erlang and C rows
 - **Supersedes:** the ordering clause of [LOOP.md](../LOOP.md) §9 ("Python first, then Java,

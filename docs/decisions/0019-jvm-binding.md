@@ -1,6 +1,6 @@
 # 0019 — How a JVM binding reaches these libraries
 
-- **Status:** provisional
+- **Status:** provisional; superseded in part by [0046](0046-how-each-language-binds-libweida.md)
 - **Date:** 2026-09-14
 - **Related:** B-199; [0013](0013-competitor-libraries.md) §4.2, §4.4, §4.6, §4.7;
   [0014](0014-parallel-libraries.md) §2, §3; [LOOP.md](../LOOP.md) §2, §5, §9 Phase C;
