@@ -27,7 +27,7 @@
   <!-- left half: weida -->
   <rect x="20" y="44" width="410" height="370" class="band"/>
   <text x="32" y="66" class="head">weida — a new QUIC messaging protocol</text>
-  <text x="32" y="82" class="sub">the protocol, its Rust/Python library and the built core of the L2 broker</text>
+  <text x="32" y="82" class="sub">the protocol, Rust library, C ABI + Python, and the built core of the L2 broker</text>
   <rect x="32" y="92" width="386" height="310" rx="6" class="weida"/>
   <text x="44" y="112" class="lbl">Guarantee dimensions — a tuple, never one enum</text>
   <text x="44" y="128" class="sub">delivery · acknowledgement/completion · ordering · deduplication</text>
@@ -39,7 +39,7 @@
   <rect x="44" y="212" width="362" height="20" rx="3" class="built"/><text x="52" y="226" class="sub">all four transports built; named pipes Windows-gated</text>
   <text x="44" y="256" class="lbl">Patterns — transport-blind above the boundary</text>
   <text x="44" y="272" class="sub">Req/Rep · Push/Pull · Pub/Sub · PAIR · SURVEY · BUS</text>
-  <text x="44" y="284" class="sub">cursors orthogonal; all six in async Rust, blocking Rust and Python</text>
+  <text x="44" y="284" class="sub">cursors orthogonal; six in async Rust, Req/Rep in libweida and Python</text>
   <rect x="44" y="292" width="362" height="20" rx="3" class="partial"/><text x="52" y="306" class="sub">broker: admission · credit · settle/requeue; store + cluster pending</text>
   <text x="44" y="336" class="lbl">Proof</text>
   <text x="44" y="352" class="sub">tests/transports.rs runs all six patterns over QUIC, inproc, AF_UNIX</text>
@@ -65,7 +65,7 @@
   <rect x="20" y="430" width="920" height="52" rx="6" class="built"/>
   <text x="32" y="448" class="lbl">Shared foundation — both products stand on it, and it knows neither protocol</text>
   <text x="32" y="462" class="sub">weida-runtime — Exec, the three reactor owners, the capped resolver, AF_UNIX hygiene, the name registry · weida-core — addresses, limits, errors</text>
-  <text x="32" y="474" class="sub">weida-py-core — one exception class per errno variant, the asyncio bridge, the bytes boundary. No library depends on weida or weida-protocol (0013 §4.2)</text>
+  <text x="32" y="474" class="sub">weida-py-core (under the five PyO3 bindings) — one exception class per errno variant, the asyncio bridge, the bytes boundary. No library depends on weida (0013 §4.2)</text>
 
-  <text x="20" y="502" class="sub">Sources: docs/decisions/0013 §4 (two kinds of product), 0014 §2 (four workstreams, one PyO3 foundation), docs/libraries/*.md, docs/STATUS.md.</text>
+  <text x="20" y="502" class="sub">Sources: docs/decisions/0013 §4 (two kinds of product), 0014 §2 (one PyO3 foundation), 0045, 0046 (libweida), docs/libraries/*.md, docs/STATUS.md.</text>
 </svg>

@@ -27,7 +27,7 @@ across phases. A phase is `done`, `partial` (its row says what is missing) or `n
 | 7 | Broker clustering | not started | Nothing is built. `weida-raft` is the consensus transport it will use. |
 | 8 | Web binding | not started | Nothing is built. |
 | 9 | Standalone foreign-protocol libraries | partial | All six libraries with codecs, fuzzing and interop; the NATS interop is written and not run. |
-| 10 | Language bindings | partial | Python for `weida` and the first five libraries; HTTP's is filed (B-371); no other language. |
+| 10 | Language bindings | partial | Python for `weida` (cffi over `libweida`, CPython, 3.14t and PyPy) and the first five libraries; HTTP's is filed (B-371); the other languages have CI environments and no package yet ([0046](decisions/0046-how-each-language-binds-libweida.md)). |
 | 11 | CLI and administration | partial | The `weida` binary with `serve`, `request`, `send` and `sub`; no broker or cluster inspection. |
 | 12 | Documentation/site/stabilization | partial | [GUIDE.md](GUIDE.md) and the website, which lives in its own repository ([0033](decisions/0033-the-website-moves-out.md)). |
 
@@ -411,7 +411,9 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
 - weida for Python (`crates/py/weida-py`) is cffi in ABI mode over `libweida`, one
   `py3-none-<platform>` wheel per platform, with a synchronous surface and `weida.asyncio`
   ([libraries/weida-py.md](libraries/weida-py.md)). It replaced the PyO3 `weida-py` and the
-  `weida::blocking` facade that one sat on.
+  `weida::blocking` facade that one sat on. The `c-abi-linux-*` jobs build the wheel with
+  `libweida` and hand both on; the `python-linux-*` jobs install that wheel and run its tests on
+  CPython 3.14, free-threaded CPython 3.14t and PyPy 3.11, on linux-amd64 and linux-arm64.
 - `weida-zmq-py`, `weida-nng-py`, `weida-mqtt-py`, `weida-amqp-py` and `weida-nats-py` bind the
   first five libraries, each following its own library, with an asyncio and a synchronous
   surface on `weida-py-core` (`crates/py/weida-py-core`), the shared PyO3 foundation
@@ -422,8 +424,14 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   filed as B-371.
 
 **Not built:** the rest of weida in the C ABI (0045 §5), and a binding for any language but
-Python. Every further language binds the C ABI; the JVM design is
-[0019](decisions/0019-jvm-binding.md).
+Python. Every further language binds `libweida` through native glue against `weida.h`, in the
+order JavaScript (a Node-API addon for Node, Bun and Deno), JVM and Android (one JNI layer),
+Erlang/Elixir (a NIF), Go (cgo) and Swift/iOS (an XCFramework)
+([0046](decisions/0046-how-each-language-binds-libweida.md)). Their toolchains exist as CI
+images on linux-amd64 and linux-arm64 (`.zeughaus-ci/{js,jvm,beam,go}.Containerfile`), each
+with a job that compiles and runs `tests/c/smoke.c` against the handed-on `libweida`, and
+`android-libweida` cross-builds `libweida` for arm64-v8a, armeabi-v7a, x86_64 and x86 with the
+NDK, API 24 and up.
 
 ### Phase 11 — CLI and administration
 

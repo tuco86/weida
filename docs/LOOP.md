@@ -123,7 +123,9 @@ Keep the failures block of the test output; a count without names is not a gate 
 
 The integration tier and every platform run in the CI after the push (`.zeughaus-ci/`): a
 push to `main` runs the unit tier and the doctests on linux-amd64, linux-arm64, darwin-arm64
-and windows-amd64, the nightly and a `v*` tag both tiers. Never run
+and windows-amd64, the nightly and a `v*` tag both tiers. The same pipelines build `libweida`
+on both Linux architectures and run the language jobs on it (`python-`, `js-`, `jvm-`,
+`beam-`, `go-linux-*`); `android-libweida` runs on the nightly and tags only. Never run
 `cargo test --workspace`, `--profile integration` or `--profile ci` locally.
 
 **`--workspace` is not the whole workspace.** It builds every crate in its *default*
@@ -268,14 +270,16 @@ B4 AMQP 1.0 client `weida-amqp` (link credit onto the L2 credit of 0003) and NAT
 After every Phase B slice, one research item: update that protocol's sheet with what the
 implementation taught, or open the next protocol's unknowns.
 
-**Phase C — bindings, one per library, per
-[0014](decisions/0014-parallel-libraries.md).** A binding follows its own library and nothing
-else: the library's interop slice is green, then the binding — **asyncio first, then a sync
-surface** over that library's blocking facade, which is the order that builds the facade once.
-Python (PyO3 plus maturin) first, then Java, then Node; every binding sits on the one shared
-`weida-py-core` (error mapping, the Runtime/Context bridge to asyncio, the `bytes` boundary)
-and no binding re-derives it. Each reuses the library's interop suite: binding client against
-the Rust implementation and a named upstream peer, and later binding against binding.
+**Phase C — bindings.** A foreign-protocol library's binding follows its own library, per
+[0014](decisions/0014-parallel-libraries.md): the library's interop slice is green, then the
+binding — **asyncio first, then a sync surface** over that library's blocking facade, which is
+the order that builds the facade once — on the shared PyO3 foundation `weida-py-core` (error
+mapping, the Runtime/Context bridge to asyncio, the `bytes` boundary), which no binding
+re-derives. Each reuses the library's interop suite: binding client against the Rust
+implementation and a named upstream peer, and later binding against binding. weida itself is
+reached only through its C ABI, `libweida` ([0045](decisions/0045-the-c-abi-is-the-boundary.md)):
+Python through cffi, then JavaScript, JVM/Android, Erlang/Elixir, Go and Swift/iOS, each through
+native glue against `weida.h` ([0046](decisions/0046-how-each-language-binds-libweida.md)).
 
 **Phase D — the L2 broker** (master plan Phase 6): managed Queue and Connector resources in
 one control Raft, with one independent Raft group per replicated Queue and payload outside the

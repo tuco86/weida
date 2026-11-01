@@ -87,14 +87,15 @@
   <text x="28" y="478" class="side">ITSELF</text>
   <text x="28" y="494" class="sub">protocol · library</text>
   <text x="28" y="506" class="sub">binding · broker</text>
-  <rect x="140" y="458" width="152" height="40" rx="4" class="built"/><text x="148" y="475" class="lbl">Patterns</text><text x="148" y="489" class="sub">six · async + blocking</text>
+  <rect x="140" y="458" width="152" height="40" rx="4" class="built"/><text x="148" y="475" class="lbl">Patterns</text><text x="148" y="489" class="sub">six · async Rust</text>
   <rect x="302" y="458" width="152" height="40" rx="4" class="built"/><text x="310" y="475" class="lbl">Ordering</text><text x="310" y="489" class="sub">detect + reassemble</text>
   <rect x="464" y="458" width="152" height="40" rx="4" class="built"/><text x="472" y="475" class="lbl">Dedup</text><text x="472" y="489" class="sub">Bounded(window)</text>
   <rect x="626" y="458" width="152" height="40" rx="4" class="built"/><text x="634" y="475" class="lbl">Cursors</text><text x="634" y="489" class="sub">open levels · own stream</text>
   <rect x="788" y="458" width="152" height="40" rx="4" class="built"/><text x="796" y="475" class="lbl">Pool</text><text x="796" y="489" class="sub">one conn per dialled path</text>
   <rect x="140" y="506" width="380" height="36" rx="4" class="built"/><text x="148" y="522" class="lbl">weida-protocol</text><text x="148" y="536" class="sub">DATA keys 0–14, key 12 reserved; 9 frame kinds, HELLO sets, fuzzed</text>
   <rect x="530" y="506" width="410" height="36" rx="4" class="built"/><text x="538" y="522" class="lbl">Guarantee sets</text><text x="538" y="536" class="sub">core + supersets negotiated; Accepted reported as a cursor (kind 6)</text>
-  <rect x="140" y="550" width="380" height="36" rx="4" class="built"/><text x="148" y="566" class="lbl">weida-py</text><text x="148" y="580" class="sub">all six patterns + cursors · asyncio and sync</text>
+  <rect x="140" y="550" width="186" height="36" rx="4" class="partial"/><text x="148" y="566" class="lbl">weida-c (libweida)</text><text x="148" y="580" class="sub">runtime · TLS · streamed Req/Rep</text>
+  <rect x="334" y="550" width="186" height="36" rx="4" class="partial"/><text x="342" y="566" class="lbl">weida-py (cffi)</text><text x="342" y="580" class="sub">C ABI's surface · CPython, PyPy</text>
   <rect x="530" y="550" width="410" height="36" rx="4" class="partial"/><text x="538" y="566" class="lbl">weida-broker</text><text x="538" y="580" class="sub">admit · credit · settle/requeue built; attempt · relay · retire next</text>
   <rect x="140" y="594" width="800" height="30" rx="4" class="built"/><text x="148" y="613" class="lbl">Transport boundary — transport.rs: Link / SendHalf / RecvHalf as enums (no vtable on the payload path)</text>
   <rect x="140" y="636" width="192" height="46" rx="4" class="built"/><text x="148" y="652" class="lbl">QUIC (quinn)</text><text x="148" y="665" class="sub">TLS identity = fingerprint</text><text x="148" y="677" class="sub">one connection per path</text>
@@ -103,5 +104,5 @@
   <rect x="746" y="636" width="192" height="46" rx="4" class="built"/><text x="754" y="652" class="lbl">Named pipes (Windows)</text><text x="754" y="665" class="sub">built, Windows-gated</text><text x="754" y="677" class="sub">same grouped transport (0012)</text>
 
   <text x="20" y="704" class="sub">No foreign-protocol library depends on weida or weida-protocol (0013 §4.2): it names its codec, weida-runtime and weida-core, while a codec names nothing.</text>
-  <text x="20" y="720" class="sub">Sources: decisions 0013 §4.1–§4.2, 0014 §2; cargo metadata (25 members).</text>
+  <text x="20" y="720" class="sub">Sources: decisions 0013 §4.1–§4.2, 0014 §2, 0045, 0046; cargo metadata (28 members).</text>
 </svg>

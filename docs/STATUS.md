@@ -124,8 +124,19 @@ suite; the NATS suite is written and not run, which its parity table records as 
 met** rather than rounding up. HTTP speaks HTTP/1.1, HTTP/2 and HTTP/3 in both roles, and
 `weida-openbao` uses it in place of `reqwest`. The first five libraries have **PyO3 bindings**,
 each with an asyncio and a synchronous surface on the shared `weida-py-core` foundation; HTTP's
-is filed (B-371). weida's own Python package is cffi over `libweida`, synchronous and asyncio,
-and reaches what the C ABI maps so far: the runtime, TLS values and streamed Req/Rep.
+is filed (B-371).
+
+weida's own Python package is cffi over `libweida`, synchronous and asyncio, and reaches what
+the C ABI maps so far: the runtime, TLS values and streamed Req/Rep. One wheel per platform
+serves CPython, free-threaded CPython and PyPy, and the CI tests the built wheel on CPython
+3.14, 3.14t (where importing `weida` leaves the GIL disabled) and PyPy 3.11, on linux-amd64 and
+linux-arm64. Every further language binds `libweida` through native glue against `weida.h`
+([0046](decisions/0046-how-each-language-binds-libweida.md)): a Node-API addon for Node, Bun and
+Deno, one JNI layer for the JVM and Android, a NIF for Erlang/Elixir, cgo for Go and an
+XCFramework for Swift/iOS. None of those packages exists yet; their environments do. Each
+language has a CI image on both Linux architectures, whose job compiles and runs the C smoke
+program against the `libweida` the `c-abi-linux-*` job of that architecture built, and
+`android-libweida` cross-builds `libweida` for the four Android ABIs on the nightly and tags.
 
 ## 3. The measurements that decided something
 
@@ -146,8 +157,9 @@ environment and the full results are in [IMPLEMENTATION.md](IMPLEMENTATION.md) �
 ![Latency by transport](status/transport-latency.svg)
 
 More measurements shape a decision outside the table: the Python boundary and round trip
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.14, §4.15) keep the binding's copies and answer "no"
-to a second Python client for PyPy, because the cost is one event-loop wakeup per `await`; the
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.14, §4.15) keep the PyO3 bindings' copies, and the
+second Python client for PyPy they argued against became unnecessary once weida's own package
+moved onto cffi over `libweida` ([0045](decisions/0045-the-c-abi-is-the-boundary.md)); the
 fan-out at width ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.11) shows the delivery rate, not
 memory, bounding a node; and voice beside bulk ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.17)
 puts a bulk profile that shares a bottleneck with media on `Congestion::Bbr`
@@ -168,9 +180,11 @@ The ready items of [BACKLOG.md](BACKLOG.md) fall into these themes:
   not.
 
 Behind them sit the phases of [IMPLEMENTATION.md](IMPLEMENTATION.md) §1 that are not built:
-persistence, consensus-backed clustering, the Web binding, and the rest of weida in its C ABI,
-which every further language binds
-([0045](decisions/0045-the-c-abi-is-the-boundary.md) §5).
+persistence, consensus-backed clustering, the Web binding, and the rest of weida in its C ABI
+([0045](decisions/0045-the-c-abi-is-the-boundary.md) §5). The language packages over it follow
+in the order of [0046](decisions/0046-how-each-language-binds-libweida.md) — JavaScript,
+JVM/Android, Erlang/Elixir, Go, Swift/iOS — one plan each, on the CI environments that already
+exist; Swift/iOS also needs Xcode on the macOS runner, installed by hand.
 
 What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
 announcer, a blob store, one identity per connection and following a Raft leader stay out of
@@ -189,7 +203,9 @@ reversible ([decisions/README.md](decisions/README.md)), and each wants a yes or
 - [0017](decisions/0017-subscription-verdict.md): a per-subscription verdict — the silence
   stays, and is defined.
 - [0018](decisions/0018-minimal-broker.md): what the minimal L2 broker is.
-- [0019](decisions/0019-jvm-binding.md): how a JVM binding reaches these libraries.
+- [0019](decisions/0019-jvm-binding.md): how a JVM binding reaches these libraries; its
+  `weida-jvm-core` foundation is superseded by [0046](decisions/0046-how-each-language-binds-libweida.md),
+  which binds `libweida` through JNI.
 - [0020](decisions/0020-cluster-and-discovery.md): a cluster is a set of nodes the client may
   know about.
 - [0021](decisions/0021-consensus-openraft.md): consensus is a dependency, not a subsystem.
@@ -200,4 +216,6 @@ reversible ([decisions/README.md](decisions/README.md)), and each wants a yes or
 - [0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md): a report is relayed, a
   certificate is not.
 - [0030](decisions/0030-which-runtimes-and-in-which-order.md): which runtimes the language
-  bindings reach, and in which order.
+  bindings reach, and in which order; §3.1, §3.4 and §5 are superseded by
+  [0045](decisions/0045-the-c-abi-is-the-boundary.md), the order of §3 by
+  [0046](decisions/0046-how-each-language-binds-libweida.md).
