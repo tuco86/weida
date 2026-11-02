@@ -80,8 +80,8 @@ through a socket pair.
    `weida.dll`, linked with `-lweida`; the header is `weida.h`. Inside it the Rust crate is
    `weida_rs`. Accepted cost: on Windows debug builds the CLI's `weida.pdb` and the DLL's collide,
    which cargo reports as a warning; two links writing the one file at once failed with
-   LNK1201, so the root manifest strips the DLL's debuginfo in the dev profile and it writes no
-   PDB.
+   LNK1201. rustc passes `/DEBUG` to MSVC's linker whatever `strip` says, so
+   `crates/weida-c/build.rs` names the DLL's PDB into its own `OUT_DIR` instead.
 2. **Readiness-based async, as in ZeroMQ.** One waitable descriptor per handle that can become
    ready (a Unix fd, a socket on Windows). No callbacks into foreign code.
 3. **Handles are typed per role.** No polymorphic socket.
