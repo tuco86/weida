@@ -443,6 +443,39 @@ static napi_value optional_u64(napi_env env, int present, uint64_t n) {
     return v;
 }
 
+/* A new Uint8Array holding a copy of `len` bytes at `data`. */
+static napi_value bytes_value(napi_env env, const uint8_t *data, size_t len) {
+    napi_value ab, out;
+    void *copy = NULL;
+    if (napi_create_arraybuffer(env, len, &copy, &ab) != napi_ok ||
+        napi_create_typedarray(env, napi_uint8_array, len, ab, 0, &out) != napi_ok)
+        return throw_napi(env);
+    if (len)
+        memcpy(copy, data, len);
+    return out;
+}
+
+/* The peer's chain as an array of DER Uint8Arrays, leaf first, or null.
+ * The certificates live in `m`, so this runs before `m` is dropped. */
+static napi_value chain_value(napi_env env, const weida_incoming_meta *m) {
+    size_t n = 0;
+    napi_value arr;
+    if (weida_incoming_meta_peer_chain_len(m, &n) != 1)
+        return js_null(env);
+    if (napi_create_array_with_length(env, n, &arr) != napi_ok)
+        return throw_napi(env);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const uint8_t *der = weida_incoming_meta_peer_chain_cert(m, i, &len);
+        napi_value cert = bytes_value(env, der, len);
+        if (!cert)
+            return NULL;
+        if (napi_set_element(env, arr, (uint32_t)i, cert) != napi_ok)
+            return throw_napi(env);
+    }
+    return arr;
+}
+
 /* Copies a weida_incoming_meta out into a plain object and drops it. */
 static napi_value meta_value(napi_env env, void *ptr) {
     weida_incoming_meta *m = ptr;
@@ -462,6 +495,7 @@ static napi_value meta_value(napi_env env, void *ptr) {
     ok = ok && set(env, obj, "topic", js_string(env, s, len));
     s = weida_incoming_meta_peer_fingerprint(m, &len);
     ok = ok && set(env, obj, "peerFingerprint", js_string(env, s, len));
+    ok = ok && set(env, obj, "peerChain", chain_value(env, m));
     present = weida_incoming_meta_content_len(m, &n);
     ok = ok && set(env, obj, "contentLen", optional_u64(env, present, n));
     present = weida_incoming_meta_sequence(m, &n);
@@ -700,10 +734,98 @@ static napi_value trust_add_pin(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
 }
 
+static napi_value trust_add_anchor(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_trust *t = live(env, argv[0], drop_trust);
+    const uint8_t *pem = NULL;
+    size_t len = 0;
+    if (!t || !get_bytes(env, argv[1], &pem, &len))
+        return NULL;
+    int rc = weida_trust_add_anchor(t, pem, len);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+static napi_value trust_add_anchor_file(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_trust *t = live(env, argv[0], drop_trust);
+    if (!t)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    int rc = weida_trust_add_anchor_file(t, path);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
 static napi_value identity_generate(napi_env env, napi_callback_info info) {
     (void)info;
     weida_identity *out = NULL;
     int rc = weida_identity_generate(&out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_identity);
+}
+
+static napi_value identity_generate_for(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    bool is = false;
+    uint32_t n = 0, got = 0;
+    napi_value result = NULL;
+    if (napi_is_array(env, argv[0], &is) != napi_ok || !is)
+        return throw_type(env, "expected an array of strings");
+    if (napi_get_array_length(env, argv[0], &n) != napi_ok)
+        return throw_napi(env);
+    char **names = calloc(n ? n : 1, sizeof *names);
+    if (!names) {
+        napi_throw_error(env, NULL, "out of memory");
+        return NULL;
+    }
+    /* `got` counts the strings to free: every one read before a throw. */
+    for (; got < n; got++) {
+        napi_value el;
+        if (napi_get_element(env, argv[0], got, &el) != napi_ok) {
+            throw_napi(env);
+            break;
+        }
+        names[got] = get_string(env, el);
+        if (!names[got])
+            break;
+    }
+    if (got == n) {
+        weida_identity *id = NULL;
+        int rc = weida_identity_generate_for((const char *const *)names, n, &id);
+        result = rc < 0 ? throw_rc(env, rc) : wrap(env, id, drop_identity);
+    }
+    for (uint32_t i = 0; i < got; i++)
+        free(names[i]);
+    free(names);
+    return result;
+}
+
+static napi_value identity_from_pem_file(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_identity *out = NULL;
+    char *path = get_string(env, argv[0]);
+    if (!path)
+        return NULL;
+    int rc = weida_identity_from_pem_file(path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_identity);
+}
+
+static napi_value identity_from_pem_files(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    weida_identity *out = NULL;
+    char *cert = get_string(env, argv[0]);
+    if (!cert)
+        return NULL;
+    char *key = get_string(env, argv[1]);
+    if (!key) {
+        free(cert);
+        return NULL;
+    }
+    int rc = weida_identity_from_pem_files(cert, key, &out);
+    free(cert);
+    free(key);
     return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_identity);
 }
 
@@ -728,6 +850,37 @@ static napi_value identity_fingerprint(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : js_string(env, fp, NAPI_AUTO_LENGTH);
 }
 
+/* The chain as a string; the weida_pem is dropped at once. */
+static napi_value identity_certificate_pem(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_identity *id = live(env, argv[0], drop_identity);
+    weida_pem *p = NULL;
+    if (!id)
+        return NULL;
+    int rc = weida_identity_certificate_pem(id, &p);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    napi_value v = js_string(env, (const char *)weida_pem_data(p), weida_pem_len(p));
+    weida_pem_drop(p);
+    return v;
+}
+
+/* Chain and key as a Uint8Array the caller can wipe; the weida_pem is
+ * dropped, which wipes the library's copy. */
+static napi_value identity_to_pem(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_identity *id = live(env, argv[0], drop_identity);
+    weida_pem *p = NULL;
+    if (!id)
+        return NULL;
+    int rc = weida_identity_to_pem(id, &p);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    napi_value v = bytes_value(env, weida_pem_data(p), weida_pem_len(p));
+    weida_pem_drop(p);
+    return v;
+}
+
 static napi_value client_tls_new(napi_env env, napi_callback_info info) {
     ARGS(1);
     const weida_trust *t = live(env, argv[0], drop_trust);
@@ -738,6 +891,18 @@ static napi_value client_tls_new(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_client_tls);
 }
 
+static napi_value client_tls_set_identity(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_client_tls *tls = live(env, argv[0], drop_client_tls);
+    if (!tls)
+        return NULL;
+    const weida_identity *id = live(env, argv[1], drop_identity);
+    if (!id)
+        return NULL;
+    int rc = weida_client_tls_set_identity(tls, id);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
 static napi_value server_tls_new(napi_env env, napi_callback_info info) {
     ARGS(1);
     const weida_identity *id = live(env, argv[0], drop_identity);
@@ -746,6 +911,27 @@ static napi_value server_tls_new(napi_env env, napi_callback_info info) {
         return NULL;
     int rc = weida_server_tls_new(id, &out);
     return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_server_tls);
+}
+
+static napi_value server_tls_require_client(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_server_tls *tls = live(env, argv[0], drop_server_tls);
+    if (!tls)
+        return NULL;
+    const weida_trust *t = live(env, argv[1], drop_trust);
+    if (!t)
+        return NULL;
+    int rc = weida_server_tls_require_client(tls, t);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+static napi_value server_tls_require_any_key(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_server_tls *tls = live(env, argv[0], drop_server_tls);
+    if (!tls)
+        return NULL;
+    int rc = weida_server_tls_require_any_key(tls);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
 }
 
 /* transfer meta */
@@ -1058,11 +1244,21 @@ NAPI_MODULE_INIT() {
         FN("runtimeShutdownOpWait", runtime_shutdown_op_wait),
         FN("trustNew", trust_new),
         FN("trustAddPin", trust_add_pin),
+        FN("trustAddAnchor", trust_add_anchor),
+        FN("trustAddAnchorFile", trust_add_anchor_file),
         FN("identityGenerate", identity_generate),
+        FN("identityGenerateFor", identity_generate_for),
         FN("identityFromPem", identity_from_pem),
+        FN("identityFromPemFile", identity_from_pem_file),
+        FN("identityFromPemFiles", identity_from_pem_files),
         FN("identityFingerprint", identity_fingerprint),
+        FN("identityCertificatePem", identity_certificate_pem),
+        FN("identityToPem", identity_to_pem),
         FN("clientTlsNew", client_tls_new),
+        FN("clientTlsSetIdentity", client_tls_set_identity),
         FN("serverTlsNew", server_tls_new),
+        FN("serverTlsRequireClient", server_tls_require_client),
+        FN("serverTlsRequireAnyKey", server_tls_require_any_key),
         FN("transferMetaNew", transfer_meta_new),
         FN("transferMetaSetContentType", transfer_meta_set_content_type),
         FN("listenerBindQuic", listener_bind_quic),

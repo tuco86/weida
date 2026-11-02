@@ -1,5 +1,7 @@
 // Declarations of lib/index.js (docs/libraries/weida-js.md).
 
+import type { KeyObject, X509Certificate } from "node:crypto";
+
 /** The options every waiting method takes last. */
 export interface WaitOptions {
   /** Aborting it rejects the wait with `signal.reason` and cancels the
@@ -39,6 +41,9 @@ export interface IncomingMeta {
   readonly contentType: string | null;
   readonly topic: string | null;
   readonly peerFingerprint: string | null;
+  /** The chain the sender presented, leaf first; null for an anonymous or
+   * local sender. */
+  readonly peerChain: readonly X509Certificate[] | null;
   readonly contentLen: bigint | null;
   readonly sequence: bigint | null;
 }
@@ -82,20 +87,43 @@ export class Trust extends Handle {
   constructor();
   /** Pins a `sha256:` fingerprint; returns this trust. */
   addPin(fingerprint: string): this;
+  /** Trusts the certificate authorities in `anchor` for a peer whose chain
+   * leads to one and names the dialled host; returns this trust. */
+  addAnchor(anchor: X509Certificate | Bytes): this;
+  /** Trusts the certificate authorities in a PEM file, read at each dial. */
+  addAnchorFile(path: string): this;
 }
 
 export class Identity extends Handle {
   static generate(): Identity;
+  /** A self-signed identity whose certificate names `names`. */
+  static generateFor(names: string[]): Identity;
   static fromPem(cert: Bytes, key: Bytes): Identity;
+  /** From Node's types or PEM; a `KeyObject` is exported as PKCS#8. */
+  static from(parts: { cert: X509Certificate | X509Certificate[] | Bytes; key: KeyObject | Bytes }): Identity;
+  /** One PEM file with the chain and the key, read at first use. */
+  static fromPemFile(path: string): Identity;
+  /** A chain file and a key file, read at first use. */
+  static fromPemFiles(cert: string, key: string): Identity;
   fingerprint(): string;
+  /** The certificate chain as PEM, without the key. */
+  certificatePem(): string;
+  /** The chain and the private key as one PEM document. Holds the private
+   * key; wipe it with `fill(0)` when done. */
+  toPem(): Uint8Array;
+  /** The certificate chain, leaf first. */
+  certificates(): X509Certificate[];
 }
 
 export class ClientTls extends Handle {
-  constructor(trust: Trust);
+  /** Dials under `trust`, presenting `identity` when given. */
+  constructor(trust: Trust, options?: { identity?: Identity });
 }
 
 export class ServerTls extends Handle {
-  constructor(identity: Identity);
+  /** Serves as `identity`; `requireClient` requires every client to present
+   * a key the trust accepts, or with "any-key" any key it proves. */
+  constructor(identity: Identity, options?: { requireClient?: Trust | "any-key" });
 }
 
 export class Listener extends Handle {

@@ -3,6 +3,9 @@
 // Promise and takes an optional last `{ signal }`; `AbortSignal.timeout(ms)`
 // is the timeout. A dropped or consumed object throws WEIDA_ECLOSED without
 // calling C.
+// A namespace import, so the module still loads on a runtime that lacks one
+// of the exports; the conversions that need it check at use.
+import * as nodeCrypto from "node:crypto";
 import native from "./native.js";
 import { WeidaError } from "./errors.js";
 import { WAITS, call, cancelWaits, op } from "./wait.js";
@@ -32,6 +35,59 @@ function bytes(data) {
     return data;
   }
   throw new TypeError("expected a Uint8Array or a string");
+}
+
+/** Whether `value` is an instance of `node:crypto`'s export `name`. */
+function isCrypto(value, name) {
+  const Class = nodeCrypto[name];
+  return typeof Class === "function" && value instanceof Class;
+}
+
+/** An `X509Certificate` from PEM or DER. */
+function x509(data) {
+  const X509 = nodeCrypto.X509Certificate;
+  if (typeof X509 !== "function") {
+    throw new TypeError("node:crypto has no X509Certificate on this runtime");
+  }
+  return new X509(data);
+}
+
+/** A certificate chain as PEM: X509Certificate(s), bytes or a string. */
+function certPem(cert) {
+  if (isCrypto(cert, "X509Certificate")) {
+    return cert.toString();
+  }
+  if (Array.isArray(cert)) {
+    if (cert.length === 0) {
+      throw new TypeError("expected at least one certificate");
+    }
+    return cert
+      .map((c) => {
+        if (!isCrypto(c, "X509Certificate")) {
+          throw new TypeError("expected an array of X509Certificate");
+        }
+        return c.toString();
+      })
+      .join("\n");
+  }
+  return bytes(cert);
+}
+
+/** A private key as PEM: a private KeyObject (exported as PKCS#8), bytes or
+ * a string. */
+function keyPem(key) {
+  if (isCrypto(key, "KeyObject")) {
+    if (key.type !== "private") {
+      throw new TypeError("expected a private KeyObject");
+    }
+    return key.export({ type: "pkcs8", format: "pem" });
+  }
+  return bytes(key);
+}
+
+/** The certificate blocks of a PEM text. */
+function pemBlocks(text) {
+  return text.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----\n?/g) ?? [];
 }
 
 function handleOf(value, Class) {
@@ -74,7 +130,11 @@ class Handle {
   }
 }
 
+/** Freezes metadata, the presented chain mapped to `X509Certificate`s. */
 function freezeMeta(meta) {
+  if (meta.peerChain != null) {
+    meta.peerChain = Object.freeze(meta.peerChain.map((der) => x509(der)));
+  }
   return Object.freeze(meta);
 }
 
@@ -173,13 +233,30 @@ export class Trust extends Handle {
     native.trustAddPin(this[HANDLE], fingerprint);
     return this;
   }
+
+  /** Trusts the certificate authorities in `anchor`, an `X509Certificate`
+   * or PEM bytes, for a peer whose chain leads to one and names the dialled
+   * host; returns this trust. */
+  addAnchor(anchor) {
+    const pem = isCrypto(anchor, "X509Certificate") ? anchor.toString() : anchor;
+    native.trustAddAnchor(this[HANDLE], bytes(pem));
+    return this;
+  }
+
+  /** Trusts the certificate authorities in a PEM file, read at each dial;
+   * returns this trust. */
+  addAnchorFile(path) {
+    native.trustAddAnchorFile(this[HANDLE], path);
+    return this;
+  }
 }
 
-/** A certificate chain and its private key. */
+/** A certificate chain and its private key. Conversions from Node's key
+ * types follow docs/decisions/0047. */
 export class Identity extends Handle {
   constructor() {
     super();
-    noConstructor("Identity", "Identity.generate() or Identity.fromPem()");
+    noConstructor("Identity", "Identity.generate(), Identity.from() or Identity.fromPem()");
   }
 
   /** A self-signed identity with a fresh key, for pinning. */
@@ -187,30 +264,105 @@ export class Identity extends Handle {
     return adopt(Identity, native.identityGenerate());
   }
 
+  /** A self-signed identity whose certificate names `names` (DNS names or IP
+   * literals), so a peer anchoring it can check the host it dialled. */
+  static generateFor(names) {
+    if (!Array.isArray(names) || !names.every((n) => typeof n === "string")) {
+      throw new TypeError("expected an array of names");
+    }
+    return adopt(Identity, native.identityGenerateFor(names));
+  }
+
   /** An identity from PEM: the chain, leaf first, and the key. */
   static fromPem(cert, key) {
     return adopt(Identity, native.identityFromPem(bytes(cert), bytes(key)));
+  }
+
+  /** An identity from Node's types or PEM: `cert` is an `X509Certificate`,
+   * an array of them (leaf first) or PEM bytes; `key` a private `KeyObject`
+   * or PEM bytes. */
+  static from({ cert, key } = {}) {
+    if (cert == null || key == null) {
+      throw new TypeError("Identity.from needs { cert, key }");
+    }
+    return Identity.fromPem(certPem(cert), keyPem(key));
+  }
+
+  /** An identity from one PEM file holding the chain and the key, the form
+   * `toPem()` writes. The file is read at first use. */
+  static fromPemFile(path) {
+    return adopt(Identity, native.identityFromPemFile(path));
+  }
+
+  /** An identity from a chain file and a key file, read at first use. */
+  static fromPemFiles(cert, key) {
+    return adopt(Identity, native.identityFromPemFiles(cert, key));
   }
 
   /** The public-key fingerprint, `sha256:` text. */
   fingerprint() {
     return native.identityFingerprint(this[HANDLE]);
   }
-}
 
-/** The TLS terms a requester dials on: anonymous, under `trust`. */
-export class ClientTls extends Handle {
-  constructor(trust) {
-    super();
-    init(this, native.clientTlsNew(handleOf(trust, Trust)));
+  /** The certificate chain as PEM, without the key. */
+  certificatePem() {
+    return native.identityCertificatePem(this[HANDLE]);
+  }
+
+  /** The chain and the private key as one PEM document. Holds the private
+   * key; wipe it with `fill(0)` when done. */
+  toPem() {
+    return native.identityToPem(this[HANDLE]);
+  }
+
+  /** The certificate chain, leaf first. */
+  certificates() {
+    return pemBlocks(this.certificatePem()).map((block) => x509(block));
   }
 }
 
-/** The TLS terms a QUIC binding serves on, presenting `identity`. */
-export class ServerTls extends Handle {
-  constructor(identity) {
+/** The TLS terms a requester dials on, under `trust`: anonymous, or
+ * presenting `identity`. */
+export class ClientTls extends Handle {
+  constructor(trust, { identity } = {}) {
     super();
-    init(this, native.serverTlsNew(handleOf(identity, Identity)));
+    const trustHandle = handleOf(trust, Trust);
+    const id = identity == null ? null : handleOf(identity, Identity);
+    const handle = native.clientTlsNew(trustHandle);
+    try {
+      if (id !== null) {
+        native.clientTlsSetIdentity(handle, id);
+      }
+    } catch (error) {
+      native.drop(handle);
+      throw error;
+    }
+    init(this, handle);
+  }
+}
+
+/** The TLS terms a QUIC binding serves on, presenting `identity`. With
+ * `requireClient` every client must present a key: one the `Trust` accepts,
+ * or with "any-key" any key it proves it holds. */
+export class ServerTls extends Handle {
+  constructor(identity, { requireClient } = {}) {
+    super();
+    const id = handleOf(identity, Identity);
+    if (!(requireClient == null || requireClient === "any-key" || requireClient instanceof Trust)) {
+      throw new TypeError('requireClient is a Trust or "any-key"');
+    }
+    const handle = native.serverTlsNew(id);
+    try {
+      if (requireClient === "any-key") {
+        native.serverTlsRequireAnyKey(handle);
+      } else if (requireClient != null) {
+        native.serverTlsRequireClient(handle, requireClient[HANDLE]);
+      }
+    } catch (error) {
+      native.drop(handle);
+      throw error;
+    }
+    init(this, handle);
   }
 }
 

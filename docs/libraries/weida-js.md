@@ -23,9 +23,10 @@ linux-arm64 (the `js-linux-*` jobs).
 | --- | --- | --- |
 | `weida_runtime_config` | `RuntimeConfig({ workerThreads, shutdownTimeoutMs })`, a plain value turned into a handle by `Runtime.owned` | present; `errors.test.js` "a runtime with no worker threads is a runtime failure" |
 | `weida_runtime` | `Runtime.owned(config?)`, `.listener()`, `.requester(clientTls)`, `.shutdown(opts)` (consumes), `.drop()` | present; every round-trip test |
-| `weida_trust` | `new Trust()`, `.addPin(fp)` returning the trust | present; `errors.test.js` "a malformed pin is an invalid fingerprint", `quic.test.js` "a wrong pin rejects with WEIDA_EUNTRUSTED carrying the fingerprint" |
-| `weida_identity` | `Identity.generate()`, `Identity.fromPem(cert, key)`, `.fingerprint()` | present; `quic.test.js` "a round trip over QUIC with a pinned key" |
-| `weida_client_tls`, `weida_server_tls` | `new ClientTls(trust)`, `new ServerTls(identity)` | present |
+| `weida_trust` | `new Trust()`, `.addPin(fp)`, `.addAnchor(X509Certificate \| bytes)`, `.addAnchorFile(path)`, each returning the trust | present; `errors.test.js` "a malformed pin is an invalid fingerprint", `quic.test.js` "a wrong pin rejects with WEIDA_EUNTRUSTED carrying the fingerprint", `mtls.test.js` "an anchor accepts the dialled name", "identity and anchor files read back" |
+| `weida_identity` | `Identity.generate()`, `.generateFor(names)`, `.fromPem(cert, key)`, `.from({ cert, key })` (`X509Certificate`, an array of them or bytes; a private `KeyObject` or bytes), `.fromPemFile(path)`, `.fromPemFiles(cert, key)`, `.fingerprint()`, `.certificatePem(): string`, `.toPem(): Uint8Array`, `.certificates(): X509Certificate[]` | present; `quic.test.js` "a round trip over QUIC with a pinned key", `identity.test.js` (all five), `mtls.test.js` "identity and anchor files read back", `smoke.mjs` |
+| `weida_pem` | not exposed: copied out at once into a string (`certificatePem`) or a `Uint8Array` (`toPem`) and dropped, which wipes it | refused as a class: a JavaScript caller needs the bytes, not the handle |
+| `weida_client_tls`, `weida_server_tls` | `new ClientTls(trust, { identity? })`, `new ServerTls(identity, { requireClient? })` with `requireClient` a `Trust` or `"any-key"` | present; `mtls.test.js` "a pinned client key is accepted and the server sees its fingerprint", "an anonymous or unknown client is refused with WEIDA_ETLS and nothing reaches the server", "any-key exposes the fingerprint and the chain", `smoke.mjs` |
 | `weida_transfer_meta` | a plain object `{ contentType? }`, turned into a handle per call | present; `inproc.test.js` "a streamed round trip carries the body and the content type" |
 | `weida_listener` | `Listener.bindQuic(addr, serverTls, opts) -> Promise<Binding>`, `.bindInproc(bus)`, `.replier(path)` | present |
 | `weida_binding`, `weida_local_binding` | `Binding.localAddr()`, `LocalBinding.bus()` | present |
@@ -35,11 +36,14 @@ linux-arm64 (the `js-linux-*` jobs).
 | `weida_incoming_transfer` | `IncomingTransfer.meta()`, `.read(cap = 65536, opts) -> Promise<Uint8Array>` (empty at the end), `.collect(maxBytes, opts) -> Promise<Message>` (consumes) | present; `inproc.test.js` "reads of 3 bytes reassemble the body", "a collect over its ceiling rejects with WEIDA_ELIMIT_EXCEEDED", "a reply dropped unfinished reads as WEIDA_ECANCELED" |
 | `weida_outgoing_transfer` | `OutgoingTransfer.write(data, opts) -> Promise<number>`, `.writeAll(data, opts)`, `.finish() -> Delivery` (consumes) | present; `writeAll` is the JavaScript loop R3c leaves to the caller |
 | `weida_delivery` | `Delivery.delivered(opts)` (consumes) | present |
-| `weida_incoming_meta` | a frozen plain object `{ endpoint, contentType, topic, peerFingerprint, contentLen, sequence }`, copied out at once; absent values are `null`, the two counters `BigInt` | present |
+| `weida_incoming_meta` | a frozen plain object `{ endpoint, contentType, topic, peerFingerprint, peerChain, contentLen, sequence }`, copied out at once; absent values are `null`, the two counters `BigInt`, `peerChain` a frozen array of `X509Certificate`, leaf first | present; `mtls.test.js` "any-key exposes the fingerprint and the chain" |
 | `weida_msg` | a frozen `{ payload: Uint8Array, meta }`, copied out at once | present |
 | the ops (`*_op`) | not exposed: a waiting method starts its op, waits, and drops it in `finally`, which cancels it only when it did not finish | refused: an op is the C caller's way to wait, not a value a JavaScript caller needs |
 | the `_fd` functions, `weida_poll` | not exposed: the addon's waiter thread polls the descriptors (§4) | refused: no JavaScript runtime can watch a raw descriptor itself |
 | `weida_version`, `weida_strerror` | `version()`, `strerror(code)` | present; `smoke.mjs`, `errors.test.js` "strerror of an unknown code is 'unknown error'" |
+
+The conversions between Node's `KeyObject` and `X509Certificate` and the ABI's PEM and DER
+follow [0047](../decisions/0047-key-material-in-the-language-packages.md).
 
 Every handle class releases its handle when the garbage collector finalizes it, and `.drop()`
 and `[Symbol.dispose]()` (`using`) release it at once. A dropped or consumed object throws
