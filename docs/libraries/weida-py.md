@@ -82,6 +82,8 @@ right after the failing call on the same thread. Present;
 | PyPy | present: PyPy 3.11 runs the tests against the wheel in the `python-linux-*` jobs, amd64 and arm64 |
 | Free-threaded CPython (3.13t, 3.14t) | 3.14t present: the `python-linux-*` jobs run the tests against the wheel and check that importing `weida` leaves the GIL disabled; 3.13t not run |
 | `cryptography` | optional: imported per call, never a dependency; installed for the CPython test runs, absent on 3.14t and PyPy | present; `test_identity.py::test_without_cryptography_bytes_convert_and_objects_are_type_errors` |
+| macOS | absent: `_native.py` and `hatch_build.py` load and package `libweida.dylib`, but no job builds or runs the package there; atik's Python is the Xcode one (`check-darwin-arm64.sh`) |
+| Windows | absent: `_native.py` and `hatch_build.py` load and package `weida.dll`, and §4's Windows waits are written, but no job builds or runs the package there; wohnzimmer has no Python (`windows.ps1`) |
 | PyPI | absent: nothing of this repository is on PyPI |
 
 ## 6. What the PyO3 binding had and this one does not

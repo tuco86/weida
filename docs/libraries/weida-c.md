@@ -8,7 +8,9 @@ and every public method of the types this stage maps
 ([decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md)). Each row has one of three
 verdicts:
 
-- **present**: the C function that maps it, by R1's names, and the test that proves it;
+- **present**: the C function that maps it, by R1's names, and the test that proves it; a row
+  an area's plan made present keeps that area's name after its evidence, as in
+  `present; abi::<test> (*drain*)`;
 - **refused**: deliberately not mapped, with the rule that refuses it;
 - **absent**: not mapped yet, with the follow-up area of 0045 §5 it belongs to.
 
@@ -90,18 +92,18 @@ unit tests in `crates/weida-c/src/`.
 | every other `RuntimeConfig` field, `Limits`, `Discovery`, `Network`, `ReconnectPolicy`, `OutboxFull`, `GuaranteeSet` and its dimensions | — | absent: *config* |
 | `Trust::by_address` | `weida_trust_new` | present; `smoke.c` |
 | `Trust::and_pin` | `weida_trust_add_pin` | present; `abi::a_malformed_pin_is_an_invalid_fingerprint`, `abi::a_server_outside_the_pins_is_untrusted` |
-| `Trust::and_anchor`, `and_anchor_file` | `weida_trust_add_anchor`, `_add_anchor_file` | present; `abi::a_trust_anchor_checks_the_name_the_dial_used` |
-| `Trust::pin`, `anchor`, `anchor_file` | `weida_trust_new` plus the matching `_add_*` | present |
+| `Trust::and_anchor`, `and_anchor_file` | `weida_trust_add_anchor`, `_add_anchor_file` | present; `abi::a_trust_anchor_checks_the_name_the_dial_used` (*identity*) |
+| `Trust::pin`, `anchor`, `anchor_file` | `weida_trust_new` plus the matching `_add_*` | present (*identity*) |
 | `Trust::is_empty` | — | absent: *identity* |
 | `Identity::generate`, `from_pem`, `fingerprint` | `weida_identity_generate`, `_from_pem`, `_fingerprint` | present; `smoke.c`, `abi::a_server_outside_the_pins_is_untrusted` |
-| `Identity::generate_for` | `weida_identity_generate_for` | present; `tls::tests::generate_for_refuses_a_null_name`, `abi::a_trust_anchor_checks_the_name_the_dial_used` |
-| `Identity::from_pem_files`, `from_pem_file` | `weida_identity_from_pem_files`, `_from_pem_file` | present; `abi::an_identity_written_to_a_file_reads_back_with_its_fingerprint` |
-| `Identity::certificate_pem`, `to_pem`, `Pem` | `weida_identity_certificate_pem`, `_to_pem`, the owned `weida_pem` wiped on drop | present; `tls::tests::a_pem_written_by_to_pem_reads_back_with_the_same_fingerprint` |
+| `Identity::generate_for` | `weida_identity_generate_for` | present; `tls::tests::generate_for_refuses_a_null_name`, `abi::a_trust_anchor_checks_the_name_the_dial_used` (*identity*) |
+| `Identity::from_pem_files`, `from_pem_file` | `weida_identity_from_pem_files`, `_from_pem_file` | present; `abi::an_identity_written_to_a_file_reads_back_with_its_fingerprint` (*identity*) |
+| `Identity::certificate_pem`, `to_pem`, `Pem` | `weida_identity_certificate_pem`, `_to_pem`, the owned `weida_pem` wiped on drop | present; `tls::tests::a_pem_written_by_to_pem_reads_back_with_the_same_fingerprint` (*identity*) |
 | `ClientTls::new` | `weida_client_tls_new` | present |
-| `ClientTls::with_identity` | `weida_client_tls_set_identity` | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
+| `ClientTls::with_identity` | `weida_client_tls_set_identity` | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` (*identity*) |
 | `ClientTls::with_alpn`, `Alpn` | — | absent: *identity* |
 | `ServerTls::new` | `weida_server_tls_new` | present |
-| `ServerTls::require_client`, `ClientTrust` | `weida_server_tls_require_client` (`Trusted`), `_require_any_key` (`AnyKey`) | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
+| `ServerTls::require_client`, `ClientTrust` | `weida_server_tls_require_client` (`Trusted`), `_require_any_key` (`AnyKey`) | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` (*identity*) |
 | `ServerTls::with_alpn` | — | absent: *identity* |
 | `IdentitySource`, `TrustSource`, their weak forms, `FilesOptions`, `IdentityEvent(s)` | — | absent: *identity* (events as queues, 0045 decision 10) |
 | `TransferMeta::with_content_type` | `weida_transfer_meta_set_content_type` | present; `abi::a_streamed_round_trip_over_inproc` |
@@ -163,7 +165,8 @@ way a foreign caller calls it:
 The plan of this stage asked for the rules, the decision, and one vertical slice: runtime,
 configuration, TLS values, Req/Rep with streamed bodies, delivery receipts, readiness
 descriptors and `weida_poll`, through Rust, the header, a C program, Python and the CI. Every
-row of §2 to §5 marked present is that slice; every absent row names its area, and the slice
+row of §2 to §5 marked present without an area name is that slice, and a present row that
+names an area was mapped by that area's plan; every absent row names its area, and the slice
 is complete when no present row lacks a test.
 
 ## 11. Sources

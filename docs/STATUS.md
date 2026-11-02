@@ -6,6 +6,10 @@ commit, no test count and no date, so it stays true until the picture itself cha
 [IMPLEMENTATION.md](IMPLEMENTATION.md) is the source of truth for every phase and measurement;
 [BACKLOG.md](BACKLOG.md) and [NIGHTLOG.md](NIGHTLOG.md) are the loop's own record. The diagrams
 live in `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
+What is built, per language, platform, protocol library and crate, is not drawn here:
+[the status grid](https://weida.doodleshnookie.net/status/) is derived from `docs/libraries/`,
+[0045](decisions/0045-the-c-abi-is-the-boundary.md) §5 and `.zeughaus-ci/` on every push, so
+changing those files changes the grid.
 
 ## 1. What exists, layer by layer
 
@@ -109,12 +113,27 @@ utopian on purpose — and every program in it is a file in the tree that a test
 
 ## 2. The product line
 
-![Product line](status/product-line.svg)
-
-The two halves of that picture are the two products of
-[0013](decisions/0013-competitor-libraries.md) §4: weida on the left, with the guarantee
-dimensions, transports and patterns it offers, and the six standalone foreign-protocol
-libraries on the right. They share runtime foundations but no implicit semantic conversion.
+weida and the six standalone foreign-protocol libraries are the two products of
+[0013](decisions/0013-competitor-libraries.md) §4. They share runtime foundations but no
+implicit semantic conversion. Each has a status sheet derived from its parity document and the
+CI jobs: the C ABI ([weida-c](https://weida.doodleshnookie.net/status/weida-c/)), the packages
+([weida-py](https://weida.doodleshnookie.net/status/weida-py/),
+[weida-js](https://weida.doodleshnookie.net/status/weida-js/),
+[weida-jvm](https://weida.doodleshnookie.net/status/weida-jvm/),
+[weida-beam](https://weida.doodleshnookie.net/status/weida-beam/),
+[weida-go](https://weida.doodleshnookie.net/status/weida-go/)), the libraries
+([zmq](https://weida.doodleshnookie.net/status/zmq/),
+[nng](https://weida.doodleshnookie.net/status/nng/),
+[mqtt](https://weida.doodleshnookie.net/status/mqtt/),
+[amqp](https://weida.doodleshnookie.net/status/amqp/),
+[nats](https://weida.doodleshnookie.net/status/nats/),
+[http](https://weida.doodleshnookie.net/status/http/)) and the platforms
+([linux-amd64](https://weida.doodleshnookie.net/status/linux-amd64/),
+[linux-arm64](https://weida.doodleshnookie.net/status/linux-arm64/),
+[darwin-arm64](https://weida.doodleshnookie.net/status/darwin-arm64/),
+[windows-amd64](https://weida.doodleshnookie.net/status/windows-amd64/),
+[android](https://weida.doodleshnookie.net/status/android/),
+[ios](https://weida.doodleshnookie.net/status/ios/)).
 
 weida itself ships a library with an async API, the `weida` binary, a C ABI (`libweida`,
 [0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python, a JavaScript, a JVM, an Erlang/Elixir and a Go package on it. Each of the six
