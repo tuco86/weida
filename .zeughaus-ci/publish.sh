@@ -5,7 +5,6 @@
 # platform = "linux-amd64"
 # image = "trixie"
 # secrets = ["CARGO_REGISTRY_TOKEN"]
-# when_busy = "freeze"
 # timeout_minutes = 60
 # ///
 # Publishes the workspace to crates.io for a `v*` tag, once every platform

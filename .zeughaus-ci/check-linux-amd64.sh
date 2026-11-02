@@ -3,7 +3,6 @@
 # on = ["push main", "tag v*", "nightly"]
 # platform = "linux-amd64"
 # image = "trixie"
-# when_busy = "freeze"
 # timeout_minutes = 120
 # ///
 # The gate of docs/LOOP.md §6 on linux-amd64: formatting, clippy, the tests
