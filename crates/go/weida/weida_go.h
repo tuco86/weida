@@ -83,18 +83,42 @@ WEIDA_GO_CALL(runtime_shutdown_op_wait, (const weida_runtime_shutdown_op *op, we
 WEIDA_GO_CALL(trust_new, (weida_trust **out, weida_go_error *e), (out))
 WEIDA_GO_CALL(trust_add_pin, (const weida_trust *t, const char *fingerprint, weida_go_error *e),
               (t, fingerprint))
+WEIDA_GO_CALL(trust_add_anchor,
+              (const weida_trust *t, const uint8_t *pem, size_t len, weida_go_error *e),
+              (t, pem, len))
+WEIDA_GO_CALL(trust_add_anchor_file,
+              (const weida_trust *t, const char *path, weida_go_error *e), (t, path))
 WEIDA_GO_CALL(identity_generate, (weida_identity **out, weida_go_error *e), (out))
+WEIDA_GO_CALL(identity_generate_for,
+              (const char *const *names, size_t n, weida_identity **out, weida_go_error *e),
+              (names, n, out))
 WEIDA_GO_CALL(identity_from_pem,
               (const uint8_t *cert, size_t cert_len, const uint8_t *key, size_t key_len,
                weida_identity **out, weida_go_error *e),
               (cert, cert_len, key, key_len, out))
+WEIDA_GO_CALL(identity_from_pem_files,
+              (const char *cert_chain, const char *key, weida_identity **out, weida_go_error *e),
+              (cert_chain, key, out))
+WEIDA_GO_CALL(identity_from_pem_file,
+              (const char *path, weida_identity **out, weida_go_error *e), (path, out))
 WEIDA_GO_CALL(identity_fingerprint, (const weida_identity *id, const char **out, weida_go_error *e),
+              (id, out))
+WEIDA_GO_CALL(identity_certificate_pem,
+              (const weida_identity *id, weida_pem **out, weida_go_error *e), (id, out))
+WEIDA_GO_CALL(identity_to_pem, (const weida_identity *id, weida_pem **out, weida_go_error *e),
               (id, out))
 WEIDA_GO_CALL(client_tls_new, (const weida_trust *trust, weida_client_tls **out, weida_go_error *e),
               (trust, out))
+WEIDA_GO_CALL(client_tls_set_identity,
+              (const weida_client_tls *tls, const weida_identity *identity, weida_go_error *e),
+              (tls, identity))
 WEIDA_GO_CALL(server_tls_new,
               (const weida_identity *identity, weida_server_tls **out, weida_go_error *e),
               (identity, out))
+WEIDA_GO_CALL(server_tls_require_client,
+              (const weida_server_tls *tls, const weida_trust *trust, weida_go_error *e),
+              (tls, trust))
+WEIDA_GO_CALL(server_tls_require_any_key, (const weida_server_tls *tls, weida_go_error *e), (tls))
 WEIDA_GO_CALL(transfer_meta_new, (weida_transfer_meta **out, weida_go_error *e), (out))
 WEIDA_GO_CALL(transfer_meta_set_content_type,
               (const weida_transfer_meta *m, const char *content_type, weida_go_error *e),

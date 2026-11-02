@@ -13,7 +13,9 @@ document lists what the Go surface adds or changes. Verdicts are **present** (wi
 **refused** (with the reason) or **absent** (with the reason); there is no "partial".
 
 The tests are `weida_test.go` (the unit tier: in-process transport only, each test well under a
-second) and `quic_test.go` (the integration tier, build tag `integration`: QUIC on localhost).
+second), `identity_test.go` (the unit tier: key material in and out of an identity, no file or
+socket) and `quic_test.go` and `mtls_test.go` (the integration tier, build tag `integration`:
+QUIC on localhost).
 `cmd/weida-smoke` makes one QUIC round trip from a binary that carries `libweida` inside it.
 Measured on Go 1.27.3 on linux-amd64 and linux-arm64 (the `go-linux-*` jobs); the unit tier
 also under `-race` and `GOEXPERIMENT=cgocheck2` on the workstation.
@@ -24,9 +26,10 @@ also under `-race` and `GOEXPERIMENT=cgocheck2` on the workstation.
 | --- | --- | --- |
 | `weida_runtime_config` | `RuntimeConfig{WorkerThreads uint32; ShutdownTimeout time.Duration}`, turned into a handle by `NewRuntime`; `NewRuntime(nil)` takes weida's defaults, a config sets both fields | present; `TestARuntimeWithNoWorkerThreadsIsARuntimeFailure` |
 | `weida_runtime` | `NewRuntime(*RuntimeConfig)`, `.Listener()`, `.Requester(*ClientTLS)`, `.Shutdown(ctx)` (consumes), `.Close()` | present; every round-trip test |
-| `weida_trust` | `NewTrust()`, `.AddPin(fp) error` | present; `TestAMalformedPinIsAnInvalidFingerprint`, `TestAWrongPinIsUntrustedAndCarriesTheFingerprint` |
-| `weida_identity` | `GenerateIdentity()`, `IdentityFromPEM(cert, key []byte)`, `.Fingerprint() (string, error)` | present; `TestARoundTripOverQUICWithAPinnedKey` |
-| `weida_client_tls`, `weida_server_tls` | `NewClientTLS(*Trust)`, `NewServerTLS(*Identity)` | present |
+| `weida_trust` | `NewTrust()`, `.AddPin(fp) error`, `.AddAnchor(pem []byte) error`, `.AddAnchorFile(path) error`, `.AddAnchorCertificates(...*x509.Certificate) error` (their PEM goes to `AddAnchor`; none or a nil one is `ErrInval`) | present; `TestAMalformedPinIsAnInvalidFingerprint`, `TestAWrongPinIsUntrustedAndCarriesTheFingerprint`, `TestArgumentErrors`, `TestAnAnchorAcceptsTheDialledNameAndRefusesAnother`, `TestIdentityAndAnchorFilesReadBack` |
+| `weida_identity` | `GenerateIdentity()`, `GenerateIdentityFor(names ...string)`, `IdentityFromPEM(cert, key []byte)`, `IdentityFromPEMFile(path)`, `IdentityFromPEMFiles(certChain, key)` (nothing is read until first use: a missing file is `ErrTLS` there), `IdentityFromTLS(tls.Certificate)` (the key an `*ecdsa.PrivateKey`, `*rsa.PrivateKey` or `ed25519.PrivateKey`, through PKCS#8), `.Fingerprint() (string, error)`, `.CertificatePEM()` and `.ToPEM()` (`[]byte`; `ToPEM` holds the key and the caller wipes it with `clear`), `.Certificates() ([]*x509.Certificate, error)`, `.TLSCertificate() (tls.Certificate, error)` | present; `TestARoundTripOverQUICWithAPinnedKey`, `TestToPEMReadsBackWithTheSameFingerprint`, `TestCertificatesAreTheIdentitysKey`, `TestGenerateIdentityForNamesTheCertificate`, `TestIdentityFromTLSTakesGosKeyTypes`, `TestASignerThatIsNotExportableNamesCase2`, `TestArgumentErrors`, `TestIdentityAndAnchorFilesReadBack` |
+| `weida_client_tls`, `weida_server_tls` | `NewClientTLS(*Trust)`, `(*ClientTLS).SetIdentity(*Identity)`, `NewServerTLS(*Identity)`, `(*ServerTLS).RequireClient(*Trust)`, `.RequireAnyKey()`; the argument is copied, the last call wins, an empty trust fails the bind with `ErrTLS` | present; `TestAPinnedClientKeyIsAcceptedAndTheServerSeesItsKeyAndChain`, `TestAnAnonymousOrUnknownClientIsRefusedWithTLSAndNothingReachesTheServer`, `TestABindingThatRequiresClientsFromAnEmptyTrustDoesNotBind`, `TestAnyKeyExposesTheFingerprintAndTheChain`, `TestArgumentErrors` |
+| `weida_pem` | not exposed: `CertificatePEM` and `ToPEM` copy it into a `[]byte` and drop it (which wipes it) in the same cgo call | refused: a Go caller needs the bytes, not a handle |
 | `weida_transfer_meta` | `TransferMeta{ContentType string}`, turned into a handle per call; `""` sets no content type | present; `TestAStreamedRoundTripCarriesTheBodyAndTheContentType` |
 | `weida_listener` | `(*Listener).BindQUIC(ctx, addr, *ServerTLS) (*Binding, error)`, `.BindInproc(bus) (*LocalBinding, error)`, `.Replier(path)` | present |
 | `weida_binding`, `weida_local_binding` | `(*Binding).LocalAddr()`, `(*LocalBinding).Bus()`, each a `string`, `""` once closed | present |
@@ -36,11 +39,17 @@ also under `-race` and `GOEXPERIMENT=cgocheck2` on the workstation.
 | `weida_incoming_transfer` | `(*IncomingTransfer).Meta()`, `.Read(p) (int, error)` implementing `io.Reader` (`io.EOF` at the end), `.ReadContext(ctx, p)`, `.Collect(ctx, maxBytes uint64) (*Message, error)` (consumes) | present; `TestReadsOf3BytesReassembleTheBody`, `TestACollectOverItsCeilingIsLimitExceeded`, `TestAReplyDroppedUnfinishedReadsAsCanceled` (through `io.ReadAll`) |
 | `weida_outgoing_transfer` | `(*OutgoingTransfer).Write(p) (int, error)` implementing `io.Writer`, `.WriteContext(ctx, p)`, `.Finish() (*Delivery, error)` (consumes) | present; `Write` writes all of `p`, the Go loop R3c leaves to the caller, and returns how much it wrote when it fails |
 | `weida_delivery` | `(*Delivery).Delivered(ctx) error` (consumes) | present |
-| `weida_incoming_meta` | `IncomingMeta`, a struct copied out at once: `Endpoint`, `ContentType`, `Topic`, `PeerFingerprint` as `*string`, `ContentLen`, `Sequence` as `*uint64`, `nil` when absent | present |
+| `weida_incoming_meta` | `IncomingMeta`, a struct copied out at once: `Endpoint`, `ContentType`, `Topic`, `PeerFingerprint` as `*string`, `ContentLen`, `Sequence` as `*uint64`, `nil` when absent; `PeerChainDER [][]byte`, the certificates the peer presented, leaf first, `nil` when absent, and `PeerChain() ([]*x509.Certificate, error)`, which parses them on each call (`ErrTLS` when one does not parse, so copying the metadata never fails over a certificate) | present; `TestAPinnedClientKeyIsAcceptedAndTheServerSeesItsKeyAndChain`, `TestAnyKeyExposesTheFingerprintAndTheChain`, `TestAnAnchorAcceptsTheDialledNameAndRefusesAnother` |
 | `weida_msg` | `Message{Payload []byte; Meta IncomingMeta}`, copied out at once and the C message dropped in the same call | present |
 | the ops (`*_op`) | not exposed: a waiting method starts its op, waits, and drops it with `defer`, which cancels it only when it did not finish | refused: an op is the C caller's way to wait, not a value a Go caller needs |
 | the `_fd` functions, `weida_poll` | not exposed: the package hands the descriptor to Go's netpoller (§4) | refused: a goroutine waits by blocking, not on a descriptor |
 | `weida_version`, `weida_strerror` | `Version()`, `Code.String()` | present; `cmd/weida-smoke`, `TestAnUnknownCodeIsAnUnknownError` |
+
+The conversions to Go's types follow [0047](../decisions/0047-key-material-in-the-language-packages.md):
+an `*x509.CertPool` is refused as an anchor, since it cannot be enumerated (`AddAnchorCertificates`
+takes the certificates themselves), and any other `crypto.Signer` is case 2 of the decision: a key
+that never leaves its store needs a signer handle, which weida does not have yet, so
+`IdentityFromTLS` returns `ErrInval` naming it.
 
 Every handle type has `Close() error` (an `io.Closer`), which releases its handle at once; one
 never closed is released by a `runtime.AddCleanup` once it is unreachable. A call holds the
@@ -93,7 +102,8 @@ it is absent from the C ABI ([weida-c.md](weida-c.md) §5 to §7), and arrives w
 ## 7. Sources
 
 `crates/go/weida/` (`cgo.go`, `weida_go.h`, `errors.go`, `handle.go`, `runtime.go`,
-`reqrep.go`, `go.mod`, `develop.sh`, `weida_test.go`, `quic_test.go`, `cmd/weida-smoke/`);
+`reqrep.go`, `go.mod`, `develop.sh`, `weida_test.go`, `identity_test.go`, `quic_test.go`,
+`mtls_test.go`, `cmd/weida-smoke/`);
 `crates/weida-c/Cargo.toml`; `.zeughaus-ci/build.sh` (`c_abi`), `.zeughaus-ci/go-linux-amd64.sh`,
 `.zeughaus-ci/go-linux-arm64.sh`; [weida-c.md](weida-c.md); [docs/c/](../c/README.md);
 [decisions/0046](../decisions/0046-how-each-language-binds-libweida.md).

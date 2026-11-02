@@ -5,6 +5,8 @@ import "C"
 
 import (
 	"context"
+	"crypto/x509"
+	"fmt"
 	"io"
 	"unsafe"
 )
@@ -388,10 +390,32 @@ type IncomingMeta struct {
 	// PeerFingerprint is the key the sender proved in the TLS handshake;
 	// nil when it dialled anonymously or over a local transport.
 	PeerFingerprint *string
+	// PeerChainDER is the certificates the sender presented in the TLS
+	// handshake, DER, leaf first; nil when it dialled anonymously, over a
+	// local transport, or over a bound weida keeps. PeerChain parses it.
+	PeerChainDER [][]byte
 	// ContentLen is the advisory payload length the sender stated.
 	ContentLen *uint64
 	// Sequence is the sender's per-producer sequence number.
 	Sequence *uint64
+}
+
+// PeerChain is the certificates the sender presented, leaf first, parsed
+// from PeerChainDER on each call; nil, nil when there is none. A
+// certificate that does not parse is ErrTLS.
+func (m IncomingMeta) PeerChain() ([]*x509.Certificate, error) {
+	if m.PeerChainDER == nil {
+		return nil, nil
+	}
+	certs := make([]*x509.Certificate, 0, len(m.PeerChainDER))
+	for i, der := range m.PeerChainDER {
+		c, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, &Error{Code: CodeTLS, Message: fmt.Sprintf("certificate %d of the peer's chain does not parse: %v", i, err), Max: -1}
+		}
+		certs = append(certs, c)
+	}
+	return certs, nil
 }
 
 func copyMeta(m *C.weida_incoming_meta) IncomingMeta {
@@ -408,6 +432,14 @@ func copyMeta(m *C.weida_incoming_meta) IncomingMeta {
 	meta.ContentType = str(C.weida_incoming_meta_content_type(m, &n))
 	meta.Topic = str(C.weida_incoming_meta_topic(m, &n))
 	meta.PeerFingerprint = str(C.weida_incoming_meta_peer_fingerprint(m, &n))
+	if C.weida_incoming_meta_peer_chain_len(m, &n) == 1 {
+		meta.PeerChainDER = make([][]byte, 0, int(n))
+		for i := C.size_t(0); i < n; i++ {
+			var l C.size_t
+			der := C.weida_incoming_meta_peer_chain_cert(m, i, &l)
+			meta.PeerChainDER = append(meta.PeerChainDER, C.GoBytes(unsafe.Pointer(der), C.int(l)))
+		}
+	}
 	var u C.uint64_t
 	num := func(present C.int) *uint64 {
 		if present != 1 {

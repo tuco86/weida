@@ -78,11 +78,17 @@ type serving struct {
 
 func newServing(t *testing.T, identity *Identity) *serving {
 	t.Helper()
+	tls := must(NewServerTLS(identity))(t)
+	defer tls.Close()
+	return newServingTLS(t, tls)
+}
+
+// newServingTLS serves on tls's terms, which the binding copies.
+func newServingTLS(t *testing.T, tls *ServerTLS) *serving {
+	t.Helper()
 	s := &serving{}
 	s.runtime = must(NewRuntime(nil))(t)
 	s.listener = must(s.runtime.Listener())(t)
-	tls := must(NewServerTLS(identity))(t)
-	defer tls.Close()
 	s.binding = must(s.listener.BindQUIC(t.Context(), "127.0.0.1:0", tls))(t)
 	s.replier = must(s.listener.Replier("/echo"))(t)
 	return s
