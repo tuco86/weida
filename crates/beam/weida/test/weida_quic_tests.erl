@@ -194,11 +194,14 @@ files() ->
         ?assertEqual({ok, Fingerprint}, weida:identity_fingerprint(TwoFiles)),
 
         #{binding := Binding, replier := Replier, runtime := Runtime} = P = serving(OneFile),
-        serve_meta(Replier),
+        Ref = serve_meta(Replier),
         {ok, Anchors} = weida:trust_new(),
         ok = weida:trust_add_anchor(Anchors, {cacertfile, CertPath}),
         Requester = requester(Runtime, Anchors),
         round_trip(Requester, url(Binding)),
+        receive
+            {Ref, _} -> ok
+        end,
         close(P#{requester => Requester}),
 
         {ok, Missing} = weida:identity_from_pem_file(filename:join(Dir, "missing.pem")),
@@ -220,21 +223,23 @@ serving_tls(ServerTls) ->
     {ok, Replier} = weida:listener_replier(Listener, <<"/echo">>),
     #{runtime => Runtime, listener => Listener, binding => Binding, replier => Replier}.
 
-%% A linked process that answers one request with <<"hi">> and sends the
-%% parent {Ref, Meta}, the request's metadata; returns Ref.
+%% A linked process that answers one request with <<"hi">> and, once the
+%% reply is delivered, sends the parent {Ref, Meta}, the request's
+%% metadata; returns Ref. The parent receives it before it closes, so the
+%% delivery does not race the close.
 serve_meta(Replier) ->
     Parent = self(),
     Ref = make_ref(),
     spawn_link(fun() ->
         {ok, Request} = weida:replier_accept(Replier, infinity),
         {ok, Meta} = weida:incoming_request_meta(Request),
-        Parent ! {Ref, Meta},
         {ok, Body} = weida:incoming_request_take_body(Request),
         {ok, _} = weida:incoming_transfer_collect(Body, 1024, infinity),
         {ok, Reply} = weida:incoming_request_reply(Request, #{}, infinity),
         ok = weida:outgoing_transfer_write_all(Reply, <<"hi">>, infinity),
         {ok, Delivery} = weida:outgoing_transfer_finish(Reply),
-        ok = weida:delivery_delivered(Delivery, infinity)
+        ok = weida:delivery_delivered(Delivery, infinity),
+        Parent ! {Ref, Meta}
     end),
     Ref.
 
