@@ -1,0 +1,18 @@
+{
+  "name": "weida",
+  "version": "0.0.0-dev",
+  "description": "weida for JavaScript: a Node-API addon over libweida for Node, Bun and Deno",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "exports": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "files": [
+    "lib",
+    "build/weida.node",
+    "build/libweida.so",
+    "build/libweida.dylib"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}

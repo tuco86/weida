@@ -86,9 +86,10 @@ check_docs() {
 # The C ABI and the Python package on it (docs/decisions/0045): the committed
 # headers match what cbindgen derives from crates/weida-c, the Python tests
 # run against an editable install, and libweida, weida.h and the wheel are
-# handed on in $CI_OUTPUT for the language jobs (lib/, include/, wheels/).
-# The nightly and a release tag also run the C smoke program and the wheel's
-# smoke in a fresh virtualenv.
+# handed on in $CI_OUTPUT for the language jobs (lib/, include/, wheels/):
+# the python- jobs install the wheel, the js- jobs build the Node-API addon
+# against lib/. The nightly and a release tag also run the C smoke program
+# and the wheel's smoke in a fresh virtualenv.
 c_abi() {
     step crates/weida-c/header.sh --verify
 
