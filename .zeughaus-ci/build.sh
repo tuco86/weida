@@ -3,6 +3,24 @@
 # publish.sh, publish-npm.sh, audit.sh and fuzz.sh; no header, so not a job.
 # Run from the workspace root, with CI_PLATFORM set by the job's `platform`.
 
+# The scheduled nightly round, as opposed to a nightly that `ci_run` or a
+# rerun queued on demand (CI_ACTOR is then `<user>@<host>` or `rerun of #n`).
+scheduled_nightly() {
+    [ "$CI_EVENT" = nightly ] && [ "${CI_ACTOR:-}" = nightly ]
+}
+
+# The scheduled nightly starts every place's workspace from nothing, once a
+# day: its first job at a place removes everything git does not track
+# (caches, target directories, virtualenvs, package builds) and leaves a
+# marker, so its later jobs there build on what the first one left. A
+# nightly queued on demand runs warm (channels.toml).
+if scheduled_nightly && [ ! -e "$CI_WORKSPACE/.ci-cache/cold-$CI_PIPELINE" ]; then
+    printf '\n== cold start: wiping the workspace for the scheduled nightly\n'
+    git -c safe.directory='*' -C "$CI_WORKSPACE" clean -ffdxq
+    mkdir -p "$CI_WORKSPACE/.ci-cache"
+    : >"$CI_WORKSPACE/.ci-cache/cold-$CI_PIPELINE"
+fi
+
 # Cargo's home and target directory live in the workspace, which the jobs of
 # one place share and keep warm.
 cargo_env() {

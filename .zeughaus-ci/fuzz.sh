@@ -6,13 +6,19 @@
 # timeout_minutes = 120
 # ///
 # Runs every cargo-fuzz target of the workspace's fuzz crates for a fixed
-# time on the nightly (docs/SECURITY.md). A manual run gives each target
-# a few seconds, which proves they build and start. Every target runs even
-# after one failed; a crash input is printed as base64, because the job's
-# output directory is not kept and the log is.
+# time on the scheduled nightly (docs/SECURITY.md). A nightly queued on
+# demand (`ci_run`, a rerun) skips the round and succeeds: it is there for
+# the test tiers. A manual run gives each target a few seconds, which proves
+# they build and start. Every target runs even after one failed; a crash
+# input is printed as base64, because the job's output directory is not kept
+# and the log is.
 set -uo pipefail
 
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
+if [ "$CI_EVENT" = nightly ] && ! scheduled_nightly; then
+    echo "fuzz: skipped, the fuzz round runs on the scheduled nightly only (actor: $CI_ACTOR)"
+    exit 0
+fi
 cargo_env
 # Each fuzz crate is its own workspace and builds in its own fuzz/target,
 # where cargo-fuzz looks for the binaries.

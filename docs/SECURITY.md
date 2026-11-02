@@ -8,7 +8,7 @@ handled, and how an agent reviews the code.
 |Check|Runs|Catches|
 |---|---|---|
 |`audit` (`cargo deny --locked check advisories sources`, `deny.toml`)|nightly, release (gates `publish`)|known advisories and yanked crates in `Cargo.lock`, non-crates.io sources|
-|`fuzz` (all `cargo fuzz` targets, 60 s each)|nightly|panics, overflows, OOM and timeouts in the codecs|
+|`fuzz` (all `cargo fuzz` targets, 60 s each)|the scheduled nightly (a nightly queued with `ci_run` skips it)|panics, overflows, OOM and timeouts in the codecs|
 |`tests/fuzz_smoke.rs`, `hostile.rs`|every push|regressions of past findings|
 |agent review (section 4)|on demand|logic flaws in weida's own code|
 

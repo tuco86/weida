@@ -27,6 +27,19 @@ function Run([string]$Command, [string[]]$Arguments = @()) {
     Write-Host "== $Command $($Arguments -join ' '): $seconds s"
 }
 
+# The scheduled nightly round (CI_ACTOR `nightly`) starts the workspace from
+# nothing, once a day, as build.sh does; a nightly queued on demand stays
+# warm (channels.toml).
+if ($env:CI_EVENT -eq 'nightly' -and $env:CI_ACTOR -eq 'nightly') {
+    $marker = Join-Path $env:CI_WORKSPACE ".ci-cache\cold-$env:CI_PIPELINE"
+    if (-not (Test-Path $marker)) {
+        Write-Host '== cold start: wiping the workspace for the scheduled nightly'
+        Run 'git' @('-C', $env:CI_WORKSPACE, 'clean', '-ffdxq')
+        New-Item -ItemType Directory -Force -Path (Join-Path $env:CI_WORKSPACE '.ci-cache') | Out-Null
+        New-Item -ItemType File -Force -Path $marker | Out-Null
+    }
+}
+
 $cache = Join-Path $env:CI_WORKSPACE '.ci-cache'
 $env:CARGO_TARGET_DIR = Join-Path $cache 'target'
 
