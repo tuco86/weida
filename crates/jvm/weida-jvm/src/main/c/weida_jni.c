@@ -398,9 +398,77 @@ NATIVE(void, trustAddPin)(ENV, jlong t, jstring fingerprint) {
     check(env, rc);
 }
 
+NATIVE(void, trustAddAnchor)(ENV, jlong t, jbyteArray pem) {
+    jsize len = (*env)->GetArrayLength(env, pem);
+    /* Non-blocking, and the bytes are copied before it returns. */
+    jbyte *data = (*env)->GetPrimitiveArrayCritical(env, pem, NULL);
+    if (!data)
+        return;
+    int rc = weida_trust_add_anchor(PTR(weida_trust, t), (const uint8_t *)data, (size_t)len);
+    (*env)->ReleasePrimitiveArrayCritical(env, pem, data, JNI_ABORT);
+    check(env, rc);
+}
+
+NATIVE(void, trustAddAnchorFile)(ENV, jlong t, jstring path) {
+    char *p;
+    if (!utf8_of(env, path, &p))
+        return;
+    int rc = weida_trust_add_anchor_file(PTR(weida_trust, t), p);
+    free(p);
+    check(env, rc);
+}
+
 NATIVE(jlong, identityGenerate)(ENV) {
     weida_identity *out = NULL;
     return check(env, weida_identity_generate(&out)) ? HANDLE(out) : 0;
+}
+
+/* Copies a weida_pem into a new byte[] and drops it, which wipes its bytes,
+ * on every path. NULL with a pending exception when memory runs out. */
+static jbyteArray pem_bytes(JNIEnv *env, weida_pem *p) {
+    size_t len = weida_pem_len(p);
+    jbyteArray out = NULL;
+    if (len <= INT32_MAX)
+        out = (*env)->NewByteArray(env, (jsize)len);
+    if (out)
+        (*env)->SetByteArrayRegion(env, out, 0, (jsize)len, (const jbyte *)weida_pem_data(p));
+    weida_pem_drop(p);
+    if (!out && !(*env)->ExceptionCheck(env))
+        throw_oom(env);
+    return out;
+}
+
+NATIVE(jlong, identityGenerateFor)(ENV, jobjectArray names) {
+    jsize n = (*env)->GetArrayLength(env, names);
+    char **c = calloc(n ? (size_t)n : 1, sizeof *c);
+    if (!c) {
+        throw_oom(env);
+        return 0;
+    }
+    for (jsize i = 0; i < n; i++) {
+        jstring name = (jstring)(*env)->GetObjectArrayElement(env, names, i);
+        if (!name && (*env)->ExceptionCheck(env)) {
+            for (jsize j = 0; j < i; j++)
+                free(c[j]);
+            free(c);
+            return 0;
+        }
+        bool ok = utf8_of(env, name, &c[i]);
+        if (name)
+            (*env)->DeleteLocalRef(env, name);
+        if (!ok) {
+            for (jsize j = 0; j < i; j++)
+                free(c[j]);
+            free(c);
+            return 0;
+        }
+    }
+    weida_identity *out = NULL;
+    int rc = weida_identity_generate_for((const char *const *)c, (size_t)n, &out);
+    for (jsize i = 0; i < n; i++)
+        free(c[i]);
+    free(c);
+    return check(env, rc) ? HANDLE(out) : 0;
 }
 
 NATIVE(jlong, identityFromPem)(ENV, jbyteArray cert, jbyteArray key) {
@@ -423,6 +491,32 @@ NATIVE(jlong, identityFromPem)(ENV, jbyteArray cert, jbyteArray key) {
     return check(env, rc) ? HANDLE(out) : 0;
 }
 
+NATIVE(jlong, identityFromPemFile)(ENV, jstring path) {
+    char *p;
+    if (!utf8_of(env, path, &p))
+        return 0;
+    weida_identity *out = NULL;
+    int rc = weida_identity_from_pem_file(p, &out);
+    free(p);
+    return check(env, rc) ? HANDLE(out) : 0;
+}
+
+NATIVE(jlong, identityFromPemFiles)(ENV, jstring cert, jstring key) {
+    char *c;
+    if (!utf8_of(env, cert, &c))
+        return 0;
+    char *k;
+    if (!utf8_of(env, key, &k)) {
+        free(c);
+        return 0;
+    }
+    weida_identity *out = NULL;
+    int rc = weida_identity_from_pem_files(c, k, &out);
+    free(c);
+    free(k);
+    return check(env, rc) ? HANDLE(out) : 0;
+}
+
 NATIVE(jstring, identityFingerprint)(ENV, jlong id) {
     const char *out = NULL;
     if (!check(env, weida_identity_fingerprint(PTR(weida_identity, id), &out)))
@@ -430,14 +524,40 @@ NATIVE(jstring, identityFingerprint)(ENV, jlong id) {
     return cstring(env, out);
 }
 
+NATIVE(jbyteArray, identityCertificatePem)(ENV, jlong id) {
+    weida_pem *pem = NULL;
+    if (!check(env, weida_identity_certificate_pem(PTR(weida_identity, id), &pem)))
+        return NULL;
+    return pem_bytes(env, pem);
+}
+
+NATIVE(jbyteArray, identityToPem)(ENV, jlong id) {
+    weida_pem *pem = NULL;
+    if (!check(env, weida_identity_to_pem(PTR(weida_identity, id), &pem)))
+        return NULL;
+    return pem_bytes(env, pem);
+}
+
 NATIVE(jlong, clientTlsNew)(ENV, jlong trust) {
     weida_client_tls *out = NULL;
     return check(env, weida_client_tls_new(PTR(weida_trust, trust), &out)) ? HANDLE(out) : 0;
 }
 
+NATIVE(void, clientTlsSetIdentity)(ENV, jlong tls, jlong identity) {
+    check(env, weida_client_tls_set_identity(PTR(weida_client_tls, tls), PTR(weida_identity, identity)));
+}
+
 NATIVE(jlong, serverTlsNew)(ENV, jlong identity) {
     weida_server_tls *out = NULL;
     return check(env, weida_server_tls_new(PTR(weida_identity, identity), &out)) ? HANDLE(out) : 0;
+}
+
+NATIVE(void, serverTlsRequireClient)(ENV, jlong tls, jlong trust) {
+    check(env, weida_server_tls_require_client(PTR(weida_server_tls, tls), PTR(weida_trust, trust)));
+}
+
+NATIVE(void, serverTlsRequireAnyKey)(ENV, jlong tls) {
+    check(env, weida_server_tls_require_any_key(PTR(weida_server_tls, tls)));
 }
 
 NATIVE(jlong, transferMetaNew)(ENV) {
@@ -619,6 +739,43 @@ NATIVE(jint, incomingMetaNumbers)(ENV, jlong m, jlongArray out) {
     jlong values[2] = {(jlong)content_len, (jlong)sequence};
     (*env)->SetLongArrayRegion(env, out, 0, 2, values);
     return present;
+}
+
+/* The DER of every certificate the sender presented, leaf first, as a
+ * byte[][]; NULL when the chain is absent. */
+NATIVE(jobjectArray, incomingMetaPeerChain)(ENV, jlong m) {
+    const weida_incoming_meta *meta = PTR(const weida_incoming_meta, m);
+    size_t count = 0;
+    if (weida_incoming_meta_peer_chain_len(meta, &count) != 1 || count == 0)
+        return NULL;
+    jclass bytes = (*env)->FindClass(env, "[B");
+    if (!bytes) {
+        if (!(*env)->ExceptionCheck(env))
+            throw_oom(env);
+        return NULL;
+    }
+    jobjectArray chain = (*env)->NewObjectArray(env, (jsize)count, bytes, NULL);
+    (*env)->DeleteLocalRef(env, bytes);
+    if (!chain) {
+        if (!(*env)->ExceptionCheck(env))
+            throw_oom(env);
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        size_t len = 0;
+        const uint8_t *der = weida_incoming_meta_peer_chain_cert(meta, i, &len);
+        jbyteArray copy = (der && len <= INT32_MAX) ? (*env)->NewByteArray(env, (jsize)len) : NULL;
+        if (!copy) {
+            if (!(*env)->ExceptionCheck(env))
+                throw_oom(env);
+            (*env)->DeleteLocalRef(env, chain);
+            return NULL;
+        }
+        (*env)->SetByteArrayRegion(env, copy, 0, (jsize)len, (const jbyte *)der);
+        (*env)->SetObjectArrayElement(env, chain, (jsize)i, copy);
+        (*env)->DeleteLocalRef(env, copy);
+    }
+    return chain;
 }
 
 /* ---- incoming transfer ----------------------------------------------- */

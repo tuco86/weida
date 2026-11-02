@@ -12,8 +12,9 @@ a row below says otherwise, and every row absent there is absent here for the sa
 document lists what the Java surface adds or changes. Verdicts are **present** (with the test),
 **refused** (with the reason) or **absent** (with the reason); there is no "partial".
 
-The tests are `crates/jvm/weida-jvm/src/test/java/net/doodleshnookie/weida/`: `ErrorsTest` and
-`InprocTest` (in-process transport only, one second each) and `QuicTest`, tagged `io` (QUIC on
+The tests are `crates/jvm/weida-jvm/src/test/java/net/doodleshnookie/weida/`: `ErrorsTest`,
+`IdentityTest` and `InprocTest` (no files or sockets, in-process transport only, one second each)
+and `QuicTest` and `MtlsTest`, tagged `io` (QUIC on
 localhost, ten seconds each). `test.sh` runs them with the JUnit Platform Console Standalone
 6.1.3 and `-Xcheck:jni`, the unit tier on every push and both on the nightly and tags;
 `smoke/Smoke.java` makes one QUIC round trip, and `package.sh` runs it from a fresh directory
@@ -27,9 +28,9 @@ compiled against, not run (§5).
 | --- | --- | --- |
 | `weida_runtime_config` | `RuntimeConfig`, a value with `workerThreads(int)` and `shutdownTimeout(long, TimeUnit)` (whole milliseconds), turned into a handle by `Runtime.owned` | present; `ErrorsTest.aRuntimeWithNoWorkerThreadsIsARuntimeFailure` |
 | `weida_runtime` | `Runtime.owned()`, `Runtime.owned(RuntimeConfig)`, `.listener()`, `.requester(ClientTls)`, `.shutdownAsync()` and `.shutdown(timeout, unit)` (consumes), `.close()` | present; every round-trip test. The name shadows `java.lang.Runtime`: a file that imports `net.doodleshnookie.weida.*` also imports `net.doodleshnookie.weida.Runtime` by name |
-| `weida_trust` | `new Trust()`, `.addPin(String)` returning the trust | present; `ErrorsTest.aMalformedPinIsAnInvalidFingerprint`, `QuicTest.aWrongPinIsUntrustedCarryingTheFingerprint` |
-| `weida_identity` | `Identity.generate()`, `Identity.fromPem(byte[], byte[])`, `.fingerprint()` | present; `QuicTest.aRoundTripOverQuicWithAPinnedKey` |
-| `weida_client_tls`, `weida_server_tls` | `new ClientTls(Trust)`, `new ServerTls(Identity)` | present |
+| `weida_trust` | `new Trust()`, `.addPin(String)`, `.addAnchor(byte[])`, `.addAnchor(X509Certificate)` and `.addAnchorFile(File)`, each returning the trust | present; `ErrorsTest.aMalformedPinIsAnInvalidFingerprint`, `QuicTest.aWrongPinIsUntrustedCarryingTheFingerprint`, `MtlsTest.anAnchorAcceptsTheDialledNameAndRefusesAnother`, `MtlsTest.identityAndAnchorFilesReadBack` |
+| `weida_identity` | `Identity.generate()`, `Identity.generateFor(String...)`, `Identity.fromPem(byte[], byte[])`, `Identity.fromPemFile(File)`, `Identity.fromPemFiles(File, File)`, `Identity.from(PrivateKey, X509Certificate...)`, `Identity.fromKeyStore(KeyStore, String, char[])`, `.fingerprint()`, `.certificatePem()` and `.toPem()` as `byte[]` (`toPem()` holds the private key: the caller wipes it with `Arrays.fill`), `.certificates()` as `X509Certificate[]`, leaf first | present; `QuicTest.aRoundTripOverQuicWithAPinnedKey`, `IdentityTest.toPemReadsBackWithTheSameFingerprint`, `IdentityTest.certificatesAreTheIdentitysKey`, `IdentityTest.generateForNamesTheCertificate`, `IdentityTest.fromTakesJavasKeyTypes`, `IdentityTest.fromKeyStoreReadsAPkcs12Entry`, `IdentityTest.aKeyThatCannotBeExportedNamesCase2`, `IdentityTest.argumentErrors`, `MtlsTest.identityAndAnchorFilesReadBack` |
+| `weida_client_tls`, `weida_server_tls` | `new ClientTls(Trust)`, `.setIdentity(Identity)`; `new ServerTls(Identity)`, `.requireClient(Trust)`, `.requireAnyKey()`; each setter returns its terms | present; `MtlsTest.aPinnedClientKeyIsAcceptedAndTheServerSeesItsKeyAndChain`, `MtlsTest.anAnonymousOrUnknownClientIsRefusedWithTlsAndNothingReachesTheServer`, `MtlsTest.aBindingThatRequiresClientsFromAnEmptyTrustDoesNotBind`, `MtlsTest.anyKeyExposesTheFingerprintAndTheChain`, `IdentityTest.argumentErrors` |
 | `weida_transfer_meta` | `TransferMeta`, a value with `contentType(String)`, turned into a handle per call; `null` is empty metadata | present; `InprocTest.aStreamedRoundTripCarriesTheBodyAndTheContentType` |
 | `weida_listener` | `Listener.bindQuicAsync(addr, ServerTls)` returning `CompletableFuture<Binding>` and `.bindQuic(addr, tls, timeout, unit)`, `.bindInproc(bus)`, `.replier(path)` | present |
 | `weida_binding`, `weida_local_binding` | `Binding.localAddr()`, `LocalBinding.bus()` | present |
@@ -39,11 +40,16 @@ compiled against, not run (§5).
 | `weida_incoming_transfer` | `IncomingTransfer.meta()`, `.readAsync(byte[], off, len)` and `.read(.., timeout, unit)` (the count, -1 at the end, as `InputStream.read` does), `.collectAsync(maxBytes)` and `.collect(maxBytes, timeout, unit)` returning a `Message` (consumes; the ceiling is at most `Integer.MAX_VALUE - 8`, the largest Java array) | present; `InprocTest.readsOf3BytesReassembleTheBody`, `InprocTest.aCollectOverItsCeilingIsLimitExceeded`, `InprocTest.aReplyClosedUnfinishedReadsAsCanceled` |
 | `weida_outgoing_transfer` | `OutgoingTransfer.writeAsync(byte[], off, len)` and `.write(..)`, `.writeAllAsync(byte[])` and `.writeAll(data, timeout, unit)`, `.finish()` returning the `Delivery` (consumes) | present; `writeAll` is the Java loop R3c leaves to the caller, its timeout bounding the whole call |
 | `weida_delivery` | `Delivery.deliveredAsync()` and `.delivered(timeout, unit)` (consumes) | present |
-| `weida_incoming_meta` | `IncomingMeta`, an immutable value copied out at once: `endpoint()`, `contentType()`, `topic()`, `peerFingerprint()` as `String` or `null`, `contentLen()` and `sequence()` as `OptionalLong` (unsigned 64-bit values in a `long`) | present |
+| `weida_incoming_meta` | `IncomingMeta`, an immutable value copied out at once: `endpoint()`, `contentType()`, `topic()`, `peerFingerprint()` as `String` or `null`, `contentLen()` and `sequence()` as `OptionalLong` (unsigned 64-bit values in a `long`), `peerChain()` as `X509Certificate[]`, leaf first, or `null`; the DER is kept and parsed on each call, so copying the metadata never fails over a certificate, and a certificate that does not parse throws `TLS` | present; `MtlsTest.aPinnedClientKeyIsAcceptedAndTheServerSeesItsKeyAndChain`, `MtlsTest.anyKeyExposesTheFingerprintAndTheChain`, `MtlsTest.anAnchorAcceptsTheDialledNameAndRefusesAnother` |
 | `weida_msg` | `Message`: `payload()` as `byte[]`, `meta()`, copied out at once | present |
+| `weida_pem` | not exposed: copied into a `byte[]` and dropped (which wipes its bytes) inside the native call | refused: a Java caller needs the bytes, not a handle |
 | the ops (`*_op`) | not exposed: a waiting method starts its op, waits, and closes it when the wait ends, which cancels it only when it did not finish | refused: an op is the C caller's way to wait, not a value a Java caller needs |
 | the `_fd` functions, `weida_poll` | not exposed: the waiter thread polls the descriptors (§4) | refused: the JVM has no API that watches a raw descriptor; NIO selectors take channels only |
 | `weida_version`, `weida_strerror` | `Weida.version()`, `Weida.strerror(int)` | present; `smoke/Smoke.java`, `ErrorsTest.strerrorOfAnUnknownCodeIsUnknownError` |
+
+The conversions follow [0047](../decisions/0047-key-material-in-the-language-packages.md): a key
+whose `getEncoded()` is `null` (an Android Keystore key) is case 2 and `Identity.from` refuses
+it, naming 0047, until the ABI has a signer handle.
 
 Every handle class is `AutoCloseable`; `close()` releases the handle now, a second `close()`
 does nothing, and a closed or consumed object throws `CLOSED` without calling C. Its pending
@@ -93,6 +99,7 @@ a surrogate pair. Present; `ErrorsTest.aStringHoldingANulIsAnInvalidArgument`.
 | The Java sources use only what Android API 24 has: no `java.time`, `java.lang.ref.Cleaner`, `java.lang.foreign` or records, and no lambdas in the main sources, because API 24's `android.jar` has no `java.lang.invoke` | present; `android-libweida` compiles them against `platforms/android-24/android.jar`, which fails on any class or method API 24 lacks. That compile is at language level 8: javac compiles for 9 and up only against a modular platform, which `android.jar` is not |
 | Loading on Android: `System.loadLibrary("weida_jni")` from the APK's `jniLibs`, `libweida.so` beside it | present by construction (`Native.java`); not run |
 | Run on a device or an emulator | absent: no job has one |
+| Paths are `java.io.File` and PEM is encoded by `Pem.java`, because API 24 has no `java.nio.file` and no `java.util.Base64` | present; `android-libweida` |
 | An AAR | absent: no Gradle in this repository's CI, so 0019 §4.5's Gradle build is not done; the libraries and sources are what an app's build takes |
 
 ## 6. Packaging

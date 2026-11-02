@@ -76,15 +76,35 @@ final class Native {
 
     static native void trustAddPin(long trust, String fingerprint);
 
+    static native void trustAddAnchor(long trust, byte[] pem);
+
+    static native void trustAddAnchorFile(long trust, String path);
+
     static native long identityGenerate();
+
+    static native long identityGenerateFor(String[] names);
 
     static native long identityFromPem(byte[] cert, byte[] key);
 
+    static native long identityFromPemFile(String path);
+
+    static native long identityFromPemFiles(String certChain, String key);
+
     static native String identityFingerprint(long identity);
+
+    static native byte[] identityCertificatePem(long identity);
+
+    static native byte[] identityToPem(long identity);
 
     static native long clientTlsNew(long trust);
 
+    static native void clientTlsSetIdentity(long tls, long identity);
+
     static native long serverTlsNew(long identity);
+
+    static native void serverTlsRequireClient(long tls, long trust);
+
+    static native void serverTlsRequireAnyKey(long tls);
 
     static native long transferMetaNew();
 
@@ -127,6 +147,9 @@ final class Native {
 
     /** Writes content_len and sequence to {@code out}; bit 0 and bit 1 say which are present. */
     static native int incomingMetaNumbers(long meta, long[] out);
+
+    /** The DER of each certificate the sender presented, leaf first; {@code null} when the chain is absent. */
+    static native byte[][] incomingMetaPeerChain(long meta);
 
     static native long incomingTransferMeta(long transfer);
 
