@@ -6,7 +6,7 @@
 # - unzip: unpacks the command-line tools.
 # - Temurin 25: sdkmanager is a Java program; the same JDK jvm.Containerfile
 #   carries.
-# - the NDK and one platform, through sdkmanager; the Rust targets of the
+# - the NDK and two platforms, through sdkmanager; the Rust targets of the
 #   four ABIs; cargo-ndk, which points cargo at the NDK's linkers.
 FROM docker.io/library/rust:1.99.1-trixie
 
@@ -31,9 +31,11 @@ ENV ANDROID_HOME=/opt/android-sdk PATH=/opt/android-sdk/cmdline-tools/latest/bin
 
 # NDK 30.0.16248370: the newest stable `ndk;` entry, platform android-37.2
 # the newest stable `platforms;android-` entry, both of `sdkmanager --list`
-# (repository2-3.xml) on 2026-11-01.
+# (repository2-3.xml) on 2026-11-01. platforms;android-24 is the API floor:
+# android-libweida.sh compiles weida for the JVM's Java sources against its
+# android.jar, which fails on any class or method API 24 lacks.
 RUN yes | sdkmanager --licenses >/dev/null \
-    && sdkmanager "ndk;30.0.16248370" "platforms;android-37.2"
+    && sdkmanager "ndk;30.0.16248370" "platforms;android-37.2" "platforms;android-24"
 
 ENV ANDROID_NDK_HOME=/opt/android-sdk/ndk/30.0.16248370
 

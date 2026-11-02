@@ -12,3 +12,5 @@ crates/py/weida-py/src/weida/weida.dll
 # What crates/js/weida-js/build.sh builds, and any npm install.
 crates/js/weida-js/build/
 node_modules/
+# What crates/jvm/weida-jvm/build.sh and test.sh build.
+crates/jvm/weida-jvm/build/
