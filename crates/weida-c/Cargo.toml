@@ -17,6 +17,10 @@ publish = false
 # `-lweida`. The `rlib` lets this crate's own tests call the exports directly.
 # On Windows its PDB would collide with the `weida` CLI's, which is why the
 # root manifest strips this package's debuginfo in the dev profile.
+# The static `libweida.a`, which Go and Swift link (docs/decisions/0046), is
+# built on demand with `cargo rustc -p weida-c --lib --crate-type staticlib`
+# (.zeughaus-ci/build.sh `c_abi`): as a third crate type here it made the
+# Windows debug links fail on `deps/weida.pdb` again (LNK1201).
 [lib]
 name = "weida"
 crate-type = ["cdylib", "rlib"]

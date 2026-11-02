@@ -86,9 +86,10 @@ check_docs() {
 # The C ABI and the Python package on it (docs/decisions/0045): the committed
 # headers match what cbindgen derives from crates/weida-c, the Python tests
 # run against an editable install, and libweida, weida.h and the wheel are
-# handed on in $CI_OUTPUT for the language jobs (lib/, include/, wheels/):
-# the python- jobs install the wheel, the js-, jvm- and beam- jobs build their
-# native glue against lib/. The nightly and a release tag also run the C smoke program
+# handed on in $CI_OUTPUT for the language jobs (lib/, lib-static/, include/,
+# wheels/): the python- jobs install the wheel, the js-, jvm- and beam- jobs
+# build their native glue against lib/, the go- jobs link lib-static/'s
+# libweida.a. The nightly and a release tag also run the C smoke program
 # and the wheel's smoke in a fresh virtualenv.
 c_abi() {
     step crates/weida-c/header.sh --verify
@@ -104,10 +105,14 @@ c_abi() {
     esac
 
     # The wheel build runs `cargo build --release -p weida-c` (hatch_build.py),
-    # so libweida.so exists afterwards.
-    mkdir -p "$CI_OUTPUT/lib" "$CI_OUTPUT/include" "$CI_OUTPUT/wheels"
+    # so libweida.so exists afterwards. The static library is not one of the
+    # manifest's crate types (crates/weida-c/Cargo.toml) and is built here; it
+    # gets a directory of its own, so that a -L to it cannot pick the shared one.
+    mkdir -p "$CI_OUTPUT/lib" "$CI_OUTPUT/lib-static" "$CI_OUTPUT/include" "$CI_OUTPUT/wheels"
     step "$venv/bin/pip" wheel --no-build-isolation --no-deps -w "$CI_OUTPUT/wheels" crates/py/weida-py
+    step cargo rustc --release --locked -p weida-c --lib --crate-type staticlib
     cp "$CARGO_TARGET_DIR/release/libweida.so" "$CI_OUTPUT/lib/"
+    cp "$CARGO_TARGET_DIR/release/libweida.a" "$CI_OUTPUT/lib-static/"
     cp crates/weida-c/include/weida.h "$CI_OUTPUT/include/"
 
     if [ "$(tier)" = ci ]; then
