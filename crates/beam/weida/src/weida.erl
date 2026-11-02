@@ -18,7 +18,12 @@
 %% Every other failure is {error, Error}: Error is a map with the R9 code as
 %% a snake_case atom (`untrusted`, `limit_exceeded`, `closed`, ...) under
 %% `code`, the `Display` text under `message`, and the thread-local record's
-%% `loss_cause`, `fingerprint`, `max` and `os_code` where they apply.
+%% `loss_cause`, `fingerprint`, `max` and `os_code` where they apply. A
+%% caller's mistake is an error of class `error`: `badarg`, or
+%% {unsupported_key, Reason} for a private key that never leaves its engine
+%% or sign_fun (docs/decisions/0047, case 2). Key material in ssl's forms
+%% (identity_from/1, trust_add_anchor/2, identity_certificates/1 and the
+%% meta's `peer_chain`) is DER or PEM, as docs/decisions/0047 fixes.
 -module(weida).
 
 -export([
@@ -31,11 +36,22 @@
     runtime_shutdown/2,
     trust_new/0,
     trust_add_pin/2,
+    trust_add_anchor/2,
     identity_generate/0,
+    identity_generate_for/1,
     identity_from_pem/2,
+    identity_from_pem_file/1,
+    identity_from_pem_files/2,
+    identity_from/1,
+    identity_certificate_pem/1,
+    identity_certificates/1,
+    identity_to_pem/1,
     identity_fingerprint/1,
     client_tls_new/1,
     server_tls_new/1,
+    client_tls_set_identity/2,
+    server_tls_require_client/2,
+    server_tls_require_any_key/1,
     listener_bind_quic/4,
     listener_bind_inproc/2,
     listener_replier/2,
@@ -75,6 +91,7 @@
     content_type := binary() | undefined,
     topic := binary() | undefined,
     peer_fingerprint := binary() | undefined,
+    peer_chain := [binary()] | undefined,
     content_len := non_neg_integer() | undefined,
     sequence := non_neg_integer() | undefined
 }.
@@ -125,11 +142,91 @@ trust_new() -> weida_nif:trust_new().
 -spec trust_add_pin(handle(), iodata()) -> ok | failure().
 trust_add_pin(Trust, Fingerprint) -> weida_nif:trust_add_pin(Trust, Fingerprint).
 
+%% Adds the certificate authorities of Anchor: PEM iodata, {cacerts, [Der]}
+%% or {cacertfile, Path}. The PEM is copied and the file named is read, and
+%% either is parsed, at each dial.
+-spec trust_add_anchor(
+    handle(), iodata() | {cacerts, [binary(), ...]} | {cacertfile, iodata()}
+) -> ok | failure().
+trust_add_anchor(Trust, {cacertfile, Path}) ->
+    weida_nif:trust_add_anchor_file(Trust, Path);
+trust_add_anchor(Trust, {cacerts, [_ | _] = Ders}) ->
+    weida_nif:trust_add_anchor(Trust, cert_pem(Ders));
+trust_add_anchor(Trust, Pem) ->
+    weida_nif:trust_add_anchor(Trust, Pem).
+
 -spec identity_generate() -> {ok, handle()} | failure().
 identity_generate() -> weida_nif:identity_generate().
 
+%% A fresh identity whose certificate names Names (DNS names and IP
+%% literals); no names behaves as identity_generate/0.
+-spec identity_generate_for([iodata()]) -> {ok, handle()} | failure().
+identity_generate_for(Names) -> weida_nif:identity_generate_for(Names).
+
 -spec identity_from_pem(iodata(), iodata()) -> {ok, handle()} | failure().
 identity_from_pem(Cert, Key) -> weida_nif:identity_from_pem(Cert, Key).
+
+%% Nothing is read here; a missing or bad file is the `tls` error at first
+%% use (identity_fingerprint/1, a bind or a dial).
+-spec identity_from_pem_file(iodata()) -> {ok, handle()} | failure().
+identity_from_pem_file(Path) -> weida_nif:identity_from_pem_file(Path).
+
+-spec identity_from_pem_files(iodata(), iodata()) -> {ok, handle()} | failure().
+identity_from_pem_files(Cert, Key) -> weida_nif:identity_from_pem_files(Cert, Key).
+
+%% An identity from ssl's certificate options, a proplist (an Elixir keyword
+%% list) or a map: `certfile` and `keyfile`, `certfile` alone (the chain and
+%% the key in one file, as ssl defaults `keyfile` to `certfile`), or `cert`
+%% (a DER or a chain of them, leaf first) and `key` ({Type, Der} with Type
+%% `RSAPrivateKey`, `ECPrivateKey` or `PrivateKeyInfo`). Any other key,
+%% `password` included (weida reads no encrypted keys), and any other
+%% combination is `badarg`; a `key` held by an engine or a sign_fun is
+%% {unsupported_key, Reason} (docs/decisions/0047, case 2).
+-spec identity_from(
+    #{
+        certfile => iodata(),
+        keyfile => iodata(),
+        cert => binary() | [binary(), ...],
+        key => {'RSAPrivateKey' | 'ECPrivateKey' | 'PrivateKeyInfo', binary()} | map()
+    }
+    | [{certfile | keyfile | cert | key, term()}]
+) -> {ok, handle()} | failure().
+identity_from(Opts) when is_list(Opts) ->
+    identity_from(maps:from_list(Opts));
+identity_from(Opts) when is_map(Opts) ->
+    case maps:keys(Opts) -- [certfile, keyfile, cert, key] of
+        [] -> identity_from_known(Opts);
+        _ -> erlang:error(badarg, [Opts])
+    end;
+identity_from(Opts) ->
+    erlang:error(badarg, [Opts]).
+
+identity_from_known(#{certfile := Cert, keyfile := Key} = Opts) when map_size(Opts) =:= 2 ->
+    identity_from_pem_files(Cert, Key);
+identity_from_known(#{certfile := Cert} = Opts) when map_size(Opts) =:= 1 ->
+    identity_from_pem_file(Cert);
+identity_from_known(#{cert := Cert, key := Key} = Opts) when map_size(Opts) =:= 2 ->
+    identity_from_pem(cert_pem(Cert), key_pem(Key));
+identity_from_known(Opts) ->
+    erlang:error(badarg, [Opts]).
+
+%% The chain only, as PEM, read anew on every call.
+-spec identity_certificate_pem(handle()) -> {ok, binary()} | failure().
+identity_certificate_pem(Identity) -> weida_nif:identity_certificate_pem(Identity).
+
+%% The chain, leaf first, as DER for public_key:pkix_decode_cert/2.
+-spec identity_certificates(handle()) -> {ok, [binary()]} | failure().
+identity_certificates(Identity) ->
+    case identity_certificate_pem(Identity) of
+        {ok, Pem} -> {ok, [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(Pem)]};
+        Failure -> Failure
+    end.
+
+%% The chain and the private key as one PEM document, read anew on every
+%% call. The binary holds the private key; an Erlang binary cannot be wiped
+%% (docs/decisions/0047).
+-spec identity_to_pem(handle()) -> {ok, binary()} | failure().
+identity_to_pem(Identity) -> weida_nif:identity_to_pem(Identity).
 
 -spec identity_fingerprint(handle()) -> {ok, binary()} | failure().
 identity_fingerprint(Identity) -> weida_nif:identity_fingerprint(Identity).
@@ -139,6 +236,46 @@ client_tls_new(Trust) -> weida_nif:client_tls_new(Trust).
 
 -spec server_tls_new(handle()) -> {ok, handle()} | failure().
 server_tls_new(Identity) -> weida_nif:server_tls_new(Identity).
+
+%% The identity is copied; it affects requesters made afterwards.
+-spec client_tls_set_identity(handle(), handle()) -> ok | failure().
+client_tls_set_identity(Tls, Identity) -> weida_nif:client_tls_set_identity(Tls, Identity).
+
+%% Every client must present a key Trust accepts, pinned or chaining to an
+%% anchor. The trust is copied; an empty one makes the bind fail with `tls`.
+%% The last of this and server_tls_require_any_key/1 wins.
+-spec server_tls_require_client(handle(), handle()) -> ok | failure().
+server_tls_require_client(Tls, Trust) -> weida_nif:server_tls_require_client(Tls, Trust).
+
+%% Every client must present a key and prove it holds it, whatever the key.
+-spec server_tls_require_any_key(handle()) -> ok | failure().
+server_tls_require_any_key(Tls) -> weida_nif:server_tls_require_any_key(Tls).
+
+%% ssl's `cert` (a DER or a chain of them, leaf first) as PEM.
+cert_pem(Der) when is_binary(Der) ->
+    cert_pem([Der]);
+cert_pem(Ders) when is_list(Ders), length(Ders) > 0 ->
+    case lists:all(fun erlang:is_binary/1, Ders) of
+        true -> public_key:pem_encode([{'Certificate', Der, not_encrypted} || Der <- Ders]);
+        false -> erlang:error(badarg, [Ders])
+    end;
+cert_pem(Other) ->
+    erlang:error(badarg, [Other]).
+
+%% ssl's `key` as PEM: weida reads PKCS#1, SEC1 and PKCS#8, so the key
+%% keeps its encoding.
+key_pem({Type, Der}) when
+    is_binary(Der),
+    (Type =:= 'RSAPrivateKey' orelse Type =:= 'ECPrivateKey' orelse Type =:= 'PrivateKeyInfo')
+->
+    public_key:pem_encode([{Type, Der, not_encrypted}]);
+key_pem(Key) when is_map(Key) ->
+    erlang:error(
+        {unsupported_key,
+            <<"a key held by an engine or a sign_fun never leaves its store and needs a signer handle, which weida does not have yet (docs/decisions/0047, case 2)">>}
+    );
+key_pem(Other) ->
+    erlang:error(badarg, [Other]).
 
 %% ---- listener and bindings ----
 

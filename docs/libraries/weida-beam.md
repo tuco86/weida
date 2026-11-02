@@ -24,9 +24,10 @@ writing (zeughaus proposals #24 and #25).
 | --- | --- | --- |
 | `weida_runtime_config` | a map `#{worker_threads => N, shutdown_timeout_ms => Ms}` given to `runtime_owned/1`, turned into a handle in the same call | present; `weida_tests` "a runtime with no worker threads is a runtime failure" |
 | `weida_runtime` | `runtime_owned/1`, `runtime_listener/1`, `runtime_requester/2`, `runtime_shutdown(Rt, Timeout)` (consumes) | present; every round-trip test |
-| `weida_trust` | `trust_new/0`, `trust_add_pin(Trust, Fingerprint) -> ok` | present; `weida_tests` "a malformed pin is an invalid fingerprint", `weida_quic_tests` "a wrong pin is untrusted and carries the fingerprint" |
-| `weida_identity` | `identity_generate/0`, `identity_from_pem(Cert, Key)`, `identity_fingerprint/1 -> {ok, binary()}` | present; `weida_quic_tests` "a round trip over QUIC with a pinned key" |
-| `weida_client_tls`, `weida_server_tls` | `client_tls_new(Trust)`, `server_tls_new(Identity)` | present |
+| `weida_trust` | `trust_new/0`, `trust_add_pin(Trust, Fingerprint) -> ok`, `trust_add_anchor(Trust, Pem \| {cacerts, [Der]} \| {cacertfile, Path}) -> ok` (maps `weida_trust_add_anchor` and `weida_trust_add_anchor_file`; the PEM is copied, and the PEM or file is parsed or read at each dial) | present; `weida_tests` "a malformed pin is an invalid fingerprint", "anchors take PEM and DER", `weida_quic_tests` "a wrong pin is untrusted and carries the fingerprint", "an anchor accepts the dialled name and refuses another", "identity and anchor files read back" |
+| `weida_identity` | `identity_generate/0`, `identity_generate_for([Name])`, `identity_from_pem(Cert, Key)`, `identity_from_pem_file(Path)`, `identity_from_pem_files(Cert, Key)`, `identity_from(Opts)` (ssl's `certfile`, `keyfile`, `cert` and `key`, as a proplist or a map; `password` and any other key are `badarg`), `identity_fingerprint/1 -> {ok, binary()}`, `identity_certificate_pem/1 -> {ok, binary()}`, `identity_certificates/1 -> {ok, [Der]}` (DER, leaf first, for `public_key:pkix_decode_cert/2`), `identity_to_pem/1 -> {ok, binary()}` (holds the private key; an Erlang binary cannot be wiped) | present; `weida_quic_tests` "a round trip over QUIC with a pinned key", "identity and anchor files read back"; `weida_tests` "to_pem reads back with the same fingerprint", "the certificates are the identity's key", "generate_for names the certificate", "identity_from takes ssl's in-memory options", "identity_from refuses what it cannot honour" |
+| `weida_pem` | not exposed: copied out at once into a binary (`identity_certificate_pem/1`, `identity_to_pem/1`) and dropped, which wipes it, in the same NIF call | refused: an Erlang caller needs the bytes, not the handle |
+| `weida_client_tls`, `weida_server_tls` | `client_tls_new(Trust)`, `client_tls_set_identity(Tls, Identity) -> ok`, `server_tls_new(Identity)`, `server_tls_require_client(Tls, Trust) -> ok`, `server_tls_require_any_key(Tls) -> ok` | present; `weida_quic_tests` "a pinned client key is accepted and the server sees its key and chain", "an anonymous or unknown client is refused with tls and nothing reaches the server", "a binding that requires clients from an empty trust does not bind", "any key exposes the fingerprint and the chain"; `weida_tests` "anchors take PEM and DER" |
 | `weida_transfer_meta` | a map `#{content_type => iodata()}`, turned into a handle in the NIF call that needs it | present; `weida_tests` "a streamed round trip carries the body and the content type" |
 | `weida_listener` | `listener_bind_quic(L, Addr, ServerTls, Timeout) -> {ok, Binding}`, `listener_bind_inproc/2`, `listener_replier/2` | present |
 | `weida_binding`, `weida_local_binding` | `binding_local_addr/1`, `local_binding_bus/1`, each a binary | present |
@@ -36,11 +37,15 @@ writing (zeughaus proposals #24 and #25).
 | `weida_incoming_transfer` | `incoming_transfer_meta/1`, `incoming_transfer_read(T, Max, Timeout) -> {ok, binary()} \| eof`, `incoming_transfer_collect(T, Max, Timeout) -> {ok, Message}` (consumes) | present; `weida_tests` "reads of 3 bytes reassemble the body", "a collect over its ceiling is limit_exceeded", "a reply dropped unfinished reads as canceled" |
 | `weida_outgoing_transfer` | `outgoing_transfer_write(T, Data, Timeout) -> {ok, Count}`, `outgoing_transfer_write_all/3`, `outgoing_transfer_finish/1 -> {ok, Delivery}` (consumes) | present; `write_all` is the Erlang loop R3c leaves to the caller |
 | `weida_delivery` | `delivery_delivered(D, Timeout) -> ok` (consumes) | present |
-| `weida_incoming_meta` | a map `#{endpoint, content_type, topic, peer_fingerprint, content_len, sequence}`, copied out at once; absent values are `undefined` | present |
+| `weida_incoming_meta` | a map `#{endpoint, content_type, topic, peer_fingerprint, peer_chain, content_len, sequence}`, copied out at once; absent values are `undefined`; `peer_chain` is a list of DER binaries, leaf first, or `undefined` for an anonymous or local peer or a chain over the bound weida keeps | present; `weida_quic_tests` "a pinned client key is accepted and the server sees its key and chain", "an anchor accepts the dialled name and refuses another" |
 | `weida_msg` | a map `#{payload := binary(), meta := Meta}`, copied out at once and the C message dropped in the same call | present |
 | the ops (`*_op`) | not exposed: a waiting function starts its op, waits, and drops it in an `after` clause, which cancels it only when it did not finish | refused: an op is the C caller's way to wait, not a value an Erlang caller needs |
 | the `_fd` functions, `weida_poll` | not exposed: the NIF hands the descriptor to the VM's own poller (§4) | refused: a process waits in `receive`, not on a descriptor |
 | `weida_version`, `weida_strerror` | `version/0`, `strerror(Code)` with `Code` an R9 atom or an integer of either sign | present; `smoke.exs`, `weida_tests` "every code atom round-trips through strerror" |
+
+The conversions to ssl's forms follow [0047](../decisions/0047-key-material-in-the-language-packages.md):
+a certificate is a DER binary and a key stays in its ssl encoding (`{'RSAPrivateKey' \| 'ECPrivateKey' \| 'PrivateKeyInfo', Der}`, which weida reads as PKCS#1, SEC1 and PKCS#8).
+A key held by an engine or a `sign_fun` never leaves its store and is case 2 (§3).
 
 A handle is an opaque term. `drop/1` releases one of any kind at once; a dropped or consumed
 handle answers every call with the `closed` error without calling C, and its pending waits, in
@@ -62,9 +67,12 @@ A failure is `{error, Map}`: `code` is the R9 code as a snake_case atom (`runtim
 the record in the same call that failed, so a later call on that scheduler thread cannot overwrite
 it. A caller matches on `#{code := untrusted}`; there is no exception for a C failure. A passed
 timeout is `{error, timeout}`, the BEAM idiom, kept apart from the map. A wrong argument (a
-handle of another kind, a string with a NUL) raises `badarg`. Present; `weida_tests` "every code
-atom round-trips through strerror", `weida_quic_tests` "a wrong pin is untrusted and carries the
-fingerprint".
+handle of another kind, a string with a NUL, an option `identity_from/1` does not take) raises
+`badarg`; a private key held by an engine or a `sign_fun` raises `{unsupported_key, Reason}`
+(case 2 of [0047](../decisions/0047-key-material-in-the-language-packages.md): such a key needs a
+signer handle, which weida does not have yet). Present; `weida_tests` "every code
+atom round-trips through strerror", "identity_from refuses what it cannot honour",
+`weida_quic_tests` "a wrong pin is untrusted and carries the fingerprint".
 
 ## 4. Waiting
 

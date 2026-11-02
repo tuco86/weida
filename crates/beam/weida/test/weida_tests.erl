@@ -4,6 +4,7 @@
 -module(weida_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 %% A hang guard only, in seconds: a wait that should succeed passes
 %% `infinity`, and the CI job's budget bounds the run.
@@ -24,7 +25,13 @@ weida_test_() ->
             {"two processes accepting on one replier both get a request", fun two_accepts/0},
             {"a request that times out leaves the runtime able to shut down", fun request_timeout/0},
             {"dropping a replier ends another process's accept with closed", fun drop_ends_accept/0},
-            {"a replier its process left without drop is released", fun garbage_collected/0}
+            {"a replier its process left without drop is released", fun garbage_collected/0},
+            {"to_pem reads back with the same fingerprint", fun to_pem_reads_back/0},
+            {"the certificates are the identity's key", fun certificates_are_the_key/0},
+            {"generate_for names the certificate", fun generate_for_names/0},
+            {"identity_from takes ssl's in-memory options", fun identity_from_memory/0},
+            {"identity_from refuses what it cannot honour", fun identity_from_refuses/0},
+            {"anchors take PEM and DER", fun anchors_and_terms/0}
         ]
     ].
 
@@ -84,6 +91,80 @@ zero_workers() ->
 malformed_pin() ->
     {ok, Trust} = weida:trust_new(),
     ?assertMatch({error, #{code := invalid_fingerprint}}, weida:trust_add_pin(Trust, <<"nope">>)).
+
+to_pem_reads_back() ->
+    {ok, Id} = weida:identity_generate(),
+    {ok, Fingerprint} = weida:identity_fingerprint(Id),
+    {ok, Pem} = weida:identity_to_pem(Id),
+    ?assertNotEqual(nomatch, binary:match(Pem, <<"PRIVATE KEY">>)),
+    {ok, Back} = weida:identity_from_pem(Pem, Pem),
+    ?assertEqual({ok, Fingerprint}, weida:identity_fingerprint(Back)),
+    {ok, CertPem} = weida:identity_certificate_pem(Id),
+    ?assertNotEqual(nomatch, binary:match(CertPem, <<"-----BEGIN CERTIFICATE-----">>)),
+    ?assertEqual(nomatch, binary:match(CertPem, <<"PRIVATE KEY">>)).
+
+certificates_are_the_key() ->
+    {ok, Id} = weida:identity_generate(),
+    {ok, Fingerprint} = weida:identity_fingerprint(Id),
+    {ok, [Der]} = weida:identity_certificates(Id),
+    #'Certificate'{tbsCertificate = #'TBSCertificate'{subjectPublicKeyInfo = Spki}} =
+        public_key:pkix_decode_cert(Der, plain),
+    Hash = crypto:hash(sha256, public_key:der_encode('SubjectPublicKeyInfo', Spki)),
+    ?assertEqual(
+        <<"sha256:", (binary:encode_hex(Hash, lowercase))/binary>>, Fingerprint
+    ).
+
+generate_for_names() ->
+    {ok, Id} = weida:identity_generate_for([<<"localhost">>, <<"127.0.0.1">>]),
+    {ok, [Der]} = weida:identity_certificates(Id),
+    #'OTPCertificate'{tbsCertificate = #'OTPTBSCertificate'{extensions = Extensions}} =
+        public_key:pkix_decode_cert(Der, otp),
+    [Names] = [
+        Value
+     || #'Extension'{extnID = ?'id-ce-subjectAltName', extnValue = Value} <- Extensions
+    ],
+    ?assert(lists:member({dNSName, "localhost"}, Names)),
+    ?assert(lists:member({iPAddress, <<127, 0, 0, 1>>}, Names)),
+    ?assertMatch({ok, _}, weida:identity_generate_for([])).
+
+identity_from_memory() ->
+    {ok, Id} = weida:identity_generate(),
+    {ok, Fingerprint} = weida:identity_fingerprint(Id),
+    {ok, ToPem} = weida:identity_to_pem(Id),
+    [{'Certificate', CertDer, _}, {KeyType, KeyDer, _}] = public_key:pem_decode(ToPem),
+    {ok, FromMap} = weida:identity_from(#{cert => CertDer, key => {KeyType, KeyDer}}),
+    ?assertEqual({ok, Fingerprint}, weida:identity_fingerprint(FromMap)),
+    {ok, FromList} = weida:identity_from([{cert, [CertDer]}, {key, {KeyType, KeyDer}}]),
+    ?assertEqual({ok, Fingerprint}, weida:identity_fingerprint(FromList)).
+
+identity_from_refuses() ->
+    {ok, Id} = weida:identity_generate(),
+    {ok, ToPem} = weida:identity_to_pem(Id),
+    [{'Certificate', CertDer, _}, {KeyType, KeyDer, _}] = public_key:pem_decode(ToPem),
+    ?assertError(badarg, weida:identity_from(#{cert => CertDer})),
+    ?assertError(badarg, weida:identity_from(#{certfile => "a", key => {KeyType, KeyDer}})),
+    ?assertError(badarg, weida:identity_from(#{cert => CertDer, key => {'DSAPrivateKey', <<>>}})),
+    ?assertError(badarg, weida:identity_from([{certfile, "a"}, {password, "x"}])),
+    ?assertError(
+        {unsupported_key, _},
+        weida:identity_from(#{
+            cert => CertDer, key => #{algorithm => ecdsa, sign_fun => fun(_, _, _) -> <<>> end}
+        })
+    ).
+
+anchors_and_terms() ->
+    {ok, Id} = weida:identity_generate(),
+    {ok, CertPem} = weida:identity_certificate_pem(Id),
+    {ok, [CertDer]} = weida:identity_certificates(Id),
+    {ok, T} = weida:trust_new(),
+    ?assertEqual(ok, weida:trust_add_anchor(T, CertPem)),
+    ?assertEqual(ok, weida:trust_add_anchor(T, {cacerts, [CertDer]})),
+    ?assertError(badarg, weida:trust_add_anchor(T, {cacerts, []})),
+    {ok, Tls} = weida:server_tls_new(Id),
+    {ok, EmptyTrust} = weida:trust_new(),
+    ?assertEqual(ok, weida:server_tls_require_client(Tls, EmptyTrust)),
+    ?assertEqual(ok, weida:server_tls_require_any_key(Tls)),
+    ?assertError(badarg, weida:identity_generate_for([<<"a", 0, "b">>])).
 
 round_trip() ->
     #{replier := Replier, requester := Requester} = P = pair(),

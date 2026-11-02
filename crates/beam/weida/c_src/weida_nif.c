@@ -113,7 +113,7 @@ static const fd_fn FDS[K_COUNT] = {
 static ERL_NIF_TERM A_ok, A_error, A_again, A_eof, A_undefined, A_select, A_ready_input,
     A_weida_closed, A_enomem, A_select_failed, A_code, A_message, A_loss_cause, A_fingerprint,
     A_max, A_os_code, A_endpoint, A_content_type, A_topic, A_peer_fingerprint, A_content_len,
-    A_sequence, A_payload, A_meta, A_worker_threads, A_shutdown_timeout_ms;
+    A_sequence, A_payload, A_meta, A_worker_threads, A_shutdown_timeout_ms, A_peer_chain;
 
 /* docs/c/README.md R9, as snake_case atoms. */
 static const struct {
@@ -334,6 +334,21 @@ static ERL_NIF_TERM meta_value(ErlNifEnv *env, weida_incoming_meta *m) {
     put(env, &map, A_content_len, optional_u64(env, present, n));
     present = weida_incoming_meta_sequence(m, &n);
     put(env, &map, A_sequence, optional_u64(env, present, n));
+    size_t count = 0;
+    ERL_NIF_TERM chain = A_undefined;
+    if (weida_incoming_meta_peer_chain_len(m, &count) == 1) {
+        chain = enif_make_list(env, 0);
+        for (size_t i = count; i-- > 0;) {
+            size_t der_len = 0;
+            const uint8_t *der = weida_incoming_meta_peer_chain_cert(m, i, &der_len);
+            ERL_NIF_TERM cert;
+            unsigned char *d = enif_make_new_binary(env, der_len, &cert);
+            if (der_len)
+                memcpy(d, der, der_len);
+            chain = enif_make_list_cell(env, cert, chain);
+        }
+    }
+    put(env, &map, A_peer_chain, chain);
     weida_incoming_meta_drop(m);
     return map;
 }
@@ -762,7 +777,82 @@ NIF(nif_trust_add_pin) {
     return rc < 0 ? fail(env, rc) : A_ok;
 }
 
+NIF(nif_trust_add_anchor) {
+    struct handle *h = arg(env, argv[0], K_trust);
+    ErlNifBinary pem;
+    if (!h || !enif_inspect_iolist_as_binary(env, argv[1], &pem))
+        return enif_make_badarg(env);
+    if (!lock_live(h))
+        return closed(env);
+    int rc = weida_trust_add_anchor(h->ptr, pem.data, pem.size);
+    enif_mutex_unlock(h->mu);
+    return rc < 0 ? fail(env, rc) : A_ok;
+}
+
+NIF(nif_trust_add_anchor_file) {
+    struct handle *h = arg(env, argv[0], K_trust);
+    char *path = NULL;
+    if (!h || !get_cstr(env, argv[1], &path))
+        return enif_make_badarg(env);
+    if (!lock_live(h)) {
+        enif_free(path);
+        return closed(env);
+    }
+    int rc = weida_trust_add_anchor_file(h->ptr, path);
+    enif_mutex_unlock(h->mu);
+    enif_free(path);
+    return rc < 0 ? fail(env, rc) : A_ok;
+}
+
 CTOR0(nif_identity_generate, identity, weida_identity_generate)
+
+/* identity_generate_for([Name]): every name a binary or iolist without NUL. */
+NIF(nif_identity_generate_for) {
+    unsigned int n = 0;
+    weida_identity *out = NULL;
+    if (!enif_get_list_length(env, argv[0], &n))
+        return enif_make_badarg(env);
+    char **names = enif_alloc(sizeof *names * (n ? n : 1));
+    if (!names)
+        return enif_raise_exception(env, A_enomem);
+    unsigned int got = 0;
+    ERL_NIF_TERM list = argv[0], head;
+    while (got < n && enif_get_list_cell(env, list, &head, &list) &&
+           get_cstr(env, head, &names[got]))
+        got++;
+    int rc = got < n ? 0 : weida_identity_generate_for((const char *const *)names, n, &out);
+    for (unsigned int i = 0; i < got; i++)
+        enif_free(names[i]);
+    enif_free(names);
+    if (got < n)
+        return enif_make_badarg(env);
+    return rc < 0 ? fail(env, rc) : ok_tuple(env, make_handle(env, K_identity, out));
+}
+
+NIF(nif_identity_from_pem_file) {
+    char *path = NULL;
+    weida_identity *out = NULL;
+    if (!get_cstr(env, argv[0], &path))
+        return enif_make_badarg(env);
+    int rc = weida_identity_from_pem_file(path, &out);
+    enif_free(path);
+    return rc < 0 ? fail(env, rc) : ok_tuple(env, make_handle(env, K_identity, out));
+}
+
+NIF(nif_identity_from_pem_files) {
+    char *cert = NULL, *key = NULL;
+    weida_identity *out = NULL;
+    if (!get_cstr(env, argv[0], &cert))
+        return enif_make_badarg(env);
+    if (!get_cstr(env, argv[1], &key)) {
+        enif_free(cert);
+        return enif_make_badarg(env);
+    }
+    int rc = weida_identity_from_pem_files(cert, key, &out);
+    enif_free(cert);
+    enif_free(key);
+    return rc < 0 ? fail(env, rc) : ok_tuple(env, make_handle(env, K_identity, out));
+}
 
 NIF(nif_identity_from_pem) {
     ErlNifBinary cert, key;
@@ -787,8 +877,75 @@ NIF(nif_identity_fingerprint) {
     return v;
 }
 
+/* `f(Identity) -> {ok, Pem}`: copies the weida_pem into a binary and drops
+ * (wipes) it. */
+static ERL_NIF_TERM pem_out(ErlNifEnv *env, ERL_NIF_TERM t,
+                            int (*f)(const weida_identity *, weida_pem **)) {
+    struct handle *h = arg(env, t, K_identity);
+    weida_pem *p = NULL;
+    if (!h)
+        return enif_make_badarg(env);
+    if (!lock_live(h))
+        return closed(env);
+    int rc = f(h->ptr, &p);
+    ERL_NIF_TERM v;
+    if (rc < 0) {
+        v = fail(env, rc);
+    } else {
+        size_t len = weida_pem_len(p);
+        ERL_NIF_TERM bin;
+        unsigned char *d = enif_make_new_binary(env, len, &bin);
+        if (len)
+            memcpy(d, weida_pem_data(p), len);
+        weida_pem_drop(p);
+        v = ok_tuple(env, bin);
+    }
+    enif_mutex_unlock(h->mu);
+    return v;
+}
+
+NIF(nif_identity_certificate_pem) {
+    return pem_out(env, argv[0], weida_identity_certificate_pem);
+}
+
+NIF(nif_identity_to_pem) {
+    return pem_out(env, argv[0], weida_identity_to_pem);
+}
+
 FROM1(nif_client_tls_new, trust, weida_client_tls_new, client_tls)
 FROM1(nif_server_tls_new, identity, weida_server_tls_new, server_tls)
+
+/* `<t>_<m>(A, B) -> ok` on two handles, locked in argument order */
+#define ACT2(name, ka, kb, c) \
+    NIF(name) { \
+        struct handle *a = arg(env, argv[0], K_##ka), *b = arg(env, argv[1], K_##kb); \
+        if (!a || !b) \
+            return enif_make_badarg(env); \
+        if (!lock_live(a)) \
+            return closed(env); \
+        if (!lock_live(b)) { \
+            enif_mutex_unlock(a->mu); \
+            return closed(env); \
+        } \
+        int rc = c(a->ptr, b->ptr); \
+        enif_mutex_unlock(b->mu); \
+        enif_mutex_unlock(a->mu); \
+        return rc < 0 ? fail(env, rc) : A_ok; \
+    }
+
+ACT2(nif_client_tls_set_identity, client_tls, identity, weida_client_tls_set_identity)
+ACT2(nif_server_tls_require_client, server_tls, trust, weida_server_tls_require_client)
+
+NIF(nif_server_tls_require_any_key) {
+    struct handle *h = arg(env, argv[0], K_server_tls);
+    if (!h)
+        return enif_make_badarg(env);
+    if (!lock_live(h))
+        return closed(env);
+    int rc = weida_server_tls_require_any_key(h->ptr);
+    enif_mutex_unlock(h->mu);
+    return rc < 0 ? fail(env, rc) : A_ok;
+}
 
 /* listener and bindings */
 
@@ -1037,6 +1194,7 @@ static int load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     A_content_type = atom(env, "content_type");
     A_topic = atom(env, "topic");
     A_peer_fingerprint = atom(env, "peer_fingerprint");
+    A_peer_chain = atom(env, "peer_chain");
     A_content_len = atom(env, "content_len");
     A_sequence = atom(env, "sequence");
     A_payload = atom(env, "payload");
@@ -1063,11 +1221,21 @@ static ErlNifFunc nif_funcs[] = {
     {"runtime_shutdown_op_wait", 1, nif_runtime_shutdown_op_wait, 0},
     {"trust_new", 0, nif_trust_new, 0},
     {"trust_add_pin", 2, nif_trust_add_pin, 0},
+    {"trust_add_anchor", 2, nif_trust_add_anchor, 0},
+    {"trust_add_anchor_file", 2, nif_trust_add_anchor_file, 0},
     {"identity_generate", 0, nif_identity_generate, 0},
+    {"identity_generate_for", 1, nif_identity_generate_for, 0},
     {"identity_from_pem", 2, nif_identity_from_pem, 0},
+    {"identity_from_pem_file", 1, nif_identity_from_pem_file, 0},
+    {"identity_from_pem_files", 2, nif_identity_from_pem_files, 0},
+    {"identity_certificate_pem", 1, nif_identity_certificate_pem, 0},
+    {"identity_to_pem", 1, nif_identity_to_pem, 0},
     {"identity_fingerprint", 1, nif_identity_fingerprint, 0},
     {"client_tls_new", 1, nif_client_tls_new, 0},
     {"server_tls_new", 1, nif_server_tls_new, 0},
+    {"client_tls_set_identity", 2, nif_client_tls_set_identity, 0},
+    {"server_tls_require_client", 2, nif_server_tls_require_client, 0},
+    {"server_tls_require_any_key", 1, nif_server_tls_require_any_key, 0},
     {"listener_bind_quic", 3, nif_listener_bind_quic, 0},
     {"listener_bind_quic_op_wait", 1, nif_listener_bind_quic_op_wait, 0},
     {"listener_bind_inproc", 2, nif_listener_bind_inproc, 0},

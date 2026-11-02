@@ -17,11 +17,21 @@
     runtime_shutdown_op_wait/1,
     trust_new/0,
     trust_add_pin/2,
+    trust_add_anchor/2,
+    trust_add_anchor_file/2,
     identity_generate/0,
+    identity_generate_for/1,
     identity_from_pem/2,
+    identity_from_pem_file/1,
+    identity_from_pem_files/2,
+    identity_certificate_pem/1,
+    identity_to_pem/1,
     identity_fingerprint/1,
     client_tls_new/1,
     server_tls_new/1,
+    client_tls_set_identity/2,
+    server_tls_require_client/2,
+    server_tls_require_any_key/1,
     listener_bind_quic/3,
     listener_bind_quic_op_wait/1,
     listener_bind_inproc/2,
@@ -61,11 +71,21 @@
     runtime_shutdown_op_wait/1,
     trust_new/0,
     trust_add_pin/2,
+    trust_add_anchor/2,
+    trust_add_anchor_file/2,
     identity_generate/0,
+    identity_generate_for/1,
     identity_from_pem/2,
+    identity_from_pem_file/1,
+    identity_from_pem_files/2,
+    identity_certificate_pem/1,
+    identity_to_pem/1,
     identity_fingerprint/1,
     client_tls_new/1,
     server_tls_new/1,
+    client_tls_set_identity/2,
+    server_tls_require_client/2,
+    server_tls_require_any_key/1,
     listener_bind_quic/3,
     listener_bind_quic_op_wait/1,
     listener_bind_inproc/2,
@@ -109,11 +129,21 @@ runtime_shutdown(_Rt) -> erlang:nif_error(nif_not_loaded).
 runtime_shutdown_op_wait(_Op) -> erlang:nif_error(nif_not_loaded).
 trust_new() -> erlang:nif_error(nif_not_loaded).
 trust_add_pin(_Trust, _Fingerprint) -> erlang:nif_error(nif_not_loaded).
+trust_add_anchor(_Trust, _Pem) -> erlang:nif_error(nif_not_loaded).
+trust_add_anchor_file(_Trust, _Path) -> erlang:nif_error(nif_not_loaded).
 identity_generate() -> erlang:nif_error(nif_not_loaded).
+identity_generate_for(_Names) -> erlang:nif_error(nif_not_loaded).
 identity_from_pem(_Cert, _Key) -> erlang:nif_error(nif_not_loaded).
+identity_from_pem_file(_Path) -> erlang:nif_error(nif_not_loaded).
+identity_from_pem_files(_Cert, _Key) -> erlang:nif_error(nif_not_loaded).
+identity_certificate_pem(_Identity) -> erlang:nif_error(nif_not_loaded).
+identity_to_pem(_Identity) -> erlang:nif_error(nif_not_loaded).
 identity_fingerprint(_Identity) -> erlang:nif_error(nif_not_loaded).
 client_tls_new(_Trust) -> erlang:nif_error(nif_not_loaded).
 server_tls_new(_Identity) -> erlang:nif_error(nif_not_loaded).
+client_tls_set_identity(_Tls, _Identity) -> erlang:nif_error(nif_not_loaded).
+server_tls_require_client(_Tls, _Trust) -> erlang:nif_error(nif_not_loaded).
+server_tls_require_any_key(_Tls) -> erlang:nif_error(nif_not_loaded).
 listener_bind_quic(_L, _Addr, _Tls) -> erlang:nif_error(nif_not_loaded).
 listener_bind_quic_op_wait(_Op) -> erlang:nif_error(nif_not_loaded).
 listener_bind_inproc(_L, _Bus) -> erlang:nif_error(nif_not_loaded).

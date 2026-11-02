@@ -4,7 +4,7 @@
     {description, "weida for Erlang and Elixir: a NIF over libweida, the C ABI of weida"},
     {vsn, "0.0.0-dev"},
     {registered, []},
-    {applications, [kernel, stdlib]},
+    {applications, [kernel, stdlib, public_key]},
     {env, []},
     {modules, []},
     {licenses, ["MIT", "Apache-2.0"]},
