@@ -414,6 +414,16 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   `weida::blocking` facade that one sat on. The `c-abi-linux-*` jobs build the wheel with
   `libweida` and hand both on; the `python-linux-*` jobs install that wheel and run its tests on
   CPython 3.14, free-threaded CPython 3.14t and PyPy 3.11, on linux-amd64 and linux-arm64.
+- weida for JavaScript (`crates/js/weida-js`) is one Node-API addon written in C against
+  `weida.h`, serving Node, Bun and Deno, with an ES module on top
+  ([libraries/weida-js.md](libraries/weida-js.md)). Every native call tries with
+  `timeout_ms = 0`; on `AGAIN` the handle's descriptor goes to one waiter thread per
+  environment, which runs `weida_poll` and reports readiness through a
+  `napi_threadsafe_function`, referenced only while a wait is pending so an idle process exits.
+  Waiting methods return Promises and take `{ signal }`; aborting drops the op. The
+  `js-linux-*` jobs build the addon against the handed-on `libweida`, run the tests under Node
+  and the smoke under Node, Bun and Deno, and on the nightly and tags pack the package and run
+  the smoke from a fresh project that installed the tarball.
 - `weida-zmq-py`, `weida-nng-py`, `weida-mqtt-py`, `weida-amqp-py` and `weida-nats-py` bind the
   first five libraries, each following its own library, with an asyncio and a synchronous
   surface on `weida-py-core` (`crates/py/weida-py-core`), the shared PyO3 foundation
@@ -424,14 +434,13 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   filed as B-371.
 
 **Not built:** the rest of weida in the C ABI (0045 §5), and a binding for any language but
-Python. Every further language binds `libweida` through native glue against `weida.h`, in the
-order JavaScript (a Node-API addon for Node, Bun and Deno), JVM and Android (one JNI layer),
-Erlang/Elixir (a NIF), Go (cgo) and Swift/iOS (an XCFramework)
-([0046](decisions/0046-how-each-language-binds-libweida.md)). Their toolchains exist as CI
-images on linux-amd64 and linux-arm64 (`.zeughaus-ci/{js,jvm,beam,go}.Containerfile`), each
-with a job that compiles and runs `tests/c/smoke.c` against the handed-on `libweida`, and
-`android-libweida` cross-builds `libweida` for arm64-v8a, armeabi-v7a, x86_64 and x86 with the
-NDK, API 24 and up.
+Python and JavaScript. Every further language binds `libweida` through native glue against
+`weida.h`, in the order JVM and Android (one JNI layer), Erlang/Elixir (a NIF), Go (cgo) and
+Swift/iOS (an XCFramework) ([0046](decisions/0046-how-each-language-binds-libweida.md)). Their
+toolchains exist as CI images on linux-amd64 and linux-arm64
+(`.zeughaus-ci/{jvm,beam,go}.Containerfile`), each with a job that compiles and runs
+`tests/c/smoke.c` against the handed-on `libweida`, and `android-libweida` cross-builds
+`libweida` for arm64-v8a, armeabi-v7a, x86_64 and x86 with the NDK, API 24 and up.
 
 ### Phase 11 — CLI and administration
 

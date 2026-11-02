@@ -117,7 +117,7 @@ dimensions, transports and patterns it offers, and the six standalone foreign-pr
 libraries on the right. They share runtime foundations but no implicit semantic conversion.
 
 weida itself ships a library with an async API, the `weida` binary, a C ABI (`libweida`,
-[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python package on it. Each of the six
+[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python and a JavaScript package on it. Each of the six
 libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0, Core NATS and HTTP — has a parity document in
 [libraries/](libraries/README.md) and, where a peer exists to measure against, an interop
 suite; the NATS suite is written and not run, which its parity table records as a clause **not
@@ -130,13 +130,16 @@ weida's own Python package is cffi over `libweida`, synchronous and asyncio, and
 the C ABI maps so far: the runtime, TLS values and streamed Req/Rep. One wheel per platform
 serves CPython, free-threaded CPython and PyPy, and the CI tests the built wheel on CPython
 3.14, 3.14t (where importing `weida` leaves the GIL disabled) and PyPy 3.11, on linux-amd64 and
-linux-arm64. Every further language binds `libweida` through native glue against `weida.h`
-([0046](decisions/0046-how-each-language-binds-libweida.md)): a Node-API addon for Node, Bun and
-Deno, one JNI layer for the JVM and Android, a NIF for Erlang/Elixir, cgo for Go and an
-XCFramework for Swift/iOS. None of those packages exists yet; their environments do. Each
-language has a CI image on both Linux architectures, whose job compiles and runs the C smoke
-program against the `libweida` the `c-abi-linux-*` job of that architecture built, and
-`android-libweida` cross-builds `libweida` for the four Android ABIs on the nightly and tags.
+linux-arm64. weida's JavaScript package is one Node-API addon in C over `libweida` with Promises,
+`{ signal }` cancellation and one waiter thread polling the readiness descriptors; the CI runs
+its tests under Node and its smoke under Node, Bun and Deno on both Linux architectures. Every
+further language binds `libweida` through native glue against `weida.h`
+([0046](decisions/0046-how-each-language-binds-libweida.md)): one JNI layer for the JVM and
+Android, a NIF for Erlang/Elixir, cgo for Go and an XCFramework for Swift/iOS. None of those
+packages exists yet; their environments do. Each language has a CI image on both Linux
+architectures, whose job compiles and runs the C smoke program against the `libweida` the
+`c-abi-linux-*` job of that architecture built, and `android-libweida` cross-builds `libweida`
+for the four Android ABIs on the nightly and tags.
 
 ## 3. The measurements that decided something
 
