@@ -14,3 +14,6 @@ crates/js/weida-js/build/
 node_modules/
 # What crates/jvm/weida-jvm/build.sh and test.sh build.
 crates/jvm/weida-jvm/build/
+# What crates/beam/weida's rebar3 and c_src/build.sh build.
+crates/beam/weida/_build/
+crates/beam/weida/priv/

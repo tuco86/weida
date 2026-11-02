@@ -1,0 +1,12 @@
+%% The version stays 0.0.0-dev: no release commit touches it, and nothing is
+%% published to hex (docs/libraries/weida-beam.md, Packaging).
+{application, weida, [
+    {description, "weida for Erlang and Elixir: a NIF over libweida, the C ABI of weida"},
+    {vsn, "0.0.0-dev"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT", "Apache-2.0"]},
+    {links, [{"Source", "https://github.com/tuco86/weida"}]}
+]}.
