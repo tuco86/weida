@@ -3578,12 +3578,14 @@ name = "weida-c"
 version = "0.1.0-alpha.11-dev"
 dependencies = [
  "nix",
+ "rcgen",
  "tokio",
  "weida",
  "weida-core",
  "weida-runtime",
  "weida-testkit",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

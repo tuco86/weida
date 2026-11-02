@@ -34,6 +34,8 @@ weida_rs = { package = "weida", path = "../weida" }
 weida-core.workspace = true
 weida-runtime.workspace = true
 tokio.workspace = true
+# The bytes of a `weida_pem`, which may hold a private key, are wiped on drop.
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # `poll` on a handle's readiness descriptor (docs/c/README.md R11).
@@ -48,6 +50,8 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 weida-testkit.workspace = true
 # The paused clock of the op tests.
 tokio = { workspace = true, features = ["test-util"] }
+# Builds the two-certificate client chain of the any-key test.
+rcgen.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 # The EINTR test installs a handler and signals one thread.

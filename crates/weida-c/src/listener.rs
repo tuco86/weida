@@ -146,7 +146,7 @@ pub unsafe extern "C" fn weida_listener_bind_quic(
             .parse()
             .map_err(|_| fail(Error::InvalidAddress(text.to_owned())))?;
         let listener = l.listener.clone();
-        let tls = tls.tls.clone();
+        let tls = tls.get();
         let op = Op::start(&l.exec, async move { listener.bind_quic(addr, tls).await });
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, into_handle(weida_listener_bind_quic_op { op })) };

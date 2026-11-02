@@ -88,11 +88,23 @@ fn trust_by_address() -> *mut weida_trust {
 }
 
 fn requester(rt: *mut weida_runtime, trust: *mut weida_trust) -> *mut weida_requester {
+    requester_with(rt, trust, None)
+}
+
+/// A requester under `trust` that presents `identity` when one is given.
+fn requester_with(
+    rt: *mut weida_runtime,
+    trust: *mut weida_trust,
+    identity: Option<*mut weida_identity>,
+) -> *mut weida_requester {
     let mut tls = ptr::null_mut();
     let mut r = ptr::null_mut();
     // SAFETY: live handles and writable out-parameters.
     unsafe {
         ok(weida_client_tls_new(trust, &mut tls));
+        if let Some(identity) = identity {
+            ok(weida_client_tls_set_identity(tls, identity));
+        }
         ok(weida_runtime_requester(rt, tls, &mut r));
         weida_client_tls_drop(tls);
     }
@@ -525,15 +537,181 @@ fn a_malformed_pin_is_an_invalid_fingerprint() {
     }
 }
 
+/// The fingerprint text of `id`.
+fn fingerprint_of(id: *mut weida_identity) -> String {
+    let mut fp = ptr::null();
+    // SAFETY: a live identity and a writable out-parameter; the
+    // fingerprint lives with `id`.
+    unsafe {
+        ok(weida_identity_fingerprint(id, &mut fp));
+        CStr::from_ptr(fp).to_str().expect("UTF-8").to_owned()
+    }
+}
+
 fn identity() -> (*mut weida_identity, String) {
     let mut id = ptr::null_mut();
-    let mut fp = ptr::null();
-    // SAFETY: writable out-parameters; the fingerprint lives with `id`.
+    // SAFETY: a writable out-parameter.
+    ok(unsafe { weida_identity_generate(&mut id) });
+    (id, fingerprint_of(id))
+}
+
+/// A generated identity whose certificate names `names`.
+fn identity_for(names: &[&str]) -> (*mut weida_identity, String) {
+    let names: Vec<CString> = names.iter().map(|n| c(n)).collect();
+    let ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+    let mut id = ptr::null_mut();
+    // SAFETY: `ptrs.len()` C strings and a writable out-parameter.
+    ok(unsafe { weida_identity_generate_for(ptrs.as_ptr(), ptrs.len(), &mut id) });
+    (id, fingerprint_of(id))
+}
+
+/// The bytes of a PEM handle; drops the handle.
+fn pem_of(p: *mut weida_pem) -> Vec<u8> {
+    // SAFETY: a live PEM whose data has `weida_pem_len` bytes, dropped once.
     unsafe {
-        ok(weida_identity_generate(&mut id));
-        ok(weida_identity_fingerprint(id, &mut fp));
-        (id, CStr::from_ptr(fp).to_str().expect("UTF-8").to_owned())
+        let bytes = std::slice::from_raw_parts(weida_pem_data(p), weida_pem_len(p)).to_vec();
+        weida_pem_drop(p);
+        bytes
     }
+}
+
+fn certificate_pem(id: *mut weida_identity) -> Vec<u8> {
+    let mut p = ptr::null_mut();
+    // SAFETY: a live identity and a writable out-parameter.
+    ok(unsafe { weida_identity_certificate_pem(id, &mut p) });
+    pem_of(p)
+}
+
+fn to_pem(id: *mut weida_identity) -> Vec<u8> {
+    let mut p = ptr::null_mut();
+    // SAFETY: a live identity and a writable out-parameter.
+    ok(unsafe { weida_identity_to_pem(id, &mut p) });
+    pem_of(p)
+}
+
+/// A trust holding `pin`, beside what each address names.
+fn trust_pinning(pin: &str) -> *mut weida_trust {
+    let trust = trust_by_address();
+    let pin = c(pin);
+    // SAFETY: a live trust and a C string.
+    ok(unsafe { weida_trust_add_pin(trust, pin.as_ptr()) });
+    trust
+}
+
+/// Binds `tls` on `127.0.0.1:0`: the binding and its local address, or the
+/// status the bind's op ended with.
+fn try_bind_quic(
+    l: *mut weida_listener,
+    tls: *mut weida_server_tls,
+) -> Result<(*mut weida_binding, String), c_int> {
+    let mut bind = ptr::null_mut();
+    let mut binding = ptr::null_mut();
+    let addr = c("127.0.0.1:0");
+    let mut len = 0usize;
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        ok(weida_listener_bind_quic(l, addr.as_ptr(), tls, &mut bind));
+        let rc = settle("the bind", |ms| {
+            weida_listener_bind_quic_op_wait(bind, ms, &mut binding)
+        });
+        weida_listener_bind_quic_op_drop(bind);
+        if rc != 0 {
+            return Err(rc);
+        }
+        let local = text(weida_binding_local_addr(binding, &mut len), len).expect("an address");
+        Ok((binding, local))
+    }
+}
+
+fn bind_quic(l: *mut weida_listener, tls: *mut weida_server_tls) -> (*mut weida_binding, String) {
+    try_bind_quic(l, tls)
+        .unwrap_or_else(|rc| panic!("the bind failed with {rc}: {}", last_message()))
+}
+
+fn server_tls(identity: *mut weida_identity) -> *mut weida_server_tls {
+    let mut tls = ptr::null_mut();
+    // SAFETY: a live identity and a writable out-parameter.
+    ok(unsafe { weida_server_tls_new(identity, &mut tls) });
+    tls
+}
+
+/// Dials `url` and sends one request nobody answers: the connect op's
+/// status, or, when that is 0, the request's. A refused handshake shows at
+/// either one, depending on when the alert arrives.
+fn exchange_status(req: *mut weida_requester, url: &str) -> c_int {
+    let rc = connect(req, url);
+    if rc != 0 {
+        return rc;
+    }
+    let pending = request(req, b"hello");
+    let mut answer = ptr::null_mut();
+    // SAFETY: a live op and a writable out-parameter.
+    let rc = settle("the refused exchange", |ms| unsafe {
+        weida_requester_request_op_wait(pending, ms, &mut answer)
+    });
+    // SAFETY: dropped once.
+    unsafe { weida_requester_request_op_drop(pending) };
+    rc
+}
+
+/// Dials `url`, sends one request and answers it: the metadata of the
+/// request as the replier accepted it.
+fn round_trip(
+    req: *mut weida_requester,
+    rep: *mut weida_replier,
+    url: &str,
+) -> *mut weida_incoming_meta {
+    ok(connect(req, url));
+    let pending = request(req, b"hello");
+    let q = accept(rep);
+    let mut meta = ptr::null_mut();
+    // SAFETY: a live request and a writable out-parameter.
+    ok(unsafe { weida_incoming_request_meta(q, &mut meta) });
+    let out = reply(q, None);
+    write_all(out, b"hi");
+    let mut delivery = ptr::null_mut();
+    let mut delivered = ptr::null_mut();
+    let mut answer = ptr::null_mut();
+    // SAFETY: live handles, each consumed or dropped once.
+    unsafe {
+        ok(weida_outgoing_transfer_finish(out, &mut delivery));
+        ok(weida_delivery_delivered(delivery, &mut delivered));
+        ok(settle("the delivery receipt", |ms| {
+            weida_delivery_delivered_op_wait(delivered, ms)
+        }));
+        weida_delivery_delivered_op_drop(delivered);
+        ok(settle("the reply", |ms| {
+            weida_requester_request_op_wait(pending, ms, &mut answer)
+        }));
+        weida_requester_request_op_drop(pending);
+    }
+    assert_eq!(read_all(answer, 64).expect("the reply body"), b"hi");
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_transfer_drop(answer) };
+    meta
+}
+
+fn peer_fingerprint(meta: *mut weida_incoming_meta) -> Option<String> {
+    let mut len = 0usize;
+    // SAFETY: live metadata and a writable length.
+    let ptr = unsafe { weida_incoming_meta_peer_fingerprint(meta, &mut len) };
+    text(ptr, len)
+}
+
+/// The last failure's presented fingerprint.
+fn last_fingerprint() -> Option<String> {
+    // SAFETY: read on the thread that failed, before its next failure.
+    let presented = unsafe { weida_last_error_fingerprint() };
+    if presented.is_null() {
+        return None;
+    }
+    // SAFETY: a non-NULL fingerprint is a NUL-terminated string.
+    Some(
+        unsafe { CStr::from_ptr(presented) }
+            .to_str()
+            .expect("UTF-8")
+            .to_owned(),
+    )
 }
 
 #[test]
@@ -542,49 +720,17 @@ fn a_server_outside_the_pins_is_untrusted() {
     let l = listener(rt);
     let (server, server_fp) = identity();
     let (other, other_fp) = identity();
-    let mut tls = ptr::null_mut();
-    let mut bind = ptr::null_mut();
-    let mut binding = ptr::null_mut();
-    let addr = c("127.0.0.1:0");
-    let mut len = 0usize;
-    // SAFETY: live handles and writable out-parameters.
-    let local = unsafe {
-        ok(weida_server_tls_new(server, &mut tls));
-        ok(weida_listener_bind_quic(l, addr.as_ptr(), tls, &mut bind));
-        ok(settle("the bind", |ms| {
-            weida_listener_bind_quic_op_wait(bind, ms, &mut binding)
-        }));
-        weida_listener_bind_quic_op_drop(bind);
-        weida_server_tls_drop(tls);
-        text(weida_binding_local_addr(binding, &mut len), len).expect("an address")
-    };
+    let tls = server_tls(server);
+    let (binding, local) = bind_quic(l, tls);
+    // SAFETY: dropped once.
+    unsafe { weida_server_tls_drop(tls) };
     let rep = replier(l, "/echo");
 
-    let trust = trust_by_address();
-    let pin = c(&other_fp);
-    // SAFETY: a live trust and a C string.
-    ok(unsafe { weida_trust_add_pin(trust, pin.as_ptr()) });
+    let trust = trust_pinning(&other_fp);
     let req = requester(rt, trust);
-    let mut rc = connect(req, &format!("weida://{local}/echo"));
-    if rc == 0 {
-        let pending = request(req, b"hello");
-        let mut answer = ptr::null_mut();
-        // SAFETY: a live op and a writable out-parameter.
-        rc = settle("the refused exchange", |ms| unsafe {
-            weida_requester_request_op_wait(pending, ms, &mut answer)
-        });
-        // SAFETY: dropped once.
-        unsafe { weida_requester_request_op_drop(pending) };
-    }
+    let rc = exchange_status(req, &format!("weida://{local}/echo"));
     assert_eq!(rc, -WEIDA_EUNTRUSTED, "{}", last_message());
-    // SAFETY: read on the thread that failed, before its next failure.
-    let presented = unsafe { weida_last_error_fingerprint() };
-    assert!(!presented.is_null());
-    // SAFETY: a non-NULL fingerprint is a NUL-terminated string.
-    let presented = unsafe { CStr::from_ptr(presented) }
-        .to_str()
-        .expect("UTF-8");
-    assert_eq!(presented, server_fp);
+    assert_eq!(last_fingerprint().as_deref(), Some(server_fp.as_str()));
 
     // SAFETY: every handle is dropped once.
     unsafe {
@@ -597,6 +743,259 @@ fn a_server_outside_the_pins_is_untrusted() {
         weida_listener_drop(l);
     }
     shutdown(rt);
+}
+
+#[test]
+fn a_trust_anchor_checks_the_name_the_dial_used() {
+    let rt = runtime();
+    let l = listener(rt);
+    let rep = replier(l, "/echo");
+    let mut anchors = Vec::new();
+    let mut bindings = Vec::new();
+    let mut identities = Vec::new();
+    let mut outcomes = Vec::new();
+    for name in ["127.0.0.1", "localhost"] {
+        let (server, server_fp) = identity_for(&[name]);
+        let tls = server_tls(server);
+        let (binding, local) = bind_quic(l, tls);
+        // SAFETY: dropped once.
+        unsafe { weida_server_tls_drop(tls) };
+        let trust = trust_by_address();
+        let pem = certificate_pem(server);
+        // SAFETY: a live trust and `pem.len()` readable bytes.
+        ok(unsafe { weida_trust_add_anchor(trust, pem.as_ptr(), pem.len()) });
+        let req = requester(rt, trust);
+        let url = format!("weida://{local}/echo");
+        outcomes.push((req, url, server_fp));
+        anchors.push(trust);
+        bindings.push(binding);
+        identities.push(server);
+    }
+
+    let (named, named_url, _) = &outcomes[0];
+    let meta = round_trip(*named, rep, named_url);
+    assert_eq!(
+        peer_fingerprint(meta),
+        None,
+        "the client dialled anonymously"
+    );
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+
+    let (unnamed, unnamed_url, unnamed_fp) = &outcomes[1];
+    let rc = exchange_status(*unnamed, unnamed_url);
+    assert_eq!(rc, -WEIDA_EUNTRUSTED, "{}", last_message());
+    assert_eq!(last_fingerprint().as_deref(), Some(unnamed_fp.as_str()));
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        for (req, _, _) in outcomes {
+            weida_requester_drop(req);
+        }
+        anchors.into_iter().for_each(|t| weida_trust_drop(t));
+        bindings.into_iter().for_each(|b| weida_binding_drop(b));
+        identities
+            .into_iter()
+            .for_each(|id| weida_identity_drop(id));
+        weida_replier_drop(rep);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}
+
+#[test]
+fn a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers() {
+    let rt = runtime();
+    let l = listener(rt);
+    let rep = replier(l, "/echo");
+    let (server, server_fp) = identity();
+    let (client, client_fp) = identity();
+    let (stranger, _) = identity();
+    let tls = server_tls(server);
+
+    let empty = trust_by_address();
+    // SAFETY: live handles.
+    ok(unsafe { weida_server_tls_require_client(tls, empty) });
+    let refused = try_bind_quic(l, tls).err();
+    assert_eq!(refused, Some(-WEIDA_ETLS), "{}", last_message());
+
+    let clients = trust_pinning(&client_fp);
+    // SAFETY: live handles; the last requirement wins.
+    ok(unsafe { weida_server_tls_require_client(tls, clients) });
+    let (binding, local) = bind_quic(l, tls);
+    let url = format!("weida://{local}/echo");
+
+    let trust = trust_pinning(&server_fp);
+    let anonymous = requester(rt, trust);
+    let rc = exchange_status(anonymous, &url);
+    assert_eq!(rc, -WEIDA_ETLS, "anonymous: {}", last_message());
+    let unknown = requester_with(rt, trust, Some(stranger));
+    let rc = exchange_status(unknown, &url);
+    assert_eq!(rc, -WEIDA_ETLS, "a stranger: {}", last_message());
+    let mut q = ptr::null_mut();
+    // SAFETY: a live replier and a writable out-parameter.
+    let rc = unsafe { weida_replier_accept(rep, 0, &mut q) };
+    assert_eq!(rc, -WEIDA_EAGAIN, "nothing reached the server");
+
+    let pinned = requester_with(rt, trust, Some(client));
+    let meta = round_trip(pinned, rep, &url);
+    assert_eq!(peer_fingerprint(meta), Some(client_fp));
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_requester_drop(pinned);
+        weida_requester_drop(unknown);
+        weida_requester_drop(anonymous);
+        weida_trust_drop(trust);
+        weida_trust_drop(clients);
+        weida_trust_drop(empty);
+        weida_server_tls_drop(tls);
+        weida_binding_drop(binding);
+        weida_identity_drop(stranger);
+        weida_identity_drop(client);
+        weida_identity_drop(server);
+        weida_replier_drop(rep);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}
+
+/// The DER of certificate `index` of the metadata's peer chain.
+fn chain_cert(meta: *mut weida_incoming_meta, index: usize) -> Option<Vec<u8>> {
+    let mut len = 0usize;
+    // SAFETY: live metadata and a writable length.
+    let der = unsafe { weida_incoming_meta_peer_chain_cert(meta, index, &mut len) };
+    if der.is_null() {
+        return None;
+    }
+    // SAFETY: a non-NULL certificate points to `len` bytes.
+    Some(unsafe { std::slice::from_raw_parts(der, len) }.to_vec())
+}
+
+#[test]
+fn a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain() {
+    // A device key certified by a user key, presented as `[device, user]`.
+    let user_key = rcgen::KeyPair::generate().expect("user key");
+    let user_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("user params");
+    let user_cert = user_params.self_signed(&user_key).expect("user cert");
+    let device_key = rcgen::KeyPair::generate().expect("device key");
+    let device_cert = rcgen::CertificateParams::new(vec!["device".to_owned()])
+        .expect("device params")
+        .signed_by(&device_key, &rcgen::Issuer::new(user_params, &user_key))
+        .expect("device cert");
+    let chain_pem = device_cert.pem() + &user_cert.pem();
+    let key_pem = device_key.serialize_pem();
+    let mut client = ptr::null_mut();
+    // SAFETY: readable buffers and a writable out-parameter.
+    ok(unsafe {
+        weida_identity_from_pem(
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            key_pem.as_ptr(),
+            key_pem.len(),
+            &mut client,
+        )
+    });
+    let client_fp = fingerprint_of(client);
+
+    let rt = runtime();
+    let l = listener(rt);
+    let rep = replier(l, "/echo");
+    let (server, server_fp) = identity();
+    let tls = server_tls(server);
+    // SAFETY: live server terms.
+    ok(unsafe { weida_server_tls_require_any_key(tls) });
+    let (binding, local) = bind_quic(l, tls);
+    let url = format!("weida://{local}/echo");
+    let trust = trust_pinning(&server_fp);
+
+    let anonymous = requester(rt, trust);
+    let rc = exchange_status(anonymous, &url);
+    assert_eq!(rc, -WEIDA_ETLS, "anonymous: {}", last_message());
+
+    let keyed = requester_with(rt, trust, Some(client));
+    let meta = round_trip(keyed, rep, &url);
+    let mut n = 0usize;
+    // SAFETY: live metadata and a writable count.
+    assert_eq!(
+        unsafe { weida_incoming_meta_peer_chain_len(meta, &mut n) },
+        1
+    );
+    assert_eq!(n, 2);
+    assert_eq!(
+        chain_cert(meta, 0).as_deref(),
+        Some(device_cert.der().as_ref())
+    );
+    assert_eq!(
+        chain_cert(meta, 1).as_deref(),
+        Some(user_cert.der().as_ref())
+    );
+    assert_eq!(chain_cert(meta, 2), None);
+    assert_eq!(peer_fingerprint(meta), Some(client_fp));
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_requester_drop(keyed);
+        weida_requester_drop(anonymous);
+        weida_trust_drop(trust);
+        weida_server_tls_drop(tls);
+        weida_binding_drop(binding);
+        weida_identity_drop(server);
+        weida_identity_drop(client);
+        weida_replier_drop(rep);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}
+
+#[test]
+fn an_identity_written_to_a_file_reads_back_with_its_fingerprint() {
+    let dir = std::env::temp_dir().join(format!("weida-c-abi-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the directory");
+    let (id, fp) = identity();
+    let pem = to_pem(id);
+    let path = |name: &str| c(dir.join(name).to_str().expect("a UTF-8 path"));
+
+    std::fs::write(dir.join("id.pem"), &pem).expect("id.pem");
+    let mut one = ptr::null_mut();
+    // SAFETY: a C string and a writable out-parameter.
+    ok(unsafe { weida_identity_from_pem_file(path("id.pem").as_ptr(), &mut one) });
+    assert_eq!(fingerprint_of(one), fp);
+
+    std::fs::write(dir.join("cert.pem"), certificate_pem(id)).expect("cert.pem");
+    std::fs::write(dir.join("key.pem"), &pem).expect("key.pem");
+    let mut two = ptr::null_mut();
+    // SAFETY: C strings and a writable out-parameter.
+    ok(unsafe {
+        weida_identity_from_pem_files(
+            path("cert.pem").as_ptr(),
+            path("key.pem").as_ptr(),
+            &mut two,
+        )
+    });
+    assert_eq!(fingerprint_of(two), fp);
+
+    let mut missing = ptr::null_mut();
+    let mut text = ptr::null();
+    // SAFETY: a C string and writable out-parameters.
+    unsafe {
+        ok(weida_identity_from_pem_file(
+            path("missing.pem").as_ptr(),
+            &mut missing,
+        ));
+        assert_eq!(weida_identity_fingerprint(missing, &mut text), -WEIDA_ETLS);
+    }
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_identity_drop(missing);
+        weida_identity_drop(two);
+        weida_identity_drop(one);
+        weida_identity_drop(id);
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the directory");
 }
 
 #[cfg(unix)]

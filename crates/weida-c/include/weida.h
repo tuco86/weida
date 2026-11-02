@@ -271,6 +271,12 @@ typedef struct weida_msg weida_msg;
 typedef struct weida_outgoing_transfer weida_outgoing_transfer;
 
 /**
+ * PEM text handed out (`Identity::certificate_pem`, `Identity::to_pem`):
+ * owned bytes the caller drops, wiped when dropped.
+ */
+typedef struct weida_pem weida_pem;
+
+/**
  * The replying half of Req/Rep, serving one endpoint path.
  */
 typedef struct weida_replier weida_replier;
@@ -938,6 +944,31 @@ int weida_trust_new(weida_trust **out);
 int weida_trust_add_pin(const weida_trust *t, const char *fingerprint);
 
 /**
+ * Adds the certificate authorities in a PEM buffer (`Trust::and_anchor`):
+ * a peer whose chain leads to one of them and names the dialled host is
+ * accepted. The bytes are copied; they are parsed at each dial that uses
+ * the trust, which fails with `-WEIDA_ETLS` when they hold no certificate
+ * or do not parse.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live trust; `pem` is NULL only with a zero `len`, else
+ * points to that many readable bytes.
+ */
+int weida_trust_add_anchor(const weida_trust *t, const uint8_t *pem, size_t len);
+
+/**
+ * Adds the certificate authorities in a PEM file
+ * (`Trust::and_anchor_file`). The file is read at each dial that uses the
+ * trust, which fails with `-WEIDA_ETLS` when it is missing or bad.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live trust; `path` is NULL or a NUL-terminated string.
+ */
+int weida_trust_add_anchor_file(const weida_trust *t, const char *path);
+
+/**
  * Releases a trust. NULL does nothing.
  *
  * # Safety
@@ -958,6 +989,24 @@ void weida_trust_drop(weida_trust *t);
 int weida_identity_generate(weida_identity **out);
 
 /**
+ * Generates a self-signed identity with a fresh key whose certificate also
+ * names `names`, DNS names or IP literals (`Identity::generate_for`): a
+ * peer that takes the certificate as an anchor can then verify the host it
+ * dialled. `n == 0` is `weida_identity_generate`.
+ *
+ * Fails with `-WEIDA_EINVAL` when `names` is NULL with `n > 0`, an element
+ * is NULL or a name is not UTF-8, and with `-WEIDA_ETLS` when a name is
+ * refused for the certificate.
+ *
+ * # Safety
+ *
+ * `names` is NULL only with `n == 0`, else points to `n` readable
+ * pointers, each NULL or a NUL-terminated string; `out` is NULL or
+ * writable. Release the result with `weida_identity_drop`.
+ */
+int weida_identity_generate_for(const char *const *names, size_t n, weida_identity **out);
+
+/**
  * An identity from PEM bytes: the certificate chain, leaf first, and the
  * private key (`Identity::from_pem`). Both are copied; the material is
  * checked when it is first used.
@@ -975,6 +1024,31 @@ int weida_identity_from_pem(const uint8_t *cert,
                             weida_identity **out);
 
 /**
+ * An identity from a chain file and a key file
+ * (`Identity::from_pem_files`). Nothing is read here: a missing or bad file
+ * fails the first use (the fingerprint, a PEM getter, the bind or the dial)
+ * with `-WEIDA_ETLS`.
+ *
+ * # Safety
+ *
+ * `cert_chain` and `key` are NULL or NUL-terminated strings; `out` is NULL
+ * or writable. Release the result with `weida_identity_drop`.
+ */
+int weida_identity_from_pem_files(const char *cert_chain, const char *key, weida_identity **out);
+
+/**
+ * An identity from one PEM file holding both the chain and the key, the
+ * form `weida_identity_to_pem` writes (`Identity::from_pem_file`). Nothing
+ * is read here, as with `weida_identity_from_pem_files`.
+ *
+ * # Safety
+ *
+ * `path` is NULL or a NUL-terminated string; `out` is NULL or writable.
+ * Release the result with `weida_identity_drop`.
+ */
+int weida_identity_from_pem_file(const char *path, weida_identity **out);
+
+/**
  * Writes the identity's public-key fingerprint, `sha256:` text, to `out`.
  * The string lives as long as the identity.
  *
@@ -987,6 +1061,40 @@ int weida_identity_from_pem(const uint8_t *cert,
 int weida_identity_fingerprint(const weida_identity *id, const char **out);
 
 /**
+ * Writes the identity's certificate chain as PEM, without the key
+ * (`Identity::certificate_pem`), to `out`: publishable, for a peer to
+ * anchor or pin.
+ *
+ * The source is read on every call; fails with `-WEIDA_ETLS` when it does
+ * not read or parse.
+ *
+ * # Safety
+ *
+ * `id` is NULL or a live identity; `out` is NULL or writable. Release the
+ * result with `weida_pem_drop`.
+ */
+int weida_identity_certificate_pem(const weida_identity *id, weida_pem **out);
+
+/**
+ * Writes the chain and the private key as one PEM document
+ * (`Identity::to_pem`) to `out`, the form `weida_identity_from_pem_file`
+ * and `weida_identity_from_pem` read back. The key is PKCS#8, PKCS#1 or
+ * SEC1, as the source held it.
+ *
+ * Contains the private key; the bytes are wiped by `weida_pem_drop`, and
+ * every copy the caller makes is the caller's to wipe.
+ *
+ * The source is read on every call; fails with `-WEIDA_ETLS` when it does
+ * not read or parse.
+ *
+ * # Safety
+ *
+ * `id` is NULL or a live identity; `out` is NULL or writable. Release the
+ * result with `weida_pem_drop`.
+ */
+int weida_identity_to_pem(const weida_identity *id, weida_pem **out);
+
+/**
  * Releases an identity. NULL does nothing.
  *
  * # Safety
@@ -994,6 +1102,34 @@ int weida_identity_fingerprint(const weida_identity *id, const char **out);
  * `id` is NULL or a live identity, dropped at most once.
  */
 void weida_identity_drop(weida_identity *id);
+
+/**
+ * The PEM's bytes; `weida_pem_len` of them, not NUL-terminated. NULL for
+ * NULL. Valid as long as `p`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live PEM.
+ */
+const uint8_t *weida_pem_data(const weida_pem *p);
+
+/**
+ * The PEM's length in bytes; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live PEM.
+ */
+size_t weida_pem_len(const weida_pem *p);
+
+/**
+ * Releases a PEM and wipes its bytes. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live PEM, dropped at most once.
+ */
+void weida_pem_drop(weida_pem *p);
 
 /**
  * Client terms that dial anonymously under `trust` (`ClientTls::new`).
@@ -1005,6 +1141,17 @@ void weida_identity_drop(weida_identity *id);
  * result with `weida_client_tls_drop`.
  */
 int weida_client_tls_new(const weida_trust *trust, weida_client_tls **out);
+
+/**
+ * Presents `identity` to every peer a requester made from these terms
+ * afterwards dials (`ClientTls::with_identity`). The identity is copied.
+ *
+ * # Safety
+ *
+ * `tls` is NULL or live client terms; `identity` is NULL or a live
+ * identity.
+ */
+int weida_client_tls_set_identity(const weida_client_tls *tls, const weida_identity *identity);
 
 /**
  * Releases client terms. NULL does nothing.
@@ -1025,6 +1172,31 @@ void weida_client_tls_drop(weida_client_tls *tls);
  * Release the result with `weida_server_tls_drop`.
  */
 int weida_server_tls_new(const weida_identity *identity, weida_server_tls **out);
+
+/**
+ * Requires every client to present a key `trust` accepts, pinned or
+ * chaining to an anchor (`ServerTls::require_client`). The trust is
+ * copied. Replaces an earlier `_require_client` or `_require_any_key`.
+ *
+ * An empty trust is taken here; the bind then fails with `-WEIDA_ETLS`,
+ * since such a binding would accept no client.
+ *
+ * # Safety
+ *
+ * `tls` is NULL or live server terms; `trust` is NULL or a live trust.
+ */
+int weida_server_tls_require_client(const weida_server_tls *tls, const weida_trust *trust);
+
+/**
+ * Requires every client to present a key and prove it holds it, whatever
+ * the key (`ServerTls::require_client(ClientTrust::AnyKey)`). Replaces an
+ * earlier `_require_client` or `_require_any_key`.
+ *
+ * # Safety
+ *
+ * `tls` is NULL or live server terms.
+ */
+int weida_server_tls_require_any_key(const weida_server_tls *tls);
 
 /**
  * Releases server terms. NULL does nothing.
@@ -1104,6 +1276,30 @@ const char *weida_incoming_meta_topic(const weida_incoming_meta *m, size_t *len_
  * lives as long as `m`.
  */
 const char *weida_incoming_meta_peer_fingerprint(const weida_incoming_meta *m, size_t *len_out);
+
+/**
+ * The number of certificates the sender presented: 1 and `*out` when its
+ * chain is present (1 to 8 certificates), 0 when absent (R2): an anonymous
+ * sender, a local transport, or a chain over the bound weida keeps.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_peer_chain_len(const weida_incoming_meta *m, size_t *out);
+
+/**
+ * The DER of certificate `index` of the sender's chain, leaf first, with
+ * its length in `*len_out`; NULL when the chain is absent or `index` is
+ * out of range. Valid as long as `m`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `len_out` is NULL or writable.
+ */
+const uint8_t *weida_incoming_meta_peer_chain_cert(const weida_incoming_meta *m,
+                                                   size_t index,
+                                                   size_t *len_out);
 
 /**
  * The advisory payload length the sender stated: 1 and `*out` when

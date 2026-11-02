@@ -12,12 +12,14 @@ request or transfer it came from. None of these functions blocks.
 | `const char *weida_incoming_meta_content_type(const weida_incoming_meta *m, size_t *len_out)` | the content type label; NULL when unset |
 | `const char *weida_incoming_meta_topic(const weida_incoming_meta *m, size_t *len_out)` | the Pub/Sub topic; NULL when absent |
 | `const char *weida_incoming_meta_peer_fingerprint(const weida_incoming_meta *m, size_t *len_out)` | the `sha256:` key the sender proved; NULL for an anonymous or local peer |
+| `int weida_incoming_meta_peer_chain_len(const weida_incoming_meta *m, size_t *out)` | 1 and `*out`, the number of certificates (1 to 8), when the sender presented a chain, else 0: an anonymous or local peer, or a chain over the bound weida keeps |
+| `const uint8_t *weida_incoming_meta_peer_chain_cert(const weida_incoming_meta *m, size_t index, size_t *len_out)` | the DER of certificate `index`, leaf first, its length through `len_out` (NULL allowed), valid until `m` is dropped; NULL when the chain is absent or `index` is out of range |
 | `int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender stated a length, else 0 |
 | `int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender numbered the transfer, else 0 |
 | `void weida_incoming_meta_drop(weida_incoming_meta *m)` | — |
 
 Strings follow R7: NUL-terminated, the exact length through `len_out` (NULL allowed), valid
-until `m` is dropped. The other fields of `IncomingMeta` (`peer_chain`, `trace`, `tracestate`,
+until `m` is dropped. The other fields of `IncomingMeta` (`trace`, `tracestate`,
 `gap`, `achieved`, the report fields, `segment`, `layer`) are not mapped yet
 ([libraries/weida-c.md](../libraries/weida-c.md)).
 

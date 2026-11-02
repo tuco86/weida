@@ -57,7 +57,7 @@ pub unsafe extern "C" fn weida_runtime_requester(
         // SAFETY: forwarded from this function's contract.
         let tls = unsafe { borrow(tls) }?;
         let handle = into_handle(weida_requester {
-            requester: Arc::new(rt.runtime.requester(tls.tls.clone())),
+            requester: Arc::new(rt.runtime.requester(tls.get())),
             exec: rt.runtime.exec().clone(),
         });
         // SAFETY: `out` passed `out_ptr`.

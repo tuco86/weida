@@ -210,6 +210,72 @@ pub unsafe extern "C" fn weida_incoming_meta_peer_fingerprint(
     unsafe { meta_text(m, len_out, |m| m.peer_fingerprint.as_ref()) }
 }
 
+/// The number of certificates the sender presented: 1 and `*out` when its
+/// chain is present (1 to 8 certificates), 0 when absent (R2): an anonymous
+/// sender, a local transport, or a chain over the bound weida keeps.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_peer_chain_len(
+    m: *const weida_incoming_meta,
+    out: *mut usize,
+) -> c_int {
+    guard_or(0, || {
+        if m.is_null() || out.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `m` is live metadata by the caller's contract.
+        let m = unsafe { &*m };
+        match &m.meta.peer_chain {
+            Some(chain) => {
+                // SAFETY: a non-NULL `out` is writable by the caller's contract.
+                unsafe { out.write(chain.certs().len()) };
+                1
+            }
+            None => 0,
+        }
+    })
+}
+
+/// The DER of certificate `index` of the sender's chain, leaf first, with
+/// its length in `*len_out`; NULL when the chain is absent or `index` is
+/// out of range. Valid as long as `m`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `len_out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_peer_chain_cert(
+    m: *const weida_incoming_meta,
+    index: usize,
+    len_out: *mut usize,
+) -> *const u8 {
+    guard_ptr(|| {
+        if m.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: a non-NULL `m` is live metadata by the caller's contract;
+        // the chain lives in it.
+        let m = unsafe { &*m };
+        let Some(der) = m
+            .meta
+            .peer_chain
+            .as_ref()
+            .and_then(|c| c.certs().nth(index))
+        else {
+            return std::ptr::null();
+        };
+        if !len_out.is_null() {
+            // SAFETY: a non-NULL `len_out` is writable by the caller's
+            // contract.
+            unsafe { len_out.write(der.len()) };
+        }
+        der.as_ptr()
+    })
+}
+
 /// Reads an optional number of the metadata: 1 and `*out` when present, 0
 /// when absent (R2).
 unsafe fn meta_number(

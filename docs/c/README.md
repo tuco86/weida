@@ -122,6 +122,8 @@ The caller neither uses nor drops the handle afterwards. The docs mark such func
     so an interior NUL is representable.
   - The result is NULL when the value is absent.
   - The pointer is valid until that handle is dropped or consumed.
+- **Bytes out that may hold key material:** an owned `weida_pem` the caller drops, wiped on
+  drop ([tls.md](tls.md)).
 
 ## R8. Messages
 

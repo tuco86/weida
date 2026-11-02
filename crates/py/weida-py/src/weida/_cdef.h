@@ -100,6 +100,8 @@ typedef struct weida_msg weida_msg;
 
 typedef struct weida_outgoing_transfer weida_outgoing_transfer;
 
+typedef struct weida_pem weida_pem;
+
 typedef struct weida_replier weida_replier;
 
 typedef struct weida_requester weida_requester;
@@ -251,9 +253,15 @@ int weida_trust_new(weida_trust **out);
 
 int weida_trust_add_pin(const weida_trust *t, const char *fingerprint);
 
+int weida_trust_add_anchor(const weida_trust *t, const uint8_t *pem, size_t len);
+
+int weida_trust_add_anchor_file(const weida_trust *t, const char *path);
+
 void weida_trust_drop(weida_trust *t);
 
 int weida_identity_generate(weida_identity **out);
+
+int weida_identity_generate_for(const char *const *names, size_t n, weida_identity **out);
 
 int weida_identity_from_pem(const uint8_t *cert,
                             size_t cert_len,
@@ -261,15 +269,35 @@ int weida_identity_from_pem(const uint8_t *cert,
                             size_t key_len,
                             weida_identity **out);
 
+int weida_identity_from_pem_files(const char *cert_chain, const char *key, weida_identity **out);
+
+int weida_identity_from_pem_file(const char *path, weida_identity **out);
+
 int weida_identity_fingerprint(const weida_identity *id, const char **out);
+
+int weida_identity_certificate_pem(const weida_identity *id, weida_pem **out);
+
+int weida_identity_to_pem(const weida_identity *id, weida_pem **out);
 
 void weida_identity_drop(weida_identity *id);
 
+const uint8_t *weida_pem_data(const weida_pem *p);
+
+size_t weida_pem_len(const weida_pem *p);
+
+void weida_pem_drop(weida_pem *p);
+
 int weida_client_tls_new(const weida_trust *trust, weida_client_tls **out);
+
+int weida_client_tls_set_identity(const weida_client_tls *tls, const weida_identity *identity);
 
 void weida_client_tls_drop(weida_client_tls *tls);
 
 int weida_server_tls_new(const weida_identity *identity, weida_server_tls **out);
+
+int weida_server_tls_require_client(const weida_server_tls *tls, const weida_trust *trust);
+
+int weida_server_tls_require_any_key(const weida_server_tls *tls);
 
 void weida_server_tls_drop(weida_server_tls *tls);
 
@@ -286,6 +314,12 @@ const char *weida_incoming_meta_content_type(const weida_incoming_meta *m, size_
 const char *weida_incoming_meta_topic(const weida_incoming_meta *m, size_t *len_out);
 
 const char *weida_incoming_meta_peer_fingerprint(const weida_incoming_meta *m, size_t *len_out);
+
+int weida_incoming_meta_peer_chain_len(const weida_incoming_meta *m, size_t *out);
+
+const uint8_t *weida_incoming_meta_peer_chain_cert(const weida_incoming_meta *m,
+                                                   size_t index,
+                                                   size_t *len_out);
 
 int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out);
 

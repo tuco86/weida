@@ -90,19 +90,26 @@ unit tests in `crates/weida-c/src/`.
 | every other `RuntimeConfig` field, `Limits`, `Discovery`, `Network`, `ReconnectPolicy`, `OutboxFull`, `GuaranteeSet` and its dimensions | — | absent: *config* |
 | `Trust::by_address` | `weida_trust_new` | present; `smoke.c` |
 | `Trust::and_pin` | `weida_trust_add_pin` | present; `abi::a_malformed_pin_is_an_invalid_fingerprint`, `abi::a_server_outside_the_pins_is_untrusted` |
-| `Trust::pin`, `anchor`, `and_anchor`, `anchor_file`, `and_anchor_file`, `is_empty` | — | absent: *identity* (`pin` is `new` plus `add_pin`) |
+| `Trust::and_anchor`, `and_anchor_file` | `weida_trust_add_anchor`, `_add_anchor_file` | present; `abi::a_trust_anchor_checks_the_name_the_dial_used` |
+| `Trust::pin`, `anchor`, `anchor_file` | `weida_trust_new` plus the matching `_add_*` | present |
+| `Trust::is_empty` | — | absent: *identity* |
 | `Identity::generate`, `from_pem`, `fingerprint` | `weida_identity_generate`, `_from_pem`, `_fingerprint` | present; `smoke.c`, `abi::a_server_outside_the_pins_is_untrusted` |
-| `Identity::generate_for`, `from_pem_files`, `from_pem_file`, `certificate_pem`, `to_pem`, `Pem` | — | absent: *identity* |
+| `Identity::generate_for` | `weida_identity_generate_for` | present; `tls::tests::generate_for_refuses_a_null_name`, `abi::a_trust_anchor_checks_the_name_the_dial_used` |
+| `Identity::from_pem_files`, `from_pem_file` | `weida_identity_from_pem_files`, `_from_pem_file` | present; `abi::an_identity_written_to_a_file_reads_back_with_its_fingerprint` |
+| `Identity::certificate_pem`, `to_pem`, `Pem` | `weida_identity_certificate_pem`, `_to_pem`, the owned `weida_pem` wiped on drop | present; `tls::tests::a_pem_written_by_to_pem_reads_back_with_the_same_fingerprint` |
 | `ClientTls::new` | `weida_client_tls_new` | present |
-| `ClientTls::with_identity`, `with_alpn`, `ClientTrust`, `Alpn` | — | absent: *identity* |
+| `ClientTls::with_identity` | `weida_client_tls_set_identity` | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
+| `ClientTls::with_alpn`, `Alpn` | — | absent: *identity* |
 | `ServerTls::new` | `weida_server_tls_new` | present |
-| `ServerTls::require_client`, `with_alpn` | — | absent: *identity* |
+| `ServerTls::require_client`, `ClientTrust` | `weida_server_tls_require_client` (`Trusted`), `_require_any_key` (`AnyKey`) | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
+| `ServerTls::with_alpn` | — | absent: *identity* |
 | `IdentitySource`, `TrustSource`, their weak forms, `FilesOptions`, `IdentityEvent(s)` | — | absent: *identity* (events as queues, 0045 decision 10) |
 | `TransferMeta::with_content_type` | `weida_transfer_meta_set_content_type` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `TransferMeta::with_content_len`, `with_trace`, `with_topic`, `with_achieved`, `with_report`, `with_report_mode` | — | absent: *config* |
 | `IncomingMeta::endpoint`, `content_type`, `topic`, `content_len`, `sequence` | `weida_incoming_meta_*` | present; `endpoint` and `content_type` by `abi::a_streamed_round_trip_over_inproc` |
 | `IncomingMeta::peer` (a key) | `weida_incoming_meta_peer_fingerprint` | present for `PeerIdentity::Key`; a local principal is absent: *local transports* |
-| `IncomingMeta::trace`, `tracestate`, `peer_chain`, `gap`, `achieved`, `report`, `report_mode`, `report_id`, `segment`, `layer` | — | absent: *config*, *cursors*, *patterns* |
+| `IncomingMeta::peer_chain`, `PeerChain` | `weida_incoming_meta_peer_chain_len`, `_peer_chain_cert` (DER, leaf first) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
+| `IncomingMeta::trace`, `tracestate`, `gap`, `achieved`, `report`, `report_mode`, `report_id`, `segment`, `layer` | — | absent: *config*, *cursors*, *patterns* |
 | `Fingerprint` | `sha256:` text everywhere | present |
 | `Error`, `LossCause` | the R9 constants and the thread-local record | present; `error::tests::every_variant_has_its_own_code_below_the_abi_codes`, `abi::a_server_outside_the_pins_is_untrusted` (`weida_last_error_fingerprint`) |
 | `ErrorCode`, `StopReason`, `codes` | — | refused: wire vocabulary, reached through the R9 outcome codes |
@@ -139,7 +146,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the ten `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the fourteen `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
