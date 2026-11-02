@@ -447,6 +447,16 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   atom; a passed timeout is `{error, timeout}`. The `beam-linux-*` jobs build the NIF against
   the handed-on `libweida`, run the EUnit unit tests and the Elixir smoke in-process, and on
   the nightly and tags the QUIC tests and the QUIC smoke.
+- weida for Go (`crates/go/weida`) is a cgo package against `weida.h` with `libweida` linked
+  statically: the `c-abi-linux-*` jobs build `libweida.a` with `cargo rustc --crate-type
+  staticlib` and hand it on in `lib-static/` ([libraries/weida-go.md](libraries/weida-go.md)).
+  Every C call tries with `timeout_ms = 0`, through a C wrapper that copies the thread-local
+  error record in the same cgo call; on `EAGAIN` the goroutine opens a duplicate of the handle's
+  descriptor with `os.NewFile`, which puts it into Go's netpoller, and retries in
+  `SyscallConn().Read`'s callback. Waiting methods take a `context.Context`, which ends a park
+  through a read deadline in the past; closing a handle ends the parks on it. The `go-linux-*`
+  jobs vet the package and run its unit tests, and on the nightly and tags the QUIC tests and a
+  smoke binary checked to carry `libweida` inside it.
 - `weida-zmq-py`, `weida-nng-py`, `weida-mqtt-py`, `weida-amqp-py` and `weida-nats-py` bind the
   first five libraries, each following its own library, with an asyncio and a synchronous
   surface on `weida-py-core` (`crates/py/weida-py-core`), the shared PyO3 foundation
@@ -457,14 +467,12 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   filed as B-371.
 
 **Not built:** the rest of weida in the C ABI (0045 §5), and a binding for any language but
-Python, JavaScript, the JVM and Erlang/Elixir. Go (cgo) and Swift/iOS (an XCFramework) bind
-`libweida` through native glue against `weida.h` next
-([0046](decisions/0046-how-each-language-binds-libweida.md)). Go's toolchain exists as CI
-images on linux-amd64 and linux-arm64 (`.zeughaus-ci/go.Containerfile`), with a job that
-compiles and runs `tests/c/smoke.c` against the handed-on `libweida`, and `android-libweida`
-cross-builds `libweida` for arm64-v8a, armeabi-v7a, x86_64 and x86 with the NDK, API 24 and
-up. weida for the JVM is not run on an Android device or emulator, and has no AAR or Maven
-Central artifact.
+Python, JavaScript, the JVM, Erlang/Elixir and Go. Swift/iOS binds `libweida` through an
+XCFramework of the static library next
+([0046](decisions/0046-how-each-language-binds-libweida.md)); `android-libweida` cross-builds
+`libweida` for arm64-v8a, armeabi-v7a, x86_64 and x86 with the NDK, API 24 and up. weida for
+the JVM is not run on an Android device or emulator, and has no AAR or Maven Central artifact.
+weida for Go is not run on macOS, and no tag of this repository names its module.
 
 ### Phase 11 — CLI and administration
 

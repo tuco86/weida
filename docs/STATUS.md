@@ -117,7 +117,7 @@ dimensions, transports and patterns it offers, and the six standalone foreign-pr
 libraries on the right. They share runtime foundations but no implicit semantic conversion.
 
 weida itself ships a library with an async API, the `weida` binary, a C ABI (`libweida`,
-[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python, a JavaScript, a JVM and an Erlang/Elixir package on it. Each of the six
+[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python, a JavaScript, a JVM, an Erlang/Elixir and a Go package on it. Each of the six
 libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0, Core NATS and HTTP — has a parity document in
 [libraries/](libraries/README.md) and, where a peer exists to measure against, an interop
 suite; the NATS suite is written and not run, which its parity table records as a clause **not
@@ -140,13 +140,16 @@ ABIs and compiles the Java sources against Android API 24, without running them 
 weida for Erlang and Elixir is one NIF in C over `libweida` with an Erlang module, `:weida`
 from Elixir, whose waiting functions take a timeout and wait in `receive`: no NIF call blocks
 a scheduler, and `enif_select` puts the readiness descriptor into the VM's own poller; the CI
-runs its EUnit tests and an Elixir smoke on both Linux architectures. Go and Swift/iOS bind
-`libweida` the same way, through native glue against `weida.h`
-([0046](decisions/0046-how-each-language-binds-libweida.md)): cgo for Go and an XCFramework
-for Swift/iOS. Neither package exists yet; their environments do. Each language has a CI image
-on both Linux architectures, whose job compiles and runs the C smoke program against the
-`libweida` the `c-abi-linux-*` job of that architecture built, and `android-libweida`
-cross-builds `libweida` for the four Android ABIs on the nightly and tags.
+runs its EUnit tests and an Elixir smoke on both Linux architectures. weida for Go is a cgo
+package over a statically linked `libweida`, whose waiting methods take a `context.Context`
+and park the goroutine in Go's netpoller on the readiness descriptor, so no call blocks in C;
+the CI runs its tests and a smoke binary that carries `libweida` inside it on both Linux
+architectures. Swift/iOS binds `libweida` the same way, through native glue against `weida.h`
+([0046](decisions/0046-how-each-language-binds-libweida.md)), as an XCFramework of the static
+library. Its package does not exist yet. Each language has a CI image on both Linux
+architectures, whose job compiles and runs the C smoke program against the `libweida` the
+`c-abi-linux-*` job of that architecture built, and `android-libweida` cross-builds `libweida`
+for the four Android ABIs on the nightly and tags.
 
 ## 3. The measurements that decided something
 
