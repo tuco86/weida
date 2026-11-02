@@ -1,0 +1,126 @@
+# weida for the JVM and Android (`crates/jvm/weida-jvm`, against the C ABI `libweida`) — feature parity
+
+## 1. What a row means
+
+The package is one JNI library written in C against `weida.h`, shared by the desktop JVM and
+Android ([decisions/0046](../decisions/0046-how-each-language-binds-libweida.md)), with a Java
+API on top in the package `net.doodleshnookie.weida` (the coordinates of
+[0019](../decisions/0019-jvm-binding.md) §4.5). Its API mirrors the C ABI: one class per handle,
+one method per function with the `weida_<type>_` prefix dropped and the rest in camelCase. Its
+reference is therefore [weida-c.md](weida-c.md): every row present there is present here unless
+a row below says otherwise, and every row absent there is absent here for the same reason. This
+document lists what the Java surface adds or changes. Verdicts are **present** (with the test),
+**refused** (with the reason) or **absent** (with the reason); there is no "partial".
+
+The tests are `crates/jvm/weida-jvm/src/test/java/net/doodleshnookie/weida/`: `ErrorsTest` and
+`InprocTest` (in-process transport only, one second each) and `QuicTest`, tagged `io` (QUIC on
+localhost, ten seconds each). `test.sh` runs them with the JUnit Platform Console Standalone
+6.1.3 and `-Xcheck:jni`, the unit tier on every push and both on the nightly and tags;
+`smoke/Smoke.java` makes one QUIC round trip, and `package.sh` runs it from a fresh directory
+holding only the jar and the native libraries. Measured on Temurin 25 on linux-amd64 and
+linux-arm64 (the `jvm-linux-*` jobs) and OpenJDK 27 on linux-amd64. Android is built and
+compiled against, not run (§5).
+
+## 2. Classes
+
+| C ABI | Java (`net.doodleshnookie.weida`) | Verdict |
+| --- | --- | --- |
+| `weida_runtime_config` | `RuntimeConfig`, a value with `workerThreads(int)` and `shutdownTimeout(long, TimeUnit)` (whole milliseconds), turned into a handle by `Runtime.owned` | present; `ErrorsTest.aRuntimeWithNoWorkerThreadsIsARuntimeFailure` |
+| `weida_runtime` | `Runtime.owned()`, `Runtime.owned(RuntimeConfig)`, `.listener()`, `.requester(ClientTls)`, `.shutdownAsync()` and `.shutdown(timeout, unit)` (consumes), `.close()` | present; every round-trip test. The name shadows `java.lang.Runtime`: a file that imports `net.doodleshnookie.weida.*` also imports `net.doodleshnookie.weida.Runtime` by name |
+| `weida_trust` | `new Trust()`, `.addPin(String)` returning the trust | present; `ErrorsTest.aMalformedPinIsAnInvalidFingerprint`, `QuicTest.aWrongPinIsUntrustedCarryingTheFingerprint` |
+| `weida_identity` | `Identity.generate()`, `Identity.fromPem(byte[], byte[])`, `.fingerprint()` | present; `QuicTest.aRoundTripOverQuicWithAPinnedKey` |
+| `weida_client_tls`, `weida_server_tls` | `new ClientTls(Trust)`, `new ServerTls(Identity)` | present |
+| `weida_transfer_meta` | `TransferMeta`, a value with `contentType(String)`, turned into a handle per call; `null` is empty metadata | present; `InprocTest.aStreamedRoundTripCarriesTheBodyAndTheContentType` |
+| `weida_listener` | `Listener.bindQuicAsync(addr, ServerTls)` returning `CompletableFuture<Binding>` and `.bindQuic(addr, tls, timeout, unit)`, `.bindInproc(bus)`, `.replier(path)` | present |
+| `weida_binding`, `weida_local_binding` | `Binding.localAddr()`, `LocalBinding.bus()` | present |
+| `weida_requester` | `Requester.connectAsync(url)` and `.connect(url, timeout, unit)`, `.requestAsync(byte[])` and `.request(body, timeout, unit)` returning the `IncomingTransfer` | present; `InprocTest.aStreamedRoundTripCarriesTheBodyAndTheContentType` |
+| `weida_replier` | `Replier.path()`, `.acceptAsync()` and `.accept(timeout, unit)` | present; `InprocTest.twoConcurrentAcceptsOnOneReplierServeTwoRequests`, `InprocTest.anAcceptThatTimesOutThrowsAgainAndTheNextOneServes` |
+| `weida_incoming_request` | `IncomingRequest.meta()`, `.takeBody()`, `.replyAsync(TransferMeta)` and `.reply(meta, timeout, unit)` (consumes) | present; `InprocTest.aSecondReplyIsClosed` |
+| `weida_incoming_transfer` | `IncomingTransfer.meta()`, `.readAsync(byte[], off, len)` and `.read(.., timeout, unit)` (the count, -1 at the end, as `InputStream.read` does), `.collectAsync(maxBytes)` and `.collect(maxBytes, timeout, unit)` returning a `Message` (consumes; the ceiling is at most `Integer.MAX_VALUE - 8`, the largest Java array) | present; `InprocTest.readsOf3BytesReassembleTheBody`, `InprocTest.aCollectOverItsCeilingIsLimitExceeded`, `InprocTest.aReplyClosedUnfinishedReadsAsCanceled` |
+| `weida_outgoing_transfer` | `OutgoingTransfer.writeAsync(byte[], off, len)` and `.write(..)`, `.writeAllAsync(byte[])` and `.writeAll(data, timeout, unit)`, `.finish()` returning the `Delivery` (consumes) | present; `writeAll` is the Java loop R3c leaves to the caller, its timeout bounding the whole call |
+| `weida_delivery` | `Delivery.deliveredAsync()` and `.delivered(timeout, unit)` (consumes) | present |
+| `weida_incoming_meta` | `IncomingMeta`, an immutable value copied out at once: `endpoint()`, `contentType()`, `topic()`, `peerFingerprint()` as `String` or `null`, `contentLen()` and `sequence()` as `OptionalLong` (unsigned 64-bit values in a `long`) | present |
+| `weida_msg` | `Message`: `payload()` as `byte[]`, `meta()`, copied out at once | present |
+| the ops (`*_op`) | not exposed: a waiting method starts its op, waits, and closes it when the wait ends, which cancels it only when it did not finish | refused: an op is the C caller's way to wait, not a value a Java caller needs |
+| the `_fd` functions, `weida_poll` | not exposed: the waiter thread polls the descriptors (§4) | refused: the JVM has no API that watches a raw descriptor; NIO selectors take channels only |
+| `weida_version`, `weida_strerror` | `Weida.version()`, `Weida.strerror(int)` | present; `smoke/Smoke.java`, `ErrorsTest.strerrorOfAnUnknownCodeIsUnknownError` |
+
+Every handle class is `AutoCloseable`; `close()` releases the handle now, a second `close()`
+does nothing, and a closed or consumed object throws `CLOSED` without calling C. Its pending
+futures complete exceptionally with `CLOSED`. A call takes a lease on the handle for its
+duration, so a `close()` racing it defers the C drop until the call has returned (R5), and a
+consuming method waits for the leases of calls in progress. A handle never closed is dropped by
+the daemon thread `weida-cleaner` once the garbage collector finds it unreachable (a
+`PhantomReference`; Android API 24 has no `java.lang.ref.Cleaner`). Present;
+`ErrorsTest.aClosedObjectThrowsClosedWithoutCallingC`,
+`InprocTest.closingAReplierCompletesItsPendingAcceptWithClosed`,
+`InprocTest.aBindingNeverClosedIsDroppedOnceUnreachableAndFreesItsBus`.
+
+## 3. Errors
+
+One class, `WeidaException extends RuntimeException`, with `code()` (the enum
+`WeidaException.Code`, one constant per R9 code: `RUNTIME` to `TRANSPORT`, then `AGAIN`, `INTR`,
+`INVAL`, `CLOSED`, `PANIC`), `errno()` (the positive code), `getMessage()` (the `Display` text),
+and the thread-local record as `lossCause()` (`WeidaException.LossCause` or `null`),
+`fingerprint()` (`String` or `null`), `max()` (`OptionalLong`) and `osCode()` (`OptionalInt`),
+read by the JNI glue in the same native call that failed. A Java caller branches on `code()`,
+so there are no subclasses. Present; `ErrorsTest.everyStatusCodeHasItsOwnConstantAndLibweidasText`,
+`QuicTest.aWrongPinIsUntrustedCarryingTheFingerprint`.
+
+Strings cross as UTF-8, converted by the glue rather than through JNI's modified UTF-8: a Java
+string holding a NUL character is refused with `INVAL` before C sees it, because a C string
+cannot carry one; a string out keeps an interior NUL as U+0000 and a supplementary character as
+a surrogate pair. Present; `ErrorsTest.aStringHoldingANulIsAnInvalidArgument`.
+
+## 4. Waiting
+
+| Behaviour | Verdict |
+| --- | --- |
+| No Java thread blocks inside C: every native call passes `timeout_ms = 0`, and the glue returns `AGAIN` as a value (0, -1 or "not done") instead of throwing it | present by construction (`src/main/c/weida_jni.c`) |
+| One daemon thread per process, `weida-waiter`, runs `weida_poll` over the descriptors of every pending wait plus a wake pipe; a registration is one-shot, and when its descriptor turns readable the timeout-0 attempt runs again there. A result completes the future through `ForkJoinPool.commonPool()`, so no user stage runs on the waiter thread | present; every `InprocTest` past its first `AGAIN` |
+| A registration holds a lease on its handle until the poll round after it was removed has returned, so no descriptor is closed while it is polled | present by construction (`Waiter.java`) |
+| Two waits on one handle (two `acceptAsync` on a replier) both watch its descriptor and are both retried; the one that finds nothing watches again | present; `InprocTest.twoConcurrentAcceptsOnOneReplierServeTwoRequests` |
+| Every waiting operation twice: `xAsync(..)` returns a `CompletableFuture`, `x(.., timeout, unit)` waits for it; a passed timeout cancels the operation and throws `AGAIN`, an interrupt cancels it and rethrows `InterruptedException` | present; `InprocTest.anAcceptThatTimesOutThrowsAgainAndTheNextOneServes` |
+| `cancel` on the returned future unregisters the wait and closes its op, which aborts the operation (R3b); a cancelled accept or read loses nothing, its in-flight work stays in the handle (R3a) | present; `InprocTest.aCancelledRequestEndsAndTheRuntimeStillShutsDown` |
+| Signals: the JVM handles them itself; an `EINTR` of the waiter's poll is retried there | present by construction (`Waiter.java`) |
+| An idle JVM exits: the waiter and cleaner threads are daemons | present; `smoke/Smoke.java` exits on its own |
+
+## 5. Android
+
+| Row | Verdict |
+| --- | --- |
+| The JNI library for arm64-v8a, armeabi-v7a, x86_64 and x86, compiled with the NDK's clang for API 24 against that ABI's `libweida.so`, `jni.h` from the NDK's sysroot, each checked for its ELF machine and its `NEEDED libweida.so` | present; `android-libweida` (nightly and tags), handed on as `jniLibs/<abi>/libweida_jni.so` beside `libweida.so` |
+| The Java sources use only what Android API 24 has: no `java.time`, `java.lang.ref.Cleaner`, `java.lang.foreign` or records, and no lambdas in the main sources, because API 24's `android.jar` has no `java.lang.invoke` | present; `android-libweida` compiles them against `platforms/android-24/android.jar`, which fails on any class or method API 24 lacks. That compile is at language level 8: javac compiles for 9 and up only against a modular platform, which `android.jar` is not |
+| Loading on Android: `System.loadLibrary("weida_jni")` from the APK's `jniLibs`, `libweida.so` beside it | present by construction (`Native.java`); not run |
+| Run on a device or an emulator | absent: no job has one |
+| An AAR | absent: no Gradle in this repository's CI, so 0019 §4.5's Gradle build is not done; the libraries and sources are what an app's build takes |
+
+## 6. Packaging
+
+| Row | Verdict |
+| --- | --- |
+| `build/weida-jvm.jar` (class files for Java 17, `--release 17`), with the native libraries beside it in `build/native/`: `libweida_jni.so` with the rpath `$ORIGIN` (`@loader_path` on macOS) and `libweida.so` | present; `build.sh` |
+| The jar's `Implementation-Version` is the workspace version; no version is committed in the package | present; `smoke/Smoke.java` checks it against `Weida.version()` |
+| The jar and the native libraries run alone with no Rust toolchain on `PATH` | present; `package.sh` runs `smoke/Smoke.java` from a fresh directory with `PATH` reduced to `$JAVA_HOME/bin:/usr/bin:/bin` |
+| The JNI library is found through the system property `weida.jni.path`, else `java.library.path` | present; every test run and `package.sh` |
+| The native libraries inside the jar, extracted at load | absent: they ship beside the jar |
+| Maven Central | absent: nothing of this repository is published there |
+| macOS | absent: `build.sh` has the macOS include directory and link flags, but no job builds or runs the package there |
+| Windows | absent: no Windows JVM job, and the waiter's wake pipe is POSIX |
+
+## 7. What is not mapped
+
+Every pattern, stream, cursor and statistic the C ABI does not map yet is absent here exactly
+as it is absent from the C ABI ([weida-c.md](weida-c.md) §5 to §7), and arrives when the ABI
+maps it.
+
+## 8. Sources
+
+`crates/jvm/weida-jvm/src/main/c/weida_jni.c`, `src/main/java/net/doodleshnookie/weida/`
+(`Native.java`, `Handle.java`, `Waiter.java`, `Wait.java`, `WeidaException.java` and one file
+per class), `build.sh`, `test.sh`, `develop.sh`, `package.sh`, `smoke/Smoke.java`,
+`src/test/`; `.zeughaus-ci/jvm-linux-amd64.sh`, `.zeughaus-ci/jvm-linux-arm64.sh`,
+`.zeughaus-ci/android-libweida.sh`, `.zeughaus-ci/jvm.Containerfile`,
+`.zeughaus-ci/android.Containerfile`; [weida-c.md](weida-c.md); [docs/c/](../c/README.md);
+[decisions/0046](../decisions/0046-how-each-language-binds-libweida.md),
+[decisions/0019](../decisions/0019-jvm-binding.md).

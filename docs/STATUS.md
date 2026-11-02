@@ -117,7 +117,7 @@ dimensions, transports and patterns it offers, and the six standalone foreign-pr
 libraries on the right. They share runtime foundations but no implicit semantic conversion.
 
 weida itself ships a library with an async API, the `weida` binary, a C ABI (`libweida`,
-[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python and a JavaScript package on it. Each of the six
+[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python, a JavaScript and a JVM package on it. Each of the six
 libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0, Core NATS and HTTP — has a parity document in
 [libraries/](libraries/README.md) and, where a peer exists to measure against, an interop
 suite; the NATS suite is written and not run, which its parity table records as a clause **not
@@ -132,14 +132,17 @@ serves CPython, free-threaded CPython and PyPy, and the CI tests the built wheel
 3.14, 3.14t (where importing `weida` leaves the GIL disabled) and PyPy 3.11, on linux-amd64 and
 linux-arm64. weida's JavaScript package is one Node-API addon in C over `libweida` with Promises,
 `{ signal }` cancellation and one waiter thread polling the readiness descriptors; the CI runs
-its tests under Node and its smoke under Node, Bun and Deno on both Linux architectures. Every
-further language binds `libweida` through native glue against `weida.h`
-([0046](decisions/0046-how-each-language-binds-libweida.md)): one JNI layer for the JVM and
-Android, a NIF for Erlang/Elixir, cgo for Go and an XCFramework for Swift/iOS. None of those
-packages exists yet; their environments do. Each language has a CI image on both Linux
-architectures, whose job compiles and runs the C smoke program against the `libweida` the
-`c-abi-linux-*` job of that architecture built, and `android-libweida` cross-builds `libweida`
-for the four Android ABIs on the nightly and tags.
+its tests under Node and its smoke under Node, Bun and Deno on both Linux architectures. weida's
+JVM package is one JNI library in C over `libweida`, shared by the desktop JVM and Android,
+with a Java API of `CompletableFuture`s and blocking twins and one waiter thread; the CI runs
+its JUnit tests on both Linux architectures, cross-builds the JNI library for the four Android
+ABIs and compiles the Java sources against Android API 24, without running them on Android.
+Every further language binds `libweida` through native glue against `weida.h`
+([0046](decisions/0046-how-each-language-binds-libweida.md)): a NIF for Erlang/Elixir, cgo for
+Go and an XCFramework for Swift/iOS. None of those packages exists yet; their environments do.
+Each language has a CI image on both Linux architectures, whose job compiles and runs the C
+smoke program against the `libweida` the `c-abi-linux-*` job of that architecture built, and
+`android-libweida` cross-builds `libweida` for the four Android ABIs on the nightly and tags.
 
 ## 3. The measurements that decided something
 
@@ -185,9 +188,9 @@ The ready items of [BACKLOG.md](BACKLOG.md) fall into these themes:
 Behind them sit the phases of [IMPLEMENTATION.md](IMPLEMENTATION.md) §1 that are not built:
 persistence, consensus-backed clustering, the Web binding, and the rest of weida in its C ABI
 ([0045](decisions/0045-the-c-abi-is-the-boundary.md) §5). The language packages over it follow
-in the order of [0046](decisions/0046-how-each-language-binds-libweida.md) — JavaScript,
-JVM/Android, Erlang/Elixir, Go, Swift/iOS — one plan each, on the CI environments that already
-exist; Swift/iOS also needs Xcode on the macOS runner, installed by hand.
+in the order of [0046](decisions/0046-how-each-language-binds-libweida.md) — Erlang/Elixir, Go,
+Swift/iOS — one plan each, on the CI environments that already exist; Swift/iOS also needs
+Xcode on the macOS runner, installed by hand.
 
 What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
 announcer, a blob store, one identity per connection and following a Raft leader stay out of

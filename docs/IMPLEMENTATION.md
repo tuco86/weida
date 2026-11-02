@@ -424,6 +424,18 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   `js-linux-*` jobs build the addon against the handed-on `libweida`, run the tests under Node
   and the smoke under Node, Bun and Deno, and on the nightly and tags pack the package and run
   the smoke from a fresh project that installed the tarball.
+- weida for the JVM and Android (`crates/jvm/weida-jvm`) is one JNI library written in C
+  against `weida.h`, shared by the desktop JVM and Android, with a Java API in
+  `net.doodleshnookie.weida` on top ([libraries/weida-jvm.md](libraries/weida-jvm.md)). Every
+  native call tries with `timeout_ms = 0`; on `AGAIN` the handle's descriptor goes to one
+  daemon waiter thread per process, which runs `weida_poll` and retries the call there,
+  completing the `CompletableFuture` through the common pool. Every waiting method has a
+  blocking twin with a timeout; cancelling the future drops the op. Calls hold a lease on their
+  handle, so a concurrent `close()` defers the C drop until they returned, and a phantom
+  reference drops what was never closed. The `jvm-linux-*` jobs build the JNI library and the
+  jar against the handed-on `libweida` and run the JUnit tests, on the nightly and tags also the
+  QUIC tests and the smoke from a fresh directory; `android-libweida` cross-builds the JNI
+  library for the four ABIs and compiles the Java sources against API 24's `android.jar`.
 - `weida-zmq-py`, `weida-nng-py`, `weida-mqtt-py`, `weida-amqp-py` and `weida-nats-py` bind the
   first five libraries, each following its own library, with an asyncio and a synchronous
   surface on `weida-py-core` (`crates/py/weida-py-core`), the shared PyO3 foundation
@@ -434,13 +446,14 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   filed as B-371.
 
 **Not built:** the rest of weida in the C ABI (0045 §5), and a binding for any language but
-Python and JavaScript. Every further language binds `libweida` through native glue against
-`weida.h`, in the order JVM and Android (one JNI layer), Erlang/Elixir (a NIF), Go (cgo) and
-Swift/iOS (an XCFramework) ([0046](decisions/0046-how-each-language-binds-libweida.md)). Their
-toolchains exist as CI images on linux-amd64 and linux-arm64
-(`.zeughaus-ci/{jvm,beam,go}.Containerfile`), each with a job that compiles and runs
-`tests/c/smoke.c` against the handed-on `libweida`, and `android-libweida` cross-builds
-`libweida` for arm64-v8a, armeabi-v7a, x86_64 and x86 with the NDK, API 24 and up.
+Python, JavaScript and the JVM. Every further language binds `libweida` through native glue
+against `weida.h`, in the order Erlang/Elixir (a NIF), Go (cgo) and Swift/iOS (an XCFramework)
+([0046](decisions/0046-how-each-language-binds-libweida.md)). Their toolchains exist as CI
+images on linux-amd64 and linux-arm64 (`.zeughaus-ci/{beam,go}.Containerfile`), each with a
+job that compiles and runs `tests/c/smoke.c` against the handed-on `libweida`, and
+`android-libweida` cross-builds `libweida` for arm64-v8a, armeabi-v7a, x86_64 and x86 with the
+NDK, API 24 and up. weida for the JVM is not run on an Android device or emulator, and has no
+AAR or Maven Central artifact.
 
 ### Phase 11 — CLI and administration
 
