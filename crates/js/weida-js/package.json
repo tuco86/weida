@@ -1,5 +1,5 @@
 {
-  "name": "weida",
+  "name": "@tuco86/weida",
   "version": "0.0.0-dev",
   "description": "weida for JavaScript: a Node-API addon over libweida for Node, Bun and Deno",
   "license": "MIT OR Apache-2.0",
@@ -8,10 +8,11 @@
   "types": "./lib/index.d.ts",
   "files": [
     "lib",
-    "build/weida.node",
-    "build/libweida.so",
-    "build/libweida.dylib"
+    "prebuilds"
   ],
+  "publishConfig": {
+    "registry": "https://git.doodleshnookie.net/api/packages/tuco86/npm/"
+  },
   "engines": {
     "node": ">=20"
   }

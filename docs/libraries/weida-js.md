@@ -14,8 +14,8 @@ lists what the JavaScript surface adds or changes. Verdicts are **present** (wit
 The tests are `crates/js/weida-js/test/unit/` (in-process transport only, one second each) and
 `test/integration/` (QUIC on localhost, ten seconds each), run with `node --test`; `smoke.mjs`
 makes one round trip under each runtime, and `package.sh` runs it from a fresh project that
-installed the packed tarball. Measured on Node 26, Bun 1.4.4 and Deno 2.9.8 on linux-amd64 and
-linux-arm64 (the `js-linux-*` jobs).
+installed the packed tarball. Measured on Node 26, Bun 1.4.4 and Deno 2.9.8 on linux-amd64,
+linux-arm64 and darwin-arm64 (the `js-linux-*` jobs and `js-darwin-arm64`).
 
 ## 2. Classes
 
@@ -77,13 +77,13 @@ wrong pin rejects with WEIDA_EUNTRUSTED carrying the fingerprint".
 
 | Row | Verdict |
 | --- | --- |
-| One package `weida` per platform: `lib/`, `build/weida.node` and `libweida` beside it, found through the addon's rpath (`$ORIGIN`, `@loader_path`) | present; `package.sh` |
+| One package `@tuco86/weida` for every platform: `lib/`, and per platform `prebuilds/<platform>-<arch>/weida.node` with `libweida` beside it, found through the addon's rpath (`$ORIGIN`, `@loader_path`; libweida.dylib's install name is `@rpath/libweida.dylib`); `lib/native.js` loads the one of `process.platform`-`process.arch` and names the missing path otherwise | present; `package.sh` |
 | The packed version is the workspace version (`0.1.0-alpha.11-dev` stays as it is, already semver); the committed `package.json` says `0.0.0-dev` | present; `package.sh` checks the installed version |
 | The tarball installs offline into a fresh project and runs with no Rust toolchain on `PATH` | present; `package.sh` runs `smoke.mjs` with `PATH` reduced to node, bun, deno and `/usr/bin:/bin` |
-| Node 20 and up (`engines`), Bun and Deno load the same addon through `createRequire` | present; Node 26, Bun 1.4.4, Deno 2.9.8 run (`js-linux-amd64`, `js-linux-arm64`) |
-| macOS | absent: `build.sh` has the macOS link flags, but no job builds or runs the addon there |
+| Node 20 and up (`engines`), Bun and Deno load the same addon through `createRequire` | present; Node 26, Bun 1.4.4, Deno 2.9.8 run (`js-linux-amd64`, `js-linux-arm64`, `js-darwin-arm64`) |
+| macOS | present on arm64; `js-darwin-arm64` runs the same tests and smoke with runtimes `js_env` downloads |
 | Windows | absent: no Windows JavaScript job, and the waiter's wake pipe is POSIX |
-| npm registry | absent: nothing of this repository is published to npm |
+| npm registry | present: a `v*` tag publishes `@tuco86/weida` with the linux-x64, linux-arm64 and darwin-arm64 prebuilds to `https://git.doodleshnookie.net/api/packages/tuco86/npm/` under the dist-tag `latest`; `publish-npm` |
 
 ## 6. What is not mapped
 
@@ -95,6 +95,8 @@ maps it.
 
 `crates/js/weida-js/src/` (`addon.c`, `waiter.c`, `addon.h`), `lib/` (`index.js`,
 `index.d.ts`, `native.js`, `errors.js`, `wait.js`), `build.sh`, `develop.sh`, `package.sh`,
-`smoke.mjs`, `test/`; `.zeughaus-ci/js-linux-amd64.sh`, `.zeughaus-ci/js-linux-arm64.sh`;
+`smoke.mjs`, `test/`; `.zeughaus-ci/js-linux-amd64.sh`, `.zeughaus-ci/js-linux-arm64.sh`,
+`.zeughaus-ci/js-darwin-arm64.sh`, `.zeughaus-ci/publish-npm.sh`, `js_env` and `js_check` in
+`.zeughaus-ci/build.sh`;
 [weida-c.md](weida-c.md); [docs/c/](../c/README.md);
 [decisions/0046](../decisions/0046-how-each-language-binds-libweida.md).

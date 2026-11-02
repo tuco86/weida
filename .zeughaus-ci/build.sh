@@ -1,7 +1,7 @@
 # Sourced by the platform check jobs, the c-abi jobs, the language jobs
-# (python-, js-, jvm-, beam-, go-linux-*, android-libweida), publish.sh,
-# audit.sh and fuzz.sh; no header, so not a job. Run from the workspace root,
-# with CI_PLATFORM set by the job's `platform`.
+# (python-, js-, jvm-, beam-, go-linux-*, js-darwin-arm64, android-libweida),
+# publish.sh, publish-npm.sh, audit.sh and fuzz.sh; no header, so not a job.
+# Run from the workspace root, with CI_PLATFORM set by the job's `platform`.
 
 # Cargo's home and target directory live in the workspace, which the jobs of
 # one place share and keep warm.
@@ -135,4 +135,84 @@ smoke_libweida() {
     step cc -std=c11 -Wall -Wextra -Werror -I "$in/include" \
         crates/weida-c/tests/c/smoke.c -L "$in/lib" -lweida -o /tmp/weida-c-smoke
     step env LD_LIBRARY_PATH="$in/lib" /tmp/weida-c-smoke
+}
+
+# Node, Bun and Deno for a host job, at the js image's versions: the image
+# node:26-trixie ran Node 26.13.0 in pipeline #214, and js.Containerfile pins
+# Bun 1.4.4 and Deno 2.9.8. These versions must follow js.Containerfile.
+# Each tool is downloaded once into the warm workspace, through a temporary
+# directory, so an interrupted download never leaves a half directory at
+# the final path.
+js_env() {
+    node_version=26.13.0 bun_version=1.4.4 deno_version=2.9.8
+    case "$CI_PLATFORM" in
+        darwin-arm64) node_asset=darwin-arm64 bun_asset=bun-darwin-aarch64 deno_asset=deno-aarch64-apple-darwin ;;
+        *) echo "no JavaScript runtimes for $CI_PLATFORM" >&2; return 1 ;;
+    esac
+    js="$CI_WORKSPACE/.ci-cache/js"
+    node_dir="$js/node-v$node_version-$node_asset"
+    bun_dir="$js/bun-$bun_version"
+    deno_dir="$js/deno-$deno_version"
+    mkdir -p "$js"
+    rm -rf "$js"/dl.*
+
+    if [ ! -x "$node_dir/bin/node" ]; then
+        tmp=$(mktemp -d "$js/dl.XXXXXX")
+        curl -fLsS "https://nodejs.org/dist/v$node_version/node-v$node_version-$node_asset.tar.gz" |
+            tar xzf - -C "$tmp"
+        [ -x "$tmp/node-v$node_version-$node_asset/bin/node" ]
+        mv "$tmp/node-v$node_version-$node_asset" "$node_dir"
+        rm -rf "$tmp"
+    fi
+    if [ ! -x "$bun_dir/bun" ]; then
+        js_fetch_zip "https://github.com/oven-sh/bun/releases/download/bun-v$bun_version/$bun_asset.zip" bun "$bun_dir"
+    fi
+    if [ ! -x "$deno_dir/deno" ]; then
+        js_fetch_zip "https://github.com/denoland/deno/releases/download/v$deno_version/$deno_asset.zip" deno "$deno_dir"
+    fi
+    export PATH="$node_dir/bin:$bun_dir:$deno_dir:$PATH"
+}
+
+# js_env's download of one zip holding the executable <binary> into <dir>.
+js_fetch_zip() {
+    tmp=$(mktemp -d "$js/dl.XXXXXX")
+    curl -fLsS -o "$tmp/download.zip" "$1"
+    unzip -oqj "$tmp/download.zip" -d "$tmp/out"
+    [ -x "$tmp/out/$2" ]
+    mv "$tmp/out" "$3"
+    rm -rf "$tmp"
+}
+
+# The JavaScript package's check (docs/libraries/weida-js.md) against the
+# libweida in the directory $1: the Node-API addon built against it, the unit
+# tests under Node and the in-process smoke under Node, Bun and Deno; the
+# nightly and a release tag also run the integration tests, the QUIC smoke
+# and package.sh. The addon and its libweida are handed on as
+# $CI_OUTPUT/prebuilds/<target>/, which publish-npm reads as
+# $CI_INPUTS/<job>/prebuilds/<target>/.
+js_check() {
+    step node --version
+    step bun --version
+    step deno --version
+    step cc --version
+
+    cd crates/js/weida-js
+    step env WEIDA_LIB_DIR="$1" ./build.sh
+    case $(tier) in
+        ci) tests=test transports="inproc quic" ;;
+        *) tests=test/unit transports=inproc ;;
+    esac
+    step node --test "$tests"
+    for transport in $transports; do
+        step node smoke.mjs "$transport"
+        step bun smoke.mjs "$transport"
+        step deno run --allow-read --allow-env --allow-ffi smoke.mjs "$transport"
+    done
+    if [ "$(tier)" = ci ]; then
+        step ./package.sh
+    fi
+
+    target=$(node -p 'process.platform + "-" + process.arch')
+    mkdir -p "$CI_OUTPUT/prebuilds"
+    cp -R "prebuilds/$target" "$CI_OUTPUT/prebuilds/"
 }

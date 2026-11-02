@@ -1,8 +1,9 @@
 #!/bin/sh
-# Compiles the Node-API addon build/weida.node with the system C compiler
-# against crates/weida-c/include/weida.h and the libweida in
-# $WEIDA_LIB_DIR, and copies that library beside it, where the addon's
-# rpath finds it.
+# Compiles the Node-API addon prebuilds/<platform>-<arch>/weida.node with the
+# system C compiler against crates/weida-c/include/weida.h and the libweida
+# in $WEIDA_LIB_DIR, and copies that library beside it, where the addon's
+# rpath finds it. <platform>-<arch> is Node's process.platform-process.arch:
+# linux-x64, linux-arm64 or darwin-arm64.
 #
 # Usage: WEIDA_LIB_DIR=<dir with libweida.so or libweida.dylib> build.sh
 set -eu
@@ -16,6 +17,8 @@ if [ -z "${WEIDA_LIB_DIR:-}" ]; then
 fi
 
 node_include=$(node -p "require('path').join(process.execPath, '..', '..', 'include', 'node')")
+target=$(node -p 'process.platform + "-" + process.arch')
+out="$dir/prebuilds/$target"
 
 case $(uname -s) in
     Darwin)
@@ -33,12 +36,12 @@ if [ ! -f "$WEIDA_LIB_DIR/$lib" ]; then
     exit 1
 fi
 
-mkdir -p "$dir/build"
+mkdir -p "$out"
 # shellcheck disable=SC2086 # $link is two words on purpose
 cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared \
     -I "$node_include" -I "$root/crates/weida-c/include" \
     "$dir/src/addon.c" "$dir/src/waiter.c" \
     -L "$WEIDA_LIB_DIR" -lweida -lpthread $link \
-    -o "$dir/build/weida.node"
-cp "$WEIDA_LIB_DIR/$lib" "$dir/build/$lib"
-echo "built $dir/build/weida.node against $WEIDA_LIB_DIR/$lib"
+    -o "$out/weida.node"
+cp "$WEIDA_LIB_DIR/$lib" "$out/$lib"
+echo "built $out/weida.node against $WEIDA_LIB_DIR/$lib"

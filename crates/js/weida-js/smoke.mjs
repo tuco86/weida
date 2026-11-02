@@ -7,10 +7,10 @@
 //        bun smoke.mjs <inproc|quic>
 //        deno run --allow-read --allow-env --allow-ffi smoke.mjs <inproc|quic>
 //
-// It imports the package by its name: in this directory that is the
-// package itself, in package.sh's fresh project the installed tarball.
+// It imports the package by its name, @tuco86/weida: in this directory that
+// is the package itself, in package.sh's fresh project the installed tarball.
 import { X509Certificate, createPrivateKey } from "node:crypto";
-import * as weida from "weida";
+import * as weida from "@tuco86/weida";
 
 const runtimeName = globalThis.Deno ? "deno" : globalThis.Bun ? "bun" : "node";
 const transport = (globalThis.Deno ? Deno.args : process.argv.slice(2))[0];

@@ -5,8 +5,8 @@
 # there over both transports under node, bun and deno, with PATH reduced to
 # those three runtimes plus /usr/bin:/bin.
 #
-# Needs build/weida.node (build.sh) first. The tarball stays in
-# $CARGO_TARGET_DIR/npm.
+# Needs prebuilds/<target>/weida.node (build.sh) first; packs every prebuild
+# present. The tarball stays in $CARGO_TARGET_DIR/npm.
 set -eu
 
 dir=$(cd "$(dirname "$0")" && pwd)
@@ -16,10 +16,10 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
 out="$CARGO_TARGET_DIR/npm"
 mkdir -p "$out"
 
-if [ ! -f "$dir/build/weida.node" ]; then
-    echo "package.sh: build/weida.node is missing; run build.sh first" >&2
+ls "$dir"/prebuilds/*/weida.node >/dev/null 2>&1 || {
+    echo "package.sh: prebuilds/*/weida.node is missing; run build.sh first" >&2
     exit 1
-fi
+}
 
 # [workspace.package] version of the root Cargo.toml, already valid semver.
 version=$(awk '
@@ -35,7 +35,7 @@ fresh=$(mktemp -d)
 trap 'rm -rf "$fresh"' EXIT
 
 mkdir "$fresh/package"
-cp -R "$dir/package.json" "$dir/lib" "$dir/build" "$fresh/package/"
+cp -R "$dir/package.json" "$dir/lib" "$dir/prebuilds" "$fresh/package/"
 (cd "$fresh/package" && npm pkg set "version=$version")
 tarball=$(cd "$fresh/package" && npm pack --silent --pack-destination "$out")
 echo "packed $out/$tarball"
@@ -46,7 +46,7 @@ npm init -y >/dev/null
 npm install --offline --no-audit --no-fund "$out/$tarball"
 cp "$dir/smoke.mjs" .
 
-installed=$(node -p 'JSON.parse(require("fs").readFileSync("node_modules/weida/package.json", "utf8")).version')
+installed=$(node -p 'JSON.parse(require("fs").readFileSync("node_modules/@tuco86/weida/package.json", "utf8")).version')
 if [ "$installed" != "$version" ]; then
     echo "package.sh: the installed package is $installed, not the workspace version $version" >&2
     exit 1

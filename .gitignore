@@ -10,7 +10,7 @@ crates/py/weida-py/src/weida/_ffi.py
 crates/py/weida-py/src/weida/libweida.*
 crates/py/weida-py/src/weida/weida.dll
 # What crates/js/weida-js/build.sh builds, and any npm install.
-crates/js/weida-js/build/
+crates/js/weida-js/prebuilds/
 node_modules/
 # What crates/jvm/weida-jvm/build.sh and test.sh build.
 crates/jvm/weida-jvm/build/
