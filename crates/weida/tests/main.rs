@@ -35,6 +35,7 @@ mod raw_peers {
     mod stats;
 }
 mod reconnect;
+mod relay;
 mod reorder;
 mod reqrep;
 mod sim;

@@ -69,6 +69,7 @@ mod pool;
 mod pubsub;
 mod radio;
 mod reconnect;
+mod relay;
 mod report;
 mod runtime;
 mod segment;
@@ -114,6 +115,7 @@ pub use ordering::Gap;
 pub use pubsub::{DishDrops, FanOut, TopicDrops};
 pub use radio::{Join, JoinTerms, Received};
 pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
+pub use relay::{Relay, RelayRequest};
 pub use runtime::Runtime;
 pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
 #[cfg(feature = "test-util")]
@@ -132,7 +134,8 @@ pub use transfer::{
 pub use weida_core::{
     Address, Congestion, DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT, EndpointAddr, Error,
     ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal, LossCause, PeerIdentity, PipeAddr,
-    Result, StopReason, TraceContext, UnixAddr, WindowsPrincipal,
+    RELAY_PATH, RelayAddr, Result, SCHEME_RELAY, StopReason, TraceContext, UnixAddr,
+    WindowsPrincipal,
 };
 pub use weida_protocol::{ALPN, RAFT_ALPN, VERSION, codes, filter};
 pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};

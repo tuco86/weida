@@ -419,6 +419,15 @@ impl PeerShared {
                     addr.name
                 )));
             }
+            // The target's key is in the address, so a redial is pinned to
+            // it without `proved`.
+            Address::Relay(addr) => {
+                let conn = self
+                    .runtime
+                    .connect_relayed(addr, &self.tls, &self.limits)
+                    .await?;
+                (conn, addr.path.as_str())
+            }
         };
         if let Some(attach) = &self.attach {
             attach.attach(&conn, path).await?;

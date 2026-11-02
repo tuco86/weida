@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use quinn::VarInt;
 use tokio::sync::Mutex;
-use weida_core::{EndpointAddr, Error, Fingerprint, Limits};
+use weida_core::{EndpointAddr, Error, Fingerprint, Limits, RelayAddr};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, Discovery, RuntimeConfig};
@@ -60,11 +60,20 @@ pub(crate) struct ClientPool {
     shared: Arc<Shared>,
 }
 
-/// Which **peer** a connection belongs to: authority, trust configuration and
-/// the fingerprint the address named. Two endpoints dialling the same
-/// `host:port` on different terms are not the same peer — one was
-/// authenticated on one set of terms, not both.
-type PeerKey = (String, u16, Arc<ClientTls>, Option<Fingerprint>);
+/// How a connection reaches its peer: directly, or through the relay whose
+/// key the address named, if it named one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Hop {
+    Direct,
+    Relay(Option<Fingerprint>),
+}
+
+/// Which **peer** a connection belongs to: authority, trust configuration,
+/// the fingerprint the address named, and the hop. Two endpoints dialling
+/// the same `host:port` on different terms are not the same peer — one was
+/// authenticated on one set of terms, not both — and a peer reached through
+/// a relay at `host:port` is not the relay.
+type PeerKey = (String, u16, Arc<ClientTls>, Option<Fingerprint>, Hop);
 
 /// Which **connection**: a peer plus the endpoint path it was dialled for.
 type ConnKey = (PeerKey, String);
@@ -124,7 +133,13 @@ impl ClientPool {
         // allowed at all is the runtime's configuration.
         let written_port = *port;
         let port = dial_port(written_port, config.discovery, host)?;
-        let peer: PeerKey = (host.to_owned(), port, Arc::clone(tls), expected);
+        let peer: PeerKey = (
+            host.to_owned(),
+            port,
+            Arc::clone(tls),
+            expected,
+            Hop::Direct,
+        );
         let key: ConnKey = (peer.clone(), path.clone());
         // What the pool has to say is read under the lock and the lock is
         // then **released for the dial**. Holding it across name resolution,
@@ -247,7 +262,21 @@ impl ClientPool {
                 }));
             }
         };
+        self.adopt(config, limits, exec, key, known, conn).await
+    }
 
+    /// Makes a dialled QUIC connection a pooled one: checks the identity it
+    /// proved against this peer's live connections (`known`), runs the
+    /// HELLO exchange, settles the race for `key`, and starts its reaper.
+    async fn adopt(
+        &self,
+        config: &RuntimeConfig,
+        limits: &Limits,
+        exec: &Exec,
+        key: ConnKey,
+        known: Option<Option<Fingerprint>>,
+        conn: quinn::Connection,
+    ) -> Result<ConnHandle, Error> {
         // The connections of one peer are bound together by the proved
         // fingerprint and by nothing else (0008 §4.2). Dialling a second path
         // is dialling the same peer, so a connection that proved a different
@@ -328,6 +357,102 @@ impl ClientPool {
             limits.idle_timeout,
         ));
         Ok(handle)
+    }
+
+    /// Returns a live connection to `addr.path` on the peer whose key is
+    /// `addr.target`, reached through the relay `addr.relay`
+    /// (`docs/PROTOCOL.md` §9.6), dialling if necessary.
+    ///
+    /// The hop to the relay is an ordinary pooled connection, one per relay
+    /// and terms; on it each relayed connection has a tunnel, and an inner
+    /// `quinn` endpoint of its own runs QUIC and TLS end to end with the
+    /// target through it. The tunnel ends when the inner connection closes.
+    pub(crate) async fn connect_relayed(
+        &self,
+        config: &RuntimeConfig,
+        limits: &Limits,
+        exec: &Exec,
+        addr: &RelayAddr,
+        tls: &Arc<ClientTls>,
+    ) -> Result<ConnHandle, Error> {
+        let relay = &addr.relay;
+        let port = dial_port(relay.port, config.discovery, &relay.host)?;
+        let peer: PeerKey = (
+            relay.host.clone(),
+            port,
+            Arc::clone(tls),
+            Some(addr.target),
+            Hop::Relay(relay.peer),
+        );
+        let key: ConnKey = (peer.clone(), addr.path.clone());
+        let known = {
+            let mut state = self.state.lock().await;
+            if let Some(existing) = state.connections.get(&key) {
+                if existing.conn.close_reason().is_none() {
+                    return Ok(ConnHandle::clone(existing));
+                }
+                state.connections.remove(&key);
+            }
+            state.peer_identity(&peer)
+        };
+
+        let hop = self
+            .connect(config, &config.limits, exec, relay, tls)
+            .await?;
+        let socket = crate::relay::open_tunnel(&hop, addr.target).await?;
+        let tunnel = Arc::clone(&socket);
+        let dialled = async {
+            let endpoint = {
+                let _guard = exec.enter();
+                quinn::Endpoint::new_with_abstract_socket(
+                    quinn::EndpointConfig::default(),
+                    None,
+                    socket as Arc<dyn quinn::AsyncUdpSocket>,
+                    crate::network::quic_runtime()?,
+                )
+                .map_err(Error::Io)?
+            };
+            let (client_config, refused) = tls::client_config(tls, Some(addr.target), limits)?;
+            let connecting = {
+                let _guard = exec.enter();
+                endpoint
+                    .connect_with(client_config, crate::relay::tunnel_addr(0), &relay.host)
+                    .map_err(|e| {
+                        Error::Transport(format!("connect through the relay failed: {e}"))
+                    })?
+            };
+            let handshake = exec
+                .spawn(connecting)
+                .await
+                .map_err(|e| Error::Runtime(format!("dial task failed: {e}")))?;
+            match handshake {
+                Ok(conn) => Ok((endpoint, conn)),
+                Err(e) => {
+                    let refused = refused.lock().expect("refusal record poisoned").take();
+                    Err(match refused {
+                        Some(presented) => Error::Untrusted(presented),
+                        None => conn_error(e),
+                    })
+                }
+            }
+        }
+        .await;
+        let (endpoint, conn) = match dialled {
+            Ok(dialled) => dialled,
+            Err(e) => {
+                tunnel.end();
+                return Err(e);
+            }
+        };
+        // The tunnel is a use of the hop until the inner connection closes;
+        // the endpoint lives exactly as long.
+        let closed = conn.clone();
+        exec.spawn(async move {
+            closed.closed().await;
+            tunnel.end();
+            drop(endpoint);
+        });
+        self.adopt(config, limits, exec, key, known, conn).await
     }
 }
 

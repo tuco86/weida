@@ -150,21 +150,105 @@ impl EndpointAddr {
     }
 }
 
-impl fmt::Display for EndpointAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(SCHEME)?;
-        f.write_str("://")?;
+impl EndpointAddr {
+    /// Prints `[peer@]host[:port]`, bracketing an IPv6 literal.
+    fn fmt_authority(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(peer) = &self.peer {
             write!(f, "{peer}@")?;
         }
         match (self.host_needs_brackets(), self.port) {
-            (true, Some(port)) => write!(f, "[{}]:{}{}", self.host, port, self.path),
-            (true, None) => write!(f, "[{}]{}", self.host, self.path),
-            (false, Some(port)) => write!(f, "{}:{}{}", self.host, port, self.path),
+            (true, Some(port)) => write!(f, "[{}]:{}", self.host, port),
+            (true, None) => write!(f, "[{}]", self.host),
+            (false, Some(port)) => write!(f, "{}:{}", self.host, port),
             // Round-trips: a printed address without a port parses back to one
             // without a port, and means the same set.
-            (false, None) => write!(f, "{}{}", self.host, self.path),
+            (false, None) => f.write_str(&self.host),
         }
+    }
+}
+
+impl fmt::Display for EndpointAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(SCHEME)?;
+        f.write_str("://")?;
+        self.fmt_authority(f)?;
+        f.write_str(&self.path)
+    }
+}
+
+/// URL scheme of an address reached through a relay.
+pub const SCHEME_RELAY: &str = "weida+relay";
+
+/// The endpoint path a relay serves on, and the one a relayed address dials
+/// on its relay (`docs/PROTOCOL.md` §9.6).
+pub const RELAY_PATH: &str = "/.weida/relay";
+
+/// A parsed `weida+relay://<peer>@[relay-key@]host[:port]/path` address: the
+/// endpoint `path` of the peer whose key is `target`, which serves through
+/// the relay at `relay`.
+///
+/// QUIC and TLS run end to end between the dialler and the target; the relay
+/// only forwards datagrams, so the target's key is part of the address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayAddr {
+    /// The key of the peer the address reaches.
+    pub target: Fingerprint,
+    /// The relay's address; its `path` is always [`RELAY_PATH`] and its
+    /// `peer` is the relay's key when the address names one.
+    pub relay: EndpointAddr,
+    /// The endpoint path on the target.
+    pub path: String,
+}
+
+impl RelayAddr {
+    /// Parses a `weida+relay://<peer>@[relay-key@]host[:port]/path` URL.
+    ///
+    /// The relay's authority follows the rules of [`EndpointAddr::parse`];
+    /// the path is validated by [`validate_endpoint_path`].
+    pub fn parse(input: &str) -> Result<RelayAddr, Error> {
+        let invalid = |m: &str| Error::InvalidAddress(format!("{m}: {input:?}"));
+
+        let rest = input
+            .strip_prefix(SCHEME_RELAY)
+            .and_then(|r| r.strip_prefix("://"))
+            .ok_or_else(|| invalid("expected scheme weida+relay://"))?;
+
+        let (authority, path) = match rest.find('/') {
+            Some(i) => rest.split_at(i),
+            None => return Err(invalid("missing endpoint path")),
+        };
+
+        let target = authority
+            .split_once('@')
+            .and_then(|(target, relay)| Some((target.parse::<Fingerprint>().ok()?, relay)));
+        let Some((target, relay_authority)) = target else {
+            return Err(invalid(
+                "a relayed address names the peer it reaches: \
+                 weida+relay://sha256:<peer>@[sha256:<relay>@]host[:port]/path",
+            ));
+        };
+
+        let relay = EndpointAddr::parse(&format!("{SCHEME}://{relay_authority}{RELAY_PATH}"))
+            .map_err(|e| match e {
+                Error::InvalidAddress(m) => invalid(&format!("relay: {m}")),
+                other => other,
+            })?;
+
+        validate_endpoint_path(path).map_err(|_| invalid("invalid endpoint path"))?;
+
+        Ok(RelayAddr {
+            target,
+            relay,
+            path: path.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for RelayAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{SCHEME_RELAY}://{}@", self.target)?;
+        self.relay.fmt_authority(f)?;
+        f.write_str(&self.path)
     }
 }
 
@@ -207,11 +291,17 @@ pub enum Address {
     /// `weida+pipe://<name>/path` — a Windows named pipe, the kernel proves
     /// the peer.
     Pipe(PipeAddr),
+    /// `weida+relay://<peer>@[relay-key@]host[:port]/path` — the network
+    /// transport, end to end, through a relay.
+    Relay(RelayAddr),
 }
 
 impl Address {
     /// Parses an address of any transport, by scheme.
     pub fn parse(input: &str) -> Result<Address, Error> {
+        if input.starts_with(SCHEME_RELAY) {
+            return RelayAddr::parse(input).map(Address::Relay);
+        }
         if let Some(rest) = input
             .strip_prefix(SCHEME_INPROC)
             .and_then(|r| r.strip_prefix("://"))
@@ -234,6 +324,7 @@ impl Address {
             Address::Inproc(a) => &a.path,
             Address::Unix(a) => &a.path,
             Address::Pipe(a) => &a.path,
+            Address::Relay(a) => &a.path,
         }
     }
 }
@@ -519,6 +610,55 @@ mod tests {
         assert_eq!(EndpointAddr::parse(&a.to_string()).expect("reparse"), a);
 
         assert!(EndpointAddr::parse("weida://[::1]x/y").is_err());
+    }
+
+    const FP2: &str = "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+
+    #[test]
+    fn a_relayed_address_round_trips_through_display() {
+        let s = format!("weida+relay://{FP}@{FP2}@relay.example:7443/jobs");
+        let a = RelayAddr::parse(&s).expect("parse");
+        assert_eq!(a.target, FP.parse().unwrap());
+        assert_eq!(a.relay.peer, Some(FP2.parse().unwrap()));
+        assert_eq!(a.relay.host, "relay.example");
+        assert_eq!(a.relay.port, Some(7443));
+        assert_eq!(a.relay.path, RELAY_PATH);
+        assert_eq!(a.path, "/jobs");
+        assert_eq!(a.to_string(), s);
+        assert_eq!(RelayAddr::parse(&a.to_string()).expect("reparse"), a);
+    }
+
+    #[test]
+    fn a_relayed_address_may_omit_the_relay_key_and_use_ipv6() {
+        let a = RelayAddr::parse(&format!("weida+relay://{FP}@relay.example:7443/jobs"))
+            .expect("parse");
+        assert_eq!(a.relay.peer, None);
+        assert_eq!(a.relay.host, "relay.example");
+
+        let s = format!("weida+relay://{FP}@[::1]:7443/jobs");
+        let a = RelayAddr::parse(&s).expect("parse");
+        assert_eq!(a.relay.host, "::1");
+        assert_eq!(a.relay.port, Some(7443));
+        assert_eq!(a.to_string(), s);
+    }
+
+    #[test]
+    fn a_relayed_address_without_its_target_is_invalid() {
+        assert!(matches!(
+            RelayAddr::parse("weida+relay://relay.example:7443/jobs"),
+            Err(Error::InvalidAddress(_))
+        ));
+        assert!(matches!(
+            Address::parse("weida+relay://relay.example:7443/jobs"),
+            Err(Error::InvalidAddress(_))
+        ));
+    }
+
+    #[test]
+    fn a_relayed_url_parses_as_a_relay_address() {
+        let s = format!("weida+relay://{FP}@127.0.0.1:7443/jobs");
+        assert!(matches!(Address::parse(&s), Ok(Address::Relay(_))));
+        assert_eq!(Address::parse(&s).unwrap().path(), "/jobs");
     }
 
     /// The pinned form works without a port too: the fingerprint identifies

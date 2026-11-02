@@ -654,6 +654,11 @@ fn bind_local(listener: &weida::Listener, url: &str) -> Result<(String, String),
         Address::Pipe(_) => Err(Error::InvalidAddress(
             "weida+pipe:// needs a Windows host".to_owned(),
         )),
+        Address::Relay(_) => Err(Error::InvalidAddress(
+            "weida+relay:// is dialled, not bound; a dial-only peer binds through a relay \
+             with Listener::bind_relay"
+                .to_owned(),
+        )),
     }
 }
 

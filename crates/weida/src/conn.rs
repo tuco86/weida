@@ -130,6 +130,9 @@ pub(crate) struct ConnCtx {
     /// heads are bounded by the slots: not by the peer's stream budget, and
     /// not by what its streams go on to do.
     pub header_slots: Semaphore,
+    /// Tunnels this connection carries for a relay, and its relay flow
+    /// ([`crate::relay`]).
+    pub relay: crate::relay::RelayLink,
     agreed: watch::Receiver<Option<Agreed>>,
     /// Whether our own HELLO has been written. Negotiation waits for it as
     /// well as for the peer's: a peer parks every stream until our HELLO
@@ -193,6 +196,7 @@ impl ConnCtx {
             remote: crate::report::RemoteSlot::default(),
             // tokio panics above `Semaphore::MAX_PERMITS`.
             header_slots: Semaphore::new(limits.header_slots().min(Semaphore::MAX_PERMITS)),
+            relay: crate::relay::RelayLink::new(),
         });
 
         // Once per connection, never per message: a drain collects the

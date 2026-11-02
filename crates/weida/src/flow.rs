@@ -907,6 +907,11 @@ impl IncomingFlow {
         &self.info
     }
 
+    /// The connection the flow arrived on.
+    pub(crate) fn conn(&self) -> &ConnHandle {
+        &self.conn
+    }
+
     /// The next datagram, oldest first; `None` once the flow has ended and
     /// every datagram that arrived before its end has been taken.
     pub async fn recv(&self) -> Option<Bytes> {

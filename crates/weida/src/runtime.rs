@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use quinn::VarInt;
-use weida_core::{EndpointAddr, Error, Limits};
+use weida_core::{EndpointAddr, Error, Limits, RelayAddr};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
@@ -92,6 +92,20 @@ impl RuntimeInner {
     ) -> Result<ConnHandle, Error> {
         self.pool
             .connect(&self.config, limits, &self.exec, addr, tls)
+            .await
+    }
+
+    /// Dials, or reuses a pooled connection to, `addr.path` on the peer
+    /// `addr.target` through the relay `addr.relay`; see
+    /// [`ClientPool::connect_relayed`].
+    pub(crate) async fn connect_relayed(
+        &self,
+        addr: &RelayAddr,
+        tls: &Arc<ClientTls>,
+        limits: &Limits,
+    ) -> Result<ConnHandle, Error> {
+        self.pool
+            .connect_relayed(&self.config, limits, &self.exec, addr, tls)
             .await
     }
 

@@ -87,7 +87,7 @@ impl Network {
 }
 
 /// `quinn`'s runtime for the reactor the caller entered.
-fn quic_runtime() -> Result<Arc<dyn quinn::Runtime>, Error> {
+pub(crate) fn quic_runtime() -> Result<Arc<dyn quinn::Runtime>, Error> {
     quinn::default_runtime()
         .ok_or_else(|| Error::Runtime("no async runtime for the QUIC endpoint".into()))
 }
@@ -129,15 +129,30 @@ impl BoundSocket {
             lease: AddrLease::Os(socket),
         })
     }
+
+    /// A hidden peer's relay socket ([`crate::Listener::bind_relay`]).
+    pub(crate) fn relay(
+        socket: Arc<crate::relay::RelaySocket>,
+        exec: &Exec,
+    ) -> Result<BoundSocket, Error> {
+        let _guard = exec.enter();
+        Ok(BoundSocket {
+            inner: Arc::clone(&socket) as Arc<dyn quinn::AsyncUdpSocket>,
+            runtime: quic_runtime()?,
+            lease: AddrLease::Relay(socket),
+        })
+    }
 }
 
 /// Frees a binding's address when it closes: closes the OS socket and its
-/// handover duplicate, or frees the simulated address.
+/// handover duplicate, frees the simulated address, or ends a relay
+/// registration.
 #[derive(Clone, Debug)]
 pub(crate) enum AddrLease {
     Os(Arc<OsSocket>),
     #[cfg(feature = "test-util")]
     Sim(Arc<crate::sim::SimSocket>),
+    Relay(Arc<crate::relay::RelaySocket>),
 }
 
 impl AddrLease {
@@ -146,16 +161,18 @@ impl AddrLease {
             AddrLease::Os(socket) => socket.release(),
             #[cfg(feature = "test-util")]
             AddrLease::Sim(socket) => socket.release(),
+            AddrLease::Relay(socket) => socket.release(),
         }
     }
 
-    /// The duplicate a handover passes on; `None` on a simulated network, once
-    /// taken, and once released.
+    /// The duplicate a handover passes on; `None` on a simulated network, on
+    /// a relay, once taken, and once released.
     pub(crate) fn take_handed(&self) -> Option<std::net::UdpSocket> {
         match self {
             AddrLease::Os(socket) => socket.take_handed(),
             #[cfg(feature = "test-util")]
             AddrLease::Sim(_) => None,
+            AddrLease::Relay(_) => None,
         }
     }
 }

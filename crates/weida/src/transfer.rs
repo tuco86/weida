@@ -988,6 +988,11 @@ impl IncomingRequest {
         ConnectionId(self.reply.conn.conn.stable_id())
     }
 
+    /// The connection the request arrived on.
+    pub(crate) fn conn(&self) -> &ConnHandle {
+        &self.reply.conn
+    }
+
     /// The request payload, borrowed.
     ///
     /// Panics after [`IncomingRequest::take_body`] has detached it.

@@ -19,8 +19,9 @@ pub mod trace;
 
 pub use addr::{
     Address, DEFAULT_PORT, EndpointAddr, InprocAddr, MAX_BUS_BYTES, MAX_PATH_BYTES,
-    MAX_PIPE_NAME_BYTES, MAX_SOCKET_PATH_BYTES, PIPE_NAMESPACE, PipeAddr, SCHEME, SCHEME_INPROC,
-    SCHEME_PIPE, SCHEME_UNIX, UnixAddr, validate_endpoint_path,
+    MAX_PIPE_NAME_BYTES, MAX_SOCKET_PATH_BYTES, PIPE_NAMESPACE, PipeAddr, RELAY_PATH, RelayAddr,
+    SCHEME, SCHEME_INPROC, SCHEME_PIPE, SCHEME_RELAY, SCHEME_UNIX, UnixAddr,
+    validate_endpoint_path,
 };
 pub use error::{Error, ErrorCode, LossCause, Result, StopReason};
 pub use host::{HostKey, host_key};

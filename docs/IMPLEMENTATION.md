@@ -1394,7 +1394,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 
 | Decision | Value | Rationale |
 | --- | --- | --- |
-| URL scheme | `weida://` and, for the local transports, `weida+inproc://`, `weida+unix://` and `weida+pipe://` | The master doc's `mq://` is a working name (§82). One scheme constant per transport in `crates/core/src/addr.rs`; the scheme alone picks the transport. |
+| URL scheme | `weida://`; for the local transports `weida+inproc://`, `weida+unix://` and `weida+pipe://`; and `weida+relay://` for a dial-only peer reached through a relay (`docs/PROTOCOL.md` §9.6) | The master doc's `mq://` is a working name (§82). One scheme constant per transport in `crates/core/src/addr.rs`; the scheme alone picks the transport. |
 | ALPN token | `weida/0` | Couples the TLS-level protocol identity to the wire protocol version, so a version-0 peer cannot silently talk to a future version. |
 | Stream magic | `0x57` (ASCII `W`) | Cheap first-byte rejection of non-weida streams. |
 | Wire protocol version | `0` | Experimental per master doc §15; independent of the library version. |

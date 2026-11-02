@@ -410,6 +410,8 @@ its UDP counts — to the peer, which can see its own download loss no other way
 on QUIC and only when both HELLOs listed capability code `2` (§6.1). Kind `9` is the first
 free number.
 
+The relay of §9.6 adds no kind: it is DATA, FLOW and DATAGRAM on one fixed path.
+
 HELLO, ERROR, SUBSCRIBE, UNSUBSCRIBE and CREDIT are header-only frames: the sender MUST FIN
 the stream immediately after the header. Receiver handling of bytes appearing after the
 header on a header-only stream is unspecified in v0; a receiver MAY ignore them and MAY stop
@@ -1520,6 +1522,69 @@ drop instead of missing it silently, which is the whole reason the key exists
 ([decisions/0001](decisions/0001-sequence-field.md) §7.2).
 
 Ordering between exchanges is likewise `None`, for the same reason.
+
+### 9.6 Relay
+
+A peer that can only dial out (the **hidden** peer H) is reached through a **relay** R that
+both it and a **dialler** D can dial. R forwards opaque QUIC datagrams and terminates nothing:
+D's connection to H is an ordinary QUIC connection, with TLS end to end, whose packets travel
+through R inside a **tunnel**. The address that names it is
+`weida+relay://<H-key>@[<R-key>@]host[:port]/path`: the authority after the first `@` is R's,
+exactly as in a `weida://` address, and the path is H's. The relay adds no frame kind and no
+header key (§4); everything below is DATA, FLOW and DATAGRAM on one fixed path.
+
+**Path.** R serves `/.weida/relay`; H and D dial it. A dialling side that uses the relay
+registers the same path on its own connection, where R's FLOW to it arrives.
+
+**Request preamble.** The first bytes of the request payload of an exchange to the relay path:
+
+| Bytes | Sent by | Meaning |
+| --- | --- | --- |
+| `0x00` | H | REGISTER: serve the tunnels of the key this connection proved |
+| `0x01` followed by 32 bytes | D | REACH: open a tunnel to the peer whose key digest (§6.1's SHA-256 fingerprint) these bytes are |
+
+R answers any other first byte with ERROR `UNSUPPORTED`.
+
+**Reply preamble.** A REACH reply payload starts with `varint tunnel`, a QUIC varint naming the
+tunnel; a REGISTER reply has none. A refusal is an ERROR frame instead of the reply:
+
+| Code | When |
+| --- | --- |
+| `REJECTED` | the relay's application refused it, the registrant proved no key, or a second REGISTER arrived on one connection |
+| `UNKNOWN_ENDPOINT` | no peer with the REACH target's key is registered |
+| `UNSUPPORTED` | the preamble byte is unknown |
+
+A REGISTER from a key that is registered on another connection replaces that registration, and R
+closes the other connection: it is H's redial, which overtook R's idle timeout.
+
+**Records.** After the preambles, both halves of both exchanges carry records
+`varint tunnel || varint len || len bytes`, each record one inner QUIC datagram, with
+`1 <= len <= 1200`. A reader that sees `len` outside that range ends the exchange (reset, or
+stop with `CANCELED`). So does the reader of a REACH exchange that sees a tunnel other than the
+one its reply named. On a REGISTER exchange the tunnel says which dialler a datagram belongs
+to; R numbers tunnels and the same number names one tunnel on D's connection and on H's.
+
+**Datagrams.** Each connection to or from the relay has at most one FLOW per direction,
+addressed to the relay path with no optional keys (§6.8). Its DATAGRAM payload (§6.9) is
+`varint tunnel || inner QUIC datagram`. A datagram for an unknown tunnel is dropped.
+
+**Carrier rule.** Every sender, at each hop, sends one inner datagram as follows:
+
+1. as a datagram, if `varint tunnel || datagram` is at most the largest payload its FLOW
+   carries right now;
+2. otherwise as a record, if the inner datagram is at most 1200 bytes (RFC 9000 §14's
+   minimum, so a QUIC Initial always passes before outer MTU discovery has run);
+3. otherwise not at all, as a path with a smaller MTU drops it; the inner connection's MTU
+   discovery settles below it.
+
+Without capability code `1` (§6.1) on a connection there is no FLOW and everything goes as
+records. A record queue that is full drops the datagram, as a full socket buffer does.
+
+**Lifetimes.** A tunnel lives as long as its REACH exchange: ending either half ends it at R,
+which ends the tunnel's halves on the other connection too. A registration lives as long as its
+REGISTER exchange, and its end ends its tunnels. A side opens its FLOW toward the other end of a
+connection on the connection's first tunnel or registration and finishes it on its last, so a
+connection the relay no longer uses is free to close.
 
 ---
 

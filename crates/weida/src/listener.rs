@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use quinn::VarInt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use weida_core::{Error, Fingerprint, Limits, validate_endpoint_path};
+use weida_core::{EndpointAddr, Error, Fingerprint, Limits, RELAY_PATH, validate_endpoint_path};
 use weida_protocol::codes;
 use weida_protocol::header::GuaranteeSet;
 
@@ -27,8 +27,9 @@ use crate::handoff::{self, Handoff, HandoverSocket};
 use crate::inproc;
 use crate::network::{AddrLease, BoundSocket};
 use crate::pubsub::SubRegistry;
+use crate::relay::{RegisterAttach, Relay, RelaySocket};
 use crate::runtime::{Exec, RuntimeInner, Shared};
-use crate::stream::{Acceptor, Incoming};
+use crate::stream::{Acceptor, Incoming, Peer};
 use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
 use crate::transport::{Link, QuicLink};
@@ -405,6 +406,57 @@ impl Listener {
         )
     }
 
+    /// Serves this Listener's endpoints through a relay, for a peer that can
+    /// only dial out ([`crate::Relay`], `docs/PROTOCOL.md` §9.6).
+    ///
+    /// Dials `relay`, a `weida://[relay-key@]host[:port]/.weida/relay`
+    /// address, on `via`'s terms and registers there under the key `via`
+    /// presents, which therefore needs an identity. A dialler reaches the
+    /// endpoints as `weida+relay://<key>@[relay-key@]host[:port]/path`, with
+    /// QUIC and TLS end to end: `tls` is this side's server identity and
+    /// client trust, exactly as for [`Listener::bind_quic`], and every
+    /// endpoint sees the dialler's own key, not the relay's.
+    ///
+    /// The registration is kept as a dialled address is: a lost relay is
+    /// redialled and registered again under the runtime's
+    /// [`crate::ReconnectPolicy`], reported on [`Binding::relay_events`]. The
+    /// first registration's failure is returned, and nothing is served then:
+    /// [`Error::Rejected`] where the relay refused it.
+    pub async fn bind_relay(
+        &self,
+        relay: &str,
+        via: impl Into<ClientTls>,
+        tls: impl Into<ServerTls>,
+    ) -> Result<Binding, Error> {
+        let runtime = &self.inner.runtime;
+        let server_config = tls::server_config(&tls.into(), &runtime.config.limits)?;
+        if EndpointAddr::parse(relay)?.path != RELAY_PATH {
+            return Err(Error::InvalidAddress(format!(
+                "a relay serves on {RELAY_PATH}: {relay:?}"
+            )));
+        }
+        let socket = Arc::new(RelaySocket::new());
+        let peer = Peer::with_attach(
+            Arc::clone(runtime),
+            Arc::new(via.into()),
+            Some(Arc::new(RegisterAttach::new(&socket))),
+        );
+        peer.connect(relay).await?;
+        socket.set_peer(peer);
+        let served = BoundSocket::relay(Arc::clone(&socket), &runtime.exec)
+            .and_then(|bound| self.serve_quic(bound, server_config));
+        match served {
+            Ok(mut binding) => {
+                binding.relay = Some(socket);
+                Ok(binding)
+            }
+            Err(e) => {
+                socket.release();
+                Err(e)
+            }
+        }
+    }
+
     /// Serves this Listener's endpoints over QUIC on `socket`.
     fn serve_quic(
         &self,
@@ -454,6 +506,7 @@ impl Listener {
             open,
             close_timeout: self.inner.runtime.config.shutdown_timeout,
             exec,
+            relay: None,
         })
     }
 
@@ -672,6 +725,18 @@ impl Listener {
         Ok(Acceptor::new(path, rx))
     }
 
+    /// Serves a relay on this Listener: hidden peers register through
+    /// [`Listener::bind_relay`], and diallers reach them through
+    /// `weida+relay://` addresses ([`Relay`], `docs/PROTOCOL.md` §9.6).
+    ///
+    /// Claims [`RELAY_PATH`] on every binding of this Listener, so a second
+    /// call fails with [`Error::AlreadyRegistered`]. Each registration and
+    /// each tunnel waits at [`Relay::accept`] for the application to admit
+    /// or refuse it.
+    pub fn relay(&self) -> Result<Relay, Error> {
+        Relay::serve_on(&self.inner)
+    }
+
     /// Registers a bound paired endpoint for `path`.
     ///
     /// PAIR is one connection and one peer, carrying one-way transfers in
@@ -820,6 +885,8 @@ pub struct Binding {
     open: Arc<OpenConns>,
     exec: Exec,
     close_timeout: Duration,
+    /// The registration a relayed binding serves through.
+    relay: Option<Arc<RelaySocket>>,
 }
 
 impl std::fmt::Debug for Binding {
@@ -834,6 +901,13 @@ impl Binding {
     /// The address actually bound, with the port resolved.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The events of a relayed binding's connection to its relay: lost,
+    /// redialled and registered again, given up. `None` for every other
+    /// binding.
+    pub fn relay_events(&self) -> Option<crate::PeerEvents> {
+        self.relay.as_ref().and_then(|socket| socket.events())
     }
 
     /// Stops accepting and closes this binding's connections with
@@ -887,12 +961,12 @@ impl Binding {
     ///
     /// # Panics
     ///
-    /// On a binding on a simulated network, which has no OS socket to hand
-    /// over, or on a binding already closed by [`Binding::close`] or
+    /// On a binding on a simulated network or a relay, which has no OS socket
+    /// to hand over, or on a binding already closed by [`Binding::close`] or
     /// [`Runtime::shutdown`](crate::Runtime::shutdown).
     pub async fn hand_over(self) -> Handoff {
         let handed = self.served.take_handed().expect(
-            "Binding::hand_over needs an open OS socket; a closed binding, or one on a simulated network, has none",
+            "Binding::hand_over needs an open OS socket; a closed binding, or one on a simulated network or a relay, has none",
         );
         self.socket.hold();
         let pending: Vec<quinn::Connection> = self
