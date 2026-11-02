@@ -96,7 +96,7 @@ c_abi() {
 
     venv="$CI_WORKSPACE/.ci-cache/venv"
     step python3 -m venv "$venv"
-    step "$venv/bin/pip" install cffi hatchling pytest pytest-timeout pytest-socket
+    step "$venv/bin/pip" install cffi hatchling pytest pytest-timeout pytest-socket cryptography
     step "$venv/bin/pip" install --no-build-isolation -e crates/py/weida-py
 
     case $(tier) in

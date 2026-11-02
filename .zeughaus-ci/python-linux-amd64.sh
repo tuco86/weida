@@ -10,7 +10,8 @@
 # installs into a fresh virtualenv per interpreter, importing weida on 3.14t
 # leaves the GIL disabled, and the tests run against the installed wheel (the
 # unit tier on a push or manual run, both tiers on the nightly and a release
-# tag).
+# tag). `cryptography` goes into the CPython venv only, so 3.14t and PyPy run
+# the tests without it (decision 0047: the package works without it).
 set -eu
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 
@@ -21,7 +22,8 @@ for pair in cpython:cpython-3.14.7 cpython-ft:cpython-3.14.7+freethreaded pypy:p
     name=${pair%%:*} request=${pair#*:}
     venv="$CI_WORKSPACE/.ci-cache/venv-$name"
     step uv venv --clear --python "$request" "$venv"
-    step uv pip install --python "$venv" "$wheel" pytest pytest-timeout pytest-socket
+    case $name in cpython) extra=cryptography ;; *) extra= ;; esac
+    step uv pip install --python "$venv" "$wheel" pytest pytest-timeout pytest-socket $extra
     step "$venv/bin/python" -c 'import sys, weida; print(sys.version); print("libweida", weida.version())'
     if [ "$name" = cpython-ft ]; then
         step "$venv/bin/python" -c 'import sys, weida; assert not sys._is_gil_enabled(), "importing weida re-enabled the GIL"; print("free-threaded: GIL disabled")'

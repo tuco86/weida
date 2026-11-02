@@ -1,9 +1,13 @@
 """The value classes both surfaces share: configuration, TLS values,
 metadata and messages, and the handle base every object stands on."""
 
+import base64
+import os
+import re
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
+from weida._crypto import certificate_pem, key_pem, path
 from weida._errors import Closed, check
 from weida._native import ffi, lib
 from weida._wait import Waiters
@@ -22,6 +26,16 @@ def _text(getter: Callable, handle) -> Optional[str]:
     if ptr == ffi.NULL:
         return None
     return ffi.unpack(ptr, length[0]).decode("utf-8")
+
+
+def _pem_take(ptr, wipeable: bool):
+    """Copies a `weida_pem` out and drops it, which wipes it: into a
+    `bytearray` the caller can wipe when it holds a key, else `bytes`."""
+    try:
+        buffer = ffi.buffer(lib.weida_pem_data(ptr), lib.weida_pem_len(ptr))
+        return bytearray(buffer) if wipeable else buffer[:]
+    finally:
+        lib.weida_pem_drop(ptr)
 
 
 class _Handle:
@@ -105,7 +119,7 @@ class RuntimeConfig:
 
 
 class Trust(_Handle):
-    """Whom a dialler trusts: what each address names, plus pins."""
+    """Whom a dialler trusts: what each address names, plus pins and anchors."""
 
     def __init__(self) -> None:
         out = ffi.new("weida_trust **")
@@ -115,6 +129,27 @@ class Trust(_Handle):
     def add_pin(self, fingerprint: str) -> "Trust":
         """Pins a `sha256:` fingerprint; returns this trust."""
         check(lib.weida_trust_add_pin(self._p(), fingerprint.encode()))
+        return self
+
+    def add_anchor(self, anchor) -> "Trust":
+        """Trusts certificates chaining to `anchor` (PEM bytes, a cryptography
+        `x509.Certificate` or a list of them) for the names they carry;
+        returns this trust. The bytes are copied, and parsed at each dial: a
+        bad PEM fails that dial with `Tls`."""
+        if isinstance(anchor, (str, os.PathLike)):
+            raise TypeError(
+                "add_anchor takes PEM bytes or a cryptography x509.Certificate;"
+                " a path goes to add_anchor_file"
+            )
+        pem = certificate_pem(anchor)
+        data = ffi.from_buffer("uint8_t[]", pem)
+        check(lib.weida_trust_add_anchor(self._p(), data, len(data)))
+        return self
+
+    def add_anchor_file(self, file) -> "Trust":
+        """Trusts the PEM anchors in `file` (`str`, `bytes` or `os.PathLike`),
+        read at each dial; returns this trust."""
+        check(lib.weida_trust_add_anchor_file(self._p(), path(file)))
         return self
 
 
@@ -129,11 +164,61 @@ class Identity(_Handle):
         return cls._wrap(out[0])
 
     @classmethod
-    def from_pem(cls, cert: bytes, key: bytes) -> "Identity":
-        """An identity from PEM bytes: the chain, leaf first, and the key."""
+    def generate_for(cls, names: Sequence[str]) -> "Identity":
+        """A self-signed identity whose certificate names `names` (DNS names or
+        IP literals), so a peer anchoring it can check the dialled host. An
+        empty list is `generate()`; a name the certificate cannot carry raises
+        `Tls`."""
+        if isinstance(names, (str, bytes, bytearray)):
+            raise TypeError("generate_for takes a list of names, not one string")
+        names = list(names)
+        for name in names:
+            if not isinstance(name, str):
+                raise TypeError("every name is a str")
+            if "\0" in name:
+                raise ValueError("embedded null byte")
+        encoded = [ffi.new("char[]", name.encode()) for name in names]
+        array = ffi.new("const char *[]", encoded) if encoded else ffi.NULL
         out = ffi.new("weida_identity **")
-        check(lib.weida_identity_from_pem(cert, len(cert), key, len(key), out))
+        check(lib.weida_identity_generate_for(array, len(encoded), out))
         return cls._wrap(out[0])
+
+    @classmethod
+    def from_pem(cls, cert, key) -> "Identity":
+        """An identity from PEM bytes (any bytes-like): the chain, leaf first,
+        and the key."""
+        cert_data = ffi.from_buffer("uint8_t[]", cert)
+        key_data = ffi.from_buffer("uint8_t[]", key)
+        out = ffi.new("weida_identity **")
+        check(lib.weida_identity_from_pem(cert_data, len(cert_data), key_data, len(key_data), out))
+        return cls._wrap(out[0])
+
+    @classmethod
+    def from_pem_file(cls, file) -> "Identity":
+        """An identity from one PEM file holding the chain and the key, the
+        form `to_pem()` writes, as `ssl.SSLContext.load_cert_chain(certfile)`
+        takes it. Nothing is read here; a missing or bad file raises `Tls` at
+        first use (`fingerprint()`, the PEM getters, a bind or a dial)."""
+        out = ffi.new("weida_identity **")
+        check(lib.weida_identity_from_pem_file(path(file), out))
+        return cls._wrap(out[0])
+
+    @classmethod
+    def from_pem_files(cls, cert_chain, key) -> "Identity":
+        """An identity from a PEM chain file (leaf first) and a PEM key file.
+        Nothing is read here; a missing or bad file raises `Tls` at first use
+        (`fingerprint()`, the PEM getters, a bind or a dial)."""
+        out = ffi.new("weida_identity **")
+        check(lib.weida_identity_from_pem_files(path(cert_chain), path(key), out))
+        return cls._wrap(out[0])
+
+    @classmethod
+    def from_cryptography(cls, cert, key) -> "Identity":
+        """An identity from `cryptography` objects. `cert` is a cryptography
+        `x509.Certificate`, a list of them leaf first, or PEM bytes; `key` is a
+        cryptography RSA, EC or Ed25519 private key (exported as PKCS#8) or
+        PEM bytes. Needs `cryptography` only for its objects."""
+        return cls.from_pem(certificate_pem(cert), key_pem(key))
 
     @classmethod
     def _wrap(cls, ptr) -> "Identity":
@@ -147,23 +232,85 @@ class Identity(_Handle):
         check(lib.weida_identity_fingerprint(self._p(), out))
         return ffi.string(out[0]).decode()
 
+    def certificate_pem(self) -> bytes:
+        """The certificate chain as PEM, leaf first, without the key; read
+        anew on every call."""
+        out = ffi.new("weida_pem **")
+        check(lib.weida_identity_certificate_pem(self._p(), out))
+        return _pem_take(out[0], False)
+
+    def to_pem(self) -> bytearray:
+        """The chain and the private key as one PEM document, the form
+        `from_pem_file` reads. It holds the private key: wipe it when done
+        (`pem[:] = bytes(len(pem))`); every other copy is the caller's to
+        wipe."""
+        out = ffi.new("weida_pem **")
+        check(lib.weida_identity_to_pem(self._p(), out))
+        return _pem_take(out[0], True)
+
+    def certificates(self) -> List[bytes]:
+        """The DER of each certificate of the chain, leaf first;
+        `cryptography.x509.load_der_x509_certificate` reads each one."""
+        blocks = re.findall(
+            rb"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----",
+            self.certificate_pem(),
+            re.S,
+        )
+        return [base64.b64decode(block) for block in blocks]
+
+
+class _AnyKey:
+    """`ClientTrust::AnyKey`: any client key the client proves it holds."""
+
+    def __repr__(self) -> str:
+        return "weida.ANY_KEY"
+
+
+ANY_KEY = _AnyKey()
+
 
 class ClientTls(_Handle):
-    """The TLS terms a requester dials on: anonymous, under `trust`."""
+    """The TLS terms a requester dials on, under `trust`: anonymous, or
+    presenting `identity`."""
 
-    def __init__(self, trust: Trust) -> None:
+    def __init__(self, trust: Trust, identity: Optional[Identity] = None) -> None:
+        if identity is not None and not isinstance(identity, Identity):
+            raise TypeError("identity is a weida.Identity")
         out = ffi.new("weida_client_tls **")
         check(lib.weida_client_tls_new(trust._p(), out))
         super().__init__(out[0], lib.weida_client_tls_drop)
+        if identity is not None:
+            try:
+                check(lib.weida_client_tls_set_identity(self._p(), identity._p()))
+            except BaseException:
+                self.drop()
+                raise
 
 
 class ServerTls(_Handle):
-    """The TLS terms a QUIC binding serves on, presenting `identity`."""
+    """The TLS terms a QUIC binding serves on, presenting `identity`.
 
-    def __init__(self, identity: Identity) -> None:
+    With `require_client` every client must present a key: one the `Trust`
+    accepts (pinned or chaining to an anchor), or with `ANY_KEY` any key it
+    proves it holds. A refused client raises `Tls` on its side, and nothing
+    reaches the replier. An empty `Trust` makes the bind raise `Tls`."""
+
+    def __init__(self, identity: Identity, require_client=None) -> None:
+        if not (require_client is None or require_client is ANY_KEY or isinstance(require_client, Trust)):
+            raise TypeError("require_client is a weida.Trust or weida.ANY_KEY")
         out = ffi.new("weida_server_tls **")
         check(lib.weida_server_tls_new(identity._p(), out))
         super().__init__(out[0], lib.weida_server_tls_drop)
+        if require_client is None:
+            return
+        try:
+            if require_client is ANY_KEY:
+                check(lib.weida_server_tls_require_any_key(self._p()))
+            else:
+                check(lib.weida_server_tls_require_client(self._p(), require_client._p()))
+        except BaseException:
+            self.drop()
+            raise
 
 
 class TransferMeta:
@@ -187,7 +334,10 @@ class TransferMeta:
 
 @dataclass(frozen=True)
 class IncomingMeta:
-    """The metadata of an inbound transfer or request."""
+    """The metadata of an inbound transfer or request.
+
+    `peer_chain`: the DER certificates the peer presented, leaf first; `None`
+    for an anonymous or local peer, or a chain over the bound weida keeps."""
 
     endpoint: Optional[str]
     content_type: Optional[str]
@@ -195,6 +345,7 @@ class IncomingMeta:
     peer_fingerprint: Optional[str]
     content_len: Optional[int]
     sequence: Optional[int]
+    peer_chain: Optional[Tuple[bytes, ...]]
 
     @classmethod
     def _take(cls, ptr) -> "IncomingMeta":
@@ -205,6 +356,16 @@ class IncomingMeta:
             def optional(getter: Callable) -> Optional[int]:
                 return number[0] if getter(ptr, number) == 1 else None
 
+            count = ffi.new("size_t *")
+            peer_chain = None
+            if lib.weida_incoming_meta_peer_chain_len(ptr, count) == 1:
+                length = ffi.new("size_t *")
+                certs = []
+                for i in range(count[0]):
+                    cert = lib.weida_incoming_meta_peer_chain_cert(ptr, i, length)
+                    certs.append(ffi.buffer(cert, length[0])[:])
+                peer_chain = tuple(certs)
+
             return cls(
                 endpoint=_text(lib.weida_incoming_meta_endpoint, ptr),
                 content_type=_text(lib.weida_incoming_meta_content_type, ptr),
@@ -212,6 +373,7 @@ class IncomingMeta:
                 peer_fingerprint=_text(lib.weida_incoming_meta_peer_fingerprint, ptr),
                 content_len=optional(lib.weida_incoming_meta_content_len),
                 sequence=optional(lib.weida_incoming_meta_sequence),
+                peer_chain=peer_chain,
             )
         finally:
             lib.weida_incoming_meta_drop(ptr)

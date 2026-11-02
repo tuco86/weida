@@ -16,7 +16,7 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
 export CARGO_TARGET_DIR
 
 uv venv --allow-existing "$venv"
-uv pip install --python "$venv" cffi hatchling pytest pytest-timeout pytest-socket
+uv pip install --python "$venv" cffi hatchling pytest pytest-timeout pytest-socket cryptography
 uv pip install --python "$venv" --no-build-isolation -e "$dir"
 
 cd "$dir"
