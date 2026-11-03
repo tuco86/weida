@@ -76,4 +76,13 @@ What an outgoing transfer carries in its header. Where a function takes
 | --- | --- |
 | `int weida_transfer_meta_new(weida_transfer_meta **out)` | 0 |
 | `int weida_transfer_meta_set_content_type(const weida_transfer_meta *m, const char *content_type)` | 0; `-WEIDA_EINVAL` |
+| `int weida_transfer_meta_set_content_len(const weida_transfer_meta *m, uint64_t len)` | 0; `-WEIDA_EINVAL`. The advisory payload length |
+| `int weida_transfer_meta_set_topic(const weida_transfer_meta *m, const char *topic)` | 0; `-WEIDA_EINVAL`. A topic over 256 bytes fails the send with `-WEIDA_ELIMIT_EXCEEDED` |
+| `int weida_transfer_meta_set_trace(const weida_transfer_meta *m, const char *traceparent)` | 0; `-WEIDA_EINVAL`, also for text that is not a W3C version-00 `traceparent` |
+| `int weida_transfer_meta_set_achieved(const weida_transfer_meta *m, int level)` | 0; `-WEIDA_EINVAL`, also for a value not `WEIDA_ACKNOWLEDGEMENT_*` ([runtime.md](runtime.md#constants)) |
 | `void weida_transfer_meta_drop(weida_transfer_meta *m)` | — |
+
+`int weida_new_trace(char *out, size_t len)` (`weida::new_trace`) writes a fresh root trace
+context as its `traceparent` text: `WEIDA_TRACEPARENT_LEN` (55) bytes and a NUL. It returns 0, or
+`-WEIDA_EINVAL` for a NULL `out` or a `len` below `WEIDA_TRACEPARENT_LEN + 1`. Weida never
+mints a trace on its own; this is how a caller starts one.

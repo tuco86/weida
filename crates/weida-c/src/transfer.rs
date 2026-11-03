@@ -6,6 +6,7 @@ use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_rs::{Delivery, Error, IncomingMeta, IncomingTransfer, OutgoingTransfer, PeerIdentity};
@@ -27,6 +28,8 @@ pub struct weida_incoming_meta {
     content_type: Option<CText>,
     topic: Option<CText>,
     peer_fingerprint: Option<CText>,
+    trace: Option<CText>,
+    tracestate: Option<CText>,
 }
 
 impl weida_incoming_meta {
@@ -40,6 +43,8 @@ impl weida_incoming_meta {
                 Some(PeerIdentity::Key(fp)) => Some(CText::new(fp.to_string())),
                 _ => None,
             },
+            trace: meta.trace.map(|t| CText::new(t.to_traceparent())),
+            tracestate: text(&meta.tracestate),
             meta,
         })
     }
@@ -83,13 +88,16 @@ impl AsOp for weida_incoming_transfer_collect_op {
 /// An outbound transfer: a payload written like a socket (R3a).
 pub struct weida_outgoing_transfer {
     tried: Tried<OutgoingTransfer>,
+    trace: Option<CText>,
     exec: Exec,
 }
 
 impl weida_outgoing_transfer {
     pub(crate) fn handle(transfer: OutgoingTransfer, exec: Exec) -> *mut weida_outgoing_transfer {
+        let trace = transfer.trace().map(|t| CText::new(t.to_traceparent()));
         into_handle(weida_outgoing_transfer {
             tried: Tried::new(transfer),
+            trace,
             exec,
         })
     }
@@ -328,6 +336,66 @@ pub unsafe extern "C" fn weida_incoming_meta_sequence(
 ) -> c_int {
     // SAFETY: forwarded from this function's contract.
     unsafe { meta_number(m, out, |m| m.sequence) }
+}
+
+/// The trace context the sender propagated, as its `traceparent` text; NULL
+/// when it sent none or one that did not parse.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `len_out` is NULL or writable. The string
+/// lives as long as `m`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_trace(
+    m: *const weida_incoming_meta,
+    len_out: *mut usize,
+) -> *const c_char {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { meta_text(m, len_out, |m| m.trace.as_ref()) }
+}
+
+/// The opaque `tracestate` the sender forwarded; NULL when absent.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `len_out` is NULL or writable. The string
+/// lives as long as `m`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_tracestate(
+    m: *const weida_incoming_meta,
+    len_out: *mut usize,
+) -> *const c_char {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { meta_text(m, len_out, |m| m.tracestate.as_ref()) }
+}
+
+/// The completion level the sender achieved for the message this transfer
+/// answers: 1 and its `WEIDA_ACKNOWLEDGEMENT_*` constant in `*out` when it
+/// claimed one, 0 when absent (R2).
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_achieved(
+    m: *const weida_incoming_meta,
+    out: *mut c_int,
+) -> c_int {
+    guard_or(0, || {
+        if m.is_null() || out.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `m` is live metadata by the caller's contract.
+        let m = unsafe { &*m };
+        match m.meta.achieved {
+            Some(level) => {
+                // SAFETY: a non-NULL `out` is writable by the caller's contract.
+                unsafe { out.write(level.to_wire() as c_int) };
+                1
+            }
+            None => 0,
+        }
+    })
 }
 
 /// Releases a reference to metadata. NULL does nothing.
@@ -666,6 +734,84 @@ pub unsafe extern "C" fn weida_outgoing_transfer_write(
         let n = written.map_err(fail)?;
         // SAFETY: `out_n` passed `out_ptr`.
         unsafe { write_out(out_n, n) };
+        Ok(0)
+    })
+}
+
+/// The trace context propagated with this transfer, as its `traceparent`
+/// text (`OutgoingTransfer::trace`); NULL when none was. A reply inherits
+/// its request's.
+///
+/// # Safety
+///
+/// `t` is NULL or a live outgoing transfer; `len_out` is NULL or writable.
+/// The string lives as long as `t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_outgoing_transfer_trace(
+    t: *const weida_outgoing_transfer,
+    len_out: *mut usize,
+) -> *const c_char {
+    guard_ptr(|| {
+        if t.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: a non-NULL `t` is a live handle by the caller's contract,
+        // borrowed for this call only; the text lives as long as the handle.
+        let t = unsafe { &*t };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { text_out(t.trace.as_ref(), len_out) }
+    })
+}
+
+/// Orders this transfer against the other streams of its connection
+/// (`OutgoingTransfer::set_priority`): higher is sent first, the default is
+/// 0. A no-op on local transports. `-WEIDA_ECLOSED` once the handle was
+/// consumed.
+///
+/// # Safety
+///
+/// `t` is NULL or a live outgoing transfer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_outgoing_transfer_set_priority(
+    t: *const weida_outgoing_transfer,
+    priority: i32,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let t = unsafe { borrow(t) }?;
+        t.tried.with(|tr| tr.set_priority(priority))?;
+        Ok(0)
+    })
+}
+
+/// Resets this transfer with `CANCELED` if its bytes are not all
+/// acknowledged within `ms` milliseconds of this call
+/// (`OutgoingTransfer::expire_at`).
+///
+/// A write still running at the deadline, and a write or finish after it,
+/// fail with `-WEIDA_EEXPIRED`; the reader sees `-WEIDA_ECANCELED`, never
+/// an end. On QUIC the deadline also holds after finish: the receipt then
+/// resolves to `-WEIDA_EEXPIRED` if the tail was still unacknowledged. On a
+/// local transport it acts until finish. `-WEIDA_EEXPIRED` is not a definite
+/// failure: the peer may have read every byte before the reset landed. A
+/// deadline past what the clock can represent never expires.
+/// `-WEIDA_ECLOSED` once the handle was consumed.
+///
+/// # Safety
+///
+/// `t` is NULL or a live outgoing transfer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_outgoing_transfer_expire_after_ms(
+    t: *const weida_outgoing_transfer,
+    ms: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let t = unsafe { borrow(t) }?;
+        match Instant::now().checked_add(crate::config::ms(ms)) {
+            Some(deadline) => t.tried.with(|tr| tr.expire_at(deadline))?,
+            None => t.tried.with(|_| ())?,
+        }
         Ok(0)
     })
 }

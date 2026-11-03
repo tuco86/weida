@@ -1427,6 +1427,28 @@ int weida_requester_request(const weida_requester *r,
                             weida_requester_request_op **out);
 
 /**
+ * Sends `body` as one request carrying `meta` (`Requester::request_with`):
+ * `weida_requester_request` with metadata. `meta` is copied at the call;
+ * NULL is `TransferMeta::default()`. The body is copied.
+ *
+ * Never blocks; the exchange runs as the op written to `out`, whose wait
+ * yields the reply as an incoming transfer as soon as its header arrives.
+ * A request the replier dropped fails the wait with `-WEIDA_ENO_REPLY`; a
+ * topic over 256 bytes fails it with `-WEIDA_ELIMIT_EXCEEDED`.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live requester; `meta` is NULL or live metadata; `body`
+ * is NULL only with `len == 0`, else points to `len` readable bytes; `out`
+ * is NULL or writable. Release the op with `weida_requester_request_op_drop`.
+ */
+int weida_requester_request_with(const weida_requester *r,
+                                 const weida_transfer_meta *meta,
+                                 const uint8_t *body,
+                                 size_t len,
+                                 weida_requester_request_op **out);
+
+/**
  * The readiness descriptor of a request op: readable once it finished.
  *
  * # Safety
@@ -2037,6 +2059,60 @@ int weida_transfer_meta_new(weida_transfer_meta **out);
 int weida_transfer_meta_set_content_type(const weida_transfer_meta *m, const char *content_type);
 
 /**
+ * Sets the advisory payload length (`TransferMeta::with_content_len`).
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata.
+ */
+int weida_transfer_meta_set_content_len(const weida_transfer_meta *m, uint64_t len);
+
+/**
+ * Labels the transfer with a topic (`TransferMeta::with_topic`). A topic
+ * longer than 256 bytes fails the send with `-WEIDA_ELIMIT_EXCEEDED`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `topic` is NULL or a NUL-terminated string.
+ */
+int weida_transfer_meta_set_topic(const weida_transfer_meta *m, const char *topic);
+
+/**
+ * Propagates a trace context (`TransferMeta::with_trace`), given as its W3C
+ * version-00 `traceparent` text. Anything else is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `traceparent` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_transfer_meta_set_trace(const weida_transfer_meta *m, const char *traceparent);
+
+/**
+ * States the completion level this side achieved for the message it
+ * answers (`TransferMeta::with_achieved`), a `WEIDA_ACKNOWLEDGEMENT_*`
+ * constant; any other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata.
+ */
+int weida_transfer_meta_set_achieved(const weida_transfer_meta *m, int level);
+
+/**
+ * Writes a fresh root trace context (`weida::new_trace`) to `out` as its
+ * `traceparent` text: `WEIDA_TRACEPARENT_LEN` bytes and a NUL. A NULL `out`
+ * or a `len` below `WEIDA_TRACEPARENT_LEN + 1` is `-WEIDA_EINVAL`.
+ *
+ * Weida never mints a trace on its own; this is how a caller starts one.
+ *
+ * # Safety
+ *
+ * `out` is NULL or points to `len` writable bytes.
+ */
+int weida_new_trace(char *out, size_t len);
+
+/**
  * Releases transfer metadata. NULL does nothing.
  *
  * # Safety
@@ -2129,6 +2205,38 @@ int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out)
  * `m` is NULL or live metadata; `out` is NULL or writable.
  */
 int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out);
+
+/**
+ * The trace context the sender propagated, as its `traceparent` text; NULL
+ * when it sent none or one that did not parse.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `len_out` is NULL or writable. The string
+ * lives as long as `m`.
+ */
+const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out);
+
+/**
+ * The opaque `tracestate` the sender forwarded; NULL when absent.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `len_out` is NULL or writable. The string
+ * lives as long as `m`.
+ */
+const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out);
+
+/**
+ * The completion level the sender achieved for the message this transfer
+ * answers: 1 and its `WEIDA_ACKNOWLEDGEMENT_*` constant in `*out` when it
+ * claimed one, 0 when absent (R2).
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out);
 
 /**
  * Releases a reference to metadata. NULL does nothing.
@@ -2302,6 +2410,50 @@ int weida_outgoing_transfer_write(const weida_outgoing_transfer *t,
                                   size_t len,
                                   int64_t timeout_ms,
                                   size_t *out_n);
+
+/**
+ * The trace context propagated with this transfer, as its `traceparent`
+ * text (`OutgoingTransfer::trace`); NULL when none was. A reply inherits
+ * its request's.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live outgoing transfer; `len_out` is NULL or writable.
+ * The string lives as long as `t`.
+ */
+const char *weida_outgoing_transfer_trace(const weida_outgoing_transfer *t, size_t *len_out);
+
+/**
+ * Orders this transfer against the other streams of its connection
+ * (`OutgoingTransfer::set_priority`): higher is sent first, the default is
+ * 0. A no-op on local transports. `-WEIDA_ECLOSED` once the handle was
+ * consumed.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live outgoing transfer.
+ */
+int weida_outgoing_transfer_set_priority(const weida_outgoing_transfer *t, int32_t priority);
+
+/**
+ * Resets this transfer with `CANCELED` if its bytes are not all
+ * acknowledged within `ms` milliseconds of this call
+ * (`OutgoingTransfer::expire_at`).
+ *
+ * A write still running at the deadline, and a write or finish after it,
+ * fail with `-WEIDA_EEXPIRED`; the reader sees `-WEIDA_ECANCELED`, never
+ * an end. On QUIC the deadline also holds after finish: the receipt then
+ * resolves to `-WEIDA_EEXPIRED` if the tail was still unacknowledged. On a
+ * local transport it acts until finish. `-WEIDA_EEXPIRED` is not a definite
+ * failure: the peer may have read every byte before the reset landed. A
+ * deadline past what the clock can represent never expires.
+ * `-WEIDA_ECLOSED` once the handle was consumed.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live outgoing transfer.
+ */
+int weida_outgoing_transfer_expire_after_ms(const weida_outgoing_transfer *t, uint64_t ms);
 
 /**
  * Ends the payload (`OutgoingTransfer::finish`) and writes its delivery

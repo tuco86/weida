@@ -16,11 +16,14 @@ request or transfer it came from. None of these functions blocks.
 | `const uint8_t *weida_incoming_meta_peer_chain_cert(const weida_incoming_meta *m, size_t index, size_t *len_out)` | the DER of certificate `index`, leaf first, its length through `len_out` (NULL allowed), valid until `m` is dropped; NULL when the chain is absent or `index` is out of range |
 | `int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender stated a length, else 0 |
 | `int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender numbered the transfer, else 0 |
+| `const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out)` | the sender's trace context as `traceparent` text; NULL when it sent none or one that did not parse |
+| `const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out)` | the opaque `tracestate`; NULL when absent |
+| `int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out)` | 1 and the `WEIDA_ACKNOWLEDGEMENT_*` level in `*out` when the sender claimed one, else 0 |
 | `void weida_incoming_meta_drop(weida_incoming_meta *m)` | — |
 
 Strings follow R7: NUL-terminated, the exact length through `len_out` (NULL allowed), valid
-until `m` is dropped. The other fields of `IncomingMeta` (`trace`, `tracestate`,
-`gap`, `achieved`, the report fields, `segment`, `layer`) are not mapped yet
+until `m` is dropped. The other fields of `IncomingMeta` (`gap`, `report`, `report_mode`,
+`report_id`, `segment`, `layer`) are not mapped yet
 ([libraries/weida-c.md](../libraries/weida-c.md)).
 
 ## `weida_msg`

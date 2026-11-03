@@ -4,10 +4,16 @@
 use std::ffi::{c_char, c_int};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use weida_rs::{ClientTls, ClientTrust, Fingerprint, Identity, ServerTls, TransferMeta, Trust};
+use weida_rs::{
+    Acknowledgement, ClientTls, ClientTrust, Fingerprint, Identity, ServerTls, TraceContext,
+    TransferMeta, Trust,
+};
 use zeroize::Zeroizing;
 
-use crate::error::{fail, guard, guard_or, guard_ptr, guard_void, null_arg};
+use crate::config::{WEIDA_TRACEPARENT_LEN, wire};
+use crate::error::{
+    WEIDA_EINVAL, fail, fail_abi, guard, guard_or, guard_ptr, guard_void, null_arg,
+};
 use crate::handle::{CText, borrow, bytes, cstr, into_handle, out_ptr, release, write_out};
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -647,6 +653,126 @@ pub unsafe extern "C" fn weida_transfer_meta_set_content_type(
     })
 }
 
+/// Sets the advisory payload length (`TransferMeta::with_content_len`).
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_transfer_meta_set_content_len(
+    m: *const weida_transfer_meta,
+    len: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let m = unsafe { borrow(m) }?;
+        let mut meta = locked(&m.meta);
+        *meta = std::mem::take(&mut *meta).with_content_len(len);
+        Ok(0)
+    })
+}
+
+/// Labels the transfer with a topic (`TransferMeta::with_topic`). A topic
+/// longer than 256 bytes fails the send with `-WEIDA_ELIMIT_EXCEEDED`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `topic` is NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_transfer_meta_set_topic(
+    m: *const weida_transfer_meta,
+    topic: *const c_char,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let m = unsafe { borrow(m) }?;
+        // SAFETY: forwarded from this function's contract.
+        let topic = unsafe { cstr(topic) }?;
+        let mut meta = locked(&m.meta);
+        *meta = std::mem::take(&mut *meta).with_topic(topic);
+        Ok(0)
+    })
+}
+
+/// Propagates a trace context (`TransferMeta::with_trace`), given as its W3C
+/// version-00 `traceparent` text. Anything else is `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `traceparent` is NULL or a NUL-terminated
+/// string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_transfer_meta_set_trace(
+    m: *const weida_transfer_meta,
+    traceparent: *const c_char,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let m = unsafe { borrow(m) }?;
+        // SAFETY: forwarded from this function's contract.
+        let text = unsafe { cstr(traceparent) }?;
+        let trace = TraceContext::parse_traceparent(text)
+            .map_err(|_| fail_abi(WEIDA_EINVAL, c"not a W3C version-00 traceparent"))?;
+        let mut meta = locked(&m.meta);
+        *meta = std::mem::take(&mut *meta).with_trace(trace);
+        Ok(0)
+    })
+}
+
+/// States the completion level this side achieved for the message it
+/// answers (`TransferMeta::with_achieved`), a `WEIDA_ACKNOWLEDGEMENT_*`
+/// constant; any other value is `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_transfer_meta_set_achieved(
+    m: *const weida_transfer_meta,
+    level: c_int,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let m = unsafe { borrow(m) }?;
+        let achieved = wire(level, Acknowledgement::from_wire)?;
+        let mut meta = locked(&m.meta);
+        *meta = std::mem::take(&mut *meta).with_achieved(achieved);
+        Ok(0)
+    })
+}
+
+/// Writes a fresh root trace context (`weida::new_trace`) to `out` as its
+/// `traceparent` text: `WEIDA_TRACEPARENT_LEN` bytes and a NUL. A NULL `out`
+/// or a `len` below `WEIDA_TRACEPARENT_LEN + 1` is `-WEIDA_EINVAL`.
+///
+/// Weida never mints a trace on its own; this is how a caller starts one.
+///
+/// # Safety
+///
+/// `out` is NULL or points to `len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_new_trace(out: *mut c_char, len: usize) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        let need = WEIDA_TRACEPARENT_LEN as usize;
+        if len <= need {
+            return Err(fail_abi(
+                WEIDA_EINVAL,
+                c"the buffer holds fewer than WEIDA_TRACEPARENT_LEN + 1 bytes",
+            ));
+        }
+        let text = weida_rs::new_trace().to_traceparent();
+        debug_assert_eq!(text.len(), need);
+        // SAFETY: `out` passed `out_ptr` and holds `len > need` bytes by this
+        // function's contract; the text is `need` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(text.as_ptr().cast::<c_char>(), out, need);
+            out.add(need).write(0);
+        }
+        Ok(0)
+    })
+}
+
 /// Releases transfer metadata. NULL does nothing.
 ///
 /// # Safety
@@ -751,5 +877,54 @@ mod tests {
         assert!(fingerprint(id).starts_with("sha256:"));
         // SAFETY: `id` is live and dropped once.
         unsafe { weida_identity_drop(id) };
+    }
+
+    fn new_meta() -> *mut weida_transfer_meta {
+        let mut m = ptr::null_mut();
+        // SAFETY: `m` is writable.
+        assert_eq!(unsafe { weida_transfer_meta_new(&mut m) }, 0);
+        m
+    }
+
+    #[test]
+    fn new_trace_writes_a_traceparent_that_sets_back() {
+        let mut buf = [0 as c_char; 56];
+        // SAFETY: `buf` holds 56 writable bytes.
+        assert_eq!(unsafe { weida_new_trace(buf.as_mut_ptr(), buf.len()) }, 0);
+        // SAFETY: on success `buf` holds a NUL-terminated string.
+        let text = unsafe { CStr::from_ptr(buf.as_ptr()) };
+        let trace = TraceContext::parse_traceparent(text.to_str().unwrap()).unwrap();
+        assert!(trace.is_sampled());
+        let m = new_meta();
+        // SAFETY: `m` is live and `text` is NUL-terminated.
+        assert_eq!(
+            unsafe { weida_transfer_meta_set_trace(m, text.as_ptr()) },
+            0
+        );
+        // SAFETY: `m` is live.
+        assert_eq!(unsafe { &*m }.get().trace, Some(trace));
+        let mut short = [0 as c_char; 55];
+        // SAFETY: `short` holds 55 writable bytes.
+        let rc = unsafe { weida_new_trace(short.as_mut_ptr(), short.len()) };
+        assert_eq!(rc, -WEIDA_EINVAL);
+        // SAFETY: `m` is live and dropped once.
+        unsafe { weida_transfer_meta_drop(m) };
+    }
+
+    #[test]
+    fn a_malformed_traceparent_is_invalid() {
+        let m = new_meta();
+        for text in [
+            c"00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            c"not a trace",
+        ] {
+            // SAFETY: `m` is live and `text` is NUL-terminated.
+            let rc = unsafe { weida_transfer_meta_set_trace(m, text.as_ptr()) };
+            assert_eq!(rc, -WEIDA_EINVAL, "{text:?}");
+        }
+        // SAFETY: `m` is live.
+        assert_eq!(unsafe { &*m }.get().trace, None);
+        // SAFETY: `m` is live and dropped once.
+        unsafe { weida_transfer_meta_drop(m) };
     }
 }

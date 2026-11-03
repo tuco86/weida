@@ -59,9 +59,14 @@ fn text(ptr: *const c_char, len: usize) -> Option<String> {
 }
 
 fn runtime() -> *mut weida_runtime {
+    runtime_with(ptr::null())
+}
+
+/// A runtime on the configuration `cfg` holds, or the defaults for NULL.
+fn runtime_with(cfg: *const weida_runtime_config) -> *mut weida_runtime {
     let mut rt = ptr::null_mut();
-    // SAFETY: NULL configuration and a writable out-parameter.
-    ok(unsafe { weida_runtime_owned(ptr::null(), &mut rt) });
+    // SAFETY: a live or NULL configuration and a writable out-parameter.
+    ok(unsafe { weida_runtime_owned(cfg, &mut rt) });
     rt
 }
 
@@ -78,6 +83,24 @@ fn replier(l: *mut weida_listener, path: &str) -> *mut weida_replier {
     // SAFETY: a live listener, a C string and a writable out-parameter.
     ok(unsafe { weida_listener_replier(l, path.as_ptr(), &mut r) });
     r
+}
+
+/// Binds the inproc bus `bus` on a new listener of `rt` and registers a
+/// replier at `/echo`.
+fn inproc(
+    rt: *mut weida_runtime,
+    bus: &str,
+) -> (
+    *mut weida_listener,
+    *mut weida_local_binding,
+    *mut weida_replier,
+) {
+    let l = listener(rt);
+    let mut lb = ptr::null_mut();
+    let name = c(bus);
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_bind_inproc(l, name.as_ptr(), &mut lb) });
+    (l, lb, replier(l, "/echo"))
 }
 
 fn trust_by_address() -> *mut weida_trust {
@@ -247,12 +270,7 @@ fn shutdown(rt: *mut weida_runtime) {
 #[test]
 fn a_streamed_round_trip_over_inproc() {
     let rt = runtime();
-    let l = listener(rt);
-    let mut lb = ptr::null_mut();
-    let bus = c("abi-round-trip");
-    // SAFETY: a live listener, a C string and a writable out-parameter.
-    ok(unsafe { weida_listener_bind_inproc(l, bus.as_ptr(), &mut lb) });
-    let rep = replier(l, "/echo");
+    let (l, lb, rep) = inproc(rt, "abi-round-trip");
     let trust = trust_by_address();
     let req = requester(rt, trust);
     ok(connect(req, "weida+inproc://abi-round-trip/echo"));
@@ -1045,4 +1063,292 @@ fn a_signal_ends_a_blocked_accept_with_eintr() {
     assert_eq!(again, -WEIDA_EAGAIN, "the interrupted accept lost nothing");
     waiter.join().expect("the waiter");
     pair.close();
+}
+
+/// A configuration whose guarantee set asks for per-producer gap detection.
+fn config_detecting_gaps() -> *mut weida_runtime_config {
+    let mut cfg = ptr::null_mut();
+    let mut g = ptr::null_mut();
+    // SAFETY: writable out-parameters and live handles; `g` is dropped once.
+    unsafe {
+        ok(weida_runtime_config_new(&mut cfg));
+        ok(weida_guarantee_set_new(&mut g));
+        ok(weida_guarantee_set_set_ordering(
+            g,
+            WEIDA_ORDERING_MODE_PER_PRODUCER_DETECT,
+        ));
+        ok(weida_runtime_config_set_guarantees(cfg, g));
+        weida_guarantee_set_drop(g);
+    }
+    cfg
+}
+
+#[test]
+fn a_guarantee_the_dialler_does_not_offer_fails_negotiation() {
+    let cfg = config_detecting_gaps();
+    let server = runtime_with(cfg);
+    let (l, lb, rep) = inproc(server, "abi-config-guarantee");
+    let url = "weida+inproc://abi-config-guarantee/echo";
+
+    let plain = runtime();
+    let trust = trust_by_address();
+    let refused = requester(plain, trust);
+    let rc = exchange_status(refused, url);
+    assert_eq!(rc, -WEIDA_ENEGOTIATION, "{}", last_message());
+
+    let alike = runtime_with(cfg);
+    let req = requester(alike, trust);
+    let meta = round_trip(req, rep, url);
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_requester_drop(req);
+        weida_requester_drop(refused);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+        weida_runtime_config_drop(cfg);
+    }
+    shutdown(alike);
+    shutdown(plain);
+    shutdown(server);
+}
+
+/// A fresh traceparent from `weida_new_trace`.
+fn new_trace() -> CString {
+    let mut buf = [0 as c_char; WEIDA_TRACEPARENT_LEN as usize + 1];
+    // SAFETY: `buf` holds `buf.len()` writable bytes.
+    ok(unsafe { weida_new_trace(buf.as_mut_ptr(), buf.len()) });
+    // SAFETY: on success `buf` holds a NUL-terminated string.
+    unsafe { CStr::from_ptr(buf.as_ptr()) }.to_owned()
+}
+
+fn meta_text(
+    meta: *mut weida_incoming_meta,
+    get: unsafe extern "C" fn(*const weida_incoming_meta, *mut usize) -> *const c_char,
+) -> Option<String> {
+    let mut len = 0usize;
+    // SAFETY: live metadata and a writable length.
+    let ptr = unsafe { get(meta, &mut len) };
+    text(ptr, len)
+}
+
+#[test]
+fn metadata_travels_with_a_request_and_its_reply() {
+    let rt = runtime();
+    let (l, lb, rep) = inproc(rt, "abi-config-meta");
+    let trust = trust_by_address();
+    let req = requester(rt, trust);
+    ok(connect(req, "weida+inproc://abi-config-meta/echo"));
+    let trace = new_trace();
+    let t = trace.to_str().expect("UTF-8").to_owned();
+    let topic = c("jobs");
+
+    let mut meta = ptr::null_mut();
+    let mut pending = ptr::null_mut();
+    // SAFETY: live handles, C strings and writable out-parameters; `meta`
+    // is copied by the request and dropped once.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut meta));
+        ok(weida_transfer_meta_set_content_len(meta, 4));
+        ok(weida_transfer_meta_set_topic(meta, topic.as_ptr()));
+        ok(weida_transfer_meta_set_trace(meta, trace.as_ptr()));
+        ok(weida_requester_request_with(
+            req,
+            meta,
+            b"ping".as_ptr(),
+            4,
+            &mut pending,
+        ));
+        weida_transfer_meta_drop(meta);
+    }
+
+    let q = accept(rep);
+    let mut seen = ptr::null_mut();
+    let mut len = 0u64;
+    // SAFETY: a live request and writable out-parameters.
+    unsafe {
+        ok(weida_incoming_request_meta(q, &mut seen));
+        assert_eq!(weida_incoming_meta_content_len(seen, &mut len), 1);
+    }
+    assert_eq!(len, 4);
+    assert_eq!(
+        meta_text(seen, weida_incoming_meta_endpoint).as_deref(),
+        Some("/echo")
+    );
+    assert_eq!(
+        meta_text(seen, weida_incoming_meta_topic).as_deref(),
+        Some("jobs")
+    );
+    assert_eq!(meta_text(seen, weida_incoming_meta_trace), Some(t.clone()));
+    assert_eq!(meta_text(seen, weida_incoming_meta_tracestate), None);
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(seen) };
+
+    let mut answer_meta = ptr::null_mut();
+    let mut op = ptr::null_mut();
+    let mut out = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; `q` is consumed.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut answer_meta));
+        ok(weida_transfer_meta_set_achieved(
+            answer_meta,
+            WEIDA_ACKNOWLEDGEMENT_ACCEPTED,
+        ));
+        ok(weida_incoming_request_reply(q, answer_meta, &mut op));
+        weida_transfer_meta_drop(answer_meta);
+        ok(settle("the reply stream", |ms| {
+            weida_incoming_request_reply_op_wait(op, ms, &mut out)
+        }));
+        weida_incoming_request_reply_op_drop(op);
+        ok(weida_outgoing_transfer_set_priority(out, 5));
+        let mut len = 0usize;
+        let inherited = weida_outgoing_transfer_trace(out, &mut len);
+        assert_eq!(
+            text(inherited, len),
+            Some(t.clone()),
+            "a reply inherits the trace"
+        );
+    }
+    write_all(out, b"pong");
+    let mut delivery = ptr::null_mut();
+    let mut answer = ptr::null_mut();
+    let mut level = 0;
+    // SAFETY: live handles, each consumed or dropped once.
+    unsafe {
+        ok(weida_outgoing_transfer_finish(out, &mut delivery));
+        weida_delivery_drop(delivery);
+        ok(settle("the reply", |ms| {
+            weida_requester_request_op_wait(pending, ms, &mut answer)
+        }));
+        weida_requester_request_op_drop(pending);
+        let mut got = ptr::null_mut();
+        ok(weida_incoming_transfer_meta(answer, &mut got));
+        assert_eq!(meta_text(got, weida_incoming_meta_trace), Some(t));
+        assert_eq!(weida_incoming_meta_achieved(got, &mut level), 1);
+        weida_incoming_meta_drop(got);
+    }
+    assert_eq!(level, WEIDA_ACKNOWLEDGEMENT_ACCEPTED);
+    let msg = collect(answer, 64).expect("the reply body");
+    // SAFETY: live handles, each dropped once.
+    unsafe {
+        let data = std::slice::from_raw_parts(weida_msg_data(msg), weida_msg_len(msg));
+        assert_eq!(data, b"pong");
+        weida_msg_drop(msg);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}
+
+#[test]
+fn an_expired_reply_fails_its_finish_and_cancels_the_reader() {
+    let rt = runtime();
+    let (l, lb, rep) = inproc(rt, "abi-config-expired");
+    let trust = trust_by_address();
+    let req = requester(rt, trust);
+    ok(connect(req, "weida+inproc://abi-config-expired/echo"));
+    let pending = request(req, b"go");
+    let q = accept(rep);
+    let out = reply(q, None);
+    let mut delivery = ptr::null_mut();
+    let mut answer = ptr::null_mut();
+    // SAFETY: live handles; `out` is consumed by the finish.
+    unsafe {
+        ok(weida_outgoing_transfer_expire_after_ms(out, 0));
+        assert_eq!(
+            weida_outgoing_transfer_finish(out, &mut delivery),
+            -WEIDA_EEXPIRED
+        );
+        assert!(delivery.is_null());
+        ok(settle("the reply", |ms| {
+            weida_requester_request_op_wait(pending, ms, &mut answer)
+        }));
+        weida_requester_request_op_drop(pending);
+    }
+    assert_eq!(collect(answer, 64).err(), Some(-WEIDA_ECANCELED));
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}
+
+#[test]
+fn a_send_timeout_ends_a_request_to_a_peer_that_is_gone() {
+    let server = runtime();
+    let (l, lb, rep) = inproc(server, "abi-config-send-timeout");
+    let mut cfg = ptr::null_mut();
+    // SAFETY: a writable out-parameter, then a live configuration.
+    unsafe {
+        ok(weida_runtime_config_new(&mut cfg));
+        ok(weida_runtime_config_set_send_timeout_ms(cfg, 100));
+    }
+    let client = runtime_with(cfg);
+    let trust = trust_by_address();
+    let req = requester(client, trust);
+    ok(connect(req, "weida+inproc://abi-config-send-timeout/echo"));
+    // SAFETY: every handle of the server is dropped once.
+    unsafe {
+        weida_replier_drop(rep);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+        weida_runtime_config_drop(cfg);
+    }
+    shutdown(server);
+
+    let pending = request(req, b"anyone?");
+    let mut answer = ptr::null_mut();
+    // SAFETY: a live op and a writable out-parameter.
+    let rc = settle("the timed-out request", |ms| unsafe {
+        weida_requester_request_op_wait(pending, ms, &mut answer)
+    });
+    assert_eq!(rc, -WEIDA_ECONNECTION_LOST, "{}", last_message());
+    // SAFETY: read on the thread that failed, before its next failure.
+    assert_ne!(unsafe { weida_last_error_loss_cause() }, 0);
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_requester_request_op_drop(pending);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+    }
+    shutdown(client);
+}
+
+#[test]
+fn limits_reach_the_quic_transport() {
+    let mut cfg = ptr::null_mut();
+    let mut limits = ptr::null_mut();
+    // SAFETY: writable out-parameters and live handles, each dropped once.
+    unsafe {
+        ok(weida_runtime_config_new(&mut cfg));
+        ok(weida_limits_new(&mut limits));
+        ok(weida_limits_set_idle_timeout_ms(limits, u64::MAX));
+        ok(weida_runtime_config_set_limits(cfg, limits));
+        weida_limits_drop(limits);
+    }
+    let rt = runtime_with(cfg);
+    let l = listener(rt);
+    let (id, _) = identity();
+    let tls = server_tls(id);
+    let rc = try_bind_quic(l, tls).err();
+    assert_eq!(rc, Some(-WEIDA_ERUNTIME));
+    let message = last_message();
+    assert!(message.contains("idle_timeout out of range"), "{message}");
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_server_tls_drop(tls);
+        weida_identity_drop(id);
+        weida_listener_drop(l);
+        weida_runtime_config_drop(cfg);
+    }
+    shutdown(rt);
 }

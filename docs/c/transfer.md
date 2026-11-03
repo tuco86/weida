@@ -30,11 +30,20 @@ and the whole payload ([msg.md](msg.md)), `-WEIDA_ELIMIT_EXCEEDED` when it excee
 | --- | --- | --- |
 | `int weida_outgoing_transfer_fd(const weida_outgoing_transfer *t, int64_t *out)` | never | 0; `-WEIDA_EIO` |
 | `int weida_outgoing_transfer_write(const weida_outgoing_transfer *t, const uint8_t *buf, size_t len, int64_t timeout_ms, size_t *out_n)` | up to `timeout_ms` for flow control | 0 and `*out_n` bytes taken (at least 1 when `len > 0`); `len == 0` returns 0 at once; `-WEIDA_EREJECTED`, `-WEIDA_ECANCELED`, `-WEIDA_EUNKNOWN_ENDPOINT` (the peer's refusal), `-WEIDA_ECONNECTION_LOST`, `-WEIDA_EEXPIRED`; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
+| `const char *weida_outgoing_transfer_trace(const weida_outgoing_transfer *t, size_t *len_out)` | never | the trace context propagated with the transfer, as `traceparent` text; NULL when none. A reply inherits its request's |
+| `int weida_outgoing_transfer_set_priority(const weida_outgoing_transfer *t, int32_t priority)` | never | 0; `-WEIDA_ECLOSED`, `-WEIDA_EINVAL`. Higher is sent first among the streams of one connection, the default is 0; a no-op on local transports |
+| `int weida_outgoing_transfer_expire_after_ms(const weida_outgoing_transfer *t, uint64_t ms)` | never | 0; `-WEIDA_ECLOSED`, `-WEIDA_EINVAL`. Resets the transfer with `CANCELED` unless its bytes are all acknowledged within `ms` of the call (`OutgoingTransfer::expire_at`) |
 | `int weida_outgoing_transfer_finish(weida_outgoing_transfer *t, weida_delivery **out)` | never; **consumes** `t` | 0 and the receipt; `-WEIDA_EEXPIRED` is its only weida failure |
 | `void weida_outgoing_transfer_drop(weida_outgoing_transfer *t)` | never | — |
 
 A write takes what flow control allows; the caller loops for the rest (R3c). An unfinished
 transfer dropped is reset with `CANCELED`, which the reader sees as `-WEIDA_ECANCELED`.
+
+Past the deadline of `_expire_after_ms`, a write and a finish fail with `-WEIDA_EEXPIRED` and the
+reader sees `-WEIDA_ECANCELED`, never the end. On QUIC the deadline also holds after finish: the
+receipt then resolves to `-WEIDA_EEXPIRED` if the tail was still unacknowledged; on a local
+transport it acts until finish. `-WEIDA_EEXPIRED` is not a definite failure: the peer may have
+read every byte before the reset landed.
 
 ## `weida_delivery`
 

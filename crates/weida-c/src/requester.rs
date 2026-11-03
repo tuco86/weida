@@ -4,13 +4,13 @@ use std::ffi::{c_char, c_int};
 use std::sync::Arc;
 
 use ::weida_runtime::Exec;
-use weida_rs::{IncomingTransfer, Requester};
+use weida_rs::{IncomingTransfer, Requester, TransferMeta};
 
 use crate::error::{guard, guard_void};
 use crate::handle::{borrow, bytes, cstr, into_handle, out_ptr, release, write_out};
 use crate::op::Op;
 use crate::runtime::{AsOp, op_drop, op_fd, op_wait, weida_runtime};
-use crate::tls::weida_client_tls;
+use crate::tls::{weida_client_tls, weida_transfer_meta};
 use crate::transfer::weida_incoming_transfer;
 
 /// The requesting half of Req/Rep: dials repliers and sends them requests.
@@ -156,22 +156,74 @@ pub unsafe extern "C" fn weida_requester_request(
     len: usize,
     out: *mut *mut weida_requester_request_op,
 ) -> c_int {
-    guard(|| {
-        let out = out_ptr(out)?;
-        // SAFETY: forwarded from this function's contract.
-        let r = unsafe { borrow(r) }?;
-        // SAFETY: forwarded from this function's contract.
-        let body = unsafe { bytes(body, len) }?.to_vec();
-        let requester = Arc::clone(&r.requester);
-        let op = Op::start(&r.exec, async move { requester.request(&body).await });
-        let handle = into_handle(weida_requester_request_op {
-            op,
-            exec: r.exec.clone(),
-        });
-        // SAFETY: `out` passed `out_ptr`.
-        unsafe { write_out(out, handle) };
-        Ok(0)
-    })
+    // SAFETY: forwarded from this function's contract.
+    guard(|| unsafe { request(r, || Ok(TransferMeta::default()), body, len, out) })
+}
+
+/// Sends `body` as one request carrying `meta` (`Requester::request_with`):
+/// `weida_requester_request` with metadata. `meta` is copied at the call;
+/// NULL is `TransferMeta::default()`. The body is copied.
+///
+/// Never blocks; the exchange runs as the op written to `out`, whose wait
+/// yields the reply as an incoming transfer as soon as its header arrives.
+/// A request the replier dropped fails the wait with `-WEIDA_ENO_REPLY`; a
+/// topic over 256 bytes fails it with `-WEIDA_ELIMIT_EXCEEDED`.
+///
+/// # Safety
+///
+/// `r` is NULL or a live requester; `meta` is NULL or live metadata; `body`
+/// is NULL only with `len == 0`, else points to `len` readable bytes; `out`
+/// is NULL or writable. Release the op with `weida_requester_request_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_requester_request_with(
+    r: *const weida_requester,
+    meta: *const weida_transfer_meta,
+    body: *const u8,
+    len: usize,
+    out: *mut *mut weida_requester_request_op,
+) -> c_int {
+    let meta = || {
+        if meta.is_null() {
+            Ok(TransferMeta::default())
+        } else {
+            // SAFETY: forwarded from this function's contract.
+            Ok(unsafe { borrow(meta) }?.get())
+        }
+    };
+    // SAFETY: forwarded from this function's contract.
+    guard(|| unsafe { request(r, meta, body, len, out) })
+}
+
+/// The body of both request exports.
+///
+/// # Safety
+///
+/// As `weida_requester_request_with`.
+unsafe fn request(
+    r: *const weida_requester,
+    meta: impl FnOnce() -> Result<TransferMeta, c_int>,
+    body: *const u8,
+    len: usize,
+    out: *mut *mut weida_requester_request_op,
+) -> Result<c_int, c_int> {
+    let out = out_ptr(out)?;
+    // SAFETY: forwarded from this function's contract.
+    let r = unsafe { borrow(r) }?;
+    let meta = meta()?;
+    // SAFETY: forwarded from this function's contract.
+    let body = unsafe { bytes(body, len) }?.to_vec();
+    let requester = Arc::clone(&r.requester);
+    let op = Op::start(
+        &r.exec,
+        async move { requester.request_with(meta, &body).await },
+    );
+    let handle = into_handle(weida_requester_request_op {
+        op,
+        exec: r.exec.clone(),
+    });
+    // SAFETY: `out` passed `out_ptr`.
+    unsafe { write_out(out, handle) };
+    Ok(0)
 }
 
 /// The readiness descriptor of a request op: readable once it finished.

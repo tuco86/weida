@@ -391,6 +391,12 @@ int weida_requester_request(const weida_requester *r,
                             size_t len,
                             weida_requester_request_op **out);
 
+int weida_requester_request_with(const weida_requester *r,
+                                 const weida_transfer_meta *meta,
+                                 const uint8_t *body,
+                                 size_t len,
+                                 weida_requester_request_op **out);
+
 int weida_requester_request_op_fd(const weida_requester_request_op *op, int64_t *out);
 
 int weida_requester_request_op_wait(const weida_requester_request_op *op,
@@ -510,6 +516,16 @@ int weida_transfer_meta_new(weida_transfer_meta **out);
 
 int weida_transfer_meta_set_content_type(const weida_transfer_meta *m, const char *content_type);
 
+int weida_transfer_meta_set_content_len(const weida_transfer_meta *m, uint64_t len);
+
+int weida_transfer_meta_set_topic(const weida_transfer_meta *m, const char *topic);
+
+int weida_transfer_meta_set_trace(const weida_transfer_meta *m, const char *traceparent);
+
+int weida_transfer_meta_set_achieved(const weida_transfer_meta *m, int level);
+
+int weida_new_trace(char *out, size_t len);
+
 void weida_transfer_meta_drop(weida_transfer_meta *m);
 
 const char *weida_incoming_meta_endpoint(const weida_incoming_meta *m, size_t *len_out);
@@ -529,6 +545,12 @@ const uint8_t *weida_incoming_meta_peer_chain_cert(const weida_incoming_meta *m,
 int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out);
 
 int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out);
+
+const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out);
+
+const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out);
+
+int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out);
 
 void weida_incoming_meta_drop(weida_incoming_meta *m);
 
@@ -572,6 +594,12 @@ int weida_outgoing_transfer_write(const weida_outgoing_transfer *t,
                                   size_t len,
                                   int64_t timeout_ms,
                                   size_t *out_n);
+
+const char *weida_outgoing_transfer_trace(const weida_outgoing_transfer *t, size_t *len_out);
+
+int weida_outgoing_transfer_set_priority(const weida_outgoing_transfer *t, int32_t priority);
+
+int weida_outgoing_transfer_expire_after_ms(const weida_outgoing_transfer *t, uint64_t ms);
 
 int weida_outgoing_transfer_finish(weida_outgoing_transfer *t, weida_delivery **out);
 
