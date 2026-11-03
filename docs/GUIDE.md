@@ -183,10 +183,12 @@ Honesty is part of the method, so the gaps are named where the arithmetic needs 
   and a falling CPU cost per subscriber — which is the shape that extrapolates, and an
   extrapolation is what it remains. What a real 10⁴-subscriber node does with **one** network
   interface, across hosts, is not known here.
-- **Nothing is measured across machines at all.** Every number in the table above is loopback
+- **The table above is not measured across machines.** Every number in it is loopback
   with both ends in one process, which is the right way to isolate this library's own cost and
   the wrong way to learn what a deployment does: it has no propagation delay, no NIC, no packet
-  loss, and a congestion controller that never sees a real bottleneck.
+  loss, and a congestion controller that never sees a real bottleneck. Across machines, only
+  throughput and latency are measured so far: weida's streaming paths over a LAN and one SWARM
+  fetch over the internet ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4.19, B-391 and B-393).
 - **Federation across organisations is unbuilt.** Two to four hops inside one operator's
   network is the easy reading of §0.1. Eight billion people are not one operator's network, and
   what a hop between two *administrations* may claim is a question [0006](decisions/0006-guarantee-sets.md)

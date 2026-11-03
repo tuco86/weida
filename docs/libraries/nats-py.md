@@ -39,8 +39,8 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 | `user`/`password`/`token` | same three | present |
 | `nkeys_seed`, `user_credentials`, `user_jwt_cb`, `signature_cb` | `jwt=`, `signer=`, `nkey_signer=` | present as **closures**: the nonce arrives unchanged and the caller returns the signature. No key file is read and no algorithm is chosen here, for the same reason the TLS trust store is not chosen here |
 | `tls=ssl.SSLContext`, `tls_hostname`, `tls_handshake_first` | - | absent from **this binding**: `weida-nats` completes TLS where `INFO` demands it and takes the caller's `rustls::ClientConfig`, which has no Python spelling. A server whose `INFO` says `tls_required` arrives as `weida_nats.TlsRequired` rather than as a silent cleartext `CONNECT`. §8.5 says what adding it would need |
-| `nc.max_payload`, `client_id`, `connected_url`, `servers`, `discovered_servers` | `await connection.max_payload()`, `info()` -> `RemoteInfo` with all fifteen `INFO` fields | present, and `INFO` is one object rather than five accessors |
-| `nc.is_connected`, `is_closed`, `is_reconnecting`, `is_draining` | `await connection.state()` -> `State` with `name`, `is_usable`, `why` | present as one question with three answers (`connected`, `closed`, `failed`). The reconnecting and draining states do not exist here because neither reconnection nor drain does |
+| `nc.max_payload`, `client_id`, `connected_url`, `servers`, `discovered_servers` | `connection.max_payload()`, `info()` -> `RemoteInfo` with all fifteen `INFO` fields | present, and `INFO` is one object rather than five accessors |
+| `nc.is_connected`, `is_closed`, `is_reconnecting`, `is_draining` | `connection.state()` -> `State` with `name`, `is_usable`, `why` | present as one question with three answers (`connected`, `closed`, `failed`). The reconnecting and draining states do not exist here because neither reconnection nor drain does |
 | - | `Connection.connect_current`, `Connection.connect_sharing`, `sync.connect_sharing` | present, and nats-py has no counterpart: a second connection on the first one's reactor, so ten connections are not ten thread pools |
 
 ## 3. Publish and subscribe
@@ -98,9 +98,9 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 
 ## 7. Interop evidence
 
-`crates/nats/weida-nats-py/tests/` - **38 tests**, 36 of which run anywhere:
+`crates/nats/weida-nats-py/tests/` - **45 tests**, 43 of which run anywhere:
 
-- **21 on the asyncio surface** and **15 on the synchronous one**, against the scripted server
+- **25 on the asyncio surface** and **18 on the synchronous one**, against the scripted server
   of `tests/scripted.py`, which *routes*: it records `SUB`, delivers a publication to every
   matching subscription by that subscription's own `sid`, answers a request nobody subscribed
   to with `NATS/1.0 503`, and honours `UNSUB <sid> <max>`. That is what makes
@@ -132,7 +132,7 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
    still wanted.
 4. **The synchronous surface is smaller, not different.** `sync` has the same methods with
    `next_msg(timeout)` in place of the async iterator, and implements no protocol behaviour of
-   its own ([0013](../decisions/0013-competitor-libraries.md) §4.4 item 3). nats-py has no
+   its own ([0013](../decisions/0013-competitor-libraries.md) §4.4). nats-py has no
    synchronous surface, so this row has no reference implementation to differ from;
    `tests/test_sync.py::test_the_two_surfaces_agree` is what keeps the two honest.
 5. **TLS is absent from the binding, and that is a defect rather than a decision.**
@@ -173,7 +173,7 @@ which is the same honesty [`nats.md`](nats.md) §10 records for the Rust side.
 ## 10. Sources
 
 - Code: `crates/nats/weida-nats-py/src/` (`connection.rs`, `subscription.rs`, `values.rs`,
-  `options.rs`, `sync.rs`, `errors.rs`, `lease.rs`), `crates/py/weida-py-core/src/`.
+  `options.rs`, `sync.rs`, `errors.rs`), `crates/py/weida-py-core/src/`.
 - Tests: `crates/nats/weida-nats-py/tests/` - `test_asyncio.py`, `test_sync.py`,
   `test_interop.py`, with `scripted.py` as the routing server; `smoke.py` for the wheel.
 - nats-py's surface: `src/nats/aio/client.py`, `src/nats/aio/subscription.py`,

@@ -1673,15 +1673,15 @@ Per broker (`weida_broker::BrokerConfig`), for a process that runs the L2 layer:
 
 | Field | Default | Bound enforced |
 | --- | --- | --- |
-| `queue_bytes` | 8 MiB | bytes one queue holds, charged as the payload plus the retained labels plus a fixed `PER_MESSAGE_OVERHEAD` (256 B) per message. A queue at the bound refuses admission — ERROR `{REJECTED}` on an exchange's reply half, `STOP_SENDING(REJECTED)` on a one-way stream — and never discards a message it has already confirmed ([decisions/0018](decisions/0018-minimal-broker.md) §4.8) |
+| `queue_bytes` | 8 MiB | bytes one queue holds, charged as the payload plus the retained labels plus a fixed `PER_MESSAGE_OVERHEAD` (1 KiB) per message. A queue at the bound refuses admission — ERROR `{REJECTED}` on an exchange's reply half, `STOP_SENDING(REJECTED)` on a one-way stream — and never discards a message it has already confirmed ([decisions/0018](decisions/0018-minimal-broker.md) §4.8) |
 | `max_queues` | `64` | queues one broker registers; a configuration naming more is refused before any path is claimed |
 | `max_unsettled` | `256` | deliveries **one subscription** may have unsettled at once. A consumer's credit limit is cumulative and is honoured in full (§6.6); this bounds what may be in flight without an outcome, and an unsettled delivery keeps its bytes charged against `queue_bytes`. The name follows [decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.7: a consumer reports, it does not acknowledge |
 
 These are a **third** profile rather than fields on `Limits`, because a queue is not a
 per-connection object: it outlives every connection that touches it, which is the whole point
 of a queue. The per-message overhead exists because a budget counting payload bytes only would
-bound nothing against a producer of empty messages — with it, `queue_bytes / 256` is also the
-ceiling on the message count.
+bound nothing against a producer of empty messages — with it, `queue_bytes /
+PER_MESSAGE_OVERHEAD` is also the ceiling on the message count, 8192 messages at the default.
 
 ### 10.1 Control and bulk profiles
 

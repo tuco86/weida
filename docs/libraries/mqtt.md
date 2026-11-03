@@ -36,7 +36,7 @@ Three verdicts and no fourth:
 - **present** — implemented, with the module or test that carries it named. A present row may
   still say where the behaviour differs, and then the difference is the row.
 - **refused with a reason** — the packet, property or option exists in MQTT 5.0 and fails
-  **here, at configuration time**, with a message naming why (0013 §4.4 item 4) and, where
+  **here, at configuration time**, with a message naming why (0013 §4.4) and, where
   the protocol has one, the reason code the server would have sent. Nothing is silently
   ignored.
 - **absent with a reason** — not implemented and not configurable, with what is missing
@@ -58,8 +58,8 @@ number. Claims about what an implementation *does* were measured on Linux x86-64
 
 | Broker | Version | Suite | Why it is here |
 | --- | --- | --- | --- |
-| `rumqttd` | 0.20.0 | `crates/mqtt/weida-mqtt/tests/interop_rumqttd.rs`, 12 tests | a broker that declares almost nothing, so every §11 default is exercised as a default |
-| `rmqtt` | 0.23.1 | `crates/mqtt/weida-mqtt/tests/interop_mqtt5.rs`, 12 tests | a broker that **declares** its capabilities, which is the only way a client's refusal paths are reachable |
+| `rumqttd` | 0.20.0 | `crates/mqtt/weida-mqtt/tests/io/interop_rumqttd.rs`, 12 tests | a broker that declares almost nothing, so every §11 default is exercised as a default |
+| `rmqtt` | 0.23.1 | `crates/mqtt/weida-mqtt/tests/io/interop_mqtt5.rs`, 12 tests | a broker that **declares** its capabilities, which is the only way a client's refusal paths are reachable |
 
 Mosquitto is the broker [0014](../decisions/0014-parallel-libraries.md) and the backlog name,
 and it is a **system package**; it is absent on the machine this was measured on and
@@ -151,7 +151,7 @@ PUBREC and **not** delivered again ([MQTT-4.3.3-10]).
 1 ([MQTT-4.4.0-1]). There is no retry timer anywhere in this crate, and `lib.rs` says so,
 because the ecosystem disagrees loudly enough to make the absence worth stating — EMQX's
 30-second `retry_interval`, Paho Python's self-declared non-compliant republish (sheet §6).
-`tests/qos.rs` drives each of the four points a QoS 2 handshake can be interrupted at.
+`tests/io/qos.rs` drives each of the four points a QoS 2 handshake can be interrupted at.
 
 The send quota is the server's `Receive Maximum` counted in QoS 1 and 2 PUBLISH packets and
 nothing else, and exhausting it **stalls** the sender rather than exceeding it
@@ -325,7 +325,7 @@ count that separates a group from a filter; topic aliases both directions agains
 every PUBLISH property forwarded unaltered and in order; SUBACK and UNSUBACK codes; and the
 availability flags as **refusals** against a second listener declaring less.
 
-### Five disagreements, each measured against a named version
+### Six disagreements, each measured against a named version
 
 | # | Broker | What the specification says | What was measured |
 | --- | --- | --- | --- |
@@ -334,6 +334,7 @@ availability flags as **refusals** against a second listener declaring less.
 | 3 | rumqttd 0.20.0 | DISCONNECT 0x04 asks the server to publish the Will | nothing is published; 0x00's discard works, so it implements one half |
 | 4 | rmqtt 0.23.1 | retained messages are never sent to a shared subscription (4.8.2) | one is sent, with RETAIN 1 |
 | 5 | rmqtt 0.23.1 | a Client Identifier takeover closes the older connection ([MQTT-3.1.4-3]) **saying why**, DISCONNECT 0x8E | the transport closes with nothing sent — the 3.1.1 behaviour 5.0 exists to replace, from a broker claiming full 5.0 |
+| 6 | rumqttd 0.20.0 | an UNSUBACK carries one reason code per filter of the UNSUBSCRIBE, in order ([MQTT-3.11.3-1]) | one code for a two-filter UNSUBSCRIBE; this client reports it as `Error::AcknowledgementLengthMismatch` rather than pairing codes with filters, measured by `weida-mqtt-py`'s `test_an_unsubscribe_length_mismatch_is_reported_and_not_guessed` ([mqtt-py.md](mqtt-py.md) §8) |
 
 Two facts about installing these brokers, recorded because they cost time: `cargo install
 rumqttd --version 0.20.0` fails **with** `--locked` (its pinned `metrics` fails borrow
@@ -357,14 +358,14 @@ and a shared subscription before the wire, which looks exactly like a broken tes
 [0013](../decisions/0013-competitor-libraries.md) §4.7's six clauses, each with its verdict
 and where it is proved.
 
-| Clause | Verdict | Proof |
+| 0013 §4.7 clause | Verdict | Proof |
 | --- | --- | --- |
-| 1. A typed surface, not one handle with a runtime tag | met | `Client`, `Session`, `Message`, `Delivery`, `Subscription` are distinct types; `Completion` distinguishes what each QoS certifies; `RetainedOrigin` names the case the protocol cannot answer |
-| 2. Async first, on `weida-runtime` | met | `Context` mirrors `weida-zmq`'s three constructors, including `Context::owned` for a caller with no reactor of its own (`client.rs`) |
-| 3. Options honoured or refused, never ignored | met | §3, §5, §8 and §9; every refusal names the conformance statement and, where one exists, the reason code the server would have sent |
-| 4. Identity types apart | met | §8: no conversion from a TLS peer to an identity, and no accessor on `Delivery` returning one, because MQTT has none |
-| 5. A sans-I/O codec with an empty `[dependencies]` | met | `cargo tree -p weida-mqtt-codec` prints exactly one node; every decode takes its cap as an argument; golden vectors in `crates/mqtt/weida-mqtt-codec/tests/golden_vectors.rs` and six fuzz targets in its own workspace |
-| 6. This table | met | §2 through §8, with no row saying "partial" |
+| 1. typed API coverage of the primitive inventory | met | §2 through §7: every packet type, property, QoS machine, filter rule and reason code, with `Client`, `Session`, `Message`, `Delivery`, `Subscription` as distinct types and `Completion` distinguishing what each QoS certifies |
+| 2. transports implemented or refused with reasons | met | §8: TCP and TLS present; WebSocket, MQTT over QUIC and Unix domain sockets absent with their reasons |
+| 3. security and authorization implemented or refused with reasons | met | §3's Authentication Method and Data with the `Authenticator` exchange, §8's TLS with the caller's `rustls::ClientConfig`; no conversion from a TLS peer to an identity |
+| 4. options and resource bounds covered row by row | met | §3, §5 and §9: every option honoured or refused, each refusal naming the conformance statement and, where one exists, the reason code; §9.1's bounds; every decode in `weida-mqtt-codec` takes its cap as an argument, with golden vectors in `crates/mqtt/weida-mqtt-codec/tests/golden_vectors.rs` and seven fuzz targets in its own workspace |
+| 5. monitoring and native devices covered | met | MQTT 5.0 defines neither for a client: the mechanisms a monitor would read are the server's (§0) |
+| 6. a parity document with every row present, refused or absent with a reason, backed by interop against a named upstream version | met | this document, with §10: interop against rumqttd 0.20.0 and rmqtt 0.23.1 and six disagreements measured |
 
 ## 12. Sources
 
@@ -379,5 +380,5 @@ and where it is proved.
   [0014](../decisions/0014-parallel-libraries.md) §2 for the client/broker line of §0.
 - Code: `crates/mqtt/weida-mqtt-codec/src/` (§2, §3, §7) and `crates/mqtt/weida-mqtt/src/`
   — `client.rs`, `session.rs`, `filter.rs`, `alias.rs`, `message.rs`, `limits.rs`,
-  `options.rs`, `transport.rs` — plus `tests/interop_rumqttd.rs` and `tests/interop_mqtt5.rs`
+  `options.rs`, `transport.rs` — plus `tests/io/interop_rumqttd.rs` and `tests/io/interop_mqtt5.rs`
   (§10).

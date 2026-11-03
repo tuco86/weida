@@ -390,11 +390,13 @@ mod tests {
             Error::Rejected,
             Error::UnknownEndpoint,
             Error::Unsupported,
+            Error::NoParkedConnection,
             Error::Canceled,
             Error::NotConnected,
             Error::LimitExceeded,
             Error::DatagramsUnavailable,
             Error::TooLarge { max: 1200 },
+            Error::Untrusted(crate::identity::Fingerprint::from_bytes([0; 32])),
         ] {
             assert!(definite.is_definite_failure(), "{definite:?}");
         }

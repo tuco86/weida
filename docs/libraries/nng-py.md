@@ -24,7 +24,7 @@ either alone:
 
 | Suite | C release | How it is reached |
 | --- | --- | --- |
-| `crates/nng/weida-nng/tests/interop_nng.rs` (Rust) | **NNG 1.4.0-rc.0** | vendored by `nng-sys` under the `nng` crate 1.0.1 ([`nng.md`](nng.md) §1) |
+| `crates/nng/weida-nng/tests/io/interop_nng.rs` (Rust) | **NNG 1.4.0-rc.0** | vendored by `nng-sys` under the `nng` crate 1.0.1 ([`nng.md`](nng.md) §1) |
 | `crates/nng/weida-nng-py/tests/test_interop.py` (this binding) | **NNG 1.11.0** | bundled and built by **pynng 0.9.0**, which is the peer in §8 |
 
 The 1.11.0 figure is not assumed: `pynng.ffi.string(pynng.lib.nng_version())` answers
@@ -48,7 +48,7 @@ invocation each, and eleven more in `src/sync.rs` for the synchronous surface (�
 
 | pynng | This binding | Verdict |
 | --- | --- | --- |
-| `pynng.Req0` | `ReqSocket` | present — `sockets.rs:356`, `tests/test_sockets.py::test_a_request_reaches_a_replier_and_the_reply_comes_back` |
+| `pynng.Req0` | `ReqSocket` | present — `sockets.rs:469`, `tests/test_sockets.py::test_a_request_reaches_a_replier_and_the_reply_comes_back` |
 | `pynng.Rep0` | `RepSocket` | present, and an answer nobody asked for is `ESTATE` — `test_a_reply_nobody_asked_for_is_refused_by_name` |
 | `pynng.Push0` | `PushSocket` | present, `send`/`send_nowait`; a send with no eligible peer waits and then reports `ETIMEDOUT` — `test_work_reaches_a_puller_and_a_push_without_one_times_out` |
 | `pynng.Pull0` | `PullSocket` | present, `recv`/`recv_nowait` |
@@ -69,7 +69,7 @@ invocation each, and eleven more in `src/sync.rs` for the synchronous surface (�
 | `sock.send(data, block=False)` | `send_nowait` / `recv_nowait` | present where the protocol permits it — `NNG_FLAG_NONBLOCK`, `EAGAIN` for an empty receive |
 | `str` passed as a payload | — | refused: `payload_of` accepts `bytes` and `bytearray` and answers a `TypeError` naming what it takes (`crates/py/weida-py-core/src/bytes.rs:84-94`); pynng refuses the same mistake with a `ValueError` (`pynng/nng.py:54-57`). Neither guesses an encoding |
 | — | `weida_nng.Context`, with `Context()`, `Context.current()`, `Context.sharing(other)` | present, and pynng has **no counterpart**: NNG's reactor, `inproc` namespace and resource ceiling are process-global. All three are explicit here (`context.rs:9-13`) |
-| `sock.protocol`, `sock.protocol_name` | `socket.protocol` | present as one string, and it **differs from NNG's spelling for PAIR v0**: NNG's `protocol_name` answers `pair` (measured through pynng, §11), this binding answers `"pair0"` (`sockets.rs:423`). The other ten agree — `req`, `rep`, `push`, `pull`, `pub`, `sub`, `pair1`, `surveyor`, `respondent`, `bus` |
+| `sock.protocol`, `sock.protocol_name` | `socket.protocol` | present as one string, and it **differs from NNG's spelling for PAIR v0**: NNG's `protocol_name` answers `pair` (measured through pynng, §11), this binding answers `"pair0"` (`sockets.rs:536`). The other ten agree — `req`, `rep`, `push`, `pull`, `pub`, `sub`, `pair1`, `surveyor`, `respondent`, `bus` |
 | `sock.peer`, `sock.peer_name` | — | absent: the pairing rule is enforced by the library at handshake ([`nng.md`](nng.md) §2), and the peer's protocol number is not read back into Python |
 
 ## 3. Transports
@@ -158,14 +158,14 @@ Differences from pynng's option surface:
 | pynng | This binding | Verdict |
 | --- | --- | --- |
 | `sock.add_pre_pipe_connect_cb`, `add_post_pipe_connect_cb`, `add_post_pipe_remove_cb` and their `remove_*` counterparts | — | **absent**: the library delivers all three `NNG_PIPE_EV_*` events to one callback and lets `AddPre` reject a connection ([`nng.md`](nng.md) §6), and no `#[pyclass]` or method here exposes it — `grep -n 'Admission\|pipe_notify\|notify' crates/nng/weida-nng-py/src` finds nothing. What is missing: a Python callback or event stream, and with it the ability to refuse a pipe |
-| `pynng.Pipe`, `sock.pipes`, `msg.pipe`, `pipe.local_address`, `pipe.remote_address`, `pipe.close()` | `socket.pipe_count` | present as a **number, not a collection**: how many pipes this socket can talk to right now (`sockets.rs:332-336`). What is missing: the per-pipe objects, their addresses and the ability to close one |
+| `pynng.Pipe`, `sock.pipes`, `msg.pipe`, `pipe.local_address`, `pipe.remote_address`, `pipe.close()` | `socket.pipe_count` | present as a **number, not a collection**: how many pipes this socket can talk to right now (`sockets.rs:445-449`). What is missing: the per-pipe objects, their addresses and the ability to close one |
 | `pynng.Dialer`, `pynng.Listener`, `sock.dialers`, `sock.listeners`, `dialer.close()` | `await socket.dial(url)` / `listen(url)` returning the URL actually used | present as the one fact a caller needs — a wildcard listen reports its port (`test_a_wildcard_listen_reports_the_port_it_got`), which is `NNG_OPT_URL`/`NNG_OPT_TCP_BOUND_PORT`. What is missing: the endpoint objects and closing one without closing the socket |
 | `sock.dial(addr, block=False)` | `socket.dial_nowait(url)` | present, `NNG_FLAG_NONBLOCK`, retrying in the background with the reconnect backoff |
 | `nng_stats` | — | absent in **both**: NNG's statistics tree is a snapshot API over counters this library does not keep ([`nng.md`](nng.md) §6), and pynng exports nothing for it either |
 | — | `SubSocket.discarded` | present, and pynng has no counterpart: publications this subscriber threw away, filtered out or dropped for a full queue. Asserted across implementations — `tests/test_interop.py` checks `subscriber.discarded == 1` after the C library published one non-matching topic |
-| — | `Broadcast(queued, dropped)` from `PubSocket.send`, `BusSocket.send` | present, and pynng has no counterpart: PUB, BUS and SURVEYOR are best effort and NNG's own send reports success either way. This is the only place the second number exists (`values.rs:25-37`) |
+| — | `Broadcast(queued, dropped)` from `PubSocket.send`, `BusSocket.send` | present, and pynng has no counterpart: PUB, BUS and SURVEYOR are best effort and NNG's own send reports success either way. This is the only place the second number exists (`values.rs:36-58`) |
 | — | `Context.socket_count`, `max_sockets`, `worker_threads`, `close_budget`, `closed`, and `await ctx.shutdown()` returning the sockets still open when the budget ran out | present, no counterpart in pynng, which has no context object at all (`context.rs:155-197`) |
-| — | `ReqContext.id` / `ReplyContext.id` / `SurveyContext.id` | present — `nng_ctx_id()` as a property (`contexts.rs:102-106`) |
+| — | `ReqContext.id` / `ReplyContext.id` / `SurveyContext.id` | present — `nng_ctx_id()` as a property (`contexts.rs:110-114`) |
 
 ## 7. Devices and helpers
 
@@ -203,7 +203,7 @@ thread would deadlock against the coroutine it waits for.
 
 **REQ/REP is exercised in both roles and on both sides of the bind**; PUB/SUB, PUSH/PULL and
 SURVEYOR/RESPONDENT are exercised in one role each. **Nothing disagreed** in the recorded
-run: all six pass. The suite's 51 Python test cases are counted from the source rather than
+run: all six pass. The suite's 63 Python test cases are counted from the source rather than
 re-run (§11).
 
 What the interop does **not** cover, named rather than implied:
@@ -239,9 +239,10 @@ What the interop does **not** cover, named rather than implied:
    `weida-nng`'s own `blocking` module, which the binding enables as a Cargo feature
    (the `blocking` feature of `Cargo.toml`). No protocol behaviour exists twice, which is why the two surfaces
    cannot disagree and why a `sync` socket and an asyncio socket exchange a message in the
-   suite (`test_the_two_surfaces_talk_to_each_other`). **The GIL is released** — `py.detach`
-   around every blocking `send`, `recv`, `dial`, `listen` and `shutdown` (`sync.rs:146`, `190`,
-   `299`, `311`, `115`) — so one thread parked in `recv` does not stop another
+   suite (`test_the_two_surfaces_talk_to_each_other`). **The GIL is released** —
+   `weida_py_core::interruptible`, which detaches from the interpreter, wraps every blocking
+   `send`, `recv`, `dial`, `listen` and `shutdown` (`sync.rs:146`, `192`, `308`, `322`,
+   `113`) — so one thread parked in `recv` does not stop another
    (`test_a_blocked_thread_does_not_hold_the_gil`), and no asyncio loop exists in such a
    process (`test_no_event_loop_is_running_while_this_suite_runs`).
 6. **`weida_nng.sync.Context` is the owned constructor only.** The asyncio `Context` has three
@@ -308,15 +309,15 @@ Every count in this document, with the command that produces it:
 | Claim | Command | Result |
 | --- | --- | --- |
 | The peer's versions (§1, §8) | `.venv/bin/python -c "import pynng; print(pynng.__version__, pynng.ffi.string(pynng.lib.nng_version()).decode())"` | `0.9.0 1.11.0` |
-| The suite's size (§8) | `grep -c 'def test_' crates/nng/weida-nng-py/tests/*.py` | `test_contexts.py:4`, `test_interop.py:6`, `test_options.py:12`, `test_sockets.py:12`, `test_sync.py:9` — **43 test functions** |
-| Collected test cases | the two `@pytest.mark.parametrize` rows (`grep -n 'parametrize' crates/nng/weida-nng-py/tests/*.py`) expand one function to 7 and one to 3, so 41 + 7 + 3 = **51** | 51 |
+| The suite's size (§8) | `grep -c 'def test_' crates/nng/weida-nng-py/tests/*.py` | `test_contexts.py:4`, `test_interop.py:6`, `test_options.py:15`, `test_sockets.py:13`, `test_sync.py:10` — **48 test functions** |
+| Collected test cases | the three `@pytest.mark.parametrize` rows (`grep -n 'parametrize' crates/nng/weida-nng-py/tests/*.py`) expand one function to 11, one to 4 and one to 3, so 45 + 11 + 4 + 3 = **63** | 63 |
 | Eleven socket classes (§2) | `grep -c '^python_socket!($' crates/nng/weida-nng-py/src/sockets.rs` and `grep -c '^sync_socket!($' crates/nng/weida-nng-py/src/sync.rs` | 11 and 11 |
 | Three context classes (§2) | `grep -c '^python_context!($' crates/nng/weida-nng-py/src/contexts.rs` and `grep -c '^sync_context!($' crates/nng/weida-nng-py/src/sync.rs` | 3 and 3 |
 | 23 exception classes (§9.7) | `grep -cE '^    E[A-Z]*,$' crates/nng/weida-nng-py/src/errors.rs` | 23 |
 | 31 pynng exception classes (§9.7) | `grep -c '^class [A-Za-z]*(NNGException):' .venv/lib/python3.13/site-packages/pynng/exceptions.py` | 31 |
 | Nineteen option keywords (§5) | `grep -cE '^        [a-z_]*=None,$' crates/nng/weida-nng-py/src/options.rs` | 19 |
 | 50 option rows, 34 honoured, 16 refused (§5) | `grep -c 'name: "NNG_OPT_' crates/nng/weida-nng/src/optiontable.rs`, then the same file with `'        disposition: Disposition::Honoured'` and `'        disposition: Disposition::Refused'` | 50, 34, 16 |
-| `package.sh` and `smoke.py` present (§10) | `glob 'crates/**/package.sh; crates/**/smoke.py'` | every binding has both, each `package.sh` a wrapper over `crates/py/package.sh` |
+| `package.sh` and `smoke.py` present (§10) | `glob 'crates/**/package.sh; crates/**/smoke.py'` | every PyO3 binding has both, each `package.sh` a wrapper over `crates/py/package.sh`; `crates/py/weida-py` has both, with a `package.sh` of its own; `crates/js/weida-js` and `crates/jvm/weida-jvm` have a `package.sh` and no `smoke.py` |
 | pynng's transports (§3) | a listen attempt per scheme through `.venv/bin/python` against `pynng.Pull0` | `ws`, `wss`, `tls+tcp`, `inproc`, `ipc`, `abstract` accepted; `udp` raised `NotSupported` |
 | NNG's protocol names (§2) | `protocol_name` read from each of pynng's eleven classes | `pair` for `Pair0`, where this binding answers `pair0`; the other ten agree |
 
@@ -334,8 +335,8 @@ Every count in this document, with the command that produces it:
 1. **The pynng version is unpinned.** `0.9.0` over NNG `1.11.0` is what the repository
    virtualenv holds; nothing in the repository fixes it, and the suite asserts only
    `1.x`. Any §8 claim is a claim about that build.
-2. **The suite's size is counted, not run.** The 43 test functions and 51 cases are
-   counted from the source; the last recorded green run reports 51.
+2. **The suite's size is counted, not run.** The 48 test functions and 63 cases are
+   counted from the source; the last recorded green run, at 51 cases, predates the current suite.
 3. **Whether `weida-sp` in the binding's manifest is reserved for a raw-socket surface or is a
    leftover** is not decided by the manifest's own comment, which names the raw socket's
    constructor; §7 records that nothing under `src/` refers to it.

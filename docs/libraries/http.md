@@ -1,4 +1,4 @@
-# HTTP (hyper 1.11.1, h3 0.0.8) — feature parity
+# HTTP (hyper 1.12.0, h3 0.0.8) — feature parity
 
 `weida-http-codec` (codec) and `weida-http` (client and server), the sixth protocol family
 ([0044](../decisions/0044-weida-http.md)). Every row below is a verdict on what this library
@@ -12,8 +12,8 @@ does with an item of HTTP's inventory as RFC 9110, 9112, 9113 and 9114 define it
 - **absent with a reason**: not implemented; the row says what a caller who wants it does not
   get. 0044 §6 lists the absences that are decisions.
 
-There is no "partial". Measured claims were measured against hyper 1.11.1 with hyper-util
-0.1.20 and http-body-util 0.1.5, h3 0.0.8 with h3-quinn 0.0.10 on quinn 0.11.12 (all from
+There is no "partial". Measured claims were measured against hyper 1.12.0 with hyper-util
+0.1.21 and http-body-util 0.1.5, h3 0.0.8 with h3-quinn 0.0.10 on quinn 0.11.12 (all from
 `Cargo.lock`), and curl 8.23.0 with nghttp2 1.70.0, ngtcp2 1.25.0 and nghttp3 1.18.0.
 
 ## 2. Versions, roles and message features
@@ -95,10 +95,10 @@ None. hyper's `service` and tower layers have no counterpart: the server is pull
 
 | Pairing | Roles | Rows | Test |
 | --- | --- | --- | --- |
-| hyper 1.11.1 `server::conn::http1` | our client | 3 B GET, 1 MiB echo, 4 MiB chunked, keep-alive reuse on one connection, plain and TLS | `io::interop_hyper::our_client_against_hyper_h1{,_over_tls}`, `two_requests_share_one_keep_alive_connection` |
-| hyper 1.11.1 `client::conn::http1` | our server | GET (with `date`), 1 MiB echo, chunked response | `io::interop_hyper::hyper_h1_client_against_our_server` |
-| hyper 1.11.1 `server::conn::http2` | our client | GET, 1 MiB echo, 50 concurrent on one connection, trailers, `Version::Http2` | `io::interop_hyper::our_client_against_hyper_h2` |
-| hyper 1.11.1 `client::conn::http2` | our server | GET, 1 MiB echo, 50 concurrent on one connection, trailers | `io::interop_hyper::hyper_h2_client_against_our_server` |
+| hyper 1.12.0 `server::conn::http1` | our client | 3 B GET, 1 MiB echo, 4 MiB chunked, keep-alive reuse on one connection, plain and TLS | `io::interop_hyper::our_client_against_hyper_h1{,_over_tls}`, `two_requests_share_one_keep_alive_connection` |
+| hyper 1.12.0 `client::conn::http1` | our server | GET (with `date`), 1 MiB echo, chunked response | `io::interop_hyper::hyper_h1_client_against_our_server` |
+| hyper 1.12.0 `server::conn::http2` | our client | GET, 1 MiB echo, 50 concurrent on one connection, trailers, `Version::Http2` | `io::interop_hyper::our_client_against_hyper_h2` |
+| hyper 1.12.0 `client::conn::http2` | our server | GET, 1 MiB echo, 50 concurrent on one connection, trailers | `io::interop_hyper::hyper_h2_client_against_our_server` |
 | h3 0.0.8 server on h3-quinn 0.0.10 | our client | GET, 1 MiB echo, 50 concurrent, trailers | `io::interop_h3::our_client_against_h3_server` |
 | h3 0.0.8 client on h3-quinn 0.0.10 | our server | GET, 1 MiB echo, 50 concurrent on one connection, trailers | `io::interop_h3::h3_client_against_our_server` |
 | curl 8.23.0 | our server (`examples/hello.rs`) | HTTP/1.1, HTTP/2 (`--http2`), HTTP/3 (`--http3-only`) | smoke, recorded in the NIGHTLOG for B-368 |

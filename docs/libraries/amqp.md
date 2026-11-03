@@ -24,7 +24,7 @@ Three verdicts and no fourth:
 - **present** — implemented, with the module or test that carries it named. A present row may
   still say where the behaviour differs, and then the difference is the row.
 - **refused with a reason** — the configuration exists in the specification and fails **here,
-  at configuration time**, with a message naming why (0013 §4.4 item 4). Nothing is silently
+  at configuration time**, with a message naming why (0013 §4.4). Nothing is silently
   ignored.
 - **absent with a reason** — not implemented and not configurable, with what is missing named.
 
@@ -33,9 +33,9 @@ missing (0013 §4.7 clause 6).
 
 **Versions every measured claim was measured against.** `fe2o3-amqp` **0.18.4**, the pure-Rust
 peer, through its `acceptor` module over loopback TCP, by
-`crates/amqp/weida-amqp/tests/interop_fe2o3.rs` — eight tests, nothing `#[ignore]`d. **RabbitMQ
+`crates/amqp/weida-amqp/tests/io/interop_fe2o3.rs` — eight tests, nothing `#[ignore]`d. **RabbitMQ
 4.x is not run**: no `rabbitmq-server` is available to the tests, and neither is `docker` or
-`podman`, so `tests/interop_rabbitmq.rs` is four `#[ignore]`d tests carrying the install
+`podman`, so `tests/io/interop_rabbitmq.rs` is four `#[ignore]`d tests carrying the install
 command, and every RabbitMQ column below says *not run* rather than a verdict. Claims about
 what the specification *says* cite [`../research/amqp10.md`](../research/amqp10.md), which
 cites the five OASIS parts; claims about what a broker does cite that sheet's numbered sources
@@ -94,7 +94,7 @@ one because the specification ties them together nowhere (sheet §5.3).
 ## 5. Settle modes and delivery states
 
 What each mode *proves to an application* is the subject of `settlement.rs`'s own table and of
-`tests/disposition.rs`, where every test asserts a conclusion — the message will not come back,
+`tests/io/disposition.rs`, where every test asserts a conclusion — the message will not come back,
 the message is available again, the peer knows that this end knows — rather than that a frame
 arrived.
 
@@ -228,7 +228,7 @@ library uses **the protocol's**, and where it does not, the bound is ours and sa
 
 ## 9. Interop
 
-`crates/amqp/weida-amqp/tests/interop_fe2o3.rs` — **8 tests, nothing ignored**, against
+`crates/amqp/weida-amqp/tests/io/interop_fe2o3.rs` — **8 tests, nothing ignored**, against
 `fe2o3-amqp` 0.18.4's `acceptor` over loopback. Both roles: our sender read by its receiver,
 our receiver reading its sender, and an 8 KiB message through a 1 KiB frame reassembled whole
 at the peer. Four probes rather than assumptions, each recorded above: `rcv-settle-mode=second`
@@ -236,7 +236,7 @@ at the peer. Four probes rather than assumptions, each recorded above: `rcv-sett
 0.18.4, refused by 0.17.0 — §7.2), and transactions (§7.1). `cargo tree -p weida-amqp --no-dev-dependencies`
 reaches neither `weida` nor `weida-protocol`, and the peer brings no second TLS stack.
 
-`crates/amqp/weida-amqp/tests/interop_rabbitmq.rs` — **4 tests, all `#[ignore]`d**, because no
+`crates/amqp/weida-amqp/tests/io/interop_rabbitmq.rs` — **4 tests, all `#[ignore]`d**, because no
 `rabbitmq-server` is available. The harness starts and stops the broker on a port of its own
 and waits for the socket rather than assuming readiness; every test says what it *would*
 establish. **Nothing in it is observed**, and the sheet's RabbitMQ claims stay
@@ -274,14 +274,14 @@ forever.
 0013 §4.7's six clauses, read for AMQP, each with its verdict and where this document proves
 it.
 
-| Clause | Verdict |
+| 0013 §4.7 clause | Verdict |
 | --- | --- |
-| 1. Every performative of Part 2 §2.7 implemented or absent with a reason, with the specification's own field layouts asserted rather than described | **met** — §2: all nine present, with `tests/golden_performatives.rs` asserting the figures |
-| 2. The transports the specification defines, with the rest named absent | **met** — §6: TCP and both routes to TLS present; UDP and SCTP are reserved with no mapping *in the specification*; the WebSocket binding is absent with what is missing named |
-| 3. The security layers: SASL with the mechanisms a client can speak, and TLS | **met** — §6: `ANONYMOUS`, `PLAIN`, `EXTERNAL` and no-SASL present; the rest absent with the reason, and never offered |
-| 4. Interop in both roles against a foreign implementation | **met** — §9: 8 tests against `fe2o3-amqp` 0.18.4, both roles, four probed facts. RabbitMQ 4.x is `#[ignore]`d and stated as not run |
-| 5. The message model: every section, both credit schemes, the settle modes and the delivery states | **met** — §3, §4, §5 |
-| 6. A feature-parity table, row by row, where no row says "partial" without saying what is missing | **met** — this document |
+| 1. typed API coverage of the primitive inventory | **met** — §2: all nine performatives present, with `tests/golden_performatives.rs` asserting the figures; §3-§5: every message section, both credit schemes, the settle modes and the delivery states |
+| 2. transports implemented or refused with reasons | **met** — §6: TCP and both routes to TLS present; UDP and SCTP reserved with no mapping *in the specification*; the WebSocket binding absent with what is missing named |
+| 3. security and authorization implemented or refused with reasons | **met** — §6: `ANONYMOUS`, `PLAIN`, `EXTERNAL` and no-SASL present; the rest absent with the reason, and never offered |
+| 4. options and resource bounds covered row by row | **met** — §2's `open`, `begin` and `attach` fields and §8's bounds |
+| 5. monitoring and native devices covered | **met** — AMQP 1.0's core defines neither; a broker's node model is absent with the reason (§7) |
+| 6. a parity document with every row present, refused or absent with a reason, backed by interop against a named upstream version | **met** — this document, with §9: 8 tests against `fe2o3-amqp` 0.18.4, both roles, four probed facts; RabbitMQ 4.x is `#[ignore]`d and stated as not run |
 
 What a caller who compares this library with the OASIS core does **not** get, in one list: Part
 4 transactions and the `coordinator` target; link resumption; any *interpretation* of the three
@@ -307,6 +307,6 @@ Nothing else.
   (`performative.rs`, `message.rs`, `state.rs`, `frame.rs`, `sasl.rs`, `types.rs`) and
   `weida-amqp/src/` (`connection.rs`, `session.rs`, `link.rs`, `credit.rs`, `window.rs`,
   `settlement.rs`, `delivery.rs`, `terminus.rs`, `options.rs`, `sasl.rs`, `transport.rs`), plus
-  `weida-amqp/tests/` (`handshake.rs`, `session.rs`, `link.rs`, `transfer.rs`,
+  `weida-amqp/tests/io/` (`handshake.rs`, `session.rs`, `link.rs`, `transfer.rs`,
   `disposition.rs`, `interop_fe2o3.rs`, `interop_rabbitmq.rs`) and
   `weida-amqp-codec/tests/golden_performatives.rs`.

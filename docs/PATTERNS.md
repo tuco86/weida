@@ -194,9 +194,9 @@ is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3)
 
 ### 1.8 Liveness: idle timeout, keep-alive, redial
 
-- A connection with no traffic is declared dead after `RuntimeConfig::idle_timeout` (30 s
+- A connection with no traffic is declared dead after `Limits::idle_timeout` (30 s
   default), the smaller of the two peers' values governing both.
-- Only the **dialling** side sends keep-alives (`RuntimeConfig::keep_alive`, 10 s default). A
+- Only the **dialling** side sends keep-alives (`Limits::keep_alive`, 10 s default). A
   binding with an idle timeout shorter than its clients' keep-alive interval drops them.
 - Loss surfaces as `Error::ConnectionLost(cause)` from an operation that was on the dead
   connection, and the cause is kept rather than flattened: `IdleTimeout`, `PeerClosed`,
@@ -225,7 +225,8 @@ is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3)
 
 *`idle_timeout_reports_loss_within_the_window` (server idle timeout 500 ms, client
 keep-alive 10 s, `PeerEvent::Lost { cause: IdleTimeout }` after 1.5 s of silence, and the
-next request on the redialled connection); `crates/weida/tests/reconnect.rs`, all ten:
+next request on the redialled connection); `crates/weida/tests/reconnect.rs`, all twelve,
+and `crates/weida/tests/io/reconnect.rs`, all five:
 restart on the same address over QUIC, `AF_UNIX` and inproc with the same `Lost`, `Retrying`,
 `Connected` order, `never()`, a replacement server with a new key refused as `PeerChanged`,
 `open` waiting through the outage, `send_timeout`, re-subscription, and the outbox of
@@ -291,11 +292,11 @@ key is a new peer — `IdentityEvent::Renewed` against `KeyChanged` on the sourc
 and `PeerEvent::GaveUp { PeerChanged }` on the peers that pinned the old one. Revocation is
 not checked, on any path; a short TTL under a renewing source is the answer weida has.
 
-*`crates/weida/tests/identity.rs`, all ten; `crates/weida/tests/identity_source.rs`: a
+*`crates/weida/tests/identity.rs`, all thirteen; `crates/weida/tests/io/identity_source.rs`: a
 certificate replaced under a live binding is served to the next handshake, a replaced key is
 `KeyChanged` and `PeerChanged`, a bootstrapped directory is owner-only and yields the same key
-twice; `crates/openbao/weida-openbao/tests/scripted.rs`, and `tests/bao_dev.rs` against the
-real server.*
+twice; `crates/openbao/weida-openbao/tests/io/scripted.rs` and `tests/scripted.rs`, and
+`tests/io/bao_dev.rs` against the real server.*
 
 ### 1.10 What a local transport changes
 
@@ -354,11 +355,13 @@ one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
   reset flag instead, which needs no framing at all. The cost is priced in 0012 §4.7(e): five
   bytes per write and the zero-copy read.
 
-*`crates/weida/tests/transports.rs`: the three pattern bodies over all three transports,
-`a_unix_peer_presents_the_principal_the_kernel_proved`,
-`a_local_peer_that_goes_away_is_reported_as_connection_loss`,
-`an_exhausted_reverse_pool_drops_the_copy_and_counts_it`,
-`a_subscriber_that_parks_nothing_is_refused_at_connect`.*
+*`crates/weida/tests/transports.rs`: the seven pattern bodies (Req/Rep, Push/Pull, Pub/Sub,
+PAIR, SURVEY, BUS and a datagram flow) over QUIC and inproc, and
+`a_local_peer_that_goes_away_is_reported_as_connection_loss`;
+`crates/weida/tests/io/transports.rs`: the seven over named pipes, Push/Pull and Pub/Sub over
+`AF_UNIX`, and `a_unix_peer_presents_the_principal_the_kernel_proved`;
+`crates/weida/tests/sim_unix.rs`: `an_exhausted_reverse_pool_drops_the_copy_and_counts_it`
+and `a_subscriber_that_parks_nothing_is_refused_at_connect`.*
 
 ---
 
@@ -690,7 +693,8 @@ refused with `CANCELED` before it reaches the acceptor.
 `two_peers_on_one_connection_number_one_sequence`,
 `a_peer_segment_carries_its_layers_to_the_acceptor`,
 `an_acceptor_refuses_a_segment_older_than_one_it_delivered`,
-`a_receiver_delivers_each_layer_of_a_segment_once` (`crates/weida/tests/radio.rs`).*
+`a_receiver_delivers_each_layer_of_a_segment_once` (`crates/weida/tests/radio.rs`; the last
+two in `crates/weida/tests/raw_peers/radio.rs`).*
 
 **A datagram flow** is the third carrier
 ([decisions/0034](decisions/0034-late-is-lost.md) §4.2), for units worthless once late — a
@@ -925,7 +929,9 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 `admission_refuses_a_join_silently_and_records_nothing`,
 `evict_withdraws_a_join_and_frees_its_subscription_slot`,
 `installing_an_admission_screens_joins_already_recorded`
-(`crates/weida/tests/radio.rs`).*
+(`crates/weida/tests/radio.rs`;
+`a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole` in
+`crates/weida/tests/raw_peers/radio.rs`).*
 
 ### 6.5 SWARM
 

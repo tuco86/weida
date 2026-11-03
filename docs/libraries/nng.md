@@ -18,7 +18,7 @@ Three verdicts and no fourth:
 - **present** — implemented, with the module or test that carries it named. A present row may
   still say where the behaviour differs, and then the difference is the row.
 - **refused with a reason** — the option or URL exists in NNG and fails **here, at
-  configuration time**, with a message naming why (0013 §4.4 item 4). Nothing is silently
+  configuration time**, with a message naming why (0013 §4.4). Nothing is silently
   ignored.
 - **absent with a reason** — not implemented and not configurable, with what is missing named.
 
@@ -27,7 +27,7 @@ missing (0013 §4.7 clause 6).
 
 **Versions every measured claim was measured against.** NNG **1.4.0-rc.0**, vendored and
 built from source by `nng-sys` 1.4.0-rc.0 under the `nng` crate **1.0.1**, exercised over
-loopback TCP on Linux x86-64 on 2026-09-12 by `crates/nng/weida-nng/tests/interop_nng.rs`.
+loopback TCP on Linux x86-64 on 2026-09-12 by `crates/nng/weida-nng/tests/io/interop_nng.rs`.
 Claims about what SP *specifies* cite [`../research/nanomsg-nng.md`](../research/nanomsg-nng.md),
 which cites the nanomsg RFCs and the NNG manual; claims about what the *implementation* does
 cite that sheet's §13 and the interop suite. Nothing here is inferred from a version other
@@ -181,7 +181,7 @@ Raw sockets and the device are the reason the tag stack is a public type
 
 ## 8. Interop evidence
 
-`tests/interop_nng.rs`, eleven tests, against the versions §1 names. The `nng` crate is an
+`tests/io/interop_nng.rs`, eleven tests, against the versions §1 names. The `nng` crate is an
 optional dependency behind the `nng-interop` feature and the tests are `#[ignore]`d on top of
 that, because the C library is a build condition rather than a runtime one
 ([LOOP.md](../LOOP.md) §2); the command is
@@ -221,7 +221,7 @@ puts this library's `device()` between two NNG sockets.
 
 ## 9. Deliberate deviations and bounds NNG does not have
 
-**Two deliberate default changes** (0013 §4.4 item 5), both settable back and both rows in §5
+**Two deliberate default changes**, both settable back and both rows in §5
 or §8: `NNG_OPT_RECVMAXSZ` = 1 MiB against NNG's unlimited, and `ContextConfig::close_budget`
 = 1 s, a finite close where NNG's `nng_close` waits for its own internal drain.
 
@@ -285,14 +285,14 @@ identity (§4 here). Adding one would be a private extension no NNG peer could r
 
 0013 §4.7's six clauses, read for SP, each with its verdict.
 
-| Clause | Verdict |
+| 0013 §4.7 clause | Verdict |
 | --- | --- |
-| 1. Every protocol of `nng(7)`'s table implemented or absent with a reason, with the manual's rows asserted rather than described | **met** — §2: all eleven present, with their peer, direction, alternation and full-queue rows asserted in the module tests and in `protocol.rs`'s table test; `NNG_OPT_PAIR1_POLY` is the one behaviour refused, with what is missing named |
-| 2. `tcp`, `ipc` and `inproc`, with the rest named absent | **met** — §3, and `tls+tcp` beyond the clause |
-| 3. The security surface, honestly stated | **met** — §4: SP has no message-level authentication, authorization or sender identity, and the two transport-level answers say plainly that they authenticate a transport peer only |
-| 4. Interop in both roles against the reference implementation, every pairing it supports | **met** — §8: eleven tests against NNG 1.4.0-rc.0 through the `nng` crate, both roles, one measured correction and two kept divergences |
-| 5. The patterns exercised as the manual describes them, asserting the guarantee each claims | **met** — the seven suites `reqrep`, `pipeline`, `pubsub`, `pair`, `survey`, `bus`, `raw_device`, plus `local_transports`, `tls`, `options` and the compile-fail `directions` harness: 101 unit tests and 80 integration tests run by default, and the eleven interop tests behind the feature; each asserts the sheet's sentence rather than merely running. The hostile-peer cases — a silent TLS client, a requester that stops reading, a stack too deep for its backend, a trickled message, a peer the pipe-add-pre callback refused — are driven over loopback by hand-written peers |
-| 6. A feature-parity table, row by row, where no row says "partial" without saying what is missing | **met** — this document |
+| 1. typed API coverage of the primitive inventory | **met** — §2: all eleven protocols present, with their peer, direction, alternation and full-queue rows asserted in the module tests and in `protocol.rs`'s table test; `NNG_OPT_PAIR1_POLY` is the one behaviour refused, with what is missing named |
+| 2. transports implemented or refused with reasons | **met** — §3: `tcp`, `ipc`, `inproc` and `tls+tcp`, the rest named absent |
+| 3. security and authorization implemented or refused with reasons | **met** — §4: SP has no message-level authentication, authorization or sender identity, and the two transport-level answers say plainly that they authenticate a transport peer only |
+| 4. options and resource bounds covered row by row | **met** — §5: 50 option rows, 34 honoured and 16 refused by name; §9: the bounds NNG does not have |
+| 5. monitoring and native devices covered | **met** — §6: dialers, listeners, pipes and the three pipe events, with `nng_stats` absent with a reason; §7: raw mode and `nng_device` |
+| 6. a parity document with every row present, refused or absent with a reason, backed by interop against a named upstream version | **met** — this document, with §8: eleven tests against NNG 1.4.0-rc.0 through the `nng` crate 1.0.1, both roles, one measured correction and two kept divergences |
 
 What a caller who compares this library with NNG 1.10 does **not** get, in one list: PAIR v1
 polyamorous mode; contexts on raw sockets and the one-socket device; the `ws`, `wss`, `zt`,
@@ -314,4 +314,4 @@ polyamorous mode; contexts on raw sockets and the one-socket device; the `ws`, `
   (§5, generated from `OPTIONS` and walked by a test), `endpoint.rs` (§3), `protocol.rs` and
   `pipe.rs` (§2's full-queue rows), `reqrep.rs`, `replier.rs`, `survey.rs`, `pipeline.rs`,
   `pubsub.rs`, `pair.rs`, `bus.rs`, `raw.rs` (§2, §7), `engine.rs` (§6), `tls.rs` and `ipc.rs`
-  (§4), plus `tests/interop_nng.rs` (§8).
+  (§4), plus `tests/io/interop_nng.rs` (§8).

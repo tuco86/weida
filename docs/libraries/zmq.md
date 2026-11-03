@@ -19,7 +19,7 @@ Three verdicts and no fourth:
 - **present** — implemented, with the module or test that carries it named. A present row may
   still say where the behaviour differs, and then the difference is the row.
 - **refused with a reason** — the configuration exists in libzmq and fails **here, at
-  configuration time**, with a message naming why (0013 §4.4 item 4). Nothing is silently
+  configuration time**, with a message naming why (0013 §4.4). Nothing is silently
   ignored.
 - **absent with a reason** — not implemented and not configurable, with what is missing named.
 
@@ -132,8 +132,8 @@ is a future rather than a descriptor.
 | `ZMQ_THREAD_NAME_PREFIX` | `zmq_ctx_set` | **refused** — replaced by a weida-runtime construct: Context::owned names its reactor's threads "weida-zmq" |
 | `ZMQ_SNDHWM` | `zmq_setsockopt` | **honoured** as `SocketOptions::pipe.outgoing.hwm` — in messages, default 1000 |
 | `ZMQ_RCVHWM` | `zmq_setsockopt` | **honoured** as `SocketOptions::pipe.incoming.hwm` — in messages, default 1000 |
-| `ZMQ_MAXMSGSIZE` | `zmq_setsockopt` | **honoured** as `SocketOptions::max_message_size` — bounded by default where libzmq has no limit, which is 0013 §4.4 item 5's second deliberate deviation (DEFAULT_MAX_MESSAGE_SIZE) |
-| `ZMQ_LINGER` | `zmq_setsockopt` | **honoured** as `ContextConfig::close_budget` — finite by default where libzmq's is infinite, which is 0013 §4.4 item 5's first deliberate deviation (DEFAULT_CLOSE_BUDGET) |
+| `ZMQ_MAXMSGSIZE` | `zmq_setsockopt` | **honoured** as `SocketOptions::max_message_size` — bounded by default where libzmq has no limit (§9) (DEFAULT_MAX_MESSAGE_SIZE) |
+| `ZMQ_LINGER` | `zmq_setsockopt` | **honoured** as `ContextConfig::close_budget` — finite by default where libzmq's is infinite (§9) (DEFAULT_CLOSE_BUDGET) |
 | `ZMQ_SNDTIMEO` | `zmq_setsockopt` | **honoured** as `SocketOptions::send_timeout` |
 | `ZMQ_RCVTIMEO` | `zmq_setsockopt` | **honoured** as `SocketOptions::recv_timeout` |
 | `ZMQ_SNDBUF` | `zmq_setsockopt` | **refused** — absent: kernel socket buffers are left at the OS default; what this library bounds is the message queue, in messages, under ZMQ_SNDHWM |
@@ -274,13 +274,13 @@ have (§9).
 
 ## 8. Interop evidence
 
-Both directions of clause 4, each pairing with our socket as the **connecting** side and as
+Both directions of the interop clause 6 rests on, each pairing with our socket as the **connecting** side and as
 the **bound** side, in the ordinary test suite (no supervised process, no script to remember).
 
 | Against | How | Tests | Result |
 | --- | --- | --- | --- |
-| `zeromq` 0.6.0 (pure Rust) | dev-dependency, always runs | 13 (`tests/interop_zmqrs.rs`) | all pass; ten pairings — REQ/REP, DEALER/ROUTER, PUSH/PULL, PUB/SUB, XPUB/XSUB, each with our socket bound *and* connecting — plus a test that PAIR is absent from that crate, one for the suppressed heartbeat against a 3.0 peer, and one for the subscription form it does not understand |
-| libzmq 4.3.5 through `zmq` 0.9.2 | optional dev-dependency behind the `libzmq-interop` feature, `#[ignore]` with the install command in the doc comment | 18 (`tests/interop_libzmq.rs`) | all pass; the same ten pairings plus PAIR both ways, PLAIN in both roles, CURVE in both roles, a ZAP refusal that stops a libzmq client, our heartbeat answered, and the `as-server` measurement of fact 1 below |
+| `zeromq` 0.6.0 (pure Rust) | dev-dependency, always runs | 13 (`tests/io/interop_zmqrs.rs`) | all pass; ten pairings — REQ/REP, DEALER/ROUTER, PUSH/PULL, PUB/SUB, XPUB/XSUB, each with our socket bound *and* connecting — plus a test that PAIR is absent from that crate, one for the suppressed heartbeat against a 3.0 peer, and one for the subscription form it does not understand |
+| libzmq 4.3.5 through `zmq` 0.9.2 | optional dev-dependency behind the `libzmq-interop` feature, `#[ignore]` with the install command in the doc comment | 19 (`tests/io/interop_libzmq.rs`) | all pass; the same ten pairings plus PAIR both ways, PLAIN in both roles, CURVE in both roles, a ZAP refusal that stops a libzmq client, our heartbeat answered, the `as-server` measurement of fact 1 below, and a libzmq CURVE server asking a bound ZAP handler with `ZMQ_ZAP_DOMAIN` empty (`libzmq_asks_a_bound_handler_for_curve_without_a_domain`) |
 
 **Three measured skews against `zeromq` 0.6.0**, exercised rather than assumed: it announces a
 3.0 greeting; it recognizes only the `READY` command name; and it sends and reads only ZMTP
@@ -309,7 +309,7 @@ what our side sends or accepts:
    `inproc://zeromq.zap.01` in the same context — which 27/ZAP's "the handler SHALL start
    before any server starts" requires but no libzmq page states as a refusal.
 
-Clause 5's evidence is `examples/` with `tests/zguide_*.rs`: nine recipes — lazy, simple and
+The zguide's recipes are `examples/`, asserted by `tests/zguide_clone.rs` and `tests/io/zguide_*.rs`: nine recipes — lazy, simple and
 paranoid pirate, the load-balancing broker inside Simple Pirate, Majordomo with `mmi.service`,
 Freelance models one and two, Clone/CHP, Binary Star, the last-value cache and Espresso — each
 asserting the guarantee its original claims, with the test files including the example files as
@@ -317,7 +317,7 @@ modules so that what is asserted is the code a reader runs.
 
 ## 9. Deliberate deviations and bounds libzmq does not have
 
-**Two deliberate default changes** (0013 §4.4 item 5), both settable back to anything the type
+**Two deliberate default changes**, both settable back to anything the type
 allows and both rows in §5:
 
 | | libzmq | here |
@@ -411,14 +411,14 @@ name prefix are a Tokio runtime here, sized by `ContextConfig::worker_threads`, 
 
 0013 §4.7's six clauses, each with its verdict and where this document proves it.
 
-| Clause | Verdict |
+| 0013 §4.7 clause | Verdict |
 | --- | --- |
-| 1. Every socket type of `zmq_socket(3)`'s table implemented or absent with a reason, with the manual's rows asserted rather than described | **met** — §2: eleven of twelve stable types present with their mute, routing and alternation rows in the module tests; `ZMQ_STREAM` and the eight draft types absent with what is missing named |
-| 2. `tcp`, `ipc` and `inproc`, with the rest named absent | **met** — §3 |
-| 3. NULL, PLAIN and CURVE, with ZAP | **met** — §4; GSSAPI is the one mechanism absent, with its options refused by name |
-| 4. Interop in both roles against libzmq and against zmq.rs, every pairing each supports | **met** — §8: 13 + 18 tests, both roles, four measured libzmq facts and three measured skews |
-| 5. The zguide's canonical patterns as examples that execute in `cargo test`, each asserting the guarantee the guide claims | **met** — §8's last paragraph; nine recipes in `examples/`, asserted by `tests/zguide_*.rs` |
-| 6. A feature-parity table, row by row, where no row says "partial" without saying what is missing | **met** — this document |
+| 1. typed API coverage of the primitive inventory | **met** — §2: eleven of twelve stable socket types present with their mute, routing and alternation rows asserted in the module tests; `ZMQ_STREAM` and the eight draft types absent with what is missing named |
+| 2. transports implemented or refused with reasons | **met** — §3: `tcp`, `ipc` and `inproc`, the rest named absent |
+| 3. security and authorization implemented or refused with reasons | **met** — §4: NULL, PLAIN and CURVE with ZAP; GSSAPI absent, its options refused by name |
+| 4. options and resource bounds covered row by row | **met** — §5: 98 rows, 42 honoured and 56 refused with their reason; §9: the bounds libzmq does not have |
+| 5. monitoring and native devices covered | **met** — §6: the monitor; §7: `proxy` and `proxy_steerable` |
+| 6. a parity document with every row present, refused or absent with a reason, backed by interop against a named upstream version | **met** — this document, with §8: 13 tests against `zeromq` 0.6.0 and 19 against libzmq 4.3.5, both roles, four measured libzmq facts and three measured skews |
 
 What a caller who compares this library with libzmq 4.3.5 does **not** get, in one list:
 `ZMQ_STREAM`; the draft socket families and their transports; GSSAPI; the multicast, datagram,
@@ -434,11 +434,10 @@ refused. Nothing else.
   §11 (options and limits), §12 (transports), §13 (the measured libzmq and zmq.rs facts),
   §14 sources [17], [18], [22], [23], [40], [41].
 - [0013](../decisions/0013-competitor-libraries.md) §4.1 (crate layout), §4.3 (`weida-zmtp`
-  stays sans-I/O), §4.4 (the shape of `weida-zmq`, the option rule and the two default
-  changes), §4.7 (the six clauses), §5.5 (the `kind` column).
+  stays sans-I/O), §4.4 (the library API and the option rule), §4.7 (the six clauses).
 - [INVARIANTS.md](../INVARIANTS.md) — the allocation invariant §9's bounds answer.
 - Code the verdicts were read from, all under `crates/zmq/weida-zmq/src/`: `optiontable.rs`
   (§5, generated from `OPTIONS`), `endpoint.rs` (§3), `options.rs` and `curve.rs` and `zap.rs`
   (§4), `reqrep.rs`, `dealerrouter.rs`, `pubsub.rs`, `xpubxsub.rs`, `pipeline.rs`, `pair.rs`
   (§2), `monitor.rs` (§6), `proxy.rs` (§7), `session.rs` (the handshake refusals), plus
-  `tests/interop_zmqrs.rs`, `tests/interop_libzmq.rs` and `tests/zguide_*.rs` (§8).
+  `tests/io/interop_zmqrs.rs`, `tests/io/interop_libzmq.rs`, `tests/zguide_clone.rs` and `tests/io/zguide_*.rs` (§8).

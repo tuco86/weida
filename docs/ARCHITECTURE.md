@@ -106,7 +106,7 @@ two entry points, and both layers share the transfer handles they hand out:
 | --- | --- |
 | `Peer` | the dialling side: `open()` a one-way transfer, `open_bi()` an exchange; `connection_stats()` reads each live connection's path and traffic |
 | `Acceptor` | the bound side: one path, both stream kinds, one queue |
-| `Incoming` | what an `Acceptor` yields: `Stream(..)`, `Exchange(..)` or `Flow(..)` |
+| `Incoming` | what an `Acceptor` yields: `Stream(..)`, `Exchange(..)`, `Subscribed(..)`, `Credit(..)`, `Unsubscribed { .. }` or `Flow(..)` |
 | `OutgoingTransfer` | the write half; `finish()` yields a `Delivery` |
 | `Delivery` | the transport receipt — QUIC's own fin-acknowledgement |
 | `IncomingTransfer` | the read half plus the metadata that described it |
@@ -159,7 +159,7 @@ placement and ownership live in the control group.
 ### Foreign protocols and managed connectors
 
 The foreign-protocol crates are standalone implementations, not weida adapters. A ZeroMQ user
-uses `weida-zmq` to speak to ZeroMQ peers; the same is true for NNG, MQTT, AMQP and NATS. The
+uses `weida-zmq` to speak to ZeroMQ peers; the same is true for NNG, MQTT, AMQP, NATS and HTTP. The
 workspace defines no global equation between a foreign socket type and a weida pattern.
 
 Where the broker later exposes a foreign protocol, it does so through a managed **Connector**
@@ -267,7 +267,7 @@ A binding must be able to carry weida's addressing model: an opaque endpoint pat
 namespace, several endpoints per binding. That is what makes QUIC and Web bindings of one
 Listener — both can name `/jobs` and `/events` on the same port.
 
-**Foreign-protocol libraries are not bindings.** ZeroMQ, nanomsg/NNG, MQTT, AMQP and NATS
+**Foreign-protocol libraries are not bindings.** ZeroMQ, nanomsg/NNG, MQTT, AMQP, NATS and HTTP
 have separate crates, implemented natively in Rust and hosted by `weida-runtime` or by an
 extension of it. They are usable standalone and expose their own protocol's addressing and
 semantics. A ZeroMQ socket, for example, is one ZeroMQ endpoint addressed by that protocol;
@@ -467,6 +467,7 @@ crates/
                                                     (decisions/0045); FFI `unsafe`
     broker/                    →  weida-broker      L2: queues at endpoint paths
     raft/weida-raft/           →  weida-raft        openraft plus the I/O it lacks
+    openbao/weida-openbao/     →  weida-openbao     OpenBao client and identity sources
     zmq/weida-zmtp/            →  weida-zmtp        ZMTP 3.1 codec, no I/O and no
                                                     weida dependency
     zmq/weida-zmq/             →  weida-zmq         the ZeroMQ implementation
@@ -489,6 +490,17 @@ crates/
     py/weida-py-core/          →  weida-py-core     the shared PyO3 foundation
     py/weida-py/               →  weida (Python)    weida for Python, cffi over libweida;
                                                     not a Cargo member
+    js/weida-js/               →  @tuco86/weida     weida for JavaScript, a Node-API addon
+                                                    over libweida; not a Cargo member
+    jvm/weida-jvm/             →  net.doodleshnookie.weida
+                                                    weida for the JVM and Android, JNI over
+                                                    libweida; not a Cargo member
+    beam/weida/                →  weida (OTP)       weida for Erlang/Elixir, a NIF over
+                                                    libweida; not a Cargo member
+    go/weida/                  →  weida (Go)        weida for Go, cgo over a static
+                                                    libweida; not a Cargo member
+    swift/weida/               →  Weida (Swift)     weida for Swift and iOS over an
+                                                    XCFramework of libweida; not a Cargo member
     testkit/                   →  weida-testkit     test waits that report instead of
                                                     killing; dev-only, never published
 ```
@@ -712,8 +724,8 @@ or `lookup_host`, and the check is two greps, one per crate, because the surface
 `weida-runtime` while the rule binds both:
 
 ```text
-grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src   # no call outside #[cfg(test)]
-grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/runtime/src # only exec.rs calls them
+grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src   # none outside #[cfg(test)], sim.rs (feature test-util) and bin/weida.rs
+grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/runtime/src # only exec.rs and resolve.rs
 ```
 
 One module is exempt, and the first grep lists it: `crates/weida/src/sim.rs`, the simulated
@@ -1160,10 +1172,16 @@ The surface of crate `weida`, grouped by layer.
 // re-exports from weida-core: Error, ErrorCode, StopReason, Limits, TraceContext,
 //     EndpointAddr (with .peer: Option<Fingerprint>), Fingerprint
 // error variants: Error::InvalidFingerprint(String), Error::Untrusted(Fingerprint)
-pub struct RuntimeConfig { pub limits: Limits,
-    pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/,
-    pub worker_threads: usize /*1; Runtime::owned only*/,
-    pub network: Network /*OS UDP; SimNet with test-util*/ }                 // Default impl
+pub struct RuntimeConfig { pub limits: Limits /*keep_alive 10s, idle_timeout 30s*/,
+    pub max_connections: usize /*1024*/, pub max_connections_per_peer: usize /*64*/,
+    pub endpoint_queue: usize /*256*/, pub max_resolved_addresses: usize /*8*/,
+    pub worker_threads: usize /*1; Runtime::owned only*/, pub shutdown_timeout: Duration /*1s*/,
+    pub guarantees: GuaranteeSet /*CORE*/, pub discovery: Discovery, pub resolver: SharedResolver,
+    pub network: Network /*OS UDP; SimNet with test-util*/,
+    pub connect_attempt_timeout: Duration /*250ms*/, pub reconnect: ReconnectPolicy,
+    pub send_timeout: Option<Duration> /*None*/, pub outbox_messages: usize /*1000*/,
+    pub outbox_bytes: usize /*8 MiB*/, pub outbox_full: OutboxFull,
+    pub max_handshakes: usize /*256*/, pub retry_above_handshakes: usize /*64*/ } // Default impl
 pub struct Network { .. }                                    // Default: the OS's UDP
 impl Network { pub fn sim(net: &SimNet) -> Network; }      // feature `test-util` (0042)
 pub struct SimNet { .. }                                     // feature `test-util`; Clone to share
@@ -1180,7 +1198,7 @@ impl SimNet {                                               // real QUIC and TLS
         -> Result<tokio::io::DuplexStream, Error>;           // raw dial of a simulated weida+unix binding
 }
 pub struct SimStats { pub delivered: u64, pub dropped: u64 }
-pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file
+pub enum Pem { Bytes(Zeroizing<Vec<u8>>), File(PathBuf) }   // TLS material need not be a file; bytes wiped on drop
 pub struct Identity { pub cert_chain: Pem, pub key: Pem }   // who I am; Debug never prints the key
 impl Identity {
     pub fn generate() -> Result<Identity, Error>;            // feature `generate`, on by default
@@ -1204,13 +1222,18 @@ impl Trust {
     pub fn and_anchor_file(self, path: impl Into<PathBuf>) -> Trust;
     pub fn is_empty(&self) -> bool;
 }
-pub struct ClientTls { pub trust: Trust, pub identity: Option<Identity> } // Eq+Hash: pool keys on it
-impl ClientTls { pub fn new(trust: Trust) -> Self;            // dials anonymously
-    pub fn with_identity(self, identity: Identity) -> Self; }  // From<Trust> for ClientTls
+pub enum Alpn { Weida /*weida/0, default*/, Raft /*weida-raft/0*/ }   // non_exhaustive
+pub struct ClientTls { pub trust: TrustSource, pub identity: Option<IdentitySource>,
+    pub alpn: Alpn }                                          // Eq+Hash: pool keys on it
+impl ClientTls { pub fn new(trust: impl Into<TrustSource>) -> Self;  // dials anonymously
+    pub fn with_identity(self, identity: impl Into<IdentitySource>) -> Self;
+    pub fn with_alpn(self, alpn: Alpn) -> Self; }              // From<Trust> for ClientTls
 pub enum ClientTrust { Trusted(TrustSource), AnyKey }         // From<Trust>, From<TrustSource>
-pub struct ServerTls { pub identity: Identity, pub client_trust: Option<ClientTrust> }
-impl ServerTls { pub fn new(identity: Identity) -> Self;      // accepts anonymous peers
-    pub fn require_client(self, trust: impl Into<ClientTrust>) -> Self; } // From<Identity> for ServerTls
+pub struct ServerTls { pub identity: IdentitySource, pub client_trust: Option<ClientTrust>,
+    pub alpn: Alpn }
+impl ServerTls { pub fn new(identity: impl Into<IdentitySource>) -> Self; // accepts anonymous peers
+    pub fn require_client(self, trust: impl Into<ClientTrust>) -> Self;
+    pub fn with_alpn(self, alpn: Alpn) -> Self; }              // From<Identity> for ServerTls
 
 pub struct Runtime;                                          // Clone (Arc inner); owns or borrows a tokio reactor
 impl Runtime {
@@ -1272,8 +1295,9 @@ pub struct UnixBinding;                                      // removes the sock
 impl UnixBinding { pub fn path(&self) -> &Path; }
 // Who a peer is, once proved: a key from TLS, or a principal from the kernel
 // on a local transport [0010 §4.4]. `None` for an anonymous or in-process peer.
-pub enum PeerIdentity { Key(Fingerprint), Local(LocalPrincipal) }
+pub enum PeerIdentity { Key(Fingerprint), Local(LocalPrincipal), Windows(WindowsPrincipal) }
 pub struct LocalPrincipal { pub uid: u32, pub gid: u32, pub pid: Option<u32> } // a PID is an observation
+pub struct WindowsPrincipal { pub sid: Arc<str>, pub pid: Option<u32> }  // a named pipe's client token
 
 // ---- L0: the stream core -------------------------------------------------------------
 pub struct Peer;                                             // dialling side; multi-peer, round-robin
@@ -1285,13 +1309,14 @@ impl Peer {
     pub async fn open_bi(&self, meta: TransferMeta)
         -> Result<(OutgoingTransfer, ReplyStream), Error>;                            // exchange
 }
-pub enum Incoming { Stream(IncomingTransfer), Exchange(IncomingRequest) }
+pub enum Incoming { Stream(IncomingTransfer), Exchange(IncomingRequest), Subscribed(Consumer),
+    Credit(CreditGrant), Unsubscribed { id: ConsumerId, filter: Option<String> }, Flow(IncomingFlow) }
 pub struct Acceptor;                                         // bound side; one path, both stream kinds
 impl Acceptor { pub fn path(&self) -> &str;
     pub async fn accept(&self) -> Result<Incoming, Error>; }
 
 // ---- L1: patterns --------------------------------------------------------------------
-pub struct Endpoint<P: Pattern>;             // Pattern sealed; markers Req, Rep, Push, Pull, Pub, Sub
+pub struct Endpoint<P: Pattern>;             // Pattern sealed; markers Req, Rep, Push, Pull, Pub, Sub, Pair, Survey, Respond, Bus, Cast, Tune; Seed, Gather with feature swarm
 pub type Requester = Endpoint<Req>; pub type Replier = Endpoint<Rep>;
 pub type Pusher = Endpoint<Push>;   pub type Puller = Endpoint<Pull>;
 pub type Publisher = Endpoint<Pub>; pub type Subscriber = Endpoint<Sub>;
@@ -1418,10 +1443,12 @@ Type by type:
 - **`Fingerprint`** — the SHA-256 of a peer's DER `SubjectPublicKeyInfo`, `Display` and
   `FromStr` as `sha256:<64 hex>`. The one identity value in the system: pinned in a `Trust`,
   embedded in an address, reported on `IncomingMeta::peer`, carried by `Error::Untrusted`.
-- **`ClientTls`** — a dialling endpoint's `Trust` plus an optional `Identity` to present. A
+- **`ClientTls`** — a dialling endpoint's `TrustSource` (a `Trust` value or a source that
+  rotates) plus an optional `IdentitySource` to present and the `Alpn` token to ask for. A
   bare `Trust` converts into it. Required to `connect()`; there is no platform-root or
   skip-verification path in v0.
-- **`ServerTls`** — a binding's `Identity` plus an optional `ClientTrust`. A bare `Identity`
+- **`ServerTls`** — a binding's `IdentitySource` plus an optional `ClientTrust` and the `Alpn`
+  token it offers. A bare `Identity`
   converts into it; `require_client(trust)` makes the binding authenticate its clients against
   a `Trust`, and `require_client(ClientTrust::AnyKey)` makes it require a proved key and judge
   none ([decisions/0035](decisions/0035-keys-proved-not-judged.md)).
@@ -1461,9 +1488,11 @@ Type by type:
   `Replier` accepts only exchanges and a `Puller` only one-way transfers, an `Acceptor` takes
   whatever arrives and lets the application decide.
 - **`Incoming`** — what `Acceptor::accept()` yields: `Stream` for a one-way transfer,
-  `Exchange` for a bidirectional one.
-- **`Endpoint<P>`** — the typed L1 messaging object. `Pattern` is a sealed trait; the v0
-  markers are `Req`, `Rep`, `Push`, `Pull`, `Pub` and `Sub`.
+  `Exchange` for a bidirectional one, `Subscribed`, `Credit` and `Unsubscribed` for a
+  consumer's subscription, its credit grant and its end, and `Flow` for a datagram flow.
+- **`Endpoint<P>`** — the typed L1 messaging object. `Pattern` is a sealed trait; the
+  markers are `Req`, `Rep`, `Push`, `Pull`, `Pub`, `Sub`, `Pair`, `Survey`, `Respond`, `Bus`,
+  `Cast` and `Tune`, plus `Seed` and `Gather` behind the feature `swarm`.
 - **`Requester`** — `Endpoint<Req>`. Multi-peer: each `connect()` appends a peer and `open()`
   round-robins across them, preserving the ZeroMQ multi-peer property. `open()` returns both
   halves of one exchange.

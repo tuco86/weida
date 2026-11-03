@@ -24,7 +24,7 @@ that shared framing is what makes an interrupted `AF_UNIX` stream distinguishabl
 
 The **reactor is its own crate**: `weida-runtime` holds `Exec`, the three reactor-ownership
 constructors, the capped resolver, the `AF_UNIX` and named-pipe hygiene and the name registry.
-It depends on `weida-core`, `tokio` and, on Windows only, `weida-winpipe`, the one crate in the
+It depends on `weida-core`, `tokio`, `nix` on Unix and, on Windows only, `weida-winpipe`, the one crate in the
 tree that may use `unsafe`. That is what lets a ZeroMQ user open a socket without linking quinn,
 rustls and weida's pattern layer. Above it the tree is **one directory per protocol family**
 (`crates/zmq/`, `crates/nng/`, `crates/mqtt/`, `crates/amqp/`, `crates/nats/`, `crates/http/`), so the
@@ -136,7 +136,7 @@ CI jobs: the C ABI ([weida-c](https://weida.doodleshnookie.net/status/weida-c/))
 [ios](https://weida.doodleshnookie.net/status/ios/)).
 
 weida itself ships a library with an async API, the `weida` binary, a C ABI (`libweida`,
-[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python, a JavaScript, a JVM, an Erlang/Elixir and a Go package on it. Each of the six
+[0045](decisions/0045-the-c-abi-is-the-boundary.md)) and a Python, a JavaScript, a JVM, an Erlang/Elixir, a Go and a Swift package on it. Each of the six
 libraries — ZeroMQ, nanomsg SP, MQTT 5, AMQP 1.0, Core NATS and HTTP — has a parity document in
 [libraries/](libraries/README.md) and, where a peer exists to measure against, an interop
 suite; the NATS suite is written and not run, which its parity table records as a clause **not
@@ -163,9 +163,12 @@ runs its EUnit tests and an Elixir smoke on both Linux architectures. weida for 
 package over a statically linked `libweida`, whose waiting methods take a `context.Context`
 and park the goroutine in Go's netpoller on the readiness descriptor, so no call blocks in C;
 the CI runs its tests and a smoke binary that carries `libweida` inside it on both Linux
-architectures. Swift/iOS binds `libweida` the same way, through native glue against `weida.h`
-([0046](decisions/0046-how-each-language-binds-libweida.md)), as an XCFramework of the static
-library. Its package does not exist yet. Each language has a CI image on both Linux
+architectures. weida for Swift is a Swift package over an XCFramework of the static
+`libweida` for macOS, iOS devices and the iOS simulator. Its `async` methods suspend the task
+on a one-shot `DispatchSource` over a duplicate of the readiness descriptor, so no call blocks
+in C. The CI runs its unit tests on darwin-arm64 and, on the nightly and tags, its QUIC tests
+and the iOS link, without running on an iOS device or simulator. Each language but Swift has
+a CI image on both Linux
 architectures, whose job compiles and runs the C smoke program against the `libweida` the
 `c-abi-linux-*` job of that architecture built, and `android-libweida` cross-builds `libweida`
 for the four Android ABIs on the nightly and tags.
@@ -213,10 +216,9 @@ The ready items of [BACKLOG.md](BACKLOG.md) fall into these themes:
 
 Behind them sit the phases of [IMPLEMENTATION.md](IMPLEMENTATION.md) §1 that are not built:
 persistence, consensus-backed clustering, the Web binding, and the rest of weida in its C ABI
-([0045](decisions/0045-the-c-abi-is-the-boundary.md) §5). The language packages over it follow
-in the order of [0046](decisions/0046-how-each-language-binds-libweida.md) — Go, then
-Swift/iOS — one plan each, on the CI environments that already exist; Swift/iOS also needs
-Xcode on the macOS runner, installed by hand.
+([0045](decisions/0045-the-c-abi-is-the-boundary.md) §5). Every language package of
+[0046](decisions/0046-how-each-language-binds-libweida.md) exists; what each still lacks is
+listed in [libraries/README.md](libraries/README.md).
 
 What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
 announcer, a blob store, one identity per connection and following a Raft leader stay out of

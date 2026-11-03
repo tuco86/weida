@@ -27,7 +27,7 @@ across phases. A phase is `done`, `partial` (its row says what is missing) or `n
 | 7 | Broker clustering | not started | Nothing is built. `weida-raft` is the consensus transport it will use. |
 | 8 | Web binding | not started | Nothing is built. |
 | 9 | Standalone foreign-protocol libraries | partial | All six libraries with codecs, fuzzing and interop; the NATS interop is written and not run. |
-| 10 | Language bindings | partial | Python for `weida` (cffi over `libweida`, CPython, 3.14t and PyPy) and the first five libraries; HTTP's is filed (B-371); the other languages have CI environments and no package yet ([0046](decisions/0046-how-each-language-binds-libweida.md)). |
+| 10 | Language bindings | partial | Python for `weida` (cffi over `libweida`, CPython, 3.14t and PyPy) and the first five libraries; HTTP's is filed (B-371); JavaScript, the JVM and Android, Erlang/Elixir, Go and Swift each have a package over `libweida` ([0046](decisions/0046-how-each-language-binds-libweida.md)), and no other language has one. |
 | 11 | CLI and administration | partial | The `weida` binary with `serve`, `request`, `send` and `sub`; no broker or cluster inspection. |
 | 12 | Documentation/site/stabilization | partial | [GUIDE.md](GUIDE.md) and the website, which lives in its own repository ([0033](decisions/0033-the-website-moves-out.md)). |
 
@@ -135,7 +135,7 @@ which is empty off Windows.
   a source that rotates under a live binding (`IdentitySource`, `TrustSource`;
   [0032](decisions/0032-identity-sources-and-the-handoff.md)), and `weida-openbao`
   (`crates/openbao`) supplies OpenBao-backed sources. Tests: `tests/identity.rs`,
-  `tests/identity_source.rs`.
+  `tests/io/identity_source.rs`.
 - **Runtime ownership.** `Runtime::new` takes the ambient reactor, `Runtime::with_handle`
   somebody else's and `Runtime::owned` creates and owns one, so no caller has to stand inside
   `#[tokio::main]`; `tests/foreign_executor.rs` drives weida from a non-Tokio executor.
@@ -289,7 +289,7 @@ Responsibility is explicit and opt-in; a `core` connection writes nothing it doe
   (`Runtime::suppressed_duplicates`). The window is bounded in time and in count
   (`Limits::max_dedup_entries`, 4096; at the cap the oldest entry is evicted), and the check
   precedes the gap detector, so a duplicate the receiver never accepted cannot shift its idea
-  of where the producer is. `tests/dedup.rs` replays from the raw wire, because the library's
+  of where the producer is. `tests/raw_peers/dedup.rs` replays from the raw wire, because the library's
   own sequencer is monotone.
 - **`drain`** (`src/drain.rs`, [0009](decisions/0009-drain.md)). `Runtime::drain(Duration)`
   returns `Drained { delivered, outstanding }` and is the counterpart of the abortive
@@ -387,12 +387,12 @@ that states, row by row, what it does against the reference implementation
 
 | Family | Codec | Library | Interop |
 | --- | --- | --- | --- |
-| ZeroMQ | `weida-zmtp` (ZMTP 3.1) | `weida-zmq`: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices | libzmq 4.3.5 (`tests/interop_libzmq.rs`, feature `libzmq-interop`, `#[ignore]`d) and zmq.rs (`tests/interop_zmqrs.rs`), both roles |
-| nanomsg SP | `weida-sp` | `weida-nng`: one socket type per protocol, contexts, endpoints and pipes, the option table, TLS and IPC credentials | NNG 1.4.0-rc.0 through the `nng` crate (`tests/interop_nng.rs`, feature `nng-interop`, `#[ignore]`d), both roles |
-| MQTT 5 | `weida-mqtt-codec` | `weida-mqtt`: a client | rumqttd 0.20.0 and rmqtt 0.23.1 (`tests/interop_rumqttd.rs`, `tests/interop_mqtt5.rs`, `#[ignore]`d) |
-| AMQP 1.0 | `weida-amqp-codec` | `weida-amqp`: a client | `fe2o3-amqp` 0.18.4, both roles (`tests/interop_fe2o3.rs`); RabbitMQ (`tests/interop_rabbitmq.rs`, `#[ignore]`d) is written and not run |
-| Core NATS | `weida-nats-codec` | `weida-nats`: a client | `tests/interop_nats_server.rs` is written and `#[ignore]`d, not run: it needs a `nats-server` |
-| HTTP | `weida-http-codec` (HTTP/1.1, HPACK, HTTP/2 frames, static QPACK, HTTP/3 frames) | `weida-http`: client and pull-style server, HTTP/1.1, HTTP/2 over TLS by ALPN, HTTP/3 over quinn behind the feature `h3` ([0044](decisions/0044-weida-http.md)) | hyper 1.11.1 for HTTP/1.1 and HTTP/2 and h3 0.0.8 on h3-quinn 0.0.10 for HTTP/3, both roles, always run (`tests/io/interop_hyper.rs`, `tests/io/interop_h3.rs`) |
+| ZeroMQ | `weida-zmtp` (ZMTP 3.1) | `weida-zmq`: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices | libzmq 4.3.5 (`tests/io/interop_libzmq.rs`, feature `libzmq-interop`, `#[ignore]`d) and zmq.rs (`tests/io/interop_zmqrs.rs`), both roles |
+| nanomsg SP | `weida-sp` | `weida-nng`: one socket type per protocol, contexts, endpoints and pipes, the option table, TLS and IPC credentials | NNG 1.4.0-rc.0 through the `nng` crate (`tests/io/interop_nng.rs`, feature `nng-interop`, `#[ignore]`d), both roles |
+| MQTT 5 | `weida-mqtt-codec` | `weida-mqtt`: a client | rumqttd 0.20.0 and rmqtt 0.23.1 (`tests/io/interop_rumqttd.rs`, `tests/io/interop_mqtt5.rs`, `#[ignore]`d) |
+| AMQP 1.0 | `weida-amqp-codec` | `weida-amqp`: a client | `fe2o3-amqp` 0.18.4, both roles (`tests/io/interop_fe2o3.rs`); RabbitMQ (`tests/io/interop_rabbitmq.rs`, `#[ignore]`d) is written and not run |
+| Core NATS | `weida-nats-codec` | `weida-nats`: a client | `tests/io/interop_nats_server.rs` is written and `#[ignore]`d, not run: it needs a `nats-server` |
+| HTTP | `weida-http-codec` (HTTP/1.1, HPACK, HTTP/2 frames, static QPACK, HTTP/3 frames) | `weida-http`: client and pull-style server, HTTP/1.1, HTTP/2 over TLS by ALPN, HTTP/3 over quinn behind the feature `h3` ([0044](decisions/0044-weida-http.md)) | hyper 1.12.0 for HTTP/1.1 and HTTP/2 and h3 0.0.8 on h3-quinn 0.0.10 for HTTP/3, both roles, always run (`tests/io/interop_hyper.rs`, `tests/io/interop_h3.rs`) |
 
 **Not built:** MQTT's and AMQP's server halves ([0014](decisions/0014-parallel-libraries.md)
 §2).
@@ -508,7 +508,7 @@ newline after each payload is readable and is not framing. `length` is the one f
 a payload, so `--max-bytes` (64 MiB by default) caps the hold, and a payload above it ends the
 command with `LimitExceeded`; a received body that does not finish within 30 s (`BODY_TIMEOUT`
 in the binary) is abandoned by `serve --sink` and `serve --echo`, which answers at most 64
-requests at a time. `tests/cli.rs` drives the binary the way a user does.
+requests at a time. `tests/io/cli.rs` drives the binary the way a user does.
 
 **Not built:** broker and cluster inspection, and richer administration.
 
@@ -1484,7 +1484,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Decision | Value | Rationale |
 | --- | --- | --- |
 | `quinn` floor | `quinn = "0.11.12"` in the workspace, locked at `quinn` 0.11.12 / `quinn-proto` 0.11.19 | `PathStats::min_rtt` exists only from `quinn-proto` 0.11.18, and 0.11.12 is the first `quinn` whose manifest requires 0.11.18, so the floor is stated where a resolver reads it rather than left to whatever a lock file happens to hold ([decisions/0036](decisions/0036-connection-statistics.md) §2.1). |
-| Where statistics are read | `connection_stats()` on `Peer` and every dialling endpoint and blocking twin, one record per **live slot** | A slot is what the application dialled and what outlives a connection, so its URL is the label and its redial count is the address's. A connection the pool shares between two endpoints is reported by both, with the same transport counters (0036 §4.6). The slot list is collected under its `std` mutex and `quinn`'s counters are read after it is released, so no `quinn` lock nests inside it. |
+| Where statistics are read | `connection_stats()` on `Peer` and every dialling endpoint, one record per **live slot** | A slot is what the application dialled and what outlives a connection, so its URL is the label and its redial count is the address's. A connection the pool shares between two endpoints is reported by both, with the same transport counters (0036 §4.6). The slot list is collected under its `std` mutex and `quinn`'s counters are read after it is released, so no `quinn` lock nests inside it. |
 | Local transports | `transport: None`, `age` and `redials` still reported | No path to measure, and an empty vector has to keep meaning "no live connection" (0036 §3, option E). |
 | `age` clock | `std::time::Instant` taken in `ConnCtx::spawn` | One instant per connection, after the QUIC handshake and before HELLO; a paused Tokio clock in a test does not stop it. |
 
@@ -1516,7 +1516,6 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
 - **Single reply per exchange.** The reply half carries one DATA transfer or one ERROR and
   then FIN. Answering one request several times needs either several exchanges or a framing
   convention inside the payload; v0 offers neither.
-- **No CI.** The gate is the command list in [LOOP.md](LOOP.md) §6, run by hand.
 - **Fuzz runs need a nightly toolchain.** `cargo-fuzz` requires nightly. On a host without it
   the targets are still committed, and the deterministic `fuzz_smoke*` tests cover the same
   properties on stable, at lower depth.
@@ -1568,16 +1567,14 @@ Recorded deliberately, not discovered later. Each entry was checked against the 
   `Stream`.** Each defines `Stream` in `transport.rs`: an enum over a `TcpStream` and a boxed
   `tokio_rustls` client stream (`weida-http` adds the server stream), with the same `AsyncRead`
   and `AsyncWrite` impls.
-- **The Python bindings still duplicate some plumbing.** The lease (`Slot`/`Lease`), the seconds
-  validation (`weida_py_core::duration`), the Ctrl-C-aware blocking wait
-  (`weida_py_core::interruptible`) and the cached `bytes` getter (`LazyBytes`) now live in
-  `weida-py-core`, and `weida-nats-py`, `weida-amqp-py`, `weida-mqtt-py` and `weida-nng-py` use
-  them. `weida-zmq-py` keeps its own `lease.rs` because it additionally retires a slot when a
-  socket is split, and its own seconds helpers; `weida-py` keeps a seconds helper of its own
-  (a weida runtime error rather than the bindings' `ValueError`/`EINVAL`/`Configuration`), so
-  the helpers still disagree on the error class there. `weida-nats-py` and `weida-amqp-py` each
-  drive their synchronous surface through a `drive` of their own, where the other four bind
-  their library's `blocking` facade.
+- **The Python bindings still duplicate some plumbing.** The lease (`Slot`/`Lease`, and
+  `Retirable` for a slot whose handle leaves when a socket is split), the seconds validation
+  (`weida_py_core::duration`), the Ctrl-C-aware blocking wait
+  (`weida_py_core::interruptible`) and the cached `bytes` getter (`LazyBytes`) live in
+  `weida-py-core`, and all five PyO3 bindings use them; `weida-zmq-py` keeps one `seconds`
+  helper of its own in `options.rs`, for libzmq's `None` sentinel. `weida-nats-py` and
+  `weida-amqp-py` each drive their synchronous surface through a `drive` of their own, where
+  the other three bind their library's `blocking` facade.
 - **Decision 0016's refusal is not enforced.** [0016](decisions/0016-conflation.md) §4.5 says
   `Coalesce` backpressure and `PerProducer(reassemble)` ordering are refused together at
   configuration time. `GuaranteeSet::validate` (`crates/protocol/src/header.rs`) checks the

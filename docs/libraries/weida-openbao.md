@@ -67,11 +67,12 @@ From 0032 §2, checked where the crate can and stated here where it cannot:
 
 ## 5. Tests
 
-`tests/scripted.rs` runs the client, the three auths, the renewal pace and its retry, the refusals
+`tests/io/scripted.rs` runs the client, the three auths, the renewal pace and its retry, the refusals
 (redirects, `http://`, oversized and hostile answers) and the three sources against a scripted HTTP
-server in the crate — eighteen tests in about three seconds, in the gate. The scripted server speaks
+server in the crate — seventeen tests in about three seconds, plus
+`plain_http_is_refused_unless_it_is_allowed` in `tests/scripted.rs`. The scripted server speaks
 `http://`, so its tests set `Config::allow_insecure`.
-`tests/bao_dev.rs` runs the hand-off and the PKI path against the local `bao` binary in dev
+`tests/io/bao_dev.rs` runs the hand-off and the PKI path against the local `bao` binary in dev
 mode, `#[ignore]`d because the gate has no OpenBao:
 
 ```text

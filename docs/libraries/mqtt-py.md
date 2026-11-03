@@ -66,23 +66,23 @@ client and a delivery stream — the three handles §9.2 measures the two surfac
 
 | paho-mqtt 2.x | This binding | Verdict |
 | --- | --- | --- |
-| `mqtt.Client(CallbackAPIVersion.VERSION2, client_id, protocol=MQTTv5)` | `weida_mqtt.Context()` then `await context.connect(address, options)` → `(client, events)` | present — `client.rs:46-166`. There is no protocol argument: 5.0 or nothing (`mqtt.md` §2) |
+| `mqtt.Client(CallbackAPIVersion.VERSION2, client_id, protocol=MQTTv5)` | `weida_mqtt.Context()` then `await context.connect(address, options)` → `(client, events)` | present — `client.rs:33-164`. There is no protocol argument: 5.0 or nothing (`mqtt.md` §2) |
 | `client.connect(host, port, keepalive)` / `connect_async` | `await context.connect("host:port", options)` | present — `tests/test_interop.py::test_the_whole_round_trip_from_python`. One address string, and the coroutine *is* the async form, so there is no second `_async` spelling |
-| `client.reconnect()`, `reconnect_on_failure`, `reconnect_delay_set` | — | absent: no reconnect loop anywhere. A reconnect is a new `context.connect_session(address, session, options)` with the `Session` the caller holds, which is what makes it a *resumption* — `client.rs:125-161`, `tests/test_interop.py::test_a_session_survives_a_reconnect`. §9.5 |
-| the client object as the session | `weida_mqtt.Session`, a separate object | present, and it is the deviation: 4.1's client-side session state outlives every connection, so it is its own class with `client_id`, `in_flight`, `send_quota`, `receive_maximum`, `subscriptions` and `matching(topic)` — `client.rs:206-305` |
-| `client.publish(topic, payload, qos, retain, properties)` → `MQTTMessageInfo` | `await client.publish(weida_mqtt.Message(...))` → `Completion` | present — `client.rs:332-342`. The await *is* `MQTTMessageInfo.wait_for_publish()`, and the QoS 2 case resolves on the PUBCOMP: `tests/test_interop.py::test_a_qos_2_publish_is_awaited_to_its_pubcomp` |
-| `MQTTMessageInfo.rc`, `.mid`, `.is_published()`, `.wait_for_publish()` | `Completion.kind` ∈ `sent`/`acknowledged`/`complete`/`refused`, `.reason_code`, `.accepted` | present, and **narrower on purpose**: the three QoS levels certify three different things, so the kind is a string a caller compares rather than a boolean — `values.rs:431-496`. `mid` is not on it; a resumed exchange's identifier arrives with `Events.next_event` |
-| `client.subscribe(topic, options=SubscribeOptions(...))` → `(rc, mid)` | `await client.subscribe([Subscription(filter, qos, ...)])` → list of granted codes | present — `client.rs:352-371`. The granted codes come back from the SUBACK itself, one per filter in order, rather than arriving later in `on_subscribe`; `granted == [2]` is the assertion in `test_the_whole_round_trip_from_python` |
-| `paho.mqtt.subscribeoptions.SubscribeOptions(qos, noLocal, retainAsPublished, retainHandling)` | `weida_mqtt.Subscription(filter, qos, *, no_local, retain_as_published, retain_handling)` | present, all four options of 3.8.3.1 — `values.rs:348-393`, `tests/test_values.py::test_the_four_options_of_3_8_3_1`. Retain Handling 3 is **refused** with "it is a Protocol Error to send" rather than being a value — `test_retain_handling_three_is_a_protocol_error_and_not_a_value` |
-| the Subscription Identifier as a `Properties` field on `subscribe` | `subscribe(..., subscription_id=42)` | present — `client.rs:352-358`, `tests/test_interop.py::test_a_subscription_identifier_names_the_filter_that_matched` |
-| `client.unsubscribe(topic)` | `await client.unsubscribe([filter, ...])` → list of codes | present — `client.rs:377-390`. A count that disagrees with the filters sent raises rather than being zipped short: §8's measured disagreement |
-| `client.disconnect(reasoncode, properties)` | `await client.disconnect(reason_code=0x00, *, session_expiry=None)` | present — `client.rs:400-425`, with `weida_mqtt.NORMAL_DISCONNECTION` and `DISCONNECT_WITH_WILL_MESSAGE` named rather than left as bytes (`lib.rs:125-130`). A byte that is not a DISCONNECT code is a `ValueError` at the call |
-| `client.on_message` callback | `async for delivery in events:` and `await events.next_event()` | present as an iterator — `client.rs:594-686`, `tests/test_interop.py::test_the_async_iterator_yields_deliveries`. The synchronous mirror is `for delivery in deliveries:` and `deliveries.recv(timeout=...)` — `sync.rs:276-341` |
-| `MQTTMessage` (`.topic`, `.payload`, `.qos`, `.retain`, `.dup`, `.mid`, `.properties`, `.timestamp`, `.state`) | `weida_mqtt.Delivery` (`.topic`, `.payload`, `.qos`, `.retain`, `.dup`, `.packet_id`, `.subscription_ids`, `.origin()`, `.properties`) | present — `values.rs:196-333`. `.timestamp` and `.state` are absent: the first is `time.time()` at the caller's line, the second is paho's own queue bookkeeping. `.origin()` has no paho counterpart at all and is the honest answer to "was this from the cache", including `"unknowable"` under Retain As Published 1 |
+| `client.reconnect()`, `reconnect_on_failure`, `reconnect_delay_set` | — | absent: no reconnect loop anywhere. A reconnect is a new `context.connect_session(address, session, options)` with the `Session` the caller holds, which is what makes it a *resumption* — `client.rs:123-159`, `tests/test_interop.py::test_a_session_survives_a_reconnect`. §9.5 |
+| the client object as the session | `weida_mqtt.Session`, a separate object | present, and it is the deviation: 4.1's client-side session state outlives every connection, so it is its own class with `client_id`, `in_flight`, `send_quota`, `receive_maximum`, `subscriptions` and `matching(topic)` — `client.rs:190-303` |
+| `client.publish(topic, payload, qos, retain, properties)` → `MQTTMessageInfo` | `await client.publish(weida_mqtt.Message(...))` → `Completion` | present — `client.rs:318-340`. The await *is* `MQTTMessageInfo.wait_for_publish()`, and the QoS 2 case resolves on the PUBCOMP: `tests/test_interop.py::test_a_qos_2_publish_is_awaited_to_its_pubcomp` |
+| `MQTTMessageInfo.rc`, `.mid`, `.is_published()`, `.wait_for_publish()` | `Completion.kind` ∈ `sent`/`acknowledged`/`complete`/`refused`, `.reason_code`, `.accepted` | present, and **narrower on purpose**: the three QoS levels certify three different things, so the kind is a string a caller compares rather than a boolean — `values.rs:442-512`. `mid` is not on it; a resumed exchange's identifier arrives with `Events.next_event` |
+| `client.subscribe(topic, options=SubscribeOptions(...))` → `(rc, mid)` | `await client.subscribe([Subscription(filter, qos, ...)])` → list of granted codes | present — `client.rs:342-369`. The granted codes come back from the SUBACK itself, one per filter in order, rather than arriving later in `on_subscribe`; `granted == [2]` is the assertion in `test_the_whole_round_trip_from_python` |
+| `paho.mqtt.subscribeoptions.SubscribeOptions(qos, noLocal, retainAsPublished, retainHandling)` | `weida_mqtt.Subscription(filter, qos, *, no_local, retain_as_published, retain_handling)` | present, all four options of 3.8.3.1 — `values.rs:366-409`, `tests/test_values.py::test_the_four_options_of_3_8_3_1`. Retain Handling 3 is **refused** with "it is a Protocol Error to send" rather than being a value — `test_retain_handling_three_is_a_protocol_error_and_not_a_value` |
+| the Subscription Identifier as a `Properties` field on `subscribe` | `subscribe(..., subscription_id=42)` | present — `client.rs:350-356`, `tests/test_interop.py::test_a_subscription_identifier_names_the_filter_that_matched` |
+| `client.unsubscribe(topic)` | `await client.unsubscribe([filter, ...])` → list of codes | present — `client.rs:371-388`. A count that disagrees with the filters sent raises rather than being zipped short: §8's measured disagreement |
+| `client.disconnect(reasoncode, properties)` | `await client.disconnect(reason_code=0x00, *, session_expiry=None)` | present — `client.rs:390-417`, with `weida_mqtt.NORMAL_DISCONNECTION` and `DISCONNECT_WITH_WILL_MESSAGE` named rather than left as bytes (`lib.rs:124-129`). A byte that is not a DISCONNECT code is a `ValueError` at the call |
+| `client.on_message` callback | `async for delivery in events:` and `await events.next_event()` | present as an iterator — `client.rs:572-675`, `tests/test_interop.py::test_the_async_iterator_yields_deliveries`. The synchronous mirror is `for delivery in deliveries:` and `deliveries.recv(timeout=...)` — `sync.rs:289-384` |
+| `MQTTMessage` (`.topic`, `.payload`, `.qos`, `.retain`, `.dup`, `.mid`, `.properties`, `.timestamp`, `.state`) | `weida_mqtt.Delivery` (`.topic`, `.payload`, `.qos`, `.retain`, `.dup`, `.packet_id`, `.subscription_ids`, `.origin()`, `.properties`) | present — `values.rs:205-349`. `.timestamp` and `.state` are absent: the first is `time.time()` at the caller's line, the second is paho's own queue bookkeeping. `.origin()` has no paho counterpart at all and is the honest answer to "was this from the cache", including `"unknowable"` under Retain As Published 1 |
 | a **publish** and a **delivery** being the same `MQTTMessage` class | `Message` for what a publisher sets, `Delivery` for what a subscriber reads | present as two classes, deliberately: `dup` and `packet_id` are on no publish, and `retain` is an instruction on one and an observation on the other — `values.rs:1-13` |
-| `paho.mqtt.properties.Properties(PacketTypes.PUBLISH)` with `.MessageExpiryInterval = 60` | keyword arguments on `Message` — ten of them, `values.rs:89-101` | present: the ten fields of an Application Message are named arguments checked at construction, not attributes set on a bag that is validated at publish time. What arrives is `delivery.properties`, a **dict of eight keys**, the last of which, `truncated`, says that the PUBLISH carried more `User Property` pairs or Subscription Identifiers than the library keeps (the first are kept and the delivery arrives) — `values.rs:291-321` |
+| `paho.mqtt.properties.Properties(PacketTypes.PUBLISH)` with `.MessageExpiryInterval = 60` | keyword arguments on `Message` — ten of them, `values.rs:87-99` | present: the ten fields of an Application Message are named arguments checked at construction, not attributes set on a bag that is validated at publish time. What arrives is `delivery.properties`, a **dict of eight keys**, the last of which, `truncated`, says that the PUBLISH carried more `User Property` pairs or Subscription Identifiers than the library keeps (the first are kept and the delivery arrives) — `values.rs:301-337` |
 | `Properties` on CONNECT / DISCONNECT / SUBSCRIBE | keyword arguments on `ConnectOptions` (§5) and `disconnect(session_expiry=...)`; SUBSCRIBE properties are `subscription_id` | present for every property this client sends, refused where the protocol forbids the combination — §5 |
-| `paho.mqtt.reasoncodes.ReasonCode` as a value with `.value`, `.getName()`, `.is_failure` | reason codes are **exception classes** — 50 of them under `weida_mqtt.MqttError`, each with `errno`, `cause` and `reason_code` | present as classes, which is the largest single difference in this table. §9.3 |
+| `paho.mqtt.reasoncodes.ReasonCode` as a value with `.value`, `.getName()`, `.is_failure` | reason codes are **exception classes** — 51 of them under `weida_mqtt.MqttError`, each with `errno`, `cause` and `reason_code` | present as classes, which is the largest single difference in this table. §9.3 |
 | `paho.mqtt.enums.MQTTErrorCode`, `MQTTProtocolVersion`, `CallbackAPIVersion` | — | absent: there is one protocol version, no callbacks and therefore no callback-API version, and a failure is a class rather than an `rc` |
 | `client.user_data_set(...)`, `userdata` on every callback | — | absent: there are no callbacks to hand state to. A coroutine that owns the `Events` already owns its own state |
 | a `str` payload | refused | `payload_of` takes `bytes` and refuses a `str`, because Payload Format Indicator is a hint a publisher sets and not an encoding the protocol applies — `values.rs:15-22`, `tests/test_values.py::test_a_str_payload_is_refused` |
@@ -92,9 +92,9 @@ client and a delivery stream — the three handles §9.2 measures the two surfac
 
 | paho-mqtt 2.x | This binding | Verdict |
 | --- | --- | --- |
-| `transport="tcp"`, port 1883 | `context.connect("127.0.0.1:1883", options)` | present — `client.rs:97-123`, and every interop test runs over it |
+| `transport="tcp"`, port 1883 | `context.connect("127.0.0.1:1883", options)` | present — `client.rs:91-121`, and every interop test runs over it |
 | `client.tls_set(ca_certs=..., certfile=..., keyfile=...)`, `tls_set_context(ssl.SSLContext)`, `tls_insecure_set` | — | **absent by construction.** The library has TLS behind a default-on `tls` feature and this binding turns it off (the `weida-mqtt` dependency in `Cargo.toml`), because `weida_mqtt::ConnectOptions::tls` takes the caller's `rustls::ClientConfig` (`crates/mqtt/weida-mqtt/src/options.rs:124-133`) and this surface has no way to accept one from Python. A binding that linked a TLS stack it could not configure would be linking it for nothing. §9.1 |
-| `client.socket()` after a TLS connect, to ask what protected the credentials | `client.is_encrypted` → **always `False`**, and says so | present as an honest answer rather than an absent attribute — `client.rs:459-471`, `sync.rs:259-264`, asserted at `tests/test_interop.py::test_the_connack_reaches_python` (`assert client.is_encrypted is False`). The User Name, the Password and every byte of Authentication Data travel in the CONNECT, so this is the only question a client can ask about what protected them, and the answer here is "nothing" |
+| `client.socket()` after a TLS connect, to ask what protected the credentials | `client.is_encrypted` → **always `False`**, and says so | present as an honest answer rather than an absent attribute — `client.rs:451-463`, `sync.rs:277-282`, asserted at `tests/test_interop.py::test_the_connack_reaches_python` (`assert client.is_encrypted is False`). The User Name, the Password and every byte of Authentication Data travel in the CONNECT, so this is the only question a client can ask about what protected them, and the answer here is "nothing" |
 | `transport="websockets"`, `ws_set_options(path, headers)`, `wss` | — | absent, in the library too: an HTTP upgrade and a framing layer `weida-mqtt` has no dependency for ([`mqtt.md`](mqtt.md) §8). A caller who needs it wants a WebSocket client plus `weida-mqtt-codec`, which is sans-I/O so that the composition is possible |
 | `transport="unix"` | — | absent: not in the specification, and brokers that offer one differ on the address syntax ([`mqtt.md`](mqtt.md) §8) |
 | `client.proxy_set(proxy_type=...)` | — | absent: SOCKS/HTTP proxying is `PySocks` under paho's socket, and there is no socket to swap here — the transport is the library's |
@@ -104,41 +104,41 @@ client and a delivery stream — the three handles §9.2 measures the two surfac
 
 | paho-mqtt 2.x | This binding | Verdict |
 | --- | --- | --- |
-| `client.username_pw_set(username, password)` | `ConnectOptions(user_name=..., password=...)` | present — `options.rs:180-204`. The password is `bytes` through `payload_of`, and 5.0 permits one with no user name |
-| `Properties.AuthenticationMethod` / `AuthenticationData` on CONNECT | `ConnectOptions(authentication_method=..., authentication_data=...)` | present, and the pair is checked where it is written: data without a method is a Protocol Error ([MQTT-3.1.2-33]) refused as a `ValueError` naming the option — `options.rs:234-240`, `tests/test_values.py::test_an_unusable_option_is_refused_where_it_is_written` |
-| a multi-step 4.12 AUTH exchange (paho reports the server's AUTH to `on_connect`/callbacks and the application answers) | — | **absent from Python.** The library takes an `Arc<dyn Authenticator>` through `Client::connect_with` (`crates/mqtt/weida-mqtt/src/client.rs:303-311`), and this binding never passes one: both constructors go through `Client::connect`/`connect_session`, which install `NoAuthenticator` (`crates/mqtt/weida-mqtt/src/client.rs:289-290`). A server that answers the CONNECT with `Continue authentication` therefore gets `UnexpectedPacket` rather than a reply, and a CONNACK that carries final `Authentication Data` is refused as `AuthenticationFailed`, because nothing here can check a server's proof (`crates/mqtt/weida-mqtt/src/connection.rs:145-164`). What is missing is a Python spelling of the challenge callback — a `challenge(data: bytes | None) -> bytes` handed to `connect` |
-| — | `await client.reauthenticate()` | present as a call and **unusable without the callback above**: with no `Authentication Method` on the connection it raises `Configuration` (`crates/mqtt/weida-mqtt/src/client.rs:517-520`, surfaced at `client.rs:439-444`), and with one it reaches `NoAuthenticator.challenge` and raises `UnexpectedPacket`. Named here rather than left for a caller to discover |
+| `client.username_pw_set(username, password)` | `ConnectOptions(user_name=..., password=...)` | present — `options.rs:167-191`. The password is `bytes` through `payload_of`, and 5.0 permits one with no user name |
+| `Properties.AuthenticationMethod` / `AuthenticationData` on CONNECT | `ConnectOptions(authentication_method=..., authentication_data=...)` | present, and the pair is checked where it is written: data without a method is a Protocol Error ([MQTT-3.1.2-33]) refused as a `ValueError` naming the option — `options.rs:221-227`, `tests/test_values.py::test_an_unusable_option_is_refused_where_it_is_written` |
+| a multi-step 4.12 AUTH exchange (paho reports the server's AUTH to `on_connect`/callbacks and the application answers) | — | **absent from Python.** The library takes an `Arc<dyn Authenticator>` through `Client::connect_with` (`crates/mqtt/weida-mqtt/src/client.rs:288-308`), and this binding never passes one: both constructors go through `Client::connect`/`connect_session`, which pass none, so the one implementation they funnel through installs `NoAuthenticator` (`crates/mqtt/weida-mqtt/src/client.rs:334`). A server that answers the CONNECT with `Continue authentication` therefore gets `UnexpectedPacket` rather than a reply, and a CONNACK that carries final `Authentication Data` is refused as `AuthenticationFailed`, because nothing here can check a server's proof (`crates/mqtt/weida-mqtt/src/connection.rs:135-164`). What is missing is a Python spelling of the challenge callback — a `challenge(data: bytes | None) -> bytes` handed to `connect` |
+| — | `await client.reauthenticate()` | present as a call and **unusable without the callback above**: with no `Authentication Method` on the connection it raises `Configuration` (`crates/mqtt/weida-mqtt/src/client.rs:526-531`, surfaced at `client.rs:426-436`), and with one it reaches `NoAuthenticator.challenge` and raises `UnexpectedPacket`. Named here rather than left for a caller to discover |
 | TLS client certificates as an identity | — | absent with §3's reason, and there would be nothing to read it back with: MQTT has no per-message identity, so no accessor on `Delivery` returns one ([`mqtt.md`](mqtt.md) §8) |
 | `client.enable_bridge_mode()` | — | absent: bridge mode is 3.1.1's `0x80|version` handshake plus broker-side loop prevention, and this client speaks 5.0 only |
 
 ## 5. Options
 
 Everything a CONNECT declares is one frozen `weida_mqtt.ConnectOptions`, built with **19
-keyword arguments** (`options.rs:152-173`), and every refusal happens **at construction**
+keyword arguments** (`options.rs:139-160`), and every refusal happens **at construction**
 rather than on the wire: `ConnectOptions.new` ends in `inner.validate()` and turns the
 library's message into a `ValueError` that names the option, "because a `ValueError` at the
 line that built the options names the option, and a Protocol Error from the broker names a
-byte" (`options.rs:1-8`, `234-240`).
+byte" (`options.rs:1-8`, `221-227`).
 
 | paho-mqtt 2.x | This binding | Verdict |
 | --- | --- | --- |
-| `client_id=` on the constructor | `ConnectOptions(client_id)`, empty asks the server to assign one | present — `options.rs:137-141`, read back as `Client.client_id` (`client.rs:446-451`) |
-| `clean_session=` (3.1.1) / `clean_start=` on `connect` | `clean_start=True` by default | present — `options.rs:249-254`. There is no `clean_session`: this client speaks 5.0 |
-| `keepalive=60` seconds | `keep_alive=60.0` seconds, `0` disables the mechanism | present — `options.rs:143-145`, `tests/test_values.py::test_keep_alive_zero_is_legal_and_means_off`. What is *in force* after CONNACK is `Client.keep_alive`, which is the server's `Server Keep Alive` where it sent one |
-| `Properties.SessionExpiryInterval` on CONNECT and on DISCONNECT | `session_expiry=` seconds, and `disconnect(session_expiry=...)` | present — `options.rs:199`, `client.rs:400-420`. Seconds as a float everywhere, and a negative one is refused: `test_a_negative_interval_is_refused` |
-| `client.will_set(topic, payload, qos, retain, properties)` | `weida_mqtt.Will(topic, payload, *, qos, retain, delay, message_expiry, content_type, response_topic, correlation_data)` passed as `will=` | present, nine arguments — `options.rs:42-96`. A Will Topic is a Topic **Name**: `tests/test_values.py::test_a_will_topic_is_a_topic_name` |
+| `client_id=` on the constructor | `ConnectOptions(client_id)`, empty asks the server to assign one | present — `options.rs:124-128`, read back as `Client.client_id` (`client.rs:438-443`) |
+| `clean_session=` (3.1.1) / `clean_start=` on `connect` | `clean_start=True` by default | present — `options.rs:236-241`. There is no `clean_session`: this client speaks 5.0 |
+| `keepalive=60` seconds | `keep_alive=60.0` seconds, `0` disables the mechanism | present — `options.rs:130-132`, `tests/test_values.py::test_keep_alive_zero_is_legal_and_means_off`. What is *in force* after CONNACK is `Client.keep_alive`, which is the server's `Server Keep Alive` where it sent one |
+| `Properties.SessionExpiryInterval` on CONNECT and on DISCONNECT | `session_expiry=` seconds, and `disconnect(session_expiry=...)` | present — `options.rs:186`, `client.rs:390-417`. Seconds as a float everywhere, and a negative one is refused: `test_a_negative_interval_is_refused` |
+| `client.will_set(topic, payload, qos, retain, properties)` | `weida_mqtt.Will(topic, payload, *, qos, retain, delay, message_expiry, content_type, response_topic, correlation_data)` passed as `will=` | present, nine arguments — `options.rs:31-83`. A Will Topic is a Topic **Name**: `tests/test_values.py::test_a_will_topic_is_a_topic_name` |
 | `client.will_clear()` | `will=None`, which is the default | present: the Will lives in the CONNECT, so there is nothing to clear on a live connection — clearing it is not sending it |
-| `Properties.ReceiveMaximum` | `receive_maximum=` | present — `options.rs:214-216`, and it is **this client's own** declaration, a different number from the server's: `tests/test_interop.py::test_the_send_quota_is_the_servers_receive_maximum` asserts both side by side ([`mqtt.md`](mqtt.md) §9.2) |
-| `Properties.MaximumPacketSize` | `maximum_packet_size=` | present — `options.rs:217-219` |
-| `Properties.TopicAliasMaximum`; paho's `client.publish` never sends an alias | `topic_alias_maximum=`, and the library keeps both alias tables | present — `options.rs:220-222`; aliases are resolved before a delivery reaches Python, so `Delivery.topic` "is never empty and never a number" (`values.rs:210-215`) |
-| `Properties.RequestResponseInformation` / `RequestProblemInformation` | `request_response_information=False`, `request_problem_information=True` | present, with the protocol's own defaults — `options.rs:169-170` |
-| `Properties.UserProperty` on CONNECT | `user_properties=[(name, value), ...]` | present, a list of pairs so repeats and order survive — `options.rs:206` |
-| `client.max_inflight_messages_set(n)` | — | absent as a keyword: the in-flight bound is the smaller of the **server's** `Receive Maximum`, read from CONNACK, and the library's own `Limits::max_inflight` (1024, with no keyword; the `Limits` row below), and exhausting it stalls the publish rather than queueing it locally (`client.rs:328-331`). `Session.send_quota` is what is left |
+| `Properties.ReceiveMaximum` | `receive_maximum=` | present — `options.rs:201-203`, and it is **this client's own** declaration, a different number from the server's: `tests/test_interop.py::test_the_send_quota_is_the_servers_receive_maximum` asserts both side by side ([`mqtt.md`](mqtt.md) §9.2) |
+| `Properties.MaximumPacketSize` | `maximum_packet_size=` | present — `options.rs:204-206` |
+| `Properties.TopicAliasMaximum`; paho's `client.publish` never sends an alias | `topic_alias_maximum=`, and the library keeps both alias tables | present — `options.rs:207-209`; aliases are resolved before a delivery reaches Python, so `Delivery.topic` "is never empty and never a number" (`values.rs:226-231`) |
+| `Properties.RequestResponseInformation` / `RequestProblemInformation` | `request_response_information=False`, `request_problem_information=True` | present, with the protocol's own defaults — `options.rs:156-157` |
+| `Properties.UserProperty` on CONNECT | `user_properties=[(name, value), ...]` | present, a list of pairs so repeats and order survive — `options.rs:193` |
+| `client.max_inflight_messages_set(n)` | — | absent as a keyword: the in-flight bound is the smaller of the **server's** `Receive Maximum`, read from CONNACK, and the library's own `Limits::max_inflight` (1024, with no keyword; the `Limits` row below), and exhausting it stalls the publish rather than queueing it locally (`client.rs:326-329`). `Session.send_quota` is what is left |
 | `client.max_queued_messages_set(n)` (outbound queue) | — | absent: nothing is queued for a disconnected client. A publish with no connection raises `NotConnected` — `tests/test_interop.py::test_a_use_after_disconnect_is_not_connected` |
 | `client.message_retry_set(seconds)` | — | absent, and the absence is the library's rule: retransmission happens once, just after a CONNACK with `Session Present` 1, and there is no retry timer anywhere ([`mqtt.md`](mqtt.md) §4) |
-| — | `max_subscription_ids=`, `incoming_queue=` | present, and paho has no counterpart: the two resources MQTT bounds nowhere ([`mqtt.md`](mqtt.md) §9.1) are caller arguments — `options.rs:223-228`. `incoming_queue` is also held to a byte budget of 8 MiB that has no keyword (the `Limits` row below) |
-| — | `connect_timeout=`, `ping_timeout=` | present, and paho has neither as a number the caller sets: the specification puts no deadline on the CONNACK and none on a missing PINGRESP, and an unbounded wait is a hang — `options.rs:229-232` |
-| `Limits::max_addresses` (the library's cap on a resolver's answer), `Limits::max_user_properties` (its cap on `User Property` pairs per delivery), `Limits::incoming_queue_bytes` (the delivery queue's byte budget), `Limits::max_inflight` and `Limits::max_inflight_bytes` (the unacknowledged QoS 1 and 2 messages, counted and in bytes), `Limits::max_alias_bytes` (the Topic Alias tables) | — | absent from the Python surface: these are the six `Limits` fields with no keyword argument (`crates/mqtt/weida-mqtt/src/limits.rs` against `options.rs:214-228`), so a Python caller gets the library's defaults of 8, 64, 8 MiB, 1024, 8 MiB and 256 KiB and cannot change any of them. All stay out of the pyo3 signature deliberately |
+| — | `max_subscription_ids=`, `incoming_queue=` | present, and paho has no counterpart: the two resources MQTT bounds nowhere ([`mqtt.md`](mqtt.md) §9.1) are caller arguments — `options.rs:210-215`. `incoming_queue` is also held to a byte budget of 8 MiB that has no keyword (the `Limits` row below) |
+| — | `connect_timeout=`, `ping_timeout=` | present, and paho has neither as a number the caller sets: the specification puts no deadline on the CONNACK and none on a missing PINGRESP, and an unbounded wait is a hang — `options.rs:216-219` |
+| `Limits::max_addresses` (the library's cap on a resolver's answer), `Limits::max_user_properties` (its cap on `User Property` pairs per delivery), `Limits::incoming_queue_bytes` (the delivery queue's byte budget), `Limits::max_inflight` and `Limits::max_inflight_bytes` (the unacknowledged QoS 1 and 2 messages, counted and in bytes), `Limits::max_alias_bytes` (the Topic Alias tables) | — | absent from the Python surface: these are the six `Limits` fields with no keyword argument (`crates/mqtt/weida-mqtt/src/limits.rs` against `options.rs:201-215`), so a Python caller gets the library's defaults of 8, 64, 8 MiB, 1024, 8 MiB and 256 KiB and cannot change any of them. All stay out of the pyo3 signature deliberately |
 | `client.enable_logger()`, `on_log` | — | absent — §6 |
 | `client.manual_ack=True`, `client.ack(mid, qos)` | — | absent: acknowledgements are the connection task's, and a delivery reaching the iterator has already been acknowledged at its QoS. What paho's manual ack buys — backpressure — is `incoming_queue`, which stops the reader rather than delaying an ack |
 
@@ -146,16 +146,16 @@ byte" (`options.rs:1-8`, `234-240`).
 
 | paho-mqtt 2.x | This binding | Verdict |
 | --- | --- | --- |
-| `on_connect(client, userdata, flags, reason_code, properties)` | the CONNACK's contents as `Client.server`, a **dict of 14 keys** | present — `client.rs:502-553`, `tests/test_interop.py::test_the_connack_reaches_python`. Every declaration of 3.2.2 with §11's defaults applied to what the server left out, which is what makes an absent property safe to read |
-| `flags["session present"]` | `Client.session_present` | present — `client.rs:453-457` |
-| the assigned Client Identifier out of `properties` | `Client.client_id`, and `server["assigned_client_identifier"]` | present — `client.rs:446-451` |
-| `Properties.ResponseInformation` on CONNACK | `Client.response_information`, `Client.response_topic(suffix)` | present, and `None` is an answer rather than an omission: without the property there is no protocol-level way to learn which topics this client may reply on — `client.rs:483-500` |
-| `on_disconnect(..., reason_code, ...)` | the failure the iterator raises | present, and it is the distinction 5.0 exists to make: a server DISCONNECT arrives as the class named for its reason code, an orderly end as `StopAsyncIteration` — `client.rs:606-637`, `errors.rs:253-282` |
-| `on_publish`, `on_subscribe`, `on_unsubscribe` | the awaited return values | present as values: `Completion` from `publish`, the granted codes from `subscribe`, the codes from `unsubscribe`. A resumed exchange completing has no caller left to resolve and arrives at `await events.next_event()` as `("completed", (packet_id, Completion))`; a stored message that the server's `Maximum Packet Size` no longer admits is released and arrives as `("abandoned", (packet_id, cause))` — `client.rs:639-681` |
+| `on_connect(client, userdata, flags, reason_code, properties)` | the CONNACK's contents as `Client.server`, a **dict of 14 keys** | present — `client.rs:494-545`, `tests/test_interop.py::test_the_connack_reaches_python`. Every declaration of 3.2.2 with §11's defaults applied to what the server left out, which is what makes an absent property safe to read |
+| `flags["session present"]` | `Client.session_present` | present — `client.rs:445-449` |
+| the assigned Client Identifier out of `properties` | `Client.client_id`, and `server["assigned_client_identifier"]` | present — `client.rs:438-443` |
+| `Properties.ResponseInformation` on CONNACK | `Client.response_information`, `Client.response_topic(suffix)` | present, and `None` is an answer rather than an omission: without the property there is no protocol-level way to learn which topics this client may reply on — `client.rs:475-492` |
+| `on_disconnect(..., reason_code, ...)` | the failure the iterator raises | present, and it is the distinction 5.0 exists to make: a server DISCONNECT arrives as the class named for its reason code, an orderly end as `StopAsyncIteration` — `client.rs:598-636`, `errors.rs:255-284` |
+| `on_publish`, `on_subscribe`, `on_unsubscribe` | the awaited return values | present as values: `Completion` from `publish`, the granted codes from `subscribe`, the codes from `unsubscribe`. A resumed exchange completing has no caller left to resolve and arrives at `await events.next_event()` as `("completed", (packet_id, Completion))`; a stored message that the server's `Maximum Packet Size` no longer admits is released and arrives as `("abandoned", (packet_id, cause))` — `client.rs:638-670` |
 | `on_log(client, userdata, level, buf)`, `enable_logger(logger)` | — | absent: no logging hook and no `tracing` bridge into Python's `logging`. What a log line would carry — the reason a call failed — is on the exception (`errno`, `cause`, `reason_code`), and what a wire trace would carry is not exposed at all |
 | `client.is_connected()`, `socket()`, `want_write()` | — | absent: they are paho's network-loop API, and the loop is the library's. The question "is it still up" is answered by the next call raising `NotConnected` or by the iterator ending |
-| — | `Session.in_flight`, `send_quota`, `receive_maximum`, `subscriptions`, `matching(topic)` | present, and paho has no counterpart: the client-side session state of 4.1 is readable rather than internal — `client.rs:236-295` |
-| — | `Delivery.origin(retain_as_published)` → `"retained"`/`"live"`/`"unknowable"` | present, and the third value is the point: under Retain As Published 1 the flag is the publisher's, so a cached copy is indistinguishable from a live one and the type says so — `values.rs:266-283`, asserted both ways in `tests/test_interop.py::test_a_retained_value_is_stored_and_then_deleted` |
+| — | `Session.in_flight`, `send_quota`, `receive_maximum`, `subscriptions`, `matching(topic)` | present, and paho has no counterpart: the client-side session state of 4.1 is readable rather than internal — `client.rs:235-293` |
+| — | `Delivery.origin(retain_as_published)` → `"retained"`/`"live"`/`"unknowable"` | present, and the third value is the point: under Retain As Published 1 the flag is the publisher's, so a cached copy is indistinguishable from a live one and the type says so — `values.rs:282-299`, asserted both ways in `tests/test_interop.py::test_a_retained_value_is_stored_and_then_deleted` |
 
 ## 7. Helpers
 
@@ -166,19 +166,21 @@ byte" (`options.rs:1-8`, `234-240`).
 | `paho.mqtt.subscribe.simple(topics, hostname=..., msgCount=1)` | — | absent: `async for delivery in events: break` is it, and `tests/test_interop.py::test_the_async_iterator_yields_deliveries` is that loop |
 | `paho.mqtt.subscribe.callback(callback, topics, ...)` | — | absent as an API shape: deliveries are pulled from an iterator, never pushed into a callback (§9.4) |
 | `client.loop()`, `loop_start()`, `loop_stop()`, `loop_forever()`, `loop_read/write/misc` | — | absent **by construction**: the connection is driven by a Rust task on the reactor the `Context` owns, so there is no network loop for Python to run, start or forget to start. This is the single largest simplification of the surface |
-| `paho.mqtt.client.topic_matches_sub(sub, topic)` | `weida_mqtt.matches(filter, topic)` | present — `lib.rs:161-164`, `tests/test_values.py::test_the_specifications_own_worked_examples`, including `sport/#` matching bare `sport` and [MQTT-4.7.2-1]'s `$` rule |
-| — | `weida_mqtt.check_topic_filter(filter)`, `check_topic_name(topic)` | present, and paho has no counterpart: the grammar of 4.7.1 and [MQTT-3.3.2-2] as two functions that raise `ValueError` naming the rule — `lib.rs:173-188`, `tests/test_values.py::test_the_grammar_of_4_7_1`, `test_a_topic_name_is_not_a_pattern` |
-| — | `weida_mqtt.Message.delete_retained(topic, qos=...)` | present: the RETAIN 1 zero-byte delete as a named constructor, "because `Message(topic, b"", retain=True)` reads like an oversight" — `values.rs:139-157` |
-| — | six module constants: `NORMAL_DISCONNECTION`, `DISCONNECT_WITH_WILL_MESSAGE`, `DEFAULT_RECEIVE_MAXIMUM`, `DEFAULT_TOPIC_ALIAS_MAXIMUM`, `MAX_TOPIC_BYTES`, `SHARE_PREFIX` | present — `lib.rs:125-143` |
-| paho's persistence (`MQTTClientPersistence`-style stores in the C and Java families) | — | absent: `Session` is in memory, as paho Python's is ([`../research/mqtt5.md`](../research/mqtt5.md) §13 [38]). The consequence is not hidden: a restart that reconnects with `clean_start=False` against a broker that kept the session raises `SessionPresentWithoutState`, and the answer is `clean_start=True` — `client.rs:199-205` |
+| `paho.mqtt.client.topic_matches_sub(sub, topic)` | `weida_mqtt.matches(filter, topic)` | present — `lib.rs:150-163`, `tests/test_values.py::test_the_specifications_own_worked_examples`, including `sport/#` matching bare `sport` and [MQTT-4.7.2-1]'s `$` rule |
+| — | `weida_mqtt.check_topic_filter(filter)`, `check_topic_name(topic)` | present, and paho has no counterpart: the grammar of 4.7.1 and [MQTT-3.3.2-2] as two functions that raise `ValueError` naming the rule — `lib.rs:165-187`, `tests/test_values.py::test_the_grammar_of_4_7_1`, `test_a_topic_name_is_not_a_pattern` |
+| — | `weida_mqtt.Message.delete_retained(topic, qos=...)` | present: the RETAIN 1 zero-byte delete as a named constructor, "because `Message(topic, b"", retain=True)` reads like an oversight" — `values.rs:148-167` |
+| — | six module constants: `NORMAL_DISCONNECTION`, `DISCONNECT_WITH_WILL_MESSAGE`, `DEFAULT_RECEIVE_MAXIMUM`, `DEFAULT_TOPIC_ALIAS_MAXIMUM`, `MAX_TOPIC_BYTES`, `SHARE_PREFIX` | present — `lib.rs:124-142` |
+| paho's persistence (`MQTTClientPersistence`-style stores in the C and Java families) | — | absent: `Session` is in memory, as paho Python's is ([`../research/mqtt5.md`](../research/mqtt5.md) §13 [38]). The consequence is not hidden: a restart that reconnects with `clean_start=False` against a broker that kept the session raises `SessionPresentWithoutState`, and the answer is `clean_start=True` — `client.rs:197-203` |
 
 ## 8. Interop evidence
 
-**45 pytest functions** in `crates/mqtt/weida-mqtt-py/tests/`: 12 in `test_interop.py`, 12 in
-`test_sync.py` and 21 in `test_values.py`. **23** of them ask for the `broker` fixture and
-skip with its install command where the port does not answer (`conftest.py`); the other
-**22** — the 21 in `test_values.py` and `test_sync.py::test_no_event_loop_exists_in_this_process`,
-which asserts the condition every other test in that file runs under — need nothing.
+**49 pytest functions** in `crates/mqtt/weida-mqtt-py/tests/`: 12 in `test_interop.py`, 12 in
+`test_sync.py`, 21 in `test_values.py` and 4 in `test_hardening.py`. **24** of them ask for
+the `broker` fixture and skip with its install command where the port does not answer
+(`conftest.py`). The other **25** need no broker: the 21 in `test_values.py`,
+`test_sync.py::test_no_event_loop_exists_in_this_process`, which asserts the condition every
+other test in that file runs under, and three in `test_hardening.py`, two of them against that
+file's own `scripted` socket that answers CONNECT and never a PUBLISH.
 
 **Against `rumqttd` 0.20.0, this client on both sides of the broker** (`test_interop.py`):
 
@@ -239,7 +241,7 @@ with the other, both ways, skipped with `pip install paho-mqtt` where the packag
 
 **The numbers are counted, not run.** The counts above were counted out of the tree with the
 commands in §11; the last recorded execution passed 45 tests with rumqttd under the
-supervisor, which matches the 45 functions the tree holds.
+supervisor, before `test_hardening.py` added four; the tree holds 49.
 
 ## 9. Deliberate deviations and bounds
 
@@ -255,8 +257,8 @@ accept one, and a binding that linked a TLS stack it could not configure would b
 for nothing.
 
 The consequence is stated rather than hidden: `Client.is_encrypted` and
-`sync.Client.is_encrypted` exist and are **always `False`** (`client.rs:459-471`,
-`sync.rs:259-264`), asserted as such by `test_the_connack_reaches_python`. That matters
+`sync.Client.is_encrypted` exist and are **always `False`** (`client.rs:451-463`,
+`sync.rs:277-282`), asserted as such by `test_the_connack_reaches_python`. That matters
 because the User Name, the Password and every byte of `Authentication Data` travel inside the
 CONNECT: on this transport they travel in the clear, and the attribute is how a caller finds
 out. What adding TLS needs is a Python spelling of "these roots, this client certificate, this
@@ -280,7 +282,7 @@ because only they can: an awaitable and a blocked thread are not the same object
 `weida-mqtt`'s own `blocking` module, which is a `block_on` around each asynchronous method,
 so the QoS state machines, the session, the send quota, the topic aliases, the keep-alive
 timer and every refusal are decided exactly once and the two surfaces cannot disagree
-(`sync.rs:20-31`; [0013](../decisions/0013-competitor-libraries.md) §4.4 item 3).
+(`sync.rs:20-31`; [0013](../decisions/0013-competitor-libraries.md) §4.4).
 `test_a_refusal_is_the_asynchronous_surfaces_refusal` is what keeps that honest. The GIL is
 released while blocked, through `Python::detach` on every call, so the usual shape of a
 synchronous MQTT program — one thread publishing, one consuming — is two threads and not one
@@ -288,11 +290,11 @@ synchronous MQTT program — one thread publishing, one consuming — is two thr
 
 One honest rider. The blocking `Client` carries **fewer accessors** than the asyncio one:
 `server`, `keep_alive`, `response_information`, `response_topic` and `session` have no
-synchronous counterpart (`sync.rs:247-264` against `client.rs:446-569`), and `Deliveries` has
+synchronous counterpart (`sync.rs:265-282` against `client.rs:438-561`), and `Deliveries` has
 no `next_event`, so a resumed exchange's completion is not reachable from the blocking
 surface.
 
-### 9.3 50 exception classes, where paho has one errno
+### 9.3 51 exception classes, where paho has one errno
 
 Every acknowledgement in 5.0 carries a reason code, which is the protocol's largest single
 improvement over 3.1.1. paho hands that back as a value: an `MQTTErrorCode` return, or a
@@ -301,33 +303,31 @@ improvement over 3.1.1. paho hands that back as a value: an `MQTTErrorCode` retu
 - **36 classes named for MQTT reason codes**, de-duplicated across packets — `NotAuthorized`
   is 0x87 in CONNACK, PUBACK, SUBACK, UNSUBACK and DISCONNECT alike, and appears once, so
   `except NotAuthorized` catches it wherever it arrived (`errors.rs:65-102`);
-- **13 classes for failures MQTT gives no byte** — `NotConnected`, `Timeout`, `InvalidTopic`,
-  `AcknowledgementLengthMismatch`, `SessionPresentWithoutState` and eight more
-  (`errors.rs:104-118`);
+- **14 classes for failures MQTT gives no byte** — `NotConnected`, `Timeout`, `InvalidTopic`,
+  `AcknowledgementLengthMismatch`, `SessionPresentWithoutState` and nine more
+  (`errors.rs:104-119`);
 - **the base, `MqttError`**, created by the shared foundation alongside the subclasses
-  (`crates/py/weida-py-core/src/errors.rs:117-133`), so `except MqttError` catches the lot.
+  (`crates/py/weida-py-core/src/errors.rs:102-139`), so `except MqttError` catches the lot.
 
-36 + 13 + 1 = **50 classes**, each carrying `errno` (the name), `cause` (why) and
-`reason_code` (the byte, or `None`) — `tests/test_values.py::test_every_reason_code_is_its_own_class_under_one_base`
-and `test_the_failures_with_no_reason_code_are_classes_too`. A count of "36 coded plus 14
-uncoded" gives the same total by counting the base among the uncoded; the code has 13
-uncoded, so 50 is the right total only when the base class is counted, and that is how this
-document counts it (§11 gives the commands).
+36 + 14 + 1 = **51 classes**, each carrying `errno` (the name), `cause` (why) and
+`reason_code` (the byte, or `None`) —
+`tests/test_values.py::test_every_reason_code_is_its_own_class_under_one_base` and
+`test_the_failures_with_no_reason_code_are_classes_too` (§11 gives the commands).
 
 Two properties of the table are structural rather than tested. A duplicated name is refused at
 **import** by the foundation (`errors.rs:27-31`). And `connect_name` and `disconnect_name` are **exhaustive
-matches** over the codec's own enums (`errors.rs:137-201`), so a reason code added to the
+matches** over the codec's own enums (`errors.rs:136-202`), so a reason code added to the
 library that is not added here is a compile error in this file rather than a code that
 silently arrives as the base class.
 
 One name in the table is not a failure at all: `StopAsyncIteration`, which is how the end of a
-delivery stream is spelled, because an iteration's end is not an error (`errors.rs:253-282`).
+delivery stream is spelled, because an iteration's end is not an error (`errors.rs:255-284`).
 
 ### 9.4 `publish` has no timeout argument on the synchronous surface, deliberately
 
 `sync.Deliveries.recv` takes `timeout=` — that is where the asynchronous surface's
-cancellation goes, since a blocking caller has no task to cancel (`sync.rs:283-305`). `publish`
-does **not**, and the omission is the argued one (`sync.rs:179-186`):
+cancellation goes, since a blocking caller has no task to cancel (`sync.rs:320-348`). `publish`
+does **not**, and the omission is the argued one (`sync.rs:184-192`):
 
 > A publish abandoned mid-exchange is still session state on both sides, so a deadline here
 > would return control while the exchange continued.
@@ -353,7 +353,7 @@ pins the absence: passing `timeout=1.0` is a `TypeError`.
   warns that QoS 2 messages can therefore arrive twice (sheet §13 [38]). Here retransmission
   happens once, just after a CONNACK with `Session Present` 1 ([MQTT-4.4.0-1]), and there is
   no retry timer at all ([`mqtt.md`](mqtt.md) §4).
-- **No durable session store.** `Session` is in memory (`client.rs:199-205`), as paho's is.
+- **No durable session store.** `Session` is in memory (`client.rs:197-203`), as paho's is.
 - **No acting on `Server Reference`**: it is readable as `server["server_reference"]` and
   following a redirection is the application's.
 - **No broker**, per §0.
@@ -365,7 +365,7 @@ arguments here rather than constants: `max_subscription_ids` (32), `incoming_que
 `connect_timeout` (10 s) and `ping_timeout` (the Keep Alive). Two have no Python spelling —
 `max_addresses` (8) and `max_user_properties` (64), §5. Every duration in this surface is **seconds as a
 float**, and a negative or non-finite one is a `ValueError` at the call that wrote it
-(`options.rs:18-29`, `values.rs:55-66`, `sync.rs:64-75`).
+(`values.rs:56-62` and `sync.rs:67-73`, both over `weida_py_core::duration`).
 
 ### 9.7 Open questions
 
@@ -382,7 +382,7 @@ The clauses the asyncio surface, the synchronous surface and this document were 
 | --- | --- | --- |
 | Connect, publish, subscribe, and an async iterator of deliveries | yes | §2, `tests/test_interop.py` |
 | A delivery carrying topic, QoS, the retain flag, the properties and the subscription identifiers | yes, plus `dup`, `packet_id` and `origin()` | §2, §6 |
-| Reason codes as distinct exception classes | yes, 50 under one base, each with `reason_code` | §9.3 |
+| Reason codes as distinct exception classes | yes, 51 under one base, each with `reason_code` | §9.3 |
 | A QoS 2 publish awaited to its PUBCOMP from Python | yes | §8, `test_a_qos_2_publish_is_awaited_to_its_pubcomp` |
 | The whole round trip against a real broker | yes, rumqttd 0.20.0, this client on both sides | §8 |
 | A synchronous surface over the same client, no loop in the process | yes | §9.2, `test_no_event_loop_exists_in_this_process` |
@@ -400,25 +400,25 @@ Counts, each reproducible from the repository root:
 
 | Count | Command | Result |
 | --- | --- | --- |
-| pytest functions | `grep -c 'def test_' crates/mqtt/weida-mqtt-py/tests/*.py` | `conftest.py` 0, `test_interop.py` 12, `test_sync.py` 12, `test_values.py` 21 — **45** |
+| pytest functions | `grep -c 'def test_' crates/mqtt/weida-mqtt-py/tests/*.py` | `conftest.py` 0, `test_hardening.py` 4, `test_interop.py` 12, `test_sync.py` 12, `test_values.py` 21 — **49** |
 | reason-code exception classes | `grep -cE '^    \([A-Za-z]+, 0x[0-9A-F]{2}\),$' crates/mqtt/weida-mqtt-py/src/errors.rs` | **36** |
-| classes for failures with no byte | `grep -cE '^    \([A-Za-z]+\),$' crates/mqtt/weida-mqtt-py/src/errors.rs` | **13** |
-| exception classes in all | the two above plus the base `MqttError`, created by `ErrorFamily::new` (`crates/py/weida-py-core/src/errors.rs:117-133`) | **50** |
+| classes for failures with no byte | `grep -cE '^    \([A-Za-z]+\),$' crates/mqtt/weida-mqtt-py/src/errors.rs` | **14** |
+| exception classes in all | the two above plus the base `MqttError`, created by `ErrorFamily::build` (`crates/py/weida-py-core/src/errors.rs:102-139`) | **51** |
 | Python classes | `grep -c '#\[pyclass' crates/mqtt/weida-mqtt-py/src/*.rs` | `client.rs` 4, `options.rs` 2, `values.rs` 4, `sync.rs` 3 — **13**, ten in `weida_mqtt` and three in `weida_mqtt.sync` |
 | module-level functions | `grep -c '#\[pyfunction\]' crates/mqtt/weida-mqtt-py/src/lib.rs` | **3** (`matches`, `check_topic_filter`, `check_topic_name`) |
-| `ConnectOptions` keywords | the `#[pyo3(signature = ...)]` block at `crates/mqtt/weida-mqtt-py/src/options.rs:152-173` | **19** |
-| `Will` keywords | `crates/mqtt/weida-mqtt-py/src/options.rs:51-62` | **9** |
-| `Message` keywords | `crates/mqtt/weida-mqtt-py/src/values.rs:89-101` | **10** |
-| keys in `Client.server` | `crates/mqtt/weida-mqtt-py/src/client.rs:510-553`, one per field of `ServerLimits` | **14** |
-| keys in `Delivery.properties` | `crates/mqtt/weida-mqtt-py/src/values.rs:291-321` | **8** |
-| module constants | `crates/mqtt/weida-mqtt-py/src/lib.rs:129-143` | **6** |
+| `ConnectOptions` keywords | the `#[pyo3(signature = ...)]` block at `crates/mqtt/weida-mqtt-py/src/options.rs:139-160` | **19** |
+| `Will` keywords | `crates/mqtt/weida-mqtt-py/src/options.rs:38-49` | **9** |
+| `Message` keywords | `crates/mqtt/weida-mqtt-py/src/values.rs:87-99` | **10** |
+| keys in `Client.server` | `crates/mqtt/weida-mqtt-py/src/client.rs:494-545`, one per field of `ServerLimits` | **14** |
+| keys in `Delivery.properties` | `crates/mqtt/weida-mqtt-py/src/values.rs:301-337` | **8** |
+| module constants | `crates/mqtt/weida-mqtt-py/src/lib.rs:128-142` | **6** |
 
 Where the verdicts were read:
 
 - Code: `crates/mqtt/weida-mqtt-py/src/` — `lib.rs` (the module, the three functions, the TLS
   paragraph), `client.rs` (`Context`, `Session`, `Client`, `Events`), `options.rs`
   (`ConnectOptions`, `Will`), `values.rs` (`Message`, `Delivery`, `Subscription`,
-  `Completion`), `sync.rs` (the three blocking handles), `errors.rs` (the 50 classes);
+  `Completion`), `sync.rs` (the three blocking handles), `errors.rs` (the 51 classes);
   `crates/mqtt/weida-mqtt-py/Cargo.toml` for the feature set and
   `crates/mqtt/weida-mqtt-py/pyproject.toml` for the wheel's metadata; `crates/py/weida-py-core/src/`
   for the exception family, the asyncio bridge and the bytes boundary. Where a verdict depends

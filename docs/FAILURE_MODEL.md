@@ -161,14 +161,15 @@ are stated in the same shape in their own subsection below.
 | Idle timeout or stateless reset | any | `Error::ConnectionLost(LossCause::IdleTimeout)` or `(LossCause::Reset)`; `is_definite_failure()` is true | Both mean the connection is gone, and `conn_error` maps quinn's `TimedOut` and `Reset` there rather than to a bare transport error. **The reason survives.** `ConnectionLost` carries a `LossCause` — `IdleTimeout`, `PeerClosed`, `PeerRestarting`, `LocallyClosed`, `Reset` or `TransportError` — and peer selection reports the cause of the peer it rejected instead of flattening every dead connection into one error. `PeerRestarting` is the peer's close with `RESTARTING` ([PROTOCOL.md](PROTOCOL.md) §7): its server is being replaced and a successor serves, or is about to serve, the same address, so the dialler's first redial waits for nothing, whatever `stop_on_peer_closed` says ([decisions/0038](decisions/0038-restart-handoff.md) §4.4). The outcome is unchanged and so is `is_definite_failure()`: the cause is not a second outcome vocabulary, it is what an application deciding whether to redial needs. Demonstrated by `idle_timeout_reports_loss_within_the_window` in `crates/weida/tests/streams.rs`, which asserts `LossCause::IdleTimeout`, where the server's 500 ms idle timeout is shorter than the dialling side's 10 s keep-alive interval, so silence ends the connection. |
 
 `Error::is_definite_failure()` is the machine-readable form of the word "definite": true for
-`ConnectionLost`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `Canceled`, `NotConnected`,
-`LimitExceeded` and `Untrusted`. A typed refusal — by stop code or by ERROR frame — proves
+`ConnectionLost`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `NoParkedConnection`,
+`Canceled`, `NotConnected`, `LimitExceeded`, `DatagramsUnavailable`, `TooLarge` and
+`Untrusted`. A typed refusal — by stop code or by ERROR frame — proves
 the payload never reached an application, and a refused handshake proves nothing was sent at
 all; that is what makes them definite. `Indeterminate` is outside the set by construction,
 because keeping it apart from failure is the whole point of master doc §22, and so is
 `NoReply`: a replier that declines to answer has still read the request and may well have
-acted on it, so only the answer is missing. The exclusions, and every member except
-`Untrusted`, are pinned by `definite_failures_exclude_the_unknowable_ones`.
+acted on it, so only the answer is missing. The exclusions (`Indeterminate`, `NoReply` and
+`Expired`) and every member are pinned by `definite_failures_exclude_the_unknowable_ones`.
 
 ### Local transports: the receipt is the peer's buffer
 
@@ -322,7 +323,8 @@ to await and no outcome to resolve. The loss is therefore:
   was published" from "a message was dropped for me" (a negotiated `PerProducer` ordering
   numbers the copies and makes the gap visible, [GUARANTEES.md](GUARANTEES.md) §6);
 - visible to the publisher only in aggregate, as `Publisher::publish` returning a smaller
-  count than `Publisher::subscriber_count` and as the `Publisher::dropped` counter.
+  count than `Publisher::subscriber_count` and as the `Publisher::dropped` counter, and per
+  topic and cause through `Publisher::dropped_on`, which returns a `TopicDrops`.
 
 This is the intended behaviour for fan-out, not a gap in the failure model
 ([GUARANTEES.md](GUARANTEES.md) §6): a publisher that blocked on its slowest subscriber

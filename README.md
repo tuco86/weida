@@ -23,12 +23,14 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 
 **Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
 `weida-broker`, `weida-raft`, `weida-openbao`, `weida-http-codec` and `weida-http` are
-published on crates.io, all at `0.1.0-alpha.10`. The other eighteen members are not
+published on crates.io, all at `0.1.0-alpha.11`. The other eighteen members are not
 published: `weida-c`, `weida-py-core`, every Python binding, the other five protocol libraries with
 their codecs, and `weida-testkit`, which only tests use. The one exception on crates.io,
-`weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI
-and there are no prebuilt binaries. Wire protocol version `0` is experimental and breaking
-changes are permitted within `0.x`. Phase status lives in
+`weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI.
+The JavaScript package `@tuco86/weida` is on the forge's npm registry
+(`https://git.doodleshnookie.net/api/packages/tuco86/npm/`), with prebuilt `libweida` for
+linux-x64, linux-arm64 and darwin-arm64, published by every `v*` tag. Wire protocol version
+`0` is experimental and breaking changes are permitted within `0.x`. Phase status lives in
 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §1.
 
 Beside weida the repository ships **six protocol libraries**, none of which has weida in its
@@ -89,7 +91,7 @@ hand.
 | `crates/protocol` | `weida-protocol` | weida | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
 | `crates/runtime` | `weida-runtime` | weida | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry, `AF_UNIX` bind hygiene with peer credentials and, on Windows, named-pipe hygiene with the client's SID |
 | `crates/winpipe` | `weida-winpipe` | weida | the Win32 calls a named pipe needs and nothing else — an owner-only DACL, the client's token SID, the pipe's owner SID, both process ids — behind a safe surface; the one crate that may use `unsafe`, and empty off Windows |
-| `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, all six patterns — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS — and the cursor back channel |
+| `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, every pattern — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS, RADIO/DISH and, behind the feature `swarm`, SWARM — and the cursor back channel |
 | `crates/weida-c` | `weida-c` | weida | the C ABI every other language binds, `libweida` and `weida.h`: typed handles, status codes, readiness descriptors and `weida_poll`; so far the runtime, TLS values and streamed Req/Rep ([docs/c/](docs/c/README.md), [0045](docs/decisions/0045-the-c-abi-is-the-boundary.md), [docs/libraries/weida-c.md](docs/libraries/weida-c.md)) |
 | `crates/py/weida-py` | `weida` (Python) | binding | weida for Python over `libweida` with cffi, synchronous and asyncio; one wheel per platform for CPython, free-threaded CPython and PyPy; not a Cargo member ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
 | `crates/broker` | `weida-broker` | weida | L2, and a layer rather than a fork: queues at endpoint paths, the publisher confirm, the absolute per-subscription credit and consumer settlement with requeue; depends only on `weida`, and nothing depends on it ([0018](docs/decisions/0018-minimal-broker.md) §4.1) |
@@ -107,13 +109,13 @@ hand.
 | `crates/mqtt/weida-mqtt` | `weida-mqtt` | library | the MQTT 5.0 **client**: connection, session, both QoS machines, subscriptions, retain and Will, aliases, TLS and AUTH, interop-tested against `rumqttd` 0.20.0 and `rmqtt` 0.23.1 ([docs/libraries/mqtt.md](docs/libraries/mqtt.md)) |
 | `crates/mqtt/weida-mqtt-py` | `weida-mqtt-py` | binding | the Python MQTT surface: publish, subscribe and an iterator of deliveries, 51 exception classes, asyncio and synchronous |
 | `crates/amqp/weida-amqp-codec` | `weida-amqp-codec` | codec | AMQP 1.0 — the Part 1 type system, frames, performatives and message sections — sans-I/O |
-| `crates/amqp/weida-amqp` | `weida-amqp` | library | the AMQP 1.0 client: connection, session and link with both credit schemes, the settle modes, dispositions and SASL, interop-tested against `fe2o3-amqp` 0.17.0 in both roles ([docs/libraries/amqp.md](docs/libraries/amqp.md)) |
+| `crates/amqp/weida-amqp` | `weida-amqp` | library | the AMQP 1.0 client: connection, session and link with both credit schemes, the settle modes, dispositions and SASL, interop-tested against `fe2o3-amqp` 0.18.4 in both roles ([docs/libraries/amqp.md](docs/libraries/amqp.md)) |
 | `crates/amqp/weida-amqp-py` | `weida-amqp-py` | binding | the Python AMQP surface: connection, session and link as objects, `send` returning the delivery's terminal state, asyncio and synchronous |
 | `crates/nats/weida-nats-codec` | `weida-nats-codec` | codec | the NATS client protocol — twelve control-line verbs and the `NATS/1.0` header block — sans-I/O |
 | `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; its interop tests are written and **not run**, because they need a `nats-server` ([docs/libraries/nats.md](docs/libraries/nats.md)) |
 | `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
 | `crates/http/weida-http-codec` | `weida-http-codec` | codec | HTTP/1.1 heads and chunked bodies, HPACK with Huffman, HTTP/2 frames, QUIC varints, static-table QPACK and HTTP/3 frames — sans-I/O, every cap an argument |
-| `crates/http/weida-http` | `weida-http` | library | the HTTP client and pull-style server: HTTP/1.1, HTTP/2 over TLS by ALPN, HTTP/3 over QUIC (feature `h3`), per-origin pooling, interop-tested against hyper 1.11.1 and h3 0.0.8 in both roles ([docs/libraries/http.md](docs/libraries/http.md)) |
+| `crates/http/weida-http` | `weida-http` | library | the HTTP client and pull-style server: HTTP/1.1, HTTP/2 over TLS by ALPN, HTTP/3 over QUIC (feature `h3`), per-origin pooling, interop-tested against hyper 1.12.0 and h3 0.0.8 in both roles ([docs/libraries/http.md](docs/libraries/http.md)) |
 
 ## Quick start, without writing a program
 

@@ -38,8 +38,8 @@ against `fe2o3-amqp` 0.18.4, run by
 | `Container.container_id` | `container_id=` | present, and it defaults to `"weida-amqp-py"` rather than a UUID |
 | `Transport.max_frame_size`, `channel_max`, `idle_timeout` | `max_frame_size=`, `channel_max=`, `idle_time_out=` | present; `idle_time_out` is **seconds or `None`**, and `None` means "advertise none" rather than "use a default" |
 | - | `handshake_timeout=`, `worker_threads=` | present, and neither has a Proton counterpart: the protocol gives the handshake no deadline ([`amqp.md`](amqp.md) §8), and a reactor has to be sized by somebody |
-| `connection.remote_container`, `remote_offered_capabilities` | `await connection.remote()` | present as one dict: `container_id`, `hostname`, `max_frame_size`, `channel_max`, `idle_time_out`, `offered_capabilities` |
-| `Endpoint.state` bit flags (`LOCAL_ACTIVE`, `REMOTE_ACTIVE` and the products of the two) | `await connection.state()`, `await connection.is_usable()` | present as a string and a boolean. The nine local/remote combinations are not reproduced: a caller asks "can I still use this", and the answer to that is one question |
+| `connection.remote_container`, `remote_offered_capabilities` | `connection.remote()` | present as one dict: `container_id`, `hostname`, `max_frame_size`, `channel_max`, `idle_time_out`, `offered_capabilities` |
+| `Endpoint.state` bit flags (`LOCAL_ACTIVE`, `REMOTE_ACTIVE` and the products of the two) | `connection.state()`, `connection.is_usable()` | present as a string and a boolean. The nine local/remote combinations are not reproduced: a caller asks "can I still use this", and the answer to that is one question |
 
 ## 3. Sessions and links
 
@@ -92,7 +92,7 @@ against `fe2o3-amqp` 0.18.4, run by
 
 | Proton | This binding | Verdict |
 | --- | --- | --- |
-| `ProtonException`, `Timeout`, `LinkDetached`, `ConnectionClosed`, `SendException` | 16 client-failure classes under `weida_amqp.AmqpError`, one per `weida_amqp::Error` variant, each carrying `errno` | present - `errors.rs`, `tests/test_sync.py::test_the_two_surfaces_raise_the_same_classes` |
+| `ProtonException`, `Timeout`, `LinkDetached`, `ConnectionClosed`, `SendException` | 17 client-failure classes under `weida_amqp.AmqpError`, one per `weida_amqp::Error` variant, each carrying `errno` | present - `errors.rs`, `tests/test_sync.py::test_the_two_surfaces_raise_the_same_classes` |
 | `Condition("amqp:resource-limit-exceeded", "...")` as a value to inspect | **28 exception classes**, one per condition of Part 2 §2.8.15-§2.8.18, under the same base, plus `weida_amqp.CONDITIONS` mapping each class name to its symbol | present, and this is the other point: `except weida_amqp.ResourceLimitExceeded` rather than `if condition.name == "..."` - `tests/test_asyncio.py::test_a_condition_is_its_own_exception_class` |
 | a refused configuration raising at the first I/O | `weida_amqp.Configuration` at the call that configured it, naming the value | present: `max_frame_size=511` says `MIN-MAX-FRAME-SIZE`, and two SASL mechanisms at once says so, before a socket is opened |
 | `proton.Interrupt`, `proton.Timeout` for a blocking call | `weida_amqp.HandshakeTimeout`, `IdleTimeout`, `WriteTimeout` (the peer stopped reading and the connection failed), and `None` from `next_delivery(timeout=...)` | present. An empty receive is a **value**, not an exception, so a caller that polls does not pay for a traceback |
@@ -122,11 +122,12 @@ has not been built they skip with the one command that builds it.
 - **A delivery settled from Python**: credit granted explicitly, the peer's message read with
   its sections, `accept` reaching it - the peer's own `send` returns only once that outcome
   has landed, so the assertion is the peer's, not ours.
-- **14 further tests**: twelve against a scripted AMQP peer written in Python
+- **19 further tests**, 12 in `test_asyncio.py` and 7 in `test_sync.py`: fifteen against a
+  scripted AMQP peer written in Python
   (`tests/broker.py`), which is where the shapes a foreign client would not produce on
   demand live - a rejection with a reason, a session's six window variables, a `close`
-  carrying a condition - and two that open no socket at all, because a refused
-  configuration is refused before one is opened.
+  carrying a condition - and four that open no socket at all, because a refused
+  configuration is refused before one is opened; 22 tests in all with the three above.
 - **Nothing disagreed.** The scripted test peer follows two rules the specification fixes:
   `role` is a boolean where `true` means receiver, and an answering `attach` echoes the
   client's link **name**, because that is what correlates it.
@@ -156,7 +157,7 @@ no C library at install time is the one claim Proton cannot make.
    `windows()`, `negotiated()`, `send_nowait`, `settled`, `modify`, `stop`, `unsettled` or
    `dynamic=`: it is the same client with the same behaviour and fewer accessors, and it
    implements no protocol behaviour of its own ([0013](../decisions/0013-competitor-libraries.md)
-   §4.4 item 3). A caller that needs those reads them on the asyncio surface. `next_delivery`
+   §4.4). A caller that needs those reads them on the asyncio surface. `next_delivery`
    is the one place the two differ on purpose: it takes a timeout, because cancellation is
    the asyncio answer and a blocking call has none.
 5. **TLS is absent from the binding, and that is a defect rather than a decision.**
@@ -178,7 +179,7 @@ no C library at install time is the one claim Proton cannot make.
 | `await send` returns the delivery's terminal state | yes, an `Outcome` with four names and both redelivery questions | §5 |
 | An async iterator of deliveries with sections and annotations | yes, `async for` plus seven section accessors | §4 |
 | Credit granted explicitly from Python | yes, and nothing arrives before it | §3 |
-| AMQP conditions as distinct exception classes | yes, 28 conditions plus 16 client failures, exhaustively matched | §6 |
+| AMQP conditions as distinct exception classes | yes, 28 conditions plus 17 client failures, exhaustively matched | §6 |
 | Send-to-`accepted` and a receive settled, against the `fe2o3-amqp` peer | yes, `fe2o3-amqp` 0.18.4 in both roles | §8 |
 | The synchronous surface over the same client, no second implementation | yes, and the asyncio surface's send runs unchanged in it | §9.4 |
 | No row says "partial" | yes: §7 and §9.5 name what a caller does not get | §7, §9 |
@@ -186,11 +187,11 @@ no C library at install time is the one claim Proton cannot make.
 ## 11. Sources
 
 - Code: `crates/amqp/weida-amqp-py/src/` (`connection.rs`, `session.rs`, `link.rs`,
-  `values.rs`, `sync.rs`, `errors.rs`, `lease.rs`), `crates/py/weida-py-core/src/`.
+  `values.rs`, `sync.rs`, `errors.rs`), `crates/py/weida-py-core/src/`.
 - Tests: `crates/amqp/weida-amqp-py/tests/` - `test_asyncio.py`, `test_sync.py`,
   `test_interop.py`, with `broker.py` as the scripted peer; `smoke.py` for the wheel.
 - The peer: `crates/amqp/weida-amqp/examples/fe2o3_peer.rs`, and
-  `crates/amqp/weida-amqp/tests/interop_fe2o3.rs` for the same peer at the Rust level.
+  `crates/amqp/weida-amqp/tests/io/interop_fe2o3.rs` for the same peer at the Rust level.
 - Proton's surface: the `proton`, `proton/_reactor.py`, `proton/_handlers.py` and
   `proton/_utils.py` modules of apache/qpid-proton, and python-qpid-proton 0.40.0 on PyPI.
 - Decisions: [0014](../decisions/0014-parallel-libraries.md) §2 (one shared PyO3 foundation,
