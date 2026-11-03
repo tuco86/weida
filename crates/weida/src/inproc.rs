@@ -375,10 +375,14 @@ impl LocalSend {
     /// a write only returned once its bytes were in the peer's buffer, and
     /// dropping this half is what the reader sees as the end.
     pub(crate) fn finish(&mut self) -> Result<(), Error> {
-        if self.io.take().is_none() {
+        let Some(io) = self.io.take() else {
             return Err(Error::Transport("stream already closed".into()));
-        }
+        };
+        // `finished` before the EOF: a reader that sees the end and drops
+        // its half at once must find the transfer finished, or its drop
+        // stops it with `CANCELED` and the receipt reports a refusal.
         self.signal.finished.store(true, Ordering::Release);
+        drop(io);
         self.signal.changed.notify_waiters();
         Ok(())
     }
