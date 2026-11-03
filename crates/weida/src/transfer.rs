@@ -476,8 +476,13 @@ impl OutgoingTransfer {
         }
     }
 
+    /// Whether the deadline has passed, read from the clock rather than from
+    /// the timer: a `Sleep` reports itself elapsed only after a poll fired
+    /// it, and `finish` polls nothing.
     fn expired(&self) -> bool {
-        self.expiry.as_ref().is_some_and(|e| e.is_elapsed())
+        self.expiry
+            .as_ref()
+            .is_some_and(|e| e.deadline() <= tokio::time::Instant::now())
     }
 
     /// Writes the whole buffer.

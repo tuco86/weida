@@ -1174,3 +1174,35 @@ async fn reverse_order_completion_measures_the_reorder_buffer() {
 }
 
 // --- expiry ----------------------------------------------------------------
+
+/// Claim: a deadline that has passed fails `finish` with `Expired` even when
+/// nothing polled it, and the reader sees `Canceled` rather than the end
+/// (0034 §4.3). `expire_at(now)` followed straight by `finish` is the case a
+/// timer that reports itself elapsed only once polled would miss.
+#[tokio::test(start_paused = true)]
+async fn a_finish_past_its_deadline_fails_expired() {
+    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let listener = runtime.listener();
+    let _bus = listener
+        .bind_inproc("streams-finish-expired")
+        .expect("bind");
+    let acceptor = listener.acceptor("/late").expect("acceptor");
+    let peer = runtime.peer(weida::Trust::by_address());
+    within(peer.connect("weida+inproc://streams-finish-expired/late"))
+        .await
+        .expect("connect");
+    let mut transfer = within(peer.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    let held = match within(acceptor.accept()).await.expect("accept") {
+        weida::Incoming::Stream(held) => held,
+        other => panic!("expected a stream, got {other:?}"),
+    };
+
+    transfer.expire_at(std::time::Instant::now());
+    let finished = transfer.finish();
+    assert!(matches!(finished, Err(Error::Expired)), "{finished:?}");
+    let read = within(held.collect(64)).await;
+    assert!(matches!(read, Err(Error::Canceled)), "{read:?}");
+    runtime.shutdown().await;
+}
