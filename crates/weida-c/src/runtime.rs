@@ -4,13 +4,18 @@ use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use weida_rs::{Runtime, RuntimeConfig};
+use weida_rs::{GuaranteeSet, Runtime, RuntimeConfig};
 
-use crate::error::{guard, guard_void};
+use crate::config::{
+    Builder, count, discovery, ms, optional, outbox_full, weida_guarantee_set, weida_limits,
+    weida_reconnect_policy,
+};
+use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_void};
 use crate::handle::{borrow, into_handle, out_ptr, release, write_out};
 use crate::op::Op;
 
-/// A runtime configuration under construction: one setter per field.
+/// A runtime configuration under construction: one setter per field but
+/// `resolver` and `network`.
 pub struct weida_runtime_config {
     pub(crate) config: Mutex<RuntimeConfig>,
 }
@@ -140,6 +145,317 @@ pub unsafe extern "C" fn weida_runtime_config_set_shutdown_timeout_ms(
         // SAFETY: forwarded from this function's contract.
         let cfg = unsafe { borrow(cfg) }?;
         cfg.set(|c| c.shutdown_timeout = Duration::from_millis(ms));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::max_connections` (a count, R7): connections one
+/// binding accepts at once.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_max_connections(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.max_connections = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::max_connections_per_peer` (a count, R7):
+/// connections one proved peer may hold on one binding.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_max_connections_per_peer(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.max_connections_per_peer = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::max_resolved_addresses` (a count, R7): addresses a
+/// dial tries for one hostname.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_max_resolved_addresses(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.max_resolved_addresses = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::outbox_messages` (a count, R7): bodies a dialling
+/// endpoint's outbox holds while no peer is live.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_outbox_messages(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.outbox_messages = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::outbox_bytes` (a count, R7): the bytes those bodies
+/// may sum to.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_outbox_bytes(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.outbox_bytes = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::max_handshakes` (a count, R7): handshakes one QUIC
+/// binding runs at once.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_max_handshakes(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.max_handshakes = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::retry_above_handshakes` (a count, R7): handshakes
+/// in progress from which a QUIC binding answers with a stateless Retry.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_retry_above_handshakes(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.retry_above_handshakes = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::endpoint_queue` (a count, R7): the depth of an
+/// endpoint's accept queue. 0 is `-WEIDA_EINVAL`: a queue needs a place.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_endpoint_queue(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        if v == 0 {
+            return Err(fail_abi(WEIDA_EINVAL, c"endpoint_queue must be at least 1"));
+        }
+        cfg.set(|c| c.endpoint_queue = count(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::connect_attempt_timeout`, in milliseconds: how long
+/// a dial waits on one resolved address before trying the next.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_connect_attempt_timeout_ms(
+    cfg: *const weida_runtime_config,
+    v: u64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.connect_attempt_timeout = ms(v));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::send_timeout`, in milliseconds, or none for a
+/// negative value (R7): how long an `open` on a dialling endpoint waits for
+/// a lost peer to come back before it fails with the loss cause. None waits
+/// as long as the redial does.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_send_timeout_ms(
+    cfg: *const weida_runtime_config,
+    v: i64,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        cfg.set(|c| c.send_timeout = optional(v).map(ms));
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::outbox_full` to a `WEIDA_OUTBOX_FULL_*` constant:
+/// what a send does at the outbox bound. Any other value is `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_outbox_full(
+    cfg: *const weida_runtime_config,
+    v: c_int,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        let full = outbox_full(v)?;
+        cfg.set(|c| c.outbox_full = full);
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::discovery` to a `WEIDA_DISCOVERY_*` constant:
+/// whether an authority may name a set of nodes. Any other value is
+/// `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_discovery(
+    cfg: *const weida_runtime_config,
+    v: c_int,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        let discovery = discovery(v)?;
+        cfg.set(|c| c.discovery = discovery);
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::limits` to a copy of `v`, taken now; NULL is
+/// `Limits::default()`.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration; `v` is NULL or live limits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_limits(
+    cfg: *const weida_runtime_config,
+    v: *const weida_limits,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        let value = if v.is_null() {
+            Default::default()
+        } else {
+            // SAFETY: forwarded from this function's contract.
+            unsafe { borrow(v) }?.get()
+        };
+        cfg.set(|c| c.limits = value);
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::guarantees` to a copy of `v`, taken now; NULL is
+/// `GuaranteeSet::CORE`.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration; `v` is NULL or a live guarantee set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_guarantees(
+    cfg: *const weida_runtime_config,
+    v: *const weida_guarantee_set,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        let value = if v.is_null() {
+            GuaranteeSet::CORE
+        } else {
+            // SAFETY: forwarded from this function's contract.
+            unsafe { borrow(v) }?.get()
+        };
+        cfg.set(|c| c.guarantees = value);
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::reconnect` to a copy of `v`, taken now; NULL is
+/// `ReconnectPolicy::default()`.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration; `v` is NULL or a live policy.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_reconnect(
+    cfg: *const weida_runtime_config,
+    v: *const weida_reconnect_policy,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        let value = if v.is_null() {
+            Default::default()
+        } else {
+            // SAFETY: forwarded from this function's contract.
+            unsafe { borrow(v) }?.get()
+        };
+        cfg.set(|c| c.reconnect = value);
         Ok(0)
     })
 }
@@ -274,4 +590,268 @@ pub unsafe extern "C" fn weida_runtime_shutdown_op_drop(op: *mut weida_runtime_s
 pub unsafe extern "C" fn weida_runtime_drop(rt: *mut weida_runtime) {
     // SAFETY: forwarded from this function's contract.
     guard_void(|| drop(unsafe { release(rt) }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::*;
+    use std::ptr;
+    use weida_rs::{
+        Acknowledgement, Backpressure, Congestion, Deduplication, DeliveryLevel, Discovery,
+        Durability, Limits, OrderingMode, OutboxFull, ProducerNaming, ReconnectPolicy,
+    };
+
+    /// The four builders, freshly made.
+    fn builders() -> (
+        *mut weida_runtime_config,
+        *mut weida_limits,
+        *mut weida_guarantee_set,
+        *mut weida_reconnect_policy,
+    ) {
+        let (mut cfg, mut l, mut g, mut p) = (
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        // SAFETY: every out-pointer is writable.
+        unsafe {
+            assert_eq!(weida_runtime_config_new(&mut cfg), 0);
+            assert_eq!(weida_limits_new(&mut l), 0);
+            assert_eq!(weida_guarantee_set_new(&mut g), 0);
+            assert_eq!(weida_reconnect_policy_new(&mut p), 0);
+        }
+        (cfg, l, g, p)
+    }
+
+    /// Drops what [`builders`] made.
+    fn drop_all(
+        (cfg, l, g, p): (
+            *mut weida_runtime_config,
+            *mut weida_limits,
+            *mut weida_guarantee_set,
+            *mut weida_reconnect_policy,
+        ),
+    ) {
+        // SAFETY: each handle is live and dropped once.
+        unsafe {
+            weida_runtime_config_drop(cfg);
+            weida_limits_drop(l);
+            weida_guarantee_set_drop(g);
+            weida_reconnect_policy_drop(p);
+        }
+    }
+
+    #[test]
+    fn every_setter_lands_on_its_field() {
+        let handles = builders();
+        let (cfg, l, g, p) = handles;
+        // SAFETY: every handle is live until `drop_all`.
+        unsafe {
+            assert_eq!(weida_limits_set_max_header_bytes(l, 1), 0);
+            assert_eq!(weida_limits_set_max_concurrent_uni_streams(l, 2), 0);
+            assert_eq!(weida_limits_set_max_concurrent_bidi_streams(l, 3), 0);
+            assert_eq!(weida_limits_set_stream_receive_window(l, 4), 0);
+            assert_eq!(weida_limits_set_connection_receive_window(l, 5), 0);
+            assert_eq!(weida_limits_set_keep_alive_ms(l, 6), 0);
+            assert_eq!(weida_limits_set_idle_timeout_ms(l, 7), 0);
+            assert_eq!(weida_limits_set_hello_timeout_ms(l, 8), 0);
+            assert_eq!(weida_limits_set_max_subscriptions(l, 9), 0);
+            assert_eq!(weida_limits_set_subscriber_buffer_bytes(l, 10), 0);
+            assert_eq!(weida_limits_set_max_sequence_scopes(l, 11), 0);
+            assert_eq!(weida_limits_set_max_reorder_hold(l, 12), 0);
+            assert_eq!(weida_limits_set_max_local_streams(l, 13), 0);
+            assert_eq!(weida_limits_set_max_parked_reverse(l, 14), 0);
+            assert_eq!(weida_limits_set_max_dedup_entries(l, 15), 0);
+            assert_eq!(weida_limits_set_datagram_receive_bytes(l, 16), 0);
+            assert_eq!(weida_limits_set_datagram_send_bytes(l, 17), 0);
+            assert_eq!(weida_limits_set_path_report(l, 1), 0);
+            assert_eq!(weida_limits_set_max_flows(l, 19), 0);
+            assert_eq!(weida_limits_set_flow_queue_bytes(l, 20), 0);
+            assert_eq!(weida_limits_set_flow_early_bytes(l, 21), 0);
+            assert_eq!(weida_limits_set_flow_early_hold_ms(l, 22), 0);
+            assert_eq!(weida_limits_set_congestion(l, WEIDA_CONGESTION_BBR), 0);
+            assert_eq!(weida_limits_set_header_timeout_ms(l, 24), 0);
+            assert_eq!(weida_limits_set_max_header_streams(l, 25), 0);
+
+            let delivery = WEIDA_DELIVERY_LEVEL_AT_LEAST_ONCE;
+            assert_eq!(weida_guarantee_set_set_delivery(g, delivery), 0);
+            let replicated = WEIDA_ACKNOWLEDGEMENT_REPLICATED;
+            assert_eq!(weida_guarantee_set_set_acknowledgement(g, replicated), 0);
+            assert_eq!(
+                weida_guarantee_set_set_durability(g, WEIDA_DURABILITY_FLUSHED),
+                0
+            );
+            assert_eq!(weida_guarantee_set_set_replicas(g, 3), 0);
+            let detect = WEIDA_ORDERING_MODE_PER_PRODUCER_DETECT;
+            assert_eq!(weida_guarantee_set_set_ordering(g, detect), 0);
+            let bounded = WEIDA_DEDUPLICATION_BOUNDED;
+            assert_eq!(weida_guarantee_set_set_deduplication(g, bounded), 0);
+            assert_eq!(weida_guarantee_set_set_dedup_window_ms(g, 5000), 0);
+            let drop_level = WEIDA_BACKPRESSURE_DROP;
+            assert_eq!(weida_guarantee_set_set_backpressure(g, drop_level), 0);
+            let stable = WEIDA_PRODUCER_NAMING_STABLE;
+            assert_eq!(weida_guarantee_set_set_producer_naming(g, stable), 0);
+            assert_eq!(weida_guarantee_set_set_control_isolated(g, 1), 0);
+
+            assert_eq!(weida_reconnect_policy_set_initial_ms(p, 50), 0);
+            assert_eq!(weida_reconnect_policy_set_max_ms(p, 900), 0);
+            assert_eq!(weida_reconnect_policy_set_jitter(p, 0), 0);
+            assert_eq!(weida_reconnect_policy_set_max_attempts(p, 7), 0);
+            assert_eq!(weida_reconnect_policy_set_stop_on_peer_closed(p, 1), 0);
+
+            assert_eq!(weida_runtime_config_set_worker_threads(cfg, 3), 0);
+            assert_eq!(weida_runtime_config_set_shutdown_timeout_ms(cfg, 2500), 0);
+            assert_eq!(weida_runtime_config_set_max_connections(cfg, 101), 0);
+            assert_eq!(
+                weida_runtime_config_set_max_connections_per_peer(cfg, 102),
+                0
+            );
+            assert_eq!(weida_runtime_config_set_endpoint_queue(cfg, 103), 0);
+            assert_eq!(weida_runtime_config_set_max_resolved_addresses(cfg, 104), 0);
+            assert_eq!(
+                weida_runtime_config_set_connect_attempt_timeout_ms(cfg, 105),
+                0
+            );
+            assert_eq!(weida_runtime_config_set_send_timeout_ms(cfg, 106), 0);
+            assert_eq!(weida_runtime_config_set_outbox_messages(cfg, 107), 0);
+            assert_eq!(weida_runtime_config_set_outbox_bytes(cfg, 108), 0);
+            let reject = WEIDA_OUTBOX_FULL_REJECT;
+            assert_eq!(weida_runtime_config_set_outbox_full(cfg, reject), 0);
+            assert_eq!(weida_runtime_config_set_max_handshakes(cfg, 109), 0);
+            assert_eq!(weida_runtime_config_set_retry_above_handshakes(cfg, 110), 0);
+            assert_eq!(
+                weida_runtime_config_set_discovery(cfg, WEIDA_DISCOVERY_SINGLE),
+                0
+            );
+            assert_eq!(weida_runtime_config_set_limits(cfg, l), 0);
+            assert_eq!(weida_runtime_config_set_guarantees(cfg, g), 0);
+            assert_eq!(weida_runtime_config_set_reconnect(cfg, p), 0);
+        }
+
+        // SAFETY: `cfg` is live until `drop_all`.
+        let c = unsafe { &*cfg }.config.lock().unwrap().clone();
+        assert_eq!(
+            c.limits,
+            Limits {
+                max_header_bytes: 1,
+                max_concurrent_uni_streams: 2,
+                max_concurrent_bidi_streams: 3,
+                stream_receive_window: 4,
+                connection_receive_window: 5,
+                keep_alive: Duration::from_millis(6),
+                idle_timeout: Duration::from_millis(7),
+                hello_timeout_ms: 8,
+                max_subscriptions: 9,
+                subscriber_buffer_bytes: 10,
+                max_sequence_scopes: 11,
+                max_reorder_hold: 12,
+                max_local_streams: 13,
+                max_parked_reverse: 14,
+                max_dedup_entries: 15,
+                datagram_receive_bytes: 16,
+                datagram_send_bytes: 17,
+                path_report: true,
+                max_flows: 19,
+                flow_queue_bytes: 20,
+                flow_early_bytes: 21,
+                flow_early_hold: Duration::from_millis(22),
+                congestion: Congestion::Bbr,
+                header_timeout_ms: 24,
+                max_header_streams: 25,
+            }
+        );
+        assert_eq!(
+            c.guarantees,
+            GuaranteeSet {
+                delivery: DeliveryLevel::AtLeastOnce,
+                acknowledgement: Acknowledgement::Replicated,
+                durability: Some(Durability::Flushed),
+                replicas: Some(3),
+                ordering: OrderingMode::PerProducerDetect,
+                deduplication: Deduplication::Bounded,
+                dedup_window_ms: Some(5000),
+                backpressure: Backpressure::Drop,
+                producer_naming: ProducerNaming::Stable,
+                control_isolated: true,
+            }
+        );
+        assert_eq!(
+            c.reconnect,
+            ReconnectPolicy {
+                initial: Duration::from_millis(50),
+                max: Duration::from_millis(900),
+                jitter: false,
+                max_attempts: Some(7),
+                stop_on_peer_closed: true,
+            }
+        );
+        assert_eq!(c.worker_threads, 3);
+        assert_eq!(c.shutdown_timeout, Duration::from_millis(2500));
+        assert_eq!(c.max_connections, 101);
+        assert_eq!(c.max_connections_per_peer, 102);
+        assert_eq!(c.endpoint_queue, 103);
+        assert_eq!(c.max_resolved_addresses, 104);
+        assert_eq!(c.connect_attempt_timeout, Duration::from_millis(105));
+        assert_eq!(c.send_timeout, Some(Duration::from_millis(106)));
+        assert_eq!(c.outbox_messages, 107);
+        assert_eq!(c.outbox_bytes, 108);
+        assert_eq!(c.outbox_full, OutboxFull::Reject);
+        assert_eq!(c.max_handshakes, 109);
+        assert_eq!(c.retry_above_handshakes, 110);
+        assert_eq!(c.discovery, Discovery::Single);
+        assert_eq!(
+            WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES as usize,
+            weida_rs::DEFAULT_DATAGRAM_RECEIVE_BYTES
+        );
+
+        // NULL restores each nested default, and a negative send timeout is
+        // none.
+        // SAFETY: `cfg` is live until `drop_all`.
+        unsafe {
+            assert_eq!(weida_runtime_config_set_limits(cfg, ptr::null()), 0);
+            assert_eq!(weida_runtime_config_set_guarantees(cfg, ptr::null()), 0);
+            assert_eq!(weida_runtime_config_set_reconnect(cfg, ptr::null()), 0);
+            assert_eq!(weida_runtime_config_set_send_timeout_ms(cfg, -1), 0);
+        }
+        // SAFETY: `cfg` is live until `drop_all`.
+        let c = unsafe { &*cfg }.config.lock().unwrap().clone();
+        assert_eq!(c.limits, Limits::default());
+        assert_eq!(c.guarantees, GuaranteeSet::CORE);
+        assert_eq!(c.reconnect, ReconnectPolicy::default());
+        assert_eq!(c.send_timeout, None);
+        drop_all(handles);
+    }
+
+    #[test]
+    fn out_of_range_arguments_are_invalid() {
+        let handles = builders();
+        let (cfg, l, g, p) = handles;
+        // SAFETY: every handle is live until `drop_all`.
+        unsafe {
+            assert_eq!(
+                weida_runtime_config_set_endpoint_queue(cfg, 0),
+                -WEIDA_EINVAL
+            );
+            assert_eq!(weida_runtime_config_set_outbox_full(cfg, 3), -WEIDA_EINVAL);
+            assert_eq!(weida_runtime_config_set_discovery(cfg, -1), -WEIDA_EINVAL);
+            assert_eq!(weida_limits_set_congestion(l, 99), -WEIDA_EINVAL);
+            assert_eq!(weida_guarantee_set_set_ordering(g, 5), -WEIDA_EINVAL);
+            assert_eq!(
+                weida_reconnect_policy_set_max_attempts(p, 1 << 32),
+                -WEIDA_EINVAL
+            );
+            assert_eq!(weida_guarantee_set_set_durability(g, -1), 0);
+        }
+        // SAFETY: the handles are live until `drop_all`.
+        let (c, g, p) = unsafe { (&*cfg, &*g, &*p) };
+        let c = c.config.lock().unwrap().clone();
+        assert_eq!(c.endpoint_queue, RuntimeConfig::default().endpoint_queue);
+        assert_eq!(c.outbox_full, OutboxFull::Block);
+        assert_eq!(g.get(), GuaranteeSet::CORE);
+        assert_eq!(p.get(), ReconnectPolicy::default());
+        assert_eq!(g.get().durability, None);
+        drop_all(handles);
+    }
 }

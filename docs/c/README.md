@@ -128,6 +128,22 @@ The caller neither uses nor drops the handle afterwards. The docs mark such func
   - The pointer is valid until that handle is dropped or consumed.
 - **Bytes out that may hold key material:** an owned `weida_pem` the caller drops, wiped on
   drop ([tls.md](tls.md)).
+- **Enumerations:** an `int` taking a `WEIDA_<TYPE>_<VARIANT>` constant (a `#define`, emitted by
+  cbindgen from a `pub const ...: c_int`). The value is the Rust enum's wire value where it has
+  one (`to_wire`), otherwise its declaration order from 0. Any other value returns
+  `-WEIDA_EINVAL`. The existing `WEIDA_LOSS_*` constants are the same kind, going out.
+- **Flags in:** `int`; 0 is false, any other value is true.
+- **Counts in** (`usize`): `uint64_t`. A value above `usize::MAX` becomes `usize::MAX`, as a
+  collect's `max_bytes` already does.
+- **Optional values in** (`Option<T>` of a duration, a number or an enumeration): `int64_t` (an
+  `int` for an enumeration). Any negative value means `None`, as a negative `timeout_ms` means
+  "forever" in R4. A non-negative value outside `T`'s range returns `-WEIDA_EINVAL`.
+- **Nested configuration:** a public config field whose type is itself a configuration struct
+  (`Limits`, `GuaranteeSet`, `ReconnectPolicy`) is its own builder handle. The parent's
+  `_set_x(h, const weida_<t> *v)` copies `v` at the call, and NULL means `T::default()`, by the
+  default-able parameter rule.
+- **Trace context:** `TraceContext` is its W3C version-00 `traceparent` text, as a `Fingerprint`
+  is `sha256:` text. A malformed text returns `-WEIDA_EINVAL`.
 
 ## R8. Messages
 

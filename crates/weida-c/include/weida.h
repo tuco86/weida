@@ -12,6 +12,187 @@
 #include <stddef.h>
 
 /**
+ * `Congestion::Cubic`.
+ */
+#define WEIDA_CONGESTION_CUBIC 0
+
+/**
+ * `Congestion::NewReno`.
+ */
+#define WEIDA_CONGESTION_NEW_RENO 1
+
+/**
+ * `Congestion::Bbr`.
+ */
+#define WEIDA_CONGESTION_BBR 2
+
+/**
+ * `Discovery::Aware`.
+ */
+#define WEIDA_DISCOVERY_AWARE 0
+
+/**
+ * `Discovery::Single`.
+ */
+#define WEIDA_DISCOVERY_SINGLE 1
+
+/**
+ * `OutboxFull::Block`.
+ */
+#define WEIDA_OUTBOX_FULL_BLOCK 0
+
+/**
+ * `OutboxFull::Drop`.
+ */
+#define WEIDA_OUTBOX_FULL_DROP 1
+
+/**
+ * `OutboxFull::Reject`.
+ */
+#define WEIDA_OUTBOX_FULL_REJECT 2
+
+/**
+ * `DeliveryLevel::BestEffort`.
+ */
+#define WEIDA_DELIVERY_LEVEL_BEST_EFFORT 0
+
+/**
+ * `DeliveryLevel::AtMostOnce`.
+ */
+#define WEIDA_DELIVERY_LEVEL_AT_MOST_ONCE 1
+
+/**
+ * `DeliveryLevel::AtLeastOnce`.
+ */
+#define WEIDA_DELIVERY_LEVEL_AT_LEAST_ONCE 2
+
+/**
+ * `Acknowledgement::None`.
+ */
+#define WEIDA_ACKNOWLEDGEMENT_NONE 0
+
+/**
+ * `Acknowledgement::TransportReceipt`.
+ */
+#define WEIDA_ACKNOWLEDGEMENT_TRANSPORT_RECEIPT 1
+
+/**
+ * `Acknowledgement::Accepted`.
+ */
+#define WEIDA_ACKNOWLEDGEMENT_ACCEPTED 2
+
+/**
+ * `Acknowledgement::Stored`.
+ */
+#define WEIDA_ACKNOWLEDGEMENT_STORED 3
+
+/**
+ * `Acknowledgement::Replicated`.
+ */
+#define WEIDA_ACKNOWLEDGEMENT_REPLICATED 4
+
+/**
+ * `Acknowledgement::Processed`.
+ */
+#define WEIDA_ACKNOWLEDGEMENT_PROCESSED 5
+
+/**
+ * `Durability::Written`.
+ */
+#define WEIDA_DURABILITY_WRITTEN 0
+
+/**
+ * `Durability::Flushed`.
+ */
+#define WEIDA_DURABILITY_FLUSHED 1
+
+/**
+ * `OrderingMode::None`.
+ */
+#define WEIDA_ORDERING_MODE_NONE 0
+
+/**
+ * `OrderingMode::PerProducerDetect`.
+ */
+#define WEIDA_ORDERING_MODE_PER_PRODUCER_DETECT 1
+
+/**
+ * `OrderingMode::PerProducerReassemble`.
+ */
+#define WEIDA_ORDERING_MODE_PER_PRODUCER_REASSEMBLE 2
+
+/**
+ * `OrderingMode::PerKey`.
+ */
+#define WEIDA_ORDERING_MODE_PER_KEY 3
+
+/**
+ * `OrderingMode::Total`.
+ */
+#define WEIDA_ORDERING_MODE_TOTAL 4
+
+/**
+ * `Deduplication::None`.
+ */
+#define WEIDA_DEDUPLICATION_NONE 0
+
+/**
+ * `Deduplication::Bounded`.
+ */
+#define WEIDA_DEDUPLICATION_BOUNDED 1
+
+/**
+ * `Deduplication::Durable`.
+ */
+#define WEIDA_DEDUPLICATION_DURABLE 2
+
+/**
+ * `Backpressure::Block`.
+ */
+#define WEIDA_BACKPRESSURE_BLOCK 0
+
+/**
+ * `Backpressure::Reject`.
+ */
+#define WEIDA_BACKPRESSURE_REJECT 1
+
+/**
+ * `Backpressure::Drop`.
+ */
+#define WEIDA_BACKPRESSURE_DROP 2
+
+/**
+ * `Backpressure::Spill`.
+ */
+#define WEIDA_BACKPRESSURE_SPILL 3
+
+/**
+ * `Backpressure::Coalesce`.
+ */
+#define WEIDA_BACKPRESSURE_COALESCE 4
+
+/**
+ * `ProducerNaming::Fingerprint`.
+ */
+#define WEIDA_PRODUCER_NAMING_FINGERPRINT 0
+
+/**
+ * `ProducerNaming::Stable`.
+ */
+#define WEIDA_PRODUCER_NAMING_STABLE 1
+
+/**
+ * `weida::DEFAULT_DATAGRAM_RECEIVE_BYTES`: the documented
+ * `datagram_receive_bytes` of a profile that enables datagram flows.
+ */
+#define WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES 65536
+
+/**
+ * The length of a version-00 traceparent, without its NUL.
+ */
+#define WEIDA_TRACEPARENT_LEN 55
+
+/**
  * `Error::Runtime`: the runtime could not be created or used.
  */
 #define WEIDA_ERUNTIME 1
@@ -215,6 +396,11 @@ typedef struct weida_delivery weida_delivery;
 typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 
 /**
+ * `GuaranteeSet` under construction: one setter per dimension.
+ */
+typedef struct weida_guarantee_set weida_guarantee_set;
+
+/**
  * A certificate chain and its private key.
  */
 typedef struct weida_identity weida_identity;
@@ -244,6 +430,11 @@ typedef struct weida_incoming_transfer weida_incoming_transfer;
  * The pending collect of `weida_incoming_transfer_collect`.
  */
 typedef struct weida_incoming_transfer_collect_op weida_incoming_transfer_collect_op;
+
+/**
+ * `Limits` under construction: one setter per field.
+ */
+typedef struct weida_limits weida_limits;
 
 /**
  * Where a runtime serves: bindings and the endpoints registered on them.
@@ -277,6 +468,11 @@ typedef struct weida_outgoing_transfer weida_outgoing_transfer;
 typedef struct weida_pem weida_pem;
 
 /**
+ * `ReconnectPolicy` under construction: one setter per field.
+ */
+typedef struct weida_reconnect_policy weida_reconnect_policy;
+
+/**
  * The replying half of Req/Rep, serving one endpoint path.
  */
 typedef struct weida_replier weida_replier;
@@ -302,7 +498,8 @@ typedef struct weida_requester_request_op weida_requester_request_op;
 typedef struct weida_runtime weida_runtime;
 
 /**
- * A runtime configuration under construction: one setter per field.
+ * A runtime configuration under construction: one setter per field but
+ * `resolver` and `network`.
  */
 typedef struct weida_runtime_config weida_runtime_config;
 
@@ -357,6 +554,462 @@ extern "C" {
  * Always safe to call.
  */
 const char *weida_version(void);
+
+/**
+ * Creates limits holding weida's defaults (`Limits::default`).
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with `weida_limits_drop`.
+ */
+int weida_limits_new(weida_limits **out);
+
+/**
+ * Releases limits. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits, dropped at most once.
+ */
+void weida_limits_drop(weida_limits *l);
+
+/**
+ * Sets `Limits::max_header_bytes`: the largest frame header accepted, in
+ * bytes.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_header_bytes(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_concurrent_uni_streams`: QUIC inbound unidirectional
+ * streams at once.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_concurrent_uni_streams(const weida_limits *l, uint32_t v);
+
+/**
+ * Sets `Limits::max_concurrent_bidi_streams`: QUIC inbound bidirectional
+ * streams at once.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_concurrent_bidi_streams(const weida_limits *l, uint32_t v);
+
+/**
+ * Sets `Limits::stream_receive_window`, in bytes. Above 2^62-1 the first
+ * QUIC bind or dial fails with `-WEIDA_ERUNTIME`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_stream_receive_window(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::connection_receive_window`, in bytes. Above 2^62-1 the
+ * first QUIC bind or dial fails with `-WEIDA_ERUNTIME`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_connection_receive_window(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::keep_alive`, in milliseconds: the dialling side's QUIC
+ * keep-alive interval.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_keep_alive_ms(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::idle_timeout`, in milliseconds. A value QUIC cannot carry
+ * fails the first QUIC bind or dial with `-WEIDA_ERUNTIME`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_idle_timeout_ms(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::flow_early_hold`, in milliseconds: how long a datagram
+ * waits for its FLOW header.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_flow_early_hold_ms(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::hello_timeout_ms`: the wait for the peer's HELLO.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_hello_timeout_ms(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::header_timeout_ms`: the wait for one inbound stream's
+ * preamble and then its header.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_header_timeout_ms(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_subscriptions` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_subscriptions(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::subscriber_buffer_bytes` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_subscriber_buffer_bytes(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_sequence_scopes` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_sequence_scopes(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_reorder_hold` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_reorder_hold(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_local_streams` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_local_streams(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_parked_reverse` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_parked_reverse(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_dedup_entries` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_dedup_entries(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::datagram_receive_bytes` (a count, R7). 0 turns datagram
+ * flows off; `WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES` is the documented value
+ * for turning them on.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_datagram_receive_bytes(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::datagram_send_bytes` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_datagram_send_bytes(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_flows` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_flows(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::flow_queue_bytes` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_flow_queue_bytes(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::flow_early_bytes` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_flow_early_bytes(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::max_header_streams` (a count, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_max_header_streams(const weida_limits *l, uint64_t v);
+
+/**
+ * Sets `Limits::path_report` (a flag, R7).
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_path_report(const weida_limits *l, int v);
+
+/**
+ * Sets `Limits::congestion` to a `WEIDA_CONGESTION_*` constant; any other
+ * value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or live limits.
+ */
+int weida_limits_set_congestion(const weida_limits *l, int v);
+
+/**
+ * Creates a guarantee set holding `GuaranteeSet::CORE`.
+ *
+ * No combination of dimensions is checked here, as in Rust: a set a peer
+ * cannot meet fails the connect or the first request with
+ * `-WEIDA_ENEGOTIATION`.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_guarantee_set_drop`.
+ */
+int weida_guarantee_set_new(weida_guarantee_set **out);
+
+/**
+ * Releases a guarantee set. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set, dropped at most once.
+ */
+void weida_guarantee_set_drop(weida_guarantee_set *g);
+
+/**
+ * Sets `GuaranteeSet::delivery` to a `WEIDA_DELIVERY_LEVEL_*` constant; any
+ * other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_delivery(const weida_guarantee_set *g, int v);
+
+/**
+ * Sets `GuaranteeSet::acknowledgement` to a `WEIDA_ACKNOWLEDGEMENT_*` constant; any
+ * other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_acknowledgement(const weida_guarantee_set *g, int v);
+
+/**
+ * Sets `GuaranteeSet::durability` to a `WEIDA_DURABILITY_*` constant, or
+ * to none for a negative value; any other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_durability(const weida_guarantee_set *g, int v);
+
+/**
+ * Sets `GuaranteeSet::replicas`, or none for a negative value (R7).
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_replicas(const weida_guarantee_set *g, int64_t v);
+
+/**
+ * Sets `GuaranteeSet::ordering` to a `WEIDA_ORDERING_MODE_*` constant; any
+ * other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_ordering(const weida_guarantee_set *g, int v);
+
+/**
+ * Sets `GuaranteeSet::deduplication` to a `WEIDA_DEDUPLICATION_*` constant; any
+ * other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_deduplication(const weida_guarantee_set *g, int v);
+
+/**
+ * Sets `GuaranteeSet::dedup_window_ms`, or none for a negative value (R7).
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_dedup_window_ms(const weida_guarantee_set *g, int64_t v);
+
+/**
+ * Sets `GuaranteeSet::backpressure` to a `WEIDA_BACKPRESSURE_*` constant; any
+ * other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_backpressure(const weida_guarantee_set *g, int v);
+
+/**
+ * Sets `GuaranteeSet::producer_naming` to a `WEIDA_PRODUCER_NAMING_*` constant; any
+ * other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_producer_naming(const weida_guarantee_set *g, int v);
+
+/**
+ * Sets `GuaranteeSet::control_isolated` (a flag, R7).
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live guarantee set.
+ */
+int weida_guarantee_set_set_control_isolated(const weida_guarantee_set *g, int v);
+
+/**
+ * Creates a redial policy holding weida's default
+ * (`ReconnectPolicy::default`): doubling from 100 ms to 30 s with jitter,
+ * never giving up.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_reconnect_policy_drop`.
+ */
+int weida_reconnect_policy_new(weida_reconnect_policy **out);
+
+/**
+ * Creates a policy that never redials (`ReconnectPolicy::never`): a lost
+ * peer fails the next operation with its loss cause.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_reconnect_policy_drop`.
+ */
+int weida_reconnect_policy_never(weida_reconnect_policy **out);
+
+/**
+ * Releases a redial policy. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live policy, dropped at most once.
+ */
+void weida_reconnect_policy_drop(weida_reconnect_policy *p);
+
+/**
+ * Sets `ReconnectPolicy::initial`, in milliseconds: the delay before the
+ * first redial.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live policy.
+ */
+int weida_reconnect_policy_set_initial_ms(const weida_reconnect_policy *p, uint64_t v);
+
+/**
+ * Sets `ReconnectPolicy::max`, in milliseconds: the ceiling on the delay,
+ * and how long a connection must live to earn a fresh schedule.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live policy.
+ */
+int weida_reconnect_policy_set_max_ms(const weida_reconnect_policy *p, uint64_t v);
+
+/**
+ * Sets `ReconnectPolicy::jitter` (a flag, R7).
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live policy.
+ */
+int weida_reconnect_policy_set_jitter(const weida_reconnect_policy *p, int v);
+
+/**
+ * Sets `ReconnectPolicy::max_attempts`, or none (redial for as long as the
+ * endpoint lives) for a negative value. Above `UINT32_MAX` it is
+ * `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live policy.
+ */
+int weida_reconnect_policy_set_max_attempts(const weida_reconnect_policy *p, int64_t v);
+
+/**
+ * Sets `ReconnectPolicy::stop_on_peer_closed` (a flag, R7).
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live policy.
+ */
+int weida_reconnect_policy_set_stop_on_peer_closed(const weida_reconnect_policy *p, int v);
 
 /**
  * The description of a status code, positive or negative.
@@ -842,6 +1495,162 @@ int weida_runtime_config_set_worker_threads(const weida_runtime_config *cfg, uin
  * `cfg` is NULL or a live configuration.
  */
 int weida_runtime_config_set_shutdown_timeout_ms(const weida_runtime_config *cfg, uint64_t ms);
+
+/**
+ * Sets `RuntimeConfig::max_connections` (a count, R7): connections one
+ * binding accepts at once.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_max_connections(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::max_connections_per_peer` (a count, R7):
+ * connections one proved peer may hold on one binding.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_max_connections_per_peer(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::max_resolved_addresses` (a count, R7): addresses a
+ * dial tries for one hostname.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_max_resolved_addresses(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::outbox_messages` (a count, R7): bodies a dialling
+ * endpoint's outbox holds while no peer is live.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_outbox_messages(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::outbox_bytes` (a count, R7): the bytes those bodies
+ * may sum to.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_outbox_bytes(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::max_handshakes` (a count, R7): handshakes one QUIC
+ * binding runs at once.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_max_handshakes(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::retry_above_handshakes` (a count, R7): handshakes
+ * in progress from which a QUIC binding answers with a stateless Retry.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_retry_above_handshakes(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::endpoint_queue` (a count, R7): the depth of an
+ * endpoint's accept queue. 0 is `-WEIDA_EINVAL`: a queue needs a place.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_endpoint_queue(const weida_runtime_config *cfg, uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::connect_attempt_timeout`, in milliseconds: how long
+ * a dial waits on one resolved address before trying the next.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_connect_attempt_timeout_ms(const weida_runtime_config *cfg,
+                                                        uint64_t v);
+
+/**
+ * Sets `RuntimeConfig::send_timeout`, in milliseconds, or none for a
+ * negative value (R7): how long an `open` on a dialling endpoint waits for
+ * a lost peer to come back before it fails with the loss cause. None waits
+ * as long as the redial does.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_send_timeout_ms(const weida_runtime_config *cfg, int64_t v);
+
+/**
+ * Sets `RuntimeConfig::outbox_full` to a `WEIDA_OUTBOX_FULL_*` constant:
+ * what a send does at the outbox bound. Any other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_outbox_full(const weida_runtime_config *cfg, int v);
+
+/**
+ * Sets `RuntimeConfig::discovery` to a `WEIDA_DISCOVERY_*` constant:
+ * whether an authority may name a set of nodes. Any other value is
+ * `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration.
+ */
+int weida_runtime_config_set_discovery(const weida_runtime_config *cfg, int v);
+
+/**
+ * Sets `RuntimeConfig::limits` to a copy of `v`, taken now; NULL is
+ * `Limits::default()`.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration; `v` is NULL or live limits.
+ */
+int weida_runtime_config_set_limits(const weida_runtime_config *cfg, const weida_limits *v);
+
+/**
+ * Sets `RuntimeConfig::guarantees` to a copy of `v`, taken now; NULL is
+ * `GuaranteeSet::CORE`.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration; `v` is NULL or a live guarantee set.
+ */
+int weida_runtime_config_set_guarantees(const weida_runtime_config *cfg,
+                                        const weida_guarantee_set *v);
+
+/**
+ * Sets `RuntimeConfig::reconnect` to a copy of `v`, taken now; NULL is
+ * `ReconnectPolicy::default()`.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration; `v` is NULL or a live policy.
+ */
+int weida_runtime_config_set_reconnect(const weida_runtime_config *cfg,
+                                       const weida_reconnect_policy *v);
 
 /**
  * Releases a configuration. NULL does nothing.

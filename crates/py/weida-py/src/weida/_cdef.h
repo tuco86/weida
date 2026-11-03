@@ -1,3 +1,75 @@
+#define WEIDA_CONGESTION_CUBIC 0
+
+#define WEIDA_CONGESTION_NEW_RENO 1
+
+#define WEIDA_CONGESTION_BBR 2
+
+#define WEIDA_DISCOVERY_AWARE 0
+
+#define WEIDA_DISCOVERY_SINGLE 1
+
+#define WEIDA_OUTBOX_FULL_BLOCK 0
+
+#define WEIDA_OUTBOX_FULL_DROP 1
+
+#define WEIDA_OUTBOX_FULL_REJECT 2
+
+#define WEIDA_DELIVERY_LEVEL_BEST_EFFORT 0
+
+#define WEIDA_DELIVERY_LEVEL_AT_MOST_ONCE 1
+
+#define WEIDA_DELIVERY_LEVEL_AT_LEAST_ONCE 2
+
+#define WEIDA_ACKNOWLEDGEMENT_NONE 0
+
+#define WEIDA_ACKNOWLEDGEMENT_TRANSPORT_RECEIPT 1
+
+#define WEIDA_ACKNOWLEDGEMENT_ACCEPTED 2
+
+#define WEIDA_ACKNOWLEDGEMENT_STORED 3
+
+#define WEIDA_ACKNOWLEDGEMENT_REPLICATED 4
+
+#define WEIDA_ACKNOWLEDGEMENT_PROCESSED 5
+
+#define WEIDA_DURABILITY_WRITTEN 0
+
+#define WEIDA_DURABILITY_FLUSHED 1
+
+#define WEIDA_ORDERING_MODE_NONE 0
+
+#define WEIDA_ORDERING_MODE_PER_PRODUCER_DETECT 1
+
+#define WEIDA_ORDERING_MODE_PER_PRODUCER_REASSEMBLE 2
+
+#define WEIDA_ORDERING_MODE_PER_KEY 3
+
+#define WEIDA_ORDERING_MODE_TOTAL 4
+
+#define WEIDA_DEDUPLICATION_NONE 0
+
+#define WEIDA_DEDUPLICATION_BOUNDED 1
+
+#define WEIDA_DEDUPLICATION_DURABLE 2
+
+#define WEIDA_BACKPRESSURE_BLOCK 0
+
+#define WEIDA_BACKPRESSURE_REJECT 1
+
+#define WEIDA_BACKPRESSURE_DROP 2
+
+#define WEIDA_BACKPRESSURE_SPILL 3
+
+#define WEIDA_BACKPRESSURE_COALESCE 4
+
+#define WEIDA_PRODUCER_NAMING_FINGERPRINT 0
+
+#define WEIDA_PRODUCER_NAMING_STABLE 1
+
+#define WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES 65536
+
+#define WEIDA_TRACEPARENT_LEN 55
+
 #define WEIDA_ERUNTIME 1
 
 #define WEIDA_EINVALID_ADDRESS 2
@@ -78,6 +150,8 @@ typedef struct weida_delivery weida_delivery;
 
 typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 
+typedef struct weida_guarantee_set weida_guarantee_set;
+
 typedef struct weida_identity weida_identity;
 
 typedef struct weida_incoming_meta weida_incoming_meta;
@@ -90,6 +164,8 @@ typedef struct weida_incoming_transfer weida_incoming_transfer;
 
 typedef struct weida_incoming_transfer_collect_op weida_incoming_transfer_collect_op;
 
+typedef struct weida_limits weida_limits;
+
 typedef struct weida_listener weida_listener;
 
 typedef struct weida_listener_bind_quic_op weida_listener_bind_quic_op;
@@ -101,6 +177,8 @@ typedef struct weida_msg weida_msg;
 typedef struct weida_outgoing_transfer weida_outgoing_transfer;
 
 typedef struct weida_pem weida_pem;
+
+typedef struct weida_reconnect_policy weida_reconnect_policy;
 
 typedef struct weida_replier weida_replier;
 
@@ -129,6 +207,100 @@ typedef struct {
 } weida_poll_item;
 
 const char *weida_version(void);
+
+int weida_limits_new(weida_limits **out);
+
+void weida_limits_drop(weida_limits *l);
+
+int weida_limits_set_max_header_bytes(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_concurrent_uni_streams(const weida_limits *l, uint32_t v);
+
+int weida_limits_set_max_concurrent_bidi_streams(const weida_limits *l, uint32_t v);
+
+int weida_limits_set_stream_receive_window(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_connection_receive_window(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_keep_alive_ms(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_idle_timeout_ms(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_flow_early_hold_ms(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_hello_timeout_ms(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_header_timeout_ms(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_subscriptions(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_subscriber_buffer_bytes(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_sequence_scopes(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_reorder_hold(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_local_streams(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_parked_reverse(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_dedup_entries(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_datagram_receive_bytes(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_datagram_send_bytes(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_flows(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_flow_queue_bytes(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_flow_early_bytes(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_max_header_streams(const weida_limits *l, uint64_t v);
+
+int weida_limits_set_path_report(const weida_limits *l, int v);
+
+int weida_limits_set_congestion(const weida_limits *l, int v);
+
+int weida_guarantee_set_new(weida_guarantee_set **out);
+
+void weida_guarantee_set_drop(weida_guarantee_set *g);
+
+int weida_guarantee_set_set_delivery(const weida_guarantee_set *g, int v);
+
+int weida_guarantee_set_set_acknowledgement(const weida_guarantee_set *g, int v);
+
+int weida_guarantee_set_set_durability(const weida_guarantee_set *g, int v);
+
+int weida_guarantee_set_set_replicas(const weida_guarantee_set *g, int64_t v);
+
+int weida_guarantee_set_set_ordering(const weida_guarantee_set *g, int v);
+
+int weida_guarantee_set_set_deduplication(const weida_guarantee_set *g, int v);
+
+int weida_guarantee_set_set_dedup_window_ms(const weida_guarantee_set *g, int64_t v);
+
+int weida_guarantee_set_set_backpressure(const weida_guarantee_set *g, int v);
+
+int weida_guarantee_set_set_producer_naming(const weida_guarantee_set *g, int v);
+
+int weida_guarantee_set_set_control_isolated(const weida_guarantee_set *g, int v);
+
+int weida_reconnect_policy_new(weida_reconnect_policy **out);
+
+int weida_reconnect_policy_never(weida_reconnect_policy **out);
+
+void weida_reconnect_policy_drop(weida_reconnect_policy *p);
+
+int weida_reconnect_policy_set_initial_ms(const weida_reconnect_policy *p, uint64_t v);
+
+int weida_reconnect_policy_set_max_ms(const weida_reconnect_policy *p, uint64_t v);
+
+int weida_reconnect_policy_set_jitter(const weida_reconnect_policy *p, int v);
+
+int weida_reconnect_policy_set_max_attempts(const weida_reconnect_policy *p, int64_t v);
+
+int weida_reconnect_policy_set_stop_on_peer_closed(const weida_reconnect_policy *p, int v);
 
 const char *weida_strerror(int code);
 
@@ -234,6 +406,39 @@ int weida_runtime_config_new(weida_runtime_config **out);
 int weida_runtime_config_set_worker_threads(const weida_runtime_config *cfg, uint32_t threads);
 
 int weida_runtime_config_set_shutdown_timeout_ms(const weida_runtime_config *cfg, uint64_t ms);
+
+int weida_runtime_config_set_max_connections(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_max_connections_per_peer(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_max_resolved_addresses(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_outbox_messages(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_outbox_bytes(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_max_handshakes(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_retry_above_handshakes(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_endpoint_queue(const weida_runtime_config *cfg, uint64_t v);
+
+int weida_runtime_config_set_connect_attempt_timeout_ms(const weida_runtime_config *cfg,
+                                                        uint64_t v);
+
+int weida_runtime_config_set_send_timeout_ms(const weida_runtime_config *cfg, int64_t v);
+
+int weida_runtime_config_set_outbox_full(const weida_runtime_config *cfg, int v);
+
+int weida_runtime_config_set_discovery(const weida_runtime_config *cfg, int v);
+
+int weida_runtime_config_set_limits(const weida_runtime_config *cfg, const weida_limits *v);
+
+int weida_runtime_config_set_guarantees(const weida_runtime_config *cfg,
+                                        const weida_guarantee_set *v);
+
+int weida_runtime_config_set_reconnect(const weida_runtime_config *cfg,
+                                       const weida_reconnect_policy *v);
 
 void weida_runtime_config_drop(weida_runtime_config *cfg);
 

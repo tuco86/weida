@@ -12,6 +12,7 @@
 
 #![allow(non_camel_case_types)]
 
+mod config;
 mod error;
 mod handle;
 mod listener;
@@ -26,6 +27,7 @@ mod try_handle;
 
 use std::ffi::c_char;
 
+pub use config::*;
 pub use error::*;
 pub use listener::*;
 pub use poll::*;
