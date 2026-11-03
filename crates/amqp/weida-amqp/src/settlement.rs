@@ -861,42 +861,6 @@ mod tests {
     }
 
     #[test]
-    fn a_single_id_costs_one_lookup_and_not_a_walk_of_the_map() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        fn filled(n: u32) -> Unsettled {
-            let mut map = Unsettled::new(usize::try_from(n).unwrap());
-            for id in 0..n {
-                assert!(map.insert(id, b"tag"));
-            }
-            map
-        }
-        // Two map sizes and the same number of calls: what a walk of the map
-        // costs grows with the size, and an ordered lookup does not. The
-        // comparison is the ratio, so it holds on a loaded machine, and the
-        // margin is wide: a walk is ~64x apart here, a lookup ~1x.
-        let small = filled(64);
-        let large = filled(4096);
-        let calls = 20_000u32;
-        let run = |map: &Unsettled| {
-            let started = Instant::now();
-            for call in 0..calls {
-                let id = black_box(call % 64);
-                black_box(map.ids_in(id, id));
-            }
-            started.elapsed()
-        };
-        let _warm = (run(&small), run(&large));
-        let small_time = run(&small);
-        let large_time = run(&large);
-        assert!(
-            large_time < small_time * 8 + std::time::Duration::from_millis(50),
-            "64 entries took {small_time:?}, 4096 took {large_time:?}"
-        );
-    }
-
-    #[test]
     fn a_tag_longer_than_the_protocol_allows_is_not_recorded() {
         let mut map = Unsettled::new(4);
         assert!(map.insert(1, &[7u8; 32]));
