@@ -17,3 +17,6 @@ crates/jvm/weida-jvm/build/
 # What crates/beam/weida's rebar3 and c_src/build.sh build.
 crates/beam/weida/_build/
 crates/beam/weida/priv/
+# What crates/swift/weida/build-xcframework.sh and SwiftPM build.
+crates/swift/weida/build/
+crates/swift/weida/.build/

@@ -168,7 +168,11 @@ futures-io = "0.3"
 futures = "0.3"
 tracing = "0.1"
 # `getpeereid` for `weida-runtime` on Apple targets only, without `unsafe`
-# (B-392); it needs both `socket` and `user`.
+# (B-392); it needs both `socket` and `user`. Cargo.lock holds libc at
+# 0.2.189: libc 0.2.190 put `SYSPROTO_CONTROL` behind `target_os = "macos"`,
+# and nix 0.30 and 0.31 name it for every Apple target, so nix's `socket`
+# does not build for iOS above it (nix-rust/nix#2830). The iOS slices of
+# crates/swift/weida/build-xcframework.sh fail when an update lifts it.
 nix = { version = "0.30", default-features = false, features = ["socket", "user"] }
 rand = "0.9"
 minicbor = { version = "2", features = ["alloc"] }

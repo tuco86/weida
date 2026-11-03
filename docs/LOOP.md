@@ -125,7 +125,8 @@ The integration tier and every platform run in the CI after the push (`.zeughaus
 push to `main` runs the unit tier and the doctests on linux-amd64, linux-arm64, darwin-arm64
 and windows-amd64, the nightly and a `v*` tag both tiers. The same pipelines build `libweida`
 on both Linux architectures and run the language jobs on it (`python-`, `js-`, `jvm-`,
-`beam-`, `go-linux-*`); `android-libweida` runs on the nightly and tags only. Never run
+`beam-`, `go-linux-*`), and `swift-darwin-arm64` builds its own XCFramework on atik;
+`android-libweida` runs on the nightly and tags only. Never run
 `cargo test --workspace`, `--profile integration` or `--profile ci` locally.
 
 **`--workspace` is not the whole workspace.** It builds every crate in its *default*
