@@ -55,6 +55,9 @@ DROP(incoming_transfer_collect_op)
 DROP(outgoing_transfer)
 DROP(delivery)
 DROP(delivery_delivered_op)
+DROP(limits)
+DROP(guarantee_set)
+DROP(reconnect_policy)
 
 static void finalize_wh(napi_env env, void *data, void *hint) {
     (void)env;
@@ -231,6 +234,23 @@ static const char *loss_name(int cause) {
         NAME(LOSS_LOCALLY_CLOSED)
         NAME(LOSS_RESET)
         NAME(LOSS_TRANSPORT_ERROR)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *acknowledgement_name(int level) {
+    switch (level) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(ACKNOWLEDGEMENT_NONE)
+        NAME(ACKNOWLEDGEMENT_TRANSPORT_RECEIPT)
+        NAME(ACKNOWLEDGEMENT_ACCEPTED)
+        NAME(ACKNOWLEDGEMENT_STORED)
+        NAME(ACKNOWLEDGEMENT_REPLICATED)
+        NAME(ACKNOWLEDGEMENT_PROCESSED)
 #undef NAME
     default:
         return NULL;
@@ -426,6 +446,38 @@ static bool get_u64(napi_env env, napi_value v, uint64_t max, uint64_t *out) {
     return true;
 }
 
+/* An integer number within INT32_MIN..INT32_MAX. */
+static bool get_i32(napi_env env, napi_value v, int32_t *out) {
+    napi_valuetype type;
+    double d = 0;
+    if (napi_typeof(env, v, &type) != napi_ok) {
+        throw_napi(env);
+        return false;
+    }
+    if (type != napi_number) {
+        throw_type(env, "expected a number");
+        return false;
+    }
+    napi_get_value_double(env, v, &d);
+    if (!(d >= INT32_MIN && d <= INT32_MAX) || d != (double)(int32_t)d) {
+        throw_range(env, "expected a 32-bit integer");
+        return false;
+    }
+    *out = (int32_t)d;
+    return true;
+}
+
+/* A boolean, as an R7 flag. */
+static bool get_flag(napi_env env, napi_value v, int *out) {
+    bool b = false;
+    if (napi_get_value_bool(env, v, &b) != napi_ok) {
+        throw_type(env, "expected a boolean");
+        return false;
+    }
+    *out = b;
+    return true;
+}
+
 /* ---- values out ---- */
 
 static napi_value set(napi_env env, napi_value obj, const char *key, napi_value v) {
@@ -500,6 +552,15 @@ static napi_value meta_value(napi_env env, void *ptr) {
     ok = ok && set(env, obj, "contentLen", optional_u64(env, present, n));
     present = weida_incoming_meta_sequence(m, &n);
     ok = ok && set(env, obj, "sequence", optional_u64(env, present, n));
+    s = weida_incoming_meta_trace(m, &len);
+    ok = ok && set(env, obj, "trace", js_string(env, s, len));
+    s = weida_incoming_meta_tracestate(m, &len);
+    ok = ok && set(env, obj, "tracestate", js_string(env, s, len));
+    int level = 0;
+    ok = ok && set(env, obj, "achieved",
+                   weida_incoming_meta_achieved(m, &level) == 1
+                       ? js_string(env, acknowledgement_name(level), NAPI_AUTO_LENGTH)
+                       : js_null(env));
     weida_incoming_meta_drop(m);
     return ok ? obj : NULL;
 }
@@ -595,6 +656,70 @@ WRAP_AS(outgoing_transfer)
         return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_##t); \
     }
 
+/* `<t>_set_<x>(h, n)`: an integer up to `max` (R7 counts, durations and
+ * optional values; the JS layer never passes null for an optional). */
+#define SET_U64(js, t, x, max) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        uint64_t v = 0; \
+        if (!h || !get_u64(env, argv[1], max, &v)) \
+            return NULL; \
+        int rc = weida_##t##_set_##x(h, v); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `<t>_set_<x>(h, n)`: an enumeration constant, range-checked by C. */
+#define SET_INT(js, t, x) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        int32_t v = 0; \
+        if (!h || !get_i32(env, argv[1], &v)) \
+            return NULL; \
+        int rc = weida_##t##_set_##x(h, v); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `<t>_set_<x>(h, bool)` (R7 flags) */
+#define SET_FLAG(js, t, x) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        int v = 0; \
+        if (!h || !get_flag(env, argv[1], &v)) \
+            return NULL; \
+        int rc = weida_##t##_set_##x(h, v); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `<t>_set_<x>(h, string)` */
+#define SET_TEXT(js, t, x) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        if (!h) \
+            return NULL; \
+        char *s = get_string(env, argv[1]); \
+        if (!s) \
+            return NULL; \
+        int rc = weida_##t##_set_##x(h, s); \
+        free(s); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `<t>_set_<x>(h, handle | null)`: a nested configuration, copied by C. */
+#define SET_HANDLE(js, t, x, u) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        void *p = NULL; \
+        if (!h || !optional(env, argv[1], drop_##u, &p)) \
+            return NULL; \
+        int rc = weida_##t##_set_##x(h, p); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
 /* ---- the functions ---- */
 
 static napi_value version(napi_env env, napi_callback_info info) {
@@ -669,6 +794,82 @@ static napi_value runtime_config_set_shutdown_timeout_ms(napi_env env, napi_call
     int rc = weida_runtime_config_set_shutdown_timeout_ms(cfg, ms);
     return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
 }
+
+SET_U64(runtime_config_set_max_connections, runtime_config, max_connections, UINT64_MAX)
+SET_U64(runtime_config_set_max_connections_per_peer, runtime_config, max_connections_per_peer,
+        UINT64_MAX)
+SET_U64(runtime_config_set_endpoint_queue, runtime_config, endpoint_queue, UINT64_MAX)
+SET_U64(runtime_config_set_max_resolved_addresses, runtime_config, max_resolved_addresses,
+        UINT64_MAX)
+SET_U64(runtime_config_set_connect_attempt_timeout_ms, runtime_config, connect_attempt_timeout_ms,
+        UINT64_MAX)
+SET_U64(runtime_config_set_send_timeout_ms, runtime_config, send_timeout_ms, INT64_MAX)
+SET_U64(runtime_config_set_outbox_messages, runtime_config, outbox_messages, UINT64_MAX)
+SET_U64(runtime_config_set_outbox_bytes, runtime_config, outbox_bytes, UINT64_MAX)
+SET_INT(runtime_config_set_outbox_full, runtime_config, outbox_full)
+SET_U64(runtime_config_set_max_handshakes, runtime_config, max_handshakes, UINT64_MAX)
+SET_U64(runtime_config_set_retry_above_handshakes, runtime_config, retry_above_handshakes,
+        UINT64_MAX)
+SET_INT(runtime_config_set_discovery, runtime_config, discovery)
+SET_HANDLE(runtime_config_set_limits, runtime_config, limits, limits)
+SET_HANDLE(runtime_config_set_guarantees, runtime_config, guarantees, guarantee_set)
+SET_HANDLE(runtime_config_set_reconnect, runtime_config, reconnect, reconnect_policy)
+
+/* nested configuration */
+
+NEW0(limits_new, limits)
+SET_U64(limits_set_max_header_bytes, limits, max_header_bytes, UINT64_MAX)
+SET_U64(limits_set_max_concurrent_uni_streams, limits, max_concurrent_uni_streams, UINT32_MAX)
+SET_U64(limits_set_max_concurrent_bidi_streams, limits, max_concurrent_bidi_streams, UINT32_MAX)
+SET_U64(limits_set_stream_receive_window, limits, stream_receive_window, UINT64_MAX)
+SET_U64(limits_set_connection_receive_window, limits, connection_receive_window, UINT64_MAX)
+SET_U64(limits_set_keep_alive_ms, limits, keep_alive_ms, UINT64_MAX)
+SET_U64(limits_set_idle_timeout_ms, limits, idle_timeout_ms, UINT64_MAX)
+SET_U64(limits_set_hello_timeout_ms, limits, hello_timeout_ms, UINT64_MAX)
+SET_U64(limits_set_max_subscriptions, limits, max_subscriptions, UINT64_MAX)
+SET_U64(limits_set_subscriber_buffer_bytes, limits, subscriber_buffer_bytes, UINT64_MAX)
+SET_U64(limits_set_max_sequence_scopes, limits, max_sequence_scopes, UINT64_MAX)
+SET_U64(limits_set_max_reorder_hold, limits, max_reorder_hold, UINT64_MAX)
+SET_U64(limits_set_max_local_streams, limits, max_local_streams, UINT64_MAX)
+SET_U64(limits_set_max_parked_reverse, limits, max_parked_reverse, UINT64_MAX)
+SET_U64(limits_set_max_dedup_entries, limits, max_dedup_entries, UINT64_MAX)
+SET_U64(limits_set_datagram_receive_bytes, limits, datagram_receive_bytes, UINT64_MAX)
+SET_U64(limits_set_datagram_send_bytes, limits, datagram_send_bytes, UINT64_MAX)
+SET_FLAG(limits_set_path_report, limits, path_report)
+SET_U64(limits_set_max_flows, limits, max_flows, UINT64_MAX)
+SET_U64(limits_set_flow_queue_bytes, limits, flow_queue_bytes, UINT64_MAX)
+SET_U64(limits_set_flow_early_bytes, limits, flow_early_bytes, UINT64_MAX)
+SET_U64(limits_set_flow_early_hold_ms, limits, flow_early_hold_ms, UINT64_MAX)
+SET_INT(limits_set_congestion, limits, congestion)
+SET_U64(limits_set_header_timeout_ms, limits, header_timeout_ms, UINT64_MAX)
+SET_U64(limits_set_max_header_streams, limits, max_header_streams, UINT64_MAX)
+
+NEW0(guarantee_set_new, guarantee_set)
+SET_INT(guarantee_set_set_delivery, guarantee_set, delivery)
+SET_INT(guarantee_set_set_acknowledgement, guarantee_set, acknowledgement)
+SET_INT(guarantee_set_set_durability, guarantee_set, durability)
+SET_U64(guarantee_set_set_replicas, guarantee_set, replicas, INT64_MAX)
+SET_INT(guarantee_set_set_ordering, guarantee_set, ordering)
+SET_INT(guarantee_set_set_deduplication, guarantee_set, deduplication)
+SET_U64(guarantee_set_set_dedup_window_ms, guarantee_set, dedup_window_ms, INT64_MAX)
+SET_INT(guarantee_set_set_backpressure, guarantee_set, backpressure)
+SET_INT(guarantee_set_set_producer_naming, guarantee_set, producer_naming)
+SET_FLAG(guarantee_set_set_control_isolated, guarantee_set, control_isolated)
+
+NEW0(reconnect_policy_new, reconnect_policy)
+
+static napi_value reconnect_policy_never(napi_env env, napi_callback_info info) {
+    (void)info;
+    weida_reconnect_policy *out = NULL;
+    int rc = weida_reconnect_policy_never(&out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_reconnect_policy);
+}
+
+SET_U64(reconnect_policy_set_initial_ms, reconnect_policy, initial_ms, UINT64_MAX)
+SET_U64(reconnect_policy_set_max_ms, reconnect_policy, max_ms, UINT64_MAX)
+SET_FLAG(reconnect_policy_set_jitter, reconnect_policy, jitter)
+SET_U64(reconnect_policy_set_max_attempts, reconnect_policy, max_attempts, UINT32_MAX)
+SET_FLAG(reconnect_policy_set_stop_on_peer_closed, reconnect_policy, stop_on_peer_closed)
 
 static napi_value runtime_owned(napi_env env, napi_callback_info info) {
     ARGS(1);
@@ -951,6 +1152,19 @@ static napi_value transfer_meta_set_content_type(napi_env env, napi_callback_inf
     return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
 }
 
+SET_U64(transfer_meta_set_content_len, transfer_meta, content_len, UINT64_MAX)
+SET_TEXT(transfer_meta_set_topic, transfer_meta, topic)
+SET_TEXT(transfer_meta_set_trace, transfer_meta, trace)
+SET_INT(transfer_meta_set_achieved, transfer_meta, achieved)
+
+/* `newTrace() -> string`: a fresh root traceparent. */
+static napi_value new_trace(napi_env env, napi_callback_info info) {
+    (void)info;
+    char buf[WEIDA_TRACEPARENT_LEN + 1];
+    int rc = weida_new_trace(buf, sizeof buf);
+    return rc < 0 ? throw_rc(env, rc) : js_string(env, buf, WEIDA_TRACEPARENT_LEN);
+}
+
 /* listener and bindings */
 
 static napi_value listener_bind_quic(napi_env env, napi_callback_info info) {
@@ -1088,6 +1302,20 @@ static napi_value requester_request(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_requester_request_op);
 }
 
+static napi_value requester_request_with(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_requester *r = live(env, argv[0], drop_requester);
+    void *meta = NULL;
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_requester_request_op *op = NULL;
+    if (!r || !optional(env, argv[1], drop_transfer_meta, &meta) ||
+        !get_bytes(env, argv[2], &body, &len))
+        return NULL;
+    int rc = weida_requester_request_with(r, meta, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_requester_request_op);
+}
+
 FD(requester_request_op_fd, requester_request_op)
 WAIT1(requester_request_op_wait, requester_request_op, weida_incoming_transfer,
       wrap_incoming_transfer)
@@ -1163,6 +1391,28 @@ static napi_value outgoing_transfer_write(napi_env env, napi_callback_info info)
     return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
 }
 
+TEXT(outgoing_transfer_trace, outgoing_transfer, trace)
+
+static napi_value outgoing_transfer_set_priority(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_outgoing_transfer *t = live(env, argv[0], drop_outgoing_transfer);
+    int32_t priority = 0;
+    if (!t || !get_i32(env, argv[1], &priority))
+        return NULL;
+    int rc = weida_outgoing_transfer_set_priority(t, priority);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+static napi_value outgoing_transfer_expire_after_ms(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_outgoing_transfer *t = live(env, argv[0], drop_outgoing_transfer);
+    uint64_t ms = 0;
+    if (!t || !get_u64(env, argv[1], UINT64_MAX, &ms))
+        return NULL;
+    int rc = weida_outgoing_transfer_expire_after_ms(t, ms);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
 /* consumes the transfer */
 static napi_value outgoing_transfer_finish(napi_env env, napi_callback_info info) {
     ARGS(1);
@@ -1188,6 +1438,54 @@ static napi_value delivery_delivered(napi_env env, napi_callback_info info) {
 FD(delivery_delivered_op_fd, delivery_delivered_op)
 WAIT0(delivery_delivered_op_wait, delivery_delivered_op)
 
+/* `CONSTANTS`: the enumeration constants of weida.h by name (R7), frozen. */
+static napi_value constants(napi_env env) {
+    napi_value obj;
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+#define CONST(c) \
+    if (!set(env, obj, "WEIDA_" #c, js_int64(env, WEIDA_##c))) \
+        return NULL;
+    CONST(CONGESTION_CUBIC)
+    CONST(CONGESTION_NEW_RENO)
+    CONST(CONGESTION_BBR)
+    CONST(DISCOVERY_AWARE)
+    CONST(DISCOVERY_SINGLE)
+    CONST(OUTBOX_FULL_BLOCK)
+    CONST(OUTBOX_FULL_DROP)
+    CONST(OUTBOX_FULL_REJECT)
+    CONST(DELIVERY_LEVEL_BEST_EFFORT)
+    CONST(DELIVERY_LEVEL_AT_MOST_ONCE)
+    CONST(DELIVERY_LEVEL_AT_LEAST_ONCE)
+    CONST(ACKNOWLEDGEMENT_NONE)
+    CONST(ACKNOWLEDGEMENT_TRANSPORT_RECEIPT)
+    CONST(ACKNOWLEDGEMENT_ACCEPTED)
+    CONST(ACKNOWLEDGEMENT_STORED)
+    CONST(ACKNOWLEDGEMENT_REPLICATED)
+    CONST(ACKNOWLEDGEMENT_PROCESSED)
+    CONST(DURABILITY_WRITTEN)
+    CONST(DURABILITY_FLUSHED)
+    CONST(ORDERING_MODE_NONE)
+    CONST(ORDERING_MODE_PER_PRODUCER_DETECT)
+    CONST(ORDERING_MODE_PER_PRODUCER_REASSEMBLE)
+    CONST(ORDERING_MODE_PER_KEY)
+    CONST(ORDERING_MODE_TOTAL)
+    CONST(DEDUPLICATION_NONE)
+    CONST(DEDUPLICATION_BOUNDED)
+    CONST(DEDUPLICATION_DURABLE)
+    CONST(BACKPRESSURE_BLOCK)
+    CONST(BACKPRESSURE_REJECT)
+    CONST(BACKPRESSURE_DROP)
+    CONST(BACKPRESSURE_SPILL)
+    CONST(BACKPRESSURE_COALESCE)
+    CONST(PRODUCER_NAMING_FINGERPRINT)
+    CONST(PRODUCER_NAMING_STABLE)
+#undef CONST
+    if (napi_object_freeze(env, obj) != napi_ok)
+        return throw_napi(env);
+    return obj;
+}
+
 /* ---- the module ---- */
 
 void addon_release(struct addon *a) {
@@ -1207,7 +1505,7 @@ static void finalize_addon(napi_env env, void *data, void *hint) {
 
 NAPI_MODULE_INIT() {
     struct addon *a = calloc(1, sizeof *a);
-    napi_value again_obj;
+    napi_value again_obj, constants_obj;
     if (!a) {
         napi_throw_error(env, NULL, "out of memory");
         return NULL;
@@ -1223,9 +1521,13 @@ NAPI_MODULE_INIT() {
         napi_object_freeze(env, again_obj) != napi_ok ||
         napi_create_reference(env, again_obj, 1, &a->again) != napi_ok)
         return throw_napi(env);
+    constants_obj = constants(env);
+    if (!constants_obj)
+        return NULL;
 
     napi_property_descriptor props[] = {
         {"AGAIN", NULL, NULL, NULL, NULL, again_obj, napi_enumerable, NULL},
+        {"CONSTANTS", NULL, NULL, NULL, NULL, constants_obj, napi_enumerable, NULL},
         FN("version", version),
         FN("strerror", strerror_),
         FN("error", error_),
@@ -1233,9 +1535,70 @@ NAPI_MODULE_INIT() {
         FN("drop", drop_),
         FN("watch", waiter_watch),
         FN("unwatch", waiter_unwatch),
+        FN("newTrace", new_trace),
         FN("runtimeConfigNew", runtime_config_new),
         FN("runtimeConfigSetWorkerThreads", runtime_config_set_worker_threads),
         FN("runtimeConfigSetShutdownTimeoutMs", runtime_config_set_shutdown_timeout_ms),
+        FN("runtimeConfigSetMaxConnections", runtime_config_set_max_connections),
+        FN("runtimeConfigSetMaxConnectionsPerPeer", runtime_config_set_max_connections_per_peer),
+        FN("runtimeConfigSetEndpointQueue", runtime_config_set_endpoint_queue),
+        FN("runtimeConfigSetMaxResolvedAddresses", runtime_config_set_max_resolved_addresses),
+        FN("runtimeConfigSetConnectAttemptTimeoutMs",
+           runtime_config_set_connect_attempt_timeout_ms),
+        FN("runtimeConfigSetSendTimeoutMs", runtime_config_set_send_timeout_ms),
+        FN("runtimeConfigSetOutboxMessages", runtime_config_set_outbox_messages),
+        FN("runtimeConfigSetOutboxBytes", runtime_config_set_outbox_bytes),
+        FN("runtimeConfigSetOutboxFull", runtime_config_set_outbox_full),
+        FN("runtimeConfigSetMaxHandshakes", runtime_config_set_max_handshakes),
+        FN("runtimeConfigSetRetryAboveHandshakes", runtime_config_set_retry_above_handshakes),
+        FN("runtimeConfigSetDiscovery", runtime_config_set_discovery),
+        FN("runtimeConfigSetLimits", runtime_config_set_limits),
+        FN("runtimeConfigSetGuarantees", runtime_config_set_guarantees),
+        FN("runtimeConfigSetReconnect", runtime_config_set_reconnect),
+        FN("limitsNew", limits_new),
+        FN("limitsSetMaxHeaderBytes", limits_set_max_header_bytes),
+        FN("limitsSetMaxConcurrentUniStreams", limits_set_max_concurrent_uni_streams),
+        FN("limitsSetMaxConcurrentBidiStreams", limits_set_max_concurrent_bidi_streams),
+        FN("limitsSetStreamReceiveWindow", limits_set_stream_receive_window),
+        FN("limitsSetConnectionReceiveWindow", limits_set_connection_receive_window),
+        FN("limitsSetKeepAliveMs", limits_set_keep_alive_ms),
+        FN("limitsSetIdleTimeoutMs", limits_set_idle_timeout_ms),
+        FN("limitsSetHelloTimeoutMs", limits_set_hello_timeout_ms),
+        FN("limitsSetMaxSubscriptions", limits_set_max_subscriptions),
+        FN("limitsSetSubscriberBufferBytes", limits_set_subscriber_buffer_bytes),
+        FN("limitsSetMaxSequenceScopes", limits_set_max_sequence_scopes),
+        FN("limitsSetMaxReorderHold", limits_set_max_reorder_hold),
+        FN("limitsSetMaxLocalStreams", limits_set_max_local_streams),
+        FN("limitsSetMaxParkedReverse", limits_set_max_parked_reverse),
+        FN("limitsSetMaxDedupEntries", limits_set_max_dedup_entries),
+        FN("limitsSetDatagramReceiveBytes", limits_set_datagram_receive_bytes),
+        FN("limitsSetDatagramSendBytes", limits_set_datagram_send_bytes),
+        FN("limitsSetPathReport", limits_set_path_report),
+        FN("limitsSetMaxFlows", limits_set_max_flows),
+        FN("limitsSetFlowQueueBytes", limits_set_flow_queue_bytes),
+        FN("limitsSetFlowEarlyBytes", limits_set_flow_early_bytes),
+        FN("limitsSetFlowEarlyHoldMs", limits_set_flow_early_hold_ms),
+        FN("limitsSetCongestion", limits_set_congestion),
+        FN("limitsSetHeaderTimeoutMs", limits_set_header_timeout_ms),
+        FN("limitsSetMaxHeaderStreams", limits_set_max_header_streams),
+        FN("guaranteeSetNew", guarantee_set_new),
+        FN("guaranteeSetSetDelivery", guarantee_set_set_delivery),
+        FN("guaranteeSetSetAcknowledgement", guarantee_set_set_acknowledgement),
+        FN("guaranteeSetSetDurability", guarantee_set_set_durability),
+        FN("guaranteeSetSetReplicas", guarantee_set_set_replicas),
+        FN("guaranteeSetSetOrdering", guarantee_set_set_ordering),
+        FN("guaranteeSetSetDeduplication", guarantee_set_set_deduplication),
+        FN("guaranteeSetSetDedupWindowMs", guarantee_set_set_dedup_window_ms),
+        FN("guaranteeSetSetBackpressure", guarantee_set_set_backpressure),
+        FN("guaranteeSetSetProducerNaming", guarantee_set_set_producer_naming),
+        FN("guaranteeSetSetControlIsolated", guarantee_set_set_control_isolated),
+        FN("reconnectPolicyNew", reconnect_policy_new),
+        FN("reconnectPolicyNever", reconnect_policy_never),
+        FN("reconnectPolicySetInitialMs", reconnect_policy_set_initial_ms),
+        FN("reconnectPolicySetMaxMs", reconnect_policy_set_max_ms),
+        FN("reconnectPolicySetJitter", reconnect_policy_set_jitter),
+        FN("reconnectPolicySetMaxAttempts", reconnect_policy_set_max_attempts),
+        FN("reconnectPolicySetStopOnPeerClosed", reconnect_policy_set_stop_on_peer_closed),
         FN("runtimeOwned", runtime_owned),
         FN("runtimeListener", runtime_listener),
         FN("runtimeRequester", runtime_requester),
@@ -1261,6 +1624,10 @@ NAPI_MODULE_INIT() {
         FN("serverTlsRequireAnyKey", server_tls_require_any_key),
         FN("transferMetaNew", transfer_meta_new),
         FN("transferMetaSetContentType", transfer_meta_set_content_type),
+        FN("transferMetaSetContentLen", transfer_meta_set_content_len),
+        FN("transferMetaSetTopic", transfer_meta_set_topic),
+        FN("transferMetaSetTrace", transfer_meta_set_trace),
+        FN("transferMetaSetAchieved", transfer_meta_set_achieved),
         FN("listenerBindQuic", listener_bind_quic),
         FN("listenerBindQuicOpFd", listener_bind_quic_op_fd),
         FN("listenerBindQuicOpWait", listener_bind_quic_op_wait),
@@ -1280,6 +1647,7 @@ NAPI_MODULE_INIT() {
         FN("requesterConnectOpFd", requester_connect_op_fd),
         FN("requesterConnectOpWait", requester_connect_op_wait),
         FN("requesterRequest", requester_request),
+        FN("requesterRequestWith", requester_request_with),
         FN("requesterRequestOpFd", requester_request_op_fd),
         FN("requesterRequestOpWait", requester_request_op_wait),
         FN("incomingTransferMeta", incoming_transfer_meta),
@@ -1290,6 +1658,9 @@ NAPI_MODULE_INIT() {
         FN("incomingTransferCollectOpWait", incoming_transfer_collect_op_wait),
         FN("outgoingTransferFd", outgoing_transfer_fd),
         FN("outgoingTransferWrite", outgoing_transfer_write),
+        FN("outgoingTransferTrace", outgoing_transfer_trace),
+        FN("outgoingTransferSetPriority", outgoing_transfer_set_priority),
+        FN("outgoingTransferExpireAfterMs", outgoing_transfer_expire_after_ms),
         FN("outgoingTransferFinish", outgoing_transfer_finish),
         FN("deliveryDelivered", delivery_delivered),
         FN("deliveryDeliveredOpFd", delivery_delivered_op_fd),

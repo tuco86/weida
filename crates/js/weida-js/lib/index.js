@@ -27,6 +27,12 @@ export function strerror(code) {
   return native.strerror(code);
 }
 
+/** A fresh root trace context as W3C `traceparent` text, for
+ * `TransferMeta.trace`: weida never starts a trace on its own. */
+export function newTrace() {
+  return native.newTrace();
+}
+
 function bytes(data) {
   if (typeof data === "string") {
     return encoder.encode(data);
@@ -138,16 +144,139 @@ function freezeMeta(meta) {
   return Object.freeze(meta);
 }
 
-/** A transfer meta `{ contentType? }` as a handle for one call. */
+/** The value of the weida.h constant `name`, which must start with
+ * `prefix`: enumerations travel as the constant names. */
+function constant(prefix, name) {
+  const value =
+    typeof name === "string" && name.startsWith(prefix) ? native.CONSTANTS[name] : undefined;
+  if (value === undefined) {
+    const names = Object.keys(native.CONSTANTS).filter((k) => k.startsWith(prefix));
+    throw new TypeError(`expected one of ${names.join(", ")}`);
+  }
+  return value;
+}
+
+/** Throws for an own key of `object` that is not in `known`. */
+function checkKeys(object, known, what) {
+  for (const key of Object.keys(object)) {
+    if (!known.includes(key)) {
+      throw new TypeError(`unknown ${what} field: ${key}`);
+    }
+  }
+}
+
+// Field tables: [jsKey, setter, kind], the kind "value" (passed as is) or
+// the prefix of an enumeration's constants.
+const CONFIG_FIELDS = [
+  ["workerThreads", native.runtimeConfigSetWorkerThreads, "value"],
+  ["shutdownTimeoutMs", native.runtimeConfigSetShutdownTimeoutMs, "value"],
+  ["maxConnections", native.runtimeConfigSetMaxConnections, "value"],
+  ["maxConnectionsPerPeer", native.runtimeConfigSetMaxConnectionsPerPeer, "value"],
+  ["endpointQueue", native.runtimeConfigSetEndpointQueue, "value"],
+  ["maxResolvedAddresses", native.runtimeConfigSetMaxResolvedAddresses, "value"],
+  ["connectAttemptTimeoutMs", native.runtimeConfigSetConnectAttemptTimeoutMs, "value"],
+  ["sendTimeoutMs", native.runtimeConfigSetSendTimeoutMs, "value"],
+  ["outboxMessages", native.runtimeConfigSetOutboxMessages, "value"],
+  ["outboxBytes", native.runtimeConfigSetOutboxBytes, "value"],
+  ["maxHandshakes", native.runtimeConfigSetMaxHandshakes, "value"],
+  ["retryAboveHandshakes", native.runtimeConfigSetRetryAboveHandshakes, "value"],
+  ["outboxFull", native.runtimeConfigSetOutboxFull, "WEIDA_OUTBOX_FULL_"],
+  ["discovery", native.runtimeConfigSetDiscovery, "WEIDA_DISCOVERY_"],
+];
+
+const LIMITS_FIELDS = [
+  ["maxHeaderBytes", native.limitsSetMaxHeaderBytes, "value"],
+  ["maxConcurrentUniStreams", native.limitsSetMaxConcurrentUniStreams, "value"],
+  ["maxConcurrentBidiStreams", native.limitsSetMaxConcurrentBidiStreams, "value"],
+  ["streamReceiveWindow", native.limitsSetStreamReceiveWindow, "value"],
+  ["connectionReceiveWindow", native.limitsSetConnectionReceiveWindow, "value"],
+  ["keepAliveMs", native.limitsSetKeepAliveMs, "value"],
+  ["idleTimeoutMs", native.limitsSetIdleTimeoutMs, "value"],
+  ["helloTimeoutMs", native.limitsSetHelloTimeoutMs, "value"],
+  ["maxSubscriptions", native.limitsSetMaxSubscriptions, "value"],
+  ["subscriberBufferBytes", native.limitsSetSubscriberBufferBytes, "value"],
+  ["maxSequenceScopes", native.limitsSetMaxSequenceScopes, "value"],
+  ["maxReorderHold", native.limitsSetMaxReorderHold, "value"],
+  ["maxLocalStreams", native.limitsSetMaxLocalStreams, "value"],
+  ["maxParkedReverse", native.limitsSetMaxParkedReverse, "value"],
+  ["maxDedupEntries", native.limitsSetMaxDedupEntries, "value"],
+  ["datagramReceiveBytes", native.limitsSetDatagramReceiveBytes, "value"],
+  ["datagramSendBytes", native.limitsSetDatagramSendBytes, "value"],
+  ["pathReport", native.limitsSetPathReport, "value"],
+  ["maxFlows", native.limitsSetMaxFlows, "value"],
+  ["flowQueueBytes", native.limitsSetFlowQueueBytes, "value"],
+  ["flowEarlyBytes", native.limitsSetFlowEarlyBytes, "value"],
+  ["flowEarlyHoldMs", native.limitsSetFlowEarlyHoldMs, "value"],
+  ["congestion", native.limitsSetCongestion, "WEIDA_CONGESTION_"],
+  ["headerTimeoutMs", native.limitsSetHeaderTimeoutMs, "value"],
+  ["maxHeaderStreams", native.limitsSetMaxHeaderStreams, "value"],
+];
+
+const GUARANTEE_FIELDS = [
+  ["delivery", native.guaranteeSetSetDelivery, "WEIDA_DELIVERY_LEVEL_"],
+  ["acknowledgement", native.guaranteeSetSetAcknowledgement, "WEIDA_ACKNOWLEDGEMENT_"],
+  ["durability", native.guaranteeSetSetDurability, "WEIDA_DURABILITY_"],
+  ["replicas", native.guaranteeSetSetReplicas, "value"],
+  ["ordering", native.guaranteeSetSetOrdering, "WEIDA_ORDERING_MODE_"],
+  ["deduplication", native.guaranteeSetSetDeduplication, "WEIDA_DEDUPLICATION_"],
+  ["dedupWindowMs", native.guaranteeSetSetDedupWindowMs, "value"],
+  ["backpressure", native.guaranteeSetSetBackpressure, "WEIDA_BACKPRESSURE_"],
+  ["producerNaming", native.guaranteeSetSetProducerNaming, "WEIDA_PRODUCER_NAMING_"],
+  ["controlIsolated", native.guaranteeSetSetControlIsolated, "value"],
+];
+
+const RECONNECT_FIELDS = [
+  ["initialMs", native.reconnectPolicySetInitialMs, "value"],
+  ["maxMs", native.reconnectPolicySetMaxMs, "value"],
+  ["jitter", native.reconnectPolicySetJitter, "value"],
+  ["maxAttempts", native.reconnectPolicySetMaxAttempts, "value"],
+  ["stopOnPeerClosed", native.reconnectPolicySetStopOnPeerClosed, "value"],
+];
+
+const NESTED = ["limits", "guarantees", "reconnect"];
+const CONFIG_KEYS = [...CONFIG_FIELDS.map(([key]) => key), ...NESTED];
+
+/** Checks `object`'s keys against `fields` (and `extra`), then calls the
+ * setter of each field that is neither null nor undefined. */
+function applyFields(handle, object, fields, what, extra = []) {
+  checkKeys(object, [...fields.map(([key]) => key), ...extra], what);
+  for (const [key, setter, kind] of fields) {
+    const value = object[key];
+    if (value != null) {
+      setter(handle, kind === "value" ? value : constant(kind, value));
+    }
+  }
+}
+
+/** Builds a nested configuration handle from `object`, hands it to `use`
+ * (the parent's setter, which copies it) and drops it. */
+function nested(object, make, fields, what, use, extra) {
+  const handle = make();
+  try {
+    applyFields(handle, object, fields, what, extra);
+    use(handle);
+  } finally {
+    native.drop(handle);
+  }
+}
+
+const META_FIELDS = [
+  ["contentType", native.transferMetaSetContentType, "value"],
+  ["contentLen", native.transferMetaSetContentLen, "value"],
+  ["trace", native.transferMetaSetTrace, "value"],
+  ["topic", native.transferMetaSetTopic, "value"],
+  ["achieved", native.transferMetaSetAchieved, "WEIDA_ACKNOWLEDGEMENT_"],
+];
+
+/** A transfer meta `{ contentType?, contentLen?, trace?, topic?,
+ * achieved? }` as a handle for one call. */
 function withTransferMeta(meta, use) {
   if (meta == null) {
     return use(null);
   }
   const handle = native.transferMetaNew();
   try {
-    if (meta.contentType != null) {
-      native.transferMetaSetContentType(handle, meta.contentType);
-    }
+    applyFields(handle, meta, META_FIELDS, "TransferMeta");
     return use(handle);
   } finally {
     native.drop(handle);
@@ -156,9 +285,13 @@ function withTransferMeta(meta, use) {
 
 /** `RuntimeConfig`: the fields set here, weida's defaults for the rest. */
 export class RuntimeConfig {
-  constructor({ workerThreads, shutdownTimeoutMs } = {}) {
-    this.workerThreads = workerThreads;
-    this.shutdownTimeoutMs = shutdownTimeoutMs;
+  constructor(fields = {}) {
+    checkKeys(fields, CONFIG_KEYS, "RuntimeConfig");
+    for (const key of CONFIG_KEYS) {
+      if (fields[key] !== undefined) {
+        this[key] = fields[key];
+      }
+    }
   }
 }
 
@@ -168,11 +301,28 @@ function configHandle(config) {
   }
   const handle = native.runtimeConfigNew();
   try {
-    if (config.workerThreads != null) {
-      native.runtimeConfigSetWorkerThreads(handle, config.workerThreads);
+    applyFields(handle, config, CONFIG_FIELDS, "RuntimeConfig", NESTED);
+    if (config.limits != null) {
+      nested(config.limits, native.limitsNew, LIMITS_FIELDS, "limits", (h) =>
+        native.runtimeConfigSetLimits(handle, h),
+      );
     }
-    if (config.shutdownTimeoutMs != null) {
-      native.runtimeConfigSetShutdownTimeoutMs(handle, config.shutdownTimeoutMs);
+    if (config.guarantees != null) {
+      nested(config.guarantees, native.guaranteeSetNew, GUARANTEE_FIELDS, "guarantees", (h) =>
+        native.runtimeConfigSetGuarantees(handle, h),
+      );
+    }
+    if (config.reconnect != null) {
+      const make =
+        config.reconnect.never === true ? native.reconnectPolicyNever : native.reconnectPolicyNew;
+      nested(
+        config.reconnect,
+        make,
+        RECONNECT_FIELDS,
+        "reconnect",
+        (h) => native.runtimeConfigSetReconnect(handle, h),
+        ["never"],
+      );
     }
   } catch (error) {
     native.drop(handle);
@@ -452,6 +602,20 @@ export class Requester extends Handle {
     );
     return adopt(IncomingTransfer, transfer);
   }
+
+  /** `request` with metadata (`{ contentType?, contentLen?, trace?, topic?,
+   * achieved? }`, or null), copied when the request starts. */
+  async requestWith(meta, body, { signal } = {}) {
+    const data = bytes(body);
+    const transfer = await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.requesterRequestWith(this[HANDLE], m, data)),
+      native.requesterRequestOpWait,
+      native.requesterRequestOpFd,
+      signal,
+    );
+    return adopt(IncomingTransfer, transfer);
+  }
 }
 
 /** The replying half of Req/Rep, serving one endpoint path. */
@@ -494,8 +658,8 @@ export class IncomingRequest extends Handle {
     return adopt(IncomingTransfer, native.incomingRequestTakeBody(this[HANDLE]));
   }
 
-  /** Opens the reply stream with `meta` (`{ contentType? }`). Consumes the
-   * request. */
+  /** Opens the reply stream with `meta` (a `TransferMeta` object, or null).
+   * Consumes the request. */
   async reply(meta, { signal } = {}) {
     const transfer = await op(
       this,
@@ -569,6 +733,25 @@ export class OutgoingTransfer extends Handle {
     while (rest.length > 0) {
       rest = rest.subarray(await this.write(rest, options));
     }
+  }
+
+  /** The trace context propagated with this transfer, as `traceparent`
+   * text, or null; a reply inherits its request's. */
+  trace() {
+    return native.outgoingTransferTrace(this[HANDLE]);
+  }
+
+  /** Orders this transfer against the other streams of its connection:
+   * higher is sent first, the default is 0. A no-op on local transports. */
+  setPriority(priority) {
+    native.outgoingTransferSetPriority(this[HANDLE], priority);
+  }
+
+  /** Resets the transfer with WEIDA_ECANCELED for the reader unless its
+   * bytes are all acknowledged within `ms`; a write or finish past it
+   * throws WEIDA_EEXPIRED. */
+  expireAfterMs(ms) {
+    native.outgoingTransferExpireAfterMs(this[HANDLE], ms);
   }
 
   /** Ends the payload and returns its delivery receipt. Consumes the

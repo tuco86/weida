@@ -103,6 +103,12 @@ atom round-trips through strerror", "identity_from refuses what it cannot honour
 Every pattern, stream, cursor and statistic the C ABI does not map yet is absent here exactly as
 it is absent from the C ABI ([weida-c.md](weida-c.md) §5 to §7), and arrives when the ABI maps it.
 
+The C ABI's *config* area is absent here: every row of [weida-c.md](weida-c.md) marked
+(*config*), that is the rest of `RuntimeConfig`, `Limits`, `GuaranteeSet`, `ReconnectPolicy`,
+the `TransferMeta` setters beyond the content type, `Requester::request_with`, the trace and
+achieved getters and `OutgoingTransfer::trace`, `set_priority` and `expire_at`. This package
+keeps its two configuration fields and the content type.
+
 ## 7. Sources
 
 `crates/beam/weida/c_src/` (`weida_nif.c`, `build.sh`), `src/` (`weida.erl`, `weida_nif.erl`,

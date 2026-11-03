@@ -34,12 +34,15 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::shutdown` | `weida_runtime_shutdown` (op) | present; `abi::a_shutdown_finishes_with_an_exchange_abandoned` |
 | `Runtime::drain` | — | absent: *drain* |
 | `Runtime::peer`, `pusher`, `subscriber`, `dish`, `pair`, `surveyor`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
-| `Runtime::config`, `exec`, `suppressed_duplicates`, `expired_transfers` | — | absent: *config*, *stats*; `exec` refused, it is the binding's own seam |
+| `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
+| `Runtime::suppressed_duplicates`, `expired_transfers` | — | absent: *stats* |
+| `Runtime::exec` | — | refused: it is the binding's own seam |
 | `Drop for Runtime` | `weida_runtime_drop` | present; R13, the reactor ends with its last user |
 | `Listener::bind_quic` | `weida_listener_bind_quic` (op) | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Listener::bind_inproc` | `weida_listener_bind_inproc` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Listener::replier` | `weida_listener_replier` | present; every `abi::` test |
 | `Listener::bind_quic_socket`, `bind_unix`, `bind_pipe` | — | absent: *binding lifecycle*, *local transports* |
+| `Listener::bind_relay`, `Listener::relay`, `Relay`, `RelayRequest`, `Binding::relay_events` | — | absent: *binding lifecycle*. Dialling a `weida+relay://` URL already works, because the ABI passes URL text |
 | `Listener::puller`, `publisher`, `radio`, `acceptor`, `pair`, `respondent`, `seeder`, `bus` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Binding::local_addr` | `weida_binding_local_addr` | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Binding::close`, `hand_over`, `take_over`, `disconnect` | — | absent: *binding lifecycle* |
@@ -52,7 +55,7 @@ unit tests in `crates/weida-c/src/`.
 | --- | --- | --- |
 | `Requester::connect` | `weida_requester_connect` (op) | present; `abi::a_streamed_round_trip_over_inproc`, `smoke.c` |
 | `Requester::request` | `weida_requester_request` (op), the reply handed over at its header | present; `abi::a_streamed_round_trip_over_inproc` |
-| `Requester::request_with` | — | absent: *streams* |
+| `Requester::request_with` | `weida_requester_request_with` (op) | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
 | `Requester::open`, `ReplyStream` | — | absent: *streams* |
 | `Requester::connection_stats`, `events` | — | absent: *stats* |
 | `Replier::accept` | `weida_replier_accept` (try, R3a) | present; `abi::an_accept_with_nothing_pending_answers_eagain`, `abi::a_repliers_descriptor_follows_its_queue`, `abi::a_signal_ends_a_blocked_accept_with_eintr`, `abi::dropping_a_replier_ends_a_blocked_accept_with_eclosed` |
@@ -79,7 +82,8 @@ unit tests in `crates/weida-c/src/`.
 | `OutgoingTransfer::write_all` | — | refused: R3c |
 | `OutgoingTransfer::finish` | `weida_outgoing_transfer_finish` (consumes) | present; `abi::a_streamed_round_trip_over_inproc` |
 | `OutgoingTransfer::cancel` | `weida_outgoing_transfer_drop` (an unfinished transfer is reset `CANCELED`) | present; `abi::a_reply_dropped_unfinished_reads_as_canceled` |
-| `OutgoingTransfer::trace`, `cursors`, `set_priority`, `expire_at` | — | absent: *cursors*, *config* |
+| `OutgoingTransfer::trace`, `set_priority`, `expire_at` | `weida_outgoing_transfer_trace`, `_set_priority`, `_expire_after_ms` | present; `abi::metadata_travels_with_a_request_and_its_reply`, `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (*config*) |
+| `OutgoingTransfer::cursors` | — | absent: *cursors* |
 | `Delivery::delivered` | `weida_delivery_delivered` (op, consumes) | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Drop for Delivery` | `weida_delivery_drop` | present |
 | `ConnectionId` | — | absent: *stats* |
@@ -89,7 +93,16 @@ unit tests in `crates/weida-c/src/`.
 | `crates/weida` | C ABI | Verdict |
 | --- | --- | --- |
 | `RuntimeConfig::worker_threads`, `shutdown_timeout` | `weida_runtime_config_set_worker_threads`, `_set_shutdown_timeout_ms` | present; `test_errors.py` (Python) for `worker_threads = 0` |
-| every other `RuntimeConfig` field, `Limits`, `Discovery`, `Network`, `ReconnectPolicy`, `OutboxFull`, `GuaranteeSet` and its dimensions | — | absent: *config* |
+| every other `RuntimeConfig` field (`limits`, `max_connections`, `max_connections_per_peer`, `endpoint_queue`, `max_resolved_addresses`, `guarantees`, `discovery`, `connect_attempt_timeout`, `reconnect`, `send_timeout`, `outbox_messages`, `outbox_bytes`, `outbox_full`, `max_handshakes`, `retry_above_handshakes`) | `weida_runtime_config_set_*` | present; `runtime::tests::every_setter_lands_on_its_field`, `abi::a_send_timeout_ends_a_request_to_a_peer_that_is_gone` for `send_timeout` (*config*) |
+| `RuntimeConfig::resolver` | — | absent: *resolver* |
+| `RuntimeConfig::network`, `Network` | — | refused: a `SimNet` exists only under `test-util` |
+| `Limits`, `Congestion`, `DEFAULT_DATAGRAM_RECEIVE_BYTES` | `weida_limits` and its setters, `WEIDA_CONGESTION_*`, `WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES` | present; `runtime::tests::every_setter_lands_on_its_field`, `abi::limits_reach_the_quic_transport` (*config*) |
+| `Limits::header_slots`, `worst_case_header_memory` | — | refused: computations over the caller's own values |
+| `Discovery`, `OutboxFull` | `WEIDA_DISCOVERY_*`, `WEIDA_OUTBOX_FULL_*` | present; `runtime::tests::every_setter_lands_on_its_field` (*config*) |
+| `ReconnectPolicy` (fields and `never`) | `weida_reconnect_policy` and its setters, `weida_reconnect_policy_never` | present; `runtime::tests::every_setter_lands_on_its_field` (*config*) |
+| `ReconnectPolicy::redials`, `delay` | — | refused: computations over the caller's own values |
+| `GuaranteeSet` and its dimensions (`DeliveryLevel`, `Acknowledgement`, `Durability`, `OrderingMode`, `Deduplication`, `Backpressure`, `ProducerNaming`) | `weida_guarantee_set` and its setters, the `WEIDA_<DIMENSION>_*` constants | present; `runtime::tests::every_setter_lands_on_its_field`, `abi::a_guarantee_the_dialler_does_not_offer_fails_negotiation` (*config*) |
+| `GuaranteeSet::is_core`, `intersect`, `reaches` | — | refused: the runtime negotiates, and the ABI hands a caller no set to compare |
 | `Trust::by_address` | `weida_trust_new` | present; `smoke.c` |
 | `Trust::and_pin` | `weida_trust_add_pin` | present; `abi::a_malformed_pin_is_an_invalid_fingerprint`, `abi::a_server_outside_the_pins_is_untrusted` |
 | `Trust::and_anchor`, `and_anchor_file` | `weida_trust_add_anchor`, `_add_anchor_file` | present; `abi::a_trust_anchor_checks_the_name_the_dial_used` (*identity*) |
@@ -107,16 +120,19 @@ unit tests in `crates/weida-c/src/`.
 | `ServerTls::with_alpn` | — | absent: *identity* |
 | `IdentitySource`, `TrustSource`, their weak forms, `FilesOptions`, `IdentityEvent(s)` | — | absent: *identity* (events as queues, 0045 decision 10) |
 | `TransferMeta::with_content_type` | `weida_transfer_meta_set_content_type` | present; `abi::a_streamed_round_trip_over_inproc` |
-| `TransferMeta::with_content_len`, `with_trace`, `with_topic`, `with_achieved`, `with_report`, `with_report_mode` | — | absent: *config* |
+| `TransferMeta::with_content_len`, `with_trace`, `with_topic`, `with_achieved` | `weida_transfer_meta_set_content_len`, `_set_trace`, `_set_topic`, `_set_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
+| `TransferMeta::with_report`, `with_report_mode` | — | absent: *cursors* |
 | `IncomingMeta::endpoint`, `content_type`, `topic`, `content_len`, `sequence` | `weida_incoming_meta_*` | present; `endpoint` and `content_type` by `abi::a_streamed_round_trip_over_inproc` |
 | `IncomingMeta::peer` (a key) | `weida_incoming_meta_peer_fingerprint` | present for `PeerIdentity::Key`; a local principal is absent: *local transports* |
 | `IncomingMeta::peer_chain`, `PeerChain` | `weida_incoming_meta_peer_chain_len`, `_peer_chain_cert` (DER, leaf first) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
-| `IncomingMeta::trace`, `tracestate`, `gap`, `achieved`, `report`, `report_mode`, `report_id`, `segment`, `layer` | — | absent: *config*, *cursors*, *patterns* |
+| `IncomingMeta::trace`, `tracestate`, `achieved` | `weida_incoming_meta_trace`, `_tracestate`, `_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
+| `IncomingMeta::gap`, `segment`, `layer` | — | absent: *patterns* |
+| `IncomingMeta::report`, `report_mode`, `report_id` | — | absent: *cursors* |
 | `Fingerprint` | `sha256:` text everywhere | present |
 | `Error`, `LossCause` | the R9 constants and the thread-local record | present; `error::tests::every_variant_has_its_own_code_below_the_abi_codes`, `abi::a_server_outside_the_pins_is_untrusted` (`weida_last_error_fingerprint`) |
 | `ErrorCode`, `StopReason`, `codes` | — | refused: wire vocabulary, reached through the R9 outcome codes |
 | `Address`, `EndpointAddr`, `InprocAddr`, `UnixAddr`, `PipeAddr`, `DEFAULT_PORT` | URLs as strings | refused: the C caller passes the text, weida parses it |
-| `new_trace`, `TraceContext` | — | absent: *config* |
+| `new_trace`, `TraceContext` | `weida_new_trace`; a trace context is its `traceparent` text (R7) | present; `tls::tests::new_trace_writes_a_traceparent_that_sets_back` (*config*) |
 | `Resolver`, `SharedResolver`, `SystemResolver`, `Resolved` | — | absent: *resolver* (a queue, decision 10) |
 | `SimNet`, `SimStats` | — | refused: a test double of the Rust test suite (`test-util`) |
 | `Result`, `Pattern`, `Endpoint` and the pattern markers | — | refused: Rust type machinery; the ABI has one handle type per role (decision 3) |
@@ -148,7 +164,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the fourteen `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the nineteen `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -159,6 +175,11 @@ way a foreign caller calls it:
 - A collect's `max_bytes` is `uint64_t`; above `usize::MAX` it is `usize::MAX`.
 - A readiness descriptor costs a socket pair per handle, created on first use (R11).
 - On Windows a blocking wait cannot be interrupted (R4); callers bound their waits.
+- `expire_at` takes milliseconds from the call (`weida_outgoing_transfer_expire_after_ms`),
+  because C has no `Instant`.
+- `endpoint_queue` 0 is `-WEIDA_EINVAL` at the setter, where Rust panics at the first queue.
+- An optional value in is negative for `None` (R7).
+- A count in above `usize::MAX` becomes `usize::MAX` (R7).
 
 ## 10. The definition of done
 
@@ -172,7 +193,7 @@ is complete when no present row lacks a test.
 ## 11. Sources
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
-`runtime.rs`, `tls.rs`, `listener.rs`, `transfer.rs`, `requester.rs`, `poll.rs`),
+`config.rs`, `runtime.rs`, `tls.rs`, `listener.rs`, `transfer.rs`, `requester.rs`, `poll.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

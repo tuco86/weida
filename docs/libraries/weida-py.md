@@ -93,6 +93,12 @@ surface and connection statistics. Each of those is absent here exactly as it is
 the C ABI ([weida-c.md](weida-c.md) §5 to §7), and returns when the ABI maps it. The new
 package is not compatible with the old module's API (0045 decision 6).
 
+The C ABI's *config* area is absent here: every row of [weida-c.md](weida-c.md) marked
+(*config*), that is the rest of `RuntimeConfig`, `Limits`, `GuaranteeSet`, `ReconnectPolicy`,
+the `TransferMeta` setters beyond the content type, `Requester::request_with`, the trace and
+achieved getters and `OutgoingTransfer::trace`, `set_priority` and `expire_at`. This package
+keeps its two configuration fields and the content type.
+
 ## 7. Sources
 
 `crates/py/weida-py/src/weida/` (`__init__.py`, `_native.py`, `_errors.py`, `_wait.py`,

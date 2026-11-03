@@ -121,6 +121,12 @@ Every pattern, stream, cursor and statistic the C ABI does not map yet is absent
 as it is absent from the C ABI ([weida-c.md](weida-c.md) §5 to §7), and arrives when the ABI
 maps it.
 
+The C ABI's *config* area is absent here: every row of [weida-c.md](weida-c.md) marked
+(*config*), that is the rest of `RuntimeConfig`, `Limits`, `GuaranteeSet`, `ReconnectPolicy`,
+the `TransferMeta` setters beyond the content type, `Requester::request_with`, the trace and
+achieved getters and `OutgoingTransfer::trace`, `set_priority` and `expire_at`. This package
+keeps its two configuration fields and the content type.
+
 ## 8. Sources
 
 `crates/jvm/weida-jvm/src/main/c/weida_jni.c`, `src/main/java/net/doodleshnookie/weida/`
