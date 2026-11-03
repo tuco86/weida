@@ -13,6 +13,10 @@ later stages. The pages beside this one document each function of the current sl
 and [errors.md](errors.md). What is not yet mapped is listed in
 [libraries/weida-c.md](../libraries/weida-c.md).
 
+The easy tier, `crates/weida-c/include/weida_easy.h`, is not part of the ABI: it is C source
+over it, header-only helpers that run a Req/Rep step as one blocking call with one deadline.
+[easy.md](easy.md) documents it.
+
 ## R1. Names
 
 - A Rust type `T` becomes the opaque C type `weida_<snake(T)>`, its method `T::m` the function
