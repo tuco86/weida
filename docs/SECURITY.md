@@ -8,13 +8,20 @@ handled, and how an agent reviews the code.
 |Check|Runs|Catches|
 |---|---|---|
 |`audit` (`cargo deny --locked check advisories sources`, `deny.toml`)|nightly, release (gates `publish`)|known advisories and yanked crates in `Cargo.lock`, non-crates.io sources|
-|`fuzz` (all `cargo fuzz` targets, 60 s each)|the scheduled nightly (a nightly queued with `ci_run` skips it)|panics, overflows, OOM and timeouts in the codecs|
+|`fuzz` (all `cargo fuzz` targets, 60 s each, from the corpus of earlier rounds)|the scheduled nightly (a nightly queued with `ci_run` skips it)|panics, overflows, OOM and timeouts in the codecs|
 |`tests/fuzz_smoke.rs`, `hostile.rs`|every push|regressions of past findings|
 |agent review (section 4)|on demand|logic flaws in weida's own code|
 
 `audit` covers the root `Cargo.lock` only. The fuzz workspaces
 (`crates/**/fuzz`) add nothing but `libfuzzer-sys` and `arbitrary`, and
 nothing from them ships.
+
+The `fuzz` round keeps its corpus in the job state store `fuzz-corpus`,
+one directory per target named `<crate path below crates/>/<target>`
+(`protocol/credit`): each scheduled round starts from the previous one's
+corpus, adds what it finds and merges it down to the inputs that add
+coverage, so the corpus grows from round to round. `ci_state` lists the
+versions the CI keeps (the 3 newest).
 
 ## 2. An advisory
 
@@ -36,7 +43,12 @@ nothing from them ships.
 2. Decode it into `<crate>/fuzz/artifacts/<target>/<name>` with `base64 -d`.
 3. Reproduce from `<crate>`:
    `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<name>`.
-4. Add the input as a deterministic case to that crate's
+4. To fuzz further from the nightly's corpus, download it with
+   `ci_state_get` `{name: "fuzz-corpus", dir: "<empty dir>"}` and run from
+   `<crate>`: `cargo +nightly fuzz run <target> <dir>/<crate path below crates/>/<target>`
+   (for `crates/nats/weida-nats-codec`, `<dir>/nats/weida-nats-codec/op_stream`).
+   New inputs land in the downloaded copy only.
+5. Add the input as a deterministic case to that crate's
    `tests/fuzz_smoke.rs`, then fix. When the panic is the target's own
    assertion and the code under test behaves as specified, the oracle is
    wrong: fix the target instead.
