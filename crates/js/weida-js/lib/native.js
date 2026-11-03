@@ -10,7 +10,7 @@ const target = `${process.platform}-${process.arch}`;
 const path = fileURLToPath(new URL(`../prebuilds/${target}/weida.node`, import.meta.url));
 if (!existsSync(path)) {
   throw new Error(
-    `weida: no addon for ${target}: ${path} does not exist; the package carries linux-x64, linux-arm64 and darwin-arm64, and build.sh builds one from source`,
+    `weida: no addon for ${target}: ${path} does not exist; the package carries linux-x64, linux-arm64, darwin-arm64 and win32-x64, and build.sh (build.ps1 on Windows) builds one from source`,
   );
 }
 const native = createRequire(import.meta.url)(path);

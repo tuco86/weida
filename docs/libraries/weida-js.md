@@ -15,7 +15,8 @@ The tests are `crates/js/weida-js/test/unit/` (in-process transport only, one se
 `test/integration/` (QUIC on localhost, ten seconds each), run with `node --test`; `smoke.mjs`
 makes one round trip under each runtime, and `package.sh` runs it from a fresh project that
 installed the packed tarball. Measured on Node 26, Bun 1.4.4 and Deno 2.9.8 on linux-amd64,
-linux-arm64 and darwin-arm64 (the `js-linux-*` jobs and `js-darwin-arm64`).
+linux-arm64, darwin-arm64 and windows-amd64 (the `js-linux-*` jobs, `js-darwin-arm64` and
+`js-windows-amd64`).
 
 ## 2. Classes
 
@@ -67,24 +68,24 @@ wrong pin rejects with WEIDA_EUNTRUSTED carrying the fingerprint".
 | Behaviour | Verdict |
 | --- | --- |
 | The JS thread never blocks: every native call passes `timeout_ms = 0`, and a try or op wait that would block returns `AGAIN` to the JavaScript layer | present by construction (`src/addon.c`) |
-| One waiter thread per runtime environment runs `weida_poll` over the descriptors of every pending wait plus a wake pipe, and reports each readable one, once, to the JS thread through one `napi_threadsafe_function`; the call is then tried again | present; every unit test past its first `AGAIN` |
+| One waiter thread per runtime environment runs `weida_poll` over the descriptors of every pending wait plus a wake pipe (on Windows a loopback UDP socket connected to itself, since `WSAPoll` takes only sockets), and reports each readable one, once, to the JS thread through one `napi_threadsafe_function`; the call is then tried again | present; every unit test past its first `AGAIN` |
 | Two waits on one handle (two `accept`s on a replier) both watch its descriptor and are both retried; the one that finds nothing watches again | present; `inproc.test.js` "two concurrent accepts on one replier serve two requests" |
 | An idle process exits: the threadsafe function is referenced only while a wait is pending | present; `smoke.mjs` exits on its own under all three runtimes |
 | Every waiting method takes `{ signal }`; aborting rejects with `signal.reason` and cancels the operation (its op is dropped). `AbortSignal.timeout(ms)` is the timeout | present; `inproc.test.js` "an aborted request rejects with the reason and the runtime still shuts down" |
-| The waiter thread blocks every signal, so a process-directed signal reaches the JS thread, whose runtime handles it | present by construction (`src/waiter.c`) |
+| The waiter thread blocks every signal, so a process-directed signal reaches the JS thread, whose runtime handles it | present by construction (`src/waiter.c`); on Windows there are none to block |
 | Worker threads: each `napi_env` has its own instance data and waiter | present by construction; not run |
 
 ## 5. Packaging
 
 | Row | Verdict |
 | --- | --- |
-| One package `@tuco86/weida` for every platform: `lib/`, and per platform `prebuilds/<platform>-<arch>/weida.node` with `libweida` beside it, found through the addon's rpath (`$ORIGIN`, `@loader_path`; libweida.dylib's install name is `@rpath/libweida.dylib`); `lib/native.js` loads the one of `process.platform`-`process.arch` and names the missing path otherwise | present; `package.sh` |
+| One package `@tuco86/weida` for every platform: `lib/`, and per platform `prebuilds/<platform>-<arch>/weida.node` with `libweida` beside it, found through the addon's rpath (`$ORIGIN`, `@loader_path`; libweida.dylib's install name is `@rpath/libweida.dylib`); `lib/native.js` loads the one of `process.platform`-`process.arch` and names the missing path otherwise; on Windows `weida.dll` sits beside the addon, which links it and `node.lib` delay-loaded: `src/win32.c` binds `node.exe` to the running executable and loads `weida.dll` from the addon's directory | present; `package.sh` |
 | The packed version is the workspace version (`0.1.0-alpha.11-dev` stays as it is, already semver); the committed `package.json` says `0.0.0-dev` | present; `package.sh` checks the installed version |
-| The tarball installs offline into a fresh project and runs with no Rust toolchain on `PATH` | present; `package.sh` runs `smoke.mjs` with `PATH` reduced to node, bun, deno and `/usr/bin:/bin` |
-| Node 20 and up (`engines`), Bun and Deno load the same addon through `createRequire` | present; Node 26, Bun 1.4.4, Deno 2.9.8 run (`js-linux-amd64`, `js-linux-arm64`, `js-darwin-arm64`) |
+| The tarball installs offline into a fresh project and runs with no Rust toolchain on `PATH` | present; `package.sh` (`package.ps1` on Windows) runs `smoke.mjs` with `PATH` reduced to node, bun, deno and `/usr/bin:/bin` (`%SystemRoot%\System32` and `%SystemRoot%` on Windows) |
+| Node 20 and up (`engines`), Bun and Deno load the same addon through `createRequire` | present; Node 26, Bun 1.4.4, Deno 2.9.8 run (`js-linux-amd64`, `js-linux-arm64`, `js-darwin-arm64`, `js-windows-amd64`) |
 | macOS | present on arm64; `js-darwin-arm64` runs the same tests and smoke with runtimes `js_env` downloads |
-| Windows | absent: no Windows JavaScript job, and the waiter's wake pipe is POSIX |
-| npm registry | present: a `v*` tag publishes `@tuco86/weida` with the linux-x64, linux-arm64 and darwin-arm64 prebuilds to `https://git.doodleshnookie.net/api/packages/tuco86/npm/` under the dist-tag `latest`; `publish-npm` |
+| Windows | present on x64: `js-windows-amd64` builds the addon with MSVC (`build.ps1`) on wohnzimmer and runs the same tests and smoke with runtimes it downloads; the addon and `weida.dll` link the C runtime statically |
+| npm registry | present: a `v*` tag publishes `@tuco86/weida` with the linux-x64, linux-arm64, darwin-arm64 and win32-x64 prebuilds to `https://git.doodleshnookie.net/api/packages/tuco86/npm/` under the dist-tag `latest`; `publish-npm` |
 
 ## 6. What is not mapped
 
@@ -94,10 +95,11 @@ maps it.
 
 ## 7. Sources
 
-`crates/js/weida-js/src/` (`addon.c`, `waiter.c`, `addon.h`), `lib/` (`index.js`,
-`index.d.ts`, `native.js`, `errors.js`, `wait.js`), `build.sh`, `develop.sh`, `package.sh`,
-`smoke.mjs`, `test/`; `.zeughaus-ci/js-linux-amd64.sh`, `.zeughaus-ci/js-linux-arm64.sh`,
-`.zeughaus-ci/js-darwin-arm64.sh`, `.zeughaus-ci/publish-npm.sh`, `js_env` and `js_check` in
+`crates/js/weida-js/src/` (`addon.c`, `waiter.c`, `win32.c`, `addon.h`), `lib/` (`index.js`,
+`index.d.ts`, `native.js`, `errors.js`, `wait.js`), `build.sh`, `build.ps1`, `develop.sh`,
+`package.sh`, `package.ps1`, `smoke.mjs`, `test/`; `.zeughaus-ci/js-linux-amd64.sh`,
+`.zeughaus-ci/js-linux-arm64.sh`, `.zeughaus-ci/js-darwin-arm64.sh`,
+`.zeughaus-ci/js-windows-amd64.ps1`, `.zeughaus-ci/publish-npm.sh`, `js_env` and `js_check` in
 `.zeughaus-ci/build.sh`;
 [weida-c.md](weida-c.md); [docs/c/](../c/README.md);
 [decisions/0046](../decisions/0046-how-each-language-binds-libweida.md).

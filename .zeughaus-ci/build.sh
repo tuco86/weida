@@ -158,7 +158,8 @@ smoke_libweida() {
 
 # Node, Bun and Deno for a host job, at the js image's versions: the image
 # node:26-trixie ran Node 26.13.0 in pipeline #214, and js.Containerfile pins
-# Bun 1.4.4 and Deno 2.9.8. These versions must follow js.Containerfile.
+# Bun 1.4.4 and Deno 2.9.8. These versions must follow js.Containerfile, and
+# so must js-windows-amd64.ps1's.
 # Each tool is downloaded once into the warm workspace, through a temporary
 # directory, so an interrupted download never leaves a half directory at
 # the final path.

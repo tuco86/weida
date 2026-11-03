@@ -636,7 +636,7 @@ WRAP_AS(outgoing_transfer)
     }
 
 /* `<t>_<x>(h) -> string | null` (R7 strings out) */
-#define TEXT(js, t, x) \
+#define STRING_OUT(js, t, x) \
     static napi_value js(napi_env env, napi_callback_info info) { \
         ARGS(1); \
         const weida_##t *p = live(env, argv[0], drop_##t); \
@@ -666,6 +666,18 @@ WRAP_AS(outgoing_transfer)
         if (!h || !get_u64(env, argv[1], max, &v)) \
             return NULL; \
         int rc = weida_##t##_set_##x(h, v); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `<t>_set_<x>(h, n)`: an integer up to UINT32_MAX for a `uint32_t` setter. */
+#define SET_U32(js, t, x) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        uint64_t v = 0; \
+        if (!h || !get_u64(env, argv[1], UINT32_MAX, &v)) \
+            return NULL; \
+        int rc = weida_##t##_set_##x(h, (uint32_t)v); \
         return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
     }
 
@@ -819,8 +831,8 @@ SET_HANDLE(runtime_config_set_reconnect, runtime_config, reconnect, reconnect_po
 
 NEW0(limits_new, limits)
 SET_U64(limits_set_max_header_bytes, limits, max_header_bytes, UINT64_MAX)
-SET_U64(limits_set_max_concurrent_uni_streams, limits, max_concurrent_uni_streams, UINT32_MAX)
-SET_U64(limits_set_max_concurrent_bidi_streams, limits, max_concurrent_bidi_streams, UINT32_MAX)
+SET_U32(limits_set_max_concurrent_uni_streams, limits, max_concurrent_uni_streams)
+SET_U32(limits_set_max_concurrent_bidi_streams, limits, max_concurrent_bidi_streams)
 SET_U64(limits_set_stream_receive_window, limits, stream_receive_window, UINT64_MAX)
 SET_U64(limits_set_connection_receive_window, limits, connection_receive_window, UINT64_MAX)
 SET_U64(limits_set_keep_alive_ms, limits, keep_alive_ms, UINT64_MAX)
@@ -1215,12 +1227,12 @@ static napi_value listener_replier(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_replier);
 }
 
-TEXT(binding_local_addr, binding, local_addr)
-TEXT(local_binding_bus, local_binding, bus)
+STRING_OUT(binding_local_addr, binding, local_addr)
+STRING_OUT(local_binding_bus, local_binding, bus)
 
 /* replier and incoming request */
 
-TEXT(replier_path, replier, path)
+STRING_OUT(replier_path, replier, path)
 FD(replier_fd, replier)
 
 static napi_value replier_accept(napi_env env, napi_callback_info info) {
@@ -1391,7 +1403,7 @@ static napi_value outgoing_transfer_write(napi_env env, napi_callback_info info)
     return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
 }
 
-TEXT(outgoing_transfer_trace, outgoing_transfer, trace)
+STRING_OUT(outgoing_transfer_trace, outgoing_transfer, trace)
 
 static napi_value outgoing_transfer_set_priority(napi_env env, napi_callback_info info) {
     ARGS(2);
@@ -1443,44 +1455,44 @@ static napi_value constants(napi_env env) {
     napi_value obj;
     if (napi_create_object(env, &obj) != napi_ok)
         return throw_napi(env);
-#define CONST(c) \
+#define CONSTANT(c) \
     if (!set(env, obj, "WEIDA_" #c, js_int64(env, WEIDA_##c))) \
         return NULL;
-    CONST(CONGESTION_CUBIC)
-    CONST(CONGESTION_NEW_RENO)
-    CONST(CONGESTION_BBR)
-    CONST(DISCOVERY_AWARE)
-    CONST(DISCOVERY_SINGLE)
-    CONST(OUTBOX_FULL_BLOCK)
-    CONST(OUTBOX_FULL_DROP)
-    CONST(OUTBOX_FULL_REJECT)
-    CONST(DELIVERY_LEVEL_BEST_EFFORT)
-    CONST(DELIVERY_LEVEL_AT_MOST_ONCE)
-    CONST(DELIVERY_LEVEL_AT_LEAST_ONCE)
-    CONST(ACKNOWLEDGEMENT_NONE)
-    CONST(ACKNOWLEDGEMENT_TRANSPORT_RECEIPT)
-    CONST(ACKNOWLEDGEMENT_ACCEPTED)
-    CONST(ACKNOWLEDGEMENT_STORED)
-    CONST(ACKNOWLEDGEMENT_REPLICATED)
-    CONST(ACKNOWLEDGEMENT_PROCESSED)
-    CONST(DURABILITY_WRITTEN)
-    CONST(DURABILITY_FLUSHED)
-    CONST(ORDERING_MODE_NONE)
-    CONST(ORDERING_MODE_PER_PRODUCER_DETECT)
-    CONST(ORDERING_MODE_PER_PRODUCER_REASSEMBLE)
-    CONST(ORDERING_MODE_PER_KEY)
-    CONST(ORDERING_MODE_TOTAL)
-    CONST(DEDUPLICATION_NONE)
-    CONST(DEDUPLICATION_BOUNDED)
-    CONST(DEDUPLICATION_DURABLE)
-    CONST(BACKPRESSURE_BLOCK)
-    CONST(BACKPRESSURE_REJECT)
-    CONST(BACKPRESSURE_DROP)
-    CONST(BACKPRESSURE_SPILL)
-    CONST(BACKPRESSURE_COALESCE)
-    CONST(PRODUCER_NAMING_FINGERPRINT)
-    CONST(PRODUCER_NAMING_STABLE)
-#undef CONST
+    CONSTANT(CONGESTION_CUBIC)
+    CONSTANT(CONGESTION_NEW_RENO)
+    CONSTANT(CONGESTION_BBR)
+    CONSTANT(DISCOVERY_AWARE)
+    CONSTANT(DISCOVERY_SINGLE)
+    CONSTANT(OUTBOX_FULL_BLOCK)
+    CONSTANT(OUTBOX_FULL_DROP)
+    CONSTANT(OUTBOX_FULL_REJECT)
+    CONSTANT(DELIVERY_LEVEL_BEST_EFFORT)
+    CONSTANT(DELIVERY_LEVEL_AT_MOST_ONCE)
+    CONSTANT(DELIVERY_LEVEL_AT_LEAST_ONCE)
+    CONSTANT(ACKNOWLEDGEMENT_NONE)
+    CONSTANT(ACKNOWLEDGEMENT_TRANSPORT_RECEIPT)
+    CONSTANT(ACKNOWLEDGEMENT_ACCEPTED)
+    CONSTANT(ACKNOWLEDGEMENT_STORED)
+    CONSTANT(ACKNOWLEDGEMENT_REPLICATED)
+    CONSTANT(ACKNOWLEDGEMENT_PROCESSED)
+    CONSTANT(DURABILITY_WRITTEN)
+    CONSTANT(DURABILITY_FLUSHED)
+    CONSTANT(ORDERING_MODE_NONE)
+    CONSTANT(ORDERING_MODE_PER_PRODUCER_DETECT)
+    CONSTANT(ORDERING_MODE_PER_PRODUCER_REASSEMBLE)
+    CONSTANT(ORDERING_MODE_PER_KEY)
+    CONSTANT(ORDERING_MODE_TOTAL)
+    CONSTANT(DEDUPLICATION_NONE)
+    CONSTANT(DEDUPLICATION_BOUNDED)
+    CONSTANT(DEDUPLICATION_DURABLE)
+    CONSTANT(BACKPRESSURE_BLOCK)
+    CONSTANT(BACKPRESSURE_REJECT)
+    CONSTANT(BACKPRESSURE_DROP)
+    CONSTANT(BACKPRESSURE_SPILL)
+    CONSTANT(BACKPRESSURE_COALESCE)
+    CONSTANT(PRODUCER_NAMING_FINGERPRINT)
+    CONSTANT(PRODUCER_NAMING_STABLE)
+#undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
     return obj;
@@ -1504,6 +1516,12 @@ static void finalize_addon(napi_env env, void *data, void *hint) {
 #define FN(js, c) {js, NULL, c, NULL, NULL, NULL, napi_enumerable, NULL}
 
 NAPI_MODULE_INIT() {
+#ifdef _WIN32
+    if (!load_libweida()) {
+        napi_throw_error(env, NULL, "weida: weida.dll beside weida.node could not be loaded");
+        return NULL;
+    }
+#endif
     struct addon *a = calloc(1, sizeof *a);
     napi_value again_obj, constants_obj;
     if (!a) {

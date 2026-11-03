@@ -3,7 +3,7 @@
 # system C compiler against crates/weida-c/include/weida.h and the libweida
 # in $WEIDA_LIB_DIR, and copies that library beside it, where the addon's
 # rpath finds it. <platform>-<arch> is Node's process.platform-process.arch:
-# linux-x64, linux-arm64 or darwin-arm64.
+# linux-x64, linux-arm64 or darwin-arm64; build.ps1 builds win32-x64.
 #
 # Usage: WEIDA_LIB_DIR=<dir with libweida.so or libweida.dylib> build.sh
 set -eu
