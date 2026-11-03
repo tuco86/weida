@@ -204,6 +204,17 @@ The ABI's own codes:
 | `WEIDA_LOSS_RESET` | 5 |
 | `WEIDA_LOSS_TRANSPORT_ERROR` | 6 |
 
+`ErrorCode` constants, going in (R7): the code `weida_incoming_request_refuse` sends, and the
+code the requester's op then ends with:
+
+| `ErrorCode` | Constant | Value | Requester's op |
+| --- | --- | --- | --- |
+| `UnknownEndpoint` | `WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT` | 1 | `-WEIDA_EUNKNOWN_ENDPOINT` |
+| `Rejected` | `WEIDA_ERROR_CODE_REJECTED` | 2 | `-WEIDA_EREJECTED` |
+| `Unsupported` | `WEIDA_ERROR_CODE_UNSUPPORTED` | 3 | `-WEIDA_EUNSUPPORTED` |
+| `Internal` | `WEIDA_ERROR_CODE_INTERNAL` | 4 | `-WEIDA_ETRANSPORT` |
+| `NoReply` | `WEIDA_ERROR_CODE_NO_REPLY` | 5 | `-WEIDA_ENO_REPLY` |
+
 **The thread-local record.** Every failing `int` function stores a record on its own thread;
 success does not clear it. It is read with:
 

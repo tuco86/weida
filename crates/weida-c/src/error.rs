@@ -84,6 +84,17 @@ pub const WEIDA_LOSS_RESET: c_int = 5;
 /// `LossCause::TransportError`.
 pub const WEIDA_LOSS_TRANSPORT_ERROR: c_int = 6;
 
+/// `ErrorCode::UnknownEndpoint`.
+pub const WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT: c_int = 1;
+/// `ErrorCode::Rejected`.
+pub const WEIDA_ERROR_CODE_REJECTED: c_int = 2;
+/// `ErrorCode::Unsupported`.
+pub const WEIDA_ERROR_CODE_UNSUPPORTED: c_int = 3;
+/// `ErrorCode::Internal`.
+pub const WEIDA_ERROR_CODE_INTERNAL: c_int = 4;
+/// `ErrorCode::NoReply`.
+pub const WEIDA_ERROR_CODE_NO_REPLY: c_int = 5;
+
 /// The code of every variant. One exhaustive match, so a new variant does
 /// not compile without one.
 pub(crate) fn code(e: &Error) -> c_int {

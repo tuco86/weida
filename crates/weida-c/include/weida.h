@@ -370,6 +370,31 @@
 #define WEIDA_LOSS_TRANSPORT_ERROR 6
 
 /**
+ * `ErrorCode::UnknownEndpoint`.
+ */
+#define WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT 1
+
+/**
+ * `ErrorCode::Rejected`.
+ */
+#define WEIDA_ERROR_CODE_REJECTED 2
+
+/**
+ * `ErrorCode::Unsupported`.
+ */
+#define WEIDA_ERROR_CODE_UNSUPPORTED 3
+
+/**
+ * `ErrorCode::Internal`.
+ */
+#define WEIDA_ERROR_CODE_INTERNAL 4
+
+/**
+ * `ErrorCode::NoReply`.
+ */
+#define WEIDA_ERROR_CODE_NO_REPLY 5
+
+/**
  * The descriptor is readable: the next try or wait on its handle will not
  * block (R11).
  */
@@ -415,6 +440,17 @@ typedef struct weida_incoming_meta weida_incoming_meta;
  * One accepted request: its body and the right to reply.
  */
 typedef struct weida_incoming_request weida_incoming_request;
+
+/**
+ * The pending `IncomingRequest::canceled` of
+ * `weida_incoming_request_canceled`.
+ */
+typedef struct weida_incoming_request_canceled_op weida_incoming_request_canceled_op;
+
+/**
+ * The pending refusal of `weida_incoming_request_refuse`.
+ */
+typedef struct weida_incoming_request_refuse_op weida_incoming_request_refuse_op;
 
 /**
  * The pending reply of `weida_incoming_request_reply`.
@@ -1321,6 +1357,105 @@ int weida_incoming_request_reply_op_wait(const weida_incoming_request_reply_op *
  * `op` is NULL or a live reply op, dropped at most once.
  */
 void weida_incoming_request_reply_op_drop(weida_incoming_request_reply_op *op);
+
+/**
+ * Refuses the exchange (`IncomingRequest::refuse`): the requester's op
+ * fails with the error of `code`, a `WEIDA_ERROR_CODE_*` constant (README
+ * R9). **Consumes** `q` on every return path.
+ *
+ * Never blocks; the ERROR frame is written as the op written to `out`. A
+ * body still attached is stopped with `REJECTED`. A `code` that is not a
+ * `WEIDA_ERROR_CODE_*` is `-WEIDA_EINVAL`, and the request is consumed all
+ * the same: it answers `NO_REPLY`.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request, not used again; `out` is NULL or
+ * writable. Release the op with `weida_incoming_request_refuse_op_drop`.
+ */
+int weida_incoming_request_refuse(weida_incoming_request *q,
+                                  int code,
+                                  weida_incoming_request_refuse_op **out);
+
+/**
+ * The readiness descriptor of a refuse op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live refuse op; `out` is NULL or writable.
+ */
+int weida_incoming_request_refuse_op_fd(const weida_incoming_request_refuse_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the refusal to be written. A refusal
+ * never fails: one that could not be written (the connection is gone)
+ * also returns 0.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live refuse op.
+ */
+int weida_incoming_request_refuse_op_wait(const weida_incoming_request_refuse_op *op,
+                                          int64_t timeout_ms);
+
+/**
+ * Releases a refuse op. Dropped before its wait returned 0, it aborts the
+ * refusal, and the requester may see `NO_REPLY` instead. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live refuse op, dropped at most once.
+ */
+void weida_incoming_request_refuse_op_drop(weida_incoming_request_refuse_op *op);
+
+/**
+ * Starts watching for the requester to stop wanting a reply
+ * (`IncomingRequest::canceled`).
+ *
+ * The op is independent of `q`: it outlives a
+ * `weida_incoming_request_reply`, `_refuse` or `_drop` of the request.
+ * Start it before those consume `q`. Its wait returns 0 once any of these
+ * happened: the requester dropped its request op or its reply; a finished
+ * reply was read whole; the connection is gone.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request; `out` is NULL or writable. Release the op
+ * with `weida_incoming_request_canceled_op_drop`.
+ */
+int weida_incoming_request_canceled(const weida_incoming_request *q,
+                                    weida_incoming_request_canceled_op **out);
+
+/**
+ * The readiness descriptor of a canceled op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live canceled op; `out` is NULL or writable.
+ */
+int weida_incoming_request_canceled_op_fd(const weida_incoming_request_canceled_op *op,
+                                          int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the cancellation; 0 once it happened.
+ * `-WEIDA_ERUNTIME` once the runtime shut down.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live canceled op.
+ */
+int weida_incoming_request_canceled_op_wait(const weida_incoming_request_canceled_op *op,
+                                            int64_t timeout_ms);
+
+/**
+ * Releases a canceled op, ending the watch. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live canceled op, dropped at most once.
+ */
+void weida_incoming_request_canceled_op_drop(weida_incoming_request_canceled_op *op);
 
 /**
  * Releases a request. One not replied to answers the requester with

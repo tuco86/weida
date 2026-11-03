@@ -54,11 +54,20 @@ Dropping the replier unregisters its path and ends every wait on it with `-WEIDA
 | `int weida_incoming_request_meta(const weida_incoming_request *q, weida_incoming_meta **out)` | never | 0 and a new metadata reference ([msg.md](msg.md)); `-WEIDA_ECLOSED` |
 | `int weida_incoming_request_take_body(const weida_incoming_request *q, weida_incoming_transfer **out)` | never | 0; `-WEIDA_ECLOSED` on a second call |
 | `int weida_incoming_request_reply(weida_incoming_request *q, const weida_transfer_meta *meta_or_null, weida_incoming_request_reply_op **out)` | never; **consumes** `q` | 0; `-WEIDA_ECLOSED` |
+| `int weida_incoming_request_refuse(weida_incoming_request *q, int code, weida_incoming_request_refuse_op **out)` | never; **consumes** `q` | 0; `-WEIDA_EINVAL` for a `code` that is not a `WEIDA_ERROR_CODE_*` (the request is consumed all the same and answers `NO_REPLY`); `-WEIDA_ECLOSED` |
+| `int weida_incoming_request_canceled(const weida_incoming_request *q, weida_incoming_request_canceled_op **out)` | never | 0; `-WEIDA_ECLOSED` |
 | `void weida_incoming_request_drop(weida_incoming_request *q)` | never | — |
 
 A request dropped without a reply answers the requester with `NO_REPLY`. A body not taken
 before the reply is refused with `REJECTED`. `IncomingRequest::body` (a lent borrow) is not
 mapped (R1); `take_body` is its owning twin.
+
+A refusal answers the requester with an ERROR instead of a reply; its op ends with the code of
+[README](README.md) R9's `ErrorCode` table. A body still attached is stopped with `REJECTED`.
+`canceled` maps a sync method returning a future, so it is an op too (R3b). It is independent
+of the request: start it before `reply` or `refuse` consumes `q`. It settles when any of these
+happened: the requester dropped its request op or its reply; a finished reply was read whole;
+the connection is gone.
 
 ## `weida_incoming_request_reply_op`
 
@@ -67,3 +76,24 @@ mapped (R1); `take_body` is its owning twin.
 | `int weida_incoming_request_reply_op_fd(const weida_incoming_request_reply_op *op, int64_t *out)` | never | 0; `-WEIDA_EIO` |
 | `int weida_incoming_request_reply_op_wait(const weida_incoming_request_reply_op *op, int64_t timeout_ms, weida_outgoing_transfer **out)` | up to `timeout_ms` | 0 and the reply stream ([transfer.md](transfer.md)); `-WEIDA_ECONNECTION_LOST`, `-WEIDA_ECANCELED` (the requester gave up); `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
 | `void weida_incoming_request_reply_op_drop(weida_incoming_request_reply_op *op)` | never | — |
+
+## `weida_incoming_request_refuse_op`
+
+| Function | Blocks | Returns |
+| --- | --- | --- |
+| `int weida_incoming_request_refuse_op_fd(const weida_incoming_request_refuse_op *op, int64_t *out)` | never | 0; `-WEIDA_EIO` |
+| `int weida_incoming_request_refuse_op_wait(const weida_incoming_request_refuse_op *op, int64_t timeout_ms)` | up to `timeout_ms` | 0 once the refusal was written, or could not be (the connection is gone); `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED`, and `-WEIDA_ERUNTIME` once the runtime shut down |
+| `void weida_incoming_request_refuse_op_drop(weida_incoming_request_refuse_op *op)` | never | — |
+
+Dropped before its wait returned 0, a refuse op aborts the refusal, and the requester may see
+`-WEIDA_ENO_REPLY`.
+
+## `weida_incoming_request_canceled_op`
+
+| Function | Blocks | Returns |
+| --- | --- | --- |
+| `int weida_incoming_request_canceled_op_fd(const weida_incoming_request_canceled_op *op, int64_t *out)` | never | 0; `-WEIDA_EIO` |
+| `int weida_incoming_request_canceled_op_wait(const weida_incoming_request_canceled_op *op, int64_t timeout_ms)` | up to `timeout_ms` | 0 once the requester gave up; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED`, and `-WEIDA_ERUNTIME` once the runtime shut down |
+| `void weida_incoming_request_canceled_op_drop(weida_incoming_request_canceled_op *op)` | never | — |
+
+Dropping a canceled op ends the watch.

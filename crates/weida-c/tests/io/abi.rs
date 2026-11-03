@@ -541,6 +541,88 @@ fn a_shutdown_finishes_with_an_exchange_abandoned() {
 }
 
 #[test]
+fn a_refused_request_fails_the_requester_with_its_codes_error() {
+    let pair = Pair::new("abi-refusals-codes");
+    for (code, expected) in [
+        (WEIDA_ERROR_CODE_REJECTED, -WEIDA_EREJECTED),
+        (WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT, -WEIDA_EUNKNOWN_ENDPOINT),
+        (WEIDA_ERROR_CODE_UNSUPPORTED, -WEIDA_EUNSUPPORTED),
+        (WEIDA_ERROR_CODE_INTERNAL, -WEIDA_ETRANSPORT),
+        (WEIDA_ERROR_CODE_NO_REPLY, -WEIDA_ENO_REPLY),
+    ] {
+        let pending = request(pair.req, b"ask");
+        let q = accept(pair.rep);
+        let mut op = ptr::null_mut();
+        let mut answer = ptr::null_mut();
+        // SAFETY: a live request, consumed, live ops and writable
+        // out-parameters; each op is dropped once.
+        unsafe {
+            ok(weida_incoming_request_refuse(q, code, &mut op));
+            ok(settle("the refusal", |ms| {
+                weida_incoming_request_refuse_op_wait(op, ms)
+            }));
+            weida_incoming_request_refuse_op_drop(op);
+            assert_eq!(
+                settle("the refused request", |ms| {
+                    weida_requester_request_op_wait(pending, ms, &mut answer)
+                }),
+                expected,
+                "{code}"
+            );
+            weida_requester_request_op_drop(pending);
+        }
+    }
+
+    let pending = request(pair.req, b"ask");
+    let q = accept(pair.rep);
+    let mut op = ptr::null_mut();
+    let mut answer = ptr::null_mut();
+    // SAFETY: a live request, consumed even by the failing call, a live op
+    // dropped once and writable out-parameters.
+    unsafe {
+        assert_eq!(
+            weida_incoming_request_refuse(q, 6, &mut op),
+            -WEIDA_EINVAL
+        );
+        assert!(op.is_null(), "an invalid code starts no refusal");
+        assert_eq!(
+            settle("the dropped request", |ms| {
+                weida_requester_request_op_wait(pending, ms, &mut answer)
+            }),
+            -WEIDA_ENO_REPLY
+        );
+        weida_requester_request_op_drop(pending);
+    }
+    pair.close();
+}
+
+#[test]
+fn canceled_settles_once_the_requester_drops_its_request() {
+    let pair = Pair::new("abi-refusals-canceled");
+    let pending = request(pair.req, b"wait");
+    let q = accept(pair.rep);
+    let mut canceled = ptr::null_mut();
+    // SAFETY: a live request and op, each dropped once, and a writable
+    // out-parameter. `q` stays live until the wait settled: its NO_REPLY
+    // would finish the reply half for another reason.
+    unsafe {
+        ok(weida_incoming_request_canceled(q, &mut canceled));
+        assert_eq!(
+            weida_incoming_request_canceled_op_wait(canceled, 0),
+            -WEIDA_EAGAIN,
+            "the requester still waits"
+        );
+        weida_requester_request_op_drop(pending);
+        ok(settle("the cancellation", |ms| {
+            weida_incoming_request_canceled_op_wait(canceled, ms)
+        }));
+        weida_incoming_request_canceled_op_drop(canceled);
+        weida_incoming_request_drop(q);
+    }
+    pair.close();
+}
+
+#[test]
 fn a_malformed_pin_is_an_invalid_fingerprint() {
     let trust = trust_by_address();
     let bad = c("nope");

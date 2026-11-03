@@ -64,7 +64,8 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingRequest::take_body` | `weida_incoming_request_take_body`; a second call is `-WEIDA_ECLOSED` where Rust panics | present; `abi::a_streamed_round_trip_over_inproc` |
 | `IncomingRequest::body` | — | refused: R1, a lent `&mut` sub-handle has no C lifetime; `take_body` is its owning twin |
 | `IncomingRequest::reply` | `weida_incoming_request_reply` (op, consumes) | present; `abi::a_streamed_round_trip_over_inproc` |
-| `IncomingRequest::refuse`, `canceled` | — | absent: *refusals* |
+| `IncomingRequest::refuse`, `ErrorCode` | `weida_incoming_request_refuse` (op, consumes), `WEIDA_ERROR_CODE_*` | present; `abi::a_refused_request_fails_the_requester_with_its_codes_error` (*refusals*) |
+| `IncomingRequest::canceled` | `weida_incoming_request_canceled` (op, outlives the request) | present; `abi::canceled_settles_once_the_requester_drops_its_request` (*refusals*) |
 | `IncomingRequest::connection` | — | absent: *stats* |
 | `Drop for IncomingRequest` (`NO_REPLY`) | `weida_incoming_request_drop` | present; R1 |
 
@@ -130,7 +131,7 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingMeta::report`, `report_mode`, `report_id` | — | absent: *cursors* |
 | `Fingerprint` | `sha256:` text everywhere | present |
 | `Error`, `LossCause` | the R9 constants and the thread-local record | present; `error::tests::every_variant_has_its_own_code_below_the_abi_codes`, `abi::a_server_outside_the_pins_is_untrusted` (`weida_last_error_fingerprint`) |
-| `ErrorCode`, `StopReason`, `codes` | — | refused: wire vocabulary, reached through the R9 outcome codes |
+| `StopReason`, `codes` | — | refused: wire vocabulary, reached through the R9 outcome codes |
 | `Address`, `EndpointAddr`, `InprocAddr`, `UnixAddr`, `PipeAddr`, `DEFAULT_PORT` | URLs as strings | refused: the C caller passes the text, weida parses it |
 | `new_trace`, `TraceContext` | `weida_new_trace`; a trace context is its `traceparent` text (R7) | present; `tls::tests::new_trace_writes_a_traceparent_that_sets_back` (*config*) |
 | `Resolver`, `SharedResolver`, `SystemResolver`, `Resolved` | — | absent: *resolver* (a queue, decision 10) |
@@ -164,7 +165,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the nineteen `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the twenty-one `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -180,6 +181,10 @@ way a foreign caller calls it:
 - `endpoint_queue` 0 is `-WEIDA_EINVAL` at the setter, where Rust panics at the first queue.
 - An optional value in is negative for `None` (R7).
 - A count in above `usize::MAX` becomes `usize::MAX` (R7).
+- A refusal code outside `WEIDA_ERROR_CODE_*` is `-WEIDA_EINVAL`; the request is consumed all
+  the same (R6) and answers `NO_REPLY`.
+- `canceled` is an op started from the request, and like Rust's future it outlives it; start
+  it before `reply` or `refuse` consumes the request.
 
 ## 10. The definition of done
 

@@ -7,8 +7,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ::weida_runtime::Exec;
-use weida_rs::{Binding, Error, IncomingRequest, Listener, LocalBinding, Replier, TransferMeta};
+use weida_rs::{
+    Binding, Error, ErrorCode, IncomingRequest, Listener, LocalBinding, Replier, TransferMeta,
+};
 
+use crate::config::wire;
 use crate::error::{fail, guard, guard_ptr, guard_void};
 use crate::handle::{CText, borrow, cstr, into_handle, out_ptr, release, text_out, write_out};
 use crate::op::Op;
@@ -86,6 +89,31 @@ pub struct weida_incoming_request_reply_op {
 impl AsOp for weida_incoming_request_reply_op {
     type Output = weida_rs::OutgoingTransfer;
     fn op(&self) -> &Op<weida_rs::OutgoingTransfer> {
+        &self.op
+    }
+}
+
+/// The pending refusal of `weida_incoming_request_refuse`.
+pub struct weida_incoming_request_refuse_op {
+    op: Arc<Op<()>>,
+}
+
+impl AsOp for weida_incoming_request_refuse_op {
+    type Output = ();
+    fn op(&self) -> &Op<()> {
+        &self.op
+    }
+}
+
+/// The pending `IncomingRequest::canceled` of
+/// `weida_incoming_request_canceled`.
+pub struct weida_incoming_request_canceled_op {
+    op: Arc<Op<()>>,
+}
+
+impl AsOp for weida_incoming_request_canceled_op {
+    type Output = ();
+    fn op(&self) -> &Op<()> {
         &self.op
     }
 }
@@ -607,6 +635,167 @@ pub unsafe extern "C" fn weida_incoming_request_reply_op_wait(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn weida_incoming_request_reply_op_drop(
     op: *mut weida_incoming_request_reply_op,
+) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Refuses the exchange (`IncomingRequest::refuse`): the requester's op
+/// fails with the error of `code`, a `WEIDA_ERROR_CODE_*` constant (README
+/// R9). **Consumes** `q` on every return path.
+///
+/// Never blocks; the ERROR frame is written as the op written to `out`. A
+/// body still attached is stopped with `REJECTED`. A `code` that is not a
+/// `WEIDA_ERROR_CODE_*` is `-WEIDA_EINVAL`, and the request is consumed all
+/// the same: it answers `NO_REPLY`.
+///
+/// # Safety
+///
+/// `q` is NULL or a live request, not used again; `out` is NULL or
+/// writable. Release the op with `weida_incoming_request_refuse_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_refuse(
+    q: *mut weida_incoming_request,
+    code: c_int,
+    out: *mut *mut weida_incoming_request_refuse_op,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract; the handle is
+        // consumed here whatever happens next.
+        let q = unsafe { release(q) }.ok_or_else(crate::error::null_arg)?;
+        let state = q.lock().take();
+        let out = out_ptr(out)?;
+        let state = state.ok_or_else(crate::error::closed)?;
+        let code = wire(code, ErrorCode::from_wire)?;
+        let request = state.request;
+        let op = Op::start(&q.exec, async move {
+            request.refuse(code).await;
+            Ok(())
+        });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_incoming_request_refuse_op { op })) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a refuse op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live refuse op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_refuse_op_fd(
+    op: *const weida_incoming_request_refuse_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the refusal to be written. A refusal
+/// never fails: one that could not be written (the connection is gone)
+/// also returns 0.
+///
+/// # Safety
+///
+/// `op` is NULL or a live refuse op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_refuse_op_wait(
+    op: *const weida_incoming_request_refuse_op,
+    timeout_ms: i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    guard(|| unsafe { op_wait(op, timeout_ms) }.map(|()| 0))
+}
+
+/// Releases a refuse op. Dropped before its wait returned 0, it aborts the
+/// refusal, and the requester may see `NO_REPLY` instead. NULL does
+/// nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live refuse op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_refuse_op_drop(
+    op: *mut weida_incoming_request_refuse_op,
+) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Starts watching for the requester to stop wanting a reply
+/// (`IncomingRequest::canceled`).
+///
+/// The op is independent of `q`: it outlives a
+/// `weida_incoming_request_reply`, `_refuse` or `_drop` of the request.
+/// Start it before those consume `q`. Its wait returns 0 once any of these
+/// happened: the requester dropped its request op or its reply; a finished
+/// reply was read whole; the connection is gone.
+///
+/// # Safety
+///
+/// `q` is NULL or a live request; `out` is NULL or writable. Release the op
+/// with `weida_incoming_request_canceled_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_canceled(
+    q: *const weida_incoming_request,
+    out: *mut *mut weida_incoming_request_canceled_op,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let q = unsafe { borrow(q) }?;
+        let canceled = match q.lock().as_ref() {
+            Some(state) => state.request.canceled(),
+            None => return Err(crate::error::closed()),
+        };
+        let op = Op::start(&q.exec, async move {
+            canceled.await;
+            Ok(())
+        });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_incoming_request_canceled_op { op })) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a canceled op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live canceled op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_canceled_op_fd(
+    op: *const weida_incoming_request_canceled_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the cancellation; 0 once it happened.
+/// `-WEIDA_ERUNTIME` once the runtime shut down.
+///
+/// # Safety
+///
+/// `op` is NULL or a live canceled op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_canceled_op_wait(
+    op: *const weida_incoming_request_canceled_op,
+    timeout_ms: i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    guard(|| unsafe { op_wait(op, timeout_ms) }.map(|()| 0))
+}
+
+/// Releases a canceled op, ending the watch. NULL does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live canceled op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_canceled_op_drop(
+    op: *mut weida_incoming_request_canceled_op,
 ) {
     // SAFETY: forwarded from this function's contract.
     unsafe { op_drop(op) }

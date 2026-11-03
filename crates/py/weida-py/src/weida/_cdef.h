@@ -140,6 +140,16 @@
 
 #define WEIDA_LOSS_TRANSPORT_ERROR 6
 
+#define WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT 1
+
+#define WEIDA_ERROR_CODE_REJECTED 2
+
+#define WEIDA_ERROR_CODE_UNSUPPORTED 3
+
+#define WEIDA_ERROR_CODE_INTERNAL 4
+
+#define WEIDA_ERROR_CODE_NO_REPLY 5
+
 #define WEIDA_POLLIN 1
 
 typedef struct weida_binding weida_binding;
@@ -157,6 +167,10 @@ typedef struct weida_identity weida_identity;
 typedef struct weida_incoming_meta weida_incoming_meta;
 
 typedef struct weida_incoming_request weida_incoming_request;
+
+typedef struct weida_incoming_request_canceled_op weida_incoming_request_canceled_op;
+
+typedef struct weida_incoming_request_refuse_op weida_incoming_request_refuse_op;
 
 typedef struct weida_incoming_request_reply_op weida_incoming_request_reply_op;
 
@@ -367,6 +381,28 @@ int weida_incoming_request_reply_op_wait(const weida_incoming_request_reply_op *
                                          weida_outgoing_transfer **out);
 
 void weida_incoming_request_reply_op_drop(weida_incoming_request_reply_op *op);
+
+int weida_incoming_request_refuse(weida_incoming_request *q,
+                                  int code,
+                                  weida_incoming_request_refuse_op **out);
+
+int weida_incoming_request_refuse_op_fd(const weida_incoming_request_refuse_op *op, int64_t *out);
+
+int weida_incoming_request_refuse_op_wait(const weida_incoming_request_refuse_op *op,
+                                          int64_t timeout_ms);
+
+void weida_incoming_request_refuse_op_drop(weida_incoming_request_refuse_op *op);
+
+int weida_incoming_request_canceled(const weida_incoming_request *q,
+                                    weida_incoming_request_canceled_op **out);
+
+int weida_incoming_request_canceled_op_fd(const weida_incoming_request_canceled_op *op,
+                                          int64_t *out);
+
+int weida_incoming_request_canceled_op_wait(const weida_incoming_request_canceled_op *op,
+                                            int64_t timeout_ms);
+
+void weida_incoming_request_canceled_op_drop(weida_incoming_request_canceled_op *op);
 
 void weida_incoming_request_drop(weida_incoming_request *q);
 

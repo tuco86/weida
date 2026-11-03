@@ -103,6 +103,11 @@ the `TransferMeta` setters beyond the content type, `Requester::request_with`, t
 achieved getters and `OutgoingTransfer::trace`, `set_priority` and `expire_at`. This package
 keeps its two configuration fields and the content type.
 
+The C ABI's *refusals* area is absent here: the rows of [weida-c.md](weida-c.md) marked
+(*refusals*), `IncomingRequest::refuse` with the `WEIDA_ERROR_CODE_*` constants and
+`IncomingRequest::canceled`. A request is still declined only by dropping it, which answers
+`NO_REPLY`.
+
 ## 7. Sources
 
 `crates/swift/weida/` (`Package.swift`, `build-xcframework.sh`, `Sources/Weida/` with
