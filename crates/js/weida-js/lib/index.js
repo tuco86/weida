@@ -670,6 +670,35 @@ export class IncomingRequest extends Handle {
     );
     return adopt(OutgoingTransfer, transfer);
   }
+
+  /** Refuses the exchange with `code`, a `WEIDA_ERROR_CODE_*` name, instead of
+   * a reply: the requester's request rejects with the matching WeidaError.
+   * Consumes the request; an unknown name is a TypeError and consumes
+   * nothing. */
+  async refuse(code, { signal } = {}) {
+    const value = constant("WEIDA_ERROR_CODE_", code);
+    await op(
+      this,
+      () => native.incomingRequestRefuse(consume(this), value),
+      native.incomingRequestRefuseOpWait,
+      native.incomingRequestRefuseOpFd,
+      signal,
+    );
+  }
+
+  /** Resolves when the requester stops wanting a reply, a finished reply was
+   * read whole, or the connection is gone. Started at the call, so take it
+   * before `reply` or `refuse`; it outlives the request. A pending one keeps
+   * the process alive: abort it through `signal` once it no longer matters. */
+  canceled({ signal } = {}) {
+    return op(
+      { [WAITS]: new Set() },
+      () => native.incomingRequestCanceled(this[HANDLE]),
+      native.incomingRequestCanceledOpWait,
+      native.incomingRequestCanceledOpFd,
+      signal,
+    );
+  }
 }
 
 /** An inbound transfer: a payload read like a socket. */

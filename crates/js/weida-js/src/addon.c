@@ -42,6 +42,8 @@ DROP(local_binding)
 DROP(replier)
 DROP(incoming_request)
 DROP(incoming_request_reply_op)
+DROP(incoming_request_refuse_op)
+DROP(incoming_request_canceled_op)
 DROP(requester)
 DROP(requester_connect_op)
 DROP(requester_request_op)
@@ -1283,6 +1285,36 @@ FD(incoming_request_reply_op_fd, incoming_request_reply_op)
 WAIT1(incoming_request_reply_op_wait, incoming_request_reply_op, weida_outgoing_transfer,
       wrap_outgoing_transfer)
 
+/* consumes the request */
+static napi_value incoming_request_refuse(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    int32_t code = 0;
+    if (!get_i32(env, argv[1], &code))
+        return NULL;
+    weida_incoming_request *q = take(env, argv[0], drop_incoming_request);
+    weida_incoming_request_refuse_op *op = NULL;
+    if (!q)
+        return NULL;
+    int rc = weida_incoming_request_refuse(q, code, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_incoming_request_refuse_op);
+}
+
+FD(incoming_request_refuse_op_fd, incoming_request_refuse_op)
+WAIT0(incoming_request_refuse_op_wait, incoming_request_refuse_op)
+
+static napi_value incoming_request_canceled(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_incoming_request *q = live(env, argv[0], drop_incoming_request);
+    weida_incoming_request_canceled_op *op = NULL;
+    if (!q)
+        return NULL;
+    int rc = weida_incoming_request_canceled(q, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_incoming_request_canceled_op);
+}
+
+FD(incoming_request_canceled_op_fd, incoming_request_canceled_op)
+WAIT0(incoming_request_canceled_op_wait, incoming_request_canceled_op)
+
 /* requester */
 
 static napi_value requester_connect(napi_env env, napi_callback_info info) {
@@ -1492,6 +1524,11 @@ static napi_value constants(napi_env env) {
     CONSTANT(BACKPRESSURE_COALESCE)
     CONSTANT(PRODUCER_NAMING_FINGERPRINT)
     CONSTANT(PRODUCER_NAMING_STABLE)
+    CONSTANT(ERROR_CODE_UNKNOWN_ENDPOINT)
+    CONSTANT(ERROR_CODE_REJECTED)
+    CONSTANT(ERROR_CODE_UNSUPPORTED)
+    CONSTANT(ERROR_CODE_INTERNAL)
+    CONSTANT(ERROR_CODE_NO_REPLY)
 #undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
@@ -1661,6 +1698,12 @@ NAPI_MODULE_INIT() {
         FN("incomingRequestReply", incoming_request_reply),
         FN("incomingRequestReplyOpFd", incoming_request_reply_op_fd),
         FN("incomingRequestReplyOpWait", incoming_request_reply_op_wait),
+        FN("incomingRequestRefuse", incoming_request_refuse),
+        FN("incomingRequestRefuseOpFd", incoming_request_refuse_op_fd),
+        FN("incomingRequestRefuseOpWait", incoming_request_refuse_op_wait),
+        FN("incomingRequestCanceled", incoming_request_canceled),
+        FN("incomingRequestCanceledOpFd", incoming_request_canceled_op_fd),
+        FN("incomingRequestCanceledOpWait", incoming_request_canceled_op_wait),
         FN("requesterConnect", requester_connect),
         FN("requesterConnectOpFd", requester_connect_op_fd),
         FN("requesterConnectOpWait", requester_connect_op_wait),

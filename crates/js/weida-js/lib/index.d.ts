@@ -58,6 +58,12 @@ export type Backpressure =
   | "WEIDA_BACKPRESSURE_SPILL"
   | "WEIDA_BACKPRESSURE_COALESCE";
 export type ProducerNaming = "WEIDA_PRODUCER_NAMING_FINGERPRINT" | "WEIDA_PRODUCER_NAMING_STABLE";
+export type ErrorCode =
+  | "WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT"
+  | "WEIDA_ERROR_CODE_REJECTED"
+  | "WEIDA_ERROR_CODE_UNSUPPORTED"
+  | "WEIDA_ERROR_CODE_INTERNAL"
+  | "WEIDA_ERROR_CODE_NO_REPLY";
 
 /** `weida::Limits`, the per-connection profile; unset fields keep weida's
  * defaults. */
@@ -284,6 +290,10 @@ export class IncomingRequest extends Handle {
   takeBody(): IncomingTransfer;
   /** Consumes the request. */
   reply(meta?: TransferMeta | null, options?: WaitOptions): Promise<OutgoingTransfer>;
+  /** Refuses the exchange with `code`; consumes the request, an unknown name consumes nothing. */
+  refuse(code: ErrorCode, options?: WaitOptions): Promise<void>;
+  /** Resolves when the requester gave up; take it before `reply`, it outlives the request. */
+  canceled(options?: WaitOptions): Promise<void>;
 }
 
 export class IncomingTransfer extends Handle {

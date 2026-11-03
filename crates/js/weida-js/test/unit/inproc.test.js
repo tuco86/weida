@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import * as weida from "../../lib/index.js";
 
@@ -152,5 +153,49 @@ test("dropping a replier rejects its pending accept with WEIDA_ECLOSED", UNIT, a
   const accept = p.replier.accept();
   setImmediate(() => p.replier.drop());
   await assert.rejects(accept, { code: "WEIDA_ECLOSED" });
+  await p.close();
+});
+
+test("a refused request rejects the requester with the refused code's error", UNIT, async () => {
+  const p = await pair();
+  for (const [code, expected] of [
+    ["WEIDA_ERROR_CODE_REJECTED", "WEIDA_EREJECTED"],
+    ["WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT", "WEIDA_EUNKNOWN_ENDPOINT"],
+    ["WEIDA_ERROR_CODE_UNSUPPORTED", "WEIDA_EUNSUPPORTED"],
+    ["WEIDA_ERROR_CODE_INTERNAL", "WEIDA_ETRANSPORT"],
+    ["WEIDA_ERROR_CODE_NO_REPLY", "WEIDA_ENO_REPLY"],
+  ]) {
+    // The handler is attached first: the request rejects while the
+    // refusal's own wait is still settling.
+    const rejected = assert.rejects(p.requester.request("ask"), { code: expected });
+    const request = await p.replier.accept();
+    await request.refuse(code);
+    await rejected;
+  }
+  await p.close();
+});
+
+test("a refusal code outside WEIDA_ERROR_CODE_* is a TypeError and leaves the request usable", UNIT, async () => {
+  const p = await pair();
+  const rejected = assert.rejects(p.requester.request("ask"), { code: "WEIDA_EREJECTED" });
+  const request = await p.replier.accept();
+  await assert.rejects(request.refuse("WEIDA_EREJECTED"), TypeError);
+  await request.refuse("WEIDA_ERROR_CODE_REJECTED");
+  await rejected;
+  await p.close();
+});
+
+test("canceled settles once the requester gives up", UNIT, async () => {
+  const p = await pair();
+  const controller = new AbortController();
+  const pending = p.requester.request("wait", { signal: controller.signal });
+  const request = await p.replier.accept();
+  const canceled = request.canceled();
+  assert.equal(await Promise.race([canceled.then(() => "settled"), delay(50, "pending")]), "pending");
+  const reason = new Error("given up");
+  controller.abort(reason);
+  await assert.rejects(pending, (error) => error === reason);
+  await canceled;
+  request.drop();
   await p.close();
 });
