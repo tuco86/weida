@@ -580,10 +580,7 @@ fn a_refused_request_fails_the_requester_with_its_codes_error() {
     // SAFETY: a live request, consumed even by the failing call, a live op
     // dropped once and writable out-parameters.
     unsafe {
-        assert_eq!(
-            weida_incoming_request_refuse(q, 6, &mut op),
-            -WEIDA_EINVAL
-        );
+        assert_eq!(weida_incoming_request_refuse(q, 6, &mut op), -WEIDA_EINVAL);
         assert!(op.is_null(), "an invalid code starts no refusal");
         assert_eq!(
             settle("the dropped request", |ms| {
