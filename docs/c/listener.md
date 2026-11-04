@@ -16,6 +16,8 @@ rest.
 | `int weida_listener_bind_unix(const weida_listener *l, const char *path, weida_unix_binding **out)` | never | 0; serves the endpoints on the `AF_UNIX` socket `path`, reached at `weida+unix://<percent-encoded path>/<endpoint>`, no TLS, the kernel proves the peer; `path` MUST be in a directory this process owns and no other user may write; a stale socket file is replaced; `-WEIDA_EIO` (a live listener on the path), `-WEIDA_EINVALID_ADDRESS` (over the `sun_path` budget, or not a socket at the path), `-WEIDA_EUNSUPPORTED` off Unix |
 | `int weida_listener_bind_pipe(const weida_listener *l, const char *name, weida_pipe_binding **out)` | never | 0; binds `\\.\pipe\<name>` owner-only and local-only, only if the name does not exist yet, reached at `weida+pipe://<name>/<endpoint>`; `-WEIDA_EINVALID_ADDRESS` (an invalid name, or one that exists already), `-WEIDA_EIO`, `-WEIDA_EUNSUPPORTED` off Windows |
 | `int weida_listener_replier(const weida_listener *l, const char *path, weida_replier **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` |
+| `int weida_listener_puller(const weida_listener *l, const char *path, weida_puller **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` ([push.md](push.md)) |
+| `int weida_listener_publisher(const weida_listener *l, const char *path, weida_publisher **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` ([pubsub.md](pubsub.md)) |
 | `void weida_listener_drop(weida_listener *l)` | never | — |
 
 ## `weida_listener_bind_quic_op`

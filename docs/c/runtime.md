@@ -121,6 +121,8 @@ for the rest.
 | `int weida_runtime_owned(const weida_runtime_config *cfg_or_null, weida_runtime **out)` | never; starts the reactor's threads | 0; `-WEIDA_ERUNTIME` when `worker_threads` is 0 or the OS refuses threads; `-WEIDA_EINVAL` |
 | `int weida_runtime_listener(const weida_runtime *rt, weida_listener **out)` | never | 0; `-WEIDA_EINVAL` ([listener.md](listener.md)) |
 | `int weida_runtime_requester(const weida_runtime *rt, const weida_client_tls *tls, weida_requester **out)` | never | 0; `-WEIDA_EINVAL` ([requester.md](requester.md)) |
+| `int weida_runtime_pusher(const weida_runtime *rt, const weida_client_tls *tls, weida_pusher **out)` | never | 0; `-WEIDA_EINVAL` ([push.md](push.md)) |
+| `int weida_runtime_subscriber(const weida_runtime *rt, const weida_client_tls *tls, weida_subscriber **out)` | never | 0; `-WEIDA_EINVAL` ([pubsub.md](pubsub.md)) |
 | `int weida_runtime_shutdown(weida_runtime *rt, weida_runtime_shutdown_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
 | `int weida_runtime_drain(weida_runtime *rt, uint64_t deadline_ms, weida_runtime_drain_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
 | `uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt)` | never | duplicates discarded inside a negotiated `Deduplication::Bounded` window; 0 for NULL |

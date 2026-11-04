@@ -540,6 +540,18 @@ typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 typedef struct weida_drained weida_drained;
 
 /**
+ * A publish in progress (`FanOut`): one payload written once, a stream per
+ * subscriber. A running `weida_fan_out_write_within` holds the lock;
+ * `weida_fan_out_finish` takes the value out.
+ */
+typedef struct weida_fan_out weida_fan_out;
+
+/**
+ * The pending write of `weida_fan_out_write_within`.
+ */
+typedef struct weida_fan_out_write_within_op weida_fan_out_write_within_op;
+
+/**
  * `FilesOptions` under construction: one setter per field.
  */
 typedef struct weida_files_options weida_files_options;
@@ -675,6 +687,37 @@ typedef struct weida_pem weida_pem;
 typedef struct weida_pipe_binding weida_pipe_binding;
 
 /**
+ * The publishing half of Pub/Sub, serving one endpoint path.
+ */
+typedef struct weida_publisher weida_publisher;
+
+/**
+ * The receiving half of Push/Pull, serving one endpoint path.
+ */
+typedef struct weida_puller weida_puller;
+
+/**
+ * The sending half of Push/Pull: dials pullers and pushes to them
+ * round-robin.
+ */
+typedef struct weida_pusher weida_pusher;
+
+/**
+ * The pending dial of `weida_pusher_connect`.
+ */
+typedef struct weida_pusher_connect_op weida_pusher_connect_op;
+
+/**
+ * The pending open of `weida_pusher_open`.
+ */
+typedef struct weida_pusher_open_op weida_pusher_open_op;
+
+/**
+ * The pending send of `weida_pusher_send` and `weida_pusher_send_with`.
+ */
+typedef struct weida_pusher_send_op weida_pusher_send_op;
+
+/**
  * `ReconnectPolicy` under construction: one setter per field.
  */
 typedef struct weida_reconnect_policy weida_reconnect_policy;
@@ -772,6 +815,38 @@ typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
  * The TLS terms a QUIC binding serves on.
  */
 typedef struct weida_server_tls weida_server_tls;
+
+/**
+ * The subscribing half of Pub/Sub. The recv in flight is kept between
+ * tries, never recreated (R3a).
+ */
+typedef struct weida_subscriber weida_subscriber;
+
+/**
+ * The pending dial of `weida_subscriber_connect`.
+ */
+typedef struct weida_subscriber_connect_op weida_subscriber_connect_op;
+
+/**
+ * The pending grant of `weida_subscriber_grant`.
+ */
+typedef struct weida_subscriber_grant_op weida_subscriber_grant_op;
+
+/**
+ * The pending subscription of `weida_subscriber_subscribe`.
+ */
+typedef struct weida_subscriber_subscribe_op weida_subscriber_subscribe_op;
+
+/**
+ * The pending withdrawal of `weida_subscriber_unsubscribe`.
+ */
+typedef struct weida_subscriber_unsubscribe_op weida_subscriber_unsubscribe_op;
+
+/**
+ * One snapshot of what a publisher dropped, one record per topic
+ * (`TopicDrops`).
+ */
+typedef struct weida_topic_drops weida_topic_drops;
 
 /**
  * The metadata an outgoing transfer carries in its header.
@@ -2650,6 +2725,971 @@ void weida_incoming_request_drop(weida_incoming_request *q);
  * for the call.
  */
 int weida_poll(weida_poll_item *items, size_t n, int64_t timeout_ms);
+
+/**
+ * Registers a publisher at the endpoint path `path`
+ * (`Listener::publisher`). Subscriptions that arrived before this call are
+ * already recorded. Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
+ * `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_publisher_drop`.
+ */
+int weida_listener_publisher(const weida_listener *l, const char *path, weida_publisher **out);
+
+/**
+ * The endpoint path this publisher serves. Lives as long as the publisher.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher; `len_out` is NULL or writable.
+ */
+const char *weida_publisher_path(const weida_publisher *p, size_t *len_out);
+
+/**
+ * Fans `data` out to every subscriber whose filter matches `topic`
+ * (`Publisher::publish`) and writes how many it was enqueued to. The data
+ * is copied. Never blocks: a subscriber whose byte budget is exhausted
+ * loses this message, counted by `weida_publisher_dropped`; zero
+ * subscribers is not an error.
+ *
+ * Fails with `-WEIDA_ELIMIT_EXCEEDED` for `len` above
+ * `subscriber_buffer_bytes` or a topic above 256 bytes.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher; `topic` is NULL or a NUL-terminated
+ * string; `data` is NULL only with `len == 0`, else points to `len`
+ * readable bytes; `out` is NULL or writable.
+ */
+int weida_publisher_publish(const weida_publisher *p,
+                            const char *topic,
+                            const uint8_t *data,
+                            size_t len,
+                            size_t *out);
+
+/**
+ * `weida_publisher_publish` propagating a trace context
+ * (`Publisher::publish_with_trace`), given as its W3C version-00
+ * `traceparent` text; anything else is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * As `weida_publisher_publish`; `traceparent` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_publisher_publish_with_trace(const weida_publisher *p,
+                                       const char *topic,
+                                       const uint8_t *data,
+                                       size_t len,
+                                       const char *traceparent,
+                                       size_t *out);
+
+/**
+ * Opens a streamed publish on `topic` (`Publisher::open`): one stream per
+ * subscriber matched at this call, written chunk by chunk with
+ * `weida_fan_out_write_within` or `weida_fan_out_write_now` and ended with
+ * `weida_fan_out_finish`. Never blocks.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher; `topic` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_fan_out_finish` or `weida_fan_out_drop`.
+ */
+int weida_publisher_open(const weida_publisher *p, const char *topic, weida_fan_out **out);
+
+/**
+ * `weida_publisher_open` propagating a trace context
+ * (`Publisher::open_with_trace`), given as its W3C version-00
+ * `traceparent` text; anything else is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * As `weida_publisher_open`; `traceparent` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_publisher_open_with_trace(const weida_publisher *p,
+                                    const char *topic,
+                                    const char *traceparent,
+                                    weida_fan_out **out);
+
+/**
+ * The connections subscribed to this publisher
+ * (`Publisher::subscriber_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher.
+ */
+size_t weida_publisher_subscriber_count(const weida_publisher *p);
+
+/**
+ * The filters registered on this publisher, summed over subscribers
+ * (`Publisher::filter_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher.
+ */
+size_t weida_publisher_filter_count(const weida_publisher *p);
+
+/**
+ * The messages dropped because a subscriber could not take them, summed
+ * over topics and causes (`Publisher::dropped`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher.
+ */
+uint64_t weida_publisher_dropped(const weida_publisher *p);
+
+/**
+ * What was dropped on `topic`, by cause (`Publisher::dropped_on`): a
+ * snapshot of one record, or of none when nothing was. Never blocks.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher; `topic` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the snapshot with
+ * `weida_topic_drops_drop`.
+ */
+int weida_publisher_dropped_on(const weida_publisher *p,
+                               const char *topic,
+                               weida_topic_drops **out);
+
+/**
+ * Every topic that lost a copy, with its counts by cause
+ * (`Publisher::drops`): a snapshot read with the `weida_topic_drops_*`
+ * getters. Never blocks.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher; `out` is NULL or writable. Release the
+ * snapshot with `weida_topic_drops_drop`.
+ */
+int weida_publisher_drops(const weida_publisher *p, weida_topic_drops **out);
+
+/**
+ * Releases a publisher; its path stays registered, as a dropped Rust
+ * `Publisher` leaves it. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live publisher, dropped at most once.
+ */
+void weida_publisher_drop(weida_publisher *p);
+
+/**
+ * The topic this fan-out publishes on. Lives as long as the fan-out.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fan-out; `len_out` is NULL or writable.
+ */
+const char *weida_fan_out_topic(const weida_fan_out *f, size_t *len_out);
+
+/**
+ * Writes the subscribers still receiving this transfer
+ * (`FanOut::subscribers`). It only falls. `-WEIDA_EINVAL` while a
+ * `weida_fan_out_write_within` op runs.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fan-out; `out` is NULL or writable.
+ */
+int weida_fan_out_subscribers(const weida_fan_out *f, size_t *out);
+
+/**
+ * Writes the next chunk to every subscriber still receiving, waiting up to
+ * `limit_ms` for those that have no room (`FanOut::write_within`). The
+ * limit is for the whole call, not per subscriber; one that frees no room
+ * in time loses the transfer, and only it. The chunk is copied.
+ *
+ * Never blocks; the write runs as the op written to `out`, whose wait
+ * yields the subscribers left. Until it finished, every other call on the
+ * fan-out is `-WEIDA_EINVAL`. A chunk above `subscriber_buffer_bytes`
+ * fails the wait with `-WEIDA_ELIMIT_EXCEEDED`.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fan-out; `chunk` is NULL only with `len == 0`,
+ * else points to `len` readable bytes; `out` is NULL or writable. Release
+ * the op with `weida_fan_out_write_within_op_drop`.
+ */
+int weida_fan_out_write_within(const weida_fan_out *f,
+                               const uint8_t *chunk,
+                               size_t len,
+                               uint64_t limit_ms,
+                               weida_fan_out_write_within_op **out);
+
+/**
+ * The readiness descriptor of a write op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live write op; `out` is NULL or writable.
+ */
+int weida_fan_out_write_within_op_fd(const weida_fan_out_write_within_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the write and writes the subscribers
+ * left to `out`.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live write op; `out` is NULL or writable.
+ */
+int weida_fan_out_write_within_op_wait(const weida_fan_out_write_within_op *op,
+                                       int64_t timeout_ms,
+                                       size_t *out);
+
+/**
+ * Releases a write op. Dropped unfinished, the write is abandoned: the
+ * chunk reached some subscribers and not the rest, so later writes fail
+ * with `-WEIDA_ECANCELED` and `weida_fan_out_finish` counts 0, aborting
+ * every copy. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live write op, dropped at most once.
+ */
+void weida_fan_out_write_within_op_drop(weida_fan_out_write_within_op *op);
+
+/**
+ * Writes the next chunk without ever waiting (`FanOut::write_now`) and
+ * writes the subscribers left: one with no room right now loses the
+ * transfer. The chunk is copied. Fails with `-WEIDA_ELIMIT_EXCEEDED` for
+ * a chunk above `subscriber_buffer_bytes`, `-WEIDA_ECANCELED` after an
+ * abandoned `weida_fan_out_write_within`, and `-WEIDA_EINVAL` while one
+ * runs.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fan-out; `chunk` is NULL only with `len == 0`,
+ * else points to `len` readable bytes; `out` is NULL or writable.
+ */
+int weida_fan_out_write_now(const weida_fan_out *f, const uint8_t *chunk, size_t len, size_t *out);
+
+/**
+ * Ends the transfer (`FanOut::finish`) and writes how many subscribers
+ * received all of it as far as this side can tell. **Consumes** `f` on
+ * every return path.
+ *
+ * After an abandoned `weida_fan_out_write_within` it aborts every copy
+ * and writes 0. While a write op runs it fails with `-WEIDA_EINVAL`, and
+ * the copies abort once that write ends; a NULL `out` fails the same way
+ * and aborts them at once.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fan-out, not used again; `out` is NULL or
+ * writable.
+ */
+int weida_fan_out_finish(weida_fan_out *f, size_t *out);
+
+/**
+ * Releases a fan-out without finishing it: every copy not finished is
+ * aborted, once a running write op ends. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fan-out, dropped at most once.
+ */
+void weida_fan_out_drop(weida_fan_out *f);
+
+/**
+ * The number of records, one per topic that lost a copy; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot.
+ */
+size_t weida_topic_drops_len(const weida_topic_drops *d);
+
+/**
+ * The topic of record `index`; NULL past the end. Lives as long as `d`.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `len_out` is NULL or writable.
+ */
+const char *weida_topic_drops_topic(const weida_topic_drops *d, size_t index, size_t *len_out);
+
+/**
+ * `TopicDrops::subscriber_budget` of record `index`, copies dropped for an
+ * exhausted subscriber byte budget: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_subscriber_budget(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `TopicDrops::subscriber_queue` of record `index`, copies dropped for a
+ * full subscriber queue: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_subscriber_queue(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `TopicDrops::no_parked_connection` of record `index`, copies dropped
+ * because the subscriber had parked no connection: 1 and `*out`, 0 past
+ * the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_no_parked_connection(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `TopicDrops::superseded` of record `index`, RADIO copies reset because a
+ * newer segment opened on the topic: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_superseded(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `TopicDrops::expired` of record `index`, RADIO copies reset because the
+ * dish's `max_age` passed: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_expired(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `TopicDrops::too_large` of record `index`, RADIO datagram segments
+ * larger than the dish's connection carries: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_too_large(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `TopicDrops::no_datagrams` of record `index`, RADIO datagram segments
+ * for a dish that carries no datagrams: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_no_datagrams(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `TopicDrops::layers_cut` of record `index`, segment copies that lost
+ * layers above 0 and kept layer 0: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_topic_drops_layers_cut(const weida_topic_drops *d, size_t index, uint64_t *out);
+
+/**
+ * Releases a drops snapshot. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot, dropped at most once.
+ */
+void weida_topic_drops_drop(weida_topic_drops *d);
+
+/**
+ * Creates a subscriber that dials on `tls`'s terms
+ * (`Runtime::subscriber`). Two subscribers on one runtime share the pooled
+ * connection, so their paths collide with `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime; `tls` is NULL or live client terms;
+ * `out` is NULL or writable. Release the result with
+ * `weida_subscriber_drop`.
+ */
+int weida_runtime_subscriber(const weida_runtime *rt,
+                             const weida_client_tls *tls,
+                             weida_subscriber **out);
+
+/**
+ * Dials `url` (`Subscriber::connect`), e.g. `weida+inproc://bus/md`, and
+ * subscribes there to every filter registered so far. The runtime redials
+ * it when the connection is lost, filters included; what was published in
+ * between is gone.
+ *
+ * Never blocks; the dial runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `url` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the op with
+ * `weida_subscriber_connect_op_drop`.
+ */
+int weida_subscriber_connect(const weida_subscriber *s,
+                             const char *url,
+                             weida_subscriber_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_subscriber_connect_op_fd(const weida_subscriber_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_subscriber_connect_op_wait(const weida_subscriber_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_subscriber_connect_op_drop(weida_subscriber_connect_op *op);
+
+/**
+ * Forgets a dialled address (`Subscriber::disconnect`): 1 when `url` was
+ * dialled and is now forgotten, 0 when it was not.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `url` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_subscriber_disconnect(const weida_subscriber *s, const char *url);
+
+/**
+ * The number of connected peers (`Subscriber::peer_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber.
+ */
+size_t weida_subscriber_peer_count(const weida_subscriber *s);
+
+/**
+ * A snapshot of the subscriber's live connections
+ * (`Subscriber::connection_stats`), read with the
+ * `weida_connection_stats_*` getters. Never blocks.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_subscriber_connection_stats(const weida_subscriber *s, weida_connection_stats **out);
+
+/**
+ * A new reader of the subscriber's peer events (`Subscriber::events`),
+ * read with `weida_peer_events_recv`: where a gap in the stream began and
+ * ended. Each call is an independent reader.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_subscriber_events(const weida_subscriber *s, weida_peer_events **out);
+
+/**
+ * Registers interest in every topic `filter` matches
+ * (`Subscriber::subscribe`), a segmented pattern of PROTOCOL.md §6.4: `*`
+ * one whole segment, a trailing `#` zero or more. Subscribing twice is
+ * idempotent. The filter is copied.
+ *
+ * Never blocks; the subscription runs as the op written to `out`. A
+ * filter outside the grammar fails its wait with `-WEIDA_EPROTOCOL`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `filter` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the op with
+ * `weida_subscriber_subscribe_op_drop`.
+ */
+int weida_subscriber_subscribe(const weida_subscriber *s,
+                               const char *filter,
+                               weida_subscriber_subscribe_op **out);
+
+/**
+ * The readiness descriptor of a subscribe op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live subscribe op; `out` is NULL or writable.
+ */
+int weida_subscriber_subscribe_op_fd(const weida_subscriber_subscribe_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the subscription: 0 once every
+ * connected peer was told.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live subscribe op.
+ */
+int weida_subscriber_subscribe_op_wait(const weida_subscriber_subscribe_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a subscribe op, aborting it when unfinished. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live subscribe op, dropped at most once.
+ */
+void weida_subscriber_subscribe_op_drop(weida_subscriber_subscribe_op *op);
+
+/**
+ * Withdraws a filter (`Subscriber::unsubscribe`); an unknown one is
+ * ignored. The filter is copied.
+ *
+ * Never blocks; the withdrawal runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `filter` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the op with
+ * `weida_subscriber_unsubscribe_op_drop`.
+ */
+int weida_subscriber_unsubscribe(const weida_subscriber *s,
+                                 const char *filter,
+                                 weida_subscriber_unsubscribe_op **out);
+
+/**
+ * The readiness descriptor of an unsubscribe op: readable once it
+ * finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live unsubscribe op; `out` is NULL or writable.
+ */
+int weida_subscriber_unsubscribe_op_fd(const weida_subscriber_unsubscribe_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the withdrawal: 0 once every
+ * connected peer was told.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live unsubscribe op.
+ */
+int weida_subscriber_unsubscribe_op_wait(const weida_subscriber_unsubscribe_op *op,
+                                         int64_t timeout_ms);
+
+/**
+ * Releases an unsubscribe op, aborting it when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live unsubscribe op, dropped at most once.
+ */
+void weida_subscriber_unsubscribe_op_drop(weida_subscriber_unsubscribe_op *op);
+
+/**
+ * States how many messages this subscriber accepts in total on `filter`
+ * (`Subscriber::grant`) and sends it to every connected peer: the L2
+ * credit a queue serving the path consults, absolute and cumulative; a
+ * limit below the standing one is ignored. A publisher consults none. The
+ * filter is copied.
+ *
+ * Never blocks; the grant runs as the op written to `out`. A filter
+ * outside the grammar fails its wait with `-WEIDA_EPROTOCOL`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `filter` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the op with
+ * `weida_subscriber_grant_op_drop`.
+ */
+int weida_subscriber_grant(const weida_subscriber *s,
+                           const char *filter,
+                           uint64_t limit,
+                           weida_subscriber_grant_op **out);
+
+/**
+ * The readiness descriptor of a grant op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live grant op; `out` is NULL or writable.
+ */
+int weida_subscriber_grant_op_fd(const weida_subscriber_grant_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the grant: 0 once every connected peer
+ * was told.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live grant op.
+ */
+int weida_subscriber_grant_op_wait(const weida_subscriber_grant_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a grant op, aborting it when unfinished. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live grant op, dropped at most once.
+ */
+void weida_subscriber_grant_op_drop(weida_subscriber_grant_op *op);
+
+/**
+ * The filters this subscriber registered (`Subscriber::filter_count`); 0
+ * for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber.
+ */
+size_t weida_subscriber_filter_count(const weida_subscriber *s);
+
+/**
+ * The subscriber's readiness descriptor (R11): readable when the next
+ * `weida_subscriber_recv` will not block.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `out` is NULL or writable.
+ */
+int weida_subscriber_fd(const weida_subscriber *s, int64_t *out);
+
+/**
+ * Takes the next published copy, waiting up to `timeout_ms` (R4) for one
+ * (`Subscriber::recv`). Its topic is `weida_incoming_meta_topic`.
+ * `-WEIDA_ENOT_CONNECTED` once the queue ended.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber; `out` is NULL or writable. Release the
+ * transfer with `weida_incoming_transfer_drop`.
+ */
+int weida_subscriber_recv(const weida_subscriber *s,
+                          int64_t timeout_ms,
+                          weida_incoming_transfer **out);
+
+/**
+ * Releases a subscriber, which tells its peers it is gone and drops its
+ * connections. A thread waiting in `weida_subscriber_recv` returns
+ * `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live subscriber, dropped at most once.
+ */
+void weida_subscriber_drop(weida_subscriber *s);
+
+/**
+ * Creates a pusher that dials on `tls`'s terms (`Runtime::pusher`).
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime; `tls` is NULL or live client terms;
+ * `out` is NULL or writable. Release the result with `weida_pusher_drop`.
+ */
+int weida_runtime_pusher(const weida_runtime *rt, const weida_client_tls *tls, weida_pusher **out);
+
+/**
+ * Dials `url` (`Pusher::connect`), e.g.
+ * `weida://sha256:…@127.0.0.1:7443/jobs` or `weida+inproc://bus/jobs`.
+ * The runtime redials it when the connection is lost.
+ *
+ * Never blocks; the dial runs as the op written to `out`. A peer whose key
+ * is not trusted fails its wait with `-WEIDA_EUNTRUSTED`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher; `url` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the op with
+ * `weida_pusher_connect_op_drop`.
+ */
+int weida_pusher_connect(const weida_pusher *p, const char *url, weida_pusher_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_pusher_connect_op_fd(const weida_pusher_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_pusher_connect_op_wait(const weida_pusher_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_pusher_connect_op_drop(weida_pusher_connect_op *op);
+
+/**
+ * Forgets a dialled address (`Pusher::disconnect`): 1 when `url` was
+ * dialled and is now forgotten, its connection closed and no longer
+ * redialled; 0 when it was not dialled.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher; `url` is NULL or a NUL-terminated string.
+ */
+int weida_pusher_disconnect(const weida_pusher *p, const char *url);
+
+/**
+ * The number of connected peers (`Pusher::peer_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher.
+ */
+size_t weida_pusher_peer_count(const weida_pusher *p);
+
+/**
+ * The bodies the outbox discarded (`Pusher::dropped`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher.
+ */
+uint64_t weida_pusher_dropped(const weida_pusher *p);
+
+/**
+ * A snapshot of the pusher's live connections
+ * (`Pusher::connection_stats`): one record per live dialled address, in
+ * dial order, read with the `weida_connection_stats_*` getters. Never
+ * blocks.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_pusher_connection_stats(const weida_pusher *p, weida_connection_stats **out);
+
+/**
+ * A new reader of the pusher's peer events (`Pusher::events`): every
+ * transition of its dialled addresses from this call on, read with
+ * `weida_peer_events_recv`. Each call is an independent reader.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_pusher_events(const weida_pusher *p, weida_peer_events **out);
+
+/**
+ * Opens a one-way transfer to the next peer, round-robin (`Pusher::open`),
+ * carrying `meta`, or empty metadata when `meta` is NULL; `meta` is copied
+ * at the call. Its `weida_outgoing_transfer_finish` hands back the
+ * delivery receipt that `weida_pusher_send` discards.
+ *
+ * Never blocks; the open runs as the op written to `out`. With every peer
+ * down it waits for the redial.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher; `meta` is NULL or live metadata; `out` is
+ * NULL or writable. Release the op with `weida_pusher_open_op_drop`.
+ */
+int weida_pusher_open(const weida_pusher *p,
+                      const weida_transfer_meta *meta,
+                      weida_pusher_open_op **out);
+
+/**
+ * The readiness descriptor of an open op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_pusher_open_op_fd(const weida_pusher_open_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the open and writes the transfer to
+ * `out`, written like a socket and ended with
+ * `weida_outgoing_transfer_finish`.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_pusher_open_op_wait(const weida_pusher_open_op *op,
+                              int64_t timeout_ms,
+                              weida_outgoing_transfer **out);
+
+/**
+ * Releases an open op. An unfinished open is aborted; a transfer it opened
+ * that no wait took is reset `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op, dropped at most once.
+ */
+void weida_pusher_open_op_drop(weida_pusher_open_op *op);
+
+/**
+ * Sends `body` as one message (`Pusher::send`). The body is copied.
+ *
+ * Never blocks; the send runs as the op written to `out`. With a live peer
+ * the body is written at once; with none it waits in the outbox and is
+ * written once a peer is back, in order, and a full outbox applies the
+ * configured backpressure. The delivery receipt is discarded: use
+ * `weida_pusher_open` for it.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher; `body` is NULL only with `len == 0`, else
+ * points to `len` readable bytes; `out` is NULL or writable. Release the
+ * op with `weida_pusher_send_op_drop`.
+ */
+int weida_pusher_send(const weida_pusher *p,
+                      const uint8_t *body,
+                      size_t len,
+                      weida_pusher_send_op **out);
+
+/**
+ * Sends `body` as one message carrying `meta` (`Pusher::send_with`):
+ * `weida_pusher_send` with metadata. `meta` is copied at the call; NULL is
+ * `TransferMeta::default()`. The body is copied.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher; `meta` is NULL or live metadata; `body` is
+ * NULL only with `len == 0`, else points to `len` readable bytes; `out` is
+ * NULL or writable. Release the op with `weida_pusher_send_op_drop`.
+ */
+int weida_pusher_send_with(const weida_pusher *p,
+                           const weida_transfer_meta *meta,
+                           const uint8_t *body,
+                           size_t len,
+                           weida_pusher_send_op **out);
+
+/**
+ * The readiness descriptor of a send op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op; `out` is NULL or writable.
+ */
+int weida_pusher_send_op_fd(const weida_pusher_send_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the send: 0 once the body is written
+ * or held in the outbox.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op.
+ */
+int weida_pusher_send_op_wait(const weida_pusher_send_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a send op, abandoning the send when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op, dropped at most once.
+ */
+void weida_pusher_send_op_drop(weida_pusher_send_op *op);
+
+/**
+ * Releases a pusher, which drops its connections. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pusher, dropped at most once.
+ */
+void weida_pusher_drop(weida_pusher *p);
+
+/**
+ * Registers a puller at the endpoint path `path` (`Listener::puller`).
+ * Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
+ * `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_puller_drop`.
+ */
+int weida_listener_puller(const weida_listener *l, const char *path, weida_puller **out);
+
+/**
+ * The endpoint path this puller serves. Lives as long as the puller.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live puller; `len_out` is NULL or writable.
+ */
+const char *weida_puller_path(const weida_puller *p, size_t *len_out);
+
+/**
+ * The puller's readiness descriptor (R11): readable when the next
+ * `weida_puller_recv` will not block.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live puller; `out` is NULL or writable.
+ */
+int weida_puller_fd(const weida_puller *p, int64_t *out);
+
+/**
+ * Takes the next transfer, waiting up to `timeout_ms` (R4) for one
+ * (`Puller::recv`). The transfer arrives as soon as its header does; its
+ * body is read like a socket or collected whole. `-WEIDA_ENOT_CONNECTED`
+ * once the queue ended.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live puller; `out` is NULL or writable. Release the
+ * transfer with `weida_incoming_transfer_drop`.
+ */
+int weida_puller_recv(const weida_puller *p, int64_t timeout_ms, weida_incoming_transfer **out);
+
+/**
+ * Releases a puller; its path stays registered, as a dropped Rust `Puller`
+ * leaves it. A thread waiting in `weida_puller_recv` returns
+ * `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live puller, dropped at most once.
+ */
+void weida_puller_drop(weida_puller *p);
 
 /**
  * Serves a relay on this listener (`Listener::relay`): hidden peers
@@ -4675,6 +5715,23 @@ int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out)
  * `m` is NULL or live metadata; `out` is NULL or writable.
  */
 int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out);
+
+/**
+ * What went missing before this transfer, when the connection negotiated
+ * `WEIDA_ORDERING_MODE_PER_PRODUCER_DETECT` and a number was skipped (or a
+ * reassembly hold released out of order): 1 with the number expected next
+ * in `*out_expected` and the one that arrived in `*out_seen`; `seen -
+ * expected` transfers are missing. 0 when nothing is missing or ordering
+ * is off, and for a NULL argument; the outs are then untouched.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out_expected` and `out_seen` are NULL or
+ * writable.
+ */
+int weida_incoming_meta_gap(const weida_incoming_meta *m,
+                            uint64_t *out_expected,
+                            uint64_t *out_seen);
 
 /**
  * The trace context the sender propagated, as its `traceparent` text; NULL

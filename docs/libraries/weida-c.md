@@ -33,7 +33,8 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::requester` | `weida_runtime_requester` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Runtime::shutdown` | `weida_runtime_shutdown` (op) | present; `abi::a_shutdown_finishes_with_an_exchange_abandoned` |
 | `Runtime::drain` | `weida_runtime_drain` (op, consumes; its wait yields a `weida_drained`) | present; `abi::a_drain_counts_a_reply_finished_before_it_as_delivered`, `abi::a_drain_with_nothing_pending_returns_at_once` (*drain*) |
-| `Runtime::peer`, `pusher`, `subscriber`, `dish`, `pair`, `surveyor`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
+| `Runtime::pusher`, `subscriber` | `weida_runtime_pusher`, `weida_runtime_subscriber` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Runtime::peer`, `dish`, `pair`, `surveyor`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
 | `Runtime::suppressed_duplicates`, `expired_transfers` | `weida_runtime_suppressed_duplicates`, `weida_runtime_expired_transfers` | present; `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (counts 0 then 1), `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport` (0 without deduplication) (*stats*) |
 | `Runtime::exec` | — | refused: it is the binding's own seam |
@@ -49,7 +50,8 @@ unit tests in `crates/weida-c/src/`.
 | `RelayRequest::admit`, `refuse` | `weida_relay_request_admit`, `_refuse` (ops, consume) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Drop for Relay`, `Drop for RelayRequest` (`NO_REPLY`) | `weida_relay_drop`, `weida_relay_request_drop` | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Binding::relay_events` | `weida_binding_relay_events` (a `weida_peer_events` queue; 0 for a binding not relayed) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
-| `Listener::puller`, `publisher`, `radio`, `acceptor`, `pair`, `respondent`, `seeder`, `bus` | — | absent: *patterns*, *raw peers*, *swarm* |
+| `Listener::puller`, `publisher` | `weida_listener_puller`, `weida_listener_publisher` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Listener::radio`, `acceptor`, `pair`, `respondent`, `seeder`, `bus` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Binding::local_addr` | `weida_binding_local_addr` | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Binding::close` | `weida_binding_close` (op) | present; `abi::a_closed_binding_refuses_the_next_dial` (*binding lifecycle*) |
 | `Binding::hand_over`, `Handoff::held`, `local_addr`, `into_parts` | `weida_binding_hand_over` (op, consumes; its wait yields a `weida_handoff`), `weida_handoff_held`, `_local_addr`, `_take_socket`, `_bytes` | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
@@ -149,7 +151,9 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingMeta::peer` | `weida_incoming_meta_peer_fingerprint` (`PeerIdentity::Key`), `_peer_uid`, `_peer_gid`, `_peer_pid` (`Local`), `_peer_sid`, `_peer_pid` (`Windows`) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain`, `abi::a_round_trip_over_unix_names_the_clients_uid`, `abi::a_round_trip_over_a_pipe_names_the_clients_sid`, `transfer::tests::every_peer_identity_reads_back_through_its_getters` (*local transports*) |
 | `IncomingMeta::peer_chain`, `PeerChain` | `weida_incoming_meta_peer_chain_len`, `_peer_chain_cert` (DER, leaf first) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
 | `IncomingMeta::trace`, `tracestate`, `achieved` | `weida_incoming_meta_trace`, `_tracestate`, `_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
-| `IncomingMeta::gap`, `segment`, `layer` | — | absent: *patterns* |
+| `IncomingMeta::gap`, `Gap` | `weida_incoming_meta_gap` (both fields) | present; `transfer::tests::a_gap_reads_back_through_its_getter`, `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
+| `Gap::missed` | — | refused: a computation over the two values the getter returns |
+| `IncomingMeta::segment`, `layer` | — | absent: *patterns* |
 | `IncomingMeta::report`, `report_mode`, `report_id` | — | absent: *cursors* |
 | `Fingerprint` | `sha256:` text everywhere | present |
 | `Error`, `LossCause` | the R9 constants and the thread-local record | present; `error::tests::every_variant_has_its_own_code_below_the_abi_codes`, `abi::a_server_outside_the_pins_is_untrusted` (`weida_last_error_fingerprint`) |
@@ -167,19 +171,50 @@ unit tests in `crates/weida-c/src/`.
 | `ConnectionStats`, `PathStats`, `RemoteStats`, `TransportStats`, `UdpCounts`, `connection_stats()` | present: `weida_connection_stats` and its getters ([stats.md](../c/stats.md)); `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport`, `abi::a_quic_connection_reports_its_transport` (*stats*) |
 | `PeerEvent`, `PeerEvents`, `GiveUp` | present: `weida_peer_events` (a try handle) and `weida_peer_event`, `WEIDA_PEER_EVENT_*`, `WEIDA_GIVE_UP_*`; `abi::a_replier_runtime_shut_down_reports_lost_then_retrying`, `stats::tests::every_peer_event_kind_reads_back_through_its_getters` (*stats*) |
 | `IdentityEvent`, `IdentityEvents`, `IdentitySource::events`, `TrustSource::events` | present: `weida_identity_events` (a try handle) and `weida_identity_event`, `WEIDA_IDENTITY_EVENT_*` ([identity.md](../c/identity.md)); `abi::a_files_identity_source_rotates_a_bindings_certificate`, `identity::tests::every_identity_event_kind_reads_back_through_its_getters`, `identity::tests::an_external_source_reports_its_updates_through_the_queue` (*identity*) |
-| `DishDrops`, `TopicDrops` | absent: *patterns* |
+| `TopicDrops` | present: `weida_topic_drops` and its getters ([pubsub.md](../c/pubsub.md)); `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
+| `TopicDrops::total` | refused: a computation over the eight counts the getters return |
+| `DishDrops` | absent: *patterns* |
 | `Drained` | present: `weida_drained`, `weida_drained_delivered`, `weida_drained_outstanding` ([runtime.md](../c/runtime.md)); `abi::a_drain_counts_a_reply_finished_before_it_as_delivered` (*drain*) |
 
-## 7. Patterns and helpers not yet mapped
+## 7. Patterns
 
-Push/Pull (`Pusher`, `Puller`), Pub/Sub (`Publisher`, `Subscriber`, `FanOut`), PAIR (`Paired`),
-SURVEY (`Surveyor`, `SurveyRun`, `Respondent`), BUS (`BusMember`), RADIO/DISH (`Radio`, `Dish`,
-`Join`, `JoinTerms`, `Received`, `Segment`, `SegmentTerms`, `MAX_SEGMENT_LAYERS`), datagram flows
-(`Flow`, `FlowInfo`, `FlowMeta`, `FlowStats`, `IncomingFlow`), the raw `Peer`, `Acceptor`,
-`Incoming`, `Consumer`, `ConsumerId`, `CreditGrant`, the cursor surface (`Cursors`, `CursorSet`,
-`Reporter`, `CursorLevel`, `ReportMode`), and SWARM (`Seeder`, `Swarm`, `Fetch`, `Blob`, `BlobId`
-and the rest behind the `swarm` feature): each absent, in the areas *patterns*, *flows*,
-*raw peers*, *cursors* and *swarm*.
+| `crates/weida` | C ABI | Verdict |
+| --- | --- | --- |
+| `Pusher::connect` | `weida_pusher_connect` (op) | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Pusher::disconnect`, `peer_count` | `weida_pusher_disconnect` (1 or 0), `weida_pusher_peer_count` | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Pusher::connection_stats`, `events` | `weida_pusher_connection_stats` (a snapshot handle), `weida_pusher_events` (a `weida_peer_events` queue) | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Pusher::dropped` | `weida_pusher_dropped` | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Pusher::open` | `weida_pusher_open` (op; its wait yields a `weida_outgoing_transfer`) | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Pusher::send`, `send_with` | `weida_pusher_send`, `_send_with` (ops) | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Puller::path` | `weida_puller_path` | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Puller::recv` | `weida_puller_recv` (try, R3a) | present; `abi::push_to_pull_over_inproc_arrives_in_order` (*patterns*) |
+| `Publisher::path` | `weida_publisher_path` | present; R7 getter (*patterns*) |
+| `Publisher::publish`, `publish_with_trace` | `weida_publisher_publish`, `_publish_with_trace` (plain functions, R3) | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Publisher::open`, `open_with_trace` | `weida_publisher_open`, `_open_with_trace` (a `weida_fan_out`) | present; `abi::a_fan_out_streams_one_payload_to_every_subscriber` (*patterns*) |
+| `Publisher::subscriber_count`, `filter_count` | `weida_publisher_subscriber_count`, `_filter_count` | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Publisher::dropped` | `weida_publisher_dropped` | present; `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
+| `Publisher::dropped_on`, `drops` | `weida_publisher_dropped_on`, `_drops` (`weida_topic_drops` snapshots) | present; `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
+| `Subscriber::connect` | `weida_subscriber_connect` (op) | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Subscriber::disconnect`, `peer_count` | `weida_subscriber_disconnect` (1 or 0), `weida_subscriber_peer_count` | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Subscriber::connection_stats`, `events` | `weida_subscriber_connection_stats`, `weida_subscriber_events` | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Subscriber::subscribe`, `unsubscribe` | `weida_subscriber_subscribe`, `_unsubscribe` (ops) | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Subscriber::filter_count` | `weida_subscriber_filter_count` | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `Subscriber::recv` | `weida_subscriber_recv` (try, R3a) | present; `abi::a_subscriber_receives_only_its_topic`, `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
+| `Subscriber::grant` | `weida_subscriber_grant` (op) | present; `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
+| `FanOut::topic`, `subscribers` | `weida_fan_out_topic`, `_subscribers` | present; `abi::a_fan_out_streams_one_payload_to_every_subscriber` (*patterns*) |
+| `FanOut::write_within` | `weida_fan_out_write_within` (op) | present; `abi::a_fan_out_streams_one_payload_to_every_subscriber` (*patterns*) |
+| `FanOut::write_now` | `weida_fan_out_write_now` | present; `abi::a_fan_out_streams_one_payload_to_every_subscriber` (*patterns*) |
+| `FanOut::finish` | `weida_fan_out_finish` (consumes) | present; `abi::a_fan_out_streams_one_payload_to_every_subscriber` (*patterns*) |
+| `Drop for FanOut` (aborts every copy) | `weida_fan_out_drop` | present; R1 (*patterns*) |
+
+PAIR (`Paired`), SURVEY (`Surveyor`, `SurveyRun`, `Respondent`), BUS (`BusMember`), RADIO/DISH
+(`Radio`, `Dish`, `Join`, `JoinTerms`, `Received`, `Segment`, `SegmentTerms`,
+`MAX_SEGMENT_LAYERS`), datagram flows (`Flow`, `FlowInfo`, `FlowMeta`, `FlowStats`,
+`IncomingFlow`), the raw `Peer`, `Acceptor`, `Incoming`, `Consumer`, `ConsumerId`,
+`CreditGrant`, the cursor surface (`Cursors`, `CursorSet`, `Reporter`, `CursorLevel`,
+`ReportMode`), and SWARM (`Seeder`, `Swarm`, `Fetch`, `Blob`, `BlobId` and the rest behind the
+`swarm` feature): each absent, in the areas *patterns*, *flows*, *raw peers*, *cursors* and
+*swarm*.
 
 ## 8. Interop evidence
 
@@ -189,7 +224,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the thirty-seven `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the forty-three `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -247,6 +282,10 @@ way a foreign caller calls it:
   events.
 - `FilesOptions::poll` is milliseconds (`_set_poll_ms`, R7); a file source's directory is UTF-8
   text (R7).
+- A call on a `weida_fan_out` while its `write_within` op runs is `-WEIDA_EINVAL`, where Rust's
+  borrow rules forbid it; `finish` then consumes the handle and the copies abort when the write
+  ends.
+- `Publisher::dropped_on`'s `Option` is a snapshot of 0 or 1 record.
 
 ## 10. The definition of done
 
@@ -261,7 +300,7 @@ is complete when no present row lacks a test.
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
 `config.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`, `transfer.rs`,
-`requester.rs`, `poll.rs`, `stats.rs`),
+`requester.rs`, `push.rs`, `pubsub.rs`, `poll.rs`, `stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

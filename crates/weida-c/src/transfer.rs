@@ -343,6 +343,42 @@ pub unsafe extern "C" fn weida_incoming_meta_sequence(
     unsafe { meta_number(m, out, |m| m.sequence) }
 }
 
+/// What went missing before this transfer, when the connection negotiated
+/// `WEIDA_ORDERING_MODE_PER_PRODUCER_DETECT` and a number was skipped (or a
+/// reassembly hold released out of order): 1 with the number expected next
+/// in `*out_expected` and the one that arrived in `*out_seen`; `seen -
+/// expected` transfers are missing. 0 when nothing is missing or ordering
+/// is off, and for a NULL argument; the outs are then untouched.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out_expected` and `out_seen` are NULL or
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_gap(
+    m: *const weida_incoming_meta,
+    out_expected: *mut u64,
+    out_seen: *mut u64,
+) -> c_int {
+    guard_or(0, || {
+        if m.is_null() || out_expected.is_null() || out_seen.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `m` is live metadata by this function's
+        // contract.
+        let Some(gap) = unsafe { &*m }.meta.gap else {
+            return 0;
+        };
+        // SAFETY: both outs are non-NULL and writable by this function's
+        // contract.
+        unsafe {
+            out_expected.write(gap.expected);
+            out_seen.write(gap.seen);
+        }
+        1
+    })
+}
+
 /// The trace context the sender propagated, as its `traceparent` text; NULL
 /// when it sent none or one that did not parse.
 ///
@@ -1054,7 +1090,7 @@ pub unsafe extern "C" fn weida_delivery_drop(d: *mut weida_delivery) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weida_rs::{Fingerprint, LocalPrincipal, ReportMode, WindowsPrincipal};
+    use weida_rs::{Fingerprint, Gap, LocalPrincipal, ReportMode, WindowsPrincipal};
 
     /// A string a getter handed out, copied.
     fn text(p: *const c_char, len: usize) -> Option<String> {
@@ -1068,6 +1104,11 @@ mod tests {
 
     /// Metadata with nothing but the given peer.
     fn meta(peer: Option<PeerIdentity>) -> Arc<weida_incoming_meta> {
+        meta_with(peer, None)
+    }
+
+    /// Metadata with nothing but the given peer and gap.
+    fn meta_with(peer: Option<PeerIdentity>, gap: Option<Gap>) -> Arc<weida_incoming_meta> {
         weida_incoming_meta::new(IncomingMeta {
             endpoint: None,
             content_len: None,
@@ -1078,7 +1119,7 @@ mod tests {
             peer,
             peer_chain: None,
             sequence: None,
-            gap: None,
+            gap,
             achieved: None,
             report: Vec::new(),
             report_mode: ReportMode::default(),
@@ -1173,5 +1214,36 @@ mod tests {
         // SAFETY: `windows` is live, `len` writable.
         unsafe { weida_incoming_meta_peer_sid(Arc::as_ptr(&windows), &mut len) };
         assert_eq!(len, 19);
+    }
+
+    #[test]
+    fn a_gap_reads_back_through_its_getter() {
+        let read = |m: *const weida_incoming_meta, seen: bool| {
+            let (mut expected, mut seen_out) = (u64::MAX, u64::MAX);
+            let seen_ptr: *mut u64 = if seen {
+                &mut seen_out
+            } else {
+                std::ptr::null_mut()
+            };
+            // SAFETY: `m` is NULL or live for this call; the outs are NULL or
+            // writable.
+            let rc = unsafe { weida_incoming_meta_gap(m, &mut expected, seen_ptr) };
+            (rc, expected, seen_out)
+        };
+        let gapped = meta_with(
+            None,
+            Some(Gap {
+                expected: 2,
+                seen: 5,
+            }),
+        );
+        assert_eq!(read(Arc::as_ptr(&gapped), true), (1, 2, 5));
+        assert_eq!(
+            read(Arc::as_ptr(&meta(None)), true),
+            (0, u64::MAX, u64::MAX),
+            "no gap leaves both outs untouched"
+        );
+        assert_eq!(read(Arc::as_ptr(&gapped), false).0, 0, "a NULL out_seen");
+        assert_eq!(read(std::ptr::null(), true), (0, u64::MAX, u64::MAX));
     }
 }

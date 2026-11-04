@@ -2869,3 +2869,706 @@ fn a_refused_lookup_fails_the_connect_with_einvalid_address() {
     // SAFETY: dropped once.
     unsafe { weida_resolver_drop(r) };
 }
+
+// --- patterns: Push/Pull and Pub/Sub ----------------------------------------
+
+type LimitSetter = unsafe extern "C" fn(*const weida_limits, u64) -> c_int;
+
+/// A configuration whose guarantee set asks for `ordering` and whose limits
+/// have each setter applied. The caller drops it.
+fn pattern_config(ordering: c_int, limits: &[(LimitSetter, u64)]) -> *mut weida_runtime_config {
+    let mut cfg = ptr::null_mut();
+    let mut g = ptr::null_mut();
+    let mut l = ptr::null_mut();
+    // SAFETY: writable out-parameters and live handles; `g` and `l` are
+    // dropped once.
+    unsafe {
+        ok(weida_runtime_config_new(&mut cfg));
+        ok(weida_guarantee_set_new(&mut g));
+        ok(weida_guarantee_set_set_ordering(g, ordering));
+        ok(weida_runtime_config_set_guarantees(cfg, g));
+        weida_guarantee_set_drop(g);
+        ok(weida_limits_new(&mut l));
+        for (set, value) in limits {
+            ok(set(l, *value));
+        }
+        ok(weida_runtime_config_set_limits(cfg, l));
+        weida_limits_drop(l);
+    }
+    cfg
+}
+
+/// A new listener of `rt` bound to the inproc bus `bus`.
+fn bound(rt: *mut weida_runtime, bus: &str) -> (*mut weida_listener, *mut weida_local_binding) {
+    let l = listener(rt);
+    let mut lb = ptr::null_mut();
+    let name = c(bus);
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_bind_inproc(l, name.as_ptr(), &mut lb) });
+    (l, lb)
+}
+
+/// Client terms that trust each address; the caller drops them.
+fn client_tls() -> *mut weida_client_tls {
+    let trust = trust_by_address();
+    let mut tls = ptr::null_mut();
+    // SAFETY: a live trust, dropped once, and a writable out-parameter.
+    unsafe {
+        ok(weida_client_tls_new(trust, &mut tls));
+        weida_trust_drop(trust);
+    }
+    tls
+}
+
+fn pusher(rt: *mut weida_runtime) -> *mut weida_pusher {
+    let tls = client_tls();
+    let mut p = ptr::null_mut();
+    // SAFETY: live handles, `tls` dropped once, and a writable out-parameter.
+    unsafe {
+        ok(weida_runtime_pusher(rt, tls, &mut p));
+        weida_client_tls_drop(tls);
+    }
+    p
+}
+
+fn subscriber(rt: *mut weida_runtime) -> *mut weida_subscriber {
+    let tls = client_tls();
+    let mut s = ptr::null_mut();
+    // SAFETY: live handles, `tls` dropped once, and a writable out-parameter.
+    unsafe {
+        ok(weida_runtime_subscriber(rt, tls, &mut s));
+        weida_client_tls_drop(tls);
+    }
+    s
+}
+
+/// Starts an op with `start`, settles its wait and drops it: the status the
+/// wait ended with.
+fn run_op<O>(
+    what: &str,
+    start: impl FnOnce(*mut *mut O) -> c_int,
+    wait: unsafe extern "C" fn(*const O, i64) -> c_int,
+    drop: unsafe extern "C" fn(*mut O),
+) -> c_int {
+    let mut op = ptr::null_mut();
+    ok(start(&mut op));
+    // SAFETY: a live op.
+    let rc = settle(what, |ms| unsafe { wait(op, ms) });
+    // SAFETY: the op is dropped once.
+    unsafe { drop(op) };
+    rc
+}
+
+fn pusher_connect(p: *mut weida_pusher, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the dial",
+        // SAFETY: a live pusher, a C string and a writable out-parameter.
+        |op| unsafe { weida_pusher_connect(p, url.as_ptr(), op) },
+        weida_pusher_connect_op_wait,
+        weida_pusher_connect_op_drop,
+    )
+}
+
+fn subscriber_connect(s: *mut weida_subscriber, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the dial",
+        // SAFETY: a live subscriber, a C string and a writable out-parameter.
+        |op| unsafe { weida_subscriber_connect(s, url.as_ptr(), op) },
+        weida_subscriber_connect_op_wait,
+        weida_subscriber_connect_op_drop,
+    )
+}
+
+fn subscribe(s: *mut weida_subscriber, filter: &str) -> c_int {
+    let filter = c(filter);
+    run_op(
+        "the subscription",
+        // SAFETY: a live subscriber, a C string and a writable out-parameter.
+        |op| unsafe { weida_subscriber_subscribe(s, filter.as_ptr(), op) },
+        weida_subscriber_subscribe_op_wait,
+        weida_subscriber_subscribe_op_drop,
+    )
+}
+
+fn send(p: *mut weida_pusher, body: &[u8]) {
+    ok(run_op(
+        "the send",
+        // SAFETY: a live pusher, `body.len()` readable bytes and a writable
+        // out-parameter.
+        |op| unsafe { weida_pusher_send(p, body.as_ptr(), body.len(), op) },
+        weida_pusher_send_op_wait,
+        weida_pusher_send_op_drop,
+    ));
+}
+
+fn pull(p: *mut weida_puller) -> *mut weida_incoming_transfer {
+    let mut t = ptr::null_mut();
+    // SAFETY: a live puller and a writable out-parameter.
+    ok(settle("a pushed transfer", |ms| unsafe {
+        weida_puller_recv(p, ms, &mut t)
+    }));
+    assert!(!t.is_null());
+    t
+}
+
+fn next_copy(s: *mut weida_subscriber) -> *mut weida_incoming_transfer {
+    let mut t = ptr::null_mut();
+    // SAFETY: a live subscriber and a writable out-parameter.
+    ok(settle("a published copy", |ms| unsafe {
+        weida_subscriber_recv(s, ms, &mut t)
+    }));
+    assert!(!t.is_null());
+    t
+}
+
+/// Publishes `data` on `topic`: how many subscribers it was enqueued to.
+fn publish(p: *mut weida_publisher, topic: &str, data: &[u8]) -> usize {
+    let topic = c(topic);
+    let mut n = usize::MAX;
+    // SAFETY: a live publisher, a C string, `data.len()` readable bytes and
+    // a writable out-parameter.
+    ok(unsafe { weida_publisher_publish(p, topic.as_ptr(), data.as_ptr(), data.len(), &mut n) });
+    n
+}
+
+/// The whole body of `t`, consuming it.
+fn body(t: *mut weida_incoming_transfer) -> Vec<u8> {
+    let msg = collect(t, 1 << 20).expect("the body");
+    // SAFETY: a live message, dropped once.
+    unsafe {
+        let data = std::slice::from_raw_parts(weida_msg_data(msg), weida_msg_len(msg)).to_vec();
+        weida_msg_drop(msg);
+        data
+    }
+}
+
+/// The metadata of `t`; the caller drops it.
+fn meta_of(t: *mut weida_incoming_transfer) -> *mut weida_incoming_meta {
+    let mut m = ptr::null_mut();
+    // SAFETY: a live transfer and a writable out-parameter.
+    ok(unsafe { weida_incoming_transfer_meta(t, &mut m) });
+    m
+}
+
+fn gap(meta: *mut weida_incoming_meta) -> Option<(u64, u64)> {
+    let (mut expected, mut seen) = (0u64, 0u64);
+    // SAFETY: live metadata and writable out-parameters.
+    (unsafe { weida_incoming_meta_gap(meta, &mut expected, &mut seen) } == 1)
+        .then_some((expected, seen))
+}
+
+fn sequence(meta: *mut weida_incoming_meta) -> Option<u64> {
+    let mut n = 0u64;
+    // SAFETY: live metadata and a writable out-parameter.
+    (unsafe { weida_incoming_meta_sequence(meta, &mut n) } == 1).then_some(n)
+}
+
+/// Waits until `p` holds `n` filters: the subscriptions arrived.
+fn await_filters(p: *mut weida_publisher, n: usize) {
+    weida_testkit::poll_until("the subscriptions", WAIT, || {
+        // SAFETY: a live publisher.
+        unsafe { weida_publisher_filter_count(p) == n }
+    });
+}
+
+/// One count of a drops snapshot: `Some` when present.
+fn drop_count(
+    d: *mut weida_topic_drops,
+    index: usize,
+    get: unsafe extern "C" fn(*const weida_topic_drops, usize, *mut u64) -> c_int,
+) -> Option<u64> {
+    let mut n = 0u64;
+    // SAFETY: a live snapshot and a writable out-parameter.
+    (unsafe { get(d, index, &mut n) } == 1).then_some(n)
+}
+
+#[test]
+fn push_to_pull_over_inproc_arrives_in_order() {
+    let cfg = pattern_config(WEIDA_ORDERING_MODE_PER_PRODUCER_REASSEMBLE, &[]);
+    let server = runtime_with(cfg);
+    let client = runtime_with(cfg);
+    let (l, lb) = bound(server, "abi-patterns-push");
+    let mut pull_end = ptr::null_mut();
+    let path = c("/jobs");
+    let mut len = 0usize;
+    // SAFETY: a live listener, a C string and writable out-parameters.
+    unsafe {
+        ok(weida_listener_puller(l, path.as_ptr(), &mut pull_end));
+        let at = weida_puller_path(pull_end, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("/jobs"));
+    }
+    let push = pusher(client);
+    let mut events = ptr::null_mut();
+    // SAFETY: a live pusher and a writable out-parameter.
+    ok(unsafe { weida_pusher_events(push, &mut events) });
+    let url = "weida+inproc://abi-patterns-push/jobs";
+    ok(pusher_connect(push, url));
+    until_connected(events);
+    // SAFETY: a live pusher; the reader is dropped once.
+    unsafe {
+        assert_eq!(weida_pusher_peer_count(push), 1);
+        weida_peer_events_drop(events);
+    }
+
+    send(push, b"one");
+    send(push, b"two");
+    let mut meta = ptr::null_mut();
+    let json = c("application/json");
+    // SAFETY: live handles, a C string and writable out-parameters; `meta`
+    // is copied by the send and dropped once.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut meta));
+        ok(weida_transfer_meta_set_content_type(meta, json.as_ptr()));
+    }
+    ok(run_op(
+        "the send",
+        // SAFETY: live handles, 5 readable bytes and a writable out-parameter.
+        |op| unsafe { weida_pusher_send_with(push, meta, b"three".as_ptr(), 5, op) },
+        weida_pusher_send_op_wait,
+        weida_pusher_send_op_drop,
+    ));
+    // SAFETY: dropped once.
+    unsafe { weida_transfer_meta_drop(meta) };
+    for (n, (expected, labelled)) in [
+        (&b"one"[..], None),
+        (b"two", None),
+        (b"three", Some("application/json")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let t = pull(pull_end);
+        let meta = meta_of(t);
+        assert_eq!(sequence(meta), Some(n as u64), "arrival order");
+        assert_eq!(gap(meta), None);
+        assert_eq!(content_type(meta).as_deref(), labelled);
+        // SAFETY: dropped once.
+        unsafe { weida_incoming_meta_drop(meta) };
+        assert_eq!(body(t), expected);
+    }
+
+    let mut meta = ptr::null_mut();
+    let mut out = ptr::null_mut();
+    let mut delivery = ptr::null_mut();
+    let content_type_text = c("text/plain");
+    // SAFETY: live handles, each dropped or consumed once, and writable
+    // out-parameters.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut meta));
+        ok(weida_transfer_meta_set_content_type(
+            meta,
+            content_type_text.as_ptr(),
+        ));
+        let mut op = ptr::null_mut();
+        ok(weida_pusher_open(push, meta, &mut op));
+        weida_transfer_meta_drop(meta);
+        ok(settle("the open", |ms| {
+            weida_pusher_open_op_wait(op, ms, &mut out)
+        }));
+        weida_pusher_open_op_drop(op);
+    }
+    write_all(out, b"four");
+    // SAFETY: a live transfer, consumed, and a writable out-parameter.
+    ok(unsafe { weida_outgoing_transfer_finish(out, &mut delivery) });
+    let fourth = pull(pull_end);
+    let meta = meta_of(fourth);
+    assert_eq!(content_type(meta).as_deref(), Some("text/plain"));
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    assert_eq!(body(fourth), b"four");
+    ok(run_op(
+        "the delivery",
+        // SAFETY: a live receipt, consumed, and a writable out-parameter.
+        |op| unsafe { weida_delivery_delivered(delivery, op) },
+        weida_delivery_delivered_op_wait,
+        weida_delivery_delivered_op_drop,
+    ));
+
+    let mut stats = ptr::null_mut();
+    let url_c = c(url);
+    // SAFETY: live handles and writable out-parameters; `stats` is dropped
+    // once.
+    unsafe {
+        ok(weida_pusher_connection_stats(push, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 1);
+        let at = weida_connection_stats_url(stats, 0, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some(url));
+        weida_connection_stats_drop(stats);
+        assert_eq!(weida_pusher_dropped(push), 0);
+        assert_eq!(weida_pusher_disconnect(push, url_c.as_ptr()), 1);
+        assert_eq!(weida_pusher_disconnect(push, url_c.as_ptr()), 0);
+        assert_eq!(weida_pusher_peer_count(push), 0);
+
+        weida_pusher_drop(push);
+        weida_puller_drop(pull_end);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+        weida_runtime_config_drop(cfg);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn a_subscriber_receives_only_its_topic() {
+    let server = runtime();
+    let (l, lb) = bound(server, "abi-patterns-topics");
+    let mut p = ptr::null_mut();
+    let path = c("/md");
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_publisher(l, path.as_ptr(), &mut p) });
+    let url = "weida+inproc://abi-patterns-topics/md";
+    // One runtime per subscriber: two on one runtime share the pooled
+    // connection and collide on the path.
+    let (c1, c2) = (runtime(), runtime());
+    let (s1, s2) = (subscriber(c1), subscriber(c2));
+    let mut events = ptr::null_mut();
+    // SAFETY: a live subscriber and a writable out-parameter.
+    ok(unsafe { weida_subscriber_events(s1, &mut events) });
+    ok(subscriber_connect(s1, url));
+    ok(subscriber_connect(s2, url));
+    until_connected(events);
+    // SAFETY: the reader is dropped once.
+    unsafe { weida_peer_events_drop(events) };
+    ok(subscribe(s1, "px.#"));
+    ok(subscribe(s2, "fx.#"));
+    assert_eq!(
+        subscribe(s1, "#.px"),
+        -WEIDA_EPROTOCOL,
+        "{}",
+        last_message()
+    );
+    await_filters(p, 2);
+    // SAFETY: a live publisher.
+    assert_eq!(unsafe { weida_publisher_subscriber_count(p) }, 2);
+
+    assert_eq!(publish(p, "px.eur", b"price"), 1);
+    let trace = new_trace();
+    let topic = c("fx.usd");
+    let mut n = 0usize;
+    // SAFETY: a live publisher, C strings, 4 readable bytes and a writable
+    // out-parameter.
+    ok(unsafe {
+        weida_publisher_publish_with_trace(
+            p,
+            topic.as_ptr(),
+            b"rate".as_ptr(),
+            4,
+            trace.as_ptr(),
+            &mut n,
+        )
+    });
+    assert_eq!(n, 1);
+
+    let t1 = next_copy(s1);
+    let m1 = meta_of(t1);
+    assert_eq!(
+        meta_text(m1, weida_incoming_meta_topic).as_deref(),
+        Some("px.eur")
+    );
+    assert_eq!(body(t1), b"price");
+    let t2 = next_copy(s2);
+    let m2 = meta_of(t2);
+    assert_eq!(
+        meta_text(m2, weida_incoming_meta_topic).as_deref(),
+        Some("fx.usd")
+    );
+    assert_eq!(
+        meta_text(m2, weida_incoming_meta_trace).as_deref(),
+        trace.to_str().ok()
+    );
+    assert_eq!(body(t2), b"rate");
+    for s in [s1, s2] {
+        let mut t = ptr::null_mut();
+        // SAFETY: a live subscriber and a writable out-parameter.
+        let rc = unsafe { weida_subscriber_recv(s, 200, &mut t) };
+        assert_eq!(rc, -WEIDA_EAGAIN, "only the subscribed topic arrives");
+    }
+
+    let filter = c("px.#");
+    ok(run_op(
+        "the grant",
+        // SAFETY: a live subscriber, a C string and a writable out-parameter.
+        |op| unsafe { weida_subscriber_grant(s1, filter.as_ptr(), 10, op) },
+        weida_subscriber_grant_op_wait,
+        weida_subscriber_grant_op_drop,
+    ));
+    ok(run_op(
+        "the withdrawal",
+        // SAFETY: a live subscriber, a C string and a writable out-parameter.
+        |op| unsafe { weida_subscriber_unsubscribe(s1, filter.as_ptr(), op) },
+        weida_subscriber_unsubscribe_op_wait,
+        weida_subscriber_unsubscribe_op_drop,
+    ));
+    // SAFETY: a live subscriber.
+    assert_eq!(unsafe { weida_subscriber_filter_count(s1) }, 0);
+    await_filters(p, 1);
+    assert_eq!(publish(p, "px.eur", b"unheard"), 0);
+
+    let mut stats = ptr::null_mut();
+    let mut len = 0usize;
+    let url_c = c(url);
+    // SAFETY: live handles and writable out-parameters; `stats` is dropped
+    // once.
+    unsafe {
+        assert_eq!(weida_subscriber_peer_count(s2), 1);
+        ok(weida_subscriber_connection_stats(s2, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 1);
+        let at = weida_connection_stats_url(stats, 0, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some(url));
+        weida_connection_stats_drop(stats);
+        assert_eq!(weida_subscriber_disconnect(s2, url_c.as_ptr()), 1);
+        assert_eq!(weida_subscriber_disconnect(s2, url_c.as_ptr()), 0);
+        assert_eq!(weida_subscriber_peer_count(s2), 0);
+    }
+    await_filters(p, 0);
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(m1);
+        weida_incoming_meta_drop(m2);
+        weida_subscriber_drop(s1);
+        weida_subscriber_drop(s2);
+        weida_publisher_drop(p);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(c1);
+    shutdown(c2);
+    shutdown(server);
+}
+
+#[test]
+fn a_skipped_sequence_reads_as_a_gap_under_detect() {
+    const DETECT: c_int = WEIDA_ORDERING_MODE_PER_PRODUCER_DETECT;
+    const MSG: usize = 32 * 1024;
+    // A budget of two copies on the publisher, and a stream window on the
+    // subscriber that the first copy overflows: its writer stalls, the
+    // second copy fills the budget and the third is dropped.
+    let server_cfg = pattern_config(
+        DETECT,
+        &[(weida_limits_set_subscriber_buffer_bytes, 64 * 1024)],
+    );
+    let client_cfg = pattern_config(DETECT, &[(weida_limits_set_stream_receive_window, 8192)]);
+    let server = runtime_with(server_cfg);
+    let client = runtime_with(client_cfg);
+    let (l, lb) = bound(server, "abi-patterns-gap");
+    let mut p = ptr::null_mut();
+    let path = c("/md");
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_publisher(l, path.as_ptr(), &mut p) });
+    let s = subscriber(client);
+    ok(subscriber_connect(s, "weida+inproc://abi-patterns-gap/md"));
+    ok(subscribe(s, "px.#"));
+    await_filters(p, 1);
+
+    let payload = vec![0u8; MSG];
+    let mut published = 0u64;
+    weida_testkit::poll_until("a dropped copy", WAIT, || {
+        publish(p, "px.eur", &payload);
+        published += 1;
+        // SAFETY: a live publisher.
+        unsafe { weida_publisher_dropped(p) > 0 }
+    });
+    // SAFETY: a live publisher.
+    let lost = unsafe { weida_publisher_dropped(p) };
+    assert!(published > lost, "the first copy was deliverable");
+
+    let mut d = ptr::null_mut();
+    let mut len = 0usize;
+    // SAFETY: a live publisher and a writable out-parameter.
+    ok(unsafe { weida_publisher_drops(p, &mut d) });
+    // SAFETY: a live snapshot and a writable length.
+    unsafe {
+        assert_eq!(weida_topic_drops_len(d), 1);
+        let at = weida_topic_drops_topic(d, 0, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("px.eur"));
+        assert!(weida_topic_drops_topic(d, 1, &mut len).is_null());
+    }
+    assert_eq!(
+        drop_count(d, 0, weida_topic_drops_subscriber_budget),
+        Some(lost)
+    );
+    for other in [
+        weida_topic_drops_subscriber_queue,
+        weida_topic_drops_no_parked_connection,
+        weida_topic_drops_superseded,
+        weida_topic_drops_expired,
+        weida_topic_drops_too_large,
+        weida_topic_drops_no_datagrams,
+        weida_topic_drops_layers_cut,
+    ] {
+        assert_eq!(drop_count(d, 0, other), Some(0));
+    }
+    assert_eq!(drop_count(d, 1, weida_topic_drops_subscriber_budget), None);
+    // SAFETY: dropped once.
+    unsafe { weida_topic_drops_drop(d) };
+    for (topic, records) in [("px.eur", 1), ("fx.none", 0)] {
+        let topic = c(topic);
+        let mut d = ptr::null_mut();
+        // SAFETY: a live publisher, a C string and a writable
+        // out-parameter; the snapshot is dropped once.
+        unsafe {
+            ok(weida_publisher_dropped_on(p, topic.as_ptr(), &mut d));
+            assert_eq!(weida_topic_drops_len(d), records);
+            weida_topic_drops_drop(d);
+        }
+    }
+
+    // What arrived carries no gap yet: the lost copies were the last ones.
+    for _ in 0..published - lost {
+        let t = next_copy(s);
+        let meta = meta_of(t);
+        assert!(sequence(meta).is_some(), "detect numbers every copy");
+        assert_eq!(gap(meta), None);
+        // SAFETY: dropped once.
+        unsafe { weida_incoming_meta_drop(meta) };
+        assert_eq!(body(t).len(), MSG);
+    }
+
+    // The budget is free again: the next copy arrives and names the hole.
+    let mut t = ptr::null_mut();
+    weida_testkit::poll_until("a copy after the hole", WAIT, || {
+        publish(p, "px.eur", &payload);
+        // SAFETY: a live subscriber and a writable out-parameter.
+        let rc = unsafe { weida_subscriber_recv(s, 100, &mut t) };
+        assert!(rc == 0 || rc == -WEIDA_EAGAIN, "recv failed with {rc}");
+        rc == 0
+    });
+    let meta = meta_of(t);
+    let (expected, seen) = gap(meta).expect("the copy after the hole carries the gap");
+    // SAFETY: a live publisher.
+    let dropped = unsafe { weida_publisher_dropped(p) };
+    assert!(
+        (lost..=dropped).contains(&(seen - expected)),
+        "missed {} of {lost}..={dropped}",
+        seen - expected
+    );
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_incoming_transfer_drop(t);
+        weida_subscriber_drop(s);
+        weida_publisher_drop(p);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+        weida_runtime_config_drop(server_cfg);
+        weida_runtime_config_drop(client_cfg);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+/// Writes `chunk` to `f` without waiting: the subscribers left.
+fn write_now(f: *mut weida_fan_out, chunk: &[u8]) -> usize {
+    let mut n = usize::MAX;
+    // SAFETY: a live fan-out, `chunk.len()` readable bytes and a writable
+    // out-parameter.
+    ok(unsafe { weida_fan_out_write_now(f, chunk.as_ptr(), chunk.len(), &mut n) });
+    n
+}
+
+/// Finishes `f`, consuming it: the subscribers that received all of it.
+fn finish(f: *mut weida_fan_out) -> usize {
+    let mut n = usize::MAX;
+    // SAFETY: a live fan-out, consumed, and a writable out-parameter.
+    ok(unsafe { weida_fan_out_finish(f, &mut n) });
+    n
+}
+
+#[test]
+fn a_fan_out_streams_one_payload_to_every_subscriber() {
+    let server = runtime();
+    let (l, lb) = bound(server, "abi-patterns-fan-out");
+    let mut p = ptr::null_mut();
+    let path = c("/md");
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_publisher(l, path.as_ptr(), &mut p) });
+    let client = runtime();
+    let s = subscriber(client);
+    ok(subscriber_connect(
+        s,
+        "weida+inproc://abi-patterns-fan-out/md",
+    ));
+    ok(subscribe(s, "px.#"));
+    await_filters(p, 1);
+
+    let topic = c("px.frame");
+    let mut f = ptr::null_mut();
+    let mut len = 0usize;
+    let mut left = usize::MAX;
+    // SAFETY: live handles, C strings and writable out-parameters.
+    unsafe {
+        ok(weida_publisher_open(p, topic.as_ptr(), &mut f));
+        let at = weida_fan_out_topic(f, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("px.frame"));
+        ok(weida_fan_out_subscribers(f, &mut left));
+    }
+    assert_eq!(left, 1);
+    let mut op = ptr::null_mut();
+    // SAFETY: a live fan-out, 3 readable bytes and a writable out-parameter;
+    // the op is dropped once.
+    unsafe {
+        ok(weida_fan_out_write_within(
+            f,
+            b"abc".as_ptr(),
+            3,
+            1000,
+            &mut op,
+        ));
+        ok(settle("the bounded write", |ms| {
+            weida_fan_out_write_within_op_wait(op, ms, &mut left)
+        }));
+        weida_fan_out_write_within_op_drop(op);
+    }
+    assert_eq!(left, 1);
+    assert_eq!(write_now(f, b"def"), 1);
+    assert_eq!(finish(f), 1);
+    let t = next_copy(s);
+    let meta = meta_of(t);
+    assert_eq!(
+        meta_text(meta, weida_incoming_meta_topic).as_deref(),
+        Some("px.frame")
+    );
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    assert_eq!(body(t), b"abcdef");
+
+    let bad = c("nope");
+    let trace = new_trace();
+    // SAFETY: a live publisher, C strings and a writable out-parameter.
+    unsafe {
+        let rc = weida_publisher_open_with_trace(p, topic.as_ptr(), bad.as_ptr(), &mut f);
+        assert_eq!(rc, -WEIDA_EINVAL);
+        ok(weida_publisher_open_with_trace(
+            p,
+            topic.as_ptr(),
+            trace.as_ptr(),
+            &mut f,
+        ));
+    }
+    assert_eq!(write_now(f, b"x"), 1);
+    assert_eq!(finish(f), 1);
+    let t = next_copy(s);
+    let meta = meta_of(t);
+    assert_eq!(
+        meta_text(meta, weida_incoming_meta_trace).as_deref(),
+        trace.to_str().ok()
+    );
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    assert_eq!(body(t), b"x");
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_subscriber_drop(s);
+        weida_publisher_drop(p);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}

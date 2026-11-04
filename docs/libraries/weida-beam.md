@@ -144,6 +144,10 @@ of the TLS terms, `weida_identity_source`, `weida_trust_source`, their weak form
 `weida_files_options`, and the event queue `weida_identity_events` with `weida_identity_event`.
 TLS terms still take an identity and a trust as values, under `weida/0`.
 
+Push/Pull and Pub/Sub of the C ABI's *patterns* area are absent here: `weida_pusher`,
+`weida_puller`, `weida_publisher`, `weida_subscriber`, `weida_fan_out`, `weida_topic_drops` and
+`weida_incoming_meta_gap`.
+
 ## 7. Sources
 
 `crates/beam/weida/c_src/` (`weida_nif.c`, `build.sh`), `src/` (`weida.erl`, `weida_nif.erl`,

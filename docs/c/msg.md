@@ -20,13 +20,14 @@ request or transfer it came from. None of these functions blocks.
 | `const char *weida_incoming_meta_peer_sid(const weida_incoming_meta *m, size_t *len_out)` | the account SID (`S-1-...`) the kernel proved for a named-pipe peer, valid until `m` is dropped; NULL for any other peer |
 | `int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender stated a length, else 0 |
 | `int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender numbered the transfer, else 0 |
+| `int weida_incoming_meta_gap(const weida_incoming_meta *m, uint64_t *out_expected, uint64_t *out_seen)` | 1 with the number expected next and the one that arrived when the connection negotiated per-producer ordering and a number was skipped (`seen - expected` transfers are missing), else 0 with both outs untouched |
 | `const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out)` | the sender's trace context as `traceparent` text; NULL when it sent none or one that did not parse |
 | `const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out)` | the opaque `tracestate`; NULL when absent |
 | `int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out)` | 1 and the `WEIDA_ACKNOWLEDGEMENT_*` level in `*out` when the sender claimed one, else 0 |
 | `void weida_incoming_meta_drop(weida_incoming_meta *m)` | — |
 
 Strings follow R7: NUL-terminated, the exact length through `len_out` (NULL allowed), valid
-until `m` is dropped. The other fields of `IncomingMeta` (`gap`, `report`, `report_mode`,
+until `m` is dropped. The other fields of `IncomingMeta` (`report`, `report_mode`,
 `report_id`, `segment`, `layer`) are not mapped yet
 ([libraries/weida-c.md](../libraries/weida-c.md)).
 
