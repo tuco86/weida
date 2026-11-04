@@ -1287,6 +1287,14 @@ impl ConsumerId {
     pub(crate) fn from_conn(conn_id: usize) -> ConsumerId {
         ConsumerId(conn_id)
     }
+
+    /// The consumer's number: the serial of its connection, the same
+    /// number as that connection's [`ConnectionId::get`](crate::ConnectionId::get),
+    /// for a caller that keys on an integer, such as the C ABI. Two
+    /// connections of one process never share it.
+    pub fn get(self) -> u64 {
+        self.0 as u64
+    }
 }
 
 /// A consumer's absolute delivery limit for one subscription.
