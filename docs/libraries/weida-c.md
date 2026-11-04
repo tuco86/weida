@@ -35,7 +35,8 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::drain` | `weida_runtime_drain` (op, consumes; its wait yields a `weida_drained`) | present; `abi::a_drain_counts_a_reply_finished_before_it_as_delivered`, `abi::a_drain_with_nothing_pending_returns_at_once` (*drain*) |
 | `Runtime::pusher`, `subscriber` | `weida_runtime_pusher`, `weida_runtime_subscriber` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
 | `Runtime::pair`, `surveyor` | `weida_runtime_pair`, `weida_runtime_surveyor` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
-| `Runtime::peer`, `dish`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
+| `Runtime::dish` | `weida_runtime_dish` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Runtime::peer`, `swarm` | — | absent: *raw peers*, *swarm* |
 | `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
 | `Runtime::suppressed_duplicates`, `expired_transfers` | `weida_runtime_suppressed_duplicates`, `weida_runtime_expired_transfers` | present; `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (counts 0 then 1), `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport` (0 without deduplication) (*stats*) |
 | `Runtime::exec` | — | refused: it is the binding's own seam |
@@ -53,7 +54,8 @@ unit tests in `crates/weida-c/src/`.
 | `Binding::relay_events` | `weida_binding_relay_events` (a `weida_peer_events` queue; 0 for a binding not relayed) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Listener::puller`, `publisher` | `weida_listener_puller`, `weida_listener_publisher` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
 | `Listener::pair`, `respondent`, `bus` | `weida_listener_pair`, `weida_listener_respondent`, `weida_listener_bus` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window`, `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
-| `Listener::radio`, `acceptor`, `seeder` | — | absent: *patterns*, *raw peers*, *swarm* |
+| `Listener::radio` | `weida_listener_radio` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Listener::acceptor`, `seeder` | — | absent: *raw peers*, *swarm* |
 | `Binding::local_addr` | `weida_binding_local_addr` | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Binding::close` | `weida_binding_close` (op) | present; `abi::a_closed_binding_refuses_the_next_dial` (*binding lifecycle*) |
 | `Binding::hand_over`, `Handoff::held`, `local_addr`, `into_parts` | `weida_binding_hand_over` (op, consumes; its wait yields a `weida_handoff`), `weida_handoff_held`, `_local_addr`, `_take_socket`, `_bytes` | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
@@ -155,7 +157,7 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingMeta::trace`, `tracestate`, `achieved` | `weida_incoming_meta_trace`, `_tracestate`, `_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
 | `IncomingMeta::gap`, `Gap` | `weida_incoming_meta_gap` (both fields) | present; `transfer::tests::a_gap_reads_back_through_its_getter`, `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
 | `Gap::missed` | — | refused: a computation over the two values the getter returns |
-| `IncomingMeta::segment`, `layer` | — | absent: *patterns* |
+| `IncomingMeta::segment`, `layer` | `weida_incoming_meta_segment`, `_layer` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
 | `IncomingMeta::report`, `report_mode`, `report_id` | — | absent: *cursors* |
 | `Fingerprint` | `sha256:` text everywhere | present |
 | `Error`, `LossCause` | the R9 constants and the thread-local record | present; `error::tests::every_variant_has_its_own_code_below_the_abi_codes`, `abi::a_server_outside_the_pins_is_untrusted` (`weida_last_error_fingerprint`) |
@@ -175,7 +177,7 @@ unit tests in `crates/weida-c/src/`.
 | `IdentityEvent`, `IdentityEvents`, `IdentitySource::events`, `TrustSource::events` | present: `weida_identity_events` (a try handle) and `weida_identity_event`, `WEIDA_IDENTITY_EVENT_*` ([identity.md](../c/identity.md)); `abi::a_files_identity_source_rotates_a_bindings_certificate`, `identity::tests::every_identity_event_kind_reads_back_through_its_getters`, `identity::tests::an_external_source_reports_its_updates_through_the_queue` (*identity*) |
 | `TopicDrops` | present: `weida_topic_drops` and its getters ([pubsub.md](../c/pubsub.md)); `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
 | `TopicDrops::total` | refused: a computation over the eight counts the getters return |
-| `DishDrops` | absent: *patterns* |
+| `DishDrops` | present: `weida_dish_drops` and its getters ([radio.md](../c/radio.md)); `abi::a_superseded_segment_counts_in_dish_drops`, `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams`, `abi::a_radio_evicts_a_dish_by_its_key` (*patterns*) |
 | `Drained` | present: `weida_drained`, `weida_drained_delivered`, `weida_drained_outstanding` ([runtime.md](../c/runtime.md)); `abi::a_drain_counts_a_reply_finished_before_it_as_delivered` (*drain*) |
 
 ## 7. Patterns
@@ -235,14 +237,38 @@ unit tests in `crates/weida-c/src/`.
 | `BusMember::send`, `send_with` | `weida_bus_member_send`, `_send_with` (ops; their wait writes the members reached) | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
 | `BusMember::recv` | `weida_bus_member_recv` (try, R3a) | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
 | `BusMember::dropped` | `weida_bus_member_dropped` | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `Radio::path` | `weida_radio_path` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Radio::segment` | `weida_radio_segment` (a `weida_segment`) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Radio::datagram` | `weida_radio_datagram` (writes the dishes handed) | present; `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams` (*patterns*) |
+| `Radio::dish_count` | `weida_radio_dish_count` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Radio::dropped` | `weida_radio_dropped` | present; `abi::a_superseded_segment_counts_in_dish_drops` (*patterns*) |
+| `Radio::dropped_on`, `drops` | `weida_radio_dropped_on`, `_drops` (`weida_topic_drops` snapshots) | present; `abi::a_superseded_segment_counts_in_dish_drops`, `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams` (*patterns*) |
+| `Radio::evict` | `weida_radio_evict` (key as `sha256:` text) | present; `abi::a_radio_evicts_a_dish_by_its_key` (*patterns*) |
+| `Radio::dish_drops` | `weida_radio_dish_drops` (a `weida_dish_drops` snapshot) | present; `abi::a_superseded_segment_counts_in_dish_drops`, `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams`, `abi::a_radio_evicts_a_dish_by_its_key` (*patterns*) |
+| `Drop for Radio` (releases the path with the last handle) | `weida_radio_drop` | present; R1 (*patterns*) |
+| `Radio::with_admission`, `Join` | — | refused: a policy the connection's task calls synchronously before it records a join. 0045 decision 10 maps inverted control to queues and has no function pointers, and a queue would answer after the join was recorded. `weida_radio_evict` withdraws a join afterwards |
+| `Clone for Radio` | — | refused: one handle serves every thread (R5) |
+| `Segment::number`, `topic` | `weida_segment_number`, `_topic` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Segment::write`, `write_layer` | `weida_segment_write`, `_write_layer` (plain functions, R3) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Segment::finish_layer` | `weida_segment_finish_layer` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Segment::finish` | `weida_segment_finish` (consumes) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers`, `abi::a_superseded_segment_counts_in_dish_drops` (*patterns*) |
+| `Drop for Segment` (resets unfinished layers) | `weida_segment_drop` | present; R1 (*patterns*) |
+| `SegmentTerms` | `weida_segment_terms_*` (a builder) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `JoinTerms` | `weida_join_terms_*` (a builder) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `MAX_SEGMENT_LAYERS` | `WEIDA_MAX_SEGMENT_LAYERS` (asserted at compile time) | present (*patterns*) |
+| `Dish::connect` | `weida_dish_connect` (op) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Dish::peer_count`, `connection_stats`, `events` | `weida_dish_peer_count`, `_connection_stats` (a snapshot handle), `_events` (a `weida_peer_events` queue) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Dish::join`, `leave` | `weida_dish_join`, `_leave` (ops) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Dish::recv` | `weida_dish_recv` (try, R3a; a `weida_received`) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers`, `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams` (*patterns*) |
+| `Dish::stale`, `overflow` | `weida_dish_stale`, `_overflow` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
+| `Drop for Dish` | `weida_dish_drop` | present; R1 (*patterns*) |
+| `Received` | `weida_received` (`_kind`, `_take_segment`, `_topic`, `_segment`, `_payload`; `WEIDA_RECEIVED_*`) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers`, `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams` (*patterns*) |
 
-RADIO/DISH (`Radio`, `Dish`, `Join`, `JoinTerms`, `Received`, `Segment`, `SegmentTerms`,
-`MAX_SEGMENT_LAYERS`), datagram flows (`Flow`, `FlowInfo`, `FlowMeta`, `FlowStats`,
-`IncomingFlow`), the raw `Peer`, `Acceptor`, `Incoming`, `Consumer`, `ConsumerId`,
-`CreditGrant`, the cursor surface (`Cursors`, `CursorSet`, `Reporter`, `CursorLevel`,
-`ReportMode`), and SWARM (`Seeder`, `Swarm`, `Fetch`, `Blob`, `BlobId` and the rest behind the
-`swarm` feature): each absent, in the areas *patterns*, *flows*, *raw peers*, *cursors* and
-*swarm*.
+Datagram flows (`Flow`, `FlowInfo`, `FlowMeta`, `FlowStats`, `IncomingFlow`), the raw `Peer`,
+`Acceptor`, `Incoming`, `Consumer`, `ConsumerId`, `CreditGrant`, the cursor surface (`Cursors`,
+`CursorSet`, `Reporter`, `CursorLevel`, `ReportMode`), and SWARM (`Seeder`, `Swarm`, `Fetch`,
+`Blob`, `BlobId` and the rest behind the `swarm` feature): each absent, in the areas *flows*,
+*raw peers*, *cursors* and *swarm*.
 
 ## 8. Interop evidence
 
@@ -252,7 +278,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the forty-six `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the fifty `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -325,6 +351,16 @@ way a foreign caller calls it:
   `Binding::relay_events`.
 - A `deadline_ms` the clock cannot add is `-WEIDA_EINVAL` at `weida_surveyor_survey`, where
   Rust panics.
+- `Received` is a tagged handle, `weida_received`: `weida_received_kind` names the variant,
+  `weida_received_take_segment` hands a stream segment's transfer over once (a second call is
+  `-WEIDA_ECLOSED`, a datagram `-WEIDA_EINVAL`), and a datagram's fields are getters that read
+  absent on a stream segment.
+- `Radio::evict` takes the dish's key as `sha256:` text, and `DishDrops::peer` reads as
+  `weida_dish_drops_peer_fingerprint`, NULL for an anonymous peer or one that proved no key.
+- `SegmentTerms::priority` is `int32_t` in; outside `int16_t` it is `-WEIDA_EINVAL`.
+- `JoinTerms::max_layer` is an optional value in (R7); 16 to 255 fail the join with
+  `-WEIDA_ELIMIT_EXCEEDED`, as in Rust.
+- A segment's calls take its lock in turn, where Rust's `&mut self` forbids concurrent use.
 
 ## 10. The definition of done
 
@@ -339,8 +375,8 @@ is complete when no present row lacks a test.
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
 `config.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`, `transfer.rs`,
-`requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `bus.rs`, `poll.rs`,
-`stats.rs`),
+`requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `bus.rs`, `radio.rs`,
+`segment.rs`, `poll.rs`, `stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

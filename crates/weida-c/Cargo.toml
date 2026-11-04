@@ -34,6 +34,8 @@ weida_rs = { package = "weida", path = "../weida" }
 weida-core.workspace = true
 weida-runtime.workspace = true
 tokio.workspace = true
+# The payload of a datagram segment, held without a copy (weida_received).
+bytes.workspace = true
 # The bytes of a `weida_pem`, which may hold a private key, are wiped on drop.
 zeroize.workspace = true
 

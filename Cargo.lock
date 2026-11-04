@@ -3577,6 +3577,7 @@ dependencies = [
 name = "weida-c"
 version = "0.1.0-alpha.12-dev"
 dependencies = [
+ "bytes",
  "nix",
  "rcgen",
  "tokio",

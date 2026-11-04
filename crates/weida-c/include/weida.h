@@ -452,6 +452,21 @@
 #define WEIDA_POLLIN 1
 
 /**
+ * `Received::Segment`.
+ */
+#define WEIDA_RECEIVED_SEGMENT 0
+
+/**
+ * `Received::Datagram`.
+ */
+#define WEIDA_RECEIVED_DATAGRAM 1
+
+/**
+ * How many layers a segment carries: 0 to 15 (`MAX_SEGMENT_LAYERS`).
+ */
+#define WEIDA_MAX_SEGMENT_LAYERS 16
+
+/**
  * `PeerEvent::Connected`.
  */
 #define WEIDA_PEER_EVENT_CONNECTED 0
@@ -551,6 +566,33 @@ typedef struct weida_delivery weida_delivery;
 typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 
 /**
+ * The receiving half of RADIO/DISH. The recv in flight is kept across
+ * tries, never recreated (R3a).
+ */
+typedef struct weida_dish weida_dish;
+
+/**
+ * The pending dial of `weida_dish_connect`.
+ */
+typedef struct weida_dish_connect_op weida_dish_connect_op;
+
+/**
+ * A snapshot of what a radio dropped toward each joined dish
+ * (`DishDrops`).
+ */
+typedef struct weida_dish_drops weida_dish_drops;
+
+/**
+ * The pending join of `weida_dish_join`.
+ */
+typedef struct weida_dish_join_op weida_dish_join_op;
+
+/**
+ * The pending leave of `weida_dish_leave`.
+ */
+typedef struct weida_dish_leave_op weida_dish_leave_op;
+
+/**
  * What one drain achieved (`Drained`), read-only: two counts about the
  * transfers that were still unacknowledged when it started.
  */
@@ -640,6 +682,11 @@ typedef struct weida_incoming_transfer weida_incoming_transfer;
  * The pending collect of `weida_incoming_transfer_collect`.
  */
 typedef struct weida_incoming_transfer_collect_op weida_incoming_transfer_collect_op;
+
+/**
+ * `JoinTerms` under construction: one setter per field.
+ */
+typedef struct weida_join_terms weida_join_terms;
 
 /**
  * `Limits` under construction: one setter per field.
@@ -756,6 +803,17 @@ typedef struct weida_pusher_open_op weida_pusher_open_op;
 typedef struct weida_pusher_send_op weida_pusher_send_op;
 
 /**
+ * The sending half of RADIO/DISH, serving one endpoint path.
+ */
+typedef struct weida_radio weida_radio;
+
+/**
+ * One thing a dish received (`Received`), as a tagged handle: a stream
+ * segment's transfer until it is taken, or a datagram's fields.
+ */
+typedef struct weida_received weida_received;
+
+/**
  * `ReconnectPolicy` under construction: one setter per field.
  */
 typedef struct weida_reconnect_policy weida_reconnect_policy;
@@ -853,6 +911,18 @@ typedef struct weida_runtime_drain_op weida_runtime_drain_op;
  * The pending `Runtime::shutdown` of `weida_runtime_shutdown`.
  */
 typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
+
+/**
+ * One open segment (`Segment`). Its calls take the lock in turn, where
+ * Rust's `&mut self` forbids concurrent use; `weida_segment_finish` takes
+ * the value out.
+ */
+typedef struct weida_segment weida_segment;
+
+/**
+ * `SegmentTerms` under construction: one setter per field.
+ */
+typedef struct weida_segment_terms weida_segment_terms;
 
 /**
  * The TLS terms a QUIC binding serves on.
@@ -1688,6 +1758,101 @@ int weida_files_options_set_names(const weida_files_options *o, const char *cons
  * `o` is NULL or live options.
  */
 int weida_files_options_set_poll_ms(const weida_files_options *o, uint64_t v);
+
+/**
+ * Creates join terms holding weida's defaults (`JoinTerms::default`): no
+ * latency budget, every layer.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_join_terms_drop`.
+ */
+int weida_join_terms_new(weida_join_terms **out);
+
+/**
+ * Releases join terms. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `t` is NULL or live terms, dropped at most once.
+ */
+void weida_join_terms_drop(weida_join_terms *t);
+
+/**
+ * Sets `JoinTerms::max_age`, in milliseconds, or none for a negative
+ * value: a copy still unfinished this long after its segment opened is
+ * reset at the radio.
+ *
+ * # Safety
+ *
+ * `t` is NULL or live terms.
+ */
+int weida_join_terms_set_max_age_ms(const weida_join_terms *t, int64_t v);
+
+/**
+ * Sets `JoinTerms::max_layer`, the highest layer the dish takes, or none
+ * (every layer) for a negative value. Above 255 it is `-WEIDA_EINVAL`; 16
+ * to 255 are kept and fail the join with `-WEIDA_ELIMIT_EXCEEDED`, as in
+ * Rust.
+ *
+ * # Safety
+ *
+ * `t` is NULL or live terms.
+ */
+int weida_join_terms_set_max_layer(const weida_join_terms *t, int64_t v);
+
+/**
+ * Creates segment terms holding weida's defaults (`SegmentTerms::default`):
+ * no latency budget, priority 0, not following an upstream.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_segment_terms_drop`.
+ */
+int weida_segment_terms_new(weida_segment_terms **out);
+
+/**
+ * Releases segment terms. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `t` is NULL or live terms, dropped at most once.
+ */
+void weida_segment_terms_drop(weida_segment_terms *t);
+
+/**
+ * Sets `SegmentTerms::max_age`, in milliseconds, or none for a negative
+ * value: every copy still unfinished this long after the segment opened
+ * is reset.
+ *
+ * # Safety
+ *
+ * `t` is NULL or live terms.
+ */
+int weida_segment_terms_set_max_age_ms(const weida_segment_terms *t, int64_t v);
+
+/**
+ * Sets `SegmentTerms::priority`: higher goes first against other topics'
+ * copies of the same layer on one connection. Outside `int16_t` it is
+ * `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `t` is NULL or live terms.
+ */
+int weida_segment_terms_set_priority(const weida_segment_terms *t, int32_t v);
+
+/**
+ * Sets `SegmentTerms::follows_upstream` (a flag, R7): the writer relays a
+ * segment its upstream is still streaming.
+ *
+ * # Safety
+ *
+ * `t` is NULL or live terms.
+ */
+int weida_segment_terms_set_follows_upstream(const weida_segment_terms *t, int v);
 
 /**
  * The description of a status code, positive or negative.
@@ -4238,6 +4403,540 @@ int weida_puller_recv(const weida_puller *p, int64_t timeout_ms, weida_incoming_
 void weida_puller_drop(weida_puller *p);
 
 /**
+ * Registers a radio at the endpoint path `path` (`Listener::radio`).
+ * Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
+ * `-WEIDA_EALREADY_REGISTERED`. The path is released when the handle is
+ * dropped.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_radio_drop`.
+ */
+int weida_listener_radio(const weida_listener *l, const char *path, weida_radio **out);
+
+/**
+ * The endpoint path this radio serves. Lives as long as the radio.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio; `len_out` is NULL or writable.
+ */
+const char *weida_radio_path(const weida_radio *r, size_t *len_out);
+
+/**
+ * Opens the next segment on `topic` (`Radio::segment`), copied to every
+ * dish joined to it at this call and written with the `weida_segment_*`
+ * calls. NULL `terms` are `SegmentTerms::default()`. Opening it resets
+ * every unfinished layer of the topic's previous segment, counted
+ * `superseded`. Never blocks.
+ *
+ * Fails with `-WEIDA_ELIMIT_EXCEEDED` for a topic above 256 bytes, or when
+ * `max_sequence_scopes` topics all have a copy in flight.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio; `topic` is NULL or a NUL-terminated
+ * string; `terms` is NULL or live terms; `out` is NULL or writable.
+ * Release the result with `weida_segment_finish` or `weida_segment_drop`.
+ */
+int weida_radio_segment(const weida_radio *r,
+                        const char *topic,
+                        const weida_segment_terms *terms,
+                        weida_segment **out);
+
+/**
+ * Sends `payload` as one datagram segment to every dish joined to `topic`
+ * (`Radio::datagram`) and writes how many dishes it was handed to. The
+ * payload is copied. Never blocks: a dish whose connection carries no
+ * datagrams is a `no_datagrams` drop, one whose connection carries less
+ * a `too_large` drop.
+ *
+ * Fails with `-WEIDA_ELIMIT_EXCEEDED` for a topic above 256 bytes.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio; `topic` is NULL or a NUL-terminated
+ * string; `payload` is NULL only with `len == 0`, else points to `len`
+ * readable bytes; `out` is NULL or writable.
+ */
+int weida_radio_datagram(const weida_radio *r,
+                         const char *topic,
+                         const uint8_t *payload,
+                         size_t len,
+                         size_t *out);
+
+/**
+ * The dishes currently joined (`Radio::dish_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio.
+ */
+size_t weida_radio_dish_count(const weida_radio *r);
+
+/**
+ * The copies dropped, summed over topics and causes (`Radio::dropped`); 0
+ * for NULL.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio.
+ */
+uint64_t weida_radio_dropped(const weida_radio *r);
+
+/**
+ * What was dropped on `topic`, by cause (`Radio::dropped_on`): a snapshot
+ * of one record, or of none when nothing was. Never blocks.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio; `topic` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the snapshot with
+ * `weida_topic_drops_drop`.
+ */
+int weida_radio_dropped_on(const weida_radio *r, const char *topic, weida_topic_drops **out);
+
+/**
+ * Every topic that lost a copy, with its counts by cause (`Radio::drops`):
+ * a snapshot read with the `weida_topic_drops_*` getters. Never blocks.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio; `out` is NULL or writable. Release the
+ * snapshot with `weida_topic_drops_drop`.
+ */
+int weida_radio_drops(const weida_radio *r, weida_topic_drops **out);
+
+/**
+ * Withdraws the joins on `filter` of every dish connection whose key is
+ * `peer` (`sha256:` text) and frees their subscription slots
+ * (`Radio::evict`); writes how many joins went. The dish is not told and
+ * may join again. `-WEIDA_EINVALID_FINGERPRINT` for text that is not a
+ * key.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio; `peer` and `filter` are NULL or
+ * NUL-terminated strings; `out` is NULL or writable.
+ */
+int weida_radio_evict(const weida_radio *r, const char *peer, const char *filter, size_t *out);
+
+/**
+ * What the radio dropped toward each joined dish connection
+ * (`Radio::dish_drops`): a snapshot read with the `weida_dish_drops_*`
+ * getters. A record goes when its connection closes. Never blocks.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio; `out` is NULL or writable. Release the
+ * snapshot with `weida_dish_drops_drop`.
+ */
+int weida_radio_dish_drops(const weida_radio *r, weida_dish_drops **out);
+
+/**
+ * Releases a radio, which releases its path. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live radio, dropped at most once.
+ */
+void weida_radio_drop(weida_radio *r);
+
+/**
+ * The number of records, one per joined dish connection; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot.
+ */
+size_t weida_dish_drops_len(const weida_dish_drops *d);
+
+/**
+ * The key the dish of record `index` proved (`DishDrops::peer`), as
+ * `sha256:` text; NULL past the end and for a dish that proved no key.
+ * Lives as long as `d`.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `len_out` is NULL or writable.
+ */
+const char *weida_dish_drops_peer_fingerprint(const weida_dish_drops *d,
+                                              size_t index,
+                                              size_t *len_out);
+
+/**
+ * `DishDrops::subscriber_budget` of record `index`, copies dropped for an
+ * exhausted byte budget: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_dish_drops_subscriber_budget(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `DishDrops::subscriber_queue` of record `index`, copies dropped for a
+ * full queue: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_dish_drops_subscriber_queue(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `DishDrops::superseded` of record `index`, copies reset because a newer
+ * segment opened on their topic: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_dish_drops_superseded(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `DishDrops::expired` of record `index`, copies reset because the
+ * `max_age` passed: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_dish_drops_expired(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `DishDrops::too_large` of record `index`, datagram segments larger than
+ * the dish's connection carries: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_dish_drops_too_large(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `DishDrops::no_datagrams` of record `index`, datagram segments for a
+ * dish that carries no datagrams: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_dish_drops_no_datagrams(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+/**
+ * `DishDrops::layers_cut` of record `index`, segment copies that lost
+ * layers above 0 and kept layer 0: 1 and `*out`, 0 past the end.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_dish_drops_layers_cut(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+/**
+ * Releases a dish-drops snapshot. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live snapshot, dropped at most once.
+ */
+void weida_dish_drops_drop(weida_dish_drops *d);
+
+/**
+ * Creates a dish that dials on `tls`'s terms (`Runtime::dish`). Two dishes
+ * on one runtime share the pooled connection, so their paths collide with
+ * `-WEIDA_EALREADY_REGISTERED`: use one runtime per dish.
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime; `tls` is NULL or live client terms;
+ * `out` is NULL or writable. Release the result with `weida_dish_drop`.
+ */
+int weida_runtime_dish(const weida_runtime *rt, const weida_client_tls *tls, weida_dish **out);
+
+/**
+ * Dials a radio at `url` (`Dish::connect`), e.g. `weida+inproc://bus/r`,
+ * and joins there every filter joined so far. A redial joins again; what
+ * was sent in between is gone, and the numbers start over.
+ *
+ * Never blocks; the dial runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish; `url` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the op with
+ * `weida_dish_connect_op_drop`.
+ */
+int weida_dish_connect(const weida_dish *d, const char *url, weida_dish_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_dish_connect_op_fd(const weida_dish_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_dish_connect_op_wait(const weida_dish_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_dish_connect_op_drop(weida_dish_connect_op *op);
+
+/**
+ * The number of connected radios (`Dish::peer_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish.
+ */
+size_t weida_dish_peer_count(const weida_dish *d);
+
+/**
+ * A snapshot of the dish's live connections (`Dish::connection_stats`),
+ * read with the `weida_connection_stats_*` getters. Never blocks.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_dish_connection_stats(const weida_dish *d, weida_connection_stats **out);
+
+/**
+ * A new reader of the dish's peer events (`Dish::events`), read with
+ * `weida_peer_events_recv`. Each call is an independent reader.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_dish_events(const weida_dish *d, weida_peer_events **out);
+
+/**
+ * Joins every topic `filter` matches (`Dish::join`), a segmented pattern
+ * of PROTOCOL.md §6.4, on `terms` (NULL is `JoinTerms::default()`).
+ * Joining a filter again replaces its terms. The filter and the terms are
+ * copied.
+ *
+ * Never blocks; the join runs as the op written to `out`. Its wait fails
+ * with `-WEIDA_ELIMIT_EXCEEDED` for a `max_layer` of
+ * `WEIDA_MAX_SEGMENT_LAYERS` or above and with `-WEIDA_EPROTOCOL` for a
+ * filter outside the grammar.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish; `filter` is NULL or a NUL-terminated
+ * string; `terms` is NULL or live terms; `out` is NULL or writable.
+ * Release the op with `weida_dish_join_op_drop`.
+ */
+int weida_dish_join(const weida_dish *d,
+                    const char *filter,
+                    const weida_join_terms *terms,
+                    weida_dish_join_op **out);
+
+/**
+ * The readiness descriptor of a join op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live join op; `out` is NULL or writable.
+ */
+int weida_dish_join_op_fd(const weida_dish_join_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the join: 0 once every connected radio
+ * was told.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live join op.
+ */
+int weida_dish_join_op_wait(const weida_dish_join_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a join op, aborting it when unfinished. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live join op, dropped at most once.
+ */
+void weida_dish_join_op_drop(weida_dish_join_op *op);
+
+/**
+ * Leaves a filter (`Dish::leave`); an unknown one is ignored. The filter
+ * is copied.
+ *
+ * Never blocks; the leave runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish; `filter` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the op with
+ * `weida_dish_leave_op_drop`.
+ */
+int weida_dish_leave(const weida_dish *d, const char *filter, weida_dish_leave_op **out);
+
+/**
+ * The readiness descriptor of a leave op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live leave op; `out` is NULL or writable.
+ */
+int weida_dish_leave_op_fd(const weida_dish_leave_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the leave: 0 once every connected
+ * radio was told.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live leave op.
+ */
+int weida_dish_leave_op_wait(const weida_dish_leave_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a leave op, aborting it when unfinished. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live leave op, dropped at most once.
+ */
+void weida_dish_leave_op_drop(weida_dish_leave_op *op);
+
+/**
+ * The dish's readiness descriptor (R11): readable when the next
+ * `weida_dish_recv` will not block.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish; `out` is NULL or writable.
+ */
+int weida_dish_fd(const weida_dish *d, int64_t *out);
+
+/**
+ * Takes the next segment the dish received, waiting up to `timeout_ms`
+ * (R4) for one (`Dish::recv`), as a `weida_received`.
+ * `-WEIDA_ENOT_CONNECTED` once the queue ended.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish; `out` is NULL or writable. Release the
+ * result with `weida_received_drop`.
+ */
+int weida_dish_recv(const weida_dish *d, int64_t timeout_ms, weida_received **out);
+
+/**
+ * Segments discarded on arrival because a newer one on their topic had
+ * already been delivered (`Dish::stale`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish.
+ */
+uint64_t weida_dish_stale(const weida_dish *d);
+
+/**
+ * Segments discarded on arrival because the receive queue was full
+ * (`Dish::overflow`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish.
+ */
+uint64_t weida_dish_overflow(const weida_dish *d);
+
+/**
+ * Releases a dish, which drops its connections. A thread waiting in
+ * `weida_dish_recv` returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live dish, dropped at most once.
+ */
+void weida_dish_drop(weida_dish *d);
+
+/**
+ * What the dish received, a `WEIDA_RECEIVED_*` constant.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live received segment.
+ */
+int weida_received_kind(const weida_received *r);
+
+/**
+ * Hands a stream segment's transfer over, once: its topic, number and
+ * layer are on its metadata. A second call is `-WEIDA_ECLOSED`, a datagram
+ * `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live received segment; `out` is NULL or writable.
+ * Release the transfer with `weida_incoming_transfer_drop`.
+ */
+int weida_received_take_segment(const weida_received *r, weida_incoming_transfer **out);
+
+/**
+ * The topic of a datagram segment; NULL for a stream segment, whose topic
+ * is on its metadata. Lives as long as `r`.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live received segment; `len_out` is NULL or writable.
+ */
+const char *weida_received_topic(const weida_received *r, size_t *len_out);
+
+/**
+ * The number of a datagram segment on its topic: 1 and `*out`; 0 for a
+ * stream segment, whose number is on its metadata.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live received segment; `out` is NULL or writable.
+ */
+int weida_received_segment(const weida_received *r, uint64_t *out);
+
+/**
+ * The payload of a datagram segment, with its length in `*len_out`; NULL
+ * for a stream segment. Valid as long as `r`.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live received segment; `len_out` is NULL or writable.
+ */
+const uint8_t *weida_received_payload(const weida_received *r, size_t *len_out);
+
+/**
+ * Releases a received segment. A stream segment's transfer that was not
+ * taken is dropped, which refuses it with `REJECTED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live received segment, dropped at most once.
+ */
+void weida_received_drop(weida_received *r);
+
+/**
  * Serves a relay on this listener (`Listener::relay`): hidden peers
  * register through `weida_listener_bind_relay`, and diallers reach them
  * through `weida+relay://` URLs. Claims `/.weida/relay` on every binding of
@@ -5188,6 +5887,94 @@ uint64_t weida_runtime_expired_transfers(const weida_runtime *rt);
  * `rt` is NULL or a live runtime, dropped at most once.
  */
 void weida_runtime_drop(weida_runtime *rt);
+
+/**
+ * This segment's number on its topic (`Segment::number`); the first
+ * segment on a topic is 0. 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live segment.
+ */
+uint64_t weida_segment_number(const weida_segment *s);
+
+/**
+ * The topic this segment belongs to (`Segment::topic`). Lives as long as
+ * the segment.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live segment; `len_out` is NULL or writable.
+ */
+const char *weida_segment_topic(const weida_segment *s, size_t *len_out);
+
+/**
+ * Writes a chunk to layer 0 (`Segment::write`); as
+ * `weida_segment_write_layer`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live segment; `chunk` is NULL only with `len == 0`,
+ * else points to `len` readable bytes; `out` is NULL or writable.
+ */
+int weida_segment_write(const weida_segment *s, const uint8_t *chunk, size_t len, size_t *out);
+
+/**
+ * Writes a chunk to `layer` of every copy still taking it, without ever
+ * waiting (`Segment::write_layer`), and writes how many copies took it.
+ * The chunk is copied. A copy with no room loses this layer and every
+ * layer above it, and the whole segment when the layer is 0; a copy
+ * capped below the layer by its dish's `max_layer` is skipped, which is
+ * not a drop.
+ *
+ * Fails with `-WEIDA_ELIMIT_EXCEEDED` for a layer of
+ * `WEIDA_MAX_SEGMENT_LAYERS` or above or a chunk above 4 GiB, and with
+ * `-WEIDA_ERUNTIME` for a layer already finished.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live segment; `chunk` is NULL only with `len == 0`,
+ * else points to `len` readable bytes; `out` is NULL or writable.
+ */
+int weida_segment_write_layer(const weida_segment *s,
+                              uint8_t layer,
+                              const uint8_t *chunk,
+                              size_t len,
+                              size_t *out);
+
+/**
+ * Finishes `layer` on every copy (`Segment::finish_layer`); a later write
+ * to it is `-WEIDA_ERUNTIME`. A layer of `WEIDA_MAX_SEGMENT_LAYERS` or
+ * above is ignored, as in Rust.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live segment.
+ */
+int weida_segment_finish_layer(const weida_segment *s, uint8_t layer);
+
+/**
+ * Finishes every layer still open (`Segment::finish`) and writes how many
+ * copies still hold layer 0. **Consumes** `s` on every return path; a
+ * NULL `out` fails with `-WEIDA_EINVAL` after the segment was dropped,
+ * which resets every unfinished layer.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live segment, not used again; `out` is NULL or
+ * writable.
+ */
+int weida_segment_finish(weida_segment *s, size_t *out);
+
+/**
+ * Releases a segment without finishing it: every unfinished layer is
+ * reset on every copy. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live segment, dropped at most once.
+ */
+void weida_segment_drop(weida_segment *s);
 
 /**
  * The number of records, one per live dialled address in dial order; 0
@@ -6587,6 +7374,27 @@ int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out);
 int weida_incoming_meta_gap(const weida_incoming_meta *m,
                             uint64_t *out_expected,
                             uint64_t *out_seen);
+
+/**
+ * The segment number of a RADIO stream segment (`IncomingMeta::segment`):
+ * 1 and `*out` when present, 0 when absent.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_segment(const weida_incoming_meta *m, uint64_t *out);
+
+/**
+ * The layer of a RADIO stream segment (`IncomingMeta::layer`): 1 and
+ * `*out` when present, 0 when absent. It is present exactly when the
+ * segment number is, and 0 when the sender stated no layer (DATA key 14).
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_layer(const weida_incoming_meta *m, uint8_t *out);
 
 /**
  * The trace context the sender propagated, as its `traceparent` text; NULL

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use weida_rs::{
     Acknowledgement, Alpn, Backpressure, Congestion, Deduplication, DeliveryLevel, Discovery,
-    Durability, FilesOptions, GuaranteeSet, Limits, OrderingMode, OutboxFull, ProducerNaming,
-    ReconnectPolicy,
+    Durability, FilesOptions, GuaranteeSet, JoinTerms, Limits, OrderingMode, OutboxFull,
+    ProducerNaming, ReconnectPolicy, SegmentTerms,
 };
 
 use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_void};
@@ -204,6 +204,16 @@ pub struct weida_files_options {
     value: Mutex<FilesOptions>,
 }
 
+/// `JoinTerms` under construction: one setter per field.
+pub struct weida_join_terms {
+    value: Mutex<JoinTerms>,
+}
+
+/// `SegmentTerms` under construction: one setter per field.
+pub struct weida_segment_terms {
+    value: Mutex<SegmentTerms>,
+}
+
 impl Builder for weida_limits {
     type Value = Limits;
     fn cell(&self) -> &Mutex<Limits> {
@@ -228,6 +238,20 @@ impl Builder for weida_reconnect_policy {
 impl Builder for weida_files_options {
     type Value = FilesOptions;
     fn cell(&self) -> &Mutex<FilesOptions> {
+        &self.value
+    }
+}
+
+impl Builder for weida_join_terms {
+    type Value = JoinTerms;
+    fn cell(&self) -> &Mutex<JoinTerms> {
+        &self.value
+    }
+}
+
+impl Builder for weida_segment_terms {
+    type Value = SegmentTerms;
+    fn cell(&self) -> &Mutex<SegmentTerms> {
         &self.value
     }
 }
@@ -1079,4 +1103,157 @@ pub unsafe extern "C" fn weida_files_options_set_poll_ms(
 ) -> c_int {
     // SAFETY: forwarded from this function's contract.
     unsafe { update(o, |x| x.poll = ms(v)) }
+}
+
+// --- weida_join_terms ------------------------------------------------------
+
+/// Creates join terms holding weida's defaults (`JoinTerms::default`): no
+/// latency budget, every layer.
+///
+/// # Safety
+///
+/// `out` is NULL or writable. Release the result with
+/// `weida_join_terms_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_join_terms_new(out: *mut *mut weida_join_terms) -> c_int {
+    create(
+        out,
+        weida_join_terms {
+            value: Mutex::new(JoinTerms::default()),
+        },
+    )
+}
+
+/// Releases join terms. NULL does nothing.
+///
+/// # Safety
+///
+/// `t` is NULL or live terms, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_join_terms_drop(t: *mut weida_join_terms) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(t) }));
+}
+
+/// Sets `JoinTerms::max_age`, in milliseconds, or none for a negative
+/// value: a copy still unfinished this long after its segment opened is
+/// reset at the radio.
+///
+/// # Safety
+///
+/// `t` is NULL or live terms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_join_terms_set_max_age_ms(
+    t: *const weida_join_terms,
+    v: i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(t, |x| x.max_age = optional(v).map(ms)) }
+}
+
+/// Sets `JoinTerms::max_layer`, the highest layer the dish takes, or none
+/// (every layer) for a negative value. Above 255 it is `-WEIDA_EINVAL`; 16
+/// to 255 are kept and fail the join with `-WEIDA_ELIMIT_EXCEEDED`, as in
+/// Rust.
+///
+/// # Safety
+///
+/// `t` is NULL or live terms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_join_terms_set_max_layer(
+    t: *const weida_join_terms,
+    v: i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        try_update(t, |x| {
+            x.max_layer = match optional(v) {
+                None => None,
+                Some(n) => Some(u8::try_from(n).map_err(|_| out_of_range())?),
+            };
+            Ok(())
+        })
+    }
+}
+
+// --- weida_segment_terms ---------------------------------------------------
+
+/// Creates segment terms holding weida's defaults (`SegmentTerms::default`):
+/// no latency budget, priority 0, not following an upstream.
+///
+/// # Safety
+///
+/// `out` is NULL or writable. Release the result with
+/// `weida_segment_terms_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_segment_terms_new(out: *mut *mut weida_segment_terms) -> c_int {
+    create(
+        out,
+        weida_segment_terms {
+            value: Mutex::new(SegmentTerms::default()),
+        },
+    )
+}
+
+/// Releases segment terms. NULL does nothing.
+///
+/// # Safety
+///
+/// `t` is NULL or live terms, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_segment_terms_drop(t: *mut weida_segment_terms) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(t) }));
+}
+
+/// Sets `SegmentTerms::max_age`, in milliseconds, or none for a negative
+/// value: every copy still unfinished this long after the segment opened
+/// is reset.
+///
+/// # Safety
+///
+/// `t` is NULL or live terms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_segment_terms_set_max_age_ms(
+    t: *const weida_segment_terms,
+    v: i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(t, |x| x.max_age = optional(v).map(ms)) }
+}
+
+/// Sets `SegmentTerms::priority`: higher goes first against other topics'
+/// copies of the same layer on one connection. Outside `int16_t` it is
+/// `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `t` is NULL or live terms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_segment_terms_set_priority(
+    t: *const weida_segment_terms,
+    v: i32,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        try_update(t, |x| {
+            x.priority = i16::try_from(v).map_err(|_| out_of_range())?;
+            Ok(())
+        })
+    }
+}
+
+/// Sets `SegmentTerms::follows_upstream` (a flag, R7): the writer relays a
+/// segment its upstream is still streaming.
+///
+/// # Safety
+///
+/// `t` is NULL or live terms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_segment_terms_set_follows_upstream(
+    t: *const weida_segment_terms,
+    v: c_int,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(t, |x| x.follows_upstream = v != 0) }
 }

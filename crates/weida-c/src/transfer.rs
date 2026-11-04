@@ -379,6 +379,37 @@ pub unsafe extern "C" fn weida_incoming_meta_gap(
     })
 }
 
+/// The segment number of a RADIO stream segment (`IncomingMeta::segment`):
+/// 1 and `*out` when present, 0 when absent.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_segment(
+    m: *const weida_incoming_meta,
+    out: *mut u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { meta_number(m, out, |m| m.segment) }
+}
+
+/// The layer of a RADIO stream segment (`IncomingMeta::layer`): 1 and
+/// `*out` when present, 0 when absent. It is present exactly when the
+/// segment number is, and 0 when the sender stated no layer (DATA key 14).
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_layer(
+    m: *const weida_incoming_meta,
+    out: *mut u8,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { meta_number(m, out, |m| m.layer) }
+}
+
 /// The trace context the sender propagated, as its `traceparent` text; NULL
 /// when it sent none or one that did not parse.
 ///

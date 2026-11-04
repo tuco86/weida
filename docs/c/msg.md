@@ -21,6 +21,8 @@ request or transfer it came from. None of these functions blocks.
 | `int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender stated a length, else 0 |
 | `int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender numbered the transfer, else 0 |
 | `int weida_incoming_meta_gap(const weida_incoming_meta *m, uint64_t *out_expected, uint64_t *out_seen)` | 1 with the number expected next and the one that arrived when the connection negotiated per-producer ordering and a number was skipped (`seen - expected` transfers are missing), else 0 with both outs untouched |
+| `int weida_incoming_meta_segment(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out`, the segment number of a RADIO stream segment, else 0 |
+| `int weida_incoming_meta_layer(const weida_incoming_meta *m, uint8_t *out)` | 1 and `*out`, the layer of a RADIO stream segment, present exactly when the segment number is (0 when the sender stated none), else 0 |
 | `const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out)` | the sender's trace context as `traceparent` text; NULL when it sent none or one that did not parse |
 | `const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out)` | the opaque `tracestate`; NULL when absent |
 | `int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out)` | 1 and the `WEIDA_ACKNOWLEDGEMENT_*` level in `*out` when the sender claimed one, else 0 |
@@ -28,8 +30,7 @@ request or transfer it came from. None of these functions blocks.
 
 Strings follow R7: NUL-terminated, the exact length through `len_out` (NULL allowed), valid
 until `m` is dropped. The other fields of `IncomingMeta` (`report`, `report_mode`,
-`report_id`, `segment`, `layer`) are not mapped yet
-([libraries/weida-c.md](../libraries/weida-c.md)).
+`report_id`) are not mapped yet ([libraries/weida-c.md](../libraries/weida-c.md)).
 
 ## `weida_msg`
 

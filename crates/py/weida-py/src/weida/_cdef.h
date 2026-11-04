@@ -172,6 +172,12 @@
 
 #define WEIDA_POLLIN 1
 
+#define WEIDA_RECEIVED_SEGMENT 0
+
+#define WEIDA_RECEIVED_DATAGRAM 1
+
+#define WEIDA_MAX_SEGMENT_LAYERS 16
+
 #define WEIDA_PEER_EVENT_CONNECTED 0
 
 #define WEIDA_PEER_EVENT_LOST 1
@@ -210,6 +216,16 @@ typedef struct weida_delivery weida_delivery;
 
 typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 
+typedef struct weida_dish weida_dish;
+
+typedef struct weida_dish_connect_op weida_dish_connect_op;
+
+typedef struct weida_dish_drops weida_dish_drops;
+
+typedef struct weida_dish_join_op weida_dish_join_op;
+
+typedef struct weida_dish_leave_op weida_dish_leave_op;
+
 typedef struct weida_drained weida_drained;
 
 typedef struct weida_fan_out weida_fan_out;
@@ -243,6 +259,8 @@ typedef struct weida_incoming_request_reply_op weida_incoming_request_reply_op;
 typedef struct weida_incoming_transfer weida_incoming_transfer;
 
 typedef struct weida_incoming_transfer_collect_op weida_incoming_transfer_collect_op;
+
+typedef struct weida_join_terms weida_join_terms;
 
 typedef struct weida_limits weida_limits;
 
@@ -288,6 +306,10 @@ typedef struct weida_pusher_open_op weida_pusher_open_op;
 
 typedef struct weida_pusher_send_op weida_pusher_send_op;
 
+typedef struct weida_radio weida_radio;
+
+typedef struct weida_received weida_received;
+
 typedef struct weida_reconnect_policy weida_reconnect_policy;
 
 typedef struct weida_relay weida_relay;
@@ -325,6 +347,10 @@ typedef struct weida_runtime_config weida_runtime_config;
 typedef struct weida_runtime_drain_op weida_runtime_drain_op;
 
 typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
+
+typedef struct weida_segment weida_segment;
+
+typedef struct weida_segment_terms weida_segment_terms;
 
 typedef struct weida_server_tls weida_server_tls;
 
@@ -521,6 +547,24 @@ void weida_files_options_drop(weida_files_options *o);
 int weida_files_options_set_names(const weida_files_options *o, const char *const *names, size_t n);
 
 int weida_files_options_set_poll_ms(const weida_files_options *o, uint64_t v);
+
+int weida_join_terms_new(weida_join_terms **out);
+
+void weida_join_terms_drop(weida_join_terms *t);
+
+int weida_join_terms_set_max_age_ms(const weida_join_terms *t, int64_t v);
+
+int weida_join_terms_set_max_layer(const weida_join_terms *t, int64_t v);
+
+int weida_segment_terms_new(weida_segment_terms **out);
+
+void weida_segment_terms_drop(weida_segment_terms *t);
+
+int weida_segment_terms_set_max_age_ms(const weida_segment_terms *t, int64_t v);
+
+int weida_segment_terms_set_priority(const weida_segment_terms *t, int32_t v);
+
+int weida_segment_terms_set_follows_upstream(const weida_segment_terms *t, int v);
 
 const char *weida_strerror(int code);
 
@@ -1047,6 +1091,114 @@ int weida_puller_recv(const weida_puller *p, int64_t timeout_ms, weida_incoming_
 
 void weida_puller_drop(weida_puller *p);
 
+int weida_listener_radio(const weida_listener *l, const char *path, weida_radio **out);
+
+const char *weida_radio_path(const weida_radio *r, size_t *len_out);
+
+int weida_radio_segment(const weida_radio *r,
+                        const char *topic,
+                        const weida_segment_terms *terms,
+                        weida_segment **out);
+
+int weida_radio_datagram(const weida_radio *r,
+                         const char *topic,
+                         const uint8_t *payload,
+                         size_t len,
+                         size_t *out);
+
+size_t weida_radio_dish_count(const weida_radio *r);
+
+uint64_t weida_radio_dropped(const weida_radio *r);
+
+int weida_radio_dropped_on(const weida_radio *r, const char *topic, weida_topic_drops **out);
+
+int weida_radio_drops(const weida_radio *r, weida_topic_drops **out);
+
+int weida_radio_evict(const weida_radio *r, const char *peer, const char *filter, size_t *out);
+
+int weida_radio_dish_drops(const weida_radio *r, weida_dish_drops **out);
+
+void weida_radio_drop(weida_radio *r);
+
+size_t weida_dish_drops_len(const weida_dish_drops *d);
+
+const char *weida_dish_drops_peer_fingerprint(const weida_dish_drops *d,
+                                              size_t index,
+                                              size_t *len_out);
+
+int weida_dish_drops_subscriber_budget(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+int weida_dish_drops_subscriber_queue(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+int weida_dish_drops_superseded(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+int weida_dish_drops_expired(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+int weida_dish_drops_too_large(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+int weida_dish_drops_no_datagrams(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+int weida_dish_drops_layers_cut(const weida_dish_drops *d, size_t index, uint64_t *out);
+
+void weida_dish_drops_drop(weida_dish_drops *d);
+
+int weida_runtime_dish(const weida_runtime *rt, const weida_client_tls *tls, weida_dish **out);
+
+int weida_dish_connect(const weida_dish *d, const char *url, weida_dish_connect_op **out);
+
+int weida_dish_connect_op_fd(const weida_dish_connect_op *op, int64_t *out);
+
+int weida_dish_connect_op_wait(const weida_dish_connect_op *op, int64_t timeout_ms);
+
+void weida_dish_connect_op_drop(weida_dish_connect_op *op);
+
+size_t weida_dish_peer_count(const weida_dish *d);
+
+int weida_dish_connection_stats(const weida_dish *d, weida_connection_stats **out);
+
+int weida_dish_events(const weida_dish *d, weida_peer_events **out);
+
+int weida_dish_join(const weida_dish *d,
+                    const char *filter,
+                    const weida_join_terms *terms,
+                    weida_dish_join_op **out);
+
+int weida_dish_join_op_fd(const weida_dish_join_op *op, int64_t *out);
+
+int weida_dish_join_op_wait(const weida_dish_join_op *op, int64_t timeout_ms);
+
+void weida_dish_join_op_drop(weida_dish_join_op *op);
+
+int weida_dish_leave(const weida_dish *d, const char *filter, weida_dish_leave_op **out);
+
+int weida_dish_leave_op_fd(const weida_dish_leave_op *op, int64_t *out);
+
+int weida_dish_leave_op_wait(const weida_dish_leave_op *op, int64_t timeout_ms);
+
+void weida_dish_leave_op_drop(weida_dish_leave_op *op);
+
+int weida_dish_fd(const weida_dish *d, int64_t *out);
+
+int weida_dish_recv(const weida_dish *d, int64_t timeout_ms, weida_received **out);
+
+uint64_t weida_dish_stale(const weida_dish *d);
+
+uint64_t weida_dish_overflow(const weida_dish *d);
+
+void weida_dish_drop(weida_dish *d);
+
+int weida_received_kind(const weida_received *r);
+
+int weida_received_take_segment(const weida_received *r, weida_incoming_transfer **out);
+
+const char *weida_received_topic(const weida_received *r, size_t *len_out);
+
+int weida_received_segment(const weida_received *r, uint64_t *out);
+
+const uint8_t *weida_received_payload(const weida_received *r, size_t *len_out);
+
+void weida_received_drop(weida_received *r);
+
 int weida_listener_relay(const weida_listener *l, weida_relay **out);
 
 int weida_relay_fd(const weida_relay *r, int64_t *out);
@@ -1235,6 +1387,24 @@ uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt);
 uint64_t weida_runtime_expired_transfers(const weida_runtime *rt);
 
 void weida_runtime_drop(weida_runtime *rt);
+
+uint64_t weida_segment_number(const weida_segment *s);
+
+const char *weida_segment_topic(const weida_segment *s, size_t *len_out);
+
+int weida_segment_write(const weida_segment *s, const uint8_t *chunk, size_t len, size_t *out);
+
+int weida_segment_write_layer(const weida_segment *s,
+                              uint8_t layer,
+                              const uint8_t *chunk,
+                              size_t len,
+                              size_t *out);
+
+int weida_segment_finish_layer(const weida_segment *s, uint8_t layer);
+
+int weida_segment_finish(weida_segment *s, size_t *out);
+
+void weida_segment_drop(weida_segment *s);
 
 size_t weida_connection_stats_len(const weida_connection_stats *s);
 
@@ -1559,6 +1729,10 @@ int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out);
 int weida_incoming_meta_gap(const weida_incoming_meta *m,
                             uint64_t *out_expected,
                             uint64_t *out_seen);
+
+int weida_incoming_meta_segment(const weida_incoming_meta *m, uint64_t *out);
+
+int weida_incoming_meta_layer(const weida_incoming_meta *m, uint8_t *out);
 
 const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out);
 

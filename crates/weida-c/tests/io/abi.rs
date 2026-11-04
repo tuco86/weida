@@ -4066,3 +4066,596 @@ fn a_bus_message_reaches_every_other_member() {
         shutdown(rt);
     }
 }
+
+// --- patterns: RADIO/DISH ---------------------------------------------------
+
+/// A configuration whose limits carry datagrams
+/// (`WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES`); its guarantee set is the
+/// default, so a dish on the default configuration still negotiates with
+/// it. The caller drops it.
+fn datagram_config() -> *mut weida_runtime_config {
+    let mut cfg = ptr::null_mut();
+    let mut l = ptr::null_mut();
+    // SAFETY: writable out-parameters and live handles; `l` is dropped once.
+    unsafe {
+        ok(weida_runtime_config_new(&mut cfg));
+        ok(weida_limits_new(&mut l));
+        ok(weida_limits_set_datagram_receive_bytes(
+            l,
+            WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES as u64,
+        ));
+        ok(weida_runtime_config_set_limits(cfg, l));
+        weida_limits_drop(l);
+    }
+    cfg
+}
+
+/// A dish of `rt` dialling on `tls`, which is dropped.
+fn dish(rt: *mut weida_runtime, tls: *mut weida_client_tls) -> *mut weida_dish {
+    let mut d = ptr::null_mut();
+    // SAFETY: live handles, `tls` dropped once, and a writable out-parameter.
+    unsafe {
+        ok(weida_runtime_dish(rt, tls, &mut d));
+        weida_client_tls_drop(tls);
+    }
+    d
+}
+
+fn dish_connect(d: *mut weida_dish, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the dial",
+        // SAFETY: a live dish, a C string and a writable out-parameter.
+        |op| unsafe { weida_dish_connect(d, url.as_ptr(), op) },
+        weida_dish_connect_op_wait,
+        weida_dish_connect_op_drop,
+    )
+}
+
+fn dish_join(d: *mut weida_dish, filter: &str, terms: *const weida_join_terms) -> c_int {
+    let filter = c(filter);
+    run_op(
+        "the join",
+        // SAFETY: a live dish, a C string, live or NULL terms and a writable
+        // out-parameter.
+        |op| unsafe { weida_dish_join(d, filter.as_ptr(), terms, op) },
+        weida_dish_join_op_wait,
+        weida_dish_join_op_drop,
+    )
+}
+
+/// Waits until `n` dishes joined `r`.
+fn await_dishes(r: *mut weida_radio, n: usize) {
+    weida_testkit::poll_until("the joins", WAIT, || {
+        // SAFETY: a live radio.
+        unsafe { weida_radio_dish_count(r) == n }
+    });
+}
+
+fn next_received(d: *mut weida_dish) -> *mut weida_received {
+    let mut x = ptr::null_mut();
+    // SAFETY: a live dish and a writable out-parameter.
+    ok(settle("a segment", |ms| unsafe {
+        weida_dish_recv(d, ms, &mut x)
+    }));
+    assert!(!x.is_null());
+    x
+}
+
+/// The transfer of a stream segment, taken once; drops `x`.
+fn take_segment(x: *mut weida_received) -> *mut weida_incoming_transfer {
+    let mut t = ptr::null_mut();
+    let mut again = ptr::null_mut();
+    // SAFETY: a live received segment, dropped once, and writable
+    // out-parameters.
+    unsafe {
+        ok(weida_received_take_segment(x, &mut t));
+        assert_eq!(
+            weida_received_take_segment(x, &mut again),
+            -WEIDA_ECLOSED,
+            "a transfer is handed over once"
+        );
+        weida_received_drop(x);
+    }
+    t
+}
+
+fn segment_of(meta: *mut weida_incoming_meta) -> (Option<u64>, Option<u8>) {
+    let (mut number, mut layer) = (0u64, 0u8);
+    // SAFETY: live metadata and writable out-parameters.
+    unsafe {
+        (
+            (weida_incoming_meta_segment(meta, &mut number) == 1).then_some(number),
+            (weida_incoming_meta_layer(meta, &mut layer) == 1).then_some(layer),
+        )
+    }
+}
+
+/// The next thing `d` received, which must be a stream segment on `topic`:
+/// its transfer with its segment number and layer.
+fn stream_segment(d: *mut weida_dish, topic: &str) -> (*mut weida_incoming_transfer, u64, u8) {
+    let x = next_received(d);
+    let mut len = usize::MAX;
+    let mut n = u64::MAX;
+    // SAFETY: a live received segment and writable out-parameters.
+    unsafe {
+        assert_eq!(weida_received_kind(x), WEIDA_RECEIVED_SEGMENT);
+        assert!(weida_received_topic(x, &mut len).is_null());
+        assert_eq!(weida_received_segment(x, &mut n), 0);
+        assert!(weida_received_payload(x, &mut len).is_null());
+    }
+    let t = take_segment(x);
+    let meta = meta_of(t);
+    assert_eq!(
+        meta_text(meta, weida_incoming_meta_topic).as_deref(),
+        Some(topic)
+    );
+    let (number, layer) = segment_of(meta);
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    (
+        t,
+        number.expect("a segment number"),
+        layer.expect("a layer"),
+    )
+}
+
+/// Opens a segment of `r` on `topic`.
+fn open_segment(
+    r: *mut weida_radio,
+    topic: &str,
+    terms: *const weida_segment_terms,
+) -> *mut weida_segment {
+    let topic = c(topic);
+    let mut s = ptr::null_mut();
+    // SAFETY: a live radio, a C string, live or NULL terms and a writable
+    // out-parameter.
+    ok(unsafe { weida_radio_segment(r, topic.as_ptr(), terms, &mut s) });
+    s
+}
+
+/// Writes `chunk` to `layer` of `s`: how many copies took it.
+fn write_layer(s: *mut weida_segment, layer: u8, chunk: &[u8]) -> usize {
+    let mut n = usize::MAX;
+    // SAFETY: a live segment, `chunk.len()` readable bytes and a writable
+    // out-parameter.
+    ok(unsafe { weida_segment_write_layer(s, layer, chunk.as_ptr(), chunk.len(), &mut n) });
+    n
+}
+
+/// Finishes `s`, consuming it: how many copies still hold layer 0.
+fn finish_segment(s: *mut weida_segment) -> usize {
+    let mut n = usize::MAX;
+    // SAFETY: a live segment, consumed, and a writable out-parameter.
+    ok(unsafe { weida_segment_finish(s, &mut n) });
+    n
+}
+
+/// One count of a dish-drops snapshot: `Some` when present.
+fn dish_drop_count(
+    d: *mut weida_dish_drops,
+    index: usize,
+    get: unsafe extern "C" fn(*const weida_dish_drops, usize, *mut u64) -> c_int,
+) -> Option<u64> {
+    let mut n = 0u64;
+    // SAFETY: a live snapshot and a writable out-parameter.
+    (unsafe { get(d, index, &mut n) } == 1).then_some(n)
+}
+
+/// The radio's dish-drops snapshot; the caller drops it.
+fn dish_drops_of(r: *mut weida_radio) -> *mut weida_dish_drops {
+    let mut d = ptr::null_mut();
+    // SAFETY: a live radio and a writable out-parameter.
+    ok(unsafe { weida_radio_dish_drops(r, &mut d) });
+    d
+}
+
+/// A radio at `/r` on a new listener of `rt` bound to the inproc bus `bus`.
+fn radio_on(
+    rt: *mut weida_runtime,
+    bus: &str,
+) -> (
+    *mut weida_listener,
+    *mut weida_local_binding,
+    *mut weida_radio,
+) {
+    let (l, lb) = bound(rt, bus);
+    let path = c("/r");
+    let mut r = ptr::null_mut();
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_radio(l, path.as_ptr(), &mut r) });
+    (l, lb, r)
+}
+
+#[test]
+fn a_dish_receives_the_radios_segments_with_their_numbers_and_layers() {
+    let server = runtime();
+    let (l, lb, r) = radio_on(server, "abi-patterns-radio-layers");
+    let path = c("/r");
+    let mut again = ptr::null_mut();
+    let mut len = usize::MAX;
+    // SAFETY: live handles, a C string and writable out-parameters.
+    unsafe {
+        let at = weida_radio_path(r, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("/r"));
+        assert_eq!(
+            weida_listener_radio(l, path.as_ptr(), &mut again),
+            -WEIDA_EALREADY_REGISTERED
+        );
+    }
+
+    let mut t = ptr::null_mut();
+    // SAFETY: a writable out-parameter and live terms.
+    unsafe {
+        ok(weida_join_terms_new(&mut t));
+        assert_eq!(weida_join_terms_set_max_layer(t, 256), -WEIDA_EINVAL);
+        ok(weida_join_terms_set_max_layer(t, 16));
+    }
+    let client = runtime();
+    let d = dish(client, client_tls());
+    assert_eq!(dish_join(d, "v", t), -WEIDA_ELIMIT_EXCEEDED);
+    // SAFETY: live terms, dropped once after the join copied them.
+    ok(unsafe { weida_join_terms_set_max_layer(t, 1) });
+    ok(dish_join(d, "v", t));
+    // SAFETY: dropped once.
+    unsafe { weida_join_terms_drop(t) };
+
+    ok(dish_connect(
+        d,
+        "weida+inproc://abi-patterns-radio-layers/r",
+    ));
+    await_dishes(r, 1);
+    let mut stats = ptr::null_mut();
+    let mut events = ptr::null_mut();
+    // SAFETY: a live dish and writable out-parameters; each handle is
+    // dropped once.
+    unsafe {
+        assert_eq!(weida_dish_peer_count(d), 1);
+        ok(weida_dish_connection_stats(d, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 1);
+        weida_connection_stats_drop(stats);
+        ok(weida_dish_events(d, &mut events));
+        assert!(!events.is_null());
+        weida_peer_events_drop(events);
+    }
+
+    let long = c(&"t".repeat(257));
+    let mut refused = ptr::null_mut();
+    // SAFETY: a live radio, a C string and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_radio_segment(r, long.as_ptr(), ptr::null(), &mut refused) },
+        -WEIDA_ELIMIT_EXCEEDED
+    );
+
+    let s0 = open_segment(r, "v", ptr::null());
+    // SAFETY: a live segment and a writable length.
+    unsafe {
+        assert_eq!(weida_segment_number(s0), 0);
+        let at = weida_segment_topic(s0, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("v"));
+    }
+    assert_eq!(write_layer(s0, 0, b"a0"), 1);
+    assert_eq!(write_layer(s0, 1, b"a1"), 1);
+    assert_eq!(
+        write_layer(s0, 2, b"a2"),
+        0,
+        "the copy is capped at layer 1"
+    );
+    let mut n = usize::MAX;
+    // SAFETY: a live segment, 2 readable bytes and a writable out-parameter.
+    unsafe {
+        assert_eq!(
+            weida_segment_write_layer(s0, 16, b"xx".as_ptr(), 2, &mut n),
+            -WEIDA_ELIMIT_EXCEEDED
+        );
+        ok(weida_segment_finish_layer(s0, 0));
+        assert_eq!(
+            weida_segment_write(s0, b"xx".as_ptr(), 2, &mut n),
+            -WEIDA_ERUNTIME
+        );
+    }
+    assert_eq!(finish_segment(s0), 1);
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let (t, number, layer) = stream_segment(d, "v");
+        seen.push((number, layer, body(t)));
+    }
+
+    let mut st = ptr::null_mut();
+    // SAFETY: a writable out-parameter and live terms.
+    unsafe {
+        ok(weida_segment_terms_new(&mut st));
+        assert_eq!(weida_segment_terms_set_priority(st, 40_000), -WEIDA_EINVAL);
+        ok(weida_segment_terms_set_priority(st, 1));
+        ok(weida_segment_terms_set_max_age_ms(st, 60_000));
+    }
+    let s1 = open_segment(r, "v", st);
+    // SAFETY: live handles, 2 readable bytes and a writable out-parameter;
+    // the terms are dropped once.
+    unsafe {
+        weida_segment_terms_drop(st);
+        assert_eq!(weida_segment_number(s1), 1);
+        ok(weida_segment_write(s1, b"b0".as_ptr(), 2, &mut n));
+    }
+    assert_eq!(n, 1);
+    assert_eq!(finish_segment(s1), 1);
+    let (t, number, layer) = stream_segment(d, "v");
+    seen.push((number, layer, body(t)));
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            (0, 0, b"a0".to_vec()),
+            (0, 1, b"a1".to_vec()),
+            (1, 0, b"b0".to_vec())
+        ]
+    );
+
+    let mut drops = ptr::null_mut();
+    // SAFETY: live handles and a writable out-parameter; each snapshot is
+    // dropped once.
+    unsafe {
+        assert_eq!(weida_radio_dropped(r), 0);
+        ok(weida_radio_drops(r, &mut drops));
+        assert_eq!(weida_topic_drops_len(drops), 0);
+        weida_topic_drops_drop(drops);
+    }
+    let dd = dish_drops_of(r);
+    // SAFETY: a live snapshot.
+    assert_eq!(unsafe { weida_dish_drops_len(dd) }, 1);
+    for get in [
+        weida_dish_drops_subscriber_budget,
+        weida_dish_drops_subscriber_queue,
+        weida_dish_drops_superseded,
+        weida_dish_drops_expired,
+        weida_dish_drops_too_large,
+        weida_dish_drops_no_datagrams,
+        weida_dish_drops_layers_cut,
+    ] {
+        assert_eq!(dish_drop_count(dd, 0, get), Some(0));
+        assert_eq!(dish_drop_count(dd, 1, get), None);
+    }
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        assert_eq!(weida_dish_stale(d), 0);
+        assert_eq!(weida_dish_overflow(d), 0);
+        weida_dish_drops_drop(dd);
+        weida_dish_drop(d);
+        weida_radio_drop(r);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn a_superseded_segment_counts_in_dish_drops() {
+    let server = runtime();
+    let (l, lb, r) = radio_on(server, "abi-patterns-radio-supersede");
+    let client = runtime();
+    let d = dish(client, client_tls());
+    ok(dish_join(d, "v", ptr::null()));
+    ok(dish_connect(
+        d,
+        "weida+inproc://abi-patterns-radio-supersede/r",
+    ));
+    await_dishes(r, 1);
+
+    let first = open_segment(r, "v", ptr::null());
+    assert_eq!(write_layer(first, 0, b"first"), 1);
+    let second = open_segment(r, "v", ptr::null());
+    assert_eq!(write_layer(second, 0, b"second"), 1);
+    assert_eq!(finish_segment(second), 1);
+
+    weida_testkit::poll_until("the supersession", WAIT, || {
+        let dd = dish_drops_of(r);
+        let superseded = dish_drop_count(dd, 0, weida_dish_drops_superseded);
+        // SAFETY: dropped once.
+        unsafe { weida_dish_drops_drop(dd) };
+        superseded == Some(1)
+    });
+    let topic = c("v");
+    let mut drops = ptr::null_mut();
+    // SAFETY: a live radio, a C string and a writable out-parameter; the
+    // snapshot is dropped once.
+    unsafe {
+        ok(weida_radio_dropped_on(r, topic.as_ptr(), &mut drops));
+        assert_eq!(weida_topic_drops_len(drops), 1);
+        assert_eq!(drop_count(drops, 0, weida_topic_drops_superseded), Some(1));
+        weida_topic_drops_drop(drops);
+        assert_eq!(weida_radio_dropped(r), 1);
+    }
+    assert_eq!(finish_segment(first), 0, "the copy was reset");
+
+    loop {
+        let (t, number, layer) = stream_segment(d, "v");
+        assert_eq!(layer, 0);
+        let read = read_all(t, 1024);
+        // SAFETY: dropped once.
+        unsafe { weida_incoming_transfer_drop(t) };
+        if number == 1 {
+            assert_eq!(read.expect("segment 1"), b"second");
+            break;
+        }
+        assert!(read.is_err(), "segment 0 was reset, never finished");
+    }
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_dish_drop(d);
+        weida_radio_drop(r);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn a_radio_datagram_reaches_a_dish_that_carries_datagrams() {
+    let cfg = datagram_config();
+    let server = runtime_with(cfg);
+    let near = runtime_with(cfg);
+    let far = runtime();
+    // SAFETY: dropped once; the runtimes copied it.
+    unsafe { weida_runtime_config_drop(cfg) };
+    let (l, lb, r) = radio_on(server, "abi-patterns-radio-datagram");
+    let a = dish(near, client_tls());
+    let b = dish(far, client_tls());
+    for d in [a, b] {
+        ok(dish_join(d, "voice", ptr::null()));
+        ok(dish_connect(
+            d,
+            "weida+inproc://abi-patterns-radio-datagram/r",
+        ));
+    }
+    await_dishes(r, 2);
+
+    let topic = c("voice");
+    let mut n = usize::MAX;
+    // SAFETY: a live radio, a C string, 5 readable bytes and a writable
+    // out-parameter.
+    ok(unsafe { weida_radio_datagram(r, topic.as_ptr(), b"hello".as_ptr(), 5, &mut n) });
+    assert_eq!(n, 1, "only one dish carries datagrams");
+
+    let x = next_received(a);
+    let mut len = usize::MAX;
+    let mut number = u64::MAX;
+    let mut t = ptr::null_mut();
+    // SAFETY: a live received segment, dropped once, and writable
+    // out-parameters; the payload lives with it.
+    unsafe {
+        assert_eq!(weida_received_kind(x), WEIDA_RECEIVED_DATAGRAM);
+        let at = weida_received_topic(x, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("voice"));
+        assert_eq!(weida_received_segment(x, &mut number), 1);
+        assert_eq!(number, 0);
+        let payload = weida_received_payload(x, &mut len);
+        assert_eq!(std::slice::from_raw_parts(payload, len), b"hello");
+        assert_eq!(weida_received_take_segment(x, &mut t), -WEIDA_EINVAL);
+        weida_received_drop(x);
+    }
+
+    let mut drops = ptr::null_mut();
+    // SAFETY: a live radio, a C string and a writable out-parameter; the
+    // snapshot is dropped once.
+    unsafe {
+        ok(weida_radio_dropped_on(r, topic.as_ptr(), &mut drops));
+        assert_eq!(
+            drop_count(drops, 0, weida_topic_drops_no_datagrams),
+            Some(1)
+        );
+        weida_topic_drops_drop(drops);
+    }
+    let dd = dish_drops_of(r);
+    // SAFETY: a live snapshot.
+    assert_eq!(unsafe { weida_dish_drops_len(dd) }, 2);
+    let mut counts: Vec<Option<u64>> = (0..2)
+        .map(|i| dish_drop_count(dd, i, weida_dish_drops_no_datagrams))
+        .collect();
+    counts.sort();
+    assert_eq!(counts, [Some(0), Some(1)]);
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_dish_drops_drop(dd);
+        weida_dish_drop(a);
+        weida_dish_drop(b);
+        weida_radio_drop(r);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(near);
+    shutdown(far);
+    shutdown(server);
+}
+
+#[test]
+fn a_radio_evicts_a_dish_by_its_key() {
+    let server = runtime();
+    let l = listener(server);
+    let (server_id, server_fp) = identity();
+    let tls = server_tls(server_id);
+    // SAFETY: live server terms.
+    ok(unsafe { weida_server_tls_require_any_key(tls) });
+    let (binding, local) = bind_quic(l, tls);
+    let path = c("/r");
+    let mut r = ptr::null_mut();
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_radio(l, path.as_ptr(), &mut r) });
+
+    let client = runtime();
+    let (client_id, client_fp) = identity();
+    let trust = trust_by_address();
+    let mut dish_tls = ptr::null_mut();
+    // SAFETY: live handles and a writable out-parameter; `trust` is dropped
+    // once.
+    unsafe {
+        ok(weida_client_tls_new(trust, &mut dish_tls));
+        ok(weida_client_tls_set_identity(dish_tls, client_id));
+        weida_trust_drop(trust);
+    }
+    let d = dish(client, dish_tls);
+    ok(dish_join(d, "v", ptr::null()));
+    ok(dish_connect(d, &format!("weida://{server_fp}@{local}/r")));
+    await_dishes(r, 1);
+
+    let dd = dish_drops_of(r);
+    let mut len = usize::MAX;
+    // SAFETY: a live snapshot, dropped once, and a writable length.
+    unsafe {
+        let at = weida_dish_drops_peer_fingerprint(dd, 0, &mut len);
+        assert_eq!(text(at, len), Some(client_fp.clone()));
+        assert!(weida_dish_drops_peer_fingerprint(dd, 1, &mut len).is_null());
+        weida_dish_drops_drop(dd);
+    }
+
+    let (stranger, stranger_fp) = identity();
+    let stranger_key = c(&stranger_fp);
+    let nope = c("nope");
+    let client_key = c(&client_fp);
+    let filter = c("v");
+    let mut n = usize::MAX;
+    // SAFETY: a live radio, C strings and a writable out-parameter.
+    unsafe {
+        ok(weida_radio_evict(
+            r,
+            stranger_key.as_ptr(),
+            filter.as_ptr(),
+            &mut n,
+        ));
+        assert_eq!(n, 0, "nobody of that key joined");
+        assert_eq!(
+            weida_radio_evict(r, nope.as_ptr(), filter.as_ptr(), &mut n),
+            -WEIDA_EINVALID_FINGERPRINT
+        );
+        ok(weida_radio_evict(
+            r,
+            client_key.as_ptr(),
+            filter.as_ptr(),
+            &mut n,
+        ));
+    }
+    assert_eq!(n, 1);
+
+    let s = open_segment(r, "v", ptr::null());
+    assert_eq!(write_layer(s, 0, b"x"), 0, "the evicted dish gets no copy");
+    assert_eq!(finish_segment(s), 0);
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_dish_drop(d);
+        weida_identity_drop(client_id);
+        weida_identity_drop(stranger);
+        weida_radio_drop(r);
+        weida_binding_drop(binding);
+        weida_server_tls_drop(tls);
+        weida_identity_drop(server_id);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}

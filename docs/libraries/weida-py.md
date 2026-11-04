@@ -134,10 +134,12 @@ of the TLS terms, `weida_identity_source`, `weida_trust_source`, their weak form
 `weida_files_options`, and the event queue `weida_identity_events` with `weida_identity_event`.
 TLS terms still take an identity and a trust as values, under `weida/0`.
 
-Push/Pull, Pub/Sub, PAIR, SURVEY and BUS of the C ABI's *patterns* area are absent here:
-`weida_pusher`, `weida_puller`, `weida_publisher`, `weida_subscriber`, `weida_fan_out`,
+Push/Pull, Pub/Sub, PAIR, SURVEY, BUS and RADIO/DISH of the C ABI's *patterns* area are absent
+here: `weida_pusher`, `weida_puller`, `weida_publisher`, `weida_subscriber`, `weida_fan_out`,
 `weida_topic_drops`, `weida_incoming_meta_gap`, `weida_paired`, `weida_surveyor`,
-`weida_survey_run`, `weida_survey_answer`, `weida_respondent` and `weida_bus_member`.
+`weida_survey_run`, `weida_survey_answer`, `weida_respondent`, `weida_bus_member`, `weida_radio`,
+`weida_segment`, `weida_segment_terms`, `weida_dish`, `weida_join_terms`, `weida_received`,
+`weida_dish_drops`, `weida_incoming_meta_segment` and `weida_incoming_meta_layer`.
 
 ## 7. Sources
 

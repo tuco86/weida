@@ -21,6 +21,7 @@ rest.
 | `int weida_listener_pair(const weida_listener *l, const char *path, weida_paired **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` ([pair.md](pair.md)) |
 | `int weida_listener_respondent(const weida_listener *l, const char *path, weida_respondent **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` ([survey.md](survey.md)) |
 | `int weida_listener_bus(const weida_listener *l, const char *path, const weida_client_tls *tls, weida_bus_member **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` ([bus.md](bus.md)) |
+| `int weida_listener_radio(const weida_listener *l, const char *path, weida_radio **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED`; the path is released when the radio is dropped ([radio.md](radio.md)) |
 | `void weida_listener_drop(weida_listener *l)` | never | — |
 
 ## `weida_listener_bind_quic_op`
