@@ -30,12 +30,13 @@ crates. The pipelines run the rest: a push to `main` runs the unit tier and
 the doctests on four platforms, the nightly and a `v*` tag both tiers.
 Never run `--profile integration` or `--profile ci` locally.
 
-Both tiers on demand: `ci_run` with `event: "nightly"`. Such a nightly runs
-on the warm workspaces and skips the fuzz round (its `fuzz` job succeeds
-with "skipped"); only the scheduled round (`CI_ACTOR=nightly`) wipes the
-workspaces and fuzzes, once a day (`.zeughaus-ci/build.sh`). A nightly
-blocks every other repository's nightly while it runs, so queue one only
-when the integration tier is the check that is missing, once per change.
+Never queue a nightly: no `ci_run` with `event: "nightly"`, no `ci_rerun` of
+a nightly pipeline. Only the user starts one by hand; otherwise the scheduled
+round runs it once a day. A nightly blocks every other repository's nightly
+while it runs. A change that needs the integration tier gets it from `run_jobs`
+of that platform's check job, its test command switched to the integration
+tier and filtered to the tests in question (skill://zeughaus-ci, section 4);
+the next scheduled nightly covers the rest.
 
 ## Version cycle
 
