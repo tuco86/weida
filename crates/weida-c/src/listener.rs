@@ -4,33 +4,45 @@
 use std::ffi::{c_char, c_int};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use ::weida_runtime::Exec;
 use weida_rs::{
-    Binding, Error, ErrorCode, IncomingRequest, Listener, LocalBinding, Replier, TransferMeta,
+    Binding, Error, ErrorCode, Fingerprint, Handoff, IncomingRequest, Listener, LocalBinding,
+    Replier, TransferMeta,
 };
 
 use crate::config::wire;
-use crate::error::{fail, guard, guard_ptr, guard_void};
-use crate::handle::{CText, borrow, cstr, into_handle, out_ptr, release, text_out, write_out};
+use crate::error::{
+    WEIDA_EINVAL, closed, fail, fail_abi, guard, guard_or, guard_ptr, guard_void, null_arg,
+};
+use crate::handle::{
+    CText, borrow, bytes, cstr, into_handle, out_ptr, release, text_out, write_out,
+};
 use crate::op::Op;
 use crate::runtime::{AsOp, op_drop, op_fd, op_wait, weida_runtime};
-use crate::tls::{weida_server_tls, weida_transfer_meta};
+use crate::stats::weida_peer_events;
+use crate::tls::{weida_client_tls, weida_server_tls, weida_transfer_meta};
 use crate::transfer::{
     meta_of, weida_incoming_meta, weida_incoming_transfer, weida_outgoing_transfer,
 };
 use crate::try_handle::Tried;
 
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Where a runtime serves: bindings and the endpoints registered on them.
 pub struct weida_listener {
-    listener: Listener,
-    exec: Exec,
+    pub(crate) listener: Listener,
+    pub(crate) exec: Exec,
 }
 
 /// The pending bind of `weida_listener_bind_quic`.
 pub struct weida_listener_bind_quic_op {
     op: Arc<Op<Binding>>,
+    exec: Exec,
 }
 
 impl AsOp for weida_listener_bind_quic_op {
@@ -40,10 +52,107 @@ impl AsOp for weida_listener_bind_quic_op {
     }
 }
 
-/// A QUIC binding: the socket a listener serves on.
+/// The pending bind of `weida_listener_bind_quic_socket`.
+pub struct weida_listener_bind_quic_socket_op {
+    op: Arc<Op<Binding>>,
+    exec: Exec,
+}
+
+impl AsOp for weida_listener_bind_quic_socket_op {
+    type Output = Binding;
+    fn op(&self) -> &Op<Binding> {
+        &self.op
+    }
+}
+
+/// The pending registration of `weida_listener_bind_relay`.
+pub struct weida_listener_bind_relay_op {
+    op: Arc<Op<Binding>>,
+    exec: Exec,
+}
+
+impl AsOp for weida_listener_bind_relay_op {
+    type Output = Binding;
+    fn op(&self) -> &Op<Binding> {
+        &self.op
+    }
+}
+
+/// A QUIC binding: the socket a listener serves on, directly or through a
+/// relay.
 pub struct weida_binding {
-    _binding: Binding,
+    /// Taken by `weida_binding_hand_over`; every later call is
+    /// `-WEIDA_ECLOSED`.
+    binding: Mutex<Option<Arc<Binding>>>,
     local_addr: CText,
+    /// Made by `weida_listener_bind_relay`: no OS socket to hand over.
+    relayed: bool,
+    /// Set when a `weida_binding_close` starts.
+    closed: AtomicBool,
+    exec: Exec,
+}
+
+impl weida_binding {
+    pub(crate) fn handle(binding: Binding, exec: Exec, relayed: bool) -> *mut weida_binding {
+        let local_addr = CText::new(binding.local_addr().to_string());
+        into_handle(weida_binding {
+            binding: Mutex::new(Some(Arc::new(binding))),
+            local_addr,
+            relayed,
+            closed: AtomicBool::new(false),
+            exec,
+        })
+    }
+
+    /// The binding for one call; `-WEIDA_ECLOSED` once handed over.
+    fn get(&self) -> Result<Arc<Binding>, c_int> {
+        lock(&self.binding).clone().ok_or_else(closed)
+    }
+}
+
+/// The pending close of `weida_binding_close`.
+pub struct weida_binding_close_op {
+    op: Arc<Op<()>>,
+}
+
+impl AsOp for weida_binding_close_op {
+    type Output = ();
+    fn op(&self) -> &Op<()> {
+        &self.op
+    }
+}
+
+/// The pending hand-over of `weida_binding_hand_over`.
+pub struct weida_binding_hand_over_op {
+    op: Arc<Op<Handoff>>,
+}
+
+impl AsOp for weida_binding_hand_over_op {
+    type Output = Handoff;
+    fn op(&self) -> &Op<Handoff> {
+        &self.op
+    }
+}
+
+/// The pending take-over of `weida_binding_take_over`.
+pub struct weida_binding_take_over_op {
+    op: Arc<Op<usize>>,
+}
+
+impl AsOp for weida_binding_take_over_op {
+    type Output = usize;
+    fn op(&self) -> &Op<usize> {
+        &self.op
+    }
+}
+
+/// What a hand-over leaves for the successor (`Handoff`): the socket, taken
+/// once, and the held close packets as bytes.
+pub struct weida_handoff {
+    socket: Mutex<Option<std::net::UdpSocket>>,
+    local_addr: CText,
+    held: usize,
+    bytes: Box<[u8]>,
 }
 
 /// An in-process binding: the bus a listener answers on.
@@ -176,8 +285,12 @@ pub unsafe extern "C" fn weida_listener_bind_quic(
         let listener = l.listener.clone();
         let tls = tls.get();
         let op = Op::start(&l.exec, async move { listener.bind_quic(addr, tls).await });
+        let handle = into_handle(weida_listener_bind_quic_op {
+            op,
+            exec: l.exec.clone(),
+        });
         // SAFETY: `out` passed `out_ptr`.
-        unsafe { write_out(out, into_handle(weida_listener_bind_quic_op { op })) };
+        unsafe { write_out(out, handle) };
         Ok(0)
     })
 }
@@ -197,7 +310,8 @@ pub unsafe extern "C" fn weida_listener_bind_quic_op_fd(
 }
 
 /// Waits up to `timeout_ms` (R4) for the binding and writes it to `out`.
-/// Release it with `weida_binding_drop`, which stops serving.
+/// Release it with `weida_binding_drop`; the binding serves until
+/// `weida_binding_close`, a hand-over or the runtime's shutdown.
 ///
 /// # Safety
 ///
@@ -211,14 +325,11 @@ pub unsafe extern "C" fn weida_listener_bind_quic_op_wait(
     guard(|| {
         let out = out_ptr(out)?;
         // SAFETY: forwarded from this function's contract.
-        let binding = unsafe { op_wait(op, timeout_ms) }?;
-        let local_addr = CText::new(binding.local_addr().to_string());
-        let handle = into_handle(weida_binding {
-            _binding: binding,
-            local_addr,
-        });
+        let handle = unsafe { borrow(op) }?;
+        let binding = handle.op.wait(timeout_ms)?;
+        let binding = weida_binding::handle(binding, handle.exec.clone(), false);
         // SAFETY: `out` passed `out_ptr`.
-        unsafe { write_out(out, handle) };
+        unsafe { write_out(out, binding) };
         Ok(0)
     })
 }
@@ -231,6 +342,237 @@ pub unsafe extern "C" fn weida_listener_bind_quic_op_wait(
 /// `op` is NULL or a live bind op, dropped at most once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn weida_listener_bind_quic_op_drop(op: *mut weida_listener_bind_quic_op) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Takes ownership of the socket descriptor `socket`: a file descriptor on
+/// Unix, a `SOCKET` on Windows (R6).
+///
+/// # Safety
+///
+/// A non-negative `socket` is an open UDP socket the caller owns and does
+/// not use again.
+unsafe fn udp_socket(socket: i64) -> Result<std::net::UdpSocket, c_int> {
+    let not_a_socket = || fail_abi(WEIDA_EINVAL, c"not a socket descriptor");
+    #[cfg(unix)]
+    {
+        use std::os::fd::{FromRawFd, RawFd};
+        let fd = RawFd::try_from(socket)
+            .ok()
+            .filter(|fd| *fd >= 0)
+            .ok_or_else(not_a_socket)?;
+        // SAFETY: an open UDP socket the caller hands over, by this
+        // function's contract.
+        Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{FromRawSocket, RawSocket};
+        let raw = RawSocket::try_from(socket).map_err(|_| not_a_socket())?;
+        // SAFETY: an open UDP socket the caller hands over, by this
+        // function's contract.
+        Ok(unsafe { std::net::UdpSocket::from_raw_socket(raw) })
+    }
+}
+
+/// Serves QUIC on a socket that is already bound
+/// (`Listener::bind_quic_socket`): a predecessor's after
+/// `weida_binding_hand_over`, or one from socket activation. **Takes
+/// ownership of `socket`** on every return path but a negative or
+/// out-of-range number (`-WEIDA_EINVAL`, nothing taken). weida neither
+/// binds it nor sets options on it.
+///
+/// Never blocks; the bind runs as the op written to `out`, whose wait
+/// yields the binding.
+///
+/// # Safety
+///
+/// `l` is NULL or a live listener; a non-negative `socket` is an open UDP
+/// socket descriptor the caller owns and does not use again; `tls` is NULL
+/// or live server terms; `out` is NULL or writable. Release the op with
+/// `weida_listener_bind_quic_socket_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_quic_socket(
+    l: *const weida_listener,
+    socket: i64,
+    tls: *const weida_server_tls,
+    out: *mut *mut weida_listener_bind_quic_socket_op,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract; from here on the
+        // descriptor is owned, and closed by any failure below.
+        let socket = unsafe { udp_socket(socket) }?;
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let l = unsafe { borrow(l) }?;
+        // SAFETY: forwarded from this function's contract.
+        let tls = unsafe { borrow(tls) }?.get();
+        let listener = l.listener.clone();
+        let op = Op::start(&l.exec, async move {
+            listener.bind_quic_socket(socket, tls).await
+        });
+        let handle = into_handle(weida_listener_bind_quic_socket_op {
+            op,
+            exec: l.exec.clone(),
+        });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, handle) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a socket bind op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live socket bind op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_quic_socket_op_fd(
+    op: *const weida_listener_bind_quic_socket_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the binding and writes it to `out`.
+/// `-WEIDA_EIO` when the descriptor is not a usable UDP socket. Release the
+/// binding with `weida_binding_drop`.
+///
+/// # Safety
+///
+/// `op` is NULL or a live socket bind op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_quic_socket_op_wait(
+    op: *const weida_listener_bind_quic_socket_op,
+    timeout_ms: i64,
+    out: *mut *mut weida_binding,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let handle = unsafe { borrow(op) }?;
+        let binding = handle.op.wait(timeout_ms)?;
+        let binding = weida_binding::handle(binding, handle.exec.clone(), false);
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, binding) };
+        Ok(0)
+    })
+}
+
+/// Releases a socket bind op, aborting the bind when unfinished; the
+/// socket is closed then. NULL does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live socket bind op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_quic_socket_op_drop(
+    op: *mut weida_listener_bind_quic_socket_op,
+) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Serves this listener's endpoints through a relay, for a peer that can
+/// only dial out (`Listener::bind_relay`, PROTOCOL §9.6).
+///
+/// `relay` is `weida://[relay-key@]host[:port]/.weida/relay`; the peer
+/// registers there under the key `via` presents, so `via` needs an
+/// identity. Diallers reach the endpoints as
+/// `weida+relay://<key>@[relay-key@]host[:port]/path`, with QUIC and TLS
+/// end to end on `tls`'s terms. A lost relay is redialled and registered
+/// again (`weida_binding_relay_events`).
+///
+/// Never blocks; the registration runs as the op written to `out`. Its
+/// wait returns the first registration's failure: `-WEIDA_EREJECTED` where
+/// the relay refused it, `-WEIDA_EINVALID_ADDRESS` for another path.
+///
+/// # Safety
+///
+/// `l` is NULL or a live listener; `relay` is NULL or a NUL-terminated
+/// string; `via` is NULL or live client terms; `tls` is NULL or live
+/// server terms; `out` is NULL or writable. Release the op with
+/// `weida_listener_bind_relay_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_relay(
+    l: *const weida_listener,
+    relay: *const c_char,
+    via: *const weida_client_tls,
+    tls: *const weida_server_tls,
+    out: *mut *mut weida_listener_bind_relay_op,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let l = unsafe { borrow(l) }?;
+        // SAFETY: forwarded from this function's contract.
+        let relay = unsafe { cstr(relay) }?.to_owned();
+        // SAFETY: forwarded from this function's contract.
+        let via = unsafe { borrow(via) }?.get();
+        // SAFETY: forwarded from this function's contract.
+        let tls = unsafe { borrow(tls) }?.get();
+        let listener = l.listener.clone();
+        let op = Op::start(&l.exec, async move {
+            listener.bind_relay(&relay, via, tls).await
+        });
+        let handle = into_handle(weida_listener_bind_relay_op {
+            op,
+            exec: l.exec.clone(),
+        });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, handle) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a relay bind op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live relay bind op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_relay_op_fd(
+    op: *const weida_listener_bind_relay_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the first registration and writes the
+/// relayed binding to `out`. Release it with `weida_binding_drop`.
+///
+/// # Safety
+///
+/// `op` is NULL or a live relay bind op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_relay_op_wait(
+    op: *const weida_listener_bind_relay_op,
+    timeout_ms: i64,
+    out: *mut *mut weida_binding,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let handle = unsafe { borrow(op) }?;
+        let binding = handle.op.wait(timeout_ms)?;
+        let binding = weida_binding::handle(binding, handle.exec.clone(), true);
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, binding) };
+        Ok(0)
+    })
+}
+
+/// Releases a relay bind op, aborting the registration when unfinished.
+/// NULL does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live relay bind op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_relay_op_drop(op: *mut weida_listener_bind_relay_op) {
     // SAFETY: forwarded from this function's contract.
     unsafe { op_drop(op) }
 }
@@ -337,7 +679,450 @@ pub unsafe extern "C" fn weida_binding_local_addr(
     })
 }
 
-/// Releases a binding, which stops serving on it. NULL does nothing.
+/// Stops accepting and closes the binding's connections with `SHUTDOWN`
+/// (`Binding::close`).
+///
+/// Never blocks; the close runs as the op written to `out`. The op
+/// finishes once the socket went idle, bounded by `shutdown_timeout`, and
+/// the port is free to bind again. A relayed binding ends its registration
+/// at the relay. The handle stays valid (`weida_binding_local_addr`); drop
+/// it as usual. `-WEIDA_ECLOSED` once handed over.
+///
+/// # Safety
+///
+/// `b` is NULL or a live binding; `out` is NULL or writable. Release the op
+/// with `weida_binding_close_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_close(
+    b: *const weida_binding,
+    out: *mut *mut weida_binding_close_op,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let b = unsafe { borrow(b) }?;
+        let binding = b.get()?;
+        b.closed.store(true, Ordering::Release);
+        let op = Op::start(&b.exec, async move {
+            binding.close().await;
+            Ok(())
+        });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_binding_close_op { op })) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a close op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live close op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_close_op_fd(
+    op: *const weida_binding_close_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the close; 0 once the port is free.
+///
+/// # Safety
+///
+/// `op` is NULL or a live close op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_close_op_wait(
+    op: *const weida_binding_close_op,
+    timeout_ms: i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    guard(|| unsafe { op_wait(op, timeout_ms) }.map(|()| 0))
+}
+
+/// Releases a close op. Dropped unfinished, it aborts the close where it
+/// is: the connections may already be closed, and the port is then freed
+/// only by the runtime's shutdown. NULL does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live close op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_close_op_drop(op: *mut weida_binding_close_op) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Hands the binding's socket over to a successor process
+/// (`Binding::hand_over`, decision 0039). **Consumes** `b` on every return
+/// path.
+///
+/// From the call on, this process neither reads nor sends on the socket.
+/// Every connection is closed with `RESTARTING`, with the close packets
+/// held in the `weida_handoff` the op yields and not sent. Returns
+/// `-WEIDA_EUNSUPPORTED` for a relayed binding, which has no socket;
+/// `-WEIDA_ECLOSED` for one a `weida_binding_close` was started on;
+/// `-WEIDA_EINVAL` while a `weida_binding_take_over` op of it is
+/// unfinished. A binding consumed by one of these failures keeps serving
+/// until its runtime shuts down. After the runtime's shutdown the op ends
+/// with `-WEIDA_ERUNTIME`.
+///
+/// # Safety
+///
+/// `b` is NULL or a live binding, not used again; `out` is NULL or
+/// writable. Release the op with `weida_binding_hand_over_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_hand_over(
+    b: *mut weida_binding,
+    out: *mut *mut weida_binding_hand_over_op,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract; the handle is
+        // consumed here whatever happens next.
+        let b = unsafe { release(b) }.ok_or_else(null_arg)?;
+        let taken = lock(&b.binding).take();
+        let out = out_ptr(out)?;
+        let binding = taken.ok_or_else(closed)?;
+        if b.relayed {
+            return Err(fail(Error::Unsupported));
+        }
+        if b.closed.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        let binding = Arc::try_unwrap(binding).map_err(|_| {
+            fail_abi(
+                WEIDA_EINVAL,
+                c"a take-over of this binding is still running",
+            )
+        })?;
+        let op = Op::start(&b.exec, async move { Ok(binding.hand_over().await) });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_binding_hand_over_op { op })) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a hand-over op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live hand-over op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_hand_over_op_fd(
+    op: *const weida_binding_hand_over_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the hand-over and writes what it left
+/// for the successor to `out`. `-WEIDA_ERUNTIME` once the runtime shut
+/// down.
+///
+/// # Safety
+///
+/// `op` is NULL or a live hand-over op; `out` is NULL or writable. Release
+/// the handoff with `weida_handoff_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_hand_over_op_wait(
+    op: *const weida_binding_hand_over_op,
+    timeout_ms: i64,
+    out: *mut *mut weida_handoff,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let handoff = unsafe { op_wait(op, timeout_ms) }?;
+        let held = handoff.held();
+        let local_addr = CText::new(handoff.local_addr().to_string());
+        let (socket, bytes) = handoff.into_parts();
+        let handle = into_handle(weida_handoff {
+            socket: Mutex::new(Some(socket)),
+            local_addr,
+            held,
+            bytes: bytes.into_boxed_slice(),
+        });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, handle) };
+        Ok(0)
+    })
+}
+
+/// Releases a hand-over op. NULL does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live hand-over op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_hand_over_op_drop(op: *mut weida_binding_hand_over_op) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Sends the close packets a predecessor held (`Binding::take_over`), so
+/// its clients redial into this binding.
+///
+/// Call it once the endpoints those clients use are registered. Each
+/// datagram is sent once. `held` is `weida_handoff_bytes` of the
+/// predecessor's handoff, and needs the integrity of the channel that
+/// carries the socket: whoever can write it decides what this binding
+/// sends from its port. Never blocks; the sending runs as the op written
+/// to `out`. `-WEIDA_ECLOSED` once handed over.
+///
+/// # Safety
+///
+/// `b` is NULL or a live binding; `held` is NULL or points to `len`
+/// readable bytes (copied before the call returns); `out` is NULL or
+/// writable. Release the op with `weida_binding_take_over_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_take_over(
+    b: *const weida_binding,
+    held: *const u8,
+    len: usize,
+    out: *mut *mut weida_binding_take_over_op,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let b = unsafe { borrow(b) }?;
+        // SAFETY: forwarded from this function's contract.
+        let held = unsafe { bytes(held, len) }?.to_vec();
+        let binding = b.get()?;
+        let op = Op::start(&b.exec, async move { binding.take_over(&held).await });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_binding_take_over_op { op })) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a take-over op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live take-over op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_take_over_op_fd(
+    op: *const weida_binding_take_over_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the take-over and writes how many
+/// datagrams were sent to `out`. `-WEIDA_EIO` for bytes that are not a
+/// handoff, or a handoff of another address.
+///
+/// # Safety
+///
+/// `op` is NULL or a live take-over op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_take_over_op_wait(
+    op: *const weida_binding_take_over_op,
+    timeout_ms: i64,
+    out: *mut usize,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let sent = unsafe { op_wait(op, timeout_ms) }?;
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, sent) };
+        Ok(0)
+    })
+}
+
+/// Releases a take-over op, aborting it when unfinished. NULL does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live take-over op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_take_over_op_drop(op: *mut weida_binding_take_over_op) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Closes every live connection this binding holds from the peer whose key
+/// is `peer` (`sha256:` text) with `REJECTED`, and writes how many it
+/// closed (`Binding::disconnect`).
+///
+/// Not a ban: the peer sees `WEIDA_LOSS_PEER_CLOSED` and redials under its
+/// own policy. An anonymous client cannot be named.
+/// `-WEIDA_EINVALID_FINGERPRINT` for text that is not a key,
+/// `-WEIDA_ECLOSED` once handed over.
+///
+/// # Safety
+///
+/// `b` is NULL or a live binding; `peer` is NULL or a NUL-terminated
+/// string; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_disconnect(
+    b: *const weida_binding,
+    peer: *const c_char,
+    out: *mut usize,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let b = unsafe { borrow(b) }?;
+        // SAFETY: forwarded from this function's contract.
+        let text = unsafe { cstr(peer) }?;
+        let fp: Fingerprint = text.parse().map_err(fail)?;
+        let closed = b.get()?.disconnect(fp);
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, closed) };
+        Ok(0)
+    })
+}
+
+/// A new reader of a relayed binding's registration events
+/// (`Binding::relay_events`): lost, redialled and registered again, given
+/// up.
+///
+/// Returns 1 and writes the reader to `out`. Returns 0 and leaves `out`
+/// untouched for a binding that is not relayed, or whose registration
+/// ended with its close. `-WEIDA_ECLOSED` once handed over.
+///
+/// # Safety
+///
+/// `b` is NULL or a live binding; `out` is NULL or writable. Release the
+/// reader with `weida_peer_events_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_binding_relay_events(
+    b: *const weida_binding,
+    out: *mut *mut weida_peer_events,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let b = unsafe { borrow(b) }?;
+        let Some(events) = b.get()?.relay_events() else {
+            return Ok(0);
+        };
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, weida_peer_events::handle(events)) };
+        Ok(1)
+    })
+}
+
+/// How many close packets the handoff holds for the successor
+/// (`Handoff::held`); 0 for NULL.
+///
+/// # Safety
+///
+/// `h` is NULL or a live handoff.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_handoff_held(h: *const weida_handoff) -> usize {
+    guard_or(0, || {
+        // SAFETY: a non-NULL `h` is a live handoff by this function's
+        // contract.
+        unsafe { h.as_ref() }.map_or(0, |h| h.held)
+    })
+}
+
+/// The address the handed-over socket is bound to (`Handoff::local_addr`).
+/// Lives as long as the handoff.
+///
+/// # Safety
+///
+/// `h` is NULL or a live handoff; `len_out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_handoff_local_addr(
+    h: *const weida_handoff,
+    len_out: *mut usize,
+) -> *const c_char {
+    guard_ptr(|| {
+        if h.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: a non-NULL `h` is a live handoff by this function's
+        // contract; the text lives as long as it.
+        let h = unsafe { &*h };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { text_out(Some(&h.local_addr), len_out) }
+    })
+}
+
+/// The held datagrams for the successor's `weida_binding_take_over`, with
+/// their length in `*len_out`; NULL for NULL `h`. Lives as long as `h`.
+///
+/// They need the integrity of the channel that carries the socket (see
+/// `Handoff` in Rust).
+///
+/// # Safety
+///
+/// `h` is NULL or a live handoff; `len_out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_handoff_bytes(
+    h: *const weida_handoff,
+    len_out: *mut usize,
+) -> *const u8 {
+    guard_ptr(|| {
+        if h.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: a non-NULL `h` is a live handoff by this function's
+        // contract; the bytes live as long as it.
+        let h = unsafe { &*h };
+        if !len_out.is_null() {
+            // SAFETY: a non-NULL `len_out` is writable by this function's
+            // contract.
+            unsafe { len_out.write(h.bytes.len()) };
+        }
+        h.bytes.as_ptr()
+    })
+}
+
+/// Hands the socket's descriptor to the caller, who owns it from then on:
+/// a file descriptor on Unix, a `SOCKET` on Windows. A second call returns
+/// `-WEIDA_ECLOSED`.
+///
+/// # Safety
+///
+/// `h` is NULL or a live handoff; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_handoff_take_socket(
+    h: *const weida_handoff,
+    out: *mut i64,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let h = unsafe { borrow(h) }?;
+        let socket = lock(&h.socket).take().ok_or_else(closed)?;
+        #[cfg(unix)]
+        let raw = {
+            use std::os::fd::IntoRawFd;
+            i64::from(socket.into_raw_fd())
+        };
+        #[cfg(windows)]
+        let raw = {
+            use std::os::windows::io::IntoRawSocket;
+            socket.into_raw_socket() as i64
+        };
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, raw) };
+        Ok(0)
+    })
+}
+
+/// Releases a handoff; a socket not taken is closed. NULL does nothing.
+///
+/// # Safety
+///
+/// `h` is NULL or a live handoff, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_handoff_drop(h: *mut weida_handoff) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(h) }));
+}
+
+/// Releases a binding handle. The binding keeps serving, as a dropped Rust
+/// `Binding` does, until `weida_binding_close`, a hand-over or the
+/// runtime's shutdown. NULL does nothing.
 ///
 /// # Safety
 ///

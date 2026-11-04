@@ -144,6 +144,12 @@ The C ABI's *drain* area is absent here: the rows of [weida-c.md](weida-c.md) ma
 `weida_runtime_drain` and its `weida_drained` report. A runtime still ends only by shutdown, which
 is abortive.
 
+The C ABI's *binding lifecycle* area is absent here: the rows of [weida-c.md](weida-c.md)
+marked (*binding lifecycle*), a binding's close, hand-over and take-over with `weida_handoff`,
+`weida_listener_bind_quic_socket`, `weida_binding_disconnect`, and relay serving
+(`weida_listener_bind_relay`, `weida_listener_relay`, `weida_relay_request`,
+`weida_binding_relay_events`). A QUIC binding still ends with its runtime's shutdown.
+
 ## 8. Sources
 
 `crates/jvm/weida-jvm/src/main/c/weida_jni.c`, `src/main/java/net/doodleshnookie/weida/`

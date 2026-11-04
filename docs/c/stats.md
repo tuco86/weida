@@ -55,13 +55,13 @@ live dialled address, in dial order, copied at the call; a record is read by its
 | Function | Blocks | Returns |
 | --- | --- | --- |
 | `int weida_peer_events_fd(const weida_peer_events *e, int64_t *out)` | never | 0; `-WEIDA_EIO` |
-| `int weida_peer_events_recv(const weida_peer_events *e, int64_t timeout_ms, weida_peer_event **out)` | up to `timeout_ms` | 0 and the next event; 0 with `*out == NULL` once the requester is gone; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
+| `int weida_peer_events_recv(const weida_peer_events *e, int64_t timeout_ms, weida_peer_event **out)` | up to `timeout_ms` | 0 and the next event; 0 with `*out == NULL` once the requester, or the relayed binding's registration, is gone; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
 | `void weida_peer_events_drop(weida_peer_events *e)` | never | — |
 
-Each `weida_requester_events` call is an independent reader that sees every event from then on.
-The queue holds 64 events; a reader that falls further behind gets one `WEIDA_PEER_EVENT_MISSED`
-event carrying how many it lost. Dropping a reader ends a thread waiting in `recv` with
-`-WEIDA_ECLOSED`.
+Each `weida_requester_events` or `weida_binding_relay_events` call is an independent reader
+that sees every event from then on. The queue holds 64 events; a reader that falls further
+behind gets one `WEIDA_PEER_EVENT_MISSED` event carrying how many it lost. Dropping a reader
+ends a thread waiting in `recv` with `-WEIDA_ECLOSED`.
 
 ## `weida_peer_event`
 

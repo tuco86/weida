@@ -918,6 +918,12 @@ fn round_trip(
     url: &str,
 ) -> *mut weida_incoming_meta {
     ok(connect(req, url));
+    exchange(req, rep)
+}
+
+/// Sends one request on the connection `req` holds and answers it at
+/// `rep`: the metadata of the request as the replier accepted it.
+fn exchange(req: *mut weida_requester, rep: *mut weida_replier) -> *mut weida_incoming_meta {
     let pending = request(req, b"hello");
     let q = accept(rep);
     let mut meta = ptr::null_mut();
@@ -945,6 +951,152 @@ fn round_trip(
     // SAFETY: dropped once.
     unsafe { weida_incoming_transfer_drop(answer) };
     meta
+}
+
+/// A configuration whose limits time a connection out after `ms` idle
+/// milliseconds, its handshake included. The caller drops it.
+fn config_idle_timeout(ms: u64) -> *mut weida_runtime_config {
+    let mut cfg = ptr::null_mut();
+    let mut limits = ptr::null_mut();
+    // SAFETY: writable out-parameters and live handles; `limits` is dropped
+    // once.
+    unsafe {
+        ok(weida_runtime_config_new(&mut cfg));
+        ok(weida_limits_new(&mut limits));
+        ok(weida_limits_set_idle_timeout_ms(limits, ms));
+        ok(weida_runtime_config_set_limits(cfg, limits));
+        weida_limits_drop(limits);
+    }
+    cfg
+}
+
+/// Closes `b` and waits until its port is free; the handle stays live.
+fn close_binding(b: *mut weida_binding) {
+    let mut op = ptr::null_mut();
+    // SAFETY: a live binding and a writable out-parameter; the op is dropped
+    // once.
+    unsafe {
+        ok(weida_binding_close(b, &mut op));
+        ok(settle("the close", |ms| {
+            weida_binding_close_op_wait(op, ms)
+        }));
+        weida_binding_close_op_drop(op);
+    }
+}
+
+/// The next event of `events`, which must be a loss: its cause.
+fn lost_cause(events: *mut weida_peer_events) -> c_int {
+    let event = next_event(events);
+    let mut cause: c_int = 0;
+    // SAFETY: a live event and a writable out-parameter; dropped once.
+    unsafe {
+        assert_eq!(weida_peer_event_kind(event), WEIDA_PEER_EVENT_LOST);
+        assert_eq!(weida_peer_event_cause(event, &mut cause), 1);
+        weida_peer_event_drop(event);
+    }
+    cause
+}
+
+/// Reads `events` up to and including the next `CONNECTED`.
+fn until_connected(events: *mut weida_peer_events) {
+    loop {
+        let event = next_event(events);
+        // SAFETY: a live event, dropped once.
+        let kind = unsafe { weida_peer_event_kind(event) };
+        // SAFETY: as above.
+        unsafe { weida_peer_event_drop(event) };
+        if kind == WEIDA_PEER_EVENT_CONNECTED {
+            return;
+        }
+    }
+}
+
+/// The next request at the relay `r`: the request, the key of its asker
+/// and its target.
+fn relay_accept(r: *mut weida_relay) -> (*mut weida_relay_request, Option<String>, Option<String>) {
+    let mut q = ptr::null_mut();
+    // SAFETY: a live relay and a writable out-parameter.
+    ok(settle("a relay request", |ms| unsafe {
+        weida_relay_accept(r, ms, &mut q)
+    }));
+    let mut len = 0usize;
+    // SAFETY: a live request and a writable length.
+    let peer = text(
+        unsafe { weida_relay_request_peer_fingerprint(q, &mut len) },
+        len,
+    );
+    // SAFETY: as above.
+    let target = text(unsafe { weida_relay_request_target(q, &mut len) }, len);
+    (q, peer, target)
+}
+
+/// Admits `q`, consuming it, and waits for the admission.
+fn admit(q: *mut weida_relay_request) {
+    let mut op = ptr::null_mut();
+    // SAFETY: a live request, consumed; the op is dropped once.
+    unsafe {
+        ok(weida_relay_request_admit(q, &mut op));
+        ok(settle("the admission", |ms| {
+            weida_relay_request_admit_op_wait(op, ms)
+        }));
+        weida_relay_request_admit_op_drop(op);
+    }
+}
+
+/// Refuses `q`, consuming it, and waits for the refusal.
+fn refuse_relay(q: *mut weida_relay_request) {
+    let mut op = ptr::null_mut();
+    // SAFETY: a live request, consumed; the op is dropped once.
+    unsafe {
+        ok(weida_relay_request_refuse(q, &mut op));
+        ok(settle("the refusal", |ms| {
+            weida_relay_request_refuse_op_wait(op, ms)
+        }));
+        weida_relay_request_refuse_op_drop(op);
+    }
+}
+
+/// Starts serving `l` through the relay at `relay_url`, registered under
+/// `id`'s key and serving on `tls`: the op, not waited for.
+fn start_bind_relay(
+    l: *mut weida_listener,
+    relay_url: &str,
+    id: *mut weida_identity,
+    tls: *mut weida_server_tls,
+) -> *mut weida_listener_bind_relay_op {
+    let trust = trust_by_address();
+    let url = c(relay_url);
+    let mut via = ptr::null_mut();
+    let mut op = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; the start copied
+    // `via` and the trust, each dropped once.
+    unsafe {
+        ok(weida_client_tls_new(trust, &mut via));
+        ok(weida_client_tls_set_identity(via, id));
+        ok(weida_listener_bind_relay(
+            l,
+            url.as_ptr(),
+            via,
+            tls,
+            &mut op,
+        ));
+        weida_client_tls_drop(via);
+        weida_trust_drop(trust);
+    }
+    op
+}
+
+/// Waits for a relay bind op and drops it: the relayed binding or the
+/// status.
+fn finish_bind_relay(op: *mut weida_listener_bind_relay_op) -> Result<*mut weida_binding, c_int> {
+    let mut binding = ptr::null_mut();
+    // SAFETY: a live op and a writable out-parameter; dropped once.
+    let rc = settle("the relay registration", |ms| unsafe {
+        weida_listener_bind_relay_op_wait(op, ms, &mut binding)
+    });
+    // SAFETY: dropped once.
+    unsafe { weida_listener_bind_relay_op_drop(op) };
+    if rc == 0 { Ok(binding) } else { Err(rc) }
 }
 
 fn peer_fingerprint(meta: *mut weida_incoming_meta) -> Option<String> {
@@ -1890,4 +2042,369 @@ fn a_drain_with_nothing_pending_returns_at_once() {
         weida_local_binding_drop(pair.lb);
         weida_listener_drop(pair.l);
     }
+}
+
+#[test]
+fn a_closed_binding_refuses_the_next_dial() {
+    let rt = runtime();
+    let l = listener(rt);
+    let (server, server_fp) = identity();
+    let tls = server_tls(server);
+    let (binding, local) = bind_quic(l, tls);
+    let rep = replier(l, "/echo");
+    let url = format!("weida://{server_fp}@{local}/echo");
+    let client = runtime();
+    let trust = trust_by_address();
+    let req = requester(client, trust);
+    let meta = round_trip(req, rep, &url);
+    let mut events = ptr::null_mut();
+    // SAFETY: live handles and a writable out-parameter; the meta is
+    // dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        ok(weida_requester_events(req, &mut events));
+    }
+
+    close_binding(binding);
+    assert_eq!(lost_cause(events), WEIDA_LOSS_PEER_CLOSED);
+
+    let cfg = config_idle_timeout(1_000);
+    let late = runtime_with(cfg);
+    let late_req = requester(late, trust);
+    // Nobody answers on the closed port; the handshake times out.
+    assert_eq!(
+        connect(late_req, &url),
+        -WEIDA_ECONNECTION_LOST,
+        "{}",
+        last_message()
+    );
+    // SAFETY: read on the thread that failed, before its next failure.
+    assert_eq!(
+        unsafe { weida_last_error_loss_cause() },
+        WEIDA_LOSS_IDLE_TIMEOUT
+    );
+
+    let mut op = ptr::null_mut();
+    // SAFETY: a live binding, consumed, and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_binding_hand_over(binding, &mut op) },
+        -WEIDA_ECLOSED
+    );
+    assert!(op.is_null());
+    // SAFETY: every handle is dropped once; the binding was consumed.
+    unsafe {
+        weida_peer_events_drop(events);
+        weida_requester_drop(late_req);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_runtime_config_drop(cfg);
+        weida_replier_drop(rep);
+        weida_server_tls_drop(tls);
+        weida_identity_drop(server);
+        weida_listener_drop(l);
+    }
+    shutdown(late);
+    shutdown(client);
+    shutdown(rt);
+}
+
+#[test]
+fn a_binding_disconnects_a_peer_by_its_key() {
+    let rt = runtime();
+    let l = listener(rt);
+    let (server, server_fp) = identity();
+    let tls = server_tls(server);
+    // SAFETY: live server terms.
+    ok(unsafe { weida_server_tls_require_any_key(tls) });
+    let (binding, local) = bind_quic(l, tls);
+    let rep = replier(l, "/echo");
+    let client = runtime();
+    let trust = trust_by_address();
+    let (client_id, client_fp) = identity();
+    let req = requester_with(client, trust, Some(client_id));
+    let meta = round_trip(req, rep, &format!("weida://{server_fp}@{local}/echo"));
+    let mut events = ptr::null_mut();
+    // SAFETY: live handles and a writable out-parameter; the meta is
+    // dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        ok(weida_requester_events(req, &mut events));
+    }
+
+    let (stranger, stranger_fp) = identity();
+    let mut n = usize::MAX;
+    let stranger_key = c(&stranger_fp);
+    let nope = c("nope");
+    let client_key = c(&client_fp);
+    // SAFETY: a live binding, C strings and a writable out-parameter.
+    unsafe {
+        ok(weida_binding_disconnect(
+            binding,
+            stranger_key.as_ptr(),
+            &mut n,
+        ));
+        assert_eq!(n, 0, "nobody of that key is connected");
+        assert_eq!(
+            weida_binding_disconnect(binding, nope.as_ptr(), &mut n),
+            -WEIDA_EINVALID_FINGERPRINT
+        );
+        ok(weida_binding_disconnect(
+            binding,
+            client_key.as_ptr(),
+            &mut n,
+        ));
+    }
+    assert_eq!(n, 1);
+    assert_eq!(lost_cause(events), WEIDA_LOSS_PEER_CLOSED);
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_peer_events_drop(events);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_identity_drop(client_id);
+        weida_identity_drop(stranger);
+        weida_replier_drop(rep);
+        weida_binding_drop(binding);
+        weida_server_tls_drop(tls);
+        weida_identity_drop(server);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(rt);
+}
+
+#[test]
+fn a_hand_over_keeps_a_requesters_connection() {
+    let old = runtime();
+    let l = listener(old);
+    let (server, server_fp) = identity();
+    let tls = server_tls(server);
+    let (binding, local) = bind_quic(l, tls);
+    let rep = replier(l, "/echo");
+    let client = runtime();
+    let trust = trust_by_address();
+    let req = requester(client, trust);
+    let meta = round_trip(req, rep, &format!("weida://{server_fp}@{local}/echo"));
+    let mut events = ptr::null_mut();
+    // SAFETY: live handles and a writable out-parameter; the meta and the
+    // old replier are dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        ok(weida_requester_events(req, &mut events));
+        weida_replier_drop(rep);
+    }
+
+    let mut op = ptr::null_mut();
+    let mut handoff = ptr::null_mut();
+    let mut socket = -1i64;
+    let mut again = -1i64;
+    let mut len = 0usize;
+    // SAFETY: a live binding, consumed; then a live op and a live handoff,
+    // each dropped once; the held bytes are copied before the handoff goes.
+    let held = unsafe {
+        ok(weida_binding_hand_over(binding, &mut op));
+        ok(settle("the hand-over", |ms| {
+            weida_binding_hand_over_op_wait(op, ms, &mut handoff)
+        }));
+        weida_binding_hand_over_op_drop(op);
+        assert!(
+            weida_handoff_held(handoff) >= 1,
+            "the client's close is held"
+        );
+        assert_eq!(
+            text(weida_handoff_local_addr(handoff, &mut len), len).as_deref(),
+            Some(local.as_str())
+        );
+        ok(weida_handoff_take_socket(handoff, &mut socket));
+        assert_eq!(
+            weida_handoff_take_socket(handoff, &mut again),
+            -WEIDA_ECLOSED
+        );
+        let data = weida_handoff_bytes(handoff, &mut len);
+        let held = std::slice::from_raw_parts(data, len).to_vec();
+        weida_handoff_drop(handoff);
+        held
+    };
+
+    let new = runtime();
+    let l2 = listener(new);
+    let rep2 = replier(l2, "/echo");
+    let mut bind = ptr::null_mut();
+    let mut binding2 = ptr::null_mut();
+    let mut take = ptr::null_mut();
+    let mut sent = 0usize;
+    // SAFETY: a live listener, the socket handed over to it, live terms and
+    // writable out-parameters; each op is dropped once.
+    unsafe {
+        ok(weida_listener_bind_quic_socket(l2, socket, tls, &mut bind));
+        ok(settle("the socket bind", |ms| {
+            weida_listener_bind_quic_socket_op_wait(bind, ms, &mut binding2)
+        }));
+        weida_listener_bind_quic_socket_op_drop(bind);
+        assert_eq!(
+            text(weida_binding_local_addr(binding2, &mut len), len).as_deref(),
+            Some(local.as_str())
+        );
+        ok(weida_binding_take_over(
+            binding2,
+            held.as_ptr(),
+            held.len(),
+            &mut take,
+        ));
+        ok(settle("the take-over", |ms| {
+            weida_binding_take_over_op_wait(take, ms, &mut sent)
+        }));
+        weida_binding_take_over_op_drop(take);
+    }
+    assert!(sent >= 1, "sent {sent}");
+
+    assert_eq!(lost_cause(events), WEIDA_LOSS_PEER_RESTARTING);
+    until_connected(events);
+    // The requester kept its address: no second `connect`.
+    let meta = exchange(req, rep2);
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_peer_events_drop(events);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep2);
+        weida_binding_drop(binding2);
+        weida_listener_drop(l2);
+        weida_server_tls_drop(tls);
+        weida_identity_drop(server);
+        weida_listener_drop(l);
+    }
+    shutdown(new);
+    shutdown(client);
+    // The predecessor's runtime lives to the end, as a predecessor process
+    // would.
+    shutdown(old);
+}
+
+#[test]
+fn a_dial_only_replier_answers_through_a_relay() {
+    // The relay R.
+    let r_rt = runtime();
+    let r_l = listener(r_rt);
+    let (r_id, r_fp) = identity();
+    let r_tls = server_tls(r_id);
+    // A registration is addressed by its key, so the relay asks every peer
+    // for one.
+    // SAFETY: live server terms.
+    ok(unsafe { weida_server_tls_require_any_key(r_tls) });
+    let (r_binding, r_local) = bind_quic(r_l, r_tls);
+    let mut relay = ptr::null_mut();
+    let mut second = ptr::null_mut();
+    let mut ev = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        ok(weida_listener_relay(r_l, &mut relay));
+        assert_eq!(
+            weida_listener_relay(r_l, &mut second),
+            -WEIDA_EALREADY_REGISTERED
+        );
+        assert_eq!(
+            weida_binding_relay_events(r_binding, &mut ev),
+            0,
+            "a binding that is not relayed has no relay events"
+        );
+    }
+    let relay_url = format!("weida://{r_fp}@{r_local}/.weida/relay");
+
+    // A registration the relay refuses.
+    let h_rt = runtime();
+    let h_l = listener(h_rt);
+    let (stranger, stranger_fp) = identity();
+    let stranger_tls = server_tls(stranger);
+    let op = start_bind_relay(h_l, &relay_url, stranger, stranger_tls);
+    let (q, peer, target) = relay_accept(relay);
+    assert_eq!(peer, Some(stranger_fp));
+    assert_eq!(target, None);
+    refuse_relay(q);
+    assert_eq!(finish_bind_relay(op), Err(-WEIDA_EREJECTED));
+
+    // The hidden peer H.
+    let (h_id, h_fp) = identity();
+    let h_tls = server_tls(h_id);
+    // SAFETY: live server terms.
+    ok(unsafe { weida_server_tls_require_any_key(h_tls) });
+    let op = start_bind_relay(h_l, &relay_url, h_id, h_tls);
+    let (q, peer, target) = relay_accept(relay);
+    assert_eq!(peer.as_deref(), Some(h_fp.as_str()));
+    assert_eq!(target, None);
+    admit(q);
+    let h_binding = finish_bind_relay(op)
+        .unwrap_or_else(|rc| panic!("the registration failed with {rc}: {}", last_message()));
+    let h_rep = replier(h_l, "/echo");
+
+    // The dialler D.
+    let d_rt = runtime();
+    let trust = trust_by_address();
+    let (d_id, d_fp) = identity();
+    let d_req = requester_with(d_rt, trust, Some(d_id));
+    let url = c(&format!("weida+relay://{h_fp}@{r_fp}@{r_local}/echo"));
+    let mut dial = ptr::null_mut();
+    // SAFETY: a live requester, a C string and a writable out-parameter.
+    ok(unsafe { weida_requester_connect(d_req, url.as_ptr(), &mut dial) });
+    let (q, peer, target) = relay_accept(relay);
+    assert_eq!(peer.as_deref(), Some(d_fp.as_str()));
+    assert_eq!(target.as_deref(), Some(h_fp.as_str()));
+    admit(q);
+    // SAFETY: a live op, dropped once.
+    unsafe {
+        ok(settle("the relayed dial", |ms| {
+            weida_requester_connect_op_wait(dial, ms)
+        }));
+        weida_requester_connect_op_drop(dial);
+    }
+
+    let meta = exchange(d_req, h_rep);
+    assert_eq!(
+        peer_fingerprint(meta),
+        Some(d_fp),
+        "the replier sees the dialler's key, not the relay's"
+    );
+
+    let mut event = ptr::null_mut();
+    // SAFETY: a live binding, a live reader and writable out-parameters.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        assert_eq!(weida_binding_relay_events(h_binding, &mut ev), 1);
+        assert_eq!(
+            weida_peer_events_recv(ev, 0, &mut event),
+            -WEIDA_EAGAIN,
+            "nothing happened since the reader was made"
+        );
+        weida_relay_drop(relay);
+    }
+    assert_eq!(lost_cause(ev), WEIDA_LOSS_PEER_CLOSED);
+
+    let mut op = ptr::null_mut();
+    // SAFETY: a live binding, consumed, and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_binding_hand_over(h_binding, &mut op) },
+        -WEIDA_EUNSUPPORTED
+    );
+    assert!(op.is_null());
+    // SAFETY: every handle is dropped once; `h_binding` was consumed.
+    unsafe {
+        weida_peer_events_drop(ev);
+        weida_requester_drop(d_req);
+        weida_identity_drop(d_id);
+        weida_trust_drop(trust);
+        weida_replier_drop(h_rep);
+        weida_server_tls_drop(h_tls);
+        weida_identity_drop(h_id);
+        weida_server_tls_drop(stranger_tls);
+        weida_identity_drop(stranger);
+        weida_listener_drop(h_l);
+        weida_binding_drop(r_binding);
+        weida_server_tls_drop(r_tls);
+        weida_identity_drop(r_id);
+        weida_listener_drop(r_l);
+    }
+    shutdown(d_rt);
+    shutdown(h_rt);
+    shutdown(r_rt);
 }

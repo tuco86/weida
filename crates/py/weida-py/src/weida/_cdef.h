@@ -170,6 +170,12 @@
 
 typedef struct weida_binding weida_binding;
 
+typedef struct weida_binding_close_op weida_binding_close_op;
+
+typedef struct weida_binding_hand_over_op weida_binding_hand_over_op;
+
+typedef struct weida_binding_take_over_op weida_binding_take_over_op;
+
 typedef struct weida_client_tls weida_client_tls;
 
 typedef struct weida_connection_stats weida_connection_stats;
@@ -181,6 +187,8 @@ typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 typedef struct weida_drained weida_drained;
 
 typedef struct weida_guarantee_set weida_guarantee_set;
+
+typedef struct weida_handoff weida_handoff;
 
 typedef struct weida_identity weida_identity;
 
@@ -204,6 +212,10 @@ typedef struct weida_listener weida_listener;
 
 typedef struct weida_listener_bind_quic_op weida_listener_bind_quic_op;
 
+typedef struct weida_listener_bind_quic_socket_op weida_listener_bind_quic_socket_op;
+
+typedef struct weida_listener_bind_relay_op weida_listener_bind_relay_op;
+
 typedef struct weida_local_binding weida_local_binding;
 
 typedef struct weida_msg weida_msg;
@@ -217,6 +229,14 @@ typedef struct weida_peer_events weida_peer_events;
 typedef struct weida_pem weida_pem;
 
 typedef struct weida_reconnect_policy weida_reconnect_policy;
+
+typedef struct weida_relay weida_relay;
+
+typedef struct weida_relay_request weida_relay_request;
+
+typedef struct weida_relay_request_admit_op weida_relay_request_admit_op;
+
+typedef struct weida_relay_request_refuse_op weida_relay_request_refuse_op;
 
 typedef struct weida_replier weida_replier;
 
@@ -375,6 +395,34 @@ int weida_listener_bind_quic_op_wait(const weida_listener_bind_quic_op *op,
 
 void weida_listener_bind_quic_op_drop(weida_listener_bind_quic_op *op);
 
+int weida_listener_bind_quic_socket(const weida_listener *l,
+                                    int64_t socket,
+                                    const weida_server_tls *tls,
+                                    weida_listener_bind_quic_socket_op **out);
+
+int weida_listener_bind_quic_socket_op_fd(const weida_listener_bind_quic_socket_op *op,
+                                          int64_t *out);
+
+int weida_listener_bind_quic_socket_op_wait(const weida_listener_bind_quic_socket_op *op,
+                                            int64_t timeout_ms,
+                                            weida_binding **out);
+
+void weida_listener_bind_quic_socket_op_drop(weida_listener_bind_quic_socket_op *op);
+
+int weida_listener_bind_relay(const weida_listener *l,
+                              const char *relay,
+                              const weida_client_tls *via,
+                              const weida_server_tls *tls,
+                              weida_listener_bind_relay_op **out);
+
+int weida_listener_bind_relay_op_fd(const weida_listener_bind_relay_op *op, int64_t *out);
+
+int weida_listener_bind_relay_op_wait(const weida_listener_bind_relay_op *op,
+                                      int64_t timeout_ms,
+                                      weida_binding **out);
+
+void weida_listener_bind_relay_op_drop(weida_listener_bind_relay_op *op);
+
 int weida_listener_bind_inproc(const weida_listener *l, const char *bus, weida_local_binding **out);
 
 int weida_listener_replier(const weida_listener *l, const char *path, weida_replier **out);
@@ -382,6 +430,51 @@ int weida_listener_replier(const weida_listener *l, const char *path, weida_repl
 void weida_listener_drop(weida_listener *l);
 
 const char *weida_binding_local_addr(const weida_binding *b, size_t *len_out);
+
+int weida_binding_close(const weida_binding *b, weida_binding_close_op **out);
+
+int weida_binding_close_op_fd(const weida_binding_close_op *op, int64_t *out);
+
+int weida_binding_close_op_wait(const weida_binding_close_op *op, int64_t timeout_ms);
+
+void weida_binding_close_op_drop(weida_binding_close_op *op);
+
+int weida_binding_hand_over(weida_binding *b, weida_binding_hand_over_op **out);
+
+int weida_binding_hand_over_op_fd(const weida_binding_hand_over_op *op, int64_t *out);
+
+int weida_binding_hand_over_op_wait(const weida_binding_hand_over_op *op,
+                                    int64_t timeout_ms,
+                                    weida_handoff **out);
+
+void weida_binding_hand_over_op_drop(weida_binding_hand_over_op *op);
+
+int weida_binding_take_over(const weida_binding *b,
+                            const uint8_t *held,
+                            size_t len,
+                            weida_binding_take_over_op **out);
+
+int weida_binding_take_over_op_fd(const weida_binding_take_over_op *op, int64_t *out);
+
+int weida_binding_take_over_op_wait(const weida_binding_take_over_op *op,
+                                    int64_t timeout_ms,
+                                    size_t *out);
+
+void weida_binding_take_over_op_drop(weida_binding_take_over_op *op);
+
+int weida_binding_disconnect(const weida_binding *b, const char *peer, size_t *out);
+
+int weida_binding_relay_events(const weida_binding *b, weida_peer_events **out);
+
+size_t weida_handoff_held(const weida_handoff *h);
+
+const char *weida_handoff_local_addr(const weida_handoff *h, size_t *len_out);
+
+const uint8_t *weida_handoff_bytes(const weida_handoff *h, size_t *len_out);
+
+int weida_handoff_take_socket(const weida_handoff *h, int64_t *out);
+
+void weida_handoff_drop(weida_handoff *h);
 
 void weida_binding_drop(weida_binding *b);
 
@@ -441,6 +534,36 @@ void weida_incoming_request_canceled_op_drop(weida_incoming_request_canceled_op 
 void weida_incoming_request_drop(weida_incoming_request *q);
 
 int weida_poll(weida_poll_item *items, size_t n, int64_t timeout_ms);
+
+int weida_listener_relay(const weida_listener *l, weida_relay **out);
+
+int weida_relay_fd(const weida_relay *r, int64_t *out);
+
+int weida_relay_accept(const weida_relay *r, int64_t timeout_ms, weida_relay_request **out);
+
+void weida_relay_drop(weida_relay *r);
+
+const char *weida_relay_request_peer_fingerprint(const weida_relay_request *q, size_t *len_out);
+
+const char *weida_relay_request_target(const weida_relay_request *q, size_t *len_out);
+
+int weida_relay_request_admit(weida_relay_request *q, weida_relay_request_admit_op **out);
+
+int weida_relay_request_admit_op_fd(const weida_relay_request_admit_op *op, int64_t *out);
+
+int weida_relay_request_admit_op_wait(const weida_relay_request_admit_op *op, int64_t timeout_ms);
+
+void weida_relay_request_admit_op_drop(weida_relay_request_admit_op *op);
+
+int weida_relay_request_refuse(weida_relay_request *q, weida_relay_request_refuse_op **out);
+
+int weida_relay_request_refuse_op_fd(const weida_relay_request_refuse_op *op, int64_t *out);
+
+int weida_relay_request_refuse_op_wait(const weida_relay_request_refuse_op *op, int64_t timeout_ms);
+
+void weida_relay_request_refuse_op_drop(weida_relay_request_refuse_op *op);
+
+void weida_relay_request_drop(weida_relay_request *q);
 
 int weida_runtime_requester(const weida_runtime *rt,
                             const weida_client_tls *tls,

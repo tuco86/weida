@@ -441,9 +441,25 @@
 #define WEIDA_GIVE_UP_FAILED 2
 
 /**
- * A QUIC binding: the socket a listener serves on.
+ * A QUIC binding: the socket a listener serves on, directly or through a
+ * relay.
  */
 typedef struct weida_binding weida_binding;
+
+/**
+ * The pending close of `weida_binding_close`.
+ */
+typedef struct weida_binding_close_op weida_binding_close_op;
+
+/**
+ * The pending hand-over of `weida_binding_hand_over`.
+ */
+typedef struct weida_binding_hand_over_op weida_binding_hand_over_op;
+
+/**
+ * The pending take-over of `weida_binding_take_over`.
+ */
+typedef struct weida_binding_take_over_op weida_binding_take_over_op;
 
 /**
  * The TLS terms a requester dials on.
@@ -476,6 +492,12 @@ typedef struct weida_drained weida_drained;
  * `GuaranteeSet` under construction: one setter per dimension.
  */
 typedef struct weida_guarantee_set weida_guarantee_set;
+
+/**
+ * What a hand-over leaves for the successor (`Handoff`): the socket, taken
+ * once, and the held close packets as bytes.
+ */
+typedef struct weida_handoff weida_handoff;
 
 /**
  * A certificate chain and its private key.
@@ -535,6 +557,16 @@ typedef struct weida_listener weida_listener;
 typedef struct weida_listener_bind_quic_op weida_listener_bind_quic_op;
 
 /**
+ * The pending bind of `weida_listener_bind_quic_socket`.
+ */
+typedef struct weida_listener_bind_quic_socket_op weida_listener_bind_quic_socket_op;
+
+/**
+ * The pending registration of `weida_listener_bind_relay`.
+ */
+typedef struct weida_listener_bind_relay_op weida_listener_bind_relay_op;
+
+/**
  * An in-process binding: the bus a listener answers on.
  */
 typedef struct weida_local_binding weida_local_binding;
@@ -569,6 +601,28 @@ typedef struct weida_pem weida_pem;
  * `ReconnectPolicy` under construction: one setter per field.
  */
 typedef struct weida_reconnect_policy weida_reconnect_policy;
+
+/**
+ * The relay a listener serves on `/.weida/relay` (`Relay`), a try handle
+ * (R3a).
+ */
+typedef struct weida_relay weida_relay;
+
+/**
+ * A registration or a tunnel asking the relay to be served
+ * (`RelayRequest`).
+ */
+typedef struct weida_relay_request weida_relay_request;
+
+/**
+ * The pending admission of `weida_relay_request_admit`.
+ */
+typedef struct weida_relay_request_admit_op weida_relay_request_admit_op;
+
+/**
+ * The pending refusal of `weida_relay_request_refuse`.
+ */
+typedef struct weida_relay_request_refuse_op weida_relay_request_refuse_op;
 
 /**
  * The replying half of Req/Rep, serving one endpoint path.
@@ -1237,7 +1291,8 @@ int weida_listener_bind_quic_op_fd(const weida_listener_bind_quic_op *op, int64_
 
 /**
  * Waits up to `timeout_ms` (R4) for the binding and writes it to `out`.
- * Release it with `weida_binding_drop`, which stops serving.
+ * Release it with `weida_binding_drop`; the binding serves until
+ * `weida_binding_close`, a hand-over or the runtime's shutdown.
  *
  * # Safety
  *
@@ -1256,6 +1311,121 @@ int weida_listener_bind_quic_op_wait(const weida_listener_bind_quic_op *op,
  * `op` is NULL or a live bind op, dropped at most once.
  */
 void weida_listener_bind_quic_op_drop(weida_listener_bind_quic_op *op);
+
+/**
+ * Serves QUIC on a socket that is already bound
+ * (`Listener::bind_quic_socket`): a predecessor's after
+ * `weida_binding_hand_over`, or one from socket activation. **Takes
+ * ownership of `socket`** on every return path but a negative or
+ * out-of-range number (`-WEIDA_EINVAL`, nothing taken). weida neither
+ * binds it nor sets options on it.
+ *
+ * Never blocks; the bind runs as the op written to `out`, whose wait
+ * yields the binding.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; a non-negative `socket` is an open UDP
+ * socket descriptor the caller owns and does not use again; `tls` is NULL
+ * or live server terms; `out` is NULL or writable. Release the op with
+ * `weida_listener_bind_quic_socket_op_drop`.
+ */
+int weida_listener_bind_quic_socket(const weida_listener *l,
+                                    int64_t socket,
+                                    const weida_server_tls *tls,
+                                    weida_listener_bind_quic_socket_op **out);
+
+/**
+ * The readiness descriptor of a socket bind op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live socket bind op; `out` is NULL or writable.
+ */
+int weida_listener_bind_quic_socket_op_fd(const weida_listener_bind_quic_socket_op *op,
+                                          int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the binding and writes it to `out`.
+ * `-WEIDA_EIO` when the descriptor is not a usable UDP socket. Release the
+ * binding with `weida_binding_drop`.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live socket bind op; `out` is NULL or writable.
+ */
+int weida_listener_bind_quic_socket_op_wait(const weida_listener_bind_quic_socket_op *op,
+                                            int64_t timeout_ms,
+                                            weida_binding **out);
+
+/**
+ * Releases a socket bind op, aborting the bind when unfinished; the
+ * socket is closed then. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live socket bind op, dropped at most once.
+ */
+void weida_listener_bind_quic_socket_op_drop(weida_listener_bind_quic_socket_op *op);
+
+/**
+ * Serves this listener's endpoints through a relay, for a peer that can
+ * only dial out (`Listener::bind_relay`, PROTOCOL §9.6).
+ *
+ * `relay` is `weida://[relay-key@]host[:port]/.weida/relay`; the peer
+ * registers there under the key `via` presents, so `via` needs an
+ * identity. Diallers reach the endpoints as
+ * `weida+relay://<key>@[relay-key@]host[:port]/path`, with QUIC and TLS
+ * end to end on `tls`'s terms. A lost relay is redialled and registered
+ * again (`weida_binding_relay_events`).
+ *
+ * Never blocks; the registration runs as the op written to `out`. Its
+ * wait returns the first registration's failure: `-WEIDA_EREJECTED` where
+ * the relay refused it, `-WEIDA_EINVALID_ADDRESS` for another path.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `relay` is NULL or a NUL-terminated
+ * string; `via` is NULL or live client terms; `tls` is NULL or live
+ * server terms; `out` is NULL or writable. Release the op with
+ * `weida_listener_bind_relay_op_drop`.
+ */
+int weida_listener_bind_relay(const weida_listener *l,
+                              const char *relay,
+                              const weida_client_tls *via,
+                              const weida_server_tls *tls,
+                              weida_listener_bind_relay_op **out);
+
+/**
+ * The readiness descriptor of a relay bind op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live relay bind op; `out` is NULL or writable.
+ */
+int weida_listener_bind_relay_op_fd(const weida_listener_bind_relay_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the first registration and writes the
+ * relayed binding to `out`. Release it with `weida_binding_drop`.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live relay bind op; `out` is NULL or writable.
+ */
+int weida_listener_bind_relay_op_wait(const weida_listener_bind_relay_op *op,
+                                      int64_t timeout_ms,
+                                      weida_binding **out);
+
+/**
+ * Releases a relay bind op, aborting the registration when unfinished.
+ * NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live relay bind op, dropped at most once.
+ */
+void weida_listener_bind_relay_op_drop(weida_listener_bind_relay_op *op);
 
 /**
  * Answers on the in-process bus `bus` (`Listener::bind_inproc`): a
@@ -1302,7 +1472,248 @@ void weida_listener_drop(weida_listener *l);
 const char *weida_binding_local_addr(const weida_binding *b, size_t *len_out);
 
 /**
- * Releases a binding, which stops serving on it. NULL does nothing.
+ * Stops accepting and closes the binding's connections with `SHUTDOWN`
+ * (`Binding::close`).
+ *
+ * Never blocks; the close runs as the op written to `out`. The op
+ * finishes once the socket went idle, bounded by `shutdown_timeout`, and
+ * the port is free to bind again. A relayed binding ends its registration
+ * at the relay. The handle stays valid (`weida_binding_local_addr`); drop
+ * it as usual. `-WEIDA_ECLOSED` once handed over.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live binding; `out` is NULL or writable. Release the op
+ * with `weida_binding_close_op_drop`.
+ */
+int weida_binding_close(const weida_binding *b, weida_binding_close_op **out);
+
+/**
+ * The readiness descriptor of a close op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live close op; `out` is NULL or writable.
+ */
+int weida_binding_close_op_fd(const weida_binding_close_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the close; 0 once the port is free.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live close op.
+ */
+int weida_binding_close_op_wait(const weida_binding_close_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a close op. Dropped unfinished, it aborts the close where it
+ * is: the connections may already be closed, and the port is then freed
+ * only by the runtime's shutdown. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live close op, dropped at most once.
+ */
+void weida_binding_close_op_drop(weida_binding_close_op *op);
+
+/**
+ * Hands the binding's socket over to a successor process
+ * (`Binding::hand_over`, decision 0039). **Consumes** `b` on every return
+ * path.
+ *
+ * From the call on, this process neither reads nor sends on the socket.
+ * Every connection is closed with `RESTARTING`, with the close packets
+ * held in the `weida_handoff` the op yields and not sent. Returns
+ * `-WEIDA_EUNSUPPORTED` for a relayed binding, which has no socket;
+ * `-WEIDA_ECLOSED` for one a `weida_binding_close` was started on;
+ * `-WEIDA_EINVAL` while a `weida_binding_take_over` op of it is
+ * unfinished. A binding consumed by one of these failures keeps serving
+ * until its runtime shuts down. After the runtime's shutdown the op ends
+ * with `-WEIDA_ERUNTIME`.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live binding, not used again; `out` is NULL or
+ * writable. Release the op with `weida_binding_hand_over_op_drop`.
+ */
+int weida_binding_hand_over(weida_binding *b, weida_binding_hand_over_op **out);
+
+/**
+ * The readiness descriptor of a hand-over op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live hand-over op; `out` is NULL or writable.
+ */
+int weida_binding_hand_over_op_fd(const weida_binding_hand_over_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the hand-over and writes what it left
+ * for the successor to `out`. `-WEIDA_ERUNTIME` once the runtime shut
+ * down.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live hand-over op; `out` is NULL or writable. Release
+ * the handoff with `weida_handoff_drop`.
+ */
+int weida_binding_hand_over_op_wait(const weida_binding_hand_over_op *op,
+                                    int64_t timeout_ms,
+                                    weida_handoff **out);
+
+/**
+ * Releases a hand-over op. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live hand-over op, dropped at most once.
+ */
+void weida_binding_hand_over_op_drop(weida_binding_hand_over_op *op);
+
+/**
+ * Sends the close packets a predecessor held (`Binding::take_over`), so
+ * its clients redial into this binding.
+ *
+ * Call it once the endpoints those clients use are registered. Each
+ * datagram is sent once. `held` is `weida_handoff_bytes` of the
+ * predecessor's handoff, and needs the integrity of the channel that
+ * carries the socket: whoever can write it decides what this binding
+ * sends from its port. Never blocks; the sending runs as the op written
+ * to `out`. `-WEIDA_ECLOSED` once handed over.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live binding; `held` is NULL or points to `len`
+ * readable bytes (copied before the call returns); `out` is NULL or
+ * writable. Release the op with `weida_binding_take_over_op_drop`.
+ */
+int weida_binding_take_over(const weida_binding *b,
+                            const uint8_t *held,
+                            size_t len,
+                            weida_binding_take_over_op **out);
+
+/**
+ * The readiness descriptor of a take-over op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live take-over op; `out` is NULL or writable.
+ */
+int weida_binding_take_over_op_fd(const weida_binding_take_over_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the take-over and writes how many
+ * datagrams were sent to `out`. `-WEIDA_EIO` for bytes that are not a
+ * handoff, or a handoff of another address.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live take-over op; `out` is NULL or writable.
+ */
+int weida_binding_take_over_op_wait(const weida_binding_take_over_op *op,
+                                    int64_t timeout_ms,
+                                    size_t *out);
+
+/**
+ * Releases a take-over op, aborting it when unfinished. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live take-over op, dropped at most once.
+ */
+void weida_binding_take_over_op_drop(weida_binding_take_over_op *op);
+
+/**
+ * Closes every live connection this binding holds from the peer whose key
+ * is `peer` (`sha256:` text) with `REJECTED`, and writes how many it
+ * closed (`Binding::disconnect`).
+ *
+ * Not a ban: the peer sees `WEIDA_LOSS_PEER_CLOSED` and redials under its
+ * own policy. An anonymous client cannot be named.
+ * `-WEIDA_EINVALID_FINGERPRINT` for text that is not a key,
+ * `-WEIDA_ECLOSED` once handed over.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live binding; `peer` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable.
+ */
+int weida_binding_disconnect(const weida_binding *b, const char *peer, size_t *out);
+
+/**
+ * A new reader of a relayed binding's registration events
+ * (`Binding::relay_events`): lost, redialled and registered again, given
+ * up.
+ *
+ * Returns 1 and writes the reader to `out`. Returns 0 and leaves `out`
+ * untouched for a binding that is not relayed, or whose registration
+ * ended with its close. `-WEIDA_ECLOSED` once handed over.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live binding; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_binding_relay_events(const weida_binding *b, weida_peer_events **out);
+
+/**
+ * How many close packets the handoff holds for the successor
+ * (`Handoff::held`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live handoff.
+ */
+size_t weida_handoff_held(const weida_handoff *h);
+
+/**
+ * The address the handed-over socket is bound to (`Handoff::local_addr`).
+ * Lives as long as the handoff.
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live handoff; `len_out` is NULL or writable.
+ */
+const char *weida_handoff_local_addr(const weida_handoff *h, size_t *len_out);
+
+/**
+ * The held datagrams for the successor's `weida_binding_take_over`, with
+ * their length in `*len_out`; NULL for NULL `h`. Lives as long as `h`.
+ *
+ * They need the integrity of the channel that carries the socket (see
+ * `Handoff` in Rust).
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live handoff; `len_out` is NULL or writable.
+ */
+const uint8_t *weida_handoff_bytes(const weida_handoff *h, size_t *len_out);
+
+/**
+ * Hands the socket's descriptor to the caller, who owns it from then on:
+ * a file descriptor on Unix, a `SOCKET` on Windows. A second call returns
+ * `-WEIDA_ECLOSED`.
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live handoff; `out` is NULL or writable.
+ */
+int weida_handoff_take_socket(const weida_handoff *h, int64_t *out);
+
+/**
+ * Releases a handoff; a socket not taken is closed. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live handoff, dropped at most once.
+ */
+void weida_handoff_drop(weida_handoff *h);
+
+/**
+ * Releases a binding handle. The binding keeps serving, as a dropped Rust
+ * `Binding` does, until `weida_binding_close`, a hand-over or the
+ * runtime's shutdown. NULL does nothing.
  *
  * # Safety
  *
@@ -1577,6 +1988,175 @@ void weida_incoming_request_drop(weida_incoming_request *q);
  * for the call.
  */
 int weida_poll(weida_poll_item *items, size_t n, int64_t timeout_ms);
+
+/**
+ * Serves a relay on this listener (`Listener::relay`): hidden peers
+ * register through `weida_listener_bind_relay`, and diallers reach them
+ * through `weida+relay://` URLs. Claims `/.weida/relay` on every binding of
+ * the listener, so a second call fails with `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `out` is NULL or writable. Release the
+ * result with `weida_relay_drop`.
+ */
+int weida_listener_relay(const weida_listener *l, weida_relay **out);
+
+/**
+ * The relay's readiness descriptor (R11): readable when the next
+ * `weida_relay_accept` will not block.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live relay; `out` is NULL or writable.
+ */
+int weida_relay_fd(const weida_relay *r, int64_t *out);
+
+/**
+ * Takes the next registration or tunnel, waiting up to `timeout_ms` (R4)
+ * for one (`Relay::accept`).
+ *
+ * An anonymous registration, a tunnel to a key nobody registered, and an
+ * unknown preamble are refused before they get here.
+ * `-WEIDA_ENOT_CONNECTED` once the relay stopped serving.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live relay; `out` is NULL or writable. Answer the
+ * request with `weida_relay_request_admit` or `_refuse`, or release it
+ * with `weida_relay_request_drop`.
+ */
+int weida_relay_accept(const weida_relay *r, int64_t timeout_ms, weida_relay_request **out);
+
+/**
+ * Releases the relay: `/.weida/relay` is unregistered and every
+ * registration's connection is closed with `SHUTDOWN`, so the hidden peers
+ * redial. A thread waiting in `weida_relay_accept` returns
+ * `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live relay, dropped at most once.
+ */
+void weida_relay_drop(weida_relay *r);
+
+/**
+ * The key (`sha256:` text) the asking peer proved; NULL for an anonymous
+ * dialler. Always a key for a registration. Lives as long as the request.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request; `len_out` is NULL or writable.
+ */
+const char *weida_relay_request_peer_fingerprint(const weida_relay_request *q, size_t *len_out);
+
+/**
+ * NULL for a registration; for a tunnel, the key (`sha256:` text) of the
+ * peer it reaches. Lives as long as the request.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request; `len_out` is NULL or writable.
+ */
+const char *weida_relay_request_target(const weida_relay_request *q, size_t *len_out);
+
+/**
+ * Serves the registration or tunnel (`RelayRequest::admit`). **Consumes**
+ * `q` on every return path.
+ *
+ * A registration replaces one of the same key on another connection, and
+ * closes that connection. Never blocks; the admission runs as the op
+ * written to `out`. Its wait returns `-WEIDA_EALREADY_REGISTERED` for a
+ * second registration on one connection, `-WEIDA_EUNKNOWN_ENDPOINT` for a
+ * tunnel whose target went away, and a connection error when the asker is
+ * gone.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request, not used again; `out` is NULL or
+ * writable. Release the op with `weida_relay_request_admit_op_drop`.
+ */
+int weida_relay_request_admit(weida_relay_request *q, weida_relay_request_admit_op **out);
+
+/**
+ * The readiness descriptor of an admit op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live admit op; `out` is NULL or writable.
+ */
+int weida_relay_request_admit_op_fd(const weida_relay_request_admit_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the admission; 0 once it is served.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live admit op.
+ */
+int weida_relay_request_admit_op_wait(const weida_relay_request_admit_op *op, int64_t timeout_ms);
+
+/**
+ * Releases an admit op. Dropped unfinished, it aborts the admission, and
+ * the asker may see `-WEIDA_ENO_REPLY`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live admit op, dropped at most once.
+ */
+void weida_relay_request_admit_op_drop(weida_relay_request_admit_op *op);
+
+/**
+ * Refuses the registration or tunnel (`RelayRequest::refuse`): the asker
+ * fails with `-WEIDA_EREJECTED` (a hidden peer's
+ * `weida_listener_bind_relay` op, a dialler's connect op). **Consumes**
+ * `q` on every return path.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request, not used again; `out` is NULL or
+ * writable. Release the op with `weida_relay_request_refuse_op_drop`.
+ */
+int weida_relay_request_refuse(weida_relay_request *q, weida_relay_request_refuse_op **out);
+
+/**
+ * The readiness descriptor of a refuse op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live refuse op; `out` is NULL or writable.
+ */
+int weida_relay_request_refuse_op_fd(const weida_relay_request_refuse_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the refusal; 0 once it was written or
+ * could not be (the asker is gone).
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live refuse op.
+ */
+int weida_relay_request_refuse_op_wait(const weida_relay_request_refuse_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a refuse op. Dropped unfinished, it aborts the refusal, and the
+ * asker may see `-WEIDA_ENO_REPLY` instead. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live refuse op, dropped at most once.
+ */
+void weida_relay_request_refuse_op_drop(weida_relay_request_refuse_op *op);
+
+/**
+ * Releases a request; one not answered answers `NO_REPLY`. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request, dropped at most once.
+ */
+void weida_relay_request_drop(weida_relay_request *q);
 
 /**
  * Creates a requester that dials on `tls`'s terms (`Runtime::requester`).

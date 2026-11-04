@@ -41,13 +41,22 @@ unit tests in `crates/weida-c/src/`.
 | `Listener::bind_quic` | `weida_listener_bind_quic` (op) | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Listener::bind_inproc` | `weida_listener_bind_inproc` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Listener::replier` | `weida_listener_replier` | present; every `abi::` test |
-| `Listener::bind_quic_socket`, `bind_unix`, `bind_pipe` | — | absent: *binding lifecycle*, *local transports* |
-| `Listener::bind_relay`, `Listener::relay`, `Relay`, `RelayRequest`, `Binding::relay_events` | — | absent: *binding lifecycle*. Dialling a `weida+relay://` URL already works, because the ABI passes URL text |
+| `Listener::bind_quic_socket` | `weida_listener_bind_quic_socket` (op; takes ownership of the descriptor) | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
+| `Listener::bind_unix`, `bind_pipe` | — | absent: *local transports* |
+| `Listener::bind_relay` | `weida_listener_bind_relay` (op; its wait yields a relayed `weida_binding`). Dialling a `weida+relay://` URL needs nothing more: the ABI passes URL text | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
+| `Listener::relay`, `Relay::accept` | `weida_listener_relay`, `weida_relay_accept` (try, R3a) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
+| `RelayRequest::peer`, `target` | `weida_relay_request_peer_fingerprint`, `_target` (`sha256:` text) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
+| `RelayRequest::admit`, `refuse` | `weida_relay_request_admit`, `_refuse` (ops, consume) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
+| `Drop for Relay`, `Drop for RelayRequest` (`NO_REPLY`) | `weida_relay_drop`, `weida_relay_request_drop` | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
+| `Binding::relay_events` | `weida_binding_relay_events` (a `weida_peer_events` queue; 0 for a binding not relayed) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Listener::puller`, `publisher`, `radio`, `acceptor`, `pair`, `respondent`, `seeder`, `bus` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Binding::local_addr` | `weida_binding_local_addr` | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
-| `Binding::close`, `hand_over`, `take_over`, `disconnect` | — | absent: *binding lifecycle* |
+| `Binding::close` | `weida_binding_close` (op) | present; `abi::a_closed_binding_refuses_the_next_dial` (*binding lifecycle*) |
+| `Binding::hand_over`, `Handoff::held`, `local_addr`, `into_parts` | `weida_binding_hand_over` (op, consumes; its wait yields a `weida_handoff`), `weida_handoff_held`, `_local_addr`, `_take_socket`, `_bytes` | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
+| `Binding::take_over` | `weida_binding_take_over` (op) | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
+| `Binding::disconnect` | `weida_binding_disconnect` | present; `abi::a_binding_disconnects_a_peer_by_its_key` (*binding lifecycle*) |
 | `LocalBinding::bus` | `weida_local_binding_bus` | present; R7 getter |
-| `UnixBinding`, `PipeBinding`, `Handoff` | — | absent: *local transports*, *binding lifecycle* |
+| `UnixBinding`, `PipeBinding` | — | absent: *local transports* |
 
 ## 3. Req/Rep, streamed
 
@@ -136,7 +145,7 @@ unit tests in `crates/weida-c/src/`.
 | `Fingerprint` | `sha256:` text everywhere | present |
 | `Error`, `LossCause` | the R9 constants and the thread-local record | present; `error::tests::every_variant_has_its_own_code_below_the_abi_codes`, `abi::a_server_outside_the_pins_is_untrusted` (`weida_last_error_fingerprint`) |
 | `StopReason`, `codes` | — | refused: wire vocabulary, reached through the R9 outcome codes |
-| `Address`, `EndpointAddr`, `InprocAddr`, `UnixAddr`, `PipeAddr`, `DEFAULT_PORT` | URLs as strings | refused: the C caller passes the text, weida parses it |
+| `Address`, `EndpointAddr`, `InprocAddr`, `UnixAddr`, `PipeAddr`, `RelayAddr`, `DEFAULT_PORT`, `RELAY_PATH`, `SCHEME_RELAY` | URLs as strings | refused: the C caller passes the text, weida parses it |
 | `new_trace`, `TraceContext` | `weida_new_trace`; a trace context is its `traceparent` text (R7) | present; `tls::tests::new_trace_writes_a_traceparent_that_sets_back` (*config*) |
 | `Resolver`, `SharedResolver`, `SystemResolver`, `Resolved` | — | absent: *resolver* (a queue, decision 10) |
 | `SimNet`, `SimStats` | — | refused: a test double of the Rust test suite (`test-util`) |
@@ -170,7 +179,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the twenty-nine `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the thirty-three `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -198,6 +207,17 @@ way a foreign caller calls it:
 - `ConnectionId` is its number (`ConnectionId::get`).
 - `Runtime::drain` returns `Drained` by value; the ABI's op yields it as a `weida_drained` handle
   read by two getters. Its deadline is milliseconds (R7) and, as in Rust, mandatory.
+- `Handoff::into_parts` is two calls: `weida_handoff_take_socket` hands the descriptor over
+  once, and `weida_handoff_bytes` lends the held packets for as long as the handoff lives.
+  Dropping a handoff whose socket was not taken closes it.
+- A socket in or out is its descriptor as `int64_t`: a file descriptor on Unix, a `SOCKET` on
+  Windows.
+- `Binding::hand_over` panics in Rust on a binding without an OS socket. The ABI returns
+  `-WEIDA_EUNSUPPORTED` for a relayed binding and `-WEIDA_ECLOSED` for one a
+  `weida_binding_close` was started on, and consumes the binding either way (R6).
+- `Binding::disconnect` and `RelayRequest::peer`/`target` take and give keys as `sha256:` text.
+- `weida_binding_drop` releases the handle only; the binding serves on, as a dropped Rust
+  `Binding` does, until `weida_binding_close`, a hand-over or the runtime's shutdown.
 
 ## 10. The definition of done
 
@@ -211,8 +231,8 @@ is complete when no present row lacks a test.
 ## 11. Sources
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
-`config.rs`, `runtime.rs`, `tls.rs`, `listener.rs`, `transfer.rs`, `requester.rs`, `poll.rs`,
-`stats.rs`),
+`config.rs`, `runtime.rs`, `tls.rs`, `listener.rs`, `relay.rs`, `transfer.rs`, `requester.rs`,
+`poll.rs`, `stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).
