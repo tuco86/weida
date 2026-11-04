@@ -513,6 +513,33 @@ pub unsafe extern "C" fn weida_incoming_request_meta(
     })
 }
 
+/// The number of the connection the request arrived on
+/// (`IncomingRequest::connection`, `ConnectionId::get`): equal for requests
+/// of one connection, never shared by two connections of this process. Not
+/// an address.
+///
+/// # Safety
+///
+/// `q` is NULL or a live request; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_request_connection(
+    q: *const weida_incoming_request,
+    out: *mut u64,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let q = unsafe { borrow(q) }?;
+        let id = match q.lock().as_ref() {
+            Some(state) => state.request.connection().get(),
+            None => return Err(crate::error::closed()),
+        };
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, id) };
+        Ok(0)
+    })
+}
+
 /// Detaches the request's body, to be read like a socket
 /// (`IncomingRequest::take_body`). A second call returns `-WEIDA_ECLOSED`.
 ///

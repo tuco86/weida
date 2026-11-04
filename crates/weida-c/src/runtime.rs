@@ -10,7 +10,7 @@ use crate::config::{
     Builder, count, discovery, ms, optional, outbox_full, weida_guarantee_set, weida_limits,
     weida_reconnect_policy,
 };
-use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_void};
+use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_or, guard_void};
 use crate::handle::{borrow, into_handle, out_ptr, release, write_out};
 use crate::op::Op;
 
@@ -578,6 +578,42 @@ pub unsafe extern "C" fn weida_runtime_shutdown_op_wait(
 pub unsafe extern "C" fn weida_runtime_shutdown_op_drop(op: *mut weida_runtime_shutdown_op) {
     // SAFETY: forwarded from this function's contract.
     unsafe { op_drop(op) }
+}
+
+/// Duplicates every connection of this runtime read and discarded inside a
+/// negotiated `Deduplication::Bounded` window
+/// (`Runtime::suppressed_duplicates`); 0 without deduplication, and for
+/// NULL.
+///
+/// # Safety
+///
+/// `rt` is NULL or a live runtime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_suppressed_duplicates(rt: *const weida_runtime) -> u64 {
+    guard_or(0, || {
+        if rt.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `rt` is a live runtime by the caller's contract.
+        unsafe { &*rt }.runtime.suppressed_duplicates()
+    })
+}
+
+/// Outgoing transfers this runtime reset because their deadline passed
+/// (`Runtime::expired_transfers`), counted apart from a cancel; 0 for NULL.
+///
+/// # Safety
+///
+/// `rt` is NULL or a live runtime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_expired_transfers(rt: *const weida_runtime) -> u64 {
+    guard_or(0, || {
+        if rt.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `rt` is a live runtime by the caller's contract.
+        unsafe { &*rt }.runtime.expired_transfers()
+    })
 }
 
 /// Releases the caller's reference to a runtime. The reactor lives on while

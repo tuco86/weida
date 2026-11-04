@@ -108,6 +108,10 @@ The C ABI's *streams* area is absent here: the rows of [weida-c.md](weida-c.md) 
 (*streams*), `Requester::open` with `weida_reply_stream` and its `recv`. A request body is still
 sent whole, as one buffer.
 
+The C ABI's *stats* area is absent here: the rows of [weida-c.md](weida-c.md) marked
+(*stats*), the connection statistics snapshot, the runtime's two counters, connection numbers
+and the peer event queue.
+
 ## 7. Sources
 
 `crates/py/weida-py/src/weida/` (`__init__.py`, `_native.py`, `_errors.py`, `_wait.py`,

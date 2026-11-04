@@ -711,6 +711,15 @@ impl std::fmt::Debug for Delivery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnectionId(usize);
 
+impl ConnectionId {
+    /// The connection's number: the serial this type wraps, for a caller
+    /// that keys on an integer, such as the C ABI. Two connections of one
+    /// process never share it.
+    pub fn get(self) -> u64 {
+        self.0 as u64
+    }
+}
+
 /// An inbound transfer: one receive stream plus the metadata that described
 /// it.
 ///

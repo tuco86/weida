@@ -21,6 +21,7 @@ mod poll;
 mod ready;
 mod requester;
 mod runtime;
+mod stats;
 mod tls;
 mod transfer;
 mod try_handle;
@@ -33,6 +34,7 @@ pub use listener::*;
 pub use poll::*;
 pub use requester::*;
 pub use runtime::*;
+pub use stats::*;
 pub use tls::*;
 pub use transfer::*;
 /// The library's version, e.g. `"0.1.0-alpha.11-dev"`. The string is

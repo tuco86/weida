@@ -18,6 +18,8 @@ exchanges at once. Every `int` function can also return `-WEIDA_EINVAL` and `-WE
 | `int weida_requester_open_op_fd(const weida_requester_open_op *op, int64_t *out)` | never | 0; `-WEIDA_EIO` |
 | `int weida_requester_open_op_wait(const weida_requester_open_op *op, int64_t timeout_ms, weida_outgoing_transfer **out_body, weida_reply_stream **out_reply)` | up to `timeout_ms` | 0, the request body ([transfer.md](transfer.md)) and the reply stream, both written; `-WEIDA_ENOT_CONNECTED`, `-WEIDA_ECONNECTION_LOST`, `-WEIDA_ELIMIT_EXCEEDED` (a topic over 256 bytes), `-WEIDA_EUNTRUSTED`; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
 | `void weida_requester_open_op_drop(weida_requester_open_op *op)` | never | — |
+| `int weida_requester_connection_stats(const weida_requester *r, weida_connection_stats **out)` | never; a snapshot | 0 ([stats.md](stats.md)) |
+| `int weida_requester_events(const weida_requester *r, weida_peer_events **out)` | never | 0, a new reader ([stats.md](stats.md)) |
 | `void weida_requester_drop(weida_requester *r)` | never | — |
 
 A connected address is redialled by the runtime when its connection is lost. Dropping an

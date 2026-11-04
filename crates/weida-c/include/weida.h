@@ -401,6 +401,46 @@
 #define WEIDA_POLLIN 1
 
 /**
+ * `PeerEvent::Connected`.
+ */
+#define WEIDA_PEER_EVENT_CONNECTED 0
+
+/**
+ * `PeerEvent::Lost`.
+ */
+#define WEIDA_PEER_EVENT_LOST 1
+
+/**
+ * `PeerEvent::Retrying`.
+ */
+#define WEIDA_PEER_EVENT_RETRYING 2
+
+/**
+ * `PeerEvent::GaveUp`.
+ */
+#define WEIDA_PEER_EVENT_GAVE_UP 3
+
+/**
+ * `PeerEvent::Missed`.
+ */
+#define WEIDA_PEER_EVENT_MISSED 4
+
+/**
+ * `GiveUp::Policy`.
+ */
+#define WEIDA_GIVE_UP_POLICY 0
+
+/**
+ * `GiveUp::PeerChanged`.
+ */
+#define WEIDA_GIVE_UP_PEER_CHANGED 1
+
+/**
+ * `GiveUp::Failed`.
+ */
+#define WEIDA_GIVE_UP_FAILED 2
+
+/**
  * A QUIC binding: the socket a listener serves on.
  */
 typedef struct weida_binding weida_binding;
@@ -409,6 +449,12 @@ typedef struct weida_binding weida_binding;
  * The TLS terms a requester dials on.
  */
 typedef struct weida_client_tls weida_client_tls;
+
+/**
+ * One snapshot of a requester's live connections, read by index
+ * (`Requester::connection_stats`).
+ */
+typedef struct weida_connection_stats weida_connection_stats;
 
 /**
  * The receipt of a finished outbound transfer.
@@ -496,6 +542,16 @@ typedef struct weida_msg weida_msg;
  * An outbound transfer: a payload written like a socket (R3a).
  */
 typedef struct weida_outgoing_transfer weida_outgoing_transfer;
+
+/**
+ * One transition of one dialled address (`PeerEvent`), read-only.
+ */
+typedef struct weida_peer_event weida_peer_event;
+
+/**
+ * One reader of a requester's peer events (`PeerEvents`).
+ */
+typedef struct weida_peer_events weida_peer_events;
 
 /**
  * PEM text handed out (`Identity::certificate_pem`, `Identity::to_pem`):
@@ -1313,6 +1369,18 @@ void weida_replier_drop(weida_replier *r);
 int weida_incoming_request_meta(const weida_incoming_request *q, weida_incoming_meta **out);
 
 /**
+ * The number of the connection the request arrived on
+ * (`IncomingRequest::connection`, `ConnectionId::get`): equal for requests
+ * of one connection, never shared by two connections of this process. Not
+ * an address.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request; `out` is NULL or writable.
+ */
+int weida_incoming_request_connection(const weida_incoming_request *q, uint64_t *out);
+
+/**
  * Detaches the request's body, to be read like a socket
  * (`IncomingRequest::take_body`). A second call returns `-WEIDA_ECLOSED`.
  *
@@ -1745,6 +1813,32 @@ void weida_reply_stream_recv_op_drop(weida_reply_stream_recv_op *op);
 void weida_reply_stream_drop(weida_reply_stream *s);
 
 /**
+ * A snapshot of the requester's live connections
+ * (`Requester::connection_stats`): one record per live dialled address, in
+ * dial order, copied at the call and read with the
+ * `weida_connection_stats_*` getters. An address being redialled has no
+ * record. Never blocks.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live requester; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_requester_connection_stats(const weida_requester *r, weida_connection_stats **out);
+
+/**
+ * A new reader of the requester's peer events (`Requester::events`):
+ * every transition of its dialled addresses from this call on, read with
+ * `weida_peer_events_recv`. Each call is an independent reader.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live requester; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_requester_events(const weida_requester *r, weida_peer_events **out);
+
+/**
  * Releases a requester, which drops its connections. NULL does nothing.
  *
  * # Safety
@@ -2009,6 +2103,28 @@ int weida_runtime_shutdown_op_wait(const weida_runtime_shutdown_op *op, int64_t 
 void weida_runtime_shutdown_op_drop(weida_runtime_shutdown_op *op);
 
 /**
+ * Duplicates every connection of this runtime read and discarded inside a
+ * negotiated `Deduplication::Bounded` window
+ * (`Runtime::suppressed_duplicates`); 0 without deduplication, and for
+ * NULL.
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime.
+ */
+uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt);
+
+/**
+ * Outgoing transfers this runtime reset because their deadline passed
+ * (`Runtime::expired_transfers`), counted apart from a cancel; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime.
+ */
+uint64_t weida_runtime_expired_transfers(const weida_runtime *rt);
+
+/**
  * Releases the caller's reference to a runtime. The reactor lives on while
  * anything made from it does (R13). NULL does nothing.
  *
@@ -2017,6 +2133,537 @@ void weida_runtime_shutdown_op_drop(weida_runtime_shutdown_op *op);
  * `rt` is NULL or a live runtime, dropped at most once.
  */
 void weida_runtime_drop(weida_runtime *rt);
+
+/**
+ * The number of records, one per live dialled address in dial order; 0
+ * for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+size_t weida_connection_stats_len(const weida_connection_stats *s);
+
+/**
+ * The URL record `index` was dialled as, exactly as given to
+ * `weida_requester_connect`; NULL past the end. Lives as long as `s`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `len_out` is NULL or writable.
+ */
+const char *weida_connection_stats_url(const weida_connection_stats *s,
+                                       size_t index,
+                                       size_t *len_out);
+
+/**
+ * `ConnectionStats::age` of record `index`, in microseconds: 1 and `*out`
+ * when present, 0 when absent (only past the end or for a NULL argument).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_age_us(const weida_connection_stats *s, size_t index, uint64_t *out);
+
+/**
+ * `ConnectionStats::redials` of record `index`: 1 and `*out` when present, 0
+ * when absent (only past the end or for a NULL argument).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_redials(const weida_connection_stats *s, size_t index, uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.rtt` of record `index`, in microseconds:
+ * 1 and `*out` when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_rtt_us(const weida_connection_stats *s,
+                                                 size_t index,
+                                                 uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.min_rtt` of record `index`, in
+ * microseconds: 1 and `*out` when present, 0 when absent (the transport is
+ * local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_min_rtt_us(const weida_connection_stats *s,
+                                                     size_t index,
+                                                     uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.cwnd` of record `index`: 1 and `*out`
+ * when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_cwnd(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.congestion_events` of record `index`: 1
+ * and `*out` when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_congestion_events(const weida_connection_stats *s,
+                                                            size_t index,
+                                                            uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.lost_packets` of record `index`: 1 and
+ * `*out` when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_lost_packets(const weida_connection_stats *s,
+                                                       size_t index,
+                                                       uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.lost_bytes` of record `index`: 1 and
+ * `*out` when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_lost_bytes(const weida_connection_stats *s,
+                                                     size_t index,
+                                                     uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.sent_packets` of record `index`: 1 and
+ * `*out` when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_sent_packets(const weida_connection_stats *s,
+                                                       size_t index,
+                                                       uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.current_mtu` of record `index`: 1 and
+ * `*out` when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_current_mtu(const weida_connection_stats *s,
+                                                      size_t index,
+                                                      uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.path.max_datagram_size` of record `index`: 1
+ * and `*out` when present, 0 when absent (the transport is local, or the
+ * peer accepts no datagram).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_path_max_datagram_size(const weida_connection_stats *s,
+                                                            size_t index,
+                                                            uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.tx.datagrams` of record `index`: 1 and `*out`
+ * when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_tx_datagrams(const weida_connection_stats *s,
+                                                  size_t index,
+                                                  uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.tx.bytes` of record `index`: 1 and `*out` when
+ * present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_tx_bytes(const weida_connection_stats *s,
+                                              size_t index,
+                                              uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.rx.datagrams` of record `index`: 1 and `*out`
+ * when present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_rx_datagrams(const weida_connection_stats *s,
+                                                  size_t index,
+                                                  uint64_t *out);
+
+/**
+ * `ConnectionStats::transport.rx.bytes` of record `index`: 1 and `*out` when
+ * present, 0 when absent (the transport is local).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_transport_rx_bytes(const weida_connection_stats *s,
+                                              size_t index,
+                                              uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.rtt` of record `index`, in microseconds: 1 and
+ * `*out` when present, 0 when absent (no record from the peer yet, a local
+ * transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_rtt_us(const weida_connection_stats *s,
+                                         size_t index,
+                                         uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.min_rtt` of record `index`, in microseconds: 1
+ * and `*out` when present, 0 when absent (no record from the peer yet, a
+ * local transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_min_rtt_us(const weida_connection_stats *s,
+                                             size_t index,
+                                             uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.cwnd` of record `index`: 1 and `*out` when
+ * present, 0 when absent (no record from the peer yet, a local transport, or
+ * `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_cwnd(const weida_connection_stats *s,
+                                       size_t index,
+                                       uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.congestion_events` of record `index`: 1 and
+ * `*out` when present, 0 when absent (no record from the peer yet, a local
+ * transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_congestion_events(const weida_connection_stats *s,
+                                                    size_t index,
+                                                    uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.lost_packets` of record `index`: 1 and `*out`
+ * when present, 0 when absent (no record from the peer yet, a local
+ * transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_lost_packets(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.lost_bytes` of record `index`: 1 and `*out` when
+ * present, 0 when absent (no record from the peer yet, a local transport, or
+ * `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_lost_bytes(const weida_connection_stats *s,
+                                             size_t index,
+                                             uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.sent_packets` of record `index`: 1 and `*out`
+ * when present, 0 when absent (no record from the peer yet, a local
+ * transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_sent_packets(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.current_mtu` of record `index`: 1 and `*out` when
+ * present, 0 when absent (no record from the peer yet, a local transport, or
+ * `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_current_mtu(const weida_connection_stats *s,
+                                              size_t index,
+                                              uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.tx.datagrams` of record `index`: 1 and `*out`
+ * when present, 0 when absent (no record from the peer yet, a local
+ * transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_tx_datagrams(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.tx.bytes` of record `index`: 1 and `*out` when
+ * present, 0 when absent (no record from the peer yet, a local transport, or
+ * `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_tx_bytes(const weida_connection_stats *s,
+                                           size_t index,
+                                           uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.rx.datagrams` of record `index`: 1 and `*out`
+ * when present, 0 when absent (no record from the peer yet, a local
+ * transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_rx_datagrams(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.rx.bytes` of record `index`: 1 and `*out` when
+ * present, 0 when absent (no record from the peer yet, a local transport, or
+ * `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_rx_bytes(const weida_connection_stats *s,
+                                           size_t index,
+                                           uint64_t *out);
+
+/**
+ * `ConnectionStats::remote.age` of record `index`, in microseconds: 1 and
+ * `*out` when present, 0 when absent (no record from the peer yet, a local
+ * transport, or `path_report` off on either side).
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_connection_stats_remote_age_us(const weida_connection_stats *s,
+                                         size_t index,
+                                         uint64_t *out);
+
+/**
+ * Releases a snapshot. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot, dropped at most once.
+ */
+void weida_connection_stats_drop(weida_connection_stats *s);
+
+/**
+ * The reader's readiness descriptor (R11): readable when the next
+ * `weida_peer_events_recv` will not block.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live reader; `out` is NULL or writable.
+ */
+int weida_peer_events_fd(const weida_peer_events *e, int64_t *out);
+
+/**
+ * Takes the next event, waiting up to `timeout_ms` (R4) for one
+ * (`PeerEvents::recv`).
+ *
+ * Writes NULL to `out` and returns 0 once the requester is gone: the end
+ * of the stream, as a read's end is `*out_n == 0`. A reader that fell more
+ * than 64 events behind gets one `WEIDA_PEER_EVENT_MISSED` event carrying
+ * how many it lost.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live reader; `out` is NULL or writable. Release an
+ * event with `weida_peer_event_drop`.
+ */
+int weida_peer_events_recv(const weida_peer_events *e, int64_t timeout_ms, weida_peer_event **out);
+
+/**
+ * Releases a reader. A thread waiting in `weida_peer_events_recv` returns
+ * `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live reader, dropped at most once.
+ */
+void weida_peer_events_drop(weida_peer_events *e);
+
+/**
+ * The event's kind, a `WEIDA_PEER_EVENT_*` constant.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event.
+ */
+int weida_peer_event_kind(const weida_peer_event *e);
+
+/**
+ * The address as dialled; NULL for `WEIDA_PEER_EVENT_MISSED`. Lives as
+ * long as `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_peer_event_url(const weida_peer_event *e, size_t *len_out);
+
+/**
+ * `CONNECTED`: the fingerprint (`sha256:` text) the peer proved; NULL for
+ * any other kind, an anonymous peer or a local principal. Lives as long as
+ * `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_peer_event_peer_fingerprint(const weida_peer_event *e, size_t *len_out);
+
+/**
+ * `LOST`: 1 and the `WEIDA_LOSS_*` cause; 0 for any other kind.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `out` is NULL or writable.
+ */
+int weida_peer_event_cause(const weida_peer_event *e, int *out);
+
+/**
+ * `RETRYING`: 1 and which attempt since the last connection that stayed
+ * up, from 1; 0 for any other kind.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `out` is NULL or writable.
+ */
+int weida_peer_event_attempt(const weida_peer_event *e, uint32_t *out);
+
+/**
+ * `RETRYING`: 1 and the wait before it, in microseconds; 0 for any other
+ * kind.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `out` is NULL or writable.
+ */
+int weida_peer_event_delay_us(const weida_peer_event *e, uint64_t *out);
+
+/**
+ * `GAVE_UP`: 1 and why, a `WEIDA_GIVE_UP_*` constant; 0 for any other
+ * kind.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `out` is NULL or writable.
+ */
+int weida_peer_event_why(const weida_peer_event *e, int *out);
+
+/**
+ * `GAVE_UP` for `POLICY`: 1 and the redials attempted after the loss; 0
+ * for any other event.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `out` is NULL or writable.
+ */
+int weida_peer_event_why_attempts(const weida_peer_event *e, uint32_t *out);
+
+/**
+ * `GAVE_UP` for `PEER_CHANGED`: the fingerprint that answered instead;
+ * NULL when it proved none, and for any other event. Lives as long as `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_peer_event_why_presented(const weida_peer_event *e, size_t *len_out);
+
+/**
+ * `GAVE_UP` for `FAILED`: why the redial could not be used; NULL for any
+ * other event. Lives as long as `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_peer_event_why_message(const weida_peer_event *e, size_t *len_out);
+
+/**
+ * `MISSED`: 1 and how many events this reader lost; 0 for any other kind.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `out` is NULL or writable.
+ */
+int weida_peer_event_missed(const weida_peer_event *e, uint64_t *out);
+
+/**
+ * Releases an event. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event, dropped at most once.
+ */
+void weida_peer_event_drop(weida_peer_event *e);
 
 /**
  * Creates a trust that accepts only what each dialled address names
@@ -2558,6 +3205,17 @@ void weida_msg_drop(weida_msg *msg);
  * `t` is NULL or a live incoming transfer; `out` is NULL or writable.
  */
 int weida_incoming_transfer_meta(const weida_incoming_transfer *t, weida_incoming_meta **out);
+
+/**
+ * The number of the connection the transfer arrived on
+ * (`IncomingTransfer::connection`), as `weida_incoming_request_connection`.
+ * `-WEIDA_ECLOSED` once the transfer was collected.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live incoming transfer; `out` is NULL or writable.
+ */
+int weida_incoming_transfer_connection(const weida_incoming_transfer *t, uint64_t *out);
 
 /**
  * The transfer's readiness descriptor (R11): readable when the next

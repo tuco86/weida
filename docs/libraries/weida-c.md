@@ -35,7 +35,7 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::drain` | — | absent: *drain* |
 | `Runtime::peer`, `pusher`, `subscriber`, `dish`, `pair`, `surveyor`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
-| `Runtime::suppressed_duplicates`, `expired_transfers` | — | absent: *stats* |
+| `Runtime::suppressed_duplicates`, `expired_transfers` | `weida_runtime_suppressed_duplicates`, `weida_runtime_expired_transfers` | present; `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (counts 0 then 1), `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport` (0 without deduplication) (*stats*) |
 | `Runtime::exec` | — | refused: it is the binding's own seam |
 | `Drop for Runtime` | `weida_runtime_drop` | present; R13, the reactor ends with its last user |
 | `Listener::bind_quic` | `weida_listener_bind_quic` (op) | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
@@ -59,7 +59,8 @@ unit tests in `crates/weida-c/src/`.
 | `Requester::open` | `weida_requester_open` (op; its wait yields the request body as a `weida_outgoing_transfer` and the `weida_reply_stream`) | present; `abi::an_opened_exchange_reads_its_reply_while_the_request_is_still_open` (*streams*) |
 | `ReplyStream::recv` | `weida_reply_stream_recv` (op, consumes) | present; `abi::an_opened_exchange_reads_its_reply_while_the_request_is_still_open` (*streams*) |
 | `Drop for ReplyStream` (`CANCELED`) | `weida_reply_stream_drop` | present; `abi::dropping_a_reply_stream_cancels_the_exchange` (*streams*) |
-| `Requester::connection_stats`, `events` | — | absent: *stats* |
+| `Requester::connection_stats` | `weida_requester_connection_stats` (a snapshot handle, [stats.md](../c/stats.md)) | present; `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport`, `abi::a_quic_connection_reports_its_transport` (*stats*) |
+| `Requester::events` | `weida_requester_events` (a `weida_peer_events` queue) | present; `abi::a_replier_runtime_shut_down_reports_lost_then_retrying` (*stats*) |
 | `Replier::accept` | `weida_replier_accept` (try, R3a) | present; `abi::an_accept_with_nothing_pending_answers_eagain`, `abi::a_repliers_descriptor_follows_its_queue`, `abi::a_signal_ends_a_blocked_accept_with_eintr`, `abi::dropping_a_replier_ends_a_blocked_accept_with_eclosed` |
 | `Replier::path` | `weida_replier_path` | present; R7 getter |
 | `IncomingRequest::meta` | `weida_incoming_request_meta` | present; `abi::a_streamed_round_trip_over_inproc` (`endpoint`) |
@@ -68,7 +69,7 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingRequest::reply` | `weida_incoming_request_reply` (op, consumes) | present; `abi::a_streamed_round_trip_over_inproc` |
 | `IncomingRequest::refuse`, `ErrorCode` | `weida_incoming_request_refuse` (op, consumes), `WEIDA_ERROR_CODE_*` | present; `abi::a_refused_request_fails_the_requester_with_its_codes_error` (*refusals*) |
 | `IncomingRequest::canceled` | `weida_incoming_request_canceled` (op, outlives the request) | present; `abi::canceled_settles_once_the_requester_drops_its_request` (*refusals*) |
-| `IncomingRequest::connection` | — | absent: *stats* |
+| `IncomingRequest::connection` | `weida_incoming_request_connection` | present; `abi::a_request_and_its_body_name_the_same_connection` (*stats*) |
 | `Drop for IncomingRequest` (`NO_REPLY`) | `weida_incoming_request_drop` | present; R1 |
 
 ## 4. Transfers and receipts
@@ -79,7 +80,8 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingTransfer::collect` | `weida_incoming_transfer_collect` (op, consumes) | present; `abi::a_collect_over_its_ceiling_fails_with_limit_exceeded` |
 | `IncomingTransfer::read_capped` | — | refused: R3c, a loop over `read` the caller writes |
 | `IncomingTransfer::meta` | `weida_incoming_transfer_meta` | present; `abi::a_streamed_round_trip_over_inproc` (`content_type`) |
-| `IncomingTransfer::reporter`, `connection` | — | absent: *cursors*, *stats* |
+| `IncomingTransfer::reporter` | — | absent: *cursors* |
+| `IncomingTransfer::connection` | `weida_incoming_transfer_connection` | present; `abi::a_request_and_its_body_name_the_same_connection` (*stats*) |
 | `Drop for IncomingTransfer` (`REJECTED`) | `weida_incoming_transfer_drop` | present; `streams::a_refused_payload_reports_rejected_through_async_write` proves the outcome in Rust |
 | `AsyncWrite for OutgoingTransfer` | `weida_outgoing_transfer_write` (try) | present; `abi::a_streamed_round_trip_over_inproc`, `smoke.c` |
 | `OutgoingTransfer::write_all` | — | refused: R3c |
@@ -89,7 +91,7 @@ unit tests in `crates/weida-c/src/`.
 | `OutgoingTransfer::cursors` | — | absent: *cursors* |
 | `Delivery::delivered` | `weida_delivery_delivered` (op, consumes) | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Drop for Delivery` | `weida_delivery_drop` | present |
-| `ConnectionId` | — | absent: *stats* |
+| `ConnectionId` | its number, `uint64_t` (`ConnectionId::get`) | present; `abi::a_request_and_its_body_name_the_same_connection` (*stats*) |
 
 ## 5. Values and metadata
 
@@ -144,8 +146,8 @@ unit tests in `crates/weida-c/src/`.
 
 | `crates/weida` | Verdict |
 | --- | --- |
-| `ConnectionStats`, `PathStats`, `RemoteStats`, `TransportStats`, `UdpCounts`, `connection_stats()` | absent: *stats* |
-| `PeerEvent`, `PeerEvents`, `GiveUp` | absent: *identity* and *patterns* (events as queues) |
+| `ConnectionStats`, `PathStats`, `RemoteStats`, `TransportStats`, `UdpCounts`, `connection_stats()` | present: `weida_connection_stats` and its getters ([stats.md](../c/stats.md)); `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport`, `abi::a_quic_connection_reports_its_transport` (*stats*) |
+| `PeerEvent`, `PeerEvents`, `GiveUp` | present: `weida_peer_events` (a try handle) and `weida_peer_event`, `WEIDA_PEER_EVENT_*`, `WEIDA_GIVE_UP_*`; `abi::a_replier_runtime_shut_down_reports_lost_then_retrying`, `stats::tests::every_peer_event_kind_reads_back_through_its_getters` (*stats*) |
 | `DishDrops`, `TopicDrops`, `Drained` | absent: *patterns*, *drain* |
 
 ## 7. Patterns and helpers not yet mapped
@@ -167,7 +169,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the twenty-three `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the twenty-seven `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -187,6 +189,12 @@ way a foreign caller calls it:
   the same (R6) and answers `NO_REPLY`.
 - `canceled` is an op started from the request, and like Rust's future it outlives it; start
   it before `reply` or `refuse` consumes the request.
+- A duration out is microseconds (`_us`, R7).
+- `connection_stats()` is one snapshot handle whose records are read by index; Rust returns a
+  `Vec`.
+- The end of a peer event stream (`None`) is a 0 return with `*out == NULL`, as a read's end is
+  `*out_n == 0`.
+- `ConnectionId` is its number (`ConnectionId::get`).
 
 ## 10. The definition of done
 
@@ -200,7 +208,8 @@ is complete when no present row lacks a test.
 ## 11. Sources
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
-`config.rs`, `runtime.rs`, `tls.rs`, `listener.rs`, `transfer.rs`, `requester.rs`, `poll.rs`),
+`config.rs`, `runtime.rs`, `tls.rs`, `listener.rs`, `transfer.rs`, `requester.rs`, `poll.rs`,
+`stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

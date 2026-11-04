@@ -9,8 +9,8 @@ on their own Tokio runtime.
 The rules below (R1 to R13) are normative for every function the library exports, now and in
 later stages. The pages beside this one document each function of the current slice:
 [runtime.md](runtime.md), [tls.md](tls.md), [listener.md](listener.md),
-[requester.md](requester.md), [transfer.md](transfer.md), [msg.md](msg.md), [poll.md](poll.md)
-and [errors.md](errors.md). What is not yet mapped is listed in
+[requester.md](requester.md), [transfer.md](transfer.md), [msg.md](msg.md), [poll.md](poll.md),
+[stats.md](stats.md) and [errors.md](errors.md). What is not yet mapped is listed in
 [libraries/weida-c.md](../libraries/weida-c.md).
 
 The easy tier, `crates/weida-c/include/weida_easy.h`, is not part of the ABI: it is C source
@@ -119,6 +119,8 @@ The caller neither uses nor drops the handle afterwards. The docs mark such func
 - **Strings in:** NUL-terminated UTF-8 `const char *`. Anything else returns `-WEIDA_EINVAL`.
 - **Bytes in:** `const uint8_t *data, size_t len`. `data` may be NULL only when `len == 0`.
 - **Durations in:** milliseconds as `uint64_t`.
+- **Durations out:** microseconds as `uint64_t`, the getter's name ending in `_us`
+  (`weida_connection_stats_age_us`); a duration above `UINT64_MAX` µs reads `UINT64_MAX`.
 - **Default-able parameters:** a parameter whose Rust type implements `Default` (for example
   `TransferMeta`) is `const weida_<t> *`, and NULL means `T::default()`.
 - **Strings out from a handle:** `const char *weida_<t>_<x>(const weida_<t> *h, size_t *len_out)`.

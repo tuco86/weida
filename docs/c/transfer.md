@@ -11,6 +11,7 @@ can also return `-WEIDA_EINVAL` and `-WEIDA_EPANIC`.
 | Function | Blocks | Returns |
 | --- | --- | --- |
 | `int weida_incoming_transfer_meta(const weida_incoming_transfer *t, weida_incoming_meta **out)` | never | 0 and a new metadata reference ([msg.md](msg.md)) |
+| `int weida_incoming_transfer_connection(const weida_incoming_transfer *t, uint64_t *out)` | never | 0 and the number of its connection, as `weida_incoming_request_connection`; `-WEIDA_ECLOSED` once collected |
 | `int weida_incoming_transfer_fd(const weida_incoming_transfer *t, int64_t *out)` | never | 0; `-WEIDA_EIO` |
 | `int weida_incoming_transfer_read(const weida_incoming_transfer *t, uint8_t *buf, size_t cap, int64_t timeout_ms, size_t *out_n)` | up to `timeout_ms` | 0 and `*out_n > 0` bytes, or `*out_n == 0` at the end of the payload; `-WEIDA_ECANCELED` (the sender canceled), `-WEIDA_EREJECTED`, `-WEIDA_ECONNECTION_LOST`, `-WEIDA_ETRANSPORT`; `-WEIDA_EINVAL` for `cap == 0`; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
 | `int weida_incoming_transfer_collect(weida_incoming_transfer *t, uint64_t max_bytes, weida_incoming_transfer_collect_op **out)` | never; **consumes** `t` | 0; `-WEIDA_ECLOSED` |

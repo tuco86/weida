@@ -499,6 +499,29 @@ pub unsafe extern "C" fn weida_incoming_transfer_meta(
     })
 }
 
+/// The number of the connection the transfer arrived on
+/// (`IncomingTransfer::connection`), as `weida_incoming_request_connection`.
+/// `-WEIDA_ECLOSED` once the transfer was collected.
+///
+/// # Safety
+///
+/// `t` is NULL or a live incoming transfer; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_transfer_connection(
+    t: *const weida_incoming_transfer,
+    out: *mut u64,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let t = unsafe { borrow(t) }?;
+        let id = t.tried.with(|t| t.connection().get())?;
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, id) };
+        Ok(0)
+    })
+}
+
 /// The transfer's readiness descriptor (R11): readable when the next
 /// `weida_incoming_transfer_read` will not block.
 ///

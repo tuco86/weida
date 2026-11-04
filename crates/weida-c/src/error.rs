@@ -126,7 +126,7 @@ pub(crate) fn code(e: &Error) -> c_int {
     }
 }
 
-fn loss_code(cause: LossCause) -> c_int {
+pub(crate) fn loss_code(cause: LossCause) -> c_int {
     match cause {
         LossCause::IdleTimeout => WEIDA_LOSS_IDLE_TIMEOUT,
         LossCause::PeerClosed => WEIDA_LOSS_PEER_CLOSED,

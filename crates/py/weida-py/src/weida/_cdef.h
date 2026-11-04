@@ -152,9 +152,27 @@
 
 #define WEIDA_POLLIN 1
 
+#define WEIDA_PEER_EVENT_CONNECTED 0
+
+#define WEIDA_PEER_EVENT_LOST 1
+
+#define WEIDA_PEER_EVENT_RETRYING 2
+
+#define WEIDA_PEER_EVENT_GAVE_UP 3
+
+#define WEIDA_PEER_EVENT_MISSED 4
+
+#define WEIDA_GIVE_UP_POLICY 0
+
+#define WEIDA_GIVE_UP_PEER_CHANGED 1
+
+#define WEIDA_GIVE_UP_FAILED 2
+
 typedef struct weida_binding weida_binding;
 
 typedef struct weida_client_tls weida_client_tls;
+
+typedef struct weida_connection_stats weida_connection_stats;
 
 typedef struct weida_delivery weida_delivery;
 
@@ -189,6 +207,10 @@ typedef struct weida_local_binding weida_local_binding;
 typedef struct weida_msg weida_msg;
 
 typedef struct weida_outgoing_transfer weida_outgoing_transfer;
+
+typedef struct weida_peer_event weida_peer_event;
+
+typedef struct weida_peer_events weida_peer_events;
 
 typedef struct weida_pem weida_pem;
 
@@ -373,6 +395,8 @@ void weida_replier_drop(weida_replier *r);
 
 int weida_incoming_request_meta(const weida_incoming_request *q, weida_incoming_meta **out);
 
+int weida_incoming_request_connection(const weida_incoming_request *q, uint64_t *out);
+
 int weida_incoming_request_take_body(const weida_incoming_request *q,
                                      weida_incoming_transfer **out);
 
@@ -472,6 +496,10 @@ void weida_reply_stream_recv_op_drop(weida_reply_stream_recv_op *op);
 
 void weida_reply_stream_drop(weida_reply_stream *s);
 
+int weida_requester_connection_stats(const weida_requester *r, weida_connection_stats **out);
+
+int weida_requester_events(const weida_requester *r, weida_peer_events **out);
+
 void weida_requester_drop(weida_requester *r);
 
 int weida_runtime_config_new(weida_runtime_config **out);
@@ -525,7 +553,157 @@ int weida_runtime_shutdown_op_wait(const weida_runtime_shutdown_op *op, int64_t 
 
 void weida_runtime_shutdown_op_drop(weida_runtime_shutdown_op *op);
 
+uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt);
+
+uint64_t weida_runtime_expired_transfers(const weida_runtime *rt);
+
 void weida_runtime_drop(weida_runtime *rt);
+
+size_t weida_connection_stats_len(const weida_connection_stats *s);
+
+const char *weida_connection_stats_url(const weida_connection_stats *s,
+                                       size_t index,
+                                       size_t *len_out);
+
+int weida_connection_stats_age_us(const weida_connection_stats *s, size_t index, uint64_t *out);
+
+int weida_connection_stats_redials(const weida_connection_stats *s, size_t index, uint64_t *out);
+
+int weida_connection_stats_transport_path_rtt_us(const weida_connection_stats *s,
+                                                 size_t index,
+                                                 uint64_t *out);
+
+int weida_connection_stats_transport_path_min_rtt_us(const weida_connection_stats *s,
+                                                     size_t index,
+                                                     uint64_t *out);
+
+int weida_connection_stats_transport_path_cwnd(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+int weida_connection_stats_transport_path_congestion_events(const weida_connection_stats *s,
+                                                            size_t index,
+                                                            uint64_t *out);
+
+int weida_connection_stats_transport_path_lost_packets(const weida_connection_stats *s,
+                                                       size_t index,
+                                                       uint64_t *out);
+
+int weida_connection_stats_transport_path_lost_bytes(const weida_connection_stats *s,
+                                                     size_t index,
+                                                     uint64_t *out);
+
+int weida_connection_stats_transport_path_sent_packets(const weida_connection_stats *s,
+                                                       size_t index,
+                                                       uint64_t *out);
+
+int weida_connection_stats_transport_path_current_mtu(const weida_connection_stats *s,
+                                                      size_t index,
+                                                      uint64_t *out);
+
+int weida_connection_stats_transport_path_max_datagram_size(const weida_connection_stats *s,
+                                                            size_t index,
+                                                            uint64_t *out);
+
+int weida_connection_stats_transport_tx_datagrams(const weida_connection_stats *s,
+                                                  size_t index,
+                                                  uint64_t *out);
+
+int weida_connection_stats_transport_tx_bytes(const weida_connection_stats *s,
+                                              size_t index,
+                                              uint64_t *out);
+
+int weida_connection_stats_transport_rx_datagrams(const weida_connection_stats *s,
+                                                  size_t index,
+                                                  uint64_t *out);
+
+int weida_connection_stats_transport_rx_bytes(const weida_connection_stats *s,
+                                              size_t index,
+                                              uint64_t *out);
+
+int weida_connection_stats_remote_rtt_us(const weida_connection_stats *s,
+                                         size_t index,
+                                         uint64_t *out);
+
+int weida_connection_stats_remote_min_rtt_us(const weida_connection_stats *s,
+                                             size_t index,
+                                             uint64_t *out);
+
+int weida_connection_stats_remote_cwnd(const weida_connection_stats *s,
+                                       size_t index,
+                                       uint64_t *out);
+
+int weida_connection_stats_remote_congestion_events(const weida_connection_stats *s,
+                                                    size_t index,
+                                                    uint64_t *out);
+
+int weida_connection_stats_remote_lost_packets(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+int weida_connection_stats_remote_lost_bytes(const weida_connection_stats *s,
+                                             size_t index,
+                                             uint64_t *out);
+
+int weida_connection_stats_remote_sent_packets(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+int weida_connection_stats_remote_current_mtu(const weida_connection_stats *s,
+                                              size_t index,
+                                              uint64_t *out);
+
+int weida_connection_stats_remote_tx_datagrams(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+int weida_connection_stats_remote_tx_bytes(const weida_connection_stats *s,
+                                           size_t index,
+                                           uint64_t *out);
+
+int weida_connection_stats_remote_rx_datagrams(const weida_connection_stats *s,
+                                               size_t index,
+                                               uint64_t *out);
+
+int weida_connection_stats_remote_rx_bytes(const weida_connection_stats *s,
+                                           size_t index,
+                                           uint64_t *out);
+
+int weida_connection_stats_remote_age_us(const weida_connection_stats *s,
+                                         size_t index,
+                                         uint64_t *out);
+
+void weida_connection_stats_drop(weida_connection_stats *s);
+
+int weida_peer_events_fd(const weida_peer_events *e, int64_t *out);
+
+int weida_peer_events_recv(const weida_peer_events *e, int64_t timeout_ms, weida_peer_event **out);
+
+void weida_peer_events_drop(weida_peer_events *e);
+
+int weida_peer_event_kind(const weida_peer_event *e);
+
+const char *weida_peer_event_url(const weida_peer_event *e, size_t *len_out);
+
+const char *weida_peer_event_peer_fingerprint(const weida_peer_event *e, size_t *len_out);
+
+int weida_peer_event_cause(const weida_peer_event *e, int *out);
+
+int weida_peer_event_attempt(const weida_peer_event *e, uint32_t *out);
+
+int weida_peer_event_delay_us(const weida_peer_event *e, uint64_t *out);
+
+int weida_peer_event_why(const weida_peer_event *e, int *out);
+
+int weida_peer_event_why_attempts(const weida_peer_event *e, uint32_t *out);
+
+const char *weida_peer_event_why_presented(const weida_peer_event *e, size_t *len_out);
+
+const char *weida_peer_event_why_message(const weida_peer_event *e, size_t *len_out);
+
+int weida_peer_event_missed(const weida_peer_event *e, uint64_t *out);
+
+void weida_peer_event_drop(weida_peer_event *e);
 
 int weida_trust_new(weida_trust **out);
 
@@ -630,6 +808,8 @@ int weida_msg_meta(const weida_msg *msg, weida_incoming_meta **out);
 void weida_msg_drop(weida_msg *msg);
 
 int weida_incoming_transfer_meta(const weida_incoming_transfer *t, weida_incoming_meta **out);
+
+int weida_incoming_transfer_connection(const weida_incoming_transfer *t, uint64_t *out);
 
 int weida_incoming_transfer_fd(const weida_incoming_transfer *t, int64_t *out);
 

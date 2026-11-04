@@ -10,6 +10,7 @@ use crate::error::{closed, guard, guard_void, null_arg};
 use crate::handle::{borrow, bytes, cstr, into_handle, out_ptr, release, write_out};
 use crate::op::Op;
 use crate::runtime::{AsOp, op_drop, op_fd, op_wait, weida_runtime};
+use crate::stats::{weida_connection_stats, weida_peer_events};
 use crate::tls::{weida_client_tls, weida_transfer_meta};
 use crate::transfer::{weida_incoming_transfer, weida_outgoing_transfer};
 
@@ -521,6 +522,56 @@ pub unsafe extern "C" fn weida_reply_stream_recv_op_drop(op: *mut weida_reply_st
 pub unsafe extern "C" fn weida_reply_stream_drop(s: *mut weida_reply_stream) {
     // SAFETY: forwarded from this function's contract.
     guard_void(|| drop(unsafe { release(s) }));
+}
+
+/// A snapshot of the requester's live connections
+/// (`Requester::connection_stats`): one record per live dialled address, in
+/// dial order, copied at the call and read with the
+/// `weida_connection_stats_*` getters. An address being redialled has no
+/// record. Never blocks.
+///
+/// # Safety
+///
+/// `r` is NULL or a live requester; `out` is NULL or writable. Release the
+/// snapshot with `weida_connection_stats_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_requester_connection_stats(
+    r: *const weida_requester,
+    out: *mut *mut weida_connection_stats,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let r = unsafe { borrow(r) }?;
+        let handle = weida_connection_stats::handle(r.requester.connection_stats());
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, handle) };
+        Ok(0)
+    })
+}
+
+/// A new reader of the requester's peer events (`Requester::events`):
+/// every transition of its dialled addresses from this call on, read with
+/// `weida_peer_events_recv`. Each call is an independent reader.
+///
+/// # Safety
+///
+/// `r` is NULL or a live requester; `out` is NULL or writable. Release the
+/// reader with `weida_peer_events_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_requester_events(
+    r: *const weida_requester,
+    out: *mut *mut weida_peer_events,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let r = unsafe { borrow(r) }?;
+        let handle = weida_peer_events::handle(r.requester.events());
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, handle) };
+        Ok(0)
+    })
 }
 
 /// Releases a requester, which drops its connections. NULL does nothing.

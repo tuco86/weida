@@ -56,6 +56,7 @@ Dropping the replier unregisters its path and ends every wait on it with `-WEIDA
 | `int weida_incoming_request_reply(weida_incoming_request *q, const weida_transfer_meta *meta_or_null, weida_incoming_request_reply_op **out)` | never; **consumes** `q` | 0; `-WEIDA_ECLOSED` |
 | `int weida_incoming_request_refuse(weida_incoming_request *q, int code, weida_incoming_request_refuse_op **out)` | never; **consumes** `q` | 0; `-WEIDA_EINVAL` for a `code` that is not a `WEIDA_ERROR_CODE_*` (the request is consumed all the same and answers `NO_REPLY`); `-WEIDA_ECLOSED` |
 | `int weida_incoming_request_canceled(const weida_incoming_request *q, weida_incoming_request_canceled_op **out)` | never | 0; `-WEIDA_ECLOSED` |
+| `int weida_incoming_request_connection(const weida_incoming_request *q, uint64_t *out)` | never | 0 and the number of its connection (`ConnectionId`): equal for one connection, never shared by two of this process, not an address; `-WEIDA_ECLOSED` |
 | `void weida_incoming_request_drop(weida_incoming_request *q)` | never | — |
 
 A request dropped without a reply answers the requester with `NO_REPLY`. A body not taken

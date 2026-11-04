@@ -121,6 +121,8 @@ for the rest.
 | `int weida_runtime_listener(const weida_runtime *rt, weida_listener **out)` | never | 0; `-WEIDA_EINVAL` ([listener.md](listener.md)) |
 | `int weida_runtime_requester(const weida_runtime *rt, const weida_client_tls *tls, weida_requester **out)` | never | 0; `-WEIDA_EINVAL` ([requester.md](requester.md)) |
 | `int weida_runtime_shutdown(weida_runtime *rt, weida_runtime_shutdown_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
+| `uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt)` | never | duplicates discarded inside a negotiated `Deduplication::Bounded` window; 0 for NULL |
+| `uint64_t weida_runtime_expired_transfers(const weida_runtime *rt)` | never | outgoing transfers reset because their deadline passed; 0 for NULL |
 | `void weida_runtime_drop(weida_runtime *rt)` | never | — |
 
 The reactor's threads, its blocking pool included, block every signal except SIGSEGV, SIGBUS,

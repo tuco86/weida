@@ -297,6 +297,36 @@ fn shutdown(rt: *mut weida_runtime) {
     }
 }
 
+/// One number getter of a stats snapshot: `Some` when present.
+fn stat(
+    s: *mut weida_connection_stats,
+    index: usize,
+    get: unsafe extern "C" fn(*const weida_connection_stats, usize, *mut u64) -> c_int,
+) -> Option<u64> {
+    let mut n = 0u64;
+    // SAFETY: a live snapshot and a writable out-parameter.
+    (unsafe { get(s, index, &mut n) } == 1).then_some(n)
+}
+
+/// The requester's stats snapshot; the caller drops it.
+fn connection_stats(r: *mut weida_requester) -> *mut weida_connection_stats {
+    let mut s = ptr::null_mut();
+    // SAFETY: a live requester and a writable out-parameter.
+    ok(unsafe { weida_requester_connection_stats(r, &mut s) });
+    s
+}
+
+/// The next peer event of `events`, waiting for it; never the end.
+fn next_event(events: *mut weida_peer_events) -> *mut weida_peer_event {
+    let mut event = ptr::null_mut();
+    // SAFETY: a live reader and a writable out-parameter.
+    ok(settle("a peer event", |ms| unsafe {
+        weida_peer_events_recv(events, ms, &mut event)
+    }));
+    assert!(!event.is_null(), "the event stream ended");
+    event
+}
+
 #[test]
 fn a_streamed_round_trip_over_inproc() {
     let rt = runtime();
@@ -1430,6 +1460,8 @@ fn metadata_travels_with_a_request_and_its_reply() {
 #[test]
 fn an_expired_reply_fails_its_finish_and_cancels_the_reader() {
     let rt = runtime();
+    // SAFETY: a live runtime.
+    assert_eq!(unsafe { weida_runtime_expired_transfers(rt) }, 0);
     let (l, lb, rep) = inproc(rt, "abi-config-expired");
     let trust = trust_by_address();
     let req = requester(rt, trust);
@@ -1447,6 +1479,11 @@ fn an_expired_reply_fails_its_finish_and_cancels_the_reader() {
             -WEIDA_EEXPIRED
         );
         assert!(delivery.is_null());
+        assert_eq!(
+            weida_runtime_expired_transfers(rt),
+            1,
+            "the expiry is counted once"
+        );
         ok(settle("the reply", |ms| {
             weida_requester_request_op_wait(pending, ms, &mut answer)
         }));
@@ -1533,4 +1570,231 @@ fn limits_reach_the_quic_transport() {
         weida_runtime_config_drop(cfg);
     }
     shutdown(rt);
+}
+
+#[test]
+fn an_inproc_connection_is_reported_with_its_url_and_no_transport() {
+    let pair = Pair::new("abi-stats-inproc");
+    let pending = request(pair.req, b"ping");
+    let q = accept(pair.rep);
+    let out = reply(q, None);
+    write_all(out, b"pong");
+    let mut delivery = ptr::null_mut();
+    let mut answer = ptr::null_mut();
+    // SAFETY: live handles, each consumed or dropped once.
+    unsafe {
+        ok(weida_outgoing_transfer_finish(out, &mut delivery));
+        weida_delivery_drop(delivery);
+        ok(settle("the reply", |ms| {
+            weida_requester_request_op_wait(pending, ms, &mut answer)
+        }));
+        weida_requester_request_op_drop(pending);
+    }
+    assert_eq!(read_all(answer, 64).expect("the reply"), b"pong");
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_transfer_drop(answer) };
+
+    let s = connection_stats(pair.req);
+    let mut len = 0usize;
+    // SAFETY: a live snapshot and writable out-parameters.
+    unsafe {
+        assert_eq!(weida_connection_stats_len(s), 1);
+        assert_eq!(
+            text(weida_connection_stats_url(s, 0, &mut len), len).as_deref(),
+            Some("weida+inproc://abi-stats-inproc/p")
+        );
+    }
+    assert_eq!(stat(s, 0, weida_connection_stats_redials), Some(0));
+    assert!(stat(s, 0, weida_connection_stats_age_us).is_some());
+    assert_eq!(
+        stat(s, 0, weida_connection_stats_transport_path_rtt_us),
+        None,
+        "in process there is no path"
+    );
+    assert_eq!(stat(s, 0, weida_connection_stats_remote_rtt_us), None);
+    // SAFETY: a live snapshot, then dropped once.
+    unsafe {
+        assert!(weida_connection_stats_url(s, 1, ptr::null_mut()).is_null());
+    }
+    assert_eq!(stat(s, 1, weida_connection_stats_age_us), None);
+    // SAFETY: each handle is dropped once; the runtime is live.
+    unsafe {
+        weida_connection_stats_drop(s);
+        assert_eq!(weida_runtime_suppressed_duplicates(pair.rt), 0);
+    }
+    pair.close();
+}
+
+#[test]
+fn a_request_and_its_body_name_the_same_connection() {
+    let pair = Pair::new("abi-stats-connection");
+    let first = request(pair.req, b"one");
+    let q = accept(pair.rep);
+    let mut id = 0u64;
+    let mut body_id = 0u64;
+    // SAFETY: a live request and a writable out-parameter.
+    ok(unsafe { weida_incoming_request_connection(q, &mut id) });
+    let body = take_body(q);
+    // SAFETY: a live transfer and a writable out-parameter.
+    ok(unsafe { weida_incoming_transfer_connection(body, &mut body_id) });
+    assert_eq!(id, body_id);
+
+    let other_rt = runtime();
+    let other_trust = trust_by_address();
+    let other = requester(other_rt, other_trust);
+    ok(connect(other, "weida+inproc://abi-stats-connection/p"));
+    let second = request(other, b"two");
+    let q2 = accept(pair.rep);
+    let mut other_id = 0u64;
+    // SAFETY: a live request and a writable out-parameter.
+    ok(unsafe { weida_incoming_request_connection(q2, &mut other_id) });
+    assert_ne!(id, other_id, "another runtime dials another connection");
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_request_drop(q2);
+        weida_requester_request_op_drop(second);
+        weida_incoming_transfer_drop(body);
+        weida_incoming_request_drop(q);
+        weida_requester_request_op_drop(first);
+        weida_requester_drop(other);
+        weida_trust_drop(other_trust);
+    }
+    shutdown(other_rt);
+    pair.close();
+}
+
+#[test]
+fn a_quic_connection_reports_its_transport() {
+    let rt = runtime();
+    let l = listener(rt);
+    let (server, server_fp) = identity();
+    let tls = server_tls(server);
+    let (binding, local) = bind_quic(l, tls);
+    // SAFETY: dropped once.
+    unsafe { weida_server_tls_drop(tls) };
+    let rep = replier(l, "/echo");
+    let trust = trust_pinning(&server_fp);
+    let req = requester(rt, trust);
+    let url = format!("weida://{local}/echo");
+    let meta = round_trip(req, rep, &url);
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+
+    let s = connection_stats(req);
+    let mut len = 0usize;
+    // SAFETY: a live snapshot and a writable length.
+    unsafe {
+        assert_eq!(weida_connection_stats_len(s), 1);
+        assert_eq!(
+            text(weida_connection_stats_url(s, 0, &mut len), len),
+            Some(url)
+        );
+    }
+    assert!(stat(s, 0, weida_connection_stats_transport_path_rtt_us).is_some());
+    for (what, get) in [
+        (
+            "sent packets",
+            weida_connection_stats_transport_path_sent_packets
+                as unsafe extern "C" fn(*const weida_connection_stats, usize, *mut u64) -> c_int,
+        ),
+        (
+            "datagrams sent",
+            weida_connection_stats_transport_tx_datagrams,
+        ),
+        ("bytes received", weida_connection_stats_transport_rx_bytes),
+    ] {
+        let n = stat(s, 0, get).unwrap_or_else(|| panic!("{what} are present"));
+        assert!(n > 0, "{what}: {n}");
+    }
+    let mtu = stat(s, 0, weida_connection_stats_transport_path_current_mtu).expect("the MTU");
+    assert!(mtu >= 1200, "the MTU: {mtu}");
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_connection_stats_drop(s);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_binding_drop(binding);
+        weida_identity_drop(server);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}
+
+#[test]
+fn a_replier_runtime_shut_down_reports_lost_then_retrying() {
+    let server = runtime();
+    let (l, lb, rep) = inproc(server, "abi-stats-events");
+    let client = runtime();
+    let trust = trust_by_address();
+    let req = requester(client, trust);
+    let url = "weida+inproc://abi-stats-events/echo";
+    ok(connect(req, url));
+    let mut events = ptr::null_mut();
+    let mut event = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; the server's handles
+    // are dropped once.
+    unsafe {
+        ok(weida_requester_events(req, &mut events));
+        assert_eq!(
+            weida_peer_events_recv(events, 0, &mut event),
+            -WEIDA_EAGAIN,
+            "nothing happened since the reader was made"
+        );
+        weida_replier_drop(rep);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(server);
+
+    let mut len = 0usize;
+    let mut cause: c_int = 0;
+    let mut attempt = 0u32;
+    let mut delay = 0u64;
+    let lost = next_event(events);
+    // SAFETY: live events and writable out-parameters; each event is dropped
+    // once.
+    unsafe {
+        assert_eq!(weida_peer_event_kind(lost), WEIDA_PEER_EVENT_LOST);
+        assert_eq!(
+            text(weida_peer_event_url(lost, &mut len), len).as_deref(),
+            Some(url)
+        );
+        assert_eq!(weida_peer_event_cause(lost, &mut cause), 1);
+        assert!(
+            (WEIDA_LOSS_IDLE_TIMEOUT..=WEIDA_LOSS_TRANSPORT_ERROR).contains(&cause),
+            "{cause}"
+        );
+        weida_peer_event_drop(lost);
+    }
+    let retrying = next_event(events);
+    // SAFETY: as above.
+    unsafe {
+        assert_eq!(weida_peer_event_kind(retrying), WEIDA_PEER_EVENT_RETRYING);
+        assert_eq!(weida_peer_event_attempt(retrying, &mut attempt), 1);
+        assert_eq!(attempt, 1);
+        assert_eq!(weida_peer_event_delay_us(retrying, &mut delay), 1);
+        assert_eq!(
+            weida_peer_event_cause(retrying, &mut cause),
+            0,
+            "a field of another kind is absent"
+        );
+        weida_peer_event_drop(retrying);
+    }
+
+    // SAFETY: dropped once.
+    unsafe { weida_requester_drop(req) };
+    let mut end = ptr::null_mut();
+    // SAFETY: a live reader and a writable out-parameter.
+    ok(settle("the end of the event stream", |ms| unsafe {
+        weida_peer_events_recv(events, ms, &mut end)
+    }));
+    assert!(end.is_null(), "a requester that is gone ends its events");
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_peer_events_drop(events);
+        weida_trust_drop(trust);
+    }
+    shutdown(client);
 }
