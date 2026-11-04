@@ -376,7 +376,7 @@ mod tests {
             let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
             let mut subscriber = SubSocket::new(&ctx).expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            wait_for(|| broker.subscriber_count() == 1).await;
+            wait_for(|| broker.subscriber_count() == 1 && subscriber.peer_count() == 1).await;
 
             subscriber.subscribe("news").expect("subscribe");
             subscriber.subscribe("news").expect("again");
@@ -438,7 +438,10 @@ mod tests {
             let endpoint = verbose.bind("tcp://127.0.0.1:0").await.expect("bind");
             let mut subscriber = SubSocket::new(&ctx).expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            wait_for(|| verbose.subscriber_count() == 1).await;
+            // Both sides: a subscription the SUB makes before it sees the
+            // publisher is sent once at the handshake, from the set, however
+            // often it was made, and the repeat would never come.
+            wait_for(|| verbose.subscriber_count() == 1 && subscriber.peer_count() == 1).await;
             subscriber.subscribe("a").expect("one");
             subscriber.subscribe("a").expect("two");
             assert_eq!(next(&mut verbose).await, b"\x01a".to_vec());
@@ -459,7 +462,7 @@ mod tests {
             let endpoint = verboser.bind("tcp://127.0.0.1:0").await.expect("bind");
             let mut subscriber = SubSocket::new(&ctx).expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            wait_for(|| verboser.subscriber_count() == 1).await;
+            wait_for(|| verboser.subscriber_count() == 1 && subscriber.peer_count() == 1).await;
             // Two subscribes and one cancel: the cancel leaves the publisher
             // still holding the prefix, so it changed nothing — and that is the
             // event the default would swallow.
@@ -496,7 +499,7 @@ mod tests {
             let endpoint = verbose.bind("tcp://127.0.0.1:0").await.expect("bind");
             let mut subscriber = SubSocket::new(&ctx).expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            wait_for(|| verbose.subscriber_count() == 1).await;
+            wait_for(|| verbose.subscriber_count() == 1 && subscriber.peer_count() == 1).await;
             subscriber.subscribe("a").expect("one");
             subscriber.subscribe("a").expect("two");
             assert_eq!(next(&mut verbose).await, b"\x01a".to_vec());
@@ -635,7 +638,7 @@ mod tests {
             let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
             let mut subscriber = SubSocket::new(&ctx).expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            wait_for(|| broker.subscriber_count() == 1).await;
+            wait_for(|| broker.subscriber_count() == 1 && subscriber.peer_count() == 1).await;
 
             for n in 0..50 {
                 subscriber

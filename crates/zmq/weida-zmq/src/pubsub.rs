@@ -351,7 +351,10 @@ mod tests {
             let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
             let mut subscriber = SubSocket::new(&ctx).expect("sub");
             subscriber.connect(&endpoint.to_string()).expect("connect");
-            wait_for(|| publisher.subscriber_count() == 1).await;
+            // Both sides: a subscription the SUB makes before it sees the
+            // publisher is sent once at the handshake, from the set, however
+            // often it was made.
+            wait_for(|| publisher.subscriber_count() == 1 && subscriber.peer_count() == 1).await;
 
             subscriber.subscribe("topic").expect("first");
             subscriber.subscribe("topic").expect("second");
