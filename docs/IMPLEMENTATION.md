@@ -412,8 +412,11 @@ TLS values and streamed Req/Rep with delivery receipts ([libraries/weida-c.md](l
   `py3-none-<platform>` wheel per platform, with a synchronous surface and `weida.asyncio`
   ([libraries/weida-py.md](libraries/weida-py.md)). It replaced the PyO3 `weida-py` and the
   `weida::blocking` facade that one sat on. The `c-abi-linux-*` jobs build the wheel with
-  `libweida` and hand both on; the `python-linux-*` jobs install that wheel and run its tests on
-  CPython 3.14, free-threaded CPython 3.14t and PyPy 3.11, on linux-amd64 and linux-arm64.
+  `libweida` and hand both on; the `python-linux-*` jobs retag that wheel
+  `manylinux_2_<glibc>` and run its tests on CPython 3.14, free-threaded CPython 3.14t and
+  PyPy 3.11; `python-darwin-arm64` and `python-windows-amd64` build the `macosx_11_0_arm64` and
+  `win_amd64` wheels on their hosts and test them on CPython 3.13 and 3.14, 3.14t and PyPy 3.11.
+  Each python job hands on its wheel.
 - weida for JavaScript (`crates/js/weida-js`) is one Node-API addon written in C against
   `weida.h`, serving Node, Bun and Deno, with an ES module on top
   ([libraries/weida-js.md](libraries/weida-js.md)). Every native call tries with

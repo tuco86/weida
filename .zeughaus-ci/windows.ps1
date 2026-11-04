@@ -1,5 +1,6 @@
-# Dot-sourced by the Windows check job; no header, so not a job.
-# Sets `Run`, `Install-Nextest`, `$cache`, `$exclude` and CARGO_TARGET_DIR.
+# Dot-sourced by the Windows jobs; no header, so not a job.
+# Sets `Run`, `Install-Nextest`, `Install-Download`, `$cache`, `$exclude` and
+# CARGO_TARGET_DIR.
 $ErrorActionPreference = 'Stop'
 
 # Runs a native command and ends the script with its exit code when it fails.
@@ -56,6 +57,24 @@ function Install-Nextest {
         Remove-Item -LiteralPath $zip
     }
     $env:PATH = "$bin;$env:PATH"
+}
+
+# Downloads one tool into $Final through a temporary directory, so an
+# interrupted download never leaves a half directory at the final path.
+# $Fetch gets that directory and must leave the finished tool in its `out`.
+# Callers remove stale `dl.*` directories of their tool directory first.
+function Install-Download([string]$Final, [string]$Probe, [scriptblock]$Fetch) {
+    if (Test-Path -LiteralPath (Join-Path $Final $Probe)) {
+        return
+    }
+    $tmp = Join-Path (Split-Path -Parent $Final) ('dl.' + [IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    & $Fetch $tmp
+    if (-not (Test-Path -LiteralPath (Join-Path $tmp "out\$Probe"))) {
+        throw "the download for $Final holds no $Probe"
+    }
+    Move-Item -LiteralPath (Join-Path $tmp 'out') -Destination $Final
+    Remove-Item -Recurse -Force -LiteralPath $tmp
 }
 
 # wohnzimmer has no Python; the bindings' test binaries link libpython.

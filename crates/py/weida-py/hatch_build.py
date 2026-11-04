@@ -3,6 +3,7 @@ cffi module that loads it, built into `src/weida/` before the wheel is
 assembled."""
 
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,27 @@ def library_name() -> str:
     return "libweida.so"
 
 
+def platform_tag() -> str:
+    """The wheel's platform tag. On macOS it is the deployment target libweida
+    is built for (MACOSX_DEPLOYMENT_TARGET, which cargo hands to rustc, else
+    rustc's default), not the build interpreter's: Xcode's Python says
+    macosx_10_9_universal2. From macOS 11 on, an installer only matches minor
+    version 0. Elsewhere it is the interpreter's platform: win_amd64, or
+    linux_<arch>, which the python-linux-* jobs retag manylinux."""
+    if sys.platform == "darwin":
+        target = os.environ.get("MACOSX_DEPLOYMENT_TARGET") or MACOS_DEFAULT_TARGET
+        parts = target.split(".")
+        major = parts[0]
+        minor = "0" if int(major) >= 11 or len(parts) < 2 else parts[1]
+        return f"macosx_{major}_{minor}_{platform.machine()}"
+    return sysconfig.get_platform().replace("-", "_").replace(".", "_")
+
+
+# rustc's default minimum macOS for aarch64-apple-darwin. For x86_64-apple-darwin
+# its default (10.12) is lower, so a tag of 11.0 is still true there.
+MACOS_DEFAULT_TARGET = "11.0"
+
+
 class CustomMetadataHook(MetadataHookInterface):
     def update(self, metadata: dict) -> None:
         metadata["version"] = pep440(workspace_version())
@@ -74,5 +96,4 @@ class CustomBuildHook(BuildHookInterface):
 
         build_data["pure_python"] = False
         build_data["infer_tag"] = False
-        platform = sysconfig.get_platform().replace("-", "_").replace(".", "_")
-        build_data["tag"] = "py3-none-" + platform
+        build_data["tag"] = "py3-none-" + platform_tag()

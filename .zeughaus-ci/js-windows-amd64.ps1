@@ -23,23 +23,6 @@ $js = Join-Path $cache 'js'
 New-Item -ItemType Directory -Force -Path $js | Out-Null
 Get-ChildItem -Path $js -Filter 'dl.*' -Directory | Remove-Item -Recurse -Force
 
-# Downloads one tool into $Final through a temporary directory, so an
-# interrupted download never leaves a half directory at the final path.
-# $Fetch gets that directory and must leave the finished tool in its `out`.
-function Install-Download([string]$Final, [string]$Probe, [scriptblock]$Fetch) {
-    if (Test-Path -LiteralPath (Join-Path $Final $Probe)) {
-        return
-    }
-    $tmp = Join-Path $js ('dl.' + [IO.Path]::GetRandomFileName())
-    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-    & $Fetch $tmp
-    if (-not (Test-Path -LiteralPath (Join-Path $tmp "out\$Probe"))) {
-        throw "the download for $Final holds no $Probe"
-    }
-    Move-Item -LiteralPath (Join-Path $tmp 'out') -Destination $Final
-    Remove-Item -Recurse -Force -LiteralPath $tmp
-}
-
 $nodeDir = Join-Path $js "node-v$nodeVersion-win-x64"
 Install-Download $nodeDir 'node.exe' {
     param($tmp)
@@ -83,8 +66,8 @@ Run 'node' @('--version')
 Run 'bun' @('--version')
 Run 'deno' @('--version')
 
-# Only this job builds `release` in this workspace, so the check job's debug
-# build keeps its cache.
+# Only this job and python-windows-amd64 build `release` in this workspace,
+# with the same RUSTFLAGS, so the check job's debug build keeps its cache.
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 Run 'cargo' @('build', '--release', '--locked', '-p', 'weida-c')
 Remove-Item Env:RUSTFLAGS

@@ -1,7 +1,7 @@
 # Sourced by the platform check jobs, the c-abi jobs, the language jobs
-# (python-, js-, jvm-, beam-, go-linux-*, js-darwin-arm64, swift-darwin-arm64,
-# android-libweida), publish.sh, publish-npm.sh, audit.sh and fuzz.sh; no
-# header, so not a job.
+# (python-, js-, jvm-, beam-, go-linux-*, js-darwin-arm64, python-darwin-arm64,
+# swift-darwin-arm64, android-libweida), publish.sh, publish-npm.sh, audit.sh
+# and fuzz.sh; no header, so not a job.
 # Run from the workspace root, with CI_PLATFORM set by the job's `platform`.
 
 # The scheduled nightly round, as opposed to a nightly that `ci_run` or a
@@ -106,10 +106,10 @@ check_docs() {
 # headers match what cbindgen derives from crates/weida-c, the Python tests
 # run against an editable install, and libweida, weida.h and the wheel are
 # handed on in $CI_OUTPUT for the language jobs (lib/, lib-static/, include/,
-# wheels/): the python- jobs install the wheel, the js-, jvm- and beam- jobs
-# build their native glue against lib/, the go- jobs link lib-static/'s
-# libweida.a. The nightly and a release tag also run the C smoke program
-# and the wheel's smoke in a fresh virtualenv.
+# wheels/): the python-linux- jobs retag the wheel manylinux and install it,
+# the js-, jvm- and beam- jobs build their native glue against lib/, the go-
+# jobs link lib-static/'s libweida.a. The nightly and a release tag also run
+# the C smoke program and the wheel's smoke in a fresh virtualenv.
 c_abi() {
     step crates/weida-c/header.sh --verify
 
@@ -201,6 +201,71 @@ js_fetch_zip() {
     [ -x "$tmp/out/$2" ]
     mv "$tmp/out" "$3"
     rm -rf "$tmp"
+}
+
+# uv for a host job, at python.Containerfile's version (keep them equal),
+# downloaded once into the warm workspace through a temporary directory.
+# Its interpreters go to the workspace too, and only uv-managed ones are used,
+# never the host's (atik's is Xcode's).
+uv_env() {
+    uv_version=0.12.2
+    case "$CI_PLATFORM" in
+        darwin-arm64) uv_asset=uv-aarch64-apple-darwin ;;
+        *) echo "no uv for $CI_PLATFORM" >&2; return 1 ;;
+    esac
+    tools="$CI_WORKSPACE/.ci-cache/uv-bin"
+    uv_dir="$tools/uv-$uv_version"
+    mkdir -p "$tools"
+    rm -rf "$tools"/dl.*
+    if [ ! -x "$uv_dir/uv" ]; then
+        tmp=$(mktemp -d "$tools/dl.XXXXXX")
+        curl -fLsS "https://github.com/astral-sh/uv/releases/download/$uv_version/$uv_asset.tar.gz" |
+            tar xzf - -C "$tmp"
+        [ -x "$tmp/$uv_asset/uv" ]
+        mv "$tmp/$uv_asset" "$uv_dir"
+        rm -rf "$tmp"
+    fi
+    export PATH="$uv_dir:$PATH"
+    export UV_CACHE_DIR="$CI_WORKSPACE/.ci-cache/uv"
+    export UV_PYTHON_INSTALL_DIR="$CI_WORKSPACE/.ci-cache/uv-python"
+    export UV_PYTHON_PREFERENCE=only-managed
+}
+
+# Each python- job's check of the wheel $1 (docs/decisions/0046), on the
+# interpreters that follow as name:uv-request. First `twine check`. Then, per
+# interpreter, a fresh virtualenv with the wheel and the test tools, in which
+# importing weida on the free-threaded one (name cpython-ft) leaves the GIL
+# disabled and the tests run against the installed wheel: the unit tier on a
+# push or manual run, both tiers on the nightly and a release tag.
+# `cryptography` goes into the CPython venvs that have a GIL only (decision
+# 0047: the package works without it). The nightly and a release tag also run
+# smoke.py in a virtualenv that holds only the wheel, with no cargo on PATH.
+python_check() {
+    wheel=$1
+    shift
+    step uvx --from twine==7.0.0 twine check "$wheel"
+    for pair in "$@"; do
+        name=${pair%%:*} request=${pair#*:}
+        venv="$CI_WORKSPACE/.ci-cache/venv-$name"
+        step uv venv --clear --python "$request" "$venv"
+        case $name in cpython | cpython313) extra=cryptography ;; *) extra= ;; esac
+        step uv pip install --python "$venv" "$wheel" pytest pytest-timeout pytest-socket $extra
+        step "$venv/bin/python" -c 'import sys, weida; print(sys.version); print("libweida", weida.version())'
+        if [ "$name" = cpython-ft ]; then
+            step "$venv/bin/python" -c 'import sys, weida; assert not sys._is_gil_enabled(), "importing weida re-enabled the GIL"; print("free-threaded: GIL disabled")'
+        fi
+        case $(tier) in
+            ci) step "$venv/bin/python" -m pytest crates/py/weida-py/tests ;;
+            *) step "$venv/bin/python" -m pytest crates/py/weida-py/tests/unit ;;
+        esac
+    done
+    if [ "$(tier)" = ci ]; then
+        venv="$CI_WORKSPACE/.ci-cache/venv-smoke"
+        step uv venv --clear --python cpython-3.14.7 "$venv"
+        step uv pip install --python "$venv" "$wheel"
+        version=$("$venv/bin/python" -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+        step env PATH=/usr/bin:/bin WEIDA_WORKSPACE_VERSION="$version" "$venv/bin/python" crates/py/weida-py/smoke.py
+    fi
 }
 
 # The JavaScript package's check (docs/libraries/weida-js.md) against the

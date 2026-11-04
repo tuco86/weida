@@ -65,25 +65,26 @@ right after the failing call on the same thread. Present;
 | --- | --- |
 | A `timeout` in seconds, `None` waiting forever, `0` only trying; a passed timeout raises `Again` | present; `test_sync.py::test_an_accept_with_nothing_pending_raises_again` |
 | Ctrl-C ends a blocked call with `KeyboardInterrupt` on Unix, with no time slices: the C wait returns `EINTR`, Python runs its handler, and the call's in-flight work stays in the handle | present; `test_sync.py::test_ctrl_c_ends_a_blocked_accept`, which sends a process-directed SIGINT as a terminal does |
-| Ctrl-C on Windows: each wait is cut into 100 ms slices, because Windows has no `EINTR` | present by construction; not run, no Windows Python on the CI |
+| Ctrl-C on Windows: each wait is cut into 100 ms slices, because Windows has no `EINTR` | present: every waiting call of the tests in `python-windows-amd64` runs in slices; Ctrl-C itself is not sent there (`test_sync.py::test_ctrl_c_ends_a_blocked_accept` is skipped on Windows) |
 | The GIL is released for every C call (cffi does it), so a blocked call holds no other Python thread | present |
 | asyncio: one `loop.add_reader` registration per object and a FIFO of waiting coroutines, each retried with a timeout-0 try when the descriptor is readable | present; `test_asyncio.py::test_two_accepts_on_one_replier_serve_two_requests` |
 | asyncio cancellation cancels the operation (its op is dropped) | present; `test_asyncio.py::test_a_cancelled_request_ends_and_the_runtime_still_shuts_down` |
-| The Windows Proactor loop, which cannot watch a descriptor: the wait runs in the default executor, and cancellation drops the object, which ends that wait with `Closed` | present by construction; not run |
+| The Windows Proactor loop, which cannot watch a descriptor: the wait runs in the default executor, and cancellation drops the object, which ends that wait with `Closed` | present; `test_asyncio.py` runs on Windows' default Proactor loop in `python-windows-amd64` (the nightly and a release tag) |
 
 ## 5. Packaging
 
 | Row | Verdict |
 | --- | --- |
 | One `py3-none-<platform>` wheel per platform, with `libweida` and the generated `_ffi.py` inside | present; `package.sh` refuses any other tag |
+| Platform tags PyPI accepts: `manylinux_2_<glibc>_x86_64` and `_aarch64`, `macosx_11_0_arm64`, `win_amd64` | present: the `python-linux-*` jobs retag the `c-abi-linux-*` wheel with `auditwheel repair` (the glibc floor of the trixie build image; `libweida` is the only native file), `hatch_build.py` tags a macOS wheel with the deployment target `libweida` is built for (`MACOSX_DEPLOYMENT_TARGET`, else rustc's 11.0), and each python job checks its wheel's file name and runs `twine check` before it hands the wheel on |
 | The version is the workspace version in PEP 440 spelling (`0.1.0-alpha.11-dev` is `0.1.0a11.dev0`) | present; `smoke.py` |
-| The wheel runs with no Rust toolchain on `PATH` | present; `package.sh` runs `smoke.py` with `PATH=/usr/bin:/bin` |
-| CPython 3.9 and up | present by `requires-python`; 3.13 (the `c-abi-linux-*` jobs, editable install) and 3.14 (the `python-linux-*` jobs, the wheel) are run |
-| PyPy | present: PyPy 3.11 runs the tests against the wheel in the `python-linux-*` jobs, amd64 and arm64 |
-| Free-threaded CPython (3.13t, 3.14t) | 3.14t present: the `python-linux-*` jobs run the tests against the wheel and check that importing `weida` leaves the GIL disabled; 3.13t not run |
+| The wheel runs with no Rust toolchain on `PATH` | present; `package.sh` runs `smoke.py` with `PATH=/usr/bin:/bin`, and on the nightly and a release tag every python job runs it from a virtualenv holding only its wheel |
+| CPython 3.9 and up | present by `requires-python`; 3.13 (the `c-abi-linux-*` jobs, editable install; `python-darwin-arm64` and `python-windows-amd64`, the wheel) and 3.14 (every python job, the wheel) are run |
+| PyPy | present: PyPy 3.11 runs the tests against the wheel in every python job (linux-amd64, linux-arm64, darwin-arm64, windows-amd64) |
+| Free-threaded CPython (3.13t, 3.14t) | 3.14t present: every python job runs the tests against the wheel and checks that importing `weida` leaves the GIL disabled; 3.13t not run |
 | `cryptography` | optional: imported per call, never a dependency; installed for the CPython test runs, absent on 3.14t and PyPy | present; `test_identity.py::test_without_cryptography_bytes_convert_and_objects_are_type_errors` |
-| macOS | absent: `_native.py` and `hatch_build.py` load and package `libweida.dylib`, but no job builds or runs the package there; atik's Python is the Xcode one (`check-darwin-arm64.sh`) |
-| Windows | absent: `_native.py` and `hatch_build.py` load and package `weida.dll`, and §4's Windows waits are written, but no job builds or runs the package there; wohnzimmer has no Python (`windows.ps1`) |
+| macOS | present: `python-darwin-arm64` builds `libweida` and the `macosx_11_0_arm64` wheel on atik with uv's CPython (not the Xcode one) and runs the tests against it |
+| Windows | present: `python-windows-amd64` builds `libweida`, statically linked to the C runtime, and the `win_amd64` wheel on wohnzimmer with uv's CPython and runs the tests against it |
 | PyPI | absent: nothing of this repository is on PyPI |
 
 ## 6. What the PyO3 binding had and this one does not
