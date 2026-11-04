@@ -56,4 +56,5 @@ read every byte before the reset landed.
 | `void weida_delivery_delivered_op_drop(weida_delivery_delivered_op *op)` | never | — |
 | `void weida_delivery_drop(weida_delivery *d)` | never | — |
 
-A receipt dropped without waiting is parked where `Runtime::drain` finds it, as in Rust.
+A receipt dropped without waiting is parked where `Runtime::drain` (`weida_runtime_drain`,
+[runtime.md](runtime.md)) finds it, as in Rust.

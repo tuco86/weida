@@ -297,6 +297,32 @@ fn shutdown(rt: *mut weida_runtime) {
     }
 }
 
+/// An hour: a drain that waited for its deadline would hang the test
+/// rather than pass it.
+const DRAIN_DEADLINE_MS: u64 = 3_600_000;
+
+/// Drains `rt`, consuming it, and waits for the report:
+/// `(delivered, outstanding)`.
+fn drain(rt: *mut weida_runtime, deadline_ms: u64) -> (u64, u64) {
+    let mut op = ptr::null_mut();
+    let mut report = ptr::null_mut();
+    // SAFETY: a live runtime, consumed; then a live op and a live report,
+    // each dropped once.
+    unsafe {
+        ok(weida_runtime_drain(rt, deadline_ms, &mut op));
+        ok(settle("the drain", |ms| {
+            weida_runtime_drain_op_wait(op, ms, &mut report)
+        }));
+        weida_runtime_drain_op_drop(op);
+        let counts = (
+            weida_drained_delivered(report),
+            weida_drained_outstanding(report),
+        );
+        weida_drained_drop(report);
+        counts
+    }
+}
+
 /// One number getter of a stats snapshot: `Some` when present.
 fn stat(
     s: *mut weida_connection_stats,
@@ -1797,4 +1823,71 @@ fn a_replier_runtime_shut_down_reports_lost_then_retrying() {
         weida_trust_drop(trust);
     }
     shutdown(client);
+}
+
+#[test]
+fn a_drain_counts_a_reply_finished_before_it_as_delivered() {
+    let server = runtime();
+    let (l, lb, rep) = inproc(server, "abi-drain-reply");
+    let client = runtime();
+    let trust = trust_by_address();
+    let req = requester(client, trust);
+    ok(connect(req, "weida+inproc://abi-drain-reply/echo"));
+    let pending = request(req, b"ping");
+    let q = accept(rep);
+    let out = reply(q, None);
+    write_all(out, b"pong");
+    let mut delivery = ptr::null_mut();
+    // SAFETY: a live transfer, consumed; the receipt is dropped unwaited,
+    // which parks it where the drain finds it.
+    unsafe {
+        ok(weida_outgoing_transfer_finish(out, &mut delivery));
+        weida_delivery_drop(delivery);
+    }
+    // The requester has not read the reply: the exchange is in flight.
+    assert_eq!(
+        drain(server, DRAIN_DEADLINE_MS),
+        (1, 0),
+        "the reply's parked receipt is what the drain reports"
+    );
+    // SAFETY: every handle is dropped once; the server runtime is consumed.
+    unsafe {
+        weida_requester_request_op_drop(pending);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+}
+
+#[test]
+fn a_drain_with_nothing_pending_returns_at_once() {
+    let pair = Pair::new("abi-drain-idle");
+    let mut op = ptr::null_mut();
+    // SAFETY: a NULL runtime and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_runtime_drain(ptr::null_mut(), 0, &mut op) },
+        -WEIDA_EINVAL
+    );
+    assert!(op.is_null());
+    assert_eq!(
+        drain(pair.rt, DRAIN_DEADLINE_MS),
+        (0, 0),
+        "an idle connection leaves nothing to wait for"
+    );
+    // SAFETY: NULL reports read 0.
+    unsafe {
+        assert_eq!(weida_drained_delivered(ptr::null()), 0);
+        assert_eq!(weida_drained_outstanding(ptr::null()), 0);
+    }
+    // SAFETY: every handle is dropped once; the runtime is consumed.
+    unsafe {
+        weida_requester_drop(pair.req);
+        weida_trust_drop(pair.trust);
+        weida_replier_drop(pair.rep);
+        weida_local_binding_drop(pair.lb);
+        weida_listener_drop(pair.l);
+    }
 }

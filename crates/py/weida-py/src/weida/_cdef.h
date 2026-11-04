@@ -178,6 +178,8 @@ typedef struct weida_delivery weida_delivery;
 
 typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 
+typedef struct weida_drained weida_drained;
+
 typedef struct weida_guarantee_set weida_guarantee_set;
 
 typedef struct weida_identity weida_identity;
@@ -233,6 +235,8 @@ typedef struct weida_requester_request_op weida_requester_request_op;
 typedef struct weida_runtime weida_runtime;
 
 typedef struct weida_runtime_config weida_runtime_config;
+
+typedef struct weida_runtime_drain_op weida_runtime_drain_op;
 
 typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
 
@@ -552,6 +556,22 @@ int weida_runtime_shutdown_op_fd(const weida_runtime_shutdown_op *op, int64_t *o
 int weida_runtime_shutdown_op_wait(const weida_runtime_shutdown_op *op, int64_t timeout_ms);
 
 void weida_runtime_shutdown_op_drop(weida_runtime_shutdown_op *op);
+
+int weida_runtime_drain(weida_runtime *rt, uint64_t deadline_ms, weida_runtime_drain_op **out);
+
+int weida_runtime_drain_op_fd(const weida_runtime_drain_op *op, int64_t *out);
+
+int weida_runtime_drain_op_wait(const weida_runtime_drain_op *op,
+                                int64_t timeout_ms,
+                                weida_drained **out);
+
+void weida_runtime_drain_op_drop(weida_runtime_drain_op *op);
+
+uint64_t weida_drained_delivered(const weida_drained *d);
+
+uint64_t weida_drained_outstanding(const weida_drained *d);
+
+void weida_drained_drop(weida_drained *d);
 
 uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt);
 

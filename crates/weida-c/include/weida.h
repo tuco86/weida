@@ -467,6 +467,12 @@ typedef struct weida_delivery weida_delivery;
 typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 
 /**
+ * What one drain achieved (`Drained`), read-only: two counts about the
+ * transfers that were still unacknowledged when it started.
+ */
+typedef struct weida_drained weida_drained;
+
+/**
  * `GuaranteeSet` under construction: one setter per dimension.
  */
 typedef struct weida_guarantee_set weida_guarantee_set;
@@ -609,6 +615,11 @@ typedef struct weida_runtime weida_runtime;
  * `resolver` and `network`.
  */
 typedef struct weida_runtime_config weida_runtime_config;
+
+/**
+ * The pending `Runtime::drain` of `weida_runtime_drain`.
+ */
+typedef struct weida_runtime_drain_op weida_runtime_drain_op;
 
 /**
  * The pending `Runtime::shutdown` of `weida_runtime_shutdown`.
@@ -2101,6 +2112,88 @@ int weida_runtime_shutdown_op_wait(const weida_runtime_shutdown_op *op, int64_t 
  * `op` is NULL or a live shutdown op, dropped at most once.
  */
 void weida_runtime_shutdown_op_drop(weida_runtime_shutdown_op *op);
+
+/**
+ * Drains the runtime (`Runtime::drain`). First admission stops: bindings
+ * accept no new connection, and a new inbound stream is refused with
+ * `SHUTDOWN`. Then every finished transfer whose receipt nobody holds (a
+ * `weida_delivery` dropped unwaited) gets until `deadline_ms` to reach the
+ * peer's transport. Last comes the close of `weida_runtime_shutdown`,
+ * within what is left of the same deadline. A drain never waits for a
+ * reply or for a peer application. **Consumes** `rt` on every return path.
+ *
+ * Never blocks; the drain runs as the op written to `out`, whose wait
+ * yields its `weida_drained` report. Dropping the op unfinished aborts the
+ * drain where it is: admission, once stopped, stays stopped, and no close
+ * runs.
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime, not used again; `out` is NULL or
+ * writable. Release the op with `weida_runtime_drain_op_drop`.
+ */
+int weida_runtime_drain(weida_runtime *rt, uint64_t deadline_ms, weida_runtime_drain_op **out);
+
+/**
+ * The readiness descriptor of a drain op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live drain op; `out` is NULL or writable.
+ */
+int weida_runtime_drain_op_fd(const weida_runtime_drain_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the drain to finish and writes its
+ * report to `out`.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live drain op; `out` is NULL or writable. Release the
+ * report with `weida_drained_drop`.
+ */
+int weida_runtime_drain_op_wait(const weida_runtime_drain_op *op,
+                                int64_t timeout_ms,
+                                weida_drained **out);
+
+/**
+ * Releases a drain op, aborting an unfinished drain. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live drain op, dropped at most once.
+ */
+void weida_runtime_drain_op_drop(weida_runtime_drain_op *op);
+
+/**
+ * Transfers whose payload and FIN the peer's transport acknowledged before
+ * the deadline (`Drained::delivered`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live report.
+ */
+uint64_t weida_drained_delivered(const weida_drained *d);
+
+/**
+ * Transfers still unacknowledged at the deadline, plus those the peer
+ * refused and those whose connection was lost (`Drained::outstanding`). A
+ * non-zero count is not an error. 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live report.
+ */
+uint64_t weida_drained_outstanding(const weida_drained *d);
+
+/**
+ * Releases a report. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live report, dropped at most once.
+ */
+void weida_drained_drop(weida_drained *d);
 
 /**
  * Duplicates every connection of this runtime read and discarded inside a

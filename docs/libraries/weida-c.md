@@ -32,7 +32,7 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::listener` | `weida_runtime_listener` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Runtime::requester` | `weida_runtime_requester` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Runtime::shutdown` | `weida_runtime_shutdown` (op) | present; `abi::a_shutdown_finishes_with_an_exchange_abandoned` |
-| `Runtime::drain` | — | absent: *drain* |
+| `Runtime::drain` | `weida_runtime_drain` (op, consumes; its wait yields a `weida_drained`) | present; `abi::a_drain_counts_a_reply_finished_before_it_as_delivered`, `abi::a_drain_with_nothing_pending_returns_at_once` (*drain*) |
 | `Runtime::peer`, `pusher`, `subscriber`, `dish`, `pair`, `surveyor`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
 | `Runtime::suppressed_duplicates`, `expired_transfers` | `weida_runtime_suppressed_duplicates`, `weida_runtime_expired_transfers` | present; `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (counts 0 then 1), `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport` (0 without deduplication) (*stats*) |
@@ -148,7 +148,8 @@ unit tests in `crates/weida-c/src/`.
 | --- | --- |
 | `ConnectionStats`, `PathStats`, `RemoteStats`, `TransportStats`, `UdpCounts`, `connection_stats()` | present: `weida_connection_stats` and its getters ([stats.md](../c/stats.md)); `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport`, `abi::a_quic_connection_reports_its_transport` (*stats*) |
 | `PeerEvent`, `PeerEvents`, `GiveUp` | present: `weida_peer_events` (a try handle) and `weida_peer_event`, `WEIDA_PEER_EVENT_*`, `WEIDA_GIVE_UP_*`; `abi::a_replier_runtime_shut_down_reports_lost_then_retrying`, `stats::tests::every_peer_event_kind_reads_back_through_its_getters` (*stats*) |
-| `DishDrops`, `TopicDrops`, `Drained` | absent: *patterns*, *drain* |
+| `DishDrops`, `TopicDrops` | absent: *patterns* |
+| `Drained` | present: `weida_drained`, `weida_drained_delivered`, `weida_drained_outstanding` ([runtime.md](../c/runtime.md)); `abi::a_drain_counts_a_reply_finished_before_it_as_delivered` (*drain*) |
 
 ## 7. Patterns and helpers not yet mapped
 
@@ -169,7 +170,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the twenty-seven `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the twenty-nine `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -195,6 +196,8 @@ way a foreign caller calls it:
 - The end of a peer event stream (`None`) is a 0 return with `*out == NULL`, as a read's end is
   `*out_n == 0`.
 - `ConnectionId` is its number (`ConnectionId::get`).
+- `Runtime::drain` returns `Drained` by value; the ABI's op yields it as a `weida_drained` handle
+  read by two getters. Its deadline is milliseconds (R7) and, as in Rust, mandatory.
 
 ## 10. The definition of done
 

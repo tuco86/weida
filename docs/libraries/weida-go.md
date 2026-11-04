@@ -118,6 +118,10 @@ The C ABI's *stats* area is absent here: the rows of [weida-c.md](weida-c.md) ma
 (*stats*), the connection statistics snapshot, the runtime's two counters, connection numbers
 and the peer event queue.
 
+The C ABI's *drain* area is absent here: the rows of [weida-c.md](weida-c.md) marked (*drain*),
+`weida_runtime_drain` and its `weida_drained` report. A runtime still ends only by shutdown, which
+is abortive.
+
 ## 7. Sources
 
 `crates/go/weida/` (`cgo.go`, `weida_go.h`, `errors.go`, `handle.go`, `runtime.go`,

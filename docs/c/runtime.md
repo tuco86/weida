@@ -121,6 +121,7 @@ for the rest.
 | `int weida_runtime_listener(const weida_runtime *rt, weida_listener **out)` | never | 0; `-WEIDA_EINVAL` ([listener.md](listener.md)) |
 | `int weida_runtime_requester(const weida_runtime *rt, const weida_client_tls *tls, weida_requester **out)` | never | 0; `-WEIDA_EINVAL` ([requester.md](requester.md)) |
 | `int weida_runtime_shutdown(weida_runtime *rt, weida_runtime_shutdown_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
+| `int weida_runtime_drain(weida_runtime *rt, uint64_t deadline_ms, weida_runtime_drain_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
 | `uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt)` | never | duplicates discarded inside a negotiated `Deduplication::Bounded` window; 0 for NULL |
 | `uint64_t weida_runtime_expired_transfers(const weida_runtime *rt)` | never | outgoing transfers reset because their deadline passed; 0 for NULL |
 | `void weida_runtime_drop(weida_runtime *rt)` | never | — |
@@ -133,6 +134,12 @@ made from them keep the reactor alive; once the last of them is gone it shuts do
 background (R13). `weida_runtime_shutdown` closes every endpoint at once, whatever else is still
 held, and waits for the connections to go idle, bounded by `shutdown_timeout`.
 
+`weida_runtime_drain` is the counterpart of that abortive close (`Runtime::drain`, decision 0009).
+First admission stops for good: no new connection, and a new inbound stream is refused with
+`SHUTDOWN`. Then every finished transfer whose receipt was dropped unwaited gets until
+`deadline_ms` to reach the peer's transport. Last comes the same close, within what is left of that
+one deadline. It never waits for a reply or a peer application.
+
 ## `weida_runtime_shutdown_op`
 
 | Function | Blocks | Returns |
@@ -143,6 +150,27 @@ held, and waits for the connections to go idle, bounded by `shutdown_timeout`.
 
 Dropping the op without waiting does not stop the shutdown it started: the endpoints are already
 closed.
+
+## `weida_runtime_drain_op`
+
+| Function | Blocks | Returns |
+| --- | --- | --- |
+| `int weida_runtime_drain_op_fd(const weida_runtime_drain_op *op, int64_t *out)` | never | 0; `-WEIDA_EIO` when the descriptor pair cannot be made; `-WEIDA_EINVAL` |
+| `int weida_runtime_drain_op_wait(const weida_runtime_drain_op *op, int64_t timeout_ms, weida_drained **out)` | up to `timeout_ms` (R4) | 0 and the report; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` (taken or dropped) |
+| `void weida_runtime_drain_op_drop(weida_runtime_drain_op *op)` | never | — |
+
+Dropping the op unfinished aborts the drain where it is: admission, once stopped, stays stopped,
+and no close runs.
+
+## `weida_drained`
+
+| Function | Returns |
+| --- | --- |
+| `uint64_t weida_drained_delivered(const weida_drained *d)` | transfers the peer's transport acknowledged before the deadline; 0 for NULL |
+| `uint64_t weida_drained_outstanding(const weida_drained *d)` | transfers unacknowledged at the deadline, refused, or lost with their connection; not an error; 0 for NULL |
+| `void weida_drained_drop(weida_drained *d)` | — |
+
+Both counts are about the transfers that were still unacknowledged when the drain started.
 
 ## `weida_version`
 

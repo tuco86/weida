@@ -295,6 +295,8 @@ process-directed signal therefore reaches a caller thread, whose `poll` returns 
   once the last Rust reference is gone (`OwnedReactor`).
 - `weida_runtime_drop` releases the caller's reference only.
 - `weida_runtime_shutdown(rt, &op)` consumes `rt` and runs `Runtime::shutdown` as an op.
+- `weida_runtime_drain(rt, deadline_ms, &op)` consumes `rt` and runs `Runtime::drain` as an op
+  whose wait yields its `weida_drained` report.
 
 ## The EINTR retry loop
 

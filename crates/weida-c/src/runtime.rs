@@ -4,7 +4,7 @@ use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use weida_rs::{GuaranteeSet, Runtime, RuntimeConfig};
+use weida_rs::{Drained, GuaranteeSet, Runtime, RuntimeConfig};
 
 use crate::config::{
     Builder, count, discovery, ms, optional, outbox_full, weida_guarantee_set, weida_limits,
@@ -48,6 +48,24 @@ impl AsOp for weida_runtime_shutdown_op {
     fn op(&self) -> &Op<()> {
         &self.op
     }
+}
+
+/// The pending `Runtime::drain` of `weida_runtime_drain`.
+pub struct weida_runtime_drain_op {
+    pub(crate) op: Arc<Op<Drained>>,
+}
+
+impl AsOp for weida_runtime_drain_op {
+    type Output = Drained;
+    fn op(&self) -> &Op<Drained> {
+        &self.op
+    }
+}
+
+/// What one drain achieved (`Drained`), read-only: two counts about the
+/// transfers that were still unacknowledged when it started.
+pub struct weida_drained {
+    drained: Drained,
 }
 
 /// `_op_fd`: writes the op's readiness descriptor to `out`.
@@ -578,6 +596,139 @@ pub unsafe extern "C" fn weida_runtime_shutdown_op_wait(
 pub unsafe extern "C" fn weida_runtime_shutdown_op_drop(op: *mut weida_runtime_shutdown_op) {
     // SAFETY: forwarded from this function's contract.
     unsafe { op_drop(op) }
+}
+
+/// Drains the runtime (`Runtime::drain`). First admission stops: bindings
+/// accept no new connection, and a new inbound stream is refused with
+/// `SHUTDOWN`. Then every finished transfer whose receipt nobody holds (a
+/// `weida_delivery` dropped unwaited) gets until `deadline_ms` to reach the
+/// peer's transport. Last comes the close of `weida_runtime_shutdown`,
+/// within what is left of the same deadline. A drain never waits for a
+/// reply or for a peer application. **Consumes** `rt` on every return path.
+///
+/// Never blocks; the drain runs as the op written to `out`, whose wait
+/// yields its `weida_drained` report. Dropping the op unfinished aborts the
+/// drain where it is: admission, once stopped, stays stopped, and no close
+/// runs.
+///
+/// # Safety
+///
+/// `rt` is NULL or a live runtime, not used again; `out` is NULL or
+/// writable. Release the op with `weida_runtime_drain_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_drain(
+    rt: *mut weida_runtime,
+    deadline_ms: u64,
+    out: *mut *mut weida_runtime_drain_op,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract; the handle is
+        // consumed here whatever happens next.
+        let rt = unsafe { release(rt) }.ok_or_else(crate::error::null_arg)?;
+        let out = out_ptr(out)?;
+        let runtime = rt.runtime.clone();
+        drop(rt);
+        let exec = runtime.exec().clone();
+        let deadline = Duration::from_millis(deadline_ms);
+        let op = Op::start(&exec, async move { Ok(runtime.drain(deadline).await) });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_runtime_drain_op { op })) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a drain op: readable once it finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live drain op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_drain_op_fd(
+    op: *const weida_runtime_drain_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the drain to finish and writes its
+/// report to `out`.
+///
+/// # Safety
+///
+/// `op` is NULL or a live drain op; `out` is NULL or writable. Release the
+/// report with `weida_drained_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_drain_op_wait(
+    op: *const weida_runtime_drain_op,
+    timeout_ms: i64,
+    out: *mut *mut weida_drained,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let drained = unsafe { op_wait(op, timeout_ms) }?;
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_drained { drained })) };
+        Ok(0)
+    })
+}
+
+/// Releases a drain op, aborting an unfinished drain. NULL does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live drain op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_drain_op_drop(op: *mut weida_runtime_drain_op) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Transfers whose payload and FIN the peer's transport acknowledged before
+/// the deadline (`Drained::delivered`); 0 for NULL.
+///
+/// # Safety
+///
+/// `d` is NULL or a live report.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_drained_delivered(d: *const weida_drained) -> u64 {
+    guard_or(0, || {
+        if d.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `d` is a live report by the caller's contract.
+        unsafe { &*d }.drained.delivered
+    })
+}
+
+/// Transfers still unacknowledged at the deadline, plus those the peer
+/// refused and those whose connection was lost (`Drained::outstanding`). A
+/// non-zero count is not an error. 0 for NULL.
+///
+/// # Safety
+///
+/// `d` is NULL or a live report.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_drained_outstanding(d: *const weida_drained) -> u64 {
+    guard_or(0, || {
+        if d.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `d` is a live report by the caller's contract.
+        unsafe { &*d }.drained.outstanding
+    })
+}
+
+/// Releases a report. NULL does nothing.
+///
+/// # Safety
+///
+/// `d` is NULL or a live report, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_drained_drop(d: *mut weida_drained) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(d) }));
 }
 
 /// Duplicates every connection of this runtime read and discarded inside a
