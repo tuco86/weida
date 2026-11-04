@@ -82,7 +82,7 @@ test("a request that orders Accepted receives the reported offsets in order", UN
   assert.equal(back.reporter(), null);
   assert.equal(await readAll(back), "ok");
 
-  for (const handle of [cursors, received, back, reply]) {
+  for (const handle of [cursors, received, back]) {
     handle.drop();
   }
   await p.close();

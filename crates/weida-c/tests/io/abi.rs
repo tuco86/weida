@@ -4900,7 +4900,8 @@ fn a_request_that_orders_accepted_receives_the_reported_offsets_in_order() {
     let mut recv = ptr::null_mut();
     let mut incoming = ptr::null_mut();
     let mut no_reporter = ptr::null_mut();
-    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    // SAFETY: live handles, each consumed or dropped once (the recv consumes
+    // the stream), and writable out-parameters.
     unsafe {
         ok(weida_reply_stream_recv(stream, &mut recv));
         ok(settle("the reply", |ms| {
@@ -4919,7 +4920,6 @@ fn a_request_that_orders_accepted_receives_the_reported_offsets_in_order() {
         weida_cursors_drop(c);
         weida_incoming_transfer_drop(t);
         weida_incoming_transfer_drop(incoming);
-        weida_reply_stream_drop(stream);
     }
     pair.close();
 }
