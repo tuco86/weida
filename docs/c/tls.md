@@ -12,6 +12,7 @@ from any thread (R5).
 | `int weida_trust_add_pin(const weida_trust *t, const char *fingerprint)` | 0; `-WEIDA_EINVALID_FINGERPRINT` for anything but `sha256:` and 64 hex digits; `-WEIDA_EINVAL` for NULL or non-UTF-8 |
 | `int weida_trust_add_anchor(const weida_trust *t, const uint8_t *pem, size_t len)` | 0; `-WEIDA_EINVAL`. Trusts the certificate authorities in the PEM for a peer whose chain leads to one and names the dialled host. The bytes are copied and parsed at each dial, which fails with `-WEIDA_ETLS` ("in-memory PEM contains no certificates", "parsing certificates: …") |
 | `int weida_trust_add_anchor_file(const weida_trust *t, const char *path)` | 0; `-WEIDA_EINVAL`. The file is read at each dial, which fails with `-WEIDA_ETLS` when it is missing or bad |
+| `int weida_trust_is_empty(const weida_trust *t)` | 1 when the trust holds no pin and no anchor, so it accepts only what each dialled address names (`Trust::is_empty`); 0 otherwise |
 | `void weida_trust_drop(weida_trust *t)` | — |
 
 `Trust::pin`, `anchor` and `anchor_file` are `weida_trust_new` plus the matching `_add_*`.
@@ -47,14 +48,28 @@ copy the caller makes of them is the caller's to wipe.
 | Function | Returns |
 | --- | --- |
 | `int weida_client_tls_new(const weida_trust *trust, weida_client_tls **out)` | 0; `-WEIDA_EINVAL`. Dials anonymously under `trust` |
+| `int weida_client_tls_new_source(const weida_trust_source *trust, weida_client_tls **out)` | 0; `-WEIDA_EINVAL`. Dials anonymously under the source's trust of the moment; the source is shared, so an update reaches the next connection |
 | `int weida_client_tls_set_identity(const weida_client_tls *tls, const weida_identity *identity)` | 0; `-WEIDA_EINVAL`. Presents `identity` (copied) to every peer that requesters made from these terms afterwards dial |
+| `int weida_client_tls_set_identity_source(const weida_client_tls *tls, const weida_identity_source *identity)` | 0; `-WEIDA_EINVAL`. Presents the source's identity of the moment (shared) at each connection |
+| `int weida_client_tls_set_alpn(const weida_client_tls *tls, int alpn)` | 0; `-WEIDA_EINVAL`, also for a value not `WEIDA_ALPN_*`, which changes nothing. Asks for `alpn` instead of `WEIDA_ALPN_WEIDA` |
 | `void weida_client_tls_drop(weida_client_tls *tls)` | — |
 | `int weida_server_tls_new(const weida_identity *identity, weida_server_tls **out)` | 0; `-WEIDA_EINVAL`. Presents `identity`, accepts anonymous clients |
+| `int weida_server_tls_new_source(const weida_identity_source *identity, weida_server_tls **out)` | 0; `-WEIDA_EINVAL`. Serves whatever the source (shared) holds at each handshake: a renewed or replaced certificate reaches the next peer with no re-bind |
 | `int weida_server_tls_require_client(const weida_server_tls *tls, const weida_trust *trust)` | 0; `-WEIDA_EINVAL`. Requires every client to present a key `trust` (copied) accepts, pinned or chaining to an anchor |
+| `int weida_server_tls_require_client_source(const weida_server_tls *tls, const weida_trust_source *trust)` | 0; `-WEIDA_EINVAL`. As `_require_client`, with the source's trust of the moment (shared) |
 | `int weida_server_tls_require_any_key(const weida_server_tls *tls)` | 0; `-WEIDA_EINVAL`. Requires every client to present a key and prove it holds it, whatever the key |
+| `int weida_server_tls_set_alpn(const weida_server_tls *tls, int alpn)` | 0; `-WEIDA_EINVAL`, also for a value not `WEIDA_ALPN_*`, which changes nothing. Offers `alpn` instead of `WEIDA_ALPN_WEIDA` |
 | `void weida_server_tls_drop(weida_server_tls *tls)` | — |
 
-The last `_require_client` or `_require_any_key` wins.
+The last `_require_client*` or `_require_any_key` wins. A parameter that is a source in Rust
+takes a `weida_identity` or `weida_trust` value, which is copied, or with the `_source` suffix a
+source ([identity.md](identity.md)), which is shared.
+
+### ALPN
+
+`WEIDA_ALPN_WEIDA` 0 (`weida/0`, the default) and `WEIDA_ALPN_RAFT` 1 (`weida-raft/0`). A binding
+offers one token and a dial asks for one. A mismatch fails the TLS handshake: the dialler sees
+`-WEIDA_ETLS` from the connect op or its first request, and the binding's replier sees nothing.
 
 ### Required clients
 
@@ -62,10 +77,10 @@ A binding that requires clients refuses an anonymous client, and under `_require
 key its trust does not accept, in the TLS handshake. The client sees `-WEIDA_ETLS` from the
 connect op or, when the alert arrives after the dial completed, from its first request. The
 server's replier sees nothing: no refused client reaches `weida_replier_accept`. An empty trust
-given to `_require_client` is taken there, and the bind's op ends with `-WEIDA_ETLS` ("client
-trust is empty: a binding cannot require clients it would never accept"). What the server learns
-of an admitted client is `weida_incoming_meta_peer_fingerprint` and the chain getters
-([msg.md](msg.md)), nothing else.
+given to `_require_client` or `_require_client_source` is taken there, and the bind's op ends
+with `-WEIDA_ETLS` ("client trust is empty: a binding cannot require clients it would never
+accept"). What the server learns of an admitted client is `weida_incoming_meta_peer_fingerprint`
+and the chain getters ([msg.md](msg.md)), nothing else.
 
 ## `weida_transfer_meta`
 

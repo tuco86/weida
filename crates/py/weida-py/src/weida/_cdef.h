@@ -66,9 +66,15 @@
 
 #define WEIDA_PRODUCER_NAMING_STABLE 1
 
+#define WEIDA_ALPN_WEIDA 0
+
+#define WEIDA_ALPN_RAFT 1
+
 #define WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES 65536
 
 #define WEIDA_TRACEPARENT_LEN 55
+
+#define WEIDA_FINGERPRINT_LEN 71
 
 #define WEIDA_ERUNTIME 1
 
@@ -150,6 +156,20 @@
 
 #define WEIDA_ERROR_CODE_NO_REPLY 5
 
+#define WEIDA_IDENTITY_EVENT_LOADED 0
+
+#define WEIDA_IDENTITY_EVENT_RENEWED 1
+
+#define WEIDA_IDENTITY_EVENT_KEY_CHANGED 2
+
+#define WEIDA_IDENTITY_EVENT_RENEWAL_FAILED 3
+
+#define WEIDA_IDENTITY_EVENT_HANDOFF_STOLEN 4
+
+#define WEIDA_IDENTITY_EVENT_TRUST_REFRESHED 5
+
+#define WEIDA_IDENTITY_EVENT_MISSED 6
+
 #define WEIDA_POLLIN 1
 
 #define WEIDA_PEER_EVENT_CONNECTED 0
@@ -186,11 +206,19 @@ typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 
 typedef struct weida_drained weida_drained;
 
+typedef struct weida_files_options weida_files_options;
+
 typedef struct weida_guarantee_set weida_guarantee_set;
 
 typedef struct weida_handoff weida_handoff;
 
 typedef struct weida_identity weida_identity;
+
+typedef struct weida_identity_event weida_identity_event;
+
+typedef struct weida_identity_events weida_identity_events;
+
+typedef struct weida_identity_source weida_identity_source;
 
 typedef struct weida_incoming_meta weida_incoming_meta;
 
@@ -268,7 +296,13 @@ typedef struct weida_transfer_meta weida_transfer_meta;
 
 typedef struct weida_trust weida_trust;
 
+typedef struct weida_trust_source weida_trust_source;
+
 typedef struct weida_unix_binding weida_unix_binding;
+
+typedef struct weida_weak_identity_source weida_weak_identity_source;
+
+typedef struct weida_weak_trust_source weida_weak_trust_source;
 
 typedef struct {
   int64_t fd;
@@ -372,6 +406,14 @@ int weida_reconnect_policy_set_max_attempts(const weida_reconnect_policy *p, int
 
 int weida_reconnect_policy_set_stop_on_peer_closed(const weida_reconnect_policy *p, int v);
 
+int weida_files_options_new(weida_files_options **out);
+
+void weida_files_options_drop(weida_files_options *o);
+
+int weida_files_options_set_names(const weida_files_options *o, const char *const *names, size_t n);
+
+int weida_files_options_set_poll_ms(const weida_files_options *o, uint64_t v);
+
 const char *weida_strerror(int code);
 
 const char *weida_last_error_message(void);
@@ -383,6 +425,86 @@ const char *weida_last_error_fingerprint(void);
 int64_t weida_last_error_max(void);
 
 int weida_last_error_os_code(void);
+
+int weida_identity_source_from_identity(const weida_identity *id, weida_identity_source **out);
+
+int weida_identity_source_ephemeral(const char *const *names,
+                                    size_t n,
+                                    weida_identity_source **out);
+
+int weida_identity_source_external(const weida_identity *initial, weida_identity_source **out);
+
+int weida_identity_source_files(const char *dir,
+                                const weida_files_options *options,
+                                weida_identity_source **out);
+
+int weida_identity_source_current(const weida_identity_source *src, weida_identity **out);
+
+int weida_identity_source_fingerprint(const weida_identity_source *src, char *out, size_t len);
+
+int weida_identity_source_update(const weida_identity_source *src, const weida_identity *id);
+
+int weida_identity_source_report_failure(const weida_identity_source *src, const char *reason);
+
+int weida_identity_source_report_handoff_stolen(const weida_identity_source *src);
+
+int weida_identity_source_reload(const weida_identity_source *src);
+
+int weida_identity_source_events(const weida_identity_source *src, weida_identity_events **out);
+
+int weida_identity_source_downgrade(const weida_identity_source *src,
+                                    weida_weak_identity_source **out);
+
+void weida_identity_source_drop(weida_identity_source *src);
+
+int weida_weak_identity_source_upgrade(const weida_weak_identity_source *w,
+                                       weida_identity_source **out);
+
+void weida_weak_identity_source_drop(weida_weak_identity_source *w);
+
+int weida_trust_source_from_trust(const weida_trust *t, weida_trust_source **out);
+
+int weida_trust_source_external(const weida_trust *initial, weida_trust_source **out);
+
+int weida_trust_source_current(const weida_trust_source *ts, weida_trust **out);
+
+int weida_trust_source_update(const weida_trust_source *ts, const weida_trust *t);
+
+int weida_trust_source_report_failure(const weida_trust_source *ts, const char *reason);
+
+int weida_trust_source_is_empty(const weida_trust_source *ts);
+
+int weida_trust_source_events(const weida_trust_source *ts, weida_identity_events **out);
+
+int weida_trust_source_downgrade(const weida_trust_source *ts, weida_weak_trust_source **out);
+
+void weida_trust_source_drop(weida_trust_source *ts);
+
+int weida_weak_trust_source_upgrade(const weida_weak_trust_source *w, weida_trust_source **out);
+
+void weida_weak_trust_source_drop(weida_weak_trust_source *w);
+
+int weida_identity_events_fd(const weida_identity_events *e, int64_t *out);
+
+int weida_identity_events_recv(const weida_identity_events *e,
+                               int64_t timeout_ms,
+                               weida_identity_event **out);
+
+void weida_identity_events_drop(weida_identity_events *e);
+
+int weida_identity_event_kind(const weida_identity_event *e);
+
+const char *weida_identity_event_fingerprint(const weida_identity_event *e, size_t *len_out);
+
+const char *weida_identity_event_from(const weida_identity_event *e, size_t *len_out);
+
+const char *weida_identity_event_to(const weida_identity_event *e, size_t *len_out);
+
+const char *weida_identity_event_message(const weida_identity_event *e, size_t *len_out);
+
+int weida_identity_event_missed(const weida_identity_event *e, uint64_t *out);
+
+void weida_identity_event_drop(weida_identity_event *e);
 
 int weida_runtime_listener(const weida_runtime *rt, weida_listener **out);
 
@@ -872,6 +994,8 @@ int weida_trust_add_anchor(const weida_trust *t, const uint8_t *pem, size_t len)
 
 int weida_trust_add_anchor_file(const weida_trust *t, const char *path);
 
+int weida_trust_is_empty(const weida_trust *t);
+
 void weida_trust_drop(weida_trust *t);
 
 int weida_identity_generate(weida_identity **out);
@@ -904,15 +1028,29 @@ void weida_pem_drop(weida_pem *p);
 
 int weida_client_tls_new(const weida_trust *trust, weida_client_tls **out);
 
+int weida_client_tls_new_source(const weida_trust_source *trust, weida_client_tls **out);
+
 int weida_client_tls_set_identity(const weida_client_tls *tls, const weida_identity *identity);
+
+int weida_client_tls_set_identity_source(const weida_client_tls *tls,
+                                         const weida_identity_source *identity);
+
+int weida_client_tls_set_alpn(const weida_client_tls *tls, int alpn);
 
 void weida_client_tls_drop(weida_client_tls *tls);
 
 int weida_server_tls_new(const weida_identity *identity, weida_server_tls **out);
 
+int weida_server_tls_new_source(const weida_identity_source *identity, weida_server_tls **out);
+
 int weida_server_tls_require_client(const weida_server_tls *tls, const weida_trust *trust);
 
+int weida_server_tls_require_client_source(const weida_server_tls *tls,
+                                           const weida_trust_source *trust);
+
 int weida_server_tls_require_any_key(const weida_server_tls *tls);
+
+int weida_server_tls_set_alpn(const weida_server_tls *tls, int alpn);
 
 void weida_server_tls_drop(weida_server_tls *tls);
 

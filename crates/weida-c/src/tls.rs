@@ -11,10 +11,9 @@ use weida_rs::{
 use zeroize::Zeroizing;
 
 use crate::config::{WEIDA_TRACEPARENT_LEN, wire};
-use crate::error::{
-    WEIDA_EINVAL, fail, fail_abi, guard, guard_or, guard_ptr, guard_void, null_arg,
-};
+use crate::error::{WEIDA_EINVAL, fail, fail_abi, guard, guard_or, guard_ptr, guard_void};
 use crate::handle::{CText, borrow, bytes, cstr, into_handle, out_ptr, release, write_out};
+use crate::identity::{weida_identity_source, weida_trust_source};
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -23,6 +22,19 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Whom a dialler trusts: pins added to what each address names.
 pub struct weida_trust {
     trust: Mutex<Trust>,
+}
+
+impl weida_trust {
+    /// A copy of the trust, taken by the call that hands it on.
+    pub(crate) fn get(&self) -> Trust {
+        locked(&self.trust).clone()
+    }
+
+    pub(crate) fn handle(trust: Trust) -> *mut weida_trust {
+        into_handle(weida_trust {
+            trust: Mutex::new(trust),
+        })
+    }
 }
 
 /// A certificate chain and its private key.
@@ -80,9 +92,7 @@ impl weida_transfer_meta {
 pub unsafe extern "C" fn weida_trust_new(out: *mut *mut weida_trust) -> c_int {
     guard(|| {
         let out = out_ptr(out)?;
-        let handle = into_handle(weida_trust {
-            trust: Mutex::new(Trust::by_address()),
-        });
+        let handle = weida_trust::handle(Trust::by_address());
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, handle) };
         Ok(0)
@@ -163,6 +173,19 @@ pub unsafe extern "C" fn weida_trust_add_anchor_file(
     })
 }
 
+/// 1 when the trust holds no pin and no anchor, so it accepts only what
+/// each dialled address names (`Trust::is_empty`); 0 otherwise;
+/// `-WEIDA_EINVAL` for NULL.
+///
+/// # Safety
+///
+/// `t` is NULL or a live trust.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_trust_is_empty(t: *const weida_trust) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    guard(|| Ok(c_int::from(unsafe { borrow(t) }?.get().is_empty())))
+}
+
 /// Releases a trust. NULL does nothing.
 ///
 /// # Safety
@@ -174,7 +197,7 @@ pub unsafe extern "C" fn weida_trust_drop(t: *mut weida_trust) {
     guard_void(|| drop(unsafe { release(t) }));
 }
 
-fn identity_handle(identity: Identity) -> *mut weida_identity {
+pub(crate) fn identity_handle(identity: Identity) -> *mut weida_identity {
     into_handle(weida_identity {
         identity,
         fingerprint: OnceLock::new(),
@@ -221,18 +244,8 @@ pub unsafe extern "C" fn weida_identity_generate_for(
 ) -> c_int {
     guard(|| {
         let out = out_ptr(out)?;
-        let names: &[*const c_char] = match (n, names.is_null()) {
-            (0, _) => &[],
-            (_, true) => return Err(null_arg()),
-            // SAFETY: by this function's contract `names` points to `n`
-            // readable pointers.
-            (_, false) => unsafe { std::slice::from_raw_parts(names, n) },
-        };
-        let names = names
-            .iter()
-            // SAFETY: forwarded from this function's contract.
-            .map(|&name| unsafe { cstr(name) }.map(str::to_owned))
-            .collect::<Result<Vec<String>, c_int>>()?;
+        // SAFETY: forwarded from this function's contract.
+        let names = unsafe { crate::handle::names(names, n) }?;
         let identity = Identity::generate_for(names).map_err(fail)?;
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, identity_handle(identity)) };
@@ -499,6 +512,30 @@ pub unsafe extern "C" fn weida_client_tls_new(
     })
 }
 
+/// Client terms that dial anonymously under the trust source `trust` of the
+/// moment (`ClientTls::new` given a `TrustSource`). The source is shared,
+/// not copied: an update reaches the next connection.
+///
+/// # Safety
+///
+/// `trust` is NULL or a live trust source; `out` is NULL or writable.
+/// Release the result with `weida_client_tls_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_client_tls_new_source(
+    trust: *const weida_trust_source,
+    out: *mut *mut weida_client_tls,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let trust = unsafe { borrow(trust) }?;
+        let tls = Mutex::new(ClientTls::new(trust.source.clone()));
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_client_tls { tls })) };
+        Ok(0)
+    })
+}
+
 /// Presents `identity` to every peer a requester made from these terms
 /// afterwards dials (`ClientTls::with_identity`). The identity is copied.
 ///
@@ -518,6 +555,53 @@ pub unsafe extern "C" fn weida_client_tls_set_identity(
         let identity = unsafe { borrow(identity) }?;
         let mut g = locked(&tls.tls);
         *g = g.clone().with_identity(identity.identity.clone());
+        Ok(0)
+    })
+}
+
+/// Presents the identity source `identity` holds at each connection
+/// (`ClientTls::with_identity` given an `IdentitySource`). The source is
+/// shared, not copied: an update reaches the next connection.
+///
+/// # Safety
+///
+/// `tls` is NULL or live client terms; `identity` is NULL or a live
+/// identity source.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_client_tls_set_identity_source(
+    tls: *const weida_client_tls,
+    identity: *const weida_identity_source,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let tls = unsafe { borrow(tls) }?;
+        // SAFETY: forwarded from this function's contract.
+        let identity = unsafe { borrow(identity) }?;
+        let mut g = locked(&tls.tls);
+        *g = g.clone().with_identity(identity.source.clone());
+        Ok(0)
+    })
+}
+
+/// Asks for `alpn`, a `WEIDA_ALPN_*` constant, instead of `WEIDA_ALPN_WEIDA`
+/// (`ClientTls::with_alpn`); any other value is `-WEIDA_EINVAL` and changes
+/// nothing. A binding offering another token fails the handshake: the dial
+/// sees `-WEIDA_ETLS`.
+///
+/// # Safety
+///
+/// `tls` is NULL or live client terms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_client_tls_set_alpn(
+    tls: *const weida_client_tls,
+    alpn: c_int,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let tls = unsafe { borrow(tls) }?;
+        let alpn = crate::config::alpn(alpn)?;
+        let mut g = locked(&tls.tls);
+        *g = g.clone().with_alpn(alpn);
         Ok(0)
     })
 }
@@ -556,6 +640,31 @@ pub unsafe extern "C" fn weida_server_tls_new(
     })
 }
 
+/// Server terms that present the identity source `identity` holds at each
+/// handshake and accept anonymous clients (`ServerTls::new` given an
+/// `IdentitySource`). The source is shared, not copied: a renewed or
+/// replaced certificate reaches the next peer with no re-bind.
+///
+/// # Safety
+///
+/// `identity` is NULL or a live identity source; `out` is NULL or writable.
+/// Release the result with `weida_server_tls_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_server_tls_new_source(
+    identity: *const weida_identity_source,
+    out: *mut *mut weida_server_tls,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let identity = unsafe { borrow(identity) }?;
+        let tls = Mutex::new(ServerTls::new(identity.source.clone()));
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_server_tls { tls })) };
+        Ok(0)
+    })
+}
+
 /// Requires every client to present a key `trust` accepts, pinned or
 /// chaining to an anchor (`ServerTls::require_client`). The trust is
 /// copied. Replaces an earlier `_require_client` or `_require_any_key`.
@@ -583,6 +692,34 @@ pub unsafe extern "C" fn weida_server_tls_require_client(
     })
 }
 
+/// Requires every client to present a key the trust source `trust` accepts
+/// at the handshake (`ServerTls::require_client` given a `TrustSource`).
+/// The source is shared, not copied. Replaces an earlier `_require_client*`
+/// or `_require_any_key`.
+///
+/// An empty source is taken here; the bind then fails with `-WEIDA_ETLS`,
+/// as with `weida_server_tls_require_client`.
+///
+/// # Safety
+///
+/// `tls` is NULL or live server terms; `trust` is NULL or a live trust
+/// source.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_server_tls_require_client_source(
+    tls: *const weida_server_tls,
+    trust: *const weida_trust_source,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let tls = unsafe { borrow(tls) }?;
+        // SAFETY: forwarded from this function's contract.
+        let trust = unsafe { borrow(trust) }?;
+        let mut g = locked(&tls.tls);
+        *g = g.clone().require_client(trust.source.clone());
+        Ok(0)
+    })
+}
+
 /// Requires every client to present a key and prove it holds it, whatever
 /// the key (`ServerTls::require_client(ClientTrust::AnyKey)`). Replaces an
 /// earlier `_require_client` or `_require_any_key`.
@@ -597,6 +734,28 @@ pub unsafe extern "C" fn weida_server_tls_require_any_key(tls: *const weida_serv
         let tls = unsafe { borrow(tls) }?;
         let mut g = locked(&tls.tls);
         *g = g.clone().require_client(ClientTrust::AnyKey);
+        Ok(0)
+    })
+}
+
+/// Offers `alpn`, a `WEIDA_ALPN_*` constant, instead of `WEIDA_ALPN_WEIDA`
+/// (`ServerTls::with_alpn`); any other value is `-WEIDA_EINVAL` and changes
+/// nothing. A dial asking for another token fails with `-WEIDA_ETLS`.
+///
+/// # Safety
+///
+/// `tls` is NULL or live server terms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_server_tls_set_alpn(
+    tls: *const weida_server_tls,
+    alpn: c_int,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let tls = unsafe { borrow(tls) }?;
+        let alpn = crate::config::alpn(alpn)?;
+        let mut g = locked(&tls.tls);
+        *g = g.clone().with_alpn(alpn);
         Ok(0)
     })
 }
@@ -877,6 +1036,51 @@ mod tests {
         assert!(fingerprint(id).starts_with("sha256:"));
         // SAFETY: `id` is live and dropped once.
         unsafe { weida_identity_drop(id) };
+    }
+
+    #[test]
+    fn alpn_setters_take_the_two_tokens_and_refuse_others() {
+        use crate::config::{WEIDA_ALPN_RAFT, WEIDA_ALPN_WEIDA};
+        use weida_rs::Alpn;
+
+        let mut trust = ptr::null_mut();
+        let mut ctls = ptr::null_mut();
+        let mut id = ptr::null_mut();
+        let mut stls = ptr::null_mut();
+        let pin = format!("sha256:{}\0", "0".repeat(64));
+        // SAFETY: every handle is live until its drop, every out-parameter
+        // writable, the pin NUL-terminated.
+        unsafe {
+            assert_eq!(weida_trust_new(&mut trust), 0);
+            assert_eq!(weida_trust_is_empty(trust), 1);
+            assert_eq!(weida_client_tls_new(trust, &mut ctls), 0);
+            assert_eq!(weida_client_tls_set_alpn(ctls, WEIDA_ALPN_RAFT), 0);
+            assert_eq!((*ctls).get().alpn, Alpn::Raft);
+            assert_eq!(weida_client_tls_set_alpn(ctls, 2), -WEIDA_EINVAL);
+            assert_eq!(weida_client_tls_set_alpn(ctls, -1), -WEIDA_EINVAL);
+            assert_eq!((*ctls).get().alpn, Alpn::Raft);
+            assert_eq!(weida_client_tls_set_alpn(ctls, WEIDA_ALPN_WEIDA), 0);
+            assert_eq!((*ctls).get().alpn, Alpn::Weida);
+
+            assert_eq!(weida_identity_generate(&mut id), 0);
+            assert_eq!(weida_server_tls_new(id, &mut stls), 0);
+            assert_eq!(weida_server_tls_set_alpn(stls, WEIDA_ALPN_RAFT), 0);
+            assert_eq!((*stls).get().alpn, Alpn::Raft);
+            assert_eq!(weida_server_tls_set_alpn(stls, 2), -WEIDA_EINVAL);
+            assert_eq!(weida_server_tls_set_alpn(stls, -1), -WEIDA_EINVAL);
+            assert_eq!((*stls).get().alpn, Alpn::Raft);
+            assert_eq!(weida_client_tls_set_alpn(ptr::null(), 0), -WEIDA_EINVAL);
+            assert_eq!(weida_server_tls_set_alpn(ptr::null(), 0), -WEIDA_EINVAL);
+
+            assert_eq!(weida_trust_add_pin(trust, pin.as_ptr().cast()), 0);
+            assert_eq!(weida_trust_is_empty(trust), 0);
+            assert_eq!(weida_trust_is_empty(ptr::null()), -WEIDA_EINVAL);
+
+            weida_server_tls_drop(stls);
+            weida_identity_drop(id);
+            weida_client_tls_drop(ctls);
+            weida_trust_drop(trust);
+        }
     }
 
     fn new_meta() -> *mut weida_transfer_meta {

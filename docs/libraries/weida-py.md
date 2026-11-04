@@ -128,6 +128,12 @@ marked (*local transports*), `weida_listener_bind_unix`, `weida_listener_bind_pi
 (`weida_incoming_meta_peer_uid`, `_peer_gid`, `_peer_pid`, `_peer_sid`). A listener still
 serves QUIC and in-process bindings only.
 
+The sources and ALPN of the C ABI's *identity* area are absent here: `weida_trust_is_empty`,
+the ALPN setters (`weida_client_tls_set_alpn`, `weida_server_tls_set_alpn`), the `_source` forms
+of the TLS terms, `weida_identity_source`, `weida_trust_source`, their weak forms,
+`weida_files_options`, and the event queue `weida_identity_events` with `weida_identity_event`.
+TLS terms still take an identity and a trust as values, under `weida/0`.
+
 ## 7. Sources
 
 `crates/py/weida-py/src/weida/` (`__init__.py`, `_native.py`, `_errors.py`, `_wait.py`,

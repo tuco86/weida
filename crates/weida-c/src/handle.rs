@@ -66,6 +66,29 @@ pub(crate) unsafe fn cstr<'a>(s: *const c_char) -> Result<&'a str, c_int> {
         .map_err(|_| fail_abi(WEIDA_EINVAL, c"a string argument was not UTF-8"))
 }
 
+/// An array of `n` NUL-terminated UTF-8 arguments, copied: empty for
+/// `n == 0` whatever `names` is; NULL with `n > 0`, a NULL element or a
+/// non-UTF-8 one is `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `names` is NULL or points to `n` readable pointers, each NULL or a
+/// NUL-terminated string.
+pub(crate) unsafe fn names(names: *const *const c_char, n: usize) -> Result<Vec<String>, c_int> {
+    let names: &[*const c_char] = match (n, names.is_null()) {
+        (0, _) => &[],
+        (_, true) => return Err(null_arg()),
+        // SAFETY: by the caller's contract `names` points to `n` readable
+        // pointers.
+        (_, false) => unsafe { std::slice::from_raw_parts(names, n) },
+    };
+    names
+        .iter()
+        // SAFETY: forwarded from the caller's contract.
+        .map(|&name| unsafe { cstr(name) }.map(str::to_owned))
+        .collect()
+}
+
 /// A byte-buffer argument; `data` may be NULL only when `len` is 0.
 ///
 /// # Safety

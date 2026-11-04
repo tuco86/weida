@@ -182,6 +182,16 @@
 #define WEIDA_PRODUCER_NAMING_STABLE 1
 
 /**
+ * `Alpn::Weida`: `weida/0`.
+ */
+#define WEIDA_ALPN_WEIDA 0
+
+/**
+ * `Alpn::Raft`: `weida-raft/0`.
+ */
+#define WEIDA_ALPN_RAFT 1
+
+/**
  * `weida::DEFAULT_DATAGRAM_RECEIVE_BYTES`: the documented
  * `datagram_receive_bytes` of a profile that enables datagram flows.
  */
@@ -191,6 +201,12 @@
  * The length of a version-00 traceparent, without its NUL.
  */
 #define WEIDA_TRACEPARENT_LEN 55
+
+/**
+ * The length of a fingerprint's text, `sha256:` and 64 hex digits, without
+ * its NUL.
+ */
+#define WEIDA_FINGERPRINT_LEN 71
 
 /**
  * `Error::Runtime`: the runtime could not be created or used.
@@ -395,6 +411,41 @@
 #define WEIDA_ERROR_CODE_NO_REPLY 5
 
 /**
+ * `IdentityEvent::Loaded`.
+ */
+#define WEIDA_IDENTITY_EVENT_LOADED 0
+
+/**
+ * `IdentityEvent::Renewed`.
+ */
+#define WEIDA_IDENTITY_EVENT_RENEWED 1
+
+/**
+ * `IdentityEvent::KeyChanged`.
+ */
+#define WEIDA_IDENTITY_EVENT_KEY_CHANGED 2
+
+/**
+ * `IdentityEvent::RenewalFailed`.
+ */
+#define WEIDA_IDENTITY_EVENT_RENEWAL_FAILED 3
+
+/**
+ * `IdentityEvent::HandoffStolen`.
+ */
+#define WEIDA_IDENTITY_EVENT_HANDOFF_STOLEN 4
+
+/**
+ * `IdentityEvent::TrustRefreshed`.
+ */
+#define WEIDA_IDENTITY_EVENT_TRUST_REFRESHED 5
+
+/**
+ * `IdentityEvent::Missed`.
+ */
+#define WEIDA_IDENTITY_EVENT_MISSED 6
+
+/**
  * The descriptor is readable: the next try or wait on its handle will not
  * block (R11).
  */
@@ -489,6 +540,11 @@ typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
 typedef struct weida_drained weida_drained;
 
 /**
+ * `FilesOptions` under construction: one setter per field.
+ */
+typedef struct weida_files_options weida_files_options;
+
+/**
  * `GuaranteeSet` under construction: one setter per dimension.
  */
 typedef struct weida_guarantee_set weida_guarantee_set;
@@ -503,6 +559,21 @@ typedef struct weida_handoff weida_handoff;
  * A certificate chain and its private key.
  */
 typedef struct weida_identity weida_identity;
+
+/**
+ * One transition of a source (`IdentityEvent`), read-only.
+ */
+typedef struct weida_identity_event weida_identity_event;
+
+/**
+ * One reader of a source's events (`IdentityEvents`).
+ */
+typedef struct weida_identity_events weida_identity_events;
+
+/**
+ * Where an identity comes from (`IdentitySource`); shared, never copied.
+ */
+typedef struct weida_identity_source weida_identity_source;
 
 /**
  * The metadata of an inbound transfer or request, read-only. It outlives
@@ -702,9 +773,27 @@ typedef struct weida_transfer_meta weida_transfer_meta;
 typedef struct weida_trust weida_trust;
 
 /**
+ * Whom a peer is accepted as, as a source (`TrustSource`); shared, never
+ * copied.
+ */
+typedef struct weida_trust_source weida_trust_source;
+
+/**
  * An `AF_UNIX` binding: the socket file, removed when this is dropped.
  */
 typedef struct weida_unix_binding weida_unix_binding;
+
+/**
+ * A handle to an identity source that does not keep it alive
+ * (`WeakIdentitySource`).
+ */
+typedef struct weida_weak_identity_source weida_weak_identity_source;
+
+/**
+ * A handle to a trust source that does not keep it alive
+ * (`WeakTrustSource`).
+ */
+typedef struct weida_weak_trust_source weida_weak_trust_source;
 
 /**
  * One descriptor `weida_poll` waits on.
@@ -1195,6 +1284,51 @@ int weida_reconnect_policy_set_max_attempts(const weida_reconnect_policy *p, int
 int weida_reconnect_policy_set_stop_on_peer_closed(const weida_reconnect_policy *p, int v);
 
 /**
+ * Creates file-source options holding weida's defaults
+ * (`FilesOptions::default`): no names, a check every 10 s.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_files_options_drop`.
+ */
+int weida_files_options_new(weida_files_options **out);
+
+/**
+ * Releases file-source options. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options, dropped at most once.
+ */
+void weida_files_options_drop(weida_files_options *o);
+
+/**
+ * Sets `FilesOptions::names`, replacing the list: the names the
+ * bootstrapped certificate is made for, when the directory is empty.
+ * Unused when files exist. Fails with `-WEIDA_EINVAL`, leaving the list
+ * as it was, when `names` is NULL with `n > 0`, an element is NULL or a
+ * name is not UTF-8.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options; `names` is NULL only with `n == 0`, else
+ * points to `n` readable pointers, each NULL or a NUL-terminated string.
+ */
+int weida_files_options_set_names(const weida_files_options *o, const char *const *names, size_t n);
+
+/**
+ * Sets `FilesOptions::poll`, in milliseconds: how often the files'
+ * modification times are checked, at the next use of the identity after
+ * the interval; 0 checks at every use.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options.
+ */
+int weida_files_options_set_poll_ms(const weida_files_options *o, uint64_t v);
+
+/**
  * The description of a status code, positive or negative.
  *
  * Returns `"unknown error"` for a code this library does not define. The
@@ -1261,6 +1395,440 @@ int64_t weida_last_error_max(void);
  * Always safe to call.
  */
 int weida_last_error_os_code(void);
+
+/**
+ * A source that holds `id` and never changes
+ * (`IdentitySource::from_identity`). The identity is copied.
+ *
+ * Fails with `-WEIDA_ETLS` when the material does not read or parse: a
+ * wrong path is caught here, not at a handshake.
+ *
+ * # Safety
+ *
+ * `id` is NULL or a live identity; `out` is NULL or writable. Release the
+ * result with `weida_identity_source_drop`.
+ */
+int weida_identity_source_from_identity(const weida_identity *id, weida_identity_source **out);
+
+/**
+ * A self-signed identity generated in memory for `names`, gone with the
+ * process (`IdentitySource::ephemeral`).
+ *
+ * Fails with `-WEIDA_EINVAL` when `names` is NULL with `n > 0`, an element
+ * is NULL or a name is not UTF-8, and with `-WEIDA_ETLS` when a name is
+ * refused for the certificate.
+ *
+ * # Safety
+ *
+ * `names` is NULL only with `n == 0`, else points to `n` readable
+ * pointers, each NULL or a NUL-terminated string; `out` is NULL or
+ * writable. Release the result with `weida_identity_source_drop`.
+ */
+int weida_identity_source_ephemeral(const char *const *names,
+                                    size_t n,
+                                    weida_identity_source **out);
+
+/**
+ * A source driven from outside: starts as `initial` and changes on
+ * `weida_identity_source_update` (`IdentitySource::external`). The
+ * identity is copied.
+ *
+ * Fails with `-WEIDA_ETLS` when the material does not read or parse.
+ *
+ * # Safety
+ *
+ * `initial` is NULL or a live identity; `out` is NULL or writable. Release
+ * the result with `weida_identity_source_drop`.
+ */
+int weida_identity_source_external(const weida_identity *initial, weida_identity_source **out);
+
+/**
+ * A directory holding `cert.pem` and `key.pem`, reloaded when either
+ * changes (`IdentitySource::files`); NULL `options` is the default.
+ *
+ * When neither file exists, a self-signed identity for the options' names
+ * is written there first (the directory `0700`, both files `0600` on
+ * Unix), so a second start finds the same key. Replace the files
+ * atomically, or the certificate first and the key second; the next use
+ * of the identity after the poll interval picks them up.
+ *
+ * Fails with `-WEIDA_ETLS` when one file exists without the other or the
+ * material does not parse, and with `-WEIDA_EIO` when the bootstrap could
+ * not create or write.
+ *
+ * # Safety
+ *
+ * `dir` is NULL or a NUL-terminated string; `options` is NULL or live
+ * options; `out` is NULL or writable. Release the result with
+ * `weida_identity_source_drop`.
+ */
+int weida_identity_source_files(const char *dir,
+                                const weida_files_options *options,
+                                weida_identity_source **out);
+
+/**
+ * Writes the identity of the moment to `out` as a new identity
+ * (`IdentitySource::current`). A file source runs its due check here; its
+ * identity names the two files, read at each use as with
+ * `weida_identity_from_pem_files`.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source; `out` is NULL or writable. Release the
+ * result with `weida_identity_drop`.
+ */
+int weida_identity_source_current(const weida_identity_source *src, weida_identity **out);
+
+/**
+ * Writes the current key's fingerprint (`IdentitySource::fingerprint`) to
+ * `out`: `WEIDA_FINGERPRINT_LEN` bytes and a NUL, into the caller's buffer
+ * since it changes with the source. A NULL `out` or a `len` below
+ * `WEIDA_FINGERPRINT_LEN + 1` is `-WEIDA_EINVAL`. A file source runs its
+ * due check here.
+ *
+ * Fails with `-WEIDA_ETLS` only for a static source whose material does
+ * not read.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source; `out` is NULL or points to `len`
+ * writable bytes.
+ */
+int weida_identity_source_fingerprint(const weida_identity_source *src, char *out, size_t len);
+
+/**
+ * Replaces the identity (`IdentitySource::update`); the identity is
+ * copied. Reported as `WEIDA_IDENTITY_EVENT_RENEWED` when the key is
+ * unchanged and `WEIDA_IDENTITY_EVENT_KEY_CHANGED` when it is not.
+ *
+ * Fails with `-WEIDA_ETLS` when the material does not read, which changes
+ * nothing and is reported as `WEIDA_IDENTITY_EVENT_RENEWAL_FAILED`.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source; `id` is NULL or a live identity.
+ */
+int weida_identity_source_update(const weida_identity_source *src, const weida_identity *id);
+
+/**
+ * Reports a failed renewal that never produced material
+ * (`IdentitySource::report_failure`): `WEIDA_IDENTITY_EVENT_RENEWAL_FAILED`
+ * with `reason`. The identity in service is unchanged.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source; `reason` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_identity_source_report_failure(const weida_identity_source *src, const char *reason);
+
+/**
+ * Reports that this process's hand-off credential had already been
+ * redeemed (`IdentitySource::report_handoff_stolen`):
+ * `WEIDA_IDENTITY_EVENT_HANDOFF_STOLEN`. The identity in service is
+ * unchanged; the caller is expected not to continue.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source.
+ */
+int weida_identity_source_report_handoff_stolen(const weida_identity_source *src);
+
+/**
+ * Reloads a file source now, regardless of the poll interval
+ * (`IdentitySource::reload`): 1 when the files changed and were loaded, 0
+ * when nothing changed or the source is not a file source, `-WEIDA_ETLS`
+ * or `-WEIDA_EIO` when they changed and could not be loaded (also reported
+ * as `WEIDA_IDENTITY_EVENT_RENEWAL_FAILED`; the identity in service
+ * stays).
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source.
+ */
+int weida_identity_source_reload(const weida_identity_source *src);
+
+/**
+ * Writes a new reader of the source's events to `out`
+ * (`IdentitySource::events`): an independent reader that sees every event
+ * from this call on.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source; `out` is NULL or writable. Release the
+ * result with `weida_identity_events_drop`.
+ */
+int weida_identity_source_events(const weida_identity_source *src, weida_identity_events **out);
+
+/**
+ * Writes a weak handle to the source to `out`
+ * (`IdentitySource::downgrade`): one that does not keep it alive, for a
+ * renewal thread that must stop once the application drops the source.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source; `out` is NULL or writable. Release the
+ * result with `weida_weak_identity_source_drop`.
+ */
+int weida_identity_source_downgrade(const weida_identity_source *src,
+                                    weida_weak_identity_source **out);
+
+/**
+ * Releases a source handle. The source lives on in every terms, binding
+ * and requester that holds it. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `src` is NULL or a live source, dropped at most once.
+ */
+void weida_identity_source_drop(weida_identity_source *src);
+
+/**
+ * Writes the source to `out` as a new handle and returns 1 while anything
+ * still holds it (`WeakIdentitySource::upgrade`); writes NULL and returns
+ * 0 once nothing does.
+ *
+ * # Safety
+ *
+ * `w` is NULL or a live weak handle; `out` is NULL or writable. Release a
+ * result with `weida_identity_source_drop`.
+ */
+int weida_weak_identity_source_upgrade(const weida_weak_identity_source *w,
+                                       weida_identity_source **out);
+
+/**
+ * Releases a weak handle. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `w` is NULL or a live weak handle, dropped at most once.
+ */
+void weida_weak_identity_source_drop(weida_weak_identity_source *w);
+
+/**
+ * A source that holds `t` and never changes (`TrustSource::from_trust`).
+ * The trust is copied.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live trust; `out` is NULL or writable. Release the
+ * result with `weida_trust_source_drop`.
+ */
+int weida_trust_source_from_trust(const weida_trust *t, weida_trust_source **out);
+
+/**
+ * A source driven from outside: starts as `initial` and changes on
+ * `weida_trust_source_update` (`TrustSource::external`). The trust is
+ * copied.
+ *
+ * # Safety
+ *
+ * `initial` is NULL or a live trust; `out` is NULL or writable. Release
+ * the result with `weida_trust_source_drop`.
+ */
+int weida_trust_source_external(const weida_trust *initial, weida_trust_source **out);
+
+/**
+ * Writes the trust of the moment to `out` as a new trust
+ * (`TrustSource::current`): a copy; changing it does not change the
+ * source.
+ *
+ * # Safety
+ *
+ * `ts` is NULL or a live trust source; `out` is NULL or writable. Release
+ * the result with `weida_trust_drop`.
+ */
+int weida_trust_source_current(const weida_trust_source *ts, weida_trust **out);
+
+/**
+ * Replaces the trust (`TrustSource::update`); the trust is copied.
+ * Reported as `WEIDA_IDENTITY_EVENT_TRUST_REFRESHED`; reaches every
+ * binding and requester holding the source at its next handshake.
+ *
+ * # Safety
+ *
+ * `ts` is NULL or a live trust source; `t` is NULL or a live trust.
+ */
+int weida_trust_source_update(const weida_trust_source *ts, const weida_trust *t);
+
+/**
+ * Reports a failed refresh (`TrustSource::report_failure`):
+ * `WEIDA_IDENTITY_EVENT_RENEWAL_FAILED` with `reason`. The trust in
+ * service is unchanged.
+ *
+ * # Safety
+ *
+ * `ts` is NULL or a live trust source; `reason` is NULL or a
+ * NUL-terminated string.
+ */
+int weida_trust_source_report_failure(const weida_trust_source *ts, const char *reason);
+
+/**
+ * 1 when the trust of the moment holds no pin and no anchor
+ * (`TrustSource::is_empty`); 0 otherwise; `-WEIDA_EINVAL` for NULL.
+ *
+ * # Safety
+ *
+ * `ts` is NULL or a live trust source.
+ */
+int weida_trust_source_is_empty(const weida_trust_source *ts);
+
+/**
+ * Writes a new reader of the source's events to `out`
+ * (`TrustSource::events`), as `weida_identity_source_events`.
+ *
+ * # Safety
+ *
+ * `ts` is NULL or a live trust source; `out` is NULL or writable. Release
+ * the result with `weida_identity_events_drop`.
+ */
+int weida_trust_source_events(const weida_trust_source *ts, weida_identity_events **out);
+
+/**
+ * Writes a weak handle to the source to `out` (`TrustSource::downgrade`).
+ *
+ * # Safety
+ *
+ * `ts` is NULL or a live trust source; `out` is NULL or writable. Release
+ * the result with `weida_weak_trust_source_drop`.
+ */
+int weida_trust_source_downgrade(const weida_trust_source *ts, weida_weak_trust_source **out);
+
+/**
+ * Releases a trust source handle. The source lives on in every terms,
+ * binding and requester that holds it. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `ts` is NULL or a live trust source, dropped at most once.
+ */
+void weida_trust_source_drop(weida_trust_source *ts);
+
+/**
+ * Writes the source to `out` as a new handle and returns 1 while anything
+ * still holds it (`WeakTrustSource::upgrade`); writes NULL and returns 0
+ * once nothing does.
+ *
+ * # Safety
+ *
+ * `w` is NULL or a live weak handle; `out` is NULL or writable. Release a
+ * result with `weida_trust_source_drop`.
+ */
+int weida_weak_trust_source_upgrade(const weida_weak_trust_source *w, weida_trust_source **out);
+
+/**
+ * Releases a weak handle. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `w` is NULL or a live weak handle, dropped at most once.
+ */
+void weida_weak_trust_source_drop(weida_weak_trust_source *w);
+
+/**
+ * The reader's readiness descriptor (R11): readable when the next
+ * `weida_identity_events_recv` will not block.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live reader; `out` is NULL or writable.
+ */
+int weida_identity_events_fd(const weida_identity_events *e, int64_t *out);
+
+/**
+ * Takes the next event, waiting up to `timeout_ms` (R4) for one
+ * (`IdentityEvents::recv`).
+ *
+ * Writes NULL to `out` and returns 0 once the source is gone: its last
+ * strong handle, C or Rust, was dropped. A reader that fell more than 64
+ * events behind gets one `WEIDA_IDENTITY_EVENT_MISSED` event carrying how
+ * many it lost.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live reader; `out` is NULL or writable. Release an
+ * event with `weida_identity_event_drop`.
+ */
+int weida_identity_events_recv(const weida_identity_events *e,
+                               int64_t timeout_ms,
+                               weida_identity_event **out);
+
+/**
+ * Releases a reader. A thread waiting in `weida_identity_events_recv`
+ * returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live reader, dropped at most once.
+ */
+void weida_identity_events_drop(weida_identity_events *e);
+
+/**
+ * The event's kind, a `WEIDA_IDENTITY_EVENT_*` constant.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event.
+ */
+int weida_identity_event_kind(const weida_identity_event *e);
+
+/**
+ * `LOADED` and `RENEWED`: the key's fingerprint (`sha256:` text); NULL for
+ * any other kind. Lives as long as `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_identity_event_fingerprint(const weida_identity_event *e, size_t *len_out);
+
+/**
+ * `KEY_CHANGED`: the fingerprint that was; NULL for any other kind. Lives
+ * as long as `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_identity_event_from(const weida_identity_event *e, size_t *len_out);
+
+/**
+ * `KEY_CHANGED`: the fingerprint that is; NULL for any other kind. Lives
+ * as long as `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_identity_event_to(const weida_identity_event *e, size_t *len_out);
+
+/**
+ * `RENEWAL_FAILED`: why; NULL for any other kind. Lives as long as `e`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `len_out` is NULL or writable.
+ */
+const char *weida_identity_event_message(const weida_identity_event *e, size_t *len_out);
+
+/**
+ * `MISSED`: 1 and how many events this reader lost; 0 for any other kind,
+ * also for a NULL `e` or `out`.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event; `out` is NULL or writable.
+ */
+int weida_identity_event_missed(const weida_identity_event *e, uint64_t *out);
+
+/**
+ * Releases an event. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `e` is NULL or a live event, dropped at most once.
+ */
+void weida_identity_event_drop(weida_identity_event *e);
 
 /**
  * Creates the runtime's listener (`Runtime::listener`).
@@ -3468,6 +4036,17 @@ int weida_trust_add_anchor(const weida_trust *t, const uint8_t *pem, size_t len)
 int weida_trust_add_anchor_file(const weida_trust *t, const char *path);
 
 /**
+ * 1 when the trust holds no pin and no anchor, so it accepts only what
+ * each dialled address names (`Trust::is_empty`); 0 otherwise;
+ * `-WEIDA_EINVAL` for NULL.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live trust.
+ */
+int weida_trust_is_empty(const weida_trust *t);
+
+/**
  * Releases a trust. NULL does nothing.
  *
  * # Safety
@@ -3642,6 +4221,18 @@ void weida_pem_drop(weida_pem *p);
 int weida_client_tls_new(const weida_trust *trust, weida_client_tls **out);
 
 /**
+ * Client terms that dial anonymously under the trust source `trust` of the
+ * moment (`ClientTls::new` given a `TrustSource`). The source is shared,
+ * not copied: an update reaches the next connection.
+ *
+ * # Safety
+ *
+ * `trust` is NULL or a live trust source; `out` is NULL or writable.
+ * Release the result with `weida_client_tls_drop`.
+ */
+int weida_client_tls_new_source(const weida_trust_source *trust, weida_client_tls **out);
+
+/**
  * Presents `identity` to every peer a requester made from these terms
  * afterwards dials (`ClientTls::with_identity`). The identity is copied.
  *
@@ -3651,6 +4242,31 @@ int weida_client_tls_new(const weida_trust *trust, weida_client_tls **out);
  * identity.
  */
 int weida_client_tls_set_identity(const weida_client_tls *tls, const weida_identity *identity);
+
+/**
+ * Presents the identity source `identity` holds at each connection
+ * (`ClientTls::with_identity` given an `IdentitySource`). The source is
+ * shared, not copied: an update reaches the next connection.
+ *
+ * # Safety
+ *
+ * `tls` is NULL or live client terms; `identity` is NULL or a live
+ * identity source.
+ */
+int weida_client_tls_set_identity_source(const weida_client_tls *tls,
+                                         const weida_identity_source *identity);
+
+/**
+ * Asks for `alpn`, a `WEIDA_ALPN_*` constant, instead of `WEIDA_ALPN_WEIDA`
+ * (`ClientTls::with_alpn`); any other value is `-WEIDA_EINVAL` and changes
+ * nothing. A binding offering another token fails the handshake: the dial
+ * sees `-WEIDA_ETLS`.
+ *
+ * # Safety
+ *
+ * `tls` is NULL or live client terms.
+ */
+int weida_client_tls_set_alpn(const weida_client_tls *tls, int alpn);
 
 /**
  * Releases client terms. NULL does nothing.
@@ -3673,6 +4289,19 @@ void weida_client_tls_drop(weida_client_tls *tls);
 int weida_server_tls_new(const weida_identity *identity, weida_server_tls **out);
 
 /**
+ * Server terms that present the identity source `identity` holds at each
+ * handshake and accept anonymous clients (`ServerTls::new` given an
+ * `IdentitySource`). The source is shared, not copied: a renewed or
+ * replaced certificate reaches the next peer with no re-bind.
+ *
+ * # Safety
+ *
+ * `identity` is NULL or a live identity source; `out` is NULL or writable.
+ * Release the result with `weida_server_tls_drop`.
+ */
+int weida_server_tls_new_source(const weida_identity_source *identity, weida_server_tls **out);
+
+/**
  * Requires every client to present a key `trust` accepts, pinned or
  * chaining to an anchor (`ServerTls::require_client`). The trust is
  * copied. Replaces an earlier `_require_client` or `_require_any_key`.
@@ -3687,6 +4316,23 @@ int weida_server_tls_new(const weida_identity *identity, weida_server_tls **out)
 int weida_server_tls_require_client(const weida_server_tls *tls, const weida_trust *trust);
 
 /**
+ * Requires every client to present a key the trust source `trust` accepts
+ * at the handshake (`ServerTls::require_client` given a `TrustSource`).
+ * The source is shared, not copied. Replaces an earlier `_require_client*`
+ * or `_require_any_key`.
+ *
+ * An empty source is taken here; the bind then fails with `-WEIDA_ETLS`,
+ * as with `weida_server_tls_require_client`.
+ *
+ * # Safety
+ *
+ * `tls` is NULL or live server terms; `trust` is NULL or a live trust
+ * source.
+ */
+int weida_server_tls_require_client_source(const weida_server_tls *tls,
+                                           const weida_trust_source *trust);
+
+/**
  * Requires every client to present a key and prove it holds it, whatever
  * the key (`ServerTls::require_client(ClientTrust::AnyKey)`). Replaces an
  * earlier `_require_client` or `_require_any_key`.
@@ -3696,6 +4342,17 @@ int weida_server_tls_require_client(const weida_server_tls *tls, const weida_tru
  * `tls` is NULL or live server terms.
  */
 int weida_server_tls_require_any_key(const weida_server_tls *tls);
+
+/**
+ * Offers `alpn`, a `WEIDA_ALPN_*` constant, instead of `WEIDA_ALPN_WEIDA`
+ * (`ServerTls::with_alpn`); any other value is `-WEIDA_EINVAL` and changes
+ * nothing. A dial asking for another token fails with `-WEIDA_ETLS`.
+ *
+ * # Safety
+ *
+ * `tls` is NULL or live server terms.
+ */
+int weida_server_tls_set_alpn(const weida_server_tls *tls, int alpn);
 
 /**
  * Releases server terms. NULL does nothing.

@@ -1,12 +1,13 @@
 //! Nested configuration values and the enumeration constants (docs/c/runtime.md, R7).
 
-use std::ffi::c_int;
+use std::ffi::{c_char, c_int};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use weida_rs::{
-    Acknowledgement, Backpressure, Congestion, Deduplication, DeliveryLevel, Discovery, Durability,
-    GuaranteeSet, Limits, OrderingMode, OutboxFull, ProducerNaming, ReconnectPolicy,
+    Acknowledgement, Alpn, Backpressure, Congestion, Deduplication, DeliveryLevel, Discovery,
+    Durability, FilesOptions, GuaranteeSet, Limits, OrderingMode, OutboxFull, ProducerNaming,
+    ReconnectPolicy,
 };
 
 use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_void};
@@ -90,12 +91,21 @@ pub const WEIDA_PRODUCER_NAMING_FINGERPRINT: c_int = 0;
 /// `ProducerNaming::Stable`.
 pub const WEIDA_PRODUCER_NAMING_STABLE: c_int = 1;
 
+/// `Alpn::Weida`: `weida/0`.
+pub const WEIDA_ALPN_WEIDA: c_int = 0;
+/// `Alpn::Raft`: `weida-raft/0`.
+pub const WEIDA_ALPN_RAFT: c_int = 1;
+
 /// `weida::DEFAULT_DATAGRAM_RECEIVE_BYTES`: the documented
 /// `datagram_receive_bytes` of a profile that enables datagram flows.
 pub const WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES: c_int = 65_536;
 
 /// The length of a version-00 traceparent, without its NUL.
 pub const WEIDA_TRACEPARENT_LEN: c_int = 55;
+
+/// The length of a fingerprint's text, `sha256:` and 64 hex digits, without
+/// its NUL.
+pub const WEIDA_FINGERPRINT_LEN: c_int = 71;
 
 pub(crate) fn invalid_enum() -> c_int {
     fail_abi(WEIDA_EINVAL, c"an enumeration argument was out of range")
@@ -124,6 +134,14 @@ pub(crate) fn discovery(v: c_int) -> Result<Discovery, c_int> {
     match v {
         WEIDA_DISCOVERY_AWARE => Ok(Discovery::Aware),
         WEIDA_DISCOVERY_SINGLE => Ok(Discovery::Single),
+        _ => Err(invalid_enum()),
+    }
+}
+
+pub(crate) fn alpn(v: c_int) -> Result<Alpn, c_int> {
+    match v {
+        WEIDA_ALPN_WEIDA => Ok(Alpn::Weida),
+        WEIDA_ALPN_RAFT => Ok(Alpn::Raft),
         _ => Err(invalid_enum()),
     }
 }
@@ -181,6 +199,11 @@ pub struct weida_reconnect_policy {
     value: Mutex<ReconnectPolicy>,
 }
 
+/// `FilesOptions` under construction: one setter per field.
+pub struct weida_files_options {
+    value: Mutex<FilesOptions>,
+}
+
 impl Builder for weida_limits {
     type Value = Limits;
     fn cell(&self) -> &Mutex<Limits> {
@@ -198,6 +221,13 @@ impl Builder for weida_guarantee_set {
 impl Builder for weida_reconnect_policy {
     type Value = ReconnectPolicy;
     fn cell(&self) -> &Mutex<ReconnectPolicy> {
+        &self.value
+    }
+}
+
+impl Builder for weida_files_options {
+    type Value = FilesOptions;
+    fn cell(&self) -> &Mutex<FilesOptions> {
         &self.value
     }
 }
@@ -978,4 +1008,75 @@ pub unsafe extern "C" fn weida_reconnect_policy_set_stop_on_peer_closed(
 ) -> c_int {
     // SAFETY: forwarded from this function's contract.
     unsafe { update(p, |x| x.stop_on_peer_closed = v != 0) }
+}
+
+// --- weida_files_options ---------------------------------------------------
+
+/// Creates file-source options holding weida's defaults
+/// (`FilesOptions::default`): no names, a check every 10 s.
+///
+/// # Safety
+///
+/// `out` is NULL or writable. Release the result with
+/// `weida_files_options_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_files_options_new(out: *mut *mut weida_files_options) -> c_int {
+    create(
+        out,
+        weida_files_options {
+            value: Mutex::new(FilesOptions::default()),
+        },
+    )
+}
+
+/// Releases file-source options. NULL does nothing.
+///
+/// # Safety
+///
+/// `o` is NULL or live options, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_files_options_drop(o: *mut weida_files_options) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(o) }));
+}
+
+/// Sets `FilesOptions::names`, replacing the list: the names the
+/// bootstrapped certificate is made for, when the directory is empty.
+/// Unused when files exist. Fails with `-WEIDA_EINVAL`, leaving the list
+/// as it was, when `names` is NULL with `n > 0`, an element is NULL or a
+/// name is not UTF-8.
+///
+/// # Safety
+///
+/// `o` is NULL or live options; `names` is NULL only with `n == 0`, else
+/// points to `n` readable pointers, each NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_files_options_set_names(
+    o: *const weida_files_options,
+    names: *const *const c_char,
+    n: usize,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        try_update(o, |x| {
+            x.names = crate::handle::names(names, n)?;
+            Ok(())
+        })
+    }
+}
+
+/// Sets `FilesOptions::poll`, in milliseconds: how often the files'
+/// modification times are checked, at the next use of the identity after
+/// the interval; 0 checks at every use.
+///
+/// # Safety
+///
+/// `o` is NULL or live options.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_files_options_set_poll_ms(
+    o: *const weida_files_options,
+    v: u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(o, |x| x.poll = ms(v)) }
 }

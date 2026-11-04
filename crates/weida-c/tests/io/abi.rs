@@ -2541,3 +2541,199 @@ fn a_round_trip_over_a_pipe_names_the_clients_sid() {
     }
     shutdown(rt);
 }
+
+/// The next identity event of `events`, waiting for it; never the end.
+fn next_identity_event(events: *mut weida_identity_events) -> *mut weida_identity_event {
+    let mut event = ptr::null_mut();
+    // SAFETY: a live reader and a writable out-parameter.
+    ok(settle("an identity event", |ms| unsafe {
+        weida_identity_events_recv(events, ms, &mut event)
+    }));
+    assert!(!event.is_null(), "the event stream ended");
+    event
+}
+
+/// The current fingerprint of an identity source.
+fn source_fingerprint(src: *mut weida_identity_source) -> String {
+    let mut buf = [0 as c_char; WEIDA_FINGERPRINT_LEN as usize + 1];
+    // SAFETY: a live source and `buf.len()` writable bytes; on success
+    // `buf` holds a NUL-terminated string.
+    unsafe {
+        ok(weida_identity_source_fingerprint(
+            src,
+            buf.as_mut_ptr(),
+            buf.len(),
+        ));
+        CStr::from_ptr(buf.as_ptr())
+            .to_str()
+            .expect("UTF-8")
+            .to_owned()
+    }
+}
+
+#[test]
+fn a_files_identity_source_rotates_a_bindings_certificate() {
+    let dir = std::env::temp_dir().join(format!("weida-c-abi-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rt = runtime();
+    let l = listener(rt);
+    let mut opts = ptr::null_mut();
+    let mut src = ptr::null_mut();
+    let mut events = ptr::null_mut();
+    let mut tls = ptr::null_mut();
+    let names = [c("127.0.0.1")];
+    let ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+    let path = c(dir.to_str().expect("a UTF-8 path"));
+    // SAFETY: live handles, C strings and writable out-parameters; the
+    // options are dropped once.
+    unsafe {
+        ok(weida_files_options_new(&mut opts));
+        ok(weida_files_options_set_names(
+            opts,
+            ptrs.as_ptr(),
+            ptrs.len(),
+        ));
+        ok(weida_files_options_set_poll_ms(opts, 0));
+        ok(weida_identity_source_files(path.as_ptr(), opts, &mut src));
+        weida_files_options_drop(opts);
+    }
+    assert!(dir.join("cert.pem").exists() && dir.join("key.pem").exists());
+    let old = source_fingerprint(src);
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        ok(weida_identity_source_events(src, &mut events));
+        ok(weida_server_tls_new_source(src, &mut tls));
+    }
+    let (binding, local) = bind_quic(l, tls);
+    // SAFETY: dropped once; the binding holds its copy of the terms.
+    unsafe { weida_server_tls_drop(tls) };
+    let rep = replier(l, "/echo");
+    let url = format!("weida://{local}/echo");
+
+    let old_trust = trust_pinning(&old);
+    let first = requester(rt, old_trust);
+    let meta = round_trip(first, rep, &url);
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+
+    // An agent rewrites the files: the certificate first, the key second.
+    let (fresh, new) = identity();
+    std::fs::write(dir.join("cert.pem"), certificate_pem(fresh)).expect("cert.pem");
+    std::fs::write(dir.join("key.pem"), to_pem(fresh)).expect("key.pem");
+
+    let new_trust = trust_pinning(&new);
+    let second = requester(rt, new_trust);
+    let meta_second = round_trip(second, rep, &url);
+    // The connection made before the rotation still carries requests.
+    let meta_first = exchange(first, rep);
+
+    let event = next_identity_event(events);
+    let mut len = 0usize;
+    // SAFETY: a live event and a writable length; the texts live with it.
+    unsafe {
+        assert_eq!(
+            weida_identity_event_kind(event),
+            WEIDA_IDENTITY_EVENT_KEY_CHANGED
+        );
+        assert_eq!(
+            text(weida_identity_event_from(event, &mut len), len),
+            Some(old)
+        );
+        assert_eq!(
+            text(weida_identity_event_to(event, &mut len), len),
+            Some(new.clone())
+        );
+    }
+    assert_eq!(source_fingerprint(src), new);
+    // SAFETY: a live source; the handshake already loaded the change.
+    assert_eq!(unsafe { weida_identity_source_reload(src) }, 0);
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_identity_event_drop(event);
+        weida_identity_events_drop(events);
+        weida_incoming_meta_drop(meta_first);
+        weida_incoming_meta_drop(meta_second);
+        weida_requester_drop(second);
+        weida_requester_drop(first);
+        weida_trust_drop(new_trust);
+        weida_trust_drop(old_trust);
+        weida_replier_drop(rep);
+        weida_binding_drop(binding);
+        weida_identity_drop(fresh);
+        weida_identity_source_drop(src);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+    std::fs::remove_dir_all(&dir).expect("the directory");
+}
+
+#[test]
+fn a_mismatched_alpn_fails_the_dial_with_etls() {
+    let rt = runtime();
+    let l = listener(rt);
+    let (server, server_fp) = identity();
+    let (client, client_fp) = identity();
+    let client_pin = trust_pinning(&client_fp);
+    let server_pin = trust_pinning(&server_fp);
+    let mut client_trust = ptr::null_mut();
+    let mut server_trust = ptr::null_mut();
+    let mut client_id = ptr::null_mut();
+    let tls = server_tls(server);
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        ok(weida_trust_source_from_trust(client_pin, &mut client_trust));
+        ok(weida_trust_source_from_trust(server_pin, &mut server_trust));
+        ok(weida_identity_source_from_identity(client, &mut client_id));
+        ok(weida_server_tls_set_alpn(tls, WEIDA_ALPN_RAFT));
+        ok(weida_server_tls_require_client_source(tls, client_trust));
+    }
+    let (binding, local) = bind_quic(l, tls);
+    let rep = replier(l, "/echo");
+    let url = format!("weida://{local}/echo");
+
+    let mut plain_tls = ptr::null_mut();
+    let mut plain = ptr::null_mut();
+    let mut raft_tls = ptr::null_mut();
+    let mut raft = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        ok(weida_client_tls_new(server_pin, &mut plain_tls));
+        ok(weida_client_tls_set_identity_source(plain_tls, client_id));
+        ok(weida_runtime_requester(rt, plain_tls, &mut plain));
+        ok(weida_client_tls_new_source(server_trust, &mut raft_tls));
+        ok(weida_client_tls_set_identity_source(raft_tls, client_id));
+        ok(weida_client_tls_set_alpn(raft_tls, WEIDA_ALPN_RAFT));
+        ok(weida_runtime_requester(rt, raft_tls, &mut raft));
+    }
+    let rc = exchange_status(plain, &url);
+    assert_eq!(
+        rc,
+        -WEIDA_ETLS,
+        "weida/0 against weida-raft/0: {}",
+        last_message()
+    );
+    let meta = round_trip(raft, rep, &url);
+    assert_eq!(peer_fingerprint(meta), Some(client_fp));
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_requester_drop(raft);
+        weida_requester_drop(plain);
+        weida_client_tls_drop(raft_tls);
+        weida_client_tls_drop(plain_tls);
+        weida_replier_drop(rep);
+        weida_binding_drop(binding);
+        weida_server_tls_drop(tls);
+        weida_identity_source_drop(client_id);
+        weida_trust_source_drop(server_trust);
+        weida_trust_source_drop(client_trust);
+        weida_trust_drop(server_pin);
+        weida_trust_drop(client_pin);
+        weida_identity_drop(client);
+        weida_identity_drop(server);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}

@@ -122,18 +122,26 @@ unit tests in `crates/weida-c/src/`.
 | `Trust::and_pin` | `weida_trust_add_pin` | present; `abi::a_malformed_pin_is_an_invalid_fingerprint`, `abi::a_server_outside_the_pins_is_untrusted` |
 | `Trust::and_anchor`, `and_anchor_file` | `weida_trust_add_anchor`, `_add_anchor_file` | present; `abi::a_trust_anchor_checks_the_name_the_dial_used` (*identity*) |
 | `Trust::pin`, `anchor`, `anchor_file` | `weida_trust_new` plus the matching `_add_*` | present (*identity*) |
-| `Trust::is_empty` | — | absent: *identity* |
+| `Trust::is_empty` | `weida_trust_is_empty` | present; `tls::tests::alpn_setters_take_the_two_tokens_and_refuse_others` (*identity*) |
 | `Identity::generate`, `from_pem`, `fingerprint` | `weida_identity_generate`, `_from_pem`, `_fingerprint` | present; `smoke.c`, `abi::a_server_outside_the_pins_is_untrusted` |
 | `Identity::generate_for` | `weida_identity_generate_for` | present; `tls::tests::generate_for_refuses_a_null_name`, `abi::a_trust_anchor_checks_the_name_the_dial_used` (*identity*) |
 | `Identity::from_pem_files`, `from_pem_file` | `weida_identity_from_pem_files`, `_from_pem_file` | present; `abi::an_identity_written_to_a_file_reads_back_with_its_fingerprint` (*identity*) |
 | `Identity::certificate_pem`, `to_pem`, `Pem` | `weida_identity_certificate_pem`, `_to_pem`, the owned `weida_pem` wiped on drop | present; `tls::tests::a_pem_written_by_to_pem_reads_back_with_the_same_fingerprint` (*identity*) |
 | `ClientTls::new` | `weida_client_tls_new` | present |
 | `ClientTls::with_identity` | `weida_client_tls_set_identity` | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` (*identity*) |
-| `ClientTls::with_alpn`, `Alpn` | — | absent: *identity* |
+| `ClientTls::with_alpn`, `Alpn` | `weida_client_tls_set_alpn`, `WEIDA_ALPN_WEIDA`, `WEIDA_ALPN_RAFT` | present; `abi::a_mismatched_alpn_fails_the_dial_with_etls`, `tls::tests::alpn_setters_take_the_two_tokens_and_refuse_others` (*identity*) |
 | `ServerTls::new` | `weida_server_tls_new` | present |
 | `ServerTls::require_client`, `ClientTrust` | `weida_server_tls_require_client` (`Trusted`), `_require_any_key` (`AnyKey`) | present; `abi::a_binding_that_requires_a_pinned_client_refuses_anonymous_and_strangers`, `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` (*identity*) |
-| `ServerTls::with_alpn` | — | absent: *identity* |
-| `IdentitySource`, `TrustSource`, their weak forms, `FilesOptions`, `IdentityEvent(s)` | — | absent: *identity* (events as queues, 0045 decision 10) |
+| `ServerTls::with_alpn` | `weida_server_tls_set_alpn` | present; `abi::a_mismatched_alpn_fails_the_dial_with_etls`, `tls::tests::alpn_setters_take_the_two_tokens_and_refuse_others` (*identity*) |
+| `Alpn::token` | — | refused: wire vocabulary; each constant names its token |
+| `ClientTls::new`, `with_identity`, `ServerTls::new`, `require_client` given a source | `weida_client_tls_new_source`, `_set_identity_source`, `weida_server_tls_new_source`, `_require_client_source` (shared, not copied) | present; `abi::a_files_identity_source_rotates_a_bindings_certificate`, `abi::a_mismatched_alpn_fails_the_dial_with_etls`, `identity::tests::the_source_forms_share_their_source` (*identity*) |
+| `IdentitySource::from_identity`, `ephemeral`, `external`, `files` | `weida_identity_source_from_identity`, `_ephemeral`, `_external`, `_files` | present; `abi::a_files_identity_source_rotates_a_bindings_certificate`, `abi::a_mismatched_alpn_fails_the_dial_with_etls`, `identity::tests::an_external_source_reports_its_updates_through_the_queue` (*identity*) |
+| `IdentitySource::current`, `fingerprint` | `weida_identity_source_current` (a new `weida_identity`), `_fingerprint` (into the caller's buffer) | present; `abi::a_files_identity_source_rotates_a_bindings_certificate`, `identity::tests::an_external_source_reports_its_updates_through_the_queue` (*identity*) |
+| `IdentitySource::update`, `report_failure`, `report_handoff_stolen`, `reload` | `weida_identity_source_update`, `_report_failure`, `_report_handoff_stolen`, `_reload` (1, 0 or the error) | present; `identity::tests::an_external_source_reports_its_updates_through_the_queue`, `abi::a_files_identity_source_rotates_a_bindings_certificate` (*identity*) |
+| `IdentitySource::downgrade`, `WeakIdentitySource::upgrade`, `Drop` | `weida_identity_source_downgrade`, `weida_weak_identity_source_upgrade` (1, or 0 with NULL), `weida_identity_source_drop`, `weida_weak_identity_source_drop` | present; `identity::tests::an_external_source_reports_its_updates_through_the_queue` (*identity*) |
+| `TrustSource::from_trust`, `external`, `current`, `update`, `report_failure`, `is_empty` | `weida_trust_source_from_trust`, `_external`, `_current`, `_update`, `_report_failure`, `_is_empty` | present; `identity::tests::a_trust_source_reports_a_refresh_and_reads_back_empty`, `abi::a_mismatched_alpn_fails_the_dial_with_etls` (*identity*) |
+| `TrustSource::downgrade`, `WeakTrustSource::upgrade` | `weida_trust_source_downgrade`, `weida_weak_trust_source_upgrade` | present; `identity::tests::a_trust_source_reports_a_refresh_and_reads_back_empty` (*identity*) |
+| `FilesOptions` (`names`, `poll`) | `weida_files_options_new`, `_set_names`, `_set_poll_ms`; NULL is the default | present; `identity::tests::files_options_setters_land_on_their_fields`, `abi::a_files_identity_source_rotates_a_bindings_certificate` (*identity*) |
 | `TransferMeta::with_content_type` | `weida_transfer_meta_set_content_type` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `TransferMeta::with_content_len`, `with_trace`, `with_topic`, `with_achieved` | `weida_transfer_meta_set_content_len`, `_set_trace`, `_set_topic`, `_set_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
 | `TransferMeta::with_report`, `with_report_mode` | — | absent: *cursors* |
@@ -158,6 +166,7 @@ unit tests in `crates/weida-c/src/`.
 | --- | --- |
 | `ConnectionStats`, `PathStats`, `RemoteStats`, `TransportStats`, `UdpCounts`, `connection_stats()` | present: `weida_connection_stats` and its getters ([stats.md](../c/stats.md)); `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport`, `abi::a_quic_connection_reports_its_transport` (*stats*) |
 | `PeerEvent`, `PeerEvents`, `GiveUp` | present: `weida_peer_events` (a try handle) and `weida_peer_event`, `WEIDA_PEER_EVENT_*`, `WEIDA_GIVE_UP_*`; `abi::a_replier_runtime_shut_down_reports_lost_then_retrying`, `stats::tests::every_peer_event_kind_reads_back_through_its_getters` (*stats*) |
+| `IdentityEvent`, `IdentityEvents`, `IdentitySource::events`, `TrustSource::events` | present: `weida_identity_events` (a try handle) and `weida_identity_event`, `WEIDA_IDENTITY_EVENT_*` ([identity.md](../c/identity.md)); `abi::a_files_identity_source_rotates_a_bindings_certificate`, `identity::tests::every_identity_event_kind_reads_back_through_its_getters`, `identity::tests::an_external_source_reports_its_updates_through_the_queue` (*identity*) |
 | `DishDrops`, `TopicDrops` | absent: *patterns* |
 | `Drained` | present: `weida_drained`, `weida_drained_delivered`, `weida_drained_outstanding` ([runtime.md](../c/runtime.md)); `abi::a_drain_counts_a_reply_finished_before_it_as_delivered` (*drain*) |
 
@@ -180,7 +189,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the thirty-five `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the thirty-seven `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -225,6 +234,19 @@ way a foreign caller calls it:
 - A socket path is UTF-8 text (R7); a path that is not UTF-8 cannot be bound through the ABI.
 - `LocalPrincipal` and `WindowsPrincipal` are read through four getters on the metadata
   (`weida_incoming_meta_peer_uid`, `_peer_gid`, `_peer_pid`, `_peer_sid`), not as values.
+- A Rust parameter that takes a value or a source (`impl Into<IdentitySource>`,
+  `impl Into<TrustSource>`) maps twice: the value form keeps its name and copies, the form with
+  the `_source` suffix takes a `weida_identity_source` or `weida_trust_source` and shares it.
+- The fingerprint of an identity source is written into the caller's buffer of
+  `WEIDA_FINGERPRINT_LEN + 1` bytes, because it changes under the handle and handle-owned text
+  (R7) could not stay valid.
+- `IdentitySource::reload`'s `Result<bool>` is 1, 0 or a negative code.
+- `WeakIdentitySource::upgrade`'s and `WeakTrustSource::upgrade`'s `None` is a 0 return with
+  `*out == NULL`.
+- The end of an identity event stream (`None`) is a 0 return with `*out == NULL`, as for peer
+  events.
+- `FilesOptions::poll` is milliseconds (`_set_poll_ms`, R7); a file source's directory is UTF-8
+  text (R7).
 
 ## 10. The definition of done
 
@@ -238,8 +260,8 @@ is complete when no present row lacks a test.
 ## 11. Sources
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
-`config.rs`, `runtime.rs`, `tls.rs`, `listener.rs`, `relay.rs`, `transfer.rs`, `requester.rs`,
-`poll.rs`, `stats.rs`),
+`config.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`, `transfer.rs`,
+`requester.rs`, `poll.rs`, `stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

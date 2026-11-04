@@ -15,6 +15,7 @@
 mod config;
 mod error;
 mod handle;
+mod identity;
 mod listener;
 mod op;
 mod poll;
@@ -31,6 +32,7 @@ use std::ffi::c_char;
 
 pub use config::*;
 pub use error::*;
+pub use identity::*;
 pub use listener::*;
 pub use poll::*;
 pub use relay::*;
