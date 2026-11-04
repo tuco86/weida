@@ -143,8 +143,21 @@ export interface ReconnectPolicyFields {
   stopOnPeerClosed?: boolean | null;
 }
 
-/** `weida::RuntimeConfig` but `resolver` and `network`. An unknown field
- * throws a TypeError. */
+/** One name lookup of a dial: the host the URL wrote, its port or null when
+ * it wrote none (the answer then chooses the ports), and the most addresses
+ * the answer may hold. */
+export interface Lookup {
+  readonly name: string;
+  readonly port: number | null;
+  readonly maxAddresses: number;
+}
+
+/** Answers a lookup with `"ip:port"` strings in dial order; a throw or a
+ * rejection refuses it, and the dial rejects with WEIDA_EINVALID_ADDRESS. */
+export type Resolver = (lookup: Lookup) => readonly string[] | Promise<readonly string[]>;
+
+/** `weida::RuntimeConfig` but `network`. An unknown field throws a
+ * TypeError. */
 export interface RuntimeConfigFields {
   workerThreads?: Count | null;
   shutdownTimeoutMs?: Count | null;
@@ -163,6 +176,9 @@ export interface RuntimeConfigFields {
   limits?: LimitsFields | null;
   guarantees?: GuaranteeSetFields | null;
   reconnect?: ReconnectPolicyFields | null;
+  /** Called on the JS thread for every lookup of the runtime's dials; never
+   * keeps the process alive. */
+  resolver?: Resolver | null;
 }
 
 /** Every failure of libweida (docs/c/README.md R9). */

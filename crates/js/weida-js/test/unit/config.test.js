@@ -148,6 +148,10 @@ test("configuration input errors are thrown at once", UNIT, () => {
     (error) => error instanceof weida.WeidaError && error.code === "WEIDA_EINVAL",
   );
   assert.throws(() => weida.Runtime.owned({ maxConnections: -1 }), RangeError);
+  assert.throws(() => weida.Runtime.owned({ resolver: "dns" }), {
+    name: "TypeError",
+    message: "resolver is a function (lookup) => addresses",
+  });
 });
 
 test("newTrace is a sampled W3C traceparent", UNIT, () => {

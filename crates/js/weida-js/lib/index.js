@@ -251,7 +251,9 @@ const RECONNECT_FIELDS = [
 ];
 
 const NESTED = ["limits", "guarantees", "reconnect"];
-const CONFIG_KEYS = [...CONFIG_FIELDS.map(([key]) => key), ...NESTED];
+/** The keys besides the fields: the nested objects and the resolver. */
+const EXTRA = [...NESTED, "resolver"];
+const CONFIG_KEYS = [...CONFIG_FIELDS.map(([key]) => key), ...EXTRA];
 
 /** Checks `object`'s keys against `fields` (and `extra`), then calls the
  * setter of each field that is neither null nor undefined. */
@@ -330,13 +332,13 @@ export class RuntimeConfig {
   }
 }
 
-function configHandle(config) {
+function configHandle(config, resolver) {
   if (config == null) {
     return null;
   }
   const handle = native.runtimeConfigNew();
   try {
-    applyFields(handle, config, CONFIG_FIELDS, "RuntimeConfig", NESTED);
+    applyFields(handle, config, CONFIG_FIELDS, "RuntimeConfig", EXTRA);
     if (config.limits != null) {
       nested(config.limits, native.limitsNew, LIMITS_FIELDS, "limits", (h) =>
         native.runtimeConfigSetLimits(handle, h),
@@ -359,11 +361,69 @@ function configHandle(config) {
         ["never"],
       );
     }
+    if (resolver !== null) {
+      native.runtimeConfigSetResolver(handle, resolver);
+    }
   } catch (error) {
     native.drop(handle);
     throw error;
   }
   return handle;
+}
+
+/** Answers one lookup through `resolve`; never rejects. A throw, a
+ * rejection or an answer that is not an array of strings refuses it. */
+async function answerLookup(handle, resolve) {
+  try {
+    const lookup = Object.freeze({
+      name: native.resolvedName(handle),
+      port: native.resolvedPort(handle),
+      maxAddresses: native.resolvedMaxAddresses(handle),
+    });
+    let addresses;
+    try {
+      addresses = await resolve(lookup);
+    } catch (error) {
+      native.resolvedRefuse(handle, error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (!Array.isArray(addresses) || !addresses.every((a) => typeof a === "string")) {
+      native.resolvedRefuse(handle, "the resolver did not answer an array of address strings");
+      return;
+    }
+    native.resolvedAnswer(handle, addresses);
+  } catch {
+    // A spent lookup drops as a no-op; an unspent one fails its dial as
+    // dropped unanswered.
+    native.drop(handle);
+  }
+}
+
+/** Reads `resolver`'s lookups until no configuration or runtime holds it,
+ * answering them concurrently. Its watch is weak: it never keeps the
+ * process alive. */
+async function serveLookups(resolver, resolve) {
+  const owner = { [WAITS]: new Set() };
+  try {
+    for (;;) {
+      const handle = await call(
+        owner,
+        () => native.resolverRecv(resolver),
+        () => native.resolverFd(resolver),
+        undefined,
+        true,
+      );
+      if (handle === null) {
+        break;
+      }
+      void answerLookup(handle, resolve);
+    }
+  } catch {
+    // A descriptor that cannot be made ends the service; the lookups after
+    // it fail their dial with WEIDA_EINVALID_ADDRESS.
+  } finally {
+    native.drop(resolver);
+  }
 }
 
 /** A weida runtime: the reactor it owns, and every endpoint made from it. */
@@ -373,11 +433,33 @@ export class Runtime extends Handle {
     noConstructor("Runtime", "Runtime.owned()");
   }
 
-  /** A runtime on a reactor of its own. */
+  /** A runtime on a reactor of its own.
+   *
+   * A `resolver` in `config` answers each lookup of this runtime's dials on
+   * the JS thread: it is called with a frozen `{ name, port, maxAddresses }`
+   * and answers `"ip:port"` strings in dial order; a throw refuses the
+   * lookup, and the dial rejects with `WEIDA_EINVALID_ADDRESS` carrying the
+   * message. It is served until the runtime and everything made from it are
+   * gone, and never keeps the process alive. */
   static owned(config) {
-    const cfg = configHandle(config);
+    const resolve = config?.resolver ?? null;
+    if (resolve !== null && typeof resolve !== "function") {
+      throw new TypeError("resolver is a function (lookup) => addresses");
+    }
+    const resolver = resolve === null ? null : native.resolverNew();
+    let cfg = null;
     try {
-      return adopt(Runtime, native.runtimeOwned(cfg));
+      cfg = configHandle(config, resolver);
+      const runtime = adopt(Runtime, native.runtimeOwned(cfg));
+      if (resolver !== null) {
+        void serveLookups(resolver, resolve);
+      }
+      return runtime;
+    } catch (error) {
+      if (resolver !== null) {
+        native.drop(resolver);
+      }
+      throw error;
     } finally {
       if (cfg !== null) {
         native.drop(cfg);

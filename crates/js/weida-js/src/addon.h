@@ -31,6 +31,8 @@ struct registration {
 struct callback {
     uint32_t id;
     napi_ref fn;
+    /* A weak watch is reported like any other but keeps no process alive. */
+    bool weak;
 };
 
 struct waiter {
@@ -55,6 +57,8 @@ struct waiter {
     /* JS thread only. */
     struct callback *cbs;
     size_t ncbs, capcbs;
+    /* The pending callbacks that are not weak: they keep the process alive. */
+    size_t nstrong;
     uint32_t next_id;
 };
 

@@ -5,8 +5,9 @@
  * napi_threadsafe_function.
  *
  * A watch is one-shot: the thread removes a registration when it reports it.
- * The tsfn is referenced while at least one JS callback is pending and
- * unreferenced otherwise, so an idle process exits. A wake pipe (on Windows
+ * The tsfn is referenced while at least one callback that is not weak is
+ * pending and unreferenced otherwise, so an idle process exits, and so does
+ * one whose only pending watches are weak. A wake pipe (on Windows
  * a loopback UDP socket connected to itself, since `WSAPoll` takes only
  * sockets) interrupts the thread's poll whenever the registrations change.
  * On Windows there are no signals for the thread to block.
@@ -279,13 +280,14 @@ static void run(struct waiter *w) {
 }
 
 /* JS thread: takes the pending callback of `id` out of the table, and
- * unreferences the tsfn when it was the last one. */
+ * unreferences the tsfn when it was the last one that is not weak. */
 static bool take_callback(napi_env env, struct waiter *w, uint32_t id, napi_ref *out) {
     for (size_t i = 0; i < w->ncbs; i++) {
         if (w->cbs[i].id == id) {
+            bool weak = w->cbs[i].weak;
             *out = w->cbs[i].fn;
             w->cbs[i] = w->cbs[--w->ncbs];
-            if (w->ncbs == 0)
+            if (!weak && --w->nstrong == 0)
                 napi_unref_threadsafe_function(env, w->tsfn);
             return true;
         }
@@ -366,13 +368,16 @@ fail_wake:
     return false;
 }
 
-/* `watch(fd, callback) -> id`: calls `callback()` once on the JS thread when
- * `fd` turns readable, unless `unwatch(id)` came first. */
+/* `watch(fd, callback, weak?) -> id`: calls `callback()` once on the JS
+ * thread when `fd` turns readable, unless `unwatch(id)` came first. A weak
+ * watch (`weak === true`) is reported like any other but does not keep the
+ * process alive. */
 napi_value waiter_watch(napi_env env, napi_callback_info info) {
-    napi_value argv[2], result;
-    size_t argc = 2;
+    napi_value argv[3], result;
+    size_t argc = 3;
     napi_valuetype type;
     int64_t fd = -1;
+    bool weak = false;
     napi_ref ref;
     struct addon *a = addon_of(env);
     struct waiter *w = &a->waiter;
@@ -384,6 +389,9 @@ napi_value waiter_watch(napi_env env, napi_callback_info info) {
         return throw_type(env, "expected a descriptor");
     if (napi_typeof(env, argv[1], &type) != napi_ok || type != napi_function)
         return throw_type(env, "expected a function");
+    if (napi_typeof(env, argv[2], &type) == napi_ok && type == napi_boolean &&
+        napi_get_value_bool(env, argv[2], &weak) != napi_ok)
+        return throw_napi(env);
     if (!start(env, a))
         return NULL;
 
@@ -413,8 +421,8 @@ napi_value waiter_watch(napi_env env, napi_callback_info info) {
     uint32_t id = ++w->next_id;
     if (id == 0)
         id = ++w->next_id;
-    w->cbs[w->ncbs++] = (struct callback){id, ref};
-    if (w->ncbs == 1)
+    w->cbs[w->ncbs++] = (struct callback){id, ref, weak};
+    if (!weak && w->nstrong++ == 0)
         napi_ref_threadsafe_function(env, w->tsfn);
 
     waiter_lock(w);

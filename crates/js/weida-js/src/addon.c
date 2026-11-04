@@ -74,6 +74,8 @@ DROP(trust_source)
 DROP(weak_trust_source)
 DROP(identity_events)
 DROP(files_options)
+DROP(resolver)
+DROP(resolved)
 DROP(transfer_meta)
 DROP(incoming_transfer)
 DROP(incoming_transfer_collect_op)
@@ -907,6 +909,7 @@ WRAP_AS(incoming_transfer)
 WRAP_AS(outgoing_transfer)
 WRAP_AS(handoff)
 WRAP_AS(relay_request)
+WRAP_AS(resolved)
 
 /* `<t>_<x>(h) -> bigint`: an infallible uint64_t accessor (R2). */
 #define U64_OUT(js, t, x) \
@@ -1222,6 +1225,7 @@ SET_INT(runtime_config_set_discovery, runtime_config, discovery)
 SET_HANDLE(runtime_config_set_limits, runtime_config, limits, limits)
 SET_HANDLE(runtime_config_set_guarantees, runtime_config, guarantees, guarantee_set)
 SET_HANDLE(runtime_config_set_reconnect, runtime_config, reconnect, reconnect_policy)
+SET_HANDLE(runtime_config_set_resolver, runtime_config, resolver, resolver)
 
 /* nested configuration */
 
@@ -2266,6 +2270,79 @@ static napi_value relay_request_refuse(napi_env env, napi_callback_info info) {
 FD(relay_request_refuse_op_fd, relay_request_refuse_op)
 WAIT0(relay_request_refuse_op_wait, relay_request_refuse_op)
 
+/* resolver */
+
+NEW0(resolver_new, resolver)
+FD(resolver_fd, resolver)
+
+/* -> lookup | null | AGAIN; null once no configuration or runtime holds it */
+static napi_value resolver_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_resolver *r = live(env, argv[0], drop_resolver);
+    weida_resolved *q = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_resolver_recv(r, 0, &q);
+    if (rc == 0 && !q)
+        return js_null(env);
+    return outcome(env, rc, wrap_resolved, q);
+}
+
+STRING_OUT(resolved_name, resolved, name)
+
+/* -> number | null; null when the URL wrote no port */
+static napi_value resolved_port(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_resolved *q = live(env, argv[0], drop_resolved);
+    uint16_t port = 0;
+    if (!q)
+        return NULL;
+    return weida_resolved_port(q, &port) == 1 ? js_int64(env, port) : js_null(env);
+}
+
+/* -> number, saturated at Number.MAX_SAFE_INTEGER */
+static napi_value resolved_max_addresses(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_resolved *q = live(env, argv[0], drop_resolved);
+    if (!q)
+        return NULL;
+    uint64_t max = weida_resolved_max_addresses(q);
+    return js_int64(env, max > 9007199254740991ULL ? 9007199254740991LL : (int64_t)max);
+}
+
+/* (lookup, string[]) consumes the lookup; a TypeError consumes nothing */
+static napi_value resolved_answer(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    char **addrs = NULL;
+    uint32_t n = 0;
+    if (!string_array(env, argv[1], &addrs, &n))
+        return NULL;
+    weida_resolved *q = take(env, argv[0], drop_resolved);
+    if (!q) {
+        free_strings(addrs, n);
+        return NULL;
+    }
+    int rc = weida_resolved_answer(q, (const char *const *)addrs, n);
+    free_strings(addrs, n);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+/* (lookup, reason) consumes the lookup; a TypeError consumes nothing */
+static napi_value resolved_refuse(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    char *reason = get_string(env, argv[1]);
+    if (!reason)
+        return NULL;
+    weida_resolved *q = take(env, argv[0], drop_resolved);
+    if (!q) {
+        free(reason);
+        return NULL;
+    }
+    int rc = weida_resolved_refuse(q, reason);
+    free(reason);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -2531,6 +2608,7 @@ NAPI_MODULE_INIT() {
         FN("runtimeConfigSetLimits", runtime_config_set_limits),
         FN("runtimeConfigSetGuarantees", runtime_config_set_guarantees),
         FN("runtimeConfigSetReconnect", runtime_config_set_reconnect),
+        FN("runtimeConfigSetResolver", runtime_config_set_resolver),
         FN("limitsNew", limits_new),
         FN("limitsSetMaxHeaderBytes", limits_set_max_header_bytes),
         FN("limitsSetMaxConcurrentUniStreams", limits_set_max_concurrent_uni_streams),
@@ -2718,6 +2796,14 @@ NAPI_MODULE_INIT() {
         FN("relayRequestRefuse", relay_request_refuse),
         FN("relayRequestRefuseOpFd", relay_request_refuse_op_fd),
         FN("relayRequestRefuseOpWait", relay_request_refuse_op_wait),
+        FN("resolverNew", resolver_new),
+        FN("resolverFd", resolver_fd),
+        FN("resolverRecv", resolver_recv),
+        FN("resolvedName", resolved_name),
+        FN("resolvedPort", resolved_port),
+        FN("resolvedMaxAddresses", resolved_max_addresses),
+        FN("resolvedAnswer", resolved_answer),
+        FN("resolvedRefuse", resolved_refuse),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),

@@ -9,7 +9,7 @@ import { closed } from "./errors.js";
 /** The pending watches of a handle object: a Set of entries. */
 export const WAITS = Symbol("weida.waits");
 
-function watch(owner, fd, signal) {
+function watch(owner, fd, signal, weak) {
   return new Promise((resolve, reject) => {
     const entry = {};
     const settle = () => {
@@ -22,10 +22,14 @@ function watch(owner, fd, signal) {
       reject(reason);
     };
     entry.abort = () => entry.cancel(signal.reason);
-    entry.id = native.watch(fd, () => {
-      settle();
-      resolve();
-    });
+    entry.id = native.watch(
+      fd,
+      () => {
+        settle();
+        resolve();
+      },
+      weak === true,
+    );
     owner[WAITS].add(entry);
     signal?.addEventListener("abort", entry.abort, { once: true });
   });
@@ -34,13 +38,14 @@ function watch(owner, fd, signal) {
 /**
  * Runs `attempt()` until it returns something other than AGAIN, watching
  * `fdOf()` in between. `owner` is the object whose `drop()` ends the wait;
- * aborting `signal` ends it with `signal.reason`.
+ * aborting `signal` ends it with `signal.reason`. A `weak` wait does not keep
+ * the process alive.
  */
-export async function call(owner, attempt, fdOf, signal) {
+export async function call(owner, attempt, fdOf, signal, weak = false) {
   signal?.throwIfAborted();
   let rc = attempt();
   while (rc === native.AGAIN) {
-    await watch(owner, fdOf(), signal);
+    await watch(owner, fdOf(), signal, weak);
     rc = attempt();
   }
   return rc;
