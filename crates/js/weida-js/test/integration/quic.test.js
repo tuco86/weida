@@ -58,3 +58,35 @@ test("a wrong pin rejects with WEIDA_EUNTRUSTED carrying the fingerprint", INTEG
   }
   await runtime.shutdown();
 });
+
+test("a QUIC connection reports its transport", INTEGRATION, async () => {
+  const identity = weida.Identity.generate();
+  const fingerprint = identity.fingerprint();
+  const runtime = weida.Runtime.owned();
+  const listener = runtime.listener();
+  const binding = await listener.bindQuic("127.0.0.1:0", new weida.ServerTls(identity));
+  const replier = listener.replier("/echo");
+  const requester = runtime.requester(new weida.ClientTls(new weida.Trust().addPin(fingerprint)));
+  await requester.connect(`weida://${fingerprint}@${binding.localAddr()}/echo`);
+
+  const served = (async () => {
+    const request = await replier.accept();
+    request.takeBody().drop();
+    const out = await request.reply();
+    await out.writeAll("pong");
+    await out.finish().delivered();
+  })();
+  await (await requester.request("ping")).collect(64);
+  await served;
+
+  const [record] = requester.connectionStats();
+  assert.notEqual(record.transport, null);
+  assert.ok(record.transport.path.sentPackets > 0n);
+  assert.ok(record.transport.tx.datagrams > 0n);
+  assert.ok(record.transport.path.currentMtu >= 1200n);
+
+  for (const handle of [requester, replier, binding, listener]) {
+    handle.drop();
+  }
+  await runtime.shutdown();
+});

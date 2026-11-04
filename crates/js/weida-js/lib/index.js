@@ -144,6 +144,22 @@ function freezeMeta(meta) {
   return Object.freeze(meta);
 }
 
+/** Freezes one connection record and the objects inside it. */
+function freezeStats(record) {
+  if (record.transport !== null) {
+    Object.freeze(record.transport.path);
+    Object.freeze(record.transport.tx);
+    Object.freeze(record.transport.rx);
+    Object.freeze(record.transport);
+  }
+  if (record.remote !== null) {
+    Object.freeze(record.remote.tx);
+    Object.freeze(record.remote.rx);
+    Object.freeze(record.remote);
+  }
+  return Object.freeze(record);
+}
+
 /** The value of the weida.h constant `name`, which must start with
  * `prefix`: enumerations travel as the constant names. */
 function constant(prefix, name) {
@@ -356,6 +372,18 @@ export class Runtime extends Handle {
 
   requester(clientTls) {
     return adopt(Requester, native.runtimeRequester(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
+  /** Duplicates this runtime's connections discarded inside a negotiated
+   * deduplication window, a BigInt; 0n without deduplication. */
+  suppressedDuplicates() {
+    return native.runtimeSuppressedDuplicates(this[HANDLE]);
+  }
+
+  /** Outgoing transfers this runtime reset because their deadline passed,
+   * a BigInt. */
+  expiredTransfers() {
+    return native.runtimeExpiredTransfers(this[HANDLE]);
   }
 
   /** Closes every endpoint and waits for the connections to go idle.
@@ -635,6 +663,18 @@ export class Requester extends Handle {
       reply: adopt(ReplyStream, opened.reply),
     });
   }
+
+  /** A frozen array with one frozen record per live connection, in dial
+   * order: `{ url, ageUs, redials, transport, remote }`, every number a
+   * BigInt, `transport` ({ path, tx, rx }) and `remote` null when absent. */
+  connectionStats() {
+    return Object.freeze(native.requesterConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** A new reader of this requester's peer events, from now on. */
+  events() {
+    return adopt(PeerEvents, native.requesterEvents(this[HANDLE]));
+  }
 }
 
 /** The reply half of an exchange `Requester.open` started. Dropping it
@@ -656,6 +696,38 @@ export class ReplyStream extends Handle {
       signal,
     );
     return adopt(IncomingTransfer, transfer);
+  }
+}
+
+/** The peer events of one requester, read like a queue or iterated with
+ * `for await`; the loop ends once the requester is gone, and leaving it
+ * early drops the reader. */
+export class PeerEvents extends Handle {
+  constructor() {
+    super();
+    noConstructor("PeerEvents", "Requester.events()");
+  }
+
+  /** The next event as a frozen object, or null once the requester is gone. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const event = await call(
+      this,
+      () => native.peerEventsRecv(handle),
+      () => native.peerEventsFd(handle),
+      signal,
+    );
+    return event === null ? null : Object.freeze(event);
+  }
+
+  async *[Symbol.asyncIterator]() {
+    try {
+      for (let event = await this.recv(); event !== null; event = await this.recv()) {
+        yield event;
+      }
+    } finally {
+      this.drop();
+    }
   }
 }
 
@@ -692,6 +764,11 @@ export class IncomingRequest extends Handle {
 
   meta() {
     return freezeMeta(native.incomingRequestMeta(this[HANDLE]));
+  }
+
+  /** The number of the connection this request arrived on, a BigInt. */
+  connection() {
+    return native.incomingRequestConnection(this[HANDLE]);
   }
 
   /** Detaches the body, to be read like a socket; once. */
@@ -751,6 +828,11 @@ export class IncomingTransfer extends Handle {
 
   meta() {
     return freezeMeta(native.incomingTransferMeta(this[HANDLE]));
+  }
+
+  /** The number of the connection this transfer arrived on, a BigInt. */
+  connection() {
+    return native.incomingTransferConnection(this[HANDLE]);
   }
 
   /** Up to `cap` bytes; an empty array at the end of the payload. */

@@ -50,6 +50,7 @@ DROP(requester_request_op)
 DROP(requester_open_op)
 DROP(reply_stream)
 DROP(reply_stream_recv_op)
+DROP(peer_events)
 DROP(trust)
 DROP(identity)
 DROP(client_tls)
@@ -239,6 +240,36 @@ static const char *loss_name(int cause) {
         NAME(LOSS_LOCALLY_CLOSED)
         NAME(LOSS_RESET)
         NAME(LOSS_TRANSPORT_ERROR)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *peer_event_name(int kind) {
+    switch (kind) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(PEER_EVENT_CONNECTED)
+        NAME(PEER_EVENT_LOST)
+        NAME(PEER_EVENT_RETRYING)
+        NAME(PEER_EVENT_GAVE_UP)
+        NAME(PEER_EVENT_MISSED)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *give_up_name(int why) {
+    switch (why) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(GIVE_UP_POLICY)
+        NAME(GIVE_UP_PEER_CHANGED)
+        NAME(GIVE_UP_FAILED)
 #undef NAME
     default:
         return NULL;
@@ -500,6 +531,10 @@ static napi_value optional_u64(napi_env env, int present, uint64_t n) {
     return v;
 }
 
+static napi_value optional_u32(napi_env env, int present, uint32_t n) {
+    return present == 1 ? js_int64(env, n) : js_null(env);
+}
+
 /* A new Uint8Array holding a copy of `len` bytes at `data`. */
 static napi_value bytes_value(napi_env env, const uint8_t *data, size_t len) {
     napi_value ab, out;
@@ -596,6 +631,165 @@ static napi_value msg_value(napi_env env, void *ptr) {
     return obj;
 }
 
+/* A connection record's numbers, each read by one getter (R2). */
+typedef int (*stat_fn)(const weida_connection_stats *, size_t, uint64_t *);
+
+struct stat_field {
+    const char *key;
+    stat_fn get;
+};
+
+static const struct stat_field RECORD_FIELDS[] = {
+    {"ageUs", weida_connection_stats_age_us},
+    {"redials", weida_connection_stats_redials},
+};
+
+static const struct stat_field PATH_FIELDS[] = {
+    {"rttUs", weida_connection_stats_transport_path_rtt_us},
+    {"minRttUs", weida_connection_stats_transport_path_min_rtt_us},
+    {"cwnd", weida_connection_stats_transport_path_cwnd},
+    {"congestionEvents", weida_connection_stats_transport_path_congestion_events},
+    {"lostPackets", weida_connection_stats_transport_path_lost_packets},
+    {"lostBytes", weida_connection_stats_transport_path_lost_bytes},
+    {"sentPackets", weida_connection_stats_transport_path_sent_packets},
+    {"currentMtu", weida_connection_stats_transport_path_current_mtu},
+    {"maxDatagramSize", weida_connection_stats_transport_path_max_datagram_size},
+};
+
+static const struct stat_field TRANSPORT_TX_FIELDS[] = {
+    {"datagrams", weida_connection_stats_transport_tx_datagrams},
+    {"bytes", weida_connection_stats_transport_tx_bytes},
+};
+
+static const struct stat_field TRANSPORT_RX_FIELDS[] = {
+    {"datagrams", weida_connection_stats_transport_rx_datagrams},
+    {"bytes", weida_connection_stats_transport_rx_bytes},
+};
+
+static const struct stat_field REMOTE_FIELDS[] = {
+    {"rttUs", weida_connection_stats_remote_rtt_us},
+    {"minRttUs", weida_connection_stats_remote_min_rtt_us},
+    {"cwnd", weida_connection_stats_remote_cwnd},
+    {"congestionEvents", weida_connection_stats_remote_congestion_events},
+    {"lostPackets", weida_connection_stats_remote_lost_packets},
+    {"lostBytes", weida_connection_stats_remote_lost_bytes},
+    {"sentPackets", weida_connection_stats_remote_sent_packets},
+    {"currentMtu", weida_connection_stats_remote_current_mtu},
+    {"ageUs", weida_connection_stats_remote_age_us},
+};
+
+static const struct stat_field REMOTE_TX_FIELDS[] = {
+    {"datagrams", weida_connection_stats_remote_tx_datagrams},
+    {"bytes", weida_connection_stats_remote_tx_bytes},
+};
+
+static const struct stat_field REMOTE_RX_FIELDS[] = {
+    {"datagrams", weida_connection_stats_remote_rx_datagrams},
+    {"bytes", weida_connection_stats_remote_rx_bytes},
+};
+
+#define FIELDS(t) t, sizeof t / sizeof t[0]
+
+/* Sets each of `fields` of record `i` on `obj`, a BigInt or null. */
+static bool set_stats(napi_env env, napi_value obj, const weida_connection_stats *s, size_t i,
+                      const struct stat_field *fields, size_t count) {
+    for (size_t f = 0; f < count; f++) {
+        uint64_t n = 0;
+        int present = fields[f].get(s, i, &n);
+        if (!set(env, obj, fields[f].key, optional_u64(env, present, n)))
+            return false;
+    }
+    return true;
+}
+
+/* A new object holding `fields` of record `i`. */
+static napi_value stat_object(napi_env env, const weida_connection_stats *s, size_t i,
+                              const struct stat_field *fields, size_t count) {
+    napi_value obj;
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    return set_stats(env, obj, s, i, fields, count) ? obj : NULL;
+}
+
+/* `{ url, ageUs, redials, transport, remote }` of record `i`; `transport`
+ * and `remote` are null when the record does not carry them. */
+static napi_value stats_record(napi_env env, const weida_connection_stats *s, size_t i) {
+    napi_value obj, transport, remote;
+    size_t len = 0;
+    uint64_t n = 0;
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    const char *url = weida_connection_stats_url(s, i, &len);
+    if (!set(env, obj, "url", js_string(env, url, len)) ||
+        !set_stats(env, obj, s, i, FIELDS(RECORD_FIELDS)))
+        return NULL;
+    if (weida_connection_stats_transport_path_rtt_us(s, i, &n) == 1) {
+        if (napi_create_object(env, &transport) != napi_ok)
+            return throw_napi(env);
+        if (!set(env, transport, "path", stat_object(env, s, i, FIELDS(PATH_FIELDS))) ||
+            !set(env, transport, "tx", stat_object(env, s, i, FIELDS(TRANSPORT_TX_FIELDS))) ||
+            !set(env, transport, "rx", stat_object(env, s, i, FIELDS(TRANSPORT_RX_FIELDS))))
+            return NULL;
+    } else {
+        transport = js_null(env);
+    }
+    if (weida_connection_stats_remote_rtt_us(s, i, &n) == 1) {
+        remote = stat_object(env, s, i, FIELDS(REMOTE_FIELDS));
+        if (!remote ||
+            !set(env, remote, "tx", stat_object(env, s, i, FIELDS(REMOTE_TX_FIELDS))) ||
+            !set(env, remote, "rx", stat_object(env, s, i, FIELDS(REMOTE_RX_FIELDS))))
+            return NULL;
+    } else {
+        remote = js_null(env);
+    }
+    if (!set(env, obj, "transport", transport) || !set(env, obj, "remote", remote))
+        return NULL;
+    return obj;
+}
+
+/* Copies a weida_peer_event out into a plain object and drops it. */
+static napi_value event_value(napi_env env, void *ptr) {
+    weida_peer_event *e = ptr;
+    napi_value obj = NULL;
+    size_t len = 0;
+    uint64_t n = 0;
+    uint32_t n32 = 0;
+    int c = 0;
+    int present;
+    if (napi_create_object(env, &obj) != napi_ok) {
+        weida_peer_event_drop(e);
+        return throw_napi(env);
+    }
+    bool ok = set(env, obj, "kind",
+                  js_string(env, peer_event_name(weida_peer_event_kind(e)), NAPI_AUTO_LENGTH));
+    const char *s = weida_peer_event_url(e, &len);
+    ok = ok && set(env, obj, "url", js_string(env, s, len));
+    s = weida_peer_event_peer_fingerprint(e, &len);
+    ok = ok && set(env, obj, "peerFingerprint", js_string(env, s, len));
+    ok = ok && set(env, obj, "cause",
+                   weida_peer_event_cause(e, &c) == 1
+                       ? js_string(env, loss_name(c), NAPI_AUTO_LENGTH)
+                       : js_null(env));
+    present = weida_peer_event_attempt(e, &n32);
+    ok = ok && set(env, obj, "attempt", optional_u32(env, present, n32));
+    present = weida_peer_event_delay_us(e, &n);
+    ok = ok && set(env, obj, "delayUs", optional_u64(env, present, n));
+    ok = ok && set(env, obj, "why",
+                   weida_peer_event_why(e, &c) == 1
+                       ? js_string(env, give_up_name(c), NAPI_AUTO_LENGTH)
+                       : js_null(env));
+    present = weida_peer_event_why_attempts(e, &n32);
+    ok = ok && set(env, obj, "whyAttempts", optional_u32(env, present, n32));
+    s = weida_peer_event_why_presented(e, &len);
+    ok = ok && set(env, obj, "whyPresented", js_string(env, s, len));
+    s = weida_peer_event_why_message(e, &len);
+    ok = ok && set(env, obj, "whyMessage", js_string(env, s, len));
+    present = weida_peer_event_missed(e, &n);
+    ok = ok && set(env, obj, "missed", optional_u64(env, present, n));
+    weida_peer_event_drop(e);
+    return ok ? obj : NULL;
+}
+
 /* ---- generated shapes ---- */
 
 #define WRAP_AS(t) \
@@ -605,6 +799,28 @@ WRAP_AS(binding)
 WRAP_AS(incoming_request)
 WRAP_AS(incoming_transfer)
 WRAP_AS(outgoing_transfer)
+
+/* `<t>_<x>(h) -> bigint`: an infallible uint64_t accessor (R2). */
+#define U64_OUT(js, t, x) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_##t *p = live(env, argv[0], drop_##t); \
+        if (!p) \
+            return NULL; \
+        return optional_u64(env, 1, weida_##t##_##x(p)); \
+    }
+
+/* `<t>Connection(h) -> bigint` */
+#define CONNECTION(js, t) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_##t *p = live(env, argv[0], drop_##t); \
+        uint64_t id = 0; \
+        if (!p) \
+            return NULL; \
+        int rc = weida_##t##_connection(p, &id); \
+        return rc < 0 ? throw_rc(env, rc) : optional_u64(env, 1, id); \
+    }
 
 /* `<t>_fd(h) -> number` */
 #define FD(js, t) \
@@ -934,6 +1150,8 @@ static napi_value runtime_shutdown(napi_env env, napi_callback_info info) {
 
 FD(runtime_shutdown_op_fd, runtime_shutdown_op)
 WAIT0(runtime_shutdown_op_wait, runtime_shutdown_op)
+U64_OUT(runtime_suppressed_duplicates, runtime, suppressed_duplicates)
+U64_OUT(runtime_expired_transfers, runtime, expired_transfers)
 
 /* TLS values */
 
@@ -1260,6 +1478,8 @@ static napi_value incoming_request_meta(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : meta_value(env, m);
 }
 
+CONNECTION(incoming_request_connection, incoming_request)
+
 static napi_value incoming_request_take_body(napi_env env, napi_callback_info info) {
     ARGS(1);
     const weida_incoming_request *q = live(env, argv[0], drop_incoming_request);
@@ -1422,6 +1642,62 @@ FD(reply_stream_recv_op_fd, reply_stream_recv_op)
 WAIT1(reply_stream_recv_op_wait, reply_stream_recv_op, weida_incoming_transfer,
       wrap_incoming_transfer)
 
+/* -> record[], copied out of one snapshot */
+static napi_value requester_connection_stats(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_requester *r = live(env, argv[0], drop_requester);
+    weida_connection_stats *s = NULL;
+    napi_value arr = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_requester_connection_stats(r, &s);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    size_t len = weida_connection_stats_len(s);
+    if (napi_create_array_with_length(env, len, &arr) != napi_ok) {
+        arr = throw_napi(env);
+    } else {
+        for (size_t i = 0; i < len; i++) {
+            napi_value record = stats_record(env, s, i);
+            if (!record) {
+                arr = NULL;
+                break;
+            }
+            if (napi_set_element(env, arr, (uint32_t)i, record) != napi_ok) {
+                arr = throw_napi(env);
+                break;
+            }
+        }
+    }
+    weida_connection_stats_drop(s);
+    return arr;
+}
+
+static napi_value requester_events(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_requester *r = live(env, argv[0], drop_requester);
+    weida_peer_events *out = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_requester_events(r, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_peer_events);
+}
+
+FD(peer_events_fd, peer_events)
+
+/* -> event | null | AGAIN; null once the requester is gone */
+static napi_value peer_events_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_peer_events *e = live(env, argv[0], drop_peer_events);
+    weida_peer_event *event = NULL;
+    if (!e)
+        return NULL;
+    int rc = weida_peer_events_recv(e, 0, &event);
+    if (rc == 0 && !event)
+        return js_null(env);
+    return outcome(env, rc, event_value, event);
+}
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -1433,6 +1709,8 @@ static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) 
     int rc = weida_incoming_transfer_meta(t, &m);
     return rc < 0 ? throw_rc(env, rc) : meta_value(env, m);
 }
+
+CONNECTION(incoming_transfer_connection, incoming_transfer)
 
 FD(incoming_transfer_fd, incoming_transfer)
 
@@ -1587,6 +1865,14 @@ static napi_value constants(napi_env env) {
     CONSTANT(ERROR_CODE_UNSUPPORTED)
     CONSTANT(ERROR_CODE_INTERNAL)
     CONSTANT(ERROR_CODE_NO_REPLY)
+    CONSTANT(PEER_EVENT_CONNECTED)
+    CONSTANT(PEER_EVENT_LOST)
+    CONSTANT(PEER_EVENT_RETRYING)
+    CONSTANT(PEER_EVENT_GAVE_UP)
+    CONSTANT(PEER_EVENT_MISSED)
+    CONSTANT(GIVE_UP_POLICY)
+    CONSTANT(GIVE_UP_PEER_CHANGED)
+    CONSTANT(GIVE_UP_FAILED)
 #undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
@@ -1718,6 +2004,8 @@ NAPI_MODULE_INIT() {
         FN("runtimeShutdown", runtime_shutdown),
         FN("runtimeShutdownOpFd", runtime_shutdown_op_fd),
         FN("runtimeShutdownOpWait", runtime_shutdown_op_wait),
+        FN("runtimeSuppressedDuplicates", runtime_suppressed_duplicates),
+        FN("runtimeExpiredTransfers", runtime_expired_transfers),
         FN("trustNew", trust_new),
         FN("trustAddPin", trust_add_pin),
         FN("trustAddAnchor", trust_add_anchor),
@@ -1752,6 +2040,7 @@ NAPI_MODULE_INIT() {
         FN("replierFd", replier_fd),
         FN("replierAccept", replier_accept),
         FN("incomingRequestMeta", incoming_request_meta),
+        FN("incomingRequestConnection", incoming_request_connection),
         FN("incomingRequestTakeBody", incoming_request_take_body),
         FN("incomingRequestReply", incoming_request_reply),
         FN("incomingRequestReplyOpFd", incoming_request_reply_op_fd),
@@ -1775,7 +2064,12 @@ NAPI_MODULE_INIT() {
         FN("replyStreamRecv", reply_stream_recv),
         FN("replyStreamRecvOpFd", reply_stream_recv_op_fd),
         FN("replyStreamRecvOpWait", reply_stream_recv_op_wait),
+        FN("requesterConnectionStats", requester_connection_stats),
+        FN("requesterEvents", requester_events),
+        FN("peerEventsFd", peer_events_fd),
+        FN("peerEventsRecv", peer_events_recv),
         FN("incomingTransferMeta", incoming_transfer_meta),
+        FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),
         FN("incomingTransferRead", incoming_transfer_read),
         FN("incomingTransferCollect", incoming_transfer_collect),

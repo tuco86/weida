@@ -64,6 +64,20 @@ export type ErrorCode =
   | "WEIDA_ERROR_CODE_UNSUPPORTED"
   | "WEIDA_ERROR_CODE_INTERNAL"
   | "WEIDA_ERROR_CODE_NO_REPLY";
+export type LossCause =
+  | "WEIDA_LOSS_IDLE_TIMEOUT"
+  | "WEIDA_LOSS_PEER_CLOSED"
+  | "WEIDA_LOSS_PEER_RESTARTING"
+  | "WEIDA_LOSS_LOCALLY_CLOSED"
+  | "WEIDA_LOSS_RESET"
+  | "WEIDA_LOSS_TRANSPORT_ERROR";
+export type PeerEventKind =
+  | "WEIDA_PEER_EVENT_CONNECTED"
+  | "WEIDA_PEER_EVENT_LOST"
+  | "WEIDA_PEER_EVENT_RETRYING"
+  | "WEIDA_PEER_EVENT_GAVE_UP"
+  | "WEIDA_PEER_EVENT_MISSED";
+export type GiveUp = "WEIDA_GIVE_UP_POLICY" | "WEIDA_GIVE_UP_PEER_CHANGED" | "WEIDA_GIVE_UP_FAILED";
 
 /** `weida::Limits`, the per-connection profile; unset fields keep weida's
  * defaults. */
@@ -188,6 +202,77 @@ export interface Exchange {
   readonly reply: ReplyStream;
 }
 
+/** UDP datagrams and the bytes inside them, in one direction. */
+export interface UdpCounts {
+  readonly datagrams: bigint;
+  readonly bytes: bigint;
+}
+
+/** The path under one QUIC connection; durations in microseconds. */
+export interface PathStats {
+  readonly rttUs: bigint;
+  readonly minRttUs: bigint;
+  readonly cwnd: bigint;
+  readonly congestionEvents: bigint;
+  readonly lostPackets: bigint;
+  readonly lostBytes: bigint;
+  readonly sentPackets: bigint;
+  readonly currentMtu: bigint;
+  /** null when the peer accepts no datagram. */
+  readonly maxDatagramSize: bigint | null;
+}
+
+/** The transport's view of one QUIC connection. */
+export interface TransportStats {
+  readonly path: PathStats;
+  readonly tx: UdpCounts;
+  readonly rx: UdpCounts;
+}
+
+/** The peer's view of the path, from its latest record. */
+export interface RemoteStats {
+  readonly rttUs: bigint;
+  readonly minRttUs: bigint;
+  readonly cwnd: bigint;
+  readonly congestionEvents: bigint;
+  readonly lostPackets: bigint;
+  readonly lostBytes: bigint;
+  readonly sentPackets: bigint;
+  readonly currentMtu: bigint;
+  /** How long ago the record arrived, in microseconds. */
+  readonly ageUs: bigint;
+  readonly tx: UdpCounts;
+  readonly rx: UdpCounts;
+}
+
+/** One live connection of a requester, labelled by the URL it dialled. */
+export interface ConnectionStats {
+  readonly url: string;
+  readonly ageUs: bigint;
+  readonly redials: bigint;
+  /** null on a local transport. */
+  readonly transport: TransportStats | null;
+  /** null until the peer's first record, on a local transport, or with
+   * `pathReport` off on either side. */
+  readonly remote: RemoteStats | null;
+}
+
+/** One transition of one dialled address; a field of another kind is null. */
+export interface PeerEvent {
+  readonly kind: PeerEventKind;
+  /** null for WEIDA_PEER_EVENT_MISSED. */
+  readonly url: string | null;
+  readonly peerFingerprint: string | null;
+  readonly cause: LossCause | null;
+  readonly attempt: number | null;
+  readonly delayUs: bigint | null;
+  readonly why: GiveUp | null;
+  readonly whyAttempts: number | null;
+  readonly whyPresented: string | null;
+  readonly whyMessage: string | null;
+  readonly missed: bigint | null;
+}
+
 /** The metadata an outgoing transfer carries. An unknown field throws a
  * TypeError. */
 export interface TransferMeta {
@@ -217,6 +302,10 @@ export class Runtime extends Handle {
   static owned(config?: RuntimeConfig | RuntimeConfigFields): Runtime;
   listener(): Listener;
   requester(clientTls: ClientTls): Requester;
+  /** Duplicates discarded inside a negotiated deduplication window. */
+  suppressedDuplicates(): bigint;
+  /** Outgoing transfers reset because their deadline passed. */
+  expiredTransfers(): bigint;
   /** Closes every endpoint and waits for the connections to go idle.
    * Consumes the runtime. */
   shutdown(options?: WaitOptions): Promise<void>;
@@ -286,11 +375,21 @@ export class Requester extends Handle {
   requestWith(meta: TransferMeta | null, body: Bytes, options?: WaitOptions): Promise<IncomingTransfer>;
   /** Opens one exchange: the request body to write and the reply stream, independent of each other. */
   open(meta?: TransferMeta | null, options?: WaitOptions): Promise<Exchange>;
+  /** One frozen record per live connection, in dial order. */
+  connectionStats(): readonly ConnectionStats[];
+  /** A new reader of this requester's peer events, from now on. */
+  events(): PeerEvents;
 }
 
 export class ReplyStream extends Handle {
   /** The reply as soon as its header arrives; consumes the stream. */
   recv(options?: WaitOptions): Promise<IncomingTransfer>;
+}
+
+export class PeerEvents extends Handle {
+  /** The next event, or null once the requester is gone. */
+  recv(options?: WaitOptions): Promise<PeerEvent | null>;
+  [Symbol.asyncIterator](): AsyncGenerator<PeerEvent, void, undefined>;
 }
 
 export class Replier extends Handle {
@@ -300,6 +399,8 @@ export class Replier extends Handle {
 
 export class IncomingRequest extends Handle {
   meta(): IncomingMeta;
+  /** The number of the connection this request arrived on. */
+  connection(): bigint;
   takeBody(): IncomingTransfer;
   /** Consumes the request. */
   reply(meta?: TransferMeta | null, options?: WaitOptions): Promise<OutgoingTransfer>;
@@ -311,6 +412,8 @@ export class IncomingRequest extends Handle {
 
 export class IncomingTransfer extends Handle {
   meta(): IncomingMeta;
+  /** The number of the connection this transfer arrived on. */
+  connection(): bigint;
   /** Up to `cap` bytes (default 65536); empty at the end of the payload. */
   read(cap?: number, options?: WaitOptions): Promise<Uint8Array>;
   /** Consumes the transfer. */
