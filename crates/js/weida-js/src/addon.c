@@ -113,6 +113,13 @@ DROP(cursors)
 DROP(reporter)
 DROP(reporter_report_op)
 DROP(reporter_finish_op)
+DROP(peer)
+DROP(peer_connect_op)
+DROP(peer_open_flow_op)
+DROP(acceptor)
+DROP(flow_meta)
+DROP(flow)
+DROP(incoming_flow)
 DROP(transfer_meta)
 DROP(incoming_transfer)
 DROP(incoming_transfer_collect_op)
@@ -389,6 +396,23 @@ static const char *report_mode_name(int mode) {
         return "WEIDA_" #c;
         NAME(REPORT_MODE_PROGRESS)
         NAME(REPORT_MODE_FINAL_ONLY)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *incoming_name(int kind) {
+    switch (kind) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(INCOMING_STREAM)
+        NAME(INCOMING_EXCHANGE)
+        NAME(INCOMING_SUBSCRIBED)
+        NAME(INCOMING_CREDIT)
+        NAME(INCOMING_UNSUBSCRIBED)
+        NAME(INCOMING_FLOW)
 #undef NAME
     default:
         return NULL;
@@ -3714,6 +3738,232 @@ static napi_value reporter_finish(napi_env env, napi_callback_info info) {
 FD(reporter_finish_op_fd, reporter_finish_op)
 WAIT0(reporter_finish_op_wait, reporter_finish_op)
 
+/* flows */
+
+static napi_value runtime_peer(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_runtime *rt = live(env, argv[0], drop_runtime);
+    if (!rt)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[1], drop_client_tls);
+    weida_peer *out = NULL;
+    if (!tls)
+        return NULL;
+    int rc = weida_runtime_peer(rt, tls, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_peer);
+}
+
+STRING_OP(peer_connect, peer, connect)
+FD(peer_connect_op_fd, peer_connect_op)
+WAIT0(peer_connect_op_wait, peer_connect_op)
+
+/* (peer, meta | null) -> op */
+static napi_value peer_open_flow(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_peer *p = live(env, argv[0], drop_peer);
+    void *meta = NULL;
+    weida_peer_open_flow_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_flow_meta, &meta))
+        return NULL;
+    int rc = weida_peer_open_flow(p, meta, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_peer_open_flow_op);
+}
+
+static napi_value wrap_flow(napi_env env, void *p) { return wrap(env, p, drop_flow); }
+
+FD(peer_open_flow_op_fd, peer_open_flow_op)
+WAIT1(peer_open_flow_op_wait, peer_open_flow_op, weida_flow, wrap_flow)
+NEW0(flow_meta_new, flow_meta)
+SET_TEXT(flow_meta_set_content_type, flow_meta, content_type)
+SET_TEXT(flow_meta_set_trace, flow_meta, trace)
+SET_TEXT(flow_meta_set_topic, flow_meta, topic)
+
+static napi_value listener_acceptor(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_acceptor *out = NULL;
+    int rc = weida_listener_acceptor(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_acceptor);
+}
+
+STRING_OUT(acceptor_path, acceptor, path)
+FD(acceptor_fd, acceptor)
+
+/* Copies a weida_incoming out and drops it: `{ kind, flow }` for a flow,
+ * `{ kind }` for the kinds not mapped yet, whose payload the drop drops. */
+static napi_value incoming_value(napi_env env, void *ptr) {
+    weida_incoming *i = ptr;
+    napi_value obj = NULL;
+    int kind = weida_incoming_kind(i);
+    if (napi_create_object(env, &obj) != napi_ok) {
+        weida_incoming_drop(i);
+        return throw_napi(env);
+    }
+    bool ok = set(env, obj, "kind", js_string(env, incoming_name(kind), NAPI_AUTO_LENGTH));
+    if (kind == WEIDA_INCOMING_FLOW) {
+        weida_incoming_flow *f = NULL;
+        int rc = weida_incoming_take_flow(i, &f);
+        if (rc < 0) {
+            napi_value e = throw_rc(env, rc);
+            weida_incoming_drop(i);
+            return e;
+        }
+        weida_incoming_drop(i);
+        napi_value flow = wrap(env, f, drop_incoming_flow);
+        return ok && flow && set(env, obj, "flow", flow) ? obj : NULL;
+    }
+    weida_incoming_drop(i);
+    return ok ? obj : NULL;
+}
+
+static napi_value acceptor_accept(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_acceptor *a = live(env, argv[0], drop_acceptor);
+    weida_incoming *out = NULL;
+    if (!a)
+        return NULL;
+    int rc = weida_acceptor_accept(a, 0, &out);
+    return outcome(env, rc, incoming_value, out);
+}
+
+static napi_value flow_send(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_flow *f = live(env, argv[0], drop_flow);
+    const uint8_t *payload = NULL;
+    size_t len = 0;
+    if (!f || !get_bytes(env, argv[1], &payload, &len))
+        return NULL;
+    int rc = weida_flow_send(f, payload, len);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+/* (flow) -> number | null */
+static napi_value flow_max_payload(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_flow *f = live(env, argv[0], drop_flow);
+    size_t n = 0;
+    if (!f)
+        return NULL;
+    return weida_flow_max_payload(f, &n) == 1 ? js_int64(env, (int64_t)n) : js_null(env);
+}
+
+U64_OUT(flow_sent, flow, sent)
+U64_OUT(flow_too_large, flow, too_large)
+U64_OUT(flow_discarded, flow, discarded)
+U64_OUT(flow_not_live, flow, not_live)
+
+/* Copies a weida_path_stats out into a plain object of BigInts and drops it. */
+static napi_value path_stats_value(napi_env env, weida_path_stats *s) {
+    napi_value obj = NULL;
+    uint64_t n = 0;
+    if (napi_create_object(env, &obj) != napi_ok) {
+        weida_path_stats_drop(s);
+        return throw_napi(env);
+    }
+    bool ok = set(env, obj, "rttUs", optional_u64(env, 1, weida_path_stats_rtt_us(s)));
+    ok = ok && set(env, obj, "minRttUs", optional_u64(env, 1, weida_path_stats_min_rtt_us(s)));
+    ok = ok && set(env, obj, "cwnd", optional_u64(env, 1, weida_path_stats_cwnd(s)));
+    ok = ok && set(env, obj, "congestionEvents",
+                   optional_u64(env, 1, weida_path_stats_congestion_events(s)));
+    ok = ok &&
+         set(env, obj, "lostPackets", optional_u64(env, 1, weida_path_stats_lost_packets(s)));
+    ok = ok && set(env, obj, "lostBytes", optional_u64(env, 1, weida_path_stats_lost_bytes(s)));
+    ok = ok &&
+         set(env, obj, "sentPackets", optional_u64(env, 1, weida_path_stats_sent_packets(s)));
+    ok = ok && set(env, obj, "currentMtu", optional_u64(env, 1, weida_path_stats_current_mtu(s)));
+    int present = weida_path_stats_max_datagram_size(s, &n);
+    ok = ok && set(env, obj, "maxDatagramSize", optional_u64(env, present, n));
+    weida_path_stats_drop(s);
+    return ok ? obj : NULL;
+}
+
+/* What a path_stats call returned: the error, null, or the snapshot. */
+static napi_value path_stats_outcome(napi_env env, int rc, weida_path_stats *s) {
+    if (rc < 0)
+        return throw_rc(env, rc);
+    return rc == 1 ? path_stats_value(env, s) : js_null(env);
+}
+
+static napi_value flow_path_stats(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_flow *f = live(env, argv[0], drop_flow);
+    weida_path_stats *s = NULL;
+    if (!f)
+        return NULL;
+    return path_stats_outcome(env, weida_flow_path_stats(f, &s), s);
+}
+
+/* consumes the flow */
+static napi_value flow_abort(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_flow *f = take(env, argv[0], drop_flow);
+    if (!f)
+        return NULL;
+    weida_flow_abort(f);
+    return js_undefined(env);
+}
+
+static napi_value incoming_flow_info(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_incoming_flow *f = live(env, argv[0], drop_incoming_flow);
+    weida_incoming_meta *m = NULL;
+    if (!f)
+        return NULL;
+    int rc = weida_incoming_flow_info(f, &m);
+    return rc < 0 ? throw_rc(env, rc) : meta_value(env, m);
+}
+
+FD(incoming_flow_fd, incoming_flow)
+
+/* Copies a weida_datagram out into a Uint8Array and drops it. */
+static napi_value datagram_value(napi_env env, void *ptr) {
+    weida_datagram *d = ptr;
+    napi_value v = bytes_value(env, weida_datagram_data(d), weida_datagram_len(d));
+    weida_datagram_drop(d);
+    return v;
+}
+
+/* (flow) -> Uint8Array | null | AGAIN; null once the flow ended */
+static napi_value incoming_flow_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_incoming_flow *f = live(env, argv[0], drop_incoming_flow);
+    weida_datagram *d = NULL;
+    if (!f)
+        return NULL;
+    int rc = weida_incoming_flow_recv(f, 0, &d);
+    if (rc == 0 && !d)
+        return js_null(env);
+    return outcome(env, rc, datagram_value, d);
+}
+
+U64_OUT(incoming_flow_received, incoming_flow, received)
+U64_OUT(incoming_flow_overflow, incoming_flow, overflow)
+
+static napi_value incoming_flow_path_stats(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_incoming_flow *f = live(env, argv[0], drop_incoming_flow);
+    weida_path_stats *s = NULL;
+    if (!f)
+        return NULL;
+    return path_stats_outcome(env, weida_incoming_flow_path_stats(f, &s), s);
+}
+
+/* consumes the incoming flow */
+static napi_value incoming_flow_refuse(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_incoming_flow *f = take(env, argv[0], drop_incoming_flow);
+    if (!f)
+        return NULL;
+    weida_incoming_flow_refuse(f);
+    return js_undefined(env);
+}
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -3906,6 +4156,13 @@ static napi_value constants(napi_env env) {
     CONSTANT(REPORT_MODE_FINAL_ONLY)
     CONSTANT(REPORTER_DEFAULT_BYTES)
     CONSTANT(REPORTER_DEFAULT_INTERVAL_MS)
+    CONSTANT(INCOMING_STREAM)
+    CONSTANT(INCOMING_EXCHANGE)
+    CONSTANT(INCOMING_SUBSCRIBED)
+    CONSTANT(INCOMING_CREDIT)
+    CONSTANT(INCOMING_UNSUBSCRIBED)
+    CONSTANT(INCOMING_FLOW)
+    CONSTANT(DEFAULT_DATAGRAM_RECEIVE_BYTES)
 #undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
@@ -4347,6 +4604,36 @@ NAPI_MODULE_INIT() {
         FN("reporterFinish", reporter_finish),
         FN("reporterFinishOpFd", reporter_finish_op_fd),
         FN("reporterFinishOpWait", reporter_finish_op_wait),
+        FN("runtimePeer", runtime_peer),
+        FN("peerConnect", peer_connect),
+        FN("peerConnectOpFd", peer_connect_op_fd),
+        FN("peerConnectOpWait", peer_connect_op_wait),
+        FN("peerOpenFlow", peer_open_flow),
+        FN("peerOpenFlowOpFd", peer_open_flow_op_fd),
+        FN("peerOpenFlowOpWait", peer_open_flow_op_wait),
+        FN("flowMetaNew", flow_meta_new),
+        FN("flowMetaSetContentType", flow_meta_set_content_type),
+        FN("flowMetaSetTrace", flow_meta_set_trace),
+        FN("flowMetaSetTopic", flow_meta_set_topic),
+        FN("listenerAcceptor", listener_acceptor),
+        FN("acceptorPath", acceptor_path),
+        FN("acceptorFd", acceptor_fd),
+        FN("acceptorAccept", acceptor_accept),
+        FN("flowSend", flow_send),
+        FN("flowMaxPayload", flow_max_payload),
+        FN("flowSent", flow_sent),
+        FN("flowTooLarge", flow_too_large),
+        FN("flowDiscarded", flow_discarded),
+        FN("flowNotLive", flow_not_live),
+        FN("flowPathStats", flow_path_stats),
+        FN("flowAbort", flow_abort),
+        FN("incomingFlowInfo", incoming_flow_info),
+        FN("incomingFlowFd", incoming_flow_fd),
+        FN("incomingFlowRecv", incoming_flow_recv),
+        FN("incomingFlowReceived", incoming_flow_received),
+        FN("incomingFlowOverflow", incoming_flow_overflow),
+        FN("incomingFlowPathStats", incoming_flow_path_stats),
+        FN("incomingFlowRefuse", incoming_flow_refuse),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),

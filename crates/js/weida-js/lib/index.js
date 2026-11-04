@@ -331,6 +331,16 @@ export const MAX_SEGMENT_LAYERS = native.CONSTANTS.WEIDA_MAX_SEGMENT_LAYERS;
 export const CURSOR_LEVEL_APPLICATION_FLOOR =
   native.CONSTANTS.WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR;
 
+/** The `datagramReceiveBytes` a profile with flows uses. */
+export const DEFAULT_DATAGRAM_RECEIVE_BYTES =
+  native.CONSTANTS.WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES;
+
+const FLOW_META_FIELDS = [
+  ["contentType", native.flowMetaSetContentType, "value"],
+  ["trace", native.flowMetaSetTrace, "value"],
+  ["topic", native.flowMetaSetTopic, "value"],
+];
+
 /** A cursor level in: a "WEIDA_ACKNOWLEDGEMENT_*" name becomes its value,
  * an application stage (a number or a BigInt) passes on; C refuses 6 to
  * 15. */
@@ -545,6 +555,11 @@ export class Runtime extends Handle {
    * (WEIDA_EALREADY_REGISTERED): use one runtime per dish. */
   dish(clientTls) {
     return adopt(Dish, native.runtimeDish(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
+  /** A raw peer dialling on `clientTls`, which opens datagram flows. */
+  peer(clientTls) {
+    return adopt(Peer, native.runtimePeer(this[HANDLE], handleOf(clientTls, ClientTls)));
   }
 
   /** Duplicates this runtime's connections discarded inside a negotiated
@@ -1056,6 +1071,12 @@ export class Listener extends Handle {
   radio(path) {
     return adopt(Radio, native.listenerRadio(this[HANDLE], path));
   }
+
+  /** A raw acceptor serving `path`: it takes both stream kinds and flows on
+   * the path, tagged. */
+  acceptor(path) {
+    return adopt(Acceptor, native.listenerAcceptor(this[HANDLE], path));
+  }
 }
 
 /** A QUIC binding: the socket a listener serves on, directly or through a
@@ -1450,6 +1471,188 @@ export class Reporter extends Handle {
       native.reporterFinishOpFd,
       signal,
     );
+  }
+}
+
+/** The dialling side of the stream core: it opens datagram flows to the
+ * peers it dialled, round-robin. */
+export class Peer extends Handle {
+  constructor() {
+    super();
+    noConstructor("Peer", "Runtime.peer()");
+  }
+
+  /** Dials `url`; the runtime redials it when the connection is lost. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.peerConnect(this[HANDLE], url),
+      native.peerConnectOpWait,
+      native.peerConnectOpFd,
+      signal,
+    );
+  }
+
+  /** Registers a datagram flow to the next peer with `meta` (a
+   * `{ contentType?, trace?, topic? }` object, or null), resolving once its
+   * header is written. A refusal arrives later, as a `send` that throws.
+   * Rejects with WEIDA_EDATAGRAMS_UNAVAILABLE unless both runtimes carry
+   * datagrams (`limits.datagramReceiveBytes` above 0). */
+  async openFlow(meta = null, { signal } = {}) {
+    const flow = await op(
+      this,
+      () =>
+        withFields(meta, native.flowMetaNew, FLOW_META_FIELDS, "FlowMeta", (m) =>
+          native.peerOpenFlow(this[HANDLE], m),
+        ),
+      native.peerOpenFlowOpWait,
+      native.peerOpenFlowOpFd,
+      signal,
+    );
+    return adopt(Flow, flow);
+  }
+}
+
+/** The bound side of the stream core, serving one endpoint path. */
+export class Acceptor extends Handle {
+  constructor() {
+    super();
+    noConstructor("Acceptor", "Listener.acceptor()");
+  }
+
+  path() {
+    return native.acceptorPath(this[HANDLE]);
+  }
+
+  /** The next thing that arrived on the path: a frozen
+   * `{ kind: "WEIDA_INCOMING_FLOW", flow }`, or `{ kind }` for the other
+   * kinds, whose payload is dropped at once (a stream is refused
+   * `REJECTED`, an exchange answers `NO_REPLY`). */
+  async accept({ signal } = {}) {
+    const handle = this[HANDLE];
+    const r = await call(
+      this,
+      () => native.acceptorAccept(handle),
+      () => native.acceptorFd(handle),
+      signal,
+    );
+    if (r.kind === "WEIDA_INCOMING_FLOW") {
+      return Object.freeze({ kind: r.kind, flow: adopt(IncomingFlow, r.flow) });
+    }
+    return Object.freeze(r);
+  }
+}
+
+/** The sending half of one datagram flow. `drop()` closes it with FIN: the
+ * receiver sees its end after the datagrams already delivered. */
+export class Flow extends Handle {
+  constructor() {
+    super();
+    noConstructor("Flow", "Peer.openFlow()");
+  }
+
+  /** Sends one datagram (a string is sent as UTF-8). Never waits: it is
+   * handed to the connection, not known to arrive. Throws WEIDA_ETOO_LARGE
+   * (its `max` names the limit) above `maxPayload()`, and on an ended flow
+   * the error that ended it, e.g. WEIDA_EREJECTED. */
+  send(payload) {
+    native.flowSend(this[HANDLE], bytes(payload));
+  }
+
+  /** The largest payload `send` accepts now, or null when the connection
+   * carries no datagrams. */
+  maxPayload() {
+    return native.flowMaxPayload(this[HANDLE]);
+  }
+
+  /** A frozen `{ sent, tooLarge, discarded, notLive }` of BigInts. */
+  stats() {
+    const h = this[HANDLE];
+    return Object.freeze({
+      sent: native.flowSent(h),
+      tooLarge: native.flowTooLarge(h),
+      discarded: native.flowDiscarded(h),
+      notLive: native.flowNotLive(h),
+    });
+  }
+
+  /** The path under the flow, frozen, or null on a local transport. */
+  pathStats() {
+    const p = native.flowPathStats(this[HANDLE]);
+    return p === null ? null : Object.freeze(p);
+  }
+
+  /** Resets the flow `CANCELED`. Consumes it. */
+  abort() {
+    native.flowAbort(consume(this));
+  }
+}
+
+/** The receiving half of one datagram flow, read like a queue or iterated
+ * with `for await`; the loop ends with the flow, and leaving it early drops
+ * the flow. `drop()` stops it `CANCELED`. */
+export class IncomingFlow extends Handle {
+  constructor() {
+    super();
+    noConstructor("IncomingFlow", "Acceptor.accept()");
+  }
+
+  /** What the sender attached, frozen: `{ endpoint, topic, contentType,
+   * trace, peerFingerprint, peerChain, peerLocal }`. */
+  info() {
+    const m = native.incomingFlowInfo(this[HANDLE]);
+    return freezeMeta({
+      endpoint: m.endpoint,
+      topic: m.topic,
+      contentType: m.contentType,
+      trace: m.trace,
+      peerFingerprint: m.peerFingerprint,
+      peerChain: m.peerChain,
+      peerLocal: m.peerLocal,
+    });
+  }
+
+  /** The next datagram, oldest first, or null once the flow ended and every
+   * datagram that arrived before its end was taken. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    return await call(
+      this,
+      () => native.incomingFlowRecv(handle),
+      () => native.incomingFlowFd(handle),
+      signal,
+    );
+  }
+
+  async *[Symbol.asyncIterator]() {
+    try {
+      for (let d = await this.recv(); d !== null; d = await this.recv()) {
+        yield d;
+      }
+    } finally {
+      this.drop();
+    }
+  }
+
+  /** A frozen `{ received, overflow }` of BigInts. */
+  stats() {
+    const h = this[HANDLE];
+    return Object.freeze({
+      received: native.incomingFlowReceived(h),
+      overflow: native.incomingFlowOverflow(h),
+    });
+  }
+
+  /** The path under the flow, frozen, or null on a local transport. */
+  pathStats() {
+    const p = native.incomingFlowPathStats(this[HANDLE]);
+    return p === null ? null : Object.freeze(p);
+  }
+
+  /** Stops the flow `REJECTED`, which the sender's next `send` throws as
+   * WEIDA_EREJECTED. Consumes it. */
+  refuse() {
+    native.incomingFlowRefuse(consume(this));
   }
 }
 

@@ -31,6 +31,9 @@ export const MAX_SEGMENT_LAYERS: number;
 /** The first cursor level an application may name. */
 export const CURSOR_LEVEL_APPLICATION_FLOOR: number;
 
+/** The `datagramReceiveBytes` a profile with flows uses. */
+export const DEFAULT_DATAGRAM_RECEIVE_BYTES: number;
+
 // Enumerations travel as the names of the weida.h constants.
 export type Congestion = "WEIDA_CONGESTION_CUBIC" | "WEIDA_CONGESTION_NEW_RENO" | "WEIDA_CONGESTION_BBR";
 export type Discovery = "WEIDA_DISCOVERY_AWARE" | "WEIDA_DISCOVERY_SINGLE";
@@ -77,6 +80,14 @@ export interface CursorEntry {
 }
 /** The newest offset per reported level, ascending by level. */
 export type CursorSet = readonly CursorEntry[];
+/** What an acceptor took. */
+export type IncomingKind =
+  | "WEIDA_INCOMING_STREAM"
+  | "WEIDA_INCOMING_EXCHANGE"
+  | "WEIDA_INCOMING_SUBSCRIBED"
+  | "WEIDA_INCOMING_CREDIT"
+  | "WEIDA_INCOMING_UNSUBSCRIBED"
+  | "WEIDA_INCOMING_FLOW";
 export type ErrorCode =
   | "WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT"
   | "WEIDA_ERROR_CODE_REJECTED"
@@ -316,6 +327,46 @@ export type Received =
       readonly payload: Uint8Array;
     };
 
+/** What an acceptor took: a flow, or the kind of something else, whose
+ * payload was dropped at once. */
+export type Incoming =
+  | { readonly kind: "WEIDA_INCOMING_FLOW"; readonly flow: IncomingFlow }
+  | { readonly kind: Exclude<IncomingKind, "WEIDA_INCOMING_FLOW"> };
+
+/** What a sender attaches to a flow, once; a label is at most 256 bytes. */
+export interface FlowMeta {
+  contentType?: string | null;
+  /** W3C version-00 `traceparent` text. */
+  trace?: string | null;
+  topic?: string | null;
+}
+
+/** What the receiver learns about a flow when it arrives. */
+export interface FlowInfo {
+  readonly endpoint: string;
+  readonly topic: string | null;
+  readonly contentType: string | null;
+  readonly trace: string | null;
+  readonly peerFingerprint: string | null;
+  readonly peerChain: readonly X509Certificate[] | null;
+  readonly peerLocal: PeerLocal | null;
+}
+
+/** The sender's counters of one flow. */
+export interface FlowStats {
+  readonly sent: bigint;
+  readonly tooLarge: bigint;
+  /** Local transports only. */
+  readonly discarded: bigint;
+  readonly notLive: bigint;
+}
+
+/** The receiver's counters of one flow. */
+export interface IncomingFlowStats {
+  readonly received: bigint;
+  readonly overflow: bigint;
+}
+
 /** A collected payload and the metadata of its transfer. */
 export interface Message {
   readonly payload: Uint8Array;
@@ -474,6 +525,8 @@ export class Runtime extends Handle {
   surveyor(clientTls: ClientTls): Surveyor;
   /** Two dishes on one runtime collide on the path: use one runtime per dish. */
   dish(clientTls: ClientTls): Dish;
+  /** A raw peer that opens datagram flows. */
+  peer(clientTls: ClientTls): Peer;
   /** Duplicates discarded inside a negotiated deduplication window. */
   suppressedDuplicates(): bigint;
   /** Outgoing transfers reset because their deadline passed. */
@@ -601,6 +654,8 @@ export class Listener extends Handle {
   bus(path: string, clientTls: ClientTls): BusMember;
   /** The radio serving `path`; dropping it releases the path. */
   radio(path: string): Radio;
+  /** A raw acceptor: both stream kinds and flows on `path`, tagged. */
+  acceptor(path: string): Acceptor;
   /** Serves a relay on this listener's bindings. */
   relay(): Relay;
 }
@@ -692,6 +747,44 @@ export class Reporter extends Handle {
   report(level: CursorLevel, offset: Count, options?: WaitOptions): Promise<void>;
   /** Flushes the newest offset per reported level. Consumes the reporter. */
   finish(options?: WaitOptions): Promise<void>;
+}
+
+export class Peer extends Handle {
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  /** Resolves once the flow's header is written; a refusal arrives as a
+   * `send` that throws. */
+  openFlow(meta?: FlowMeta | null, options?: WaitOptions): Promise<Flow>;
+}
+
+export class Acceptor extends Handle {
+  path(): string | null;
+  accept(options?: WaitOptions): Promise<Incoming>;
+}
+
+/** `drop()` closes the flow with FIN. */
+export class Flow extends Handle {
+  /** Never waits; throws WEIDA_ETOO_LARGE above `maxPayload()`, and the
+   * error that ended the flow once it ended. */
+  send(payload: Bytes): void;
+  maxPayload(): number | null;
+  stats(): FlowStats;
+  /** null on a local transport. */
+  pathStats(): PathStats | null;
+  /** Resets the flow `CANCELED`. Consumes it. */
+  abort(): void;
+}
+
+/** `drop()` stops the flow `CANCELED`. */
+export class IncomingFlow extends Handle {
+  info(): FlowInfo;
+  /** The next datagram, or null once the flow ended and was drained. */
+  recv(options?: WaitOptions): Promise<Uint8Array | null>;
+  [Symbol.asyncIterator](): AsyncGenerator<Uint8Array, void, undefined>;
+  stats(): IncomingFlowStats;
+  /** null on a local transport. */
+  pathStats(): PathStats | null;
+  /** Stops the flow `REJECTED`. Consumes it. */
+  refuse(): void;
 }
 
 export class Replier extends Handle {
