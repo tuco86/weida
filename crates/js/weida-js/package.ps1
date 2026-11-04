@@ -90,7 +90,7 @@ try {
         Invoke-Native 'npm.cmd' @('install', '--offline', '--no-audit', '--no-fund', $tarballPath)
         Copy-Item -Force -LiteralPath (Join-Path $dir 'smoke.mjs') -Destination $project
 
-        $installed = node -p "JSON.parse(require('fs').readFileSync('node_modules/@tuco86/weida/package.json', 'utf8')).version"
+        $installed = node -p "JSON.parse(require('fs').readFileSync('node_modules/weida/package.json', 'utf8')).version"
         if ($installed -ne $version) {
             throw "package.ps1: the installed package is $installed, not the workspace version $version"
         }

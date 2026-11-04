@@ -119,13 +119,13 @@ wrong pin rejects with WEIDA_EUNTRUSTED carrying the fingerprint".
 
 | Row | Verdict |
 | --- | --- |
-| One package `@tuco86/weida` for every platform: `lib/`, and per platform `prebuilds/<platform>-<arch>/weida.node` with `libweida` beside it, found through the addon's rpath (`$ORIGIN`, `@loader_path`; libweida.dylib's install name is `@rpath/libweida.dylib`); `lib/native.js` loads the one of `process.platform`-`process.arch` and names the missing path otherwise; on Windows `weida.dll` sits beside the addon, which links it and `node.lib` delay-loaded: `src/win32.c` binds `node.exe` to the running executable and loads `weida.dll` from the addon's directory | present; `package.sh` |
+| One package `weida` for every platform: `lib/`, and per platform `prebuilds/<platform>-<arch>/weida.node` with `libweida` beside it, found through the addon's rpath (`$ORIGIN`, `@loader_path`; libweida.dylib's install name is `@rpath/libweida.dylib`); `lib/native.js` loads the one of `process.platform`-`process.arch` and names the missing path otherwise; on Windows `weida.dll` sits beside the addon, which links it and `node.lib` delay-loaded: `src/win32.c` binds `node.exe` to the running executable and loads `weida.dll` from the addon's directory | present; `package.sh` |
 | The packed version is the workspace version (`0.1.0-alpha.11-dev` stays as it is, already semver); the committed `package.json` says `0.0.0-dev` | present; `package.sh` checks the installed version |
 | The tarball installs offline into a fresh project and runs with no Rust toolchain on `PATH` | present; `package.sh` (`package.ps1` on Windows) runs `smoke.mjs` with `PATH` reduced to node, bun, deno and `/usr/bin:/bin` (`%SystemRoot%\System32` and `%SystemRoot%` on Windows) |
 | Node 20 and up (`engines`), Bun and Deno load the same addon through `createRequire` | present; Node 26, Bun 1.4.4, Deno 2.9.8 run (`js-linux-amd64`, `js-linux-arm64`, `js-darwin-arm64`, `js-windows-amd64`) |
 | macOS | present on arm64; `js-darwin-arm64` runs the same tests and smoke with runtimes `js_env` downloads |
 | Windows | present on x64: `js-windows-amd64` builds the addon with MSVC (`build.ps1`) on wohnzimmer and runs the same tests and smoke with runtimes it downloads; the addon and `weida.dll` link the C runtime statically |
-| npm registry | present: a `v*` tag publishes `@tuco86/weida` with the linux-x64, linux-arm64, darwin-arm64 and win32-x64 prebuilds to `https://git.doodleshnookie.net/api/packages/tuco86/npm/` under the dist-tag `latest`; `publish-npm` |
+| npm registry | present: a `v*` tag publishes `weida` with the linux-x64, linux-arm64, darwin-arm64 and win32-x64 prebuilds to npmjs.org under the dist-tag `latest` (`publish-npm`), the first being `0.1.0-alpha.14`; up to `0.1.0-alpha.13` the package was `@tuco86/weida` on the forge's registry |
 
 ## 6. What is not mapped
 

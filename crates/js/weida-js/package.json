@@ -1,8 +1,15 @@
 {
-  "name": "@tuco86/weida",
+  "name": "weida",
   "version": "0.0.0-dev",
   "description": "weida for JavaScript: a Node-API addon over libweida for Node, Bun and Deno",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tuco86/weida.git",
+    "directory": "crates/js/weida-js"
+  },
+  "homepage": "https://weida.doodleshnookie.net",
+  "keywords": ["messaging", "quic", "broker", "async", "protocol"],
   "type": "module",
   "exports": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -11,7 +18,7 @@
     "prebuilds"
   ],
   "publishConfig": {
-    "registry": "https://git.doodleshnookie.net/api/packages/tuco86/npm/"
+    "registry": "https://registry.npmjs.org/"
   },
   "engines": {
     "node": ">=20"

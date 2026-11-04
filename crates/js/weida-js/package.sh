@@ -46,7 +46,7 @@ npm init -y >/dev/null
 npm install --offline --no-audit --no-fund "$out/$tarball"
 cp "$dir/smoke.mjs" .
 
-installed=$(node -p 'JSON.parse(require("fs").readFileSync("node_modules/@tuco86/weida/package.json", "utf8")).version')
+installed=$(node -p 'JSON.parse(require("fs").readFileSync("node_modules/weida/package.json", "utf8")).version')
 if [ "$installed" != "$version" ]; then
     echo "package.sh: the installed package is $installed, not the workspace version $version" >&2
     exit 1

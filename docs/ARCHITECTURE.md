@@ -490,7 +490,7 @@ crates/
     py/weida-py-core/          →  weida-py-core     the shared PyO3 foundation
     py/weida-py/               →  weida (Python)    weida for Python, cffi over libweida;
                                                     not a Cargo member
-    js/weida-js/               →  @tuco86/weida     weida for JavaScript, a Node-API addon
+    js/weida-js/               →  weida (npm)       weida for JavaScript, a Node-API addon
                                                     over libweida; not a Cargo member
     jvm/weida-jvm/             →  net.doodleshnookie.weida
                                                     weida for the JVM and Android, JNI over

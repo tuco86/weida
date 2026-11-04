@@ -4,10 +4,10 @@
 # channels = ["release"]
 # platform = "linux-amd64"
 # image = "js"
-# secrets = ["FORGEJO_NPM_TOKEN"]
+# secrets = ["NPM_TOKEN"]
 # timeout_minutes = 20
 # ///
-# Publishes @tuco86/weida to the Forgejo npm registry for a `v*` tag, after
+# Publishes `weida` to the public npm registry for a `v*` tag, after
 # crates.io (`publish`) and with the prebuilds the four js jobs handed on.
 # A version the registry already has is left alone, so a rerun is safe. A
 # manual run (`run_jobs`) packs, smokes and runs `npm publish --dry-run`.
@@ -15,7 +15,7 @@ set -euo pipefail
 
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 export CARGO_TARGET_DIR="$CI_WORKSPACE/.ci-cache/target"
-registry=https://git.doodleshnookie.net/api/packages/tuco86/npm/
+registry=https://registry.npmjs.org/
 pkg=crates/js/weida-js
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -35,7 +35,7 @@ done
 
 # Packs all four prebuilds and smokes the tarball here, on linux-x64.
 step "$pkg/package.sh"
-tarball="$CARGO_TARGET_DIR/npm/tuco86-weida-$version.tgz"
+tarball="$CARGO_TARGET_DIR/npm/weida-$version.tgz"
 
 if [ "$CI_EVENT" = manual ]; then
     step npm publish --dry-run --tag latest --registry "$registry" "$tarball"
@@ -55,16 +55,16 @@ case "$version" in
         exit 1
         ;;
 esac
-: "${FORGEJO_NPM_TOKEN:?secret FORGEJO_NPM_TOKEN is not available to this event}"
+: "${NPM_TOKEN:?secret NPM_TOKEN is not available to this event}"
 
-if npm view "@tuco86/weida@$version" version --registry "$registry" 2>/dev/null | grep -qx "$version"; then
-    echo "@tuco86/weida $version is already in the registry"
+if npm view "weida@$version" version --registry "$registry" 2>/dev/null | grep -qx "$version"; then
+    echo "weida $version is already in the registry"
     exit 0
 fi
 
 npmrc=$(mktemp)
 trap 'rm -f "$npmrc"' EXIT
-printf '//git.doodleshnookie.net/api/packages/tuco86/npm/:_authToken=%s\n' "$FORGEJO_NPM_TOKEN" >"$npmrc"
-# Every version is a prerelease; `latest` lets `bun add @tuco86/weida`
-# without a version find it.
+printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" >"$npmrc"
+# Every version is a prerelease; `latest` lets `npm install weida` without a
+# version find it.
 step env NPM_CONFIG_USERCONFIG="$npmrc" npm publish --tag latest --registry "$registry" "$tarball"
