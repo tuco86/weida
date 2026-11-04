@@ -142,6 +142,7 @@ function freezeMeta(meta) {
     meta.peerChain = Object.freeze(meta.peerChain.map((der) => x509(der)));
   }
   if (meta.peerLocal != null) Object.freeze(meta.peerLocal);
+  if (meta.gap != null) Object.freeze(meta.gap);
   return Object.freeze(meta);
 }
 
@@ -473,6 +474,17 @@ export class Runtime extends Handle {
 
   requester(clientTls) {
     return adopt(Requester, native.runtimeRequester(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
+  pusher(clientTls) {
+    return adopt(Pusher, native.runtimePusher(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
+  /** A subscriber dialling on `clientTls`. Two subscribers on one runtime
+   * share its pooled connection and collide on the path
+   * (WEIDA_EALREADY_REGISTERED): use one runtime per subscriber of a path. */
+  subscriber(clientTls) {
+    return adopt(Subscriber, native.runtimeSubscriber(this[HANDLE], handleOf(clientTls, ClientTls)));
   }
 
   /** Duplicates this runtime's connections discarded inside a negotiated
@@ -952,6 +964,16 @@ export class Listener extends Handle {
   replier(path) {
     return adopt(Replier, native.listenerReplier(this[HANDLE], path));
   }
+
+  /** The puller serving `path` on every binding of this listener. */
+  puller(path) {
+    return adopt(Puller, native.listenerPuller(this[HANDLE], path));
+  }
+
+  /** The publisher serving `path` on every binding of this listener. */
+  publisher(path) {
+    return adopt(Publisher, native.listenerPublisher(this[HANDLE], path));
+  }
 }
 
 /** A QUIC binding: the socket a listener serves on, directly or through a
@@ -1284,6 +1306,321 @@ export class Replier extends Handle {
       signal,
     );
     return adopt(IncomingRequest, request);
+  }
+}
+
+/** The sending half of Push/Pull: dials pullers and pushes to them
+ * round-robin. */
+export class Pusher extends Handle {
+  constructor() {
+    super();
+    noConstructor("Pusher", "Runtime.pusher()");
+  }
+
+  /** Dials `url`; the runtime redials it when the connection is lost. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.pusherConnect(this[HANDLE], url),
+      native.pusherConnectOpWait,
+      native.pusherConnectOpFd,
+      signal,
+    );
+  }
+
+  /** Forgets a dialled address: whether it was dialled. */
+  disconnect(url) {
+    return native.pusherDisconnect(this[HANDLE], url);
+  }
+
+  /** The number of connected peers. */
+  peerCount() {
+    return native.pusherPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`. */
+  connectionStats() {
+    return Object.freeze(native.pusherConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** A new reader of this pusher's peer events, from now on. */
+  events() {
+    return adopt(PeerEvents, native.pusherEvents(this[HANDLE]));
+  }
+
+  /** The bodies the outbox discarded, a BigInt. */
+  dropped() {
+    return native.pusherDropped(this[HANDLE]);
+  }
+
+  /** Opens a one-way transfer to the next peer with `meta` (a
+   * `TransferMeta` object, or null): written like a socket, and its
+   * `finish()` hands back the delivery receipt `send` discards. Aborting
+   * abandons it. */
+  async open(meta, { signal } = {}) {
+    const transfer = await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.pusherOpen(this[HANDLE], m)),
+      native.pusherOpenOpWait,
+      native.pusherOpenOpFd,
+      signal,
+    );
+    return adopt(OutgoingTransfer, transfer);
+  }
+
+  /** Sends `body` (a string is sent as UTF-8) as one message; resolves once
+   * it is written or held in the outbox. */
+  async send(body, { signal } = {}) {
+    const data = bytes(body);
+    await op(
+      this,
+      () => native.pusherSend(this[HANDLE], data),
+      native.pusherSendOpWait,
+      native.pusherSendOpFd,
+      signal,
+    );
+  }
+
+  /** `send` with metadata (a `TransferMeta` object, or null), copied when
+   * the send starts. */
+  async sendWith(meta, body, { signal } = {}) {
+    const data = bytes(body);
+    await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.pusherSendWith(this[HANDLE], m, data)),
+      native.pusherSendOpWait,
+      native.pusherSendOpFd,
+      signal,
+    );
+  }
+}
+
+/** The receiving half of Push/Pull, serving one endpoint path. */
+export class Puller extends Handle {
+  constructor() {
+    super();
+    noConstructor("Puller", "Listener.puller()");
+  }
+
+  path() {
+    return native.pullerPath(this[HANDLE]);
+  }
+
+  /** The next pushed transfer, as soon as its header arrives. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const transfer = await call(
+      this,
+      () => native.pullerRecv(handle),
+      () => native.pullerFd(handle),
+      signal,
+    );
+    return adopt(IncomingTransfer, transfer);
+  }
+}
+
+/** The publishing half of Pub/Sub, serving one endpoint path. */
+export class Publisher extends Handle {
+  constructor() {
+    super();
+    noConstructor("Publisher", "Listener.publisher()");
+  }
+
+  path() {
+    return native.publisherPath(this[HANDLE]);
+  }
+
+  /** Fans `payload` (a string is sent as UTF-8) out to every subscriber
+   * whose filter matches `topic`, without waiting on any: how many it was
+   * enqueued to. One whose budget is exhausted loses it, counted by
+   * `dropped()`. */
+  publish(topic, payload) {
+    return native.publisherPublish(this[HANDLE], topic, bytes(payload));
+  }
+
+  /** `publish` propagating `trace`, a `traceparent` text. */
+  publishWithTrace(topic, payload, trace) {
+    return native.publisherPublishWithTrace(this[HANDLE], topic, bytes(payload), trace);
+  }
+
+  /** A streamed publish on `topic` to the subscribers matched now. */
+  open(topic) {
+    return adopt(FanOut, native.publisherOpen(this[HANDLE], topic));
+  }
+
+  /** `open` propagating `trace`, a `traceparent` text. */
+  openWithTrace(topic, trace) {
+    return adopt(FanOut, native.publisherOpenWithTrace(this[HANDLE], topic, trace));
+  }
+
+  /** The connections subscribed to this publisher. */
+  subscriberCount() {
+    return native.publisherSubscriberCount(this[HANDLE]);
+  }
+
+  /** The filters registered on this publisher, summed over subscribers. */
+  filterCount() {
+    return native.publisherFilterCount(this[HANDLE]);
+  }
+
+  /** The copies dropped because a subscriber could not take them, a BigInt. */
+  dropped() {
+    return native.publisherDropped(this[HANDLE]);
+  }
+
+  /** What was dropped on `topic`, a frozen `{ topic, subscriberBudget,
+   * subscriberQueue, noParkedConnection, superseded, expired, tooLarge,
+   * noDatagrams, layersCut }` of BigInts, or null when nothing was. */
+  droppedOn(topic) {
+    const [record] = native.publisherDroppedOn(this[HANDLE], topic);
+    return record === undefined ? null : Object.freeze(record);
+  }
+
+  /** A frozen array with one frozen record per topic that lost a copy. */
+  drops() {
+    return Object.freeze(native.publisherDrops(this[HANDLE]).map((r) => Object.freeze(r)));
+  }
+}
+
+/** A publish in progress: one payload written chunk by chunk, a stream per
+ * subscriber. Dropping it without `finish()` aborts every copy. */
+export class FanOut extends Handle {
+  constructor() {
+    super();
+    noConstructor("FanOut", "Publisher.open()");
+  }
+
+  topic() {
+    return native.fanOutTopic(this[HANDLE]);
+  }
+
+  /** The subscribers still receiving this transfer. */
+  subscribers() {
+    return native.fanOutSubscribers(this[HANDLE]);
+  }
+
+  /** Writes `chunk` to every subscriber still receiving, waiting up to
+   * `limitMs` for all of those with no room together: the subscribers left.
+   * Until it settles every other call on the fan-out throws WEIDA_EINVAL.
+   * Aborting abandons the transfer: later writes throw WEIDA_ECANCELED and
+   * `finish()` aborts every copy. */
+  async writeWithin(chunk, limitMs, { signal } = {}) {
+    const data = bytes(chunk);
+    return op(
+      this,
+      () => native.fanOutWriteWithin(this[HANDLE], data, limitMs),
+      native.fanOutWriteWithinOpWait,
+      native.fanOutWriteWithinOpFd,
+      signal,
+    );
+  }
+
+  /** Writes `chunk` without waiting: one with no room loses the transfer.
+   * The subscribers left. */
+  writeNow(chunk) {
+    return native.fanOutWriteNow(this[HANDLE], bytes(chunk));
+  }
+
+  /** Ends the transfer: the subscribers that received all of it. Consumes
+   * the fan-out. */
+  finish() {
+    return native.fanOutFinish(consume(this));
+  }
+}
+
+/** The subscribing half of Pub/Sub. */
+export class Subscriber extends Handle {
+  constructor() {
+    super();
+    noConstructor("Subscriber", "Runtime.subscriber()");
+  }
+
+  /** Dials `url` and subscribes there to every filter registered so far;
+   * the runtime redials it, filters included, when the connection is lost. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.subscriberConnect(this[HANDLE], url),
+      native.subscriberConnectOpWait,
+      native.subscriberConnectOpFd,
+      signal,
+    );
+  }
+
+  /** Forgets a dialled address: whether it was dialled. */
+  disconnect(url) {
+    return native.subscriberDisconnect(this[HANDLE], url);
+  }
+
+  /** The number of connected peers. */
+  peerCount() {
+    return native.subscriberPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`. */
+  connectionStats() {
+    return Object.freeze(native.subscriberConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** A new reader of this subscriber's peer events, from now on. */
+  events() {
+    return adopt(PeerEvents, native.subscriberEvents(this[HANDLE]));
+  }
+
+  /** Registers interest in every topic `filter` matches (PROTOCOL.md §6.4:
+   * `*` one segment, a trailing `#` any number). A filter outside the
+   * grammar rejects with WEIDA_EPROTOCOL. */
+  async subscribe(filter, { signal } = {}) {
+    await op(
+      this,
+      () => native.subscriberSubscribe(this[HANDLE], filter),
+      native.subscriberSubscribeOpWait,
+      native.subscriberSubscribeOpFd,
+      signal,
+    );
+  }
+
+  /** Withdraws `filter`; an unknown one is ignored. */
+  async unsubscribe(filter, { signal } = {}) {
+    await op(
+      this,
+      () => native.subscriberUnsubscribe(this[HANDLE], filter),
+      native.subscriberUnsubscribeOpWait,
+      native.subscriberUnsubscribeOpFd,
+      signal,
+    );
+  }
+
+  /** States how many messages this subscriber accepts in total on `filter`:
+   * the credit a queue serving the path consults, absolute and cumulative. */
+  async grant(filter, limit, { signal } = {}) {
+    await op(
+      this,
+      () => native.subscriberGrant(this[HANDLE], filter, limit),
+      native.subscriberGrantOpWait,
+      native.subscriberGrantOpFd,
+      signal,
+    );
+  }
+
+  /** The filters this subscriber registered. */
+  filterCount() {
+    return native.subscriberFilterCount(this[HANDLE]);
+  }
+
+  /** The next published copy, as soon as its header arrives; its topic is
+   * `meta().topic`. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const transfer = await call(
+      this,
+      () => native.subscriberRecv(handle),
+      () => native.subscriberFd(handle),
+      signal,
+    );
+    return adopt(IncomingTransfer, transfer);
   }
 }
 

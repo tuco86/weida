@@ -204,6 +204,14 @@ export type PeerLocal =
   | { readonly uid: number; readonly gid: number; readonly pid: number | null }
   | { readonly sid: string; readonly pid: number | null };
 
+/** What went missing before a transfer under per-producer ordering: the
+ * number expected next and the one that arrived; `seen - expected`
+ * transfers are missing. */
+export interface Gap {
+  readonly expected: bigint;
+  readonly seen: bigint;
+}
+
 /** The metadata of an inbound transfer or request, copied out at once. */
 export interface IncomingMeta {
   readonly endpoint: string | null;
@@ -218,11 +226,26 @@ export interface IncomingMeta {
   readonly peerLocal: PeerLocal | null;
   readonly contentLen: bigint | null;
   readonly sequence: bigint | null;
+  /** Null when nothing is missing or ordering is off. */
+  readonly gap: Gap | null;
   /** The sender's trace context as `traceparent` text. */
   readonly trace: string | null;
   readonly tracestate: string | null;
   /** The completion level the sender claimed for the message this answers. */
   readonly achieved: Acknowledgement | null;
+}
+
+/** What a publisher dropped on one topic, by cause. */
+export interface TopicDrops {
+  readonly topic: string;
+  readonly subscriberBudget: bigint;
+  readonly subscriberQueue: bigint;
+  readonly noParkedConnection: bigint;
+  readonly superseded: bigint;
+  readonly expired: bigint;
+  readonly tooLarge: bigint;
+  readonly noDatagrams: bigint;
+  readonly layersCut: bigint;
 }
 
 /** A collected payload and the metadata of its transfer. */
@@ -372,6 +395,9 @@ export class Runtime extends Handle {
   static owned(config?: RuntimeConfig | RuntimeConfigFields): Runtime;
   listener(): Listener;
   requester(clientTls: ClientTls): Requester;
+  pusher(clientTls: ClientTls): Pusher;
+  /** Two subscribers on one runtime collide on the path: use one runtime per subscriber of a path. */
+  subscriber(clientTls: ClientTls): Subscriber;
   /** Duplicates discarded inside a negotiated deduplication window. */
   suppressedDuplicates(): bigint;
   /** Outgoing transfers reset because their deadline passed. */
@@ -490,6 +516,8 @@ export class Listener extends Handle {
   /** Throws WEIDA_EUNSUPPORTED off Windows. */
   bindPipe(name: string): PipeBinding;
   replier(path: string): Replier;
+  puller(path: string): Puller;
+  publisher(path: string): Publisher;
   /** Serves a relay on this listener's bindings. */
   relay(): Relay;
 }
@@ -566,6 +594,66 @@ export class IdentityEvents extends Handle {
 export class Replier extends Handle {
   path(): string | null;
   accept(options?: WaitOptions): Promise<IncomingRequest>;
+}
+
+export class Pusher extends Handle {
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  /** Whether the address was dialled. */
+  disconnect(url: string): boolean;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  events(): PeerEvents;
+  /** The bodies the outbox discarded. */
+  dropped(): bigint;
+  /** A one-way transfer to the next peer, whose `finish()` yields the delivery receipt. */
+  open(meta?: TransferMeta | null, options?: WaitOptions): Promise<OutgoingTransfer>;
+  /** Resolves once the body is written or held in the outbox. */
+  send(body: Bytes, options?: WaitOptions): Promise<void>;
+  sendWith(meta: TransferMeta | null, body: Bytes, options?: WaitOptions): Promise<void>;
+}
+
+export class Puller extends Handle {
+  path(): string | null;
+  recv(options?: WaitOptions): Promise<IncomingTransfer>;
+}
+
+export class Publisher extends Handle {
+  path(): string | null;
+  /** How many subscribers the payload was enqueued to; never waits on one. */
+  publish(topic: string, payload: Bytes): number;
+  publishWithTrace(topic: string, payload: Bytes, trace: string): number;
+  open(topic: string): FanOut;
+  openWithTrace(topic: string, trace: string): FanOut;
+  subscriberCount(): number;
+  filterCount(): number;
+  dropped(): bigint;
+  droppedOn(topic: string): TopicDrops | null;
+  drops(): readonly TopicDrops[];
+}
+
+/** A publish in progress; dropping it without `finish()` aborts every copy. */
+export class FanOut extends Handle {
+  topic(): string | null;
+  subscribers(): number;
+  /** The subscribers left; until it settles every other call throws WEIDA_EINVAL. */
+  writeWithin(chunk: Bytes, limitMs: Count, options?: WaitOptions): Promise<number>;
+  writeNow(chunk: Bytes): number;
+  /** The subscribers that received all of it; consumes the fan-out. */
+  finish(): number;
+}
+
+export class Subscriber extends Handle {
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  disconnect(url: string): boolean;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  events(): PeerEvents;
+  /** Rejects with WEIDA_EPROTOCOL for a filter outside the grammar. */
+  subscribe(filter: string, options?: WaitOptions): Promise<void>;
+  unsubscribe(filter: string, options?: WaitOptions): Promise<void>;
+  grant(filter: string, limit: Count, options?: WaitOptions): Promise<void>;
+  filterCount(): number;
+  recv(options?: WaitOptions): Promise<IncomingTransfer>;
 }
 
 export class Relay extends Handle {

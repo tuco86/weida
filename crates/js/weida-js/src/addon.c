@@ -76,6 +76,19 @@ DROP(identity_events)
 DROP(files_options)
 DROP(resolver)
 DROP(resolved)
+DROP(pusher)
+DROP(pusher_connect_op)
+DROP(pusher_send_op)
+DROP(pusher_open_op)
+DROP(puller)
+DROP(publisher)
+DROP(fan_out)
+DROP(fan_out_write_within_op)
+DROP(subscriber)
+DROP(subscriber_connect_op)
+DROP(subscriber_subscribe_op)
+DROP(subscriber_unsubscribe_op)
+DROP(subscriber_grant_op)
 DROP(transfer_meta)
 DROP(incoming_transfer)
 DROP(incoming_transfer_collect_op)
@@ -634,6 +647,21 @@ static napi_value local_value(napi_env env, const weida_incoming_meta *m) {
     return obj;
 }
 
+/* What went missing before a transfer: { expected, seen } as BigInts, or
+ * null when nothing is missing or ordering is off. */
+static napi_value gap_value(napi_env env, const weida_incoming_meta *m) {
+    uint64_t expected = 0, seen = 0;
+    napi_value obj;
+    if (weida_incoming_meta_gap(m, &expected, &seen) != 1)
+        return js_null(env);
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    if (!set(env, obj, "expected", optional_u64(env, 1, expected)) ||
+        !set(env, obj, "seen", optional_u64(env, 1, seen)))
+        return NULL;
+    return obj;
+}
+
 /* Copies a weida_incoming_meta out into a plain object and drops it. */
 static napi_value meta_value(napi_env env, void *ptr) {
     weida_incoming_meta *m = ptr;
@@ -659,6 +687,7 @@ static napi_value meta_value(napi_env env, void *ptr) {
     ok = ok && set(env, obj, "contentLen", optional_u64(env, present, n));
     present = weida_incoming_meta_sequence(m, &n);
     ok = ok && set(env, obj, "sequence", optional_u64(env, present, n));
+    ok = ok && set(env, obj, "gap", gap_value(env, m));
     s = weida_incoming_meta_trace(m, &len);
     ok = ok && set(env, obj, "trace", js_string(env, s, len));
     s = weida_incoming_meta_tracestate(m, &len);
@@ -2154,15 +2183,10 @@ FD(reply_stream_recv_op_fd, reply_stream_recv_op)
 WAIT1(reply_stream_recv_op_wait, reply_stream_recv_op, weida_incoming_transfer,
       wrap_incoming_transfer)
 
-/* -> record[], copied out of one snapshot */
-static napi_value requester_connection_stats(napi_env env, napi_callback_info info) {
-    ARGS(1);
-    const weida_requester *r = live(env, argv[0], drop_requester);
-    weida_connection_stats *s = NULL;
+/* -> record[], copied out of the snapshot a `_connection_stats` call wrote
+ * with status `rc`; the snapshot is dropped on every path. */
+static napi_value stats_array(napi_env env, int rc, weida_connection_stats *s) {
     napi_value arr = NULL;
-    if (!r)
-        return NULL;
-    int rc = weida_requester_connection_stats(r, &s);
     if (rc < 0)
         return throw_rc(env, rc);
     size_t len = weida_connection_stats_len(s);
@@ -2183,6 +2207,17 @@ static napi_value requester_connection_stats(napi_env env, napi_callback_info in
     }
     weida_connection_stats_drop(s);
     return arr;
+}
+
+/* -> record[], copied out of one snapshot */
+static napi_value requester_connection_stats(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_requester *r = live(env, argv[0], drop_requester);
+    weida_connection_stats *s = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_requester_connection_stats(r, &s);
+    return stats_array(env, rc, s);
 }
 
 static napi_value requester_events(napi_env env, napi_callback_info info) {
@@ -2341,6 +2376,465 @@ static napi_value resolved_refuse(napi_env env, napi_callback_info info) {
     int rc = weida_resolved_refuse(q, reason);
     free(reason);
     return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+/* shapes shared by the pusher and the subscriber */
+
+/* `<t>_<x>(h, string) -> op`: the string copied in */
+#define STRING_OP(js, t, x) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *p = live(env, argv[0], drop_##t); \
+        if (!p) \
+            return NULL; \
+        char *s = get_string(env, argv[1]); \
+        if (!s) \
+            return NULL; \
+        weida_##t##_##x##_op *op = NULL; \
+        int rc = weida_##t##_##x(p, s, &op); \
+        free(s); \
+        return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_##t##_##x##_op); \
+    }
+
+/* `<t>_disconnect(h, url) -> boolean`: whether the address was dialled */
+#define DISCONNECT(js, t) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *p = live(env, argv[0], drop_##t); \
+        if (!p) \
+            return NULL; \
+        char *url = get_string(env, argv[1]); \
+        if (!url) \
+            return NULL; \
+        int rc = weida_##t##_disconnect(p, url); \
+        free(url); \
+        return rc < 0 ? throw_rc(env, rc) : js_bool(env, rc == 1); \
+    }
+
+/* `<t>_<x>(h) -> number`: an infallible size_t accessor (R2) */
+#define SIZE_OUT(js, t, x) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_##t *p = live(env, argv[0], drop_##t); \
+        if (!p) \
+            return NULL; \
+        return js_int64(env, (int64_t)weida_##t##_##x(p)); \
+    }
+
+/* `<t>_connection_stats(h) -> record[]` */
+#define CONNECTION_STATS(js, t) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_##t *p = live(env, argv[0], drop_##t); \
+        weida_connection_stats *s = NULL; \
+        if (!p) \
+            return NULL; \
+        int rc = weida_##t##_connection_stats(p, &s); \
+        return stats_array(env, rc, s); \
+    }
+
+/* `<t>_events(h) -> peer events` */
+#define EVENTS(js, t) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_##t *p = live(env, argv[0], drop_##t); \
+        weida_peer_events *out = NULL; \
+        if (!p) \
+            return NULL; \
+        int rc = weida_##t##_events(p, &out); \
+        return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_peer_events); \
+    }
+
+/* push/pull */
+
+static napi_value runtime_pusher(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_runtime *rt = live(env, argv[0], drop_runtime);
+    if (!rt)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[1], drop_client_tls);
+    weida_pusher *out = NULL;
+    if (!tls)
+        return NULL;
+    int rc = weida_runtime_pusher(rt, tls, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_pusher);
+}
+
+STRING_OP(pusher_connect, pusher, connect)
+FD(pusher_connect_op_fd, pusher_connect_op)
+WAIT0(pusher_connect_op_wait, pusher_connect_op)
+DISCONNECT(pusher_disconnect, pusher)
+SIZE_OUT(pusher_peer_count, pusher, peer_count)
+U64_OUT(pusher_dropped, pusher, dropped)
+CONNECTION_STATS(pusher_connection_stats, pusher)
+EVENTS(pusher_events, pusher)
+
+static napi_value pusher_open(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_pusher *p = live(env, argv[0], drop_pusher);
+    void *meta = NULL;
+    weida_pusher_open_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_transfer_meta, &meta))
+        return NULL;
+    int rc = weida_pusher_open(p, meta, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_pusher_open_op);
+}
+
+FD(pusher_open_op_fd, pusher_open_op)
+WAIT1(pusher_open_op_wait, pusher_open_op, weida_outgoing_transfer, wrap_outgoing_transfer)
+
+static napi_value pusher_send(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_pusher *p = live(env, argv[0], drop_pusher);
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_pusher_send_op *op = NULL;
+    if (!p || !get_bytes(env, argv[1], &body, &len))
+        return NULL;
+    int rc = weida_pusher_send(p, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_pusher_send_op);
+}
+
+static napi_value pusher_send_with(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_pusher *p = live(env, argv[0], drop_pusher);
+    void *meta = NULL;
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_pusher_send_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_transfer_meta, &meta) ||
+        !get_bytes(env, argv[2], &body, &len))
+        return NULL;
+    int rc = weida_pusher_send_with(p, meta, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_pusher_send_op);
+}
+
+FD(pusher_send_op_fd, pusher_send_op)
+WAIT0(pusher_send_op_wait, pusher_send_op)
+
+static napi_value listener_puller(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_puller *out = NULL;
+    int rc = weida_listener_puller(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_puller);
+}
+
+STRING_OUT(puller_path, puller, path)
+FD(puller_fd, puller)
+
+static napi_value puller_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_puller *p = live(env, argv[0], drop_puller);
+    weida_incoming_transfer *out = NULL;
+    if (!p)
+        return NULL;
+    int rc = weida_puller_recv(p, 0, &out);
+    return outcome(env, rc, wrap_incoming_transfer, out);
+}
+
+/* pub/sub */
+
+typedef int (*drops_fn)(const weida_topic_drops *, size_t, uint64_t *);
+
+static const struct {
+    const char *key;
+    drops_fn get;
+} DROPS_FIELDS[] = {
+    {"subscriberBudget", weida_topic_drops_subscriber_budget},
+    {"subscriberQueue", weida_topic_drops_subscriber_queue},
+    {"noParkedConnection", weida_topic_drops_no_parked_connection},
+    {"superseded", weida_topic_drops_superseded},
+    {"expired", weida_topic_drops_expired},
+    {"tooLarge", weida_topic_drops_too_large},
+    {"noDatagrams", weida_topic_drops_no_datagrams},
+    {"layersCut", weida_topic_drops_layers_cut},
+};
+
+/* `{ topic, subscriberBudget, ... }` of record `i`, the counts as BigInts. */
+static napi_value drops_record(napi_env env, const weida_topic_drops *d, size_t i) {
+    napi_value obj;
+    size_t len = 0;
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    const char *topic = weida_topic_drops_topic(d, i, &len);
+    if (!set(env, obj, "topic", js_string(env, topic, len)))
+        return NULL;
+    for (size_t f = 0; f < sizeof DROPS_FIELDS / sizeof DROPS_FIELDS[0]; f++) {
+        uint64_t n = 0;
+        int present = DROPS_FIELDS[f].get(d, i, &n);
+        if (!set(env, obj, DROPS_FIELDS[f].key, optional_u64(env, present, n)))
+            return NULL;
+    }
+    return obj;
+}
+
+/* -> record[], copied out of the snapshot a drops call wrote with status
+ * `rc`; the snapshot is dropped on every path. */
+static napi_value topic_drops_array(napi_env env, int rc, weida_topic_drops *d) {
+    napi_value arr = NULL;
+    if (rc < 0)
+        return throw_rc(env, rc);
+    size_t len = weida_topic_drops_len(d);
+    if (napi_create_array_with_length(env, len, &arr) != napi_ok) {
+        arr = throw_napi(env);
+    } else {
+        for (size_t i = 0; i < len; i++) {
+            napi_value record = drops_record(env, d, i);
+            if (!record) {
+                arr = NULL;
+                break;
+            }
+            if (napi_set_element(env, arr, (uint32_t)i, record) != napi_ok) {
+                arr = throw_napi(env);
+                break;
+            }
+        }
+    }
+    weida_topic_drops_drop(d);
+    return arr;
+}
+
+static napi_value listener_publisher(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_publisher *out = NULL;
+    int rc = weida_listener_publisher(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_publisher);
+}
+
+STRING_OUT(publisher_path, publisher, path)
+
+/* (publisher, topic, bytes) -> number: the subscribers it was enqueued to */
+static napi_value publisher_publish(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_publisher *p = live(env, argv[0], drop_publisher);
+    const uint8_t *data = NULL;
+    size_t len = 0, n = 0;
+    if (!p || !get_bytes(env, argv[2], &data, &len))
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    int rc = weida_publisher_publish(p, topic, data, len, &n);
+    free(topic);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+/* (publisher, topic, bytes, traceparent) -> number */
+static napi_value publisher_publish_with_trace(napi_env env, napi_callback_info info) {
+    ARGS(4);
+    const weida_publisher *p = live(env, argv[0], drop_publisher);
+    const uint8_t *data = NULL;
+    size_t len = 0, n = 0;
+    if (!p || !get_bytes(env, argv[2], &data, &len))
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    char *trace = get_string(env, argv[3]);
+    if (!trace) {
+        free(topic);
+        return NULL;
+    }
+    int rc = weida_publisher_publish_with_trace(p, topic, data, len, trace, &n);
+    free(trace);
+    free(topic);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+static napi_value publisher_open(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_publisher *p = live(env, argv[0], drop_publisher);
+    if (!p)
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    weida_fan_out *out = NULL;
+    int rc = weida_publisher_open(p, topic, &out);
+    free(topic);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_fan_out);
+}
+
+static napi_value publisher_open_with_trace(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_publisher *p = live(env, argv[0], drop_publisher);
+    if (!p)
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    char *trace = get_string(env, argv[2]);
+    if (!trace) {
+        free(topic);
+        return NULL;
+    }
+    weida_fan_out *out = NULL;
+    int rc = weida_publisher_open_with_trace(p, topic, trace, &out);
+    free(trace);
+    free(topic);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_fan_out);
+}
+
+SIZE_OUT(publisher_subscriber_count, publisher, subscriber_count)
+SIZE_OUT(publisher_filter_count, publisher, filter_count)
+U64_OUT(publisher_dropped, publisher, dropped)
+
+static napi_value publisher_dropped_on(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_publisher *p = live(env, argv[0], drop_publisher);
+    if (!p)
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    weida_topic_drops *d = NULL;
+    int rc = weida_publisher_dropped_on(p, topic, &d);
+    free(topic);
+    return topic_drops_array(env, rc, d);
+}
+
+static napi_value publisher_drops(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_publisher *p = live(env, argv[0], drop_publisher);
+    weida_topic_drops *d = NULL;
+    if (!p)
+        return NULL;
+    int rc = weida_publisher_drops(p, &d);
+    return topic_drops_array(env, rc, d);
+}
+
+STRING_OUT(fan_out_topic, fan_out, topic)
+
+static napi_value fan_out_subscribers(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_fan_out *f = live(env, argv[0], drop_fan_out);
+    size_t n = 0;
+    if (!f)
+        return NULL;
+    int rc = weida_fan_out_subscribers(f, &n);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+/* (fan-out, bytes, limitMs) -> op */
+static napi_value fan_out_write_within(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_fan_out *f = live(env, argv[0], drop_fan_out);
+    const uint8_t *chunk = NULL;
+    size_t len = 0;
+    uint64_t limit_ms = 0;
+    weida_fan_out_write_within_op *op = NULL;
+    if (!f || !get_bytes(env, argv[1], &chunk, &len) ||
+        !get_u64(env, argv[2], UINT64_MAX, &limit_ms))
+        return NULL;
+    int rc = weida_fan_out_write_within(f, chunk, len, limit_ms, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_fan_out_write_within_op);
+}
+
+FD(fan_out_write_within_op_fd, fan_out_write_within_op)
+
+/* -> number | AGAIN: the subscribers left */
+static napi_value fan_out_write_within_op_wait(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_fan_out_write_within_op *p = live(env, argv[0], drop_fan_out_write_within_op);
+    if (!p)
+        return NULL;
+    size_t n = 0;
+    int rc = weida_fan_out_write_within_op_wait(p, 0, &n);
+    return rc == 0 ? js_int64(env, (int64_t)n) : outcome(env, rc, NULL, NULL);
+}
+
+static napi_value fan_out_write_now(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_fan_out *f = live(env, argv[0], drop_fan_out);
+    const uint8_t *chunk = NULL;
+    size_t len = 0, n = 0;
+    if (!f || !get_bytes(env, argv[1], &chunk, &len))
+        return NULL;
+    int rc = weida_fan_out_write_now(f, chunk, len, &n);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+/* consumes the fan-out -> number: the subscribers that received all of it */
+static napi_value fan_out_finish(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_fan_out *f = take(env, argv[0], drop_fan_out);
+    size_t n = 0;
+    if (!f)
+        return NULL;
+    int rc = weida_fan_out_finish(f, &n);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+static napi_value runtime_subscriber(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_runtime *rt = live(env, argv[0], drop_runtime);
+    if (!rt)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[1], drop_client_tls);
+    weida_subscriber *out = NULL;
+    if (!tls)
+        return NULL;
+    int rc = weida_runtime_subscriber(rt, tls, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_subscriber);
+}
+
+STRING_OP(subscriber_connect, subscriber, connect)
+FD(subscriber_connect_op_fd, subscriber_connect_op)
+WAIT0(subscriber_connect_op_wait, subscriber_connect_op)
+DISCONNECT(subscriber_disconnect, subscriber)
+SIZE_OUT(subscriber_peer_count, subscriber, peer_count)
+CONNECTION_STATS(subscriber_connection_stats, subscriber)
+EVENTS(subscriber_events, subscriber)
+STRING_OP(subscriber_subscribe, subscriber, subscribe)
+FD(subscriber_subscribe_op_fd, subscriber_subscribe_op)
+WAIT0(subscriber_subscribe_op_wait, subscriber_subscribe_op)
+STRING_OP(subscriber_unsubscribe, subscriber, unsubscribe)
+FD(subscriber_unsubscribe_op_fd, subscriber_unsubscribe_op)
+WAIT0(subscriber_unsubscribe_op_wait, subscriber_unsubscribe_op)
+
+/* (subscriber, filter, limit) -> op */
+static napi_value subscriber_grant(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_subscriber *s = live(env, argv[0], drop_subscriber);
+    uint64_t limit = 0;
+    if (!s || !get_u64(env, argv[2], UINT64_MAX, &limit))
+        return NULL;
+    char *filter = get_string(env, argv[1]);
+    if (!filter)
+        return NULL;
+    weida_subscriber_grant_op *op = NULL;
+    int rc = weida_subscriber_grant(s, filter, limit, &op);
+    free(filter);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_subscriber_grant_op);
+}
+
+FD(subscriber_grant_op_fd, subscriber_grant_op)
+WAIT0(subscriber_grant_op_wait, subscriber_grant_op)
+SIZE_OUT(subscriber_filter_count, subscriber, filter_count)
+FD(subscriber_fd, subscriber)
+
+static napi_value subscriber_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_subscriber *s = live(env, argv[0], drop_subscriber);
+    weida_incoming_transfer *out = NULL;
+    if (!s)
+        return NULL;
+    int rc = weida_subscriber_recv(s, 0, &out);
+    return outcome(env, rc, wrap_incoming_transfer, out);
 }
 
 /* incoming transfer */
@@ -2804,6 +3298,64 @@ NAPI_MODULE_INIT() {
         FN("resolvedMaxAddresses", resolved_max_addresses),
         FN("resolvedAnswer", resolved_answer),
         FN("resolvedRefuse", resolved_refuse),
+        FN("runtimePusher", runtime_pusher),
+        FN("pusherConnect", pusher_connect),
+        FN("pusherConnectOpFd", pusher_connect_op_fd),
+        FN("pusherConnectOpWait", pusher_connect_op_wait),
+        FN("pusherDisconnect", pusher_disconnect),
+        FN("pusherPeerCount", pusher_peer_count),
+        FN("pusherDropped", pusher_dropped),
+        FN("pusherConnectionStats", pusher_connection_stats),
+        FN("pusherEvents", pusher_events),
+        FN("pusherOpen", pusher_open),
+        FN("pusherOpenOpFd", pusher_open_op_fd),
+        FN("pusherOpenOpWait", pusher_open_op_wait),
+        FN("pusherSend", pusher_send),
+        FN("pusherSendWith", pusher_send_with),
+        FN("pusherSendOpFd", pusher_send_op_fd),
+        FN("pusherSendOpWait", pusher_send_op_wait),
+        FN("listenerPuller", listener_puller),
+        FN("pullerPath", puller_path),
+        FN("pullerFd", puller_fd),
+        FN("pullerRecv", puller_recv),
+        FN("listenerPublisher", listener_publisher),
+        FN("publisherPath", publisher_path),
+        FN("publisherPublish", publisher_publish),
+        FN("publisherPublishWithTrace", publisher_publish_with_trace),
+        FN("publisherOpen", publisher_open),
+        FN("publisherOpenWithTrace", publisher_open_with_trace),
+        FN("publisherSubscriberCount", publisher_subscriber_count),
+        FN("publisherFilterCount", publisher_filter_count),
+        FN("publisherDropped", publisher_dropped),
+        FN("publisherDroppedOn", publisher_dropped_on),
+        FN("publisherDrops", publisher_drops),
+        FN("fanOutTopic", fan_out_topic),
+        FN("fanOutSubscribers", fan_out_subscribers),
+        FN("fanOutWriteWithin", fan_out_write_within),
+        FN("fanOutWriteWithinOpFd", fan_out_write_within_op_fd),
+        FN("fanOutWriteWithinOpWait", fan_out_write_within_op_wait),
+        FN("fanOutWriteNow", fan_out_write_now),
+        FN("fanOutFinish", fan_out_finish),
+        FN("runtimeSubscriber", runtime_subscriber),
+        FN("subscriberConnect", subscriber_connect),
+        FN("subscriberConnectOpFd", subscriber_connect_op_fd),
+        FN("subscriberConnectOpWait", subscriber_connect_op_wait),
+        FN("subscriberDisconnect", subscriber_disconnect),
+        FN("subscriberPeerCount", subscriber_peer_count),
+        FN("subscriberConnectionStats", subscriber_connection_stats),
+        FN("subscriberEvents", subscriber_events),
+        FN("subscriberSubscribe", subscriber_subscribe),
+        FN("subscriberSubscribeOpFd", subscriber_subscribe_op_fd),
+        FN("subscriberSubscribeOpWait", subscriber_subscribe_op_wait),
+        FN("subscriberUnsubscribe", subscriber_unsubscribe),
+        FN("subscriberUnsubscribeOpFd", subscriber_unsubscribe_op_fd),
+        FN("subscriberUnsubscribeOpWait", subscriber_unsubscribe_op_wait),
+        FN("subscriberGrant", subscriber_grant),
+        FN("subscriberGrantOpFd", subscriber_grant_op_fd),
+        FN("subscriberGrantOpWait", subscriber_grant_op_wait),
+        FN("subscriberFilterCount", subscriber_filter_count),
+        FN("subscriberFd", subscriber_fd),
+        FN("subscriberRecv", subscriber_recv),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),
