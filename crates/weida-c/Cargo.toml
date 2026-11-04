@@ -29,8 +29,9 @@ doctest = false
 
 [dependencies]
 # The Rust crate itself, renamed so that it does not collide with this lib
-# target's own name.
-weida_rs = { package = "weida", path = "../weida" }
+# target's own name. `swarm` links the piece tree's BLAKE3 for SWARM
+# (docs/c/swarm.md).
+weida_rs = { package = "weida", path = "../weida", features = ["swarm"] }
 weida-core.workspace = true
 weida-runtime.workspace = true
 tokio.workspace = true

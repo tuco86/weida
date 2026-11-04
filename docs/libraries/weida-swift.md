@@ -156,6 +156,11 @@ The C ABI's *flows* and *raw peers* areas are absent here: `weida_runtime_peer`,
 `weida_credit_grant`, `weida_flow_meta`, `weida_flow`, `weida_incoming_flow`, `weida_datagram`
 and `weida_path_stats`.
 
+The C ABI's *swarm* area is absent here: `weida_runtime_swarm`, `weida_swarm`,
+`weida_fetch_options`, `weida_fetch`, `weida_piece`, `weida_listener_seeder`, `weida_seeder`,
+`weida_seed_session`, `weida_blob`, `weida_piece_list`, `weida_tree_hasher`, `weida_bits` and
+`weida_blob_id_of`.
+
 ## 7. Sources
 
 `crates/swift/weida/` (`Package.swift`, `build-xcframework.sh`, `Sources/Weida/` with

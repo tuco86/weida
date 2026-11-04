@@ -12,6 +12,7 @@
 
 #![allow(non_camel_case_types)]
 
+mod blob;
 mod bus;
 mod config;
 mod consumer;
@@ -36,12 +37,14 @@ mod runtime;
 mod segment;
 mod stats;
 mod survey;
+mod swarm;
 mod tls;
 mod transfer;
 mod try_handle;
 
 use std::ffi::c_char;
 
+pub use blob::*;
 pub use bus::*;
 pub use config::*;
 pub use consumer::*;
@@ -63,6 +66,7 @@ pub use runtime::*;
 pub use segment::*;
 pub use stats::*;
 pub use survey::*;
+pub use swarm::*;
 pub use tls::*;
 pub use transfer::*;
 /// The library's version, e.g. `"0.1.0-alpha.11-dev"`. The string is

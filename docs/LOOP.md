@@ -131,8 +131,9 @@ on both Linux architectures and run the language jobs on it (`python-`, `js-`, `
 
 **`--workspace` is not the whole workspace.** It builds every crate in its *default*
 configuration, so code behind a default-off feature is compiled by none of the four commands
-above — the `swarm` pattern, HTTP/3 and three synchronous facades, as of this writing. A commit that touches Rust
-therefore also runs, for each crate whose sources it touched:
+above — HTTP/3 and three synchronous facades, as of this writing. The `swarm` pattern reaches the
+workspace clippy only because `weida-c` enables it, and `-p weida` runs none of its tests. A
+commit that touches Rust therefore also runs, for each crate whose sources it touched:
 
 | crate | feature | commands |
 | --- | --- | --- |

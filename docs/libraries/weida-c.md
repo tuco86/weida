@@ -37,7 +37,7 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::pair`, `surveyor` | `weida_runtime_pair`, `weida_runtime_surveyor` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
 | `Runtime::dish` | `weida_runtime_dish` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
 | `Runtime::peer` | `weida_runtime_peer` | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
-| `Runtime::swarm` | — | absent: *swarm* |
+| `Runtime::swarm` | `weida_runtime_swarm` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
 | `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
 | `Runtime::suppressed_duplicates`, `expired_transfers` | `weida_runtime_suppressed_duplicates`, `weida_runtime_expired_transfers` | present; `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (counts 0 then 1), `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport` (0 without deduplication) (*stats*) |
 | `Runtime::exec` | — | refused: it is the binding's own seam |
@@ -57,7 +57,7 @@ unit tests in `crates/weida-c/src/`.
 | `Listener::pair`, `respondent`, `bus` | `weida_listener_pair`, `weida_listener_respondent`, `weida_listener_bus` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window`, `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
 | `Listener::radio` | `weida_listener_radio` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
 | `Listener::acceptor` | `weida_listener_acceptor` | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
-| `Listener::seeder` | — | absent: *swarm* |
+| `Listener::seeder` | `weida_listener_seeder` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
 | `Binding::local_addr` | `weida_binding_local_addr` | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Binding::close` | `weida_binding_close` (op) | present; `abi::a_closed_binding_refuses_the_next_dial` (*binding lifecycle*) |
 | `Binding::hand_over`, `Handoff::held`, `local_addr`, `into_parts` | `weida_binding_hand_over` (op, consumes; its wait yields a `weida_handoff`), `weida_handoff_held`, `_local_addr`, `_take_socket`, `_bytes` | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
@@ -310,8 +310,38 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingFlow::refuse` | `weida_incoming_flow_refuse` (consumes) | present; `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
 | `Drop for IncomingFlow` (`CANCELED`) | `weida_incoming_flow_drop` | present; R1 (*flows*) |
 
-SWARM (`Seeder`, `Swarm`, `Fetch`, `Blob`, `BlobId` and the rest behind the `swarm` feature):
-each absent, in the area *swarm*.
+SWARM, behind weida's `swarm` feature, which `crates/weida-c` enables ([swarm.md](../c/swarm.md)):
+
+| `crates/weida` | C ABI | Verdict |
+| --- | --- | --- |
+| `Swarm::connect` | `weida_swarm_connect` (op) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `Swarm::disconnect`, `peer_count`, `connection_stats`, `events` | `weida_swarm_disconnect` (1 or 0), `_peer_count`, `_connection_stats` (a snapshot handle), `_events` (a `weida_peer_events` queue) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `Swarm::fetch` | `weida_swarm_fetch` (NULL options are the default) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `Drop for Swarm` | `weida_swarm_drop` | present; R1 (*swarm*) |
+| `FetchOptions` (`list`, `stall`, `min_rate`, `per_peer`, `max_inflight`, `max_peers`, `have_refresh`) | `weida_fetch_options_new`, `_set_list`, `_set_stall_ms`, `_set_min_rate`, `_set_per_peer`, `_set_max_inflight`, `_set_max_peers`, `_set_have_refresh_ms`, `_drop` (a builder) | present; `swarm::tests::fetch_options_setters_land_on_their_fields`, `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `Fetch::next` | `weida_fetch_next` (try, R3a; a `weida_piece`, NULL at the end), `_fd` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `Fetch::blob`, `list`, `delivered`, `in_flight` | `weida_fetch_blob`, `_list` (1 and a `weida_piece_list`, or 0 with NULL), `_delivered`, `_in_flight` (`weida_bits` copies) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `Drop for Fetch` (aborts every order) | `weida_fetch_drop` | present; R1 (*swarm*) |
+| `Piece` (`index`, `bytes`) | `weida_piece` (`_index`, `_bytes`, `_drop`) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `Seeder::path` | `weida_seeder_path` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `Seeder::accept` | `weida_seeder_accept` (try, R3a; a `weida_seed_session`), `_fd` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `Drop for Seeder` | `weida_seeder_drop` | present; R1 (*swarm*) |
+| `SeedSession::blob`, `meta`, `connection` | `weida_seed_session_blob`, `_meta`, `_connection` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `SeedSession::next`, `Ask` | `weida_seed_session_next` (try, R3a; 1 with `WEIDA_ASK_*` and the piece index, 0 at the end), `_fd` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `SeedSession::answer_list`, `answer_have`, `answer_piece` | `weida_seed_session_answer_list`, `_answer_have`, `_answer_piece` (ops) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `SeedSession::decline` | `weida_seed_session_decline` (op, consumes) | present; `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `Drop for SeedSession` | `weida_seed_session_drop` | present; R1 (*swarm*) |
+| `BlobId` (`from_bytes`, `as_bytes`, `of`) | its 32 bytes (`WEIDA_BLOB_ID_LEN`), `weida_blob_id_of` | present; `blob::tests::a_tree_hashers_list_checks_every_piece_and_matches_the_root`, `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `BlobId`'s `Display`, `FromStr`, `ParseBlobIdError` | — | refused: hex text of the 32 bytes the caller holds |
+| `PieceSize` (`MIN`, `MAX`, `DEFAULT`, `from_log2`, `log2`) | its base-2 logarithm, `uint8_t`; `WEIDA_PIECE_SIZE_MIN_LOG2`, `_MAX_LOG2`, `_DEFAULT_LOG2` (asserted at compile time) | present; `blob::tests::a_tree_hashers_list_checks_every_piece_and_matches_the_root` (*swarm*) |
+| `PieceSize::new`, `bytes` | — | refused: computations over the caller's own values |
+| `Blob` (`new`, `root`, `size`, `piece`, `count`, `span`) | `weida_blob_new`, `_root`, `_size`, `_piece_log2`, `_count`, `_span`, `_drop` | present; `blob::tests::a_tree_hashers_list_checks_every_piece_and_matches_the_root`, `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `PieceList` (`of`, `parse`, `blob`, `to_bytes`, `check`) | `weida_piece_list_of`, `_parse`, `_blob`, `_to_bytes`, `_check`, `_drop` | present; `blob::tests::a_tree_hashers_list_checks_every_piece_and_matches_the_root`, `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `TreeHasher` (`new`, `update`, `finish`) | `weida_tree_hasher_new`, `_update`, `_finish` (consumes), `_drop` | present; `blob::tests::a_tree_hashers_list_checks_every_piece_and_matches_the_root` (*swarm*) |
+| `Bits` (`new`, `full`, `from_bytes`, `as_bytes`, `len`, `get`, `set`, `ones`, `all`) | `weida_bits_new`, `_full`, `_from_bytes`, `_as_bytes` (into the caller's buffer), `_len`, `_get`, `_set`, `_ones`, `_all`, `_drop` | present; `blob::tests::bits_travel_least_significant_bit_first`, `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `Bits::is_empty` | — | refused: `weida_bits_len` is 0 |
+| `MAX_PIECES`, `MAX_PENDING_SESSIONS`, `SEED_STALL`, `MIN_RATE` | `WEIDA_MAX_PIECES`, `WEIDA_MAX_PENDING_SESSIONS`, `WEIDA_SEED_STALL_MS`, `WEIDA_MIN_RATE` (asserted at compile time) | present (*swarm*) |
+| `Seed`, `Gather` | — | refused: Rust type machinery; the ABI has one handle type per role (decision 3) |
 
 ## 8. Interop evidence
 
@@ -321,7 +351,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the fifty-seven `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the fifty-nine `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -439,6 +469,26 @@ way a foreign caller calls it:
   the snapshot.
 - `Flow::abort` and `IncomingFlow::refuse` cannot fail, so they are `void` and consume their
   handle (R6).
+- A `BlobId` is its 32 bytes in and out (`WEIDA_BLOB_ID_LEN`), written into the caller's
+  buffer; its hex text is the caller's.
+- A `PieceSize` is its base-2 logarithm, `uint8_t`, 10 to 24; outside that it is
+  `-WEIDA_EINVAL`, and `Blob::piece` reads as `weida_blob_piece_log2`.
+- The `Option` of `Blob::new`, `PieceList::of`, `PieceList::parse`, `TreeHasher::finish` and
+  `Bits::from_bytes` is `-WEIDA_EINVAL` with the reason in the record.
+- `Swarm::fetch` panics in Rust on a `have` without one bit per piece or a list of another
+  blob; the ABI returns `-WEIDA_EINVAL`.
+- `Fetch::next` is a try (R3a); its `None` is a 0 return with `*out == NULL`, and so is every
+  read after it.
+- `Fetch::list`, `delivered` and `in_flight` are copied into new handles; while a
+  `weida_fetch_next` read is in flight they are `-WEIDA_EINVAL`, where Rust's `&mut` borrow
+  forbids them. `Fetch::list`'s `None` is a 0 return with `*out == NULL`.
+- `Bits::as_bytes` copies into the caller's buffer, since another thread may set a bit
+  meanwhile.
+- `SeedSession::next` is a try (R3a): an order is a 1 return with the `WEIDA_ASK_*` kind and the
+  piece index (0 for LIST and HAVE), the end a 0 return.
+- A call on a `weida_seed_session` while its `next` is in flight or an answer op runs is
+  `-WEIDA_EINVAL`, where Rust's borrow rules forbid it; `decline` then consumes the handle and
+  the session is dropped when that answer ends.
 
 ## 10. The definition of done
 
@@ -453,8 +503,9 @@ is complete when no present row lacks a test.
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
 `config.rs`, `cursor.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`,
-`transfer.rs`, `requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `bus.rs`,
-`radio.rs`, `segment.rs`, `peer.rs`, `consumer.rs`, `flow.rs`, `poll.rs`, `stats.rs`),
+`transfer.rs`, `requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `swarm.rs`,
+`blob.rs`, `bus.rs`, `radio.rs`, `segment.rs`, `peer.rs`, `consumer.rs`, `flow.rs`, `poll.rs`,
+`stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

@@ -1,15 +1,17 @@
 //! Nested configuration values and the enumeration constants (docs/c/runtime.md, R7).
 
 use std::ffi::{c_char, c_int};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use weida_rs::{
     Acknowledgement, Alpn, Backpressure, Congestion, Deduplication, DeliveryLevel, Discovery,
-    Durability, FilesOptions, FlowMeta, GuaranteeSet, JoinTerms, Limits, OrderingMode, OutboxFull,
-    ProducerNaming, ReconnectPolicy, SegmentTerms, TraceContext,
+    Durability, FetchOptions, FilesOptions, FlowMeta, GuaranteeSet, JoinTerms, Limits,
+    OrderingMode, OutboxFull, PieceList, ProducerNaming, ReconnectPolicy, SegmentTerms,
+    TraceContext,
 };
 
+use crate::blob::weida_piece_list;
 use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_void};
 use crate::handle::{borrow, cstr, into_handle, out_ptr, release, write_out};
 
@@ -219,6 +221,27 @@ pub struct weida_flow_meta {
     value: Mutex<FlowMeta>,
 }
 
+/// `FetchOptions` under construction: one setter per field. The list is
+/// held shared and copied once, by the fetch that takes the options.
+pub struct weida_fetch_options {
+    value: Mutex<FetchOptions>,
+    list: Mutex<Option<Arc<PieceList>>>,
+}
+
+impl weida_fetch_options {
+    /// The options a fetch takes: the fields set, and a copy of the list.
+    pub(crate) fn options(&self) -> FetchOptions {
+        let mut options = self.get();
+        options.list = self
+            .list
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            .cloned();
+        options
+    }
+}
+
 impl Builder for weida_limits {
     type Value = Limits;
     fn cell(&self) -> &Mutex<Limits> {
@@ -264,6 +287,13 @@ impl Builder for weida_segment_terms {
 impl Builder for weida_flow_meta {
     type Value = FlowMeta;
     fn cell(&self) -> &Mutex<FlowMeta> {
+        &self.value
+    }
+}
+
+impl Builder for weida_fetch_options {
+    type Value = FetchOptions;
+    fn cell(&self) -> &Mutex<FetchOptions> {
         &self.value
     }
 }
@@ -1364,4 +1394,156 @@ pub unsafe extern "C" fn weida_flow_meta_set_trace(
             Ok(())
         })
     }
+}
+
+// --- weida_fetch_options ---------------------------------------------------
+
+/// Creates fetch options holding weida's defaults (`FetchOptions::default`):
+/// no list, a 30 s stall, 64 KiB/s, 8 orders per seeder, 32 in all, every
+/// seeder, a HAVE refresh after 5 s.
+///
+/// # Safety
+///
+/// `out` is NULL or writable. Release the result with
+/// `weida_fetch_options_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_new(out: *mut *mut weida_fetch_options) -> c_int {
+    create(
+        out,
+        weida_fetch_options {
+            value: Mutex::new(FetchOptions::default()),
+            list: Mutex::new(None),
+        },
+    )
+}
+
+/// Releases fetch options. NULL does nothing.
+///
+/// # Safety
+///
+/// `o` is NULL or live options, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_drop(o: *mut weida_fetch_options) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(o) }));
+}
+
+/// Sets `FetchOptions::list`: the piece list of an earlier fetch of the same
+/// blob (`weida_fetch_list`), which spares the LIST order; NULL clears it.
+/// The options share `list`; a fetch that takes them copies it.
+///
+/// # Safety
+///
+/// `o` is NULL or live options; `list` is NULL or a live piece list.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_set_list(
+    o: *const weida_fetch_options,
+    list: *const weida_piece_list,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let o = unsafe { borrow(o) }?;
+        let list = if list.is_null() {
+            None
+        } else {
+            // SAFETY: forwarded from this function's contract.
+            Some(Arc::clone(&unsafe { borrow(list) }?.list))
+        };
+        *o.list.lock().unwrap_or_else(|e| e.into_inner()) = list;
+        Ok(0)
+    })
+}
+
+/// Sets `FetchOptions::stall`, in milliseconds: the fixed part of every
+/// answer's deadline.
+///
+/// # Safety
+///
+/// `o` is NULL or live options.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_set_stall_ms(
+    o: *const weida_fetch_options,
+    v: u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(o, |x| x.stall = ms(v)) }
+}
+
+/// Sets `FetchOptions::min_rate`, in bytes per second: the answer to an
+/// order of `n` bytes is due `stall + (9 + n) / min_rate` after it was
+/// written, or after the answer before it, whichever is later. Zero counts
+/// as one.
+///
+/// # Safety
+///
+/// `o` is NULL or live options.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_set_min_rate(
+    o: *const weida_fetch_options,
+    v: u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(o, |x| x.min_rate = v) }
+}
+
+/// Sets `FetchOptions::per_peer`: the credit of one seeder, the most orders
+/// it holds at once, each from the moment it is written until the caller
+/// takes its piece from `weida_fetch_next`. Zero counts as one.
+///
+/// # Safety
+///
+/// `o` is NULL or live options.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_set_per_peer(
+    o: *const weida_fetch_options,
+    v: u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(o, |x| x.per_peer = count(v)) }
+}
+
+/// Sets `FetchOptions::max_inflight`: orders over all seeders at once, which
+/// bounds the piece bytes the fetch holds at `max_inflight` times the piece
+/// size. Zero counts as one.
+///
+/// # Safety
+///
+/// `o` is NULL or live options.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_set_max_inflight(
+    o: *const weida_fetch_options,
+    v: u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(o, |x| x.max_inflight = count(v)) }
+}
+
+/// Sets `FetchOptions::max_peers`: the seeders the fetch takes pieces from;
+/// the others stay connected and unused.
+///
+/// # Safety
+///
+/// `o` is NULL or live options.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_set_max_peers(
+    o: *const weida_fetch_options,
+    v: u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(o, |x| x.max_peers = count(v)) }
+}
+
+/// Sets `FetchOptions::have_refresh`, in milliseconds: how long a seeder with
+/// nothing the fetch can take waits before it is asked HAVE again.
+///
+/// # Safety
+///
+/// `o` is NULL or live options.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_options_set_have_refresh_ms(
+    o: *const weida_fetch_options,
+    v: u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { update(o, |x| x.have_refresh = ms(v)) }
 }

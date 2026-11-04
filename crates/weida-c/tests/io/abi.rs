@@ -3,7 +3,8 @@
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use weida::*;
@@ -5851,6 +5852,485 @@ fn credit_granted_in_two_steps_releases_exactly_that_many_deliveries() {
         weida_consumer_drop(second);
         weida_subscriber_drop(s);
         weida_acceptor_drop(a);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+// --- swarm ------------------------------------------------------------------
+
+/// `17 * 1024 + 100` bytes: 18 pieces of 1 KiB, the last one short.
+fn blob_bytes() -> Vec<u8> {
+    (0..17 * 1024 + 100)
+        .map(|i: u32| i.wrapping_mul(2_654_435_761).to_be_bytes()[0])
+        .collect()
+}
+
+fn blob_id(data: &[u8]) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    // SAFETY: `data.len()` readable bytes and 32 writable ones.
+    ok(unsafe { weida_blob_id_of(data.as_ptr(), data.len(), id.as_mut_ptr()) });
+    id
+}
+
+fn root_of(b: *const weida_blob) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    // SAFETY: a live blob and 32 writable bytes.
+    ok(unsafe { weida_blob_root(b, id.as_mut_ptr()) });
+    id
+}
+
+fn span_of(b: *const weida_blob, index: u32) -> std::ops::Range<usize> {
+    let (mut start, mut end) = (0u64, 0u64);
+    // SAFETY: a live blob and writable out-parameters.
+    assert_eq!(
+        unsafe { weida_blob_span(b, index, &mut start, &mut end) },
+        1
+    );
+    start as usize..end as usize
+}
+
+/// The bytes a piece list lends, copied.
+fn list_bytes(l: *const weida_piece_list) -> Vec<u8> {
+    let mut len = 0usize;
+    // SAFETY: a live piece list and a writable length; the bytes are copied
+    // while it lives.
+    unsafe {
+        let p = weida_piece_list_to_bytes(l, &mut len);
+        std::slice::from_raw_parts(p, len).to_vec()
+    }
+}
+
+fn bits(len: u32) -> *mut weida_bits {
+    let mut b = ptr::null_mut();
+    // SAFETY: a writable out-parameter.
+    ok(unsafe { weida_bits_new(len, &mut b) });
+    b
+}
+
+/// A swarm of `rt` dialling under `trust`; the terms and the trust are
+/// dropped.
+fn swarm_on(rt: *mut weida_runtime, trust: *mut weida_trust) -> *mut weida_swarm {
+    let mut tls = ptr::null_mut();
+    let mut s = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    unsafe {
+        ok(weida_client_tls_new(trust, &mut tls));
+        ok(weida_runtime_swarm(rt, tls, &mut s));
+        weida_client_tls_drop(tls);
+        weida_trust_drop(trust);
+    }
+    s
+}
+
+fn swarm_connect(s: *mut weida_swarm, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the dial",
+        // SAFETY: a live swarm, a C string and a writable out-parameter.
+        |op| unsafe { weida_swarm_connect(s, url.as_ptr(), op) },
+        weida_swarm_connect_op_wait,
+        weida_swarm_connect_op_drop,
+    )
+}
+
+fn seeder(l: *mut weida_listener, path: &str) -> *mut weida_seeder {
+    let mut s = ptr::null_mut();
+    let path = c(path);
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_seeder(l, path.as_ptr(), &mut s) });
+    s
+}
+
+/// Reads `f` to its end, copying each piece to its span of `out`: the
+/// indices it yielded, sorted.
+fn gather(f: *mut weida_fetch, b: *const weida_blob, out: &mut [u8]) -> Vec<u32> {
+    let mut indices = Vec::new();
+    loop {
+        let mut p = ptr::null_mut();
+        // SAFETY: a live fetch and a writable out-parameter.
+        ok(settle("a piece", |ms| unsafe {
+            weida_fetch_next(f, ms, &mut p)
+        }));
+        if p.is_null() {
+            break;
+        }
+        let mut len = 0usize;
+        // SAFETY: a live piece whose bytes are copied before its one drop.
+        unsafe {
+            let index = weida_piece_index(p);
+            let bytes = std::slice::from_raw_parts(weida_piece_bytes(p, &mut len), len);
+            let span = span_of(b, index);
+            assert_eq!(bytes.len(), span.len(), "piece {index}");
+            out[span].copy_from_slice(bytes);
+            indices.push(index);
+            weida_piece_drop(p);
+        }
+    }
+    indices.sort_unstable();
+    indices
+}
+
+/// Admits a session by its blob and endpoint, then answers its orders from
+/// `data` until the fetch finished them, recording each order's kind. A
+/// session that ends with an error ends here too, as a fetch that is
+/// dropped ends it.
+fn serve_session(
+    s: Sent<weida_seed_session>,
+    data: Arc<Vec<u8>>,
+    list: Sent<weida_piece_list>,
+    root: [u8; 32],
+    asks: Arc<Mutex<Vec<c_int>>>,
+) {
+    let (s, list) = (s.0, list.0);
+    let mut b = ptr::null_mut();
+    let mut meta = ptr::null_mut();
+    // SAFETY: a live session and writable out-parameters; each handle is
+    // dropped once.
+    unsafe {
+        ok(weida_seed_session_blob(s, &mut b));
+        assert_eq!(root_of(b), root);
+        ok(weida_seed_session_meta(s, &mut meta));
+        assert_eq!(
+            meta_text(meta, weida_incoming_meta_endpoint).as_deref(),
+            Some("/blob")
+        );
+        weida_incoming_meta_drop(meta);
+        assert_ne!(weida_seed_session_connection(s), 0);
+    }
+    loop {
+        let (mut ask, mut index) = (-1 as c_int, 0u32);
+        // SAFETY: a live session and writable out-parameters.
+        let rc = settle("an order", |ms| unsafe {
+            weida_seed_session_next(s, ms, &mut ask, &mut index)
+        });
+        if rc != 1 {
+            break;
+        }
+        asks.lock().expect("asks").push(ask);
+        let rc = match ask {
+            WEIDA_ASK_LIST => run_op(
+                "the list",
+                // SAFETY: live handles and a writable out-parameter.
+                |op| unsafe { weida_seed_session_answer_list(s, list, op) },
+                weida_seed_session_answer_list_op_wait,
+                weida_seed_session_answer_list_op_drop,
+            ),
+            WEIDA_ASK_HAVE => {
+                let mut have = ptr::null_mut();
+                // SAFETY: a live blob and a writable out-parameter.
+                ok(unsafe { weida_bits_full(weida_blob_count(b), &mut have) });
+                let rc = run_op(
+                    "the map",
+                    // SAFETY: live handles and a writable out-parameter.
+                    |op| unsafe { weida_seed_session_answer_have(s, have, op) },
+                    weida_seed_session_answer_have_op_wait,
+                    weida_seed_session_answer_have_op_drop,
+                );
+                // SAFETY: dropped once.
+                unsafe { weida_bits_drop(have) };
+                rc
+            }
+            WEIDA_ASK_PIECE => {
+                let piece = &data[span_of(b, index)];
+                run_op(
+                    "the piece",
+                    // SAFETY: a live session, `piece.len()` readable bytes and
+                    // a writable out-parameter.
+                    |op| unsafe {
+                        weida_seed_session_answer_piece(s, piece.as_ptr(), piece.len(), op)
+                    },
+                    weida_seed_session_answer_piece_op_wait,
+                    weida_seed_session_answer_piece_op_drop,
+                )
+            }
+            other => panic!("an order of kind {other}"),
+        };
+        assert_eq!(rc, 0, "answering {ask}: {}", last_message());
+    }
+    // SAFETY: each handle is dropped once.
+    unsafe {
+        weida_blob_drop(b);
+        weida_seed_session_drop(s);
+    }
+}
+
+/// Accepts sessions of `s` until `stop`, serving each on its own thread;
+/// joins them before it returns.
+fn serve(
+    s: Sent<weida_seeder>,
+    data: Arc<Vec<u8>>,
+    list: Sent<weida_piece_list>,
+    root: [u8; 32],
+    asks: Arc<Mutex<Vec<c_int>>>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let (s, list) = (s, list);
+        let mut sessions = Vec::new();
+        while !stop.load(Ordering::Acquire) {
+            let mut session = ptr::null_mut();
+            // SAFETY: a live seeder and a writable out-parameter.
+            match unsafe { weida_seeder_accept(s.0, 20, &mut session) } {
+                0 => {
+                    let (session, list) = (Sent(session), Sent(list.0));
+                    let (data, asks) = (Arc::clone(&data), Arc::clone(&asks));
+                    sessions.push(std::thread::spawn(move || {
+                        serve_session(session, data, list, root, asks);
+                    }));
+                }
+                rc if rc == -WEIDA_EAGAIN => {}
+                rc => panic!("the accept failed with {rc}: {}", last_message()),
+            }
+        }
+        for session in sessions {
+            session.join().expect("a session thread");
+        }
+    })
+}
+
+#[test]
+fn a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others() {
+    let server = runtime();
+    let l = listener(server);
+    let (id, fp) = identity();
+    let tls = server_tls(id);
+    let (binding, local) = bind_quic(l, tls);
+    let sd = seeder(l, "/blob");
+    let mut len = 0usize;
+    // SAFETY: a live seeder and a writable length.
+    let path = unsafe { weida_seeder_path(sd, &mut len) };
+    assert_eq!(text(path, len).as_deref(), Some("/blob"));
+
+    let data = Arc::new(blob_bytes());
+    let root = blob_id(&data);
+    let (mut list, mut b) = (ptr::null_mut(), ptr::null_mut());
+    // SAFETY: `data.len()` readable bytes and writable out-parameters.
+    unsafe {
+        ok(weida_piece_list_of(
+            data.as_ptr(),
+            data.len(),
+            WEIDA_PIECE_SIZE_MIN_LOG2 as u8,
+            &mut list,
+        ));
+        ok(weida_piece_list_blob(list, &mut b));
+        assert_eq!(weida_blob_count(b), 18);
+    }
+    assert_eq!(root_of(b), root);
+    let asks = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_thread = serve(
+        Sent(sd),
+        Arc::clone(&data),
+        Sent(list),
+        root,
+        Arc::clone(&asks),
+        Arc::clone(&stop),
+    );
+    let url = format!("weida://{local}/blob");
+
+    // A fetches every piece and keeps the list it learnt.
+    let near = runtime();
+    let sa = swarm_on(near, trust_pinning(&fp));
+    let mut ev = ptr::null_mut();
+    // SAFETY: a live swarm and a writable out-parameter.
+    ok(unsafe { weida_swarm_events(sa, &mut ev) });
+    ok(swarm_connect(sa, &url));
+    until_connected(ev);
+    let mut stats = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and a writable out-parameter.
+    unsafe {
+        weida_peer_events_drop(ev);
+        assert_eq!(weida_swarm_peer_count(sa), 1);
+        ok(weida_swarm_connection_stats(sa, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 1);
+        weida_connection_stats_drop(stats);
+    }
+    let have_a = bits(18);
+    let mut fa = ptr::null_mut();
+    // SAFETY: live handles and a writable out-parameter.
+    ok(unsafe { weida_swarm_fetch(sa, b, have_a, ptr::null(), &mut fa) });
+    let mut out_a = vec![0u8; data.len()];
+    assert_eq!(gather(fa, b, &mut out_a), (0..18).collect::<Vec<u32>>());
+    assert_eq!(blob_id(&out_a), root);
+    let (mut delivered, mut in_flight, mut known) =
+        (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+    let mut p = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; each map is dropped
+    // once.
+    unsafe {
+        ok(weida_fetch_delivered(fa, &mut delivered));
+        assert_eq!(weida_bits_all(delivered), 1);
+        ok(weida_fetch_in_flight(fa, &mut in_flight));
+        assert_eq!(weida_bits_ones(in_flight), 0);
+        weida_bits_drop(delivered);
+        weida_bits_drop(in_flight);
+        assert_eq!(weida_fetch_next(fa, 0, &mut p), 0);
+        assert!(p.is_null(), "a finished fetch stays finished");
+        assert_eq!(weida_fetch_list(fa, &mut known), 1);
+    }
+    assert_eq!(list_bytes(known), list_bytes(list));
+
+    // B holds the even pieces and the list: it takes only the odd ones.
+    let far = runtime();
+    let sb = swarm_on(far, trust_pinning(&fp));
+    ok(swarm_connect(sb, &url));
+    let have_b = bits(18);
+    let mut out_b = vec![0u8; data.len()];
+    for index in (0..18).step_by(2) {
+        // SAFETY: a live map.
+        ok(unsafe { weida_bits_set(have_b, index, 1) });
+        let span = span_of(b, index);
+        out_b[span.clone()].copy_from_slice(&data[span]);
+    }
+    let (mut o, mut fb) = (ptr::null_mut(), ptr::null_mut());
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        ok(weida_fetch_options_new(&mut o));
+        ok(weida_fetch_options_set_list(o, known));
+        ok(weida_fetch_options_set_per_peer(o, 2));
+        ok(weida_fetch_options_set_max_inflight(o, 4));
+        ok(weida_swarm_fetch(sb, b, have_b, o, &mut fb));
+    }
+    assert_eq!(
+        gather(fb, b, &mut out_b),
+        (1..18).step_by(2).collect::<Vec<u32>>()
+    );
+    assert_eq!(blob_id(&out_b), root);
+    assert_eq!(
+        asks.lock()
+            .expect("asks")
+            .iter()
+            .filter(|&&ask| ask == WEIDA_ASK_LIST)
+            .count(),
+        1,
+        "A asked for the list, B was spared it"
+    );
+
+    let url = c(&url);
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        assert_eq!(weida_swarm_disconnect(sa, url.as_ptr()), 1);
+        assert_eq!(weida_swarm_disconnect(sa, url.as_ptr()), 0);
+        weida_fetch_drop(fb);
+        weida_fetch_drop(fa);
+        weida_fetch_options_drop(o);
+        weida_bits_drop(have_b);
+        weida_bits_drop(have_a);
+        weida_swarm_drop(sb);
+        weida_swarm_drop(sa);
+    }
+    stop.store(true, Ordering::Release);
+    server_thread.join().expect("the seeder thread");
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_seeder_drop(sd);
+        weida_piece_list_drop(known);
+        weida_piece_list_drop(list);
+        weida_blob_drop(b);
+        weida_binding_drop(binding);
+        weida_server_tls_drop(tls);
+        weida_identity_drop(id);
+        weida_listener_drop(l);
+    }
+    shutdown(far);
+    shutdown(near);
+    shutdown(server);
+}
+
+#[test]
+fn a_declined_session_leaves_the_fetch_not_connected() {
+    let server = runtime();
+    let client = runtime();
+    let (l, lb) = bound(server, "abi-swarm-decline");
+    let sd = seeder(l, "/blob");
+    let s = swarm_on(client, trust_by_address());
+    ok(swarm_connect(s, "weida+inproc://abi-swarm-decline/blob"));
+
+    let data = blob_bytes();
+    let (mut list, mut b) = (ptr::null_mut(), ptr::null_mut());
+    let (have, short) = (bits(18), bits(17));
+    let (mut f, mut refused, mut p) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+    let (mut d, mut fb) = (ptr::null_mut(), ptr::null_mut());
+    // SAFETY: live handles, `data.len()` readable bytes and writable
+    // out-parameters; `fb` is dropped once.
+    unsafe {
+        ok(weida_piece_list_of(
+            data.as_ptr(),
+            data.len(),
+            10,
+            &mut list,
+        ));
+        ok(weida_piece_list_blob(list, &mut b));
+        assert_eq!(
+            weida_swarm_fetch(s, b, short, ptr::null(), &mut refused),
+            -WEIDA_EINVAL
+        );
+        assert!(refused.is_null());
+        ok(weida_swarm_fetch(s, b, have, ptr::null(), &mut f));
+        // The orders are written; nobody answers them yet.
+        assert_eq!(weida_fetch_next(f, 0, &mut p), -WEIDA_EAGAIN);
+        assert_eq!(weida_fetch_delivered(f, &mut d), -WEIDA_EINVAL);
+        ok(weida_fetch_blob(f, &mut fb));
+        assert_eq!(weida_blob_count(fb), 18);
+        weida_blob_drop(fb);
+    }
+
+    let mut session = ptr::null_mut();
+    let (mut ask, mut index) = (-1 as c_int, 0u32);
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        ok(settle("the session", |ms| {
+            weida_seeder_accept(sd, ms, &mut session)
+        }));
+        assert_eq!(
+            settle("an order", |ms| weida_seed_session_next(
+                session, ms, &mut ask, &mut index
+            )),
+            1,
+            "{}",
+            last_message()
+        );
+        assert_eq!(
+            weida_seed_session_next(session, 0, &mut ask, &mut index),
+            -WEIDA_EPROTOCOL,
+            "the order before is unanswered"
+        );
+    }
+    let rc = run_op(
+        "the decline",
+        // SAFETY: a live session, consumed, and a writable out-parameter.
+        |op| unsafe { weida_seed_session_decline(session, op) },
+        weida_seed_session_decline_op_wait,
+        weida_seed_session_decline_op_drop,
+    );
+    assert_eq!(rc, 0, "{}", last_message());
+
+    let mut known = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; each handle is
+    // dropped once.
+    unsafe {
+        assert_eq!(
+            settle("the fetch's end", |ms| weida_fetch_next(f, ms, &mut p)),
+            -WEIDA_ENOT_CONNECTED,
+            "{}",
+            last_message()
+        );
+        ok(weida_fetch_delivered(f, &mut d));
+        assert_eq!(weida_bits_ones(d), 0);
+        weida_bits_drop(d);
+        assert_eq!(weida_fetch_list(f, &mut known), 0);
+        assert!(known.is_null());
+
+        weida_fetch_drop(f);
+        weida_bits_drop(short);
+        weida_bits_drop(have);
+        weida_swarm_drop(s);
+        weida_seeder_drop(sd);
+        weida_piece_list_drop(list);
+        weida_blob_drop(b);
         weida_local_binding_drop(lb);
         weida_listener_drop(l);
     }

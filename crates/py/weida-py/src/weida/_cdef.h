@@ -1,3 +1,13 @@
+#define WEIDA_BLOB_ID_LEN 32
+
+#define WEIDA_MAX_PIECES 1048576
+
+#define WEIDA_PIECE_SIZE_MIN_LOG2 10
+
+#define WEIDA_PIECE_SIZE_MAX_LOG2 24
+
+#define WEIDA_PIECE_SIZE_DEFAULT_LOG2 20
+
 #define WEIDA_CONGESTION_CUBIC 0
 
 #define WEIDA_CONGESTION_NEW_RENO 1
@@ -216,6 +226,18 @@
 
 #define WEIDA_GIVE_UP_FAILED 2
 
+#define WEIDA_ASK_LIST 0
+
+#define WEIDA_ASK_HAVE 1
+
+#define WEIDA_ASK_PIECE 2
+
+#define WEIDA_MAX_PENDING_SESSIONS 64
+
+#define WEIDA_SEED_STALL_MS 30000
+
+#define WEIDA_MIN_RATE 65536
+
 typedef struct weida_acceptor weida_acceptor;
 
 typedef struct weida_binding weida_binding;
@@ -225,6 +247,10 @@ typedef struct weida_binding_close_op weida_binding_close_op;
 typedef struct weida_binding_hand_over_op weida_binding_hand_over_op;
 
 typedef struct weida_binding_take_over_op weida_binding_take_over_op;
+
+typedef struct weida_bits weida_bits;
+
+typedef struct weida_blob weida_blob;
 
 typedef struct weida_bus_member weida_bus_member;
 
@@ -269,6 +295,10 @@ typedef struct weida_drained weida_drained;
 typedef struct weida_fan_out weida_fan_out;
 
 typedef struct weida_fan_out_write_within_op weida_fan_out_write_within_op;
+
+typedef struct weida_fetch weida_fetch;
+
+typedef struct weida_fetch_options weida_fetch_options;
 
 typedef struct weida_files_options weida_files_options;
 
@@ -354,6 +384,10 @@ typedef struct weida_peer_send_op weida_peer_send_op;
 
 typedef struct weida_pem weida_pem;
 
+typedef struct weida_piece weida_piece;
+
+typedef struct weida_piece_list weida_piece_list;
+
 typedef struct weida_pipe_binding weida_pipe_binding;
 
 typedef struct weida_publisher weida_publisher;
@@ -416,6 +450,18 @@ typedef struct weida_runtime_drain_op weida_runtime_drain_op;
 
 typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
 
+typedef struct weida_seed_session weida_seed_session;
+
+typedef struct weida_seed_session_answer_have_op weida_seed_session_answer_have_op;
+
+typedef struct weida_seed_session_answer_list_op weida_seed_session_answer_list_op;
+
+typedef struct weida_seed_session_answer_piece_op weida_seed_session_answer_piece_op;
+
+typedef struct weida_seed_session_decline_op weida_seed_session_decline_op;
+
+typedef struct weida_seeder weida_seeder;
+
 typedef struct weida_segment weida_segment;
 
 typedef struct weida_segment_terms weida_segment_terms;
@@ -442,9 +488,15 @@ typedef struct weida_surveyor_connect_op weida_surveyor_connect_op;
 
 typedef struct weida_surveyor_survey_op weida_surveyor_survey_op;
 
+typedef struct weida_swarm weida_swarm;
+
+typedef struct weida_swarm_connect_op weida_swarm_connect_op;
+
 typedef struct weida_topic_drops weida_topic_drops;
 
 typedef struct weida_transfer_meta weida_transfer_meta;
+
+typedef struct weida_tree_hasher weida_tree_hasher;
 
 typedef struct weida_trust weida_trust;
 
@@ -463,6 +515,71 @@ typedef struct {
 } weida_poll_item;
 
 const char *weida_version(void);
+
+int weida_blob_id_of(const uint8_t *data, size_t len, uint8_t *out);
+
+int weida_blob_new(const uint8_t *root, uint64_t size, uint8_t piece_log2, weida_blob **out);
+
+int weida_blob_root(const weida_blob *b, uint8_t *out);
+
+uint64_t weida_blob_size(const weida_blob *b);
+
+uint8_t weida_blob_piece_log2(const weida_blob *b);
+
+uint32_t weida_blob_count(const weida_blob *b);
+
+int weida_blob_span(const weida_blob *b, uint32_t index, uint64_t *out_start, uint64_t *out_end);
+
+void weida_blob_drop(weida_blob *b);
+
+int weida_piece_list_of(const uint8_t *data,
+                        size_t len,
+                        uint8_t piece_log2,
+                        weida_piece_list **out);
+
+int weida_piece_list_parse(const weida_blob *blob,
+                           const uint8_t *data,
+                           size_t len,
+                           weida_piece_list **out);
+
+int weida_piece_list_blob(const weida_piece_list *l, weida_blob **out);
+
+const uint8_t *weida_piece_list_to_bytes(const weida_piece_list *l, size_t *len_out);
+
+int weida_piece_list_check(const weida_piece_list *l,
+                           uint32_t index,
+                           const uint8_t *piece,
+                           size_t len);
+
+void weida_piece_list_drop(weida_piece_list *l);
+
+int weida_tree_hasher_new(uint8_t piece_log2, weida_tree_hasher **out);
+
+int weida_tree_hasher_update(const weida_tree_hasher *h, const uint8_t *data, size_t len);
+
+int weida_tree_hasher_finish(weida_tree_hasher *h, weida_piece_list **out);
+
+void weida_tree_hasher_drop(weida_tree_hasher *h);
+
+int weida_bits_new(uint32_t len, weida_bits **out);
+
+int weida_bits_full(uint32_t len, weida_bits **out);
+
+int weida_bits_from_bytes(uint32_t len, const uint8_t *data, size_t n, weida_bits **out);
+
+int weida_bits_as_bytes(const weida_bits *b, uint8_t *buf, size_t cap, size_t *out_n);
+
+uint32_t weida_bits_len(const weida_bits *b);
+
+uint32_t weida_bits_ones(const weida_bits *b);
+
+int weida_bits_get(const weida_bits *b, uint32_t index);
+
+int weida_bits_all(const weida_bits *b);
+
+int weida_bits_set(const weida_bits *b, uint32_t index, int on);
+
+void weida_bits_drop(weida_bits *b);
 
 int weida_listener_bus(const weida_listener *l,
                        const char *path,
@@ -643,6 +760,24 @@ int weida_flow_meta_set_content_type(const weida_flow_meta *m, const char *conte
 int weida_flow_meta_set_topic(const weida_flow_meta *m, const char *topic);
 
 int weida_flow_meta_set_trace(const weida_flow_meta *m, const char *traceparent);
+
+int weida_fetch_options_new(weida_fetch_options **out);
+
+void weida_fetch_options_drop(weida_fetch_options *o);
+
+int weida_fetch_options_set_list(const weida_fetch_options *o, const weida_piece_list *list);
+
+int weida_fetch_options_set_stall_ms(const weida_fetch_options *o, uint64_t v);
+
+int weida_fetch_options_set_min_rate(const weida_fetch_options *o, uint64_t v);
+
+int weida_fetch_options_set_per_peer(const weida_fetch_options *o, uint64_t v);
+
+int weida_fetch_options_set_max_inflight(const weida_fetch_options *o, uint64_t v);
+
+int weida_fetch_options_set_max_peers(const weida_fetch_options *o, uint64_t v);
+
+int weida_fetch_options_set_have_refresh_ms(const weida_fetch_options *o, uint64_t v);
 
 uint64_t weida_consumer_id(const weida_consumer *c);
 
@@ -1961,6 +2096,120 @@ int weida_respondent_accept(const weida_respondent *r,
                             weida_incoming_request **out);
 
 void weida_respondent_drop(weida_respondent *r);
+
+int weida_runtime_swarm(const weida_runtime *rt, const weida_client_tls *tls, weida_swarm **out);
+
+int weida_swarm_connect(const weida_swarm *s, const char *url, weida_swarm_connect_op **out);
+
+int weida_swarm_connect_op_fd(const weida_swarm_connect_op *op, int64_t *out);
+
+int weida_swarm_connect_op_wait(const weida_swarm_connect_op *op, int64_t timeout_ms);
+
+void weida_swarm_connect_op_drop(weida_swarm_connect_op *op);
+
+int weida_swarm_disconnect(const weida_swarm *s, const char *url);
+
+size_t weida_swarm_peer_count(const weida_swarm *s);
+
+int weida_swarm_connection_stats(const weida_swarm *s, weida_connection_stats **out);
+
+int weida_swarm_events(const weida_swarm *s, weida_peer_events **out);
+
+int weida_swarm_fetch(const weida_swarm *s,
+                      const weida_blob *blob,
+                      const weida_bits *have,
+                      const weida_fetch_options *options,
+                      weida_fetch **out);
+
+void weida_swarm_drop(weida_swarm *s);
+
+int weida_fetch_fd(const weida_fetch *f, int64_t *out);
+
+int weida_fetch_next(const weida_fetch *f, int64_t timeout_ms, weida_piece **out);
+
+int weida_fetch_blob(const weida_fetch *f, weida_blob **out);
+
+int weida_fetch_list(const weida_fetch *f, weida_piece_list **out);
+
+int weida_fetch_delivered(const weida_fetch *f, weida_bits **out);
+
+int weida_fetch_in_flight(const weida_fetch *f, weida_bits **out);
+
+void weida_fetch_drop(weida_fetch *f);
+
+uint32_t weida_piece_index(const weida_piece *p);
+
+const uint8_t *weida_piece_bytes(const weida_piece *p, size_t *len_out);
+
+void weida_piece_drop(weida_piece *p);
+
+int weida_listener_seeder(const weida_listener *l, const char *path, weida_seeder **out);
+
+const char *weida_seeder_path(const weida_seeder *s, size_t *len_out);
+
+int weida_seeder_fd(const weida_seeder *s, int64_t *out);
+
+int weida_seeder_accept(const weida_seeder *s, int64_t timeout_ms, weida_seed_session **out);
+
+void weida_seeder_drop(weida_seeder *s);
+
+int weida_seed_session_blob(const weida_seed_session *s, weida_blob **out);
+
+int weida_seed_session_meta(const weida_seed_session *s, weida_incoming_meta **out);
+
+uint64_t weida_seed_session_connection(const weida_seed_session *s);
+
+int weida_seed_session_fd(const weida_seed_session *s, int64_t *out);
+
+int weida_seed_session_next(const weida_seed_session *s,
+                            int64_t timeout_ms,
+                            int *out_ask,
+                            uint32_t *out_index);
+
+int weida_seed_session_answer_list(const weida_seed_session *s,
+                                   const weida_piece_list *list,
+                                   weida_seed_session_answer_list_op **out);
+
+int weida_seed_session_answer_list_op_fd(const weida_seed_session_answer_list_op *op, int64_t *out);
+
+int weida_seed_session_answer_list_op_wait(const weida_seed_session_answer_list_op *op,
+                                           int64_t timeout_ms);
+
+void weida_seed_session_answer_list_op_drop(weida_seed_session_answer_list_op *op);
+
+int weida_seed_session_answer_have(const weida_seed_session *s,
+                                   const weida_bits *have,
+                                   weida_seed_session_answer_have_op **out);
+
+int weida_seed_session_answer_have_op_fd(const weida_seed_session_answer_have_op *op, int64_t *out);
+
+int weida_seed_session_answer_have_op_wait(const weida_seed_session_answer_have_op *op,
+                                           int64_t timeout_ms);
+
+void weida_seed_session_answer_have_op_drop(weida_seed_session_answer_have_op *op);
+
+int weida_seed_session_answer_piece(const weida_seed_session *s,
+                                    const uint8_t *data,
+                                    size_t len,
+                                    weida_seed_session_answer_piece_op **out);
+
+int weida_seed_session_answer_piece_op_fd(const weida_seed_session_answer_piece_op *op,
+                                          int64_t *out);
+
+int weida_seed_session_answer_piece_op_wait(const weida_seed_session_answer_piece_op *op,
+                                            int64_t timeout_ms);
+
+void weida_seed_session_answer_piece_op_drop(weida_seed_session_answer_piece_op *op);
+
+int weida_seed_session_decline(weida_seed_session *s, weida_seed_session_decline_op **out);
+
+int weida_seed_session_decline_op_fd(const weida_seed_session_decline_op *op, int64_t *out);
+
+int weida_seed_session_decline_op_wait(const weida_seed_session_decline_op *op, int64_t timeout_ms);
+
+void weida_seed_session_decline_op_drop(weida_seed_session_decline_op *op);
+
+void weida_seed_session_drop(weida_seed_session *s);
 
 int weida_trust_new(weida_trust **out);
 

@@ -12,6 +12,31 @@
 #include <stddef.h>
 
 /**
+ * The bytes of a blob id (`BlobId`): a BLAKE3 hash.
+ */
+#define WEIDA_BLOB_ID_LEN 32
+
+/**
+ * The most pieces a blob has (`MAX_PIECES`).
+ */
+#define WEIDA_MAX_PIECES 1048576
+
+/**
+ * `PieceSize::MIN` as its base-2 logarithm: 1 KiB.
+ */
+#define WEIDA_PIECE_SIZE_MIN_LOG2 10
+
+/**
+ * `PieceSize::MAX` as its base-2 logarithm: 16 MiB.
+ */
+#define WEIDA_PIECE_SIZE_MAX_LOG2 24
+
+/**
+ * `PieceSize::DEFAULT` as its base-2 logarithm: 1 MiB.
+ */
+#define WEIDA_PIECE_SIZE_DEFAULT_LOG2 20
+
+/**
  * `Congestion::Cubic`.
  */
 #define WEIDA_CONGESTION_CUBIC 0
@@ -564,6 +589,41 @@
 #define WEIDA_GIVE_UP_FAILED 2
 
 /**
+ * `Ask::List`: the piece list, answered with
+ * `weida_seed_session_answer_list`.
+ */
+#define WEIDA_ASK_LIST 0
+
+/**
+ * `Ask::Have`: the pieces the seeder can serve now, answered with
+ * `weida_seed_session_answer_have`.
+ */
+#define WEIDA_ASK_HAVE 1
+
+/**
+ * `Ask::Piece`: the bytes of one piece, answered with
+ * `weida_seed_session_answer_piece`.
+ */
+#define WEIDA_ASK_PIECE 2
+
+/**
+ * Sessions a seeder holds before `weida_seeder_accept` takes them
+ * (`MAX_PENDING_SESSIONS`).
+ */
+#define WEIDA_MAX_PENDING_SESSIONS 64
+
+/**
+ * The fixed part of an answer's deadline (`SEED_STALL`), in milliseconds.
+ */
+#define WEIDA_SEED_STALL_MS 30000
+
+/**
+ * The rate, in bytes per second, below which an answer is abandoned
+ * (`MIN_RATE`).
+ */
+#define WEIDA_MIN_RATE 65536
+
+/**
  * The bound side of the stream core, serving one endpoint path
  * (`Acceptor`).
  */
@@ -589,6 +649,16 @@ typedef struct weida_binding_hand_over_op weida_binding_hand_over_op;
  * The pending take-over of `weida_binding_take_over`.
  */
 typedef struct weida_binding_take_over_op weida_binding_take_over_op;
+
+/**
+ * A map of held pieces (`Bits`). Its calls take the lock in turn.
+ */
+typedef struct weida_bits weida_bits;
+
+/**
+ * A blob: its root, size and piece size (`Blob`), read-only.
+ */
+typedef struct weida_blob weida_blob;
 
 /**
  * One member of a BUS (`BusMember`): accepts on its path and dials the
@@ -711,6 +781,17 @@ typedef struct weida_fan_out weida_fan_out;
  * The pending write of `weida_fan_out_write_within`.
  */
 typedef struct weida_fan_out_write_within_op weida_fan_out_write_within_op;
+
+/**
+ * One blob being fetched (`Fetch`): its pieces, read as a try.
+ */
+typedef struct weida_fetch weida_fetch;
+
+/**
+ * `FetchOptions` under construction: one setter per field. The list is
+ * held shared and copied once, by the fetch that takes the options.
+ */
+typedef struct weida_fetch_options weida_fetch_options;
 
 /**
  * `FilesOptions` under construction: one setter per field.
@@ -929,6 +1010,17 @@ typedef struct weida_peer_send_op weida_peer_send_op;
 typedef struct weida_pem weida_pem;
 
 /**
+ * One verified piece (`Piece`), read-only.
+ */
+typedef struct weida_piece weida_piece;
+
+/**
+ * The piece hashes of a blob, checked against its root (`PieceList`),
+ * read-only.
+ */
+typedef struct weida_piece_list weida_piece_list;
+
+/**
  * A Windows named-pipe binding: the pipe name, released when this is
  * dropped.
  */
@@ -1093,6 +1185,37 @@ typedef struct weida_runtime_drain_op weida_runtime_drain_op;
 typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
 
 /**
+ * One fetch's session with this seeder (`SeedSession`). A `next` in flight
+ * and every answer op hold the lock.
+ */
+typedef struct weida_seed_session weida_seed_session;
+
+/**
+ * The pending answer of `weida_seed_session_answer_have`.
+ */
+typedef struct weida_seed_session_answer_have_op weida_seed_session_answer_have_op;
+
+/**
+ * The pending answer of `weida_seed_session_answer_list`.
+ */
+typedef struct weida_seed_session_answer_list_op weida_seed_session_answer_list_op;
+
+/**
+ * The pending answer of `weida_seed_session_answer_piece`.
+ */
+typedef struct weida_seed_session_answer_piece_op weida_seed_session_answer_piece_op;
+
+/**
+ * The pending DECLINE of `weida_seed_session_decline`.
+ */
+typedef struct weida_seed_session_decline_op weida_seed_session_decline_op;
+
+/**
+ * The bound half of SWARM, serving one endpoint path (`Seeder`).
+ */
+typedef struct weida_seeder weida_seeder;
+
+/**
  * One open segment (`Segment`). Its calls take the lock in turn, where
  * Rust's `&mut self` forbids concurrent use; `weida_segment_finish` takes
  * the value out.
@@ -1162,6 +1285,16 @@ typedef struct weida_surveyor_connect_op weida_surveyor_connect_op;
 typedef struct weida_surveyor_survey_op weida_surveyor_survey_op;
 
 /**
+ * The dialling half of SWARM (`Swarm`).
+ */
+typedef struct weida_swarm weida_swarm;
+
+/**
+ * The pending dial of `weida_swarm_connect`.
+ */
+typedef struct weida_swarm_connect_op weida_swarm_connect_op;
+
+/**
  * One snapshot of what a publisher dropped, one record per topic
  * (`TopicDrops`).
  */
@@ -1171,6 +1304,12 @@ typedef struct weida_topic_drops weida_topic_drops;
  * The metadata an outgoing transfer carries in its header.
  */
 typedef struct weida_transfer_meta weida_transfer_meta;
+
+/**
+ * The one-pass builder of a piece list (`TreeHasher`); `finish` takes the
+ * value out.
+ */
+typedef struct weida_tree_hasher weida_tree_hasher;
 
 /**
  * Whom a dialler trusts: pins added to what each address names.
@@ -1231,6 +1370,319 @@ extern "C" {
  * Always safe to call.
  */
 const char *weida_version(void);
+
+/**
+ * The id of `len` bytes (`BlobId::of`): their BLAKE3 hash,
+ * `WEIDA_BLOB_ID_LEN` bytes written to `out`.
+ *
+ * # Safety
+ *
+ * `data` is NULL only with `len == 0`, else points to `len` readable bytes;
+ * `out` is NULL or points to `WEIDA_BLOB_ID_LEN` writable bytes.
+ */
+int weida_blob_id_of(const uint8_t *data, size_t len, uint8_t *out);
+
+/**
+ * A blob of `size` bytes whose hash is `root` (`WEIDA_BLOB_ID_LEN` bytes),
+ * cut into pieces of `2^piece_log2` bytes (`Blob::new`). A `piece_log2`
+ * outside 10 to 24, more than `WEIDA_MAX_PIECES` pieces, or an empty blob
+ * whose root is not the hash of no bytes is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `root` is NULL or points to `WEIDA_BLOB_ID_LEN` readable bytes; `out` is
+ * NULL or writable. Release the result with `weida_blob_drop`.
+ */
+int weida_blob_new(const uint8_t *root, uint64_t size, uint8_t piece_log2, weida_blob **out);
+
+/**
+ * Writes the blob's root (`Blob::root`), `WEIDA_BLOB_ID_LEN` bytes, to
+ * `out`.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live blob; `out` is NULL or points to
+ * `WEIDA_BLOB_ID_LEN` writable bytes.
+ */
+int weida_blob_root(const weida_blob *b, uint8_t *out);
+
+/**
+ * The blob's length in bytes (`Blob::size`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live blob.
+ */
+uint64_t weida_blob_size(const weida_blob *b);
+
+/**
+ * The base-2 logarithm of the blob's piece size (`Blob::piece`), 10 to 24;
+ * 0 for NULL.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live blob.
+ */
+uint8_t weida_blob_piece_log2(const weida_blob *b);
+
+/**
+ * The number of pieces (`Blob::count`): the size over the piece size,
+ * rounded up; 0 for an empty blob and for NULL.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live blob.
+ */
+uint32_t weida_blob_count(const weida_blob *b);
+
+/**
+ * The byte range of piece `index` (`Blob::span`): 1 with its first byte in
+ * `*out_start` and the byte after its last in `*out_end`; the last piece is
+ * shorter when the size is not a multiple of the piece size. 0 past the last
+ * piece and for any NULL argument.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live blob; `out_start` and `out_end` are NULL or
+ * writable.
+ */
+int weida_blob_span(const weida_blob *b, uint32_t index, uint64_t *out_start, uint64_t *out_end);
+
+/**
+ * Releases a blob. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live blob, dropped at most once.
+ */
+void weida_blob_drop(weida_blob *b);
+
+/**
+ * The piece list of `len` bytes cut into pieces of `2^piece_log2` bytes
+ * (`PieceList::of`); its blob is `weida_piece_list_blob`. A `piece_log2`
+ * outside 10 to 24 or more than `WEIDA_MAX_PIECES` pieces is
+ * `-WEIDA_EINVAL`. Runs on the caller's thread.
+ *
+ * # Safety
+ *
+ * `data` is NULL only with `len == 0`, else points to `len` readable bytes;
+ * `out` is NULL or writable. Release the result with
+ * `weida_piece_list_drop`.
+ */
+int weida_piece_list_of(const uint8_t *data,
+                        size_t len,
+                        uint8_t piece_log2,
+                        weida_piece_list **out);
+
+/**
+ * The piece list of `blob` from its bytes (`PieceList::parse`), as
+ * `weida_piece_list_to_bytes` gives them: `-WEIDA_EINVAL` unless they are
+ * one chaining value per piece that hash to the blob's root.
+ *
+ * # Safety
+ *
+ * `blob` is NULL or a live blob; `data` is NULL only with `len == 0`, else
+ * points to `len` readable bytes; `out` is NULL or writable. Release the
+ * result with `weida_piece_list_drop`.
+ */
+int weida_piece_list_parse(const weida_blob *blob,
+                           const uint8_t *data,
+                           size_t len,
+                           weida_piece_list **out);
+
+/**
+ * The blob this list belongs to (`PieceList::blob`), as a new handle.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live piece list; `out` is NULL or writable. Release the
+ * result with `weida_blob_drop`.
+ */
+int weida_piece_list_blob(const weida_piece_list *l, weida_blob **out);
+
+/**
+ * The list's bytes (`PieceList::to_bytes`): the chaining values one after
+ * the other, 32 bytes each, empty for a blob of at most one piece; their
+ * length in `*len_out` when that is not NULL. NULL for NULL. Valid as long
+ * as `l`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live piece list; `len_out` is NULL or writable.
+ */
+const uint8_t *weida_piece_list_to_bytes(const weida_piece_list *l, size_t *len_out);
+
+/**
+ * Whether `len` bytes are piece `index` of the list's blob
+ * (`PieceList::check`): 1 when they hash to its slot in the list, 0
+ * otherwise, also past the last piece.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live piece list; `piece` is NULL only with `len == 0`,
+ * else points to `len` readable bytes.
+ */
+int weida_piece_list_check(const weida_piece_list *l,
+                           uint32_t index,
+                           const uint8_t *piece,
+                           size_t len);
+
+/**
+ * Releases a piece list. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live piece list, dropped at most once.
+ */
+void weida_piece_list_drop(weida_piece_list *l);
+
+/**
+ * A tree hasher that cuts a blob into pieces of `2^piece_log2` bytes
+ * (`TreeHasher::new`): fed the bytes in order, it yields the root and the
+ * piece list in one pass. A `piece_log2` outside 10 to 24 is
+ * `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_tree_hasher_finish` or `weida_tree_hasher_drop`.
+ */
+int weida_tree_hasher_new(uint8_t piece_log2, weida_tree_hasher **out);
+
+/**
+ * Feeds the next `len` bytes of the blob (`TreeHasher::update`). Runs on
+ * the caller's thread; calls from several threads take turns, in an order
+ * the caller does not control.
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live tree hasher; `data` is NULL only with `len == 0`,
+ * else points to `len` readable bytes.
+ */
+int weida_tree_hasher_update(const weida_tree_hasher *h, const uint8_t *data, size_t len);
+
+/**
+ * Ends the bytes and writes their piece list to `out`
+ * (`TreeHasher::finish`); its blob holds the root. More than
+ * `WEIDA_MAX_PIECES` pieces is `-WEIDA_EINVAL`. **Consumes** `h` on every
+ * return path.
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live tree hasher, not used again; `out` is NULL or
+ * writable. Release the result with `weida_piece_list_drop`.
+ */
+int weida_tree_hasher_finish(weida_tree_hasher *h, weida_piece_list **out);
+
+/**
+ * Releases a tree hasher unfinished. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `h` is NULL or a live tree hasher, dropped at most once.
+ */
+void weida_tree_hasher_drop(weida_tree_hasher *h);
+
+/**
+ * A map of `len` bits, all clear (`Bits::new`).
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with `weida_bits_drop`.
+ */
+int weida_bits_new(uint32_t len, weida_bits **out);
+
+/**
+ * A map of `len` bits, all set (`Bits::full`).
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with `weida_bits_drop`.
+ */
+int weida_bits_full(uint32_t len, weida_bits **out);
+
+/**
+ * A map of `len` bits from the `n` bytes they travel as
+ * (`Bits::from_bytes`): bit `i` is bit `i % 8`, least significant first, of
+ * byte `i / 8`, in `(len + 7) / 8` bytes whose padding bits are clear.
+ * Anything else is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `data` is NULL only with `n == 0`, else points to `n` readable bytes;
+ * `out` is NULL or writable. Release the result with `weida_bits_drop`.
+ */
+int weida_bits_from_bytes(uint32_t len, const uint8_t *data, size_t n, weida_bits **out);
+
+/**
+ * Copies the map's bytes (`Bits::as_bytes`), `(len + 7) / 8` of them laid
+ * out as for `weida_bits_from_bytes`, into `buf` and writes their count to
+ * `*out_n`. A `cap` below that count is `-WEIDA_EINVAL`; `buf` may be NULL
+ * only for a map of no bytes.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live map; `buf` is NULL or points to `cap` writable
+ * bytes; `out_n` is NULL or writable.
+ */
+int weida_bits_as_bytes(const weida_bits *b, uint8_t *buf, size_t cap, size_t *out_n);
+
+/**
+ * How many bits the map has (`Bits::len`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live map.
+ */
+uint32_t weida_bits_len(const weida_bits *b);
+
+/**
+ * How many bits are set (`Bits::ones`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live map.
+ */
+uint32_t weida_bits_ones(const weida_bits *b);
+
+/**
+ * Whether bit `index` is set (`Bits::get`): 1 or 0; 0 past the end and for
+ * NULL.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live map.
+ */
+int weida_bits_get(const weida_bits *b, uint32_t index);
+
+/**
+ * Whether every bit is set (`Bits::all`): 1 or 0; 1 for a map of no bits,
+ * 0 for NULL.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live map.
+ */
+int weida_bits_all(const weida_bits *b);
+
+/**
+ * Sets bit `index` when `on` is non-zero, clears it otherwise (`Bits::set`;
+ * a flag, R7). Past the end it does nothing.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live map.
+ */
+int weida_bits_set(const weida_bits *b, uint32_t index, int on);
+
+/**
+ * Releases a map. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live map, dropped at most once.
+ */
+void weida_bits_drop(weida_bits *b);
 
 /**
  * Registers a bus member at the endpoint path `path` that dials the other
@@ -2084,6 +2536,102 @@ int weida_flow_meta_set_topic(const weida_flow_meta *m, const char *topic);
  * string.
  */
 int weida_flow_meta_set_trace(const weida_flow_meta *m, const char *traceparent);
+
+/**
+ * Creates fetch options holding weida's defaults (`FetchOptions::default`):
+ * no list, a 30 s stall, 64 KiB/s, 8 orders per seeder, 32 in all, every
+ * seeder, a HAVE refresh after 5 s.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_fetch_options_drop`.
+ */
+int weida_fetch_options_new(weida_fetch_options **out);
+
+/**
+ * Releases fetch options. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options, dropped at most once.
+ */
+void weida_fetch_options_drop(weida_fetch_options *o);
+
+/**
+ * Sets `FetchOptions::list`: the piece list of an earlier fetch of the same
+ * blob (`weida_fetch_list`), which spares the LIST order; NULL clears it.
+ * The options share `list`; a fetch that takes them copies it.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options; `list` is NULL or a live piece list.
+ */
+int weida_fetch_options_set_list(const weida_fetch_options *o, const weida_piece_list *list);
+
+/**
+ * Sets `FetchOptions::stall`, in milliseconds: the fixed part of every
+ * answer's deadline.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options.
+ */
+int weida_fetch_options_set_stall_ms(const weida_fetch_options *o, uint64_t v);
+
+/**
+ * Sets `FetchOptions::min_rate`, in bytes per second: the answer to an
+ * order of `n` bytes is due `stall + (9 + n) / min_rate` after it was
+ * written, or after the answer before it, whichever is later. Zero counts
+ * as one.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options.
+ */
+int weida_fetch_options_set_min_rate(const weida_fetch_options *o, uint64_t v);
+
+/**
+ * Sets `FetchOptions::per_peer`: the credit of one seeder, the most orders
+ * it holds at once, each from the moment it is written until the caller
+ * takes its piece from `weida_fetch_next`. Zero counts as one.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options.
+ */
+int weida_fetch_options_set_per_peer(const weida_fetch_options *o, uint64_t v);
+
+/**
+ * Sets `FetchOptions::max_inflight`: orders over all seeders at once, which
+ * bounds the piece bytes the fetch holds at `max_inflight` times the piece
+ * size. Zero counts as one.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options.
+ */
+int weida_fetch_options_set_max_inflight(const weida_fetch_options *o, uint64_t v);
+
+/**
+ * Sets `FetchOptions::max_peers`: the seeders the fetch takes pieces from;
+ * the others stay connected and unused.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options.
+ */
+int weida_fetch_options_set_max_peers(const weida_fetch_options *o, uint64_t v);
+
+/**
+ * Sets `FetchOptions::have_refresh`, in milliseconds: how long a seeder with
+ * nothing the fetch can take waits before it is asked HAVE again.
+ *
+ * # Safety
+ *
+ * `o` is NULL or live options.
+ */
+int weida_fetch_options_set_have_refresh_ms(const weida_fetch_options *o, uint64_t v);
 
 /**
  * The consumer's number (`Consumer::id`): the number of the connection it
@@ -8340,6 +8888,583 @@ int weida_respondent_accept(const weida_respondent *r,
  * `r` is NULL or a live respondent, dropped at most once.
  */
 void weida_respondent_drop(weida_respondent *r);
+
+/**
+ * Creates a swarm that dials seeders on `tls`'s terms (`Runtime::swarm`).
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime; `tls` is NULL or live client terms;
+ * `out` is NULL or writable. Release the result with `weida_swarm_drop`.
+ */
+int weida_runtime_swarm(const weida_runtime *rt, const weida_client_tls *tls, weida_swarm **out);
+
+/**
+ * Dials the seeder at `url` (`Swarm::connect`). A swarm takes pieces from
+ * every seeder it connected, and one connected during a fetch joins it at
+ * its next read. The runtime redials it when the connection is lost.
+ *
+ * Never blocks; the dial runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live swarm; `url` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the op with
+ * `weida_swarm_connect_op_drop`.
+ */
+int weida_swarm_connect(const weida_swarm *s, const char *url, weida_swarm_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_swarm_connect_op_fd(const weida_swarm_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_swarm_connect_op_wait(const weida_swarm_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_swarm_connect_op_drop(weida_swarm_connect_op *op);
+
+/**
+ * Forgets the dialled address `url` (`Swarm::disconnect`): 1 when it was
+ * dialled, which closes its connection and stops it being redialled; 0
+ * when it was not dialled.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live swarm; `url` is NULL or a NUL-terminated string.
+ */
+int weida_swarm_disconnect(const weida_swarm *s, const char *url);
+
+/**
+ * The number of connected seeders (`Swarm::peer_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live swarm.
+ */
+size_t weida_swarm_peer_count(const weida_swarm *s);
+
+/**
+ * A snapshot of the swarm's live connections (`Swarm::connection_stats`):
+ * one record per live dialled address, in dial order, read with the
+ * `weida_connection_stats_*` getters. Never blocks.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live swarm; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_swarm_connection_stats(const weida_swarm *s, weida_connection_stats **out);
+
+/**
+ * A new reader of the swarm's events (`Swarm::events`): every transition
+ * of its dialled addresses from this call on, read with
+ * `weida_peer_events_recv`. Each call is an independent reader.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live swarm; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_swarm_events(const weida_swarm *s, weida_peer_events **out);
+
+/**
+ * Starts fetching the pieces of `blob` that `have` lacks (`Swarm::fetch`),
+ * ordered as `options` says, or by the defaults when it is NULL. `have` is
+ * what the caller already holds, so a fetch resumes where an earlier one
+ * stopped; it and the options are copied at the call.
+ *
+ * Never blocks: nothing is ordered until the first `weida_fetch_next`. A
+ * `have` without one bit per piece of `blob`, or a list in `options` of
+ * another blob, is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live swarm; `blob` is NULL or a live blob; `have` is
+ * NULL or a live map; `options` is NULL or live options; `out` is NULL or
+ * writable. Release the fetch with `weida_fetch_drop`.
+ */
+int weida_swarm_fetch(const weida_swarm *s,
+                      const weida_blob *blob,
+                      const weida_bits *have,
+                      const weida_fetch_options *options,
+                      weida_fetch **out);
+
+/**
+ * Releases a swarm, which drops its connections. A fetch made from it
+ * then reads `-WEIDA_ENOT_CONNECTED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live swarm, dropped at most once.
+ */
+void weida_swarm_drop(weida_swarm *s);
+
+/**
+ * The fetch's readiness descriptor (R11): readable when the next
+ * `weida_fetch_next` will not block.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch; `out` is NULL or writable.
+ */
+int weida_fetch_fd(const weida_fetch *f, int64_t *out);
+
+/**
+ * Takes the next verified piece, in any order, waiting up to `timeout_ms`
+ * (R4) for one (`Fetch::next`).
+ *
+ * Writes NULL to `out` and returns 0 once the caller holds every piece:
+ * the end of the fetch, and every later call returns it too.
+ * `-WEIDA_ENOT_CONNECTED` when no order is in flight and no seeder is left
+ * that has not failed this fetch, or when the swarm is gone; connecting a
+ * seeder and reading again resumes. Taking a piece frees its order's
+ * credit, which is the fetch's backpressure. A read in flight keeps its
+ * place across timeouts and `EINTR`.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch; `out` is NULL or writable. Release a piece
+ * with `weida_piece_drop`.
+ */
+int weida_fetch_next(const weida_fetch *f, int64_t timeout_ms, weida_piece **out);
+
+/**
+ * The blob being fetched (`Fetch::blob`), as a new handle; answers while a
+ * read is in flight too.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch; `out` is NULL or writable. Release the
+ * result with `weida_blob_drop`.
+ */
+int weida_fetch_blob(const weida_fetch *f, weida_blob **out);
+
+/**
+ * The piece list, once it is known and verified (`Fetch::list`): 1 and a
+ * copy in `*out`, to resume without LIST (`weida_fetch_options_set_list`);
+ * 0 with `*out == NULL` while it is not known. `-WEIDA_EINVAL` while a
+ * `weida_fetch_next` read is in flight.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch; `out` is NULL or writable. Release the
+ * result with `weida_piece_list_drop`.
+ */
+int weida_fetch_list(const weida_fetch *f, weida_piece_list **out);
+
+/**
+ * The pieces the caller holds (`Fetch::delivered`): those it started with
+ * and those this fetch yielded, copied into a new map. `-WEIDA_EINVAL`
+ * while a `weida_fetch_next` read is in flight.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch; `out` is NULL or writable. Release the
+ * result with `weida_bits_drop`.
+ */
+int weida_fetch_delivered(const weida_fetch *f, weida_bits **out);
+
+/**
+ * The pieces ordered of some seeder and not yet taken
+ * (`Fetch::in_flight`): on their way, or verified and waiting for
+ * `weida_fetch_next`, copied into a new map. `-WEIDA_EINVAL` while a
+ * `weida_fetch_next` read is in flight.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch; `out` is NULL or writable. Release the
+ * result with `weida_bits_drop`.
+ */
+int weida_fetch_in_flight(const weida_fetch *f, weida_bits **out);
+
+/**
+ * Releases a fetch, which aborts every order it has in flight; the pieces
+ * it yielded are the caller's. A thread waiting in `weida_fetch_next`
+ * returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch, dropped at most once.
+ */
+void weida_fetch_drop(weida_fetch *f);
+
+/**
+ * Which piece this is (`Piece::index`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live piece.
+ */
+uint32_t weida_piece_index(const weida_piece *p);
+
+/**
+ * The piece's bytes (`Piece::bytes`), checked against the blob's root: the
+ * bytes of `weida_blob_span` of its index, their length in `*len_out` when
+ * that is not NULL. NULL for NULL. Valid as long as `p`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live piece; `len_out` is NULL or writable.
+ */
+const uint8_t *weida_piece_bytes(const weida_piece *p, size_t *len_out);
+
+/**
+ * Releases a piece and its bytes. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live piece, dropped at most once.
+ */
+void weida_piece_drop(weida_piece *p);
+
+/**
+ * Registers a seeder at the endpoint path `path` (`Listener::seeder`).
+ * Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
+ * `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_seeder_drop`.
+ */
+int weida_listener_seeder(const weida_listener *l, const char *path, weida_seeder **out);
+
+/**
+ * The endpoint path this seeder serves. Lives as long as the seeder.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live seeder; `len_out` is NULL or writable.
+ */
+const char *weida_seeder_path(const weida_seeder *s, size_t *len_out);
+
+/**
+ * The seeder's readiness descriptor (R11): readable when the next
+ * `weida_seeder_accept` will not block.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live seeder; `out` is NULL or writable.
+ */
+int weida_seeder_fd(const weida_seeder *s, int64_t *out);
+
+/**
+ * Takes the next session, waiting up to `timeout_ms` (R4) for one
+ * (`Seeder::accept`). Every session arrives with a well-formed open; admit
+ * it from its blob and metadata, or decline it. `-WEIDA_ENOT_CONNECTED`
+ * once the queue ended.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live seeder; `out` is NULL or writable. Release the
+ * session with `weida_seed_session_drop` or decline it.
+ */
+int weida_seeder_accept(const weida_seeder *s, int64_t timeout_ms, weida_seed_session **out);
+
+/**
+ * Releases a seeder; sessions not yet accepted are dropped, as a dropped
+ * Rust `Seeder` drops them. A thread waiting in `weida_seeder_accept`
+ * returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live seeder, dropped at most once.
+ */
+void weida_seeder_drop(weida_seeder *s);
+
+/**
+ * The blob this session is about (`SeedSession::blob`), as a new handle.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `out` is NULL or writable. Release the
+ * result with `weida_blob_drop`.
+ */
+int weida_seed_session_blob(const weida_seed_session *s, weida_blob **out);
+
+/**
+ * Writes a new reference to the session's metadata (`SeedSession::meta`);
+ * its peer names the fetching side where its connection proved a key.
+ * Release it with `weida_incoming_meta_drop`; it outlives the session.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `out` is NULL or writable.
+ */
+int weida_seed_session_meta(const weida_seed_session *s, weida_incoming_meta **out);
+
+/**
+ * The number of the connection the session arrived on
+ * (`SeedSession::connection`, `ConnectionId::get`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session.
+ */
+uint64_t weida_seed_session_connection(const weida_seed_session *s);
+
+/**
+ * The session's readiness descriptor (R11): readable when the next
+ * `weida_seed_session_next` will not block.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `out` is NULL or writable.
+ */
+int weida_seed_session_fd(const weida_seed_session *s, int64_t *out);
+
+/**
+ * Takes the next order, waiting up to `timeout_ms` (R4) for one
+ * (`SeedSession::next`): 1 with its `WEIDA_ASK_*` kind in `*out_ask` and,
+ * for a PIECE, the piece index in `*out_index` (0 otherwise); 0 once the
+ * fetch finished its orders, the outs untouched. Answer each order with the
+ * `weida_seed_session_answer_*` that matches it before the next call.
+ *
+ * Waits as long as the fetch sends none: its idleness is its backpressure.
+ * `-WEIDA_EPROTOCOL` while the order before is unanswered, for an order
+ * this blob cannot have (the session is then refused), and after the
+ * session failed. A read in flight keeps its place across timeouts and
+ * `EINTR`; it must not be abandoned midway, so drop the session instead.
+ * `-WEIDA_EINVAL` while an answer op runs.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `out_ask` and `out_index` are NULL or
+ * writable.
+ */
+int weida_seed_session_next(const weida_seed_session *s,
+                            int64_t timeout_ms,
+                            int *out_ask,
+                            uint32_t *out_index);
+
+/**
+ * Answers `WEIDA_ASK_LIST` with the piece list of the session's blob
+ * (`SeedSession::answer_list`). The session shares `list` until the answer
+ * is written.
+ *
+ * Never blocks; the answer runs as the op written to `out`. `-WEIDA_EINVAL`
+ * while a `next` or another answer holds the session.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `list` is NULL or a live piece list; `out`
+ * is NULL or writable. Release the op with
+ * `weida_seed_session_answer_list_op_drop`.
+ */
+int weida_seed_session_answer_list(const weida_seed_session *s,
+                                   const weida_piece_list *list,
+                                   weida_seed_session_answer_list_op **out);
+
+/**
+ * The readiness descriptor of a list answer op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live list answer op; `out` is NULL or writable.
+ */
+int weida_seed_session_answer_list_op_fd(const weida_seed_session_answer_list_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the answer: 0 once it was written.
+ * `-WEIDA_EPROTOCOL` when the order was not LIST or the list is of another
+ * blob; the session is then refused.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live list answer op.
+ */
+int weida_seed_session_answer_list_op_wait(const weida_seed_session_answer_list_op *op,
+                                           int64_t timeout_ms);
+
+/**
+ * Releases a list answer op, aborting the answer when unfinished. NULL
+ * does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live list answer op, dropped at most once.
+ */
+void weida_seed_session_answer_list_op_drop(weida_seed_session_answer_list_op *op);
+
+/**
+ * Answers `WEIDA_ASK_HAVE` with the pieces this seeder can serve now
+ * (`SeedSession::answer_have`). `have` is copied at the call.
+ *
+ * Never blocks; the answer runs as the op written to `out`. `-WEIDA_EINVAL`
+ * while a `next` or another answer holds the session.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `have` is NULL or a live map; `out` is
+ * NULL or writable. Release the op with
+ * `weida_seed_session_answer_have_op_drop`.
+ */
+int weida_seed_session_answer_have(const weida_seed_session *s,
+                                   const weida_bits *have,
+                                   weida_seed_session_answer_have_op **out);
+
+/**
+ * The readiness descriptor of a HAVE answer op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live HAVE answer op; `out` is NULL or writable.
+ */
+int weida_seed_session_answer_have_op_fd(const weida_seed_session_answer_have_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the answer: 0 once it was written.
+ * `-WEIDA_EPROTOCOL` when the order was not HAVE or the map does not have
+ * one bit per piece; the session is then refused.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live HAVE answer op.
+ */
+int weida_seed_session_answer_have_op_wait(const weida_seed_session_answer_have_op *op,
+                                           int64_t timeout_ms);
+
+/**
+ * Releases a HAVE answer op, aborting the answer when unfinished. NULL
+ * does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live HAVE answer op, dropped at most once.
+ */
+void weida_seed_session_answer_have_op_drop(weida_seed_session_answer_have_op *op);
+
+/**
+ * Answers `WEIDA_ASK_PIECE` with the piece's `len` bytes
+ * (`SeedSession::answer_piece`), copied at the call. They are not checked
+ * against the root here: the fetch checks every piece and drops a seeder
+ * that sends a wrong one.
+ *
+ * Never blocks; the answer runs as the op written to `out`. `-WEIDA_EINVAL`
+ * while a `next` or another answer holds the session.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `data` is NULL only with `len == 0`, else
+ * points to `len` readable bytes; `out` is NULL or writable. Release the op
+ * with `weida_seed_session_answer_piece_op_drop`.
+ */
+int weida_seed_session_answer_piece(const weida_seed_session *s,
+                                    const uint8_t *data,
+                                    size_t len,
+                                    weida_seed_session_answer_piece_op **out);
+
+/**
+ * The readiness descriptor of a piece answer op: readable once it
+ * finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live piece answer op; `out` is NULL or writable.
+ */
+int weida_seed_session_answer_piece_op_fd(const weida_seed_session_answer_piece_op *op,
+                                          int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the answer: 0 once it was written.
+ * `-WEIDA_EPROTOCOL` when the order was not PIECE or the bytes do not have
+ * the length of its span; the session is then refused.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live piece answer op.
+ */
+int weida_seed_session_answer_piece_op_wait(const weida_seed_session_answer_piece_op *op,
+                                            int64_t timeout_ms);
+
+/**
+ * Releases a piece answer op, aborting the answer when unfinished. NULL
+ * does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live piece answer op, dropped at most once.
+ */
+void weida_seed_session_answer_piece_op_drop(weida_seed_session_answer_piece_op *op);
+
+/**
+ * Ends the session (`SeedSession::decline`): a blob this seeder does not
+ * serve, or a piece it does not hold. The fetch drops this seeder for the
+ * blob. **Consumes** `s` on every return path; a `next` in flight is
+ * dropped.
+ *
+ * Never blocks; the DECLINE runs as the op written to `out`. While an
+ * answer op runs it fails with `-WEIDA_EINVAL`, and the session is dropped
+ * when that answer ends; a NULL `out` fails the same way and drops it at
+ * once.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session, not used again; `out` is NULL or
+ * writable. Release the op with `weida_seed_session_decline_op_drop`.
+ */
+int weida_seed_session_decline(weida_seed_session *s, weida_seed_session_decline_op **out);
+
+/**
+ * The readiness descriptor of a decline op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live decline op; `out` is NULL or writable.
+ */
+int weida_seed_session_decline_op_fd(const weida_seed_session_decline_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the DECLINE: 0 once it was sent or the
+ * session was gone.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live decline op.
+ */
+int weida_seed_session_decline_op_wait(const weida_seed_session_decline_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a decline op, aborting the DECLINE when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live decline op, dropped at most once.
+ */
+void weida_seed_session_decline_op_drop(weida_seed_session_decline_op *op);
+
+/**
+ * Releases a session. It ends with the last holder (a running answer op
+ * holds it), and the fetch drops this seeder when an answer was still due.
+ * A thread waiting in `weida_seed_session_next` returns `-WEIDA_ECLOSED`.
+ * NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session, dropped at most once.
+ */
+void weida_seed_session_drop(weida_seed_session *s);
 
 /**
  * Creates a trust that accepts only what each dialled address names
