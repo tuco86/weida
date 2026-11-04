@@ -47,6 +47,9 @@ DROP(incoming_request_canceled_op)
 DROP(requester)
 DROP(requester_connect_op)
 DROP(requester_request_op)
+DROP(requester_open_op)
+DROP(reply_stream)
+DROP(reply_stream_recv_op)
 DROP(trust)
 DROP(identity)
 DROP(client_tls)
@@ -1364,6 +1367,61 @@ FD(requester_request_op_fd, requester_request_op)
 WAIT1(requester_request_op_wait, requester_request_op, weida_incoming_transfer,
       wrap_incoming_transfer)
 
+static napi_value requester_open(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_requester *r = live(env, argv[0], drop_requester);
+    void *meta = NULL;
+    weida_requester_open_op *op = NULL;
+    if (!r || !optional(env, argv[1], drop_transfer_meta, &meta))
+        return NULL;
+    int rc = weida_requester_open(r, meta, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_requester_open_op);
+}
+
+FD(requester_open_op_fd, requester_open_op)
+
+/* `requesterOpenOpWait(op) -> { body, reply } | AGAIN` */
+static napi_value requester_open_op_wait(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_requester_open_op *p = live(env, argv[0], drop_requester_open_op);
+    weida_outgoing_transfer *body = NULL;
+    weida_reply_stream *reply = NULL;
+    napi_value obj, b, s;
+    if (!p)
+        return NULL;
+    int rc = weida_requester_open_op_wait(p, 0, &body, &reply);
+    if (rc == -WEIDA_EAGAIN)
+        return again(env);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    b = wrap(env, body, drop_outgoing_transfer);
+    if (!b) {
+        weida_reply_stream_drop(reply);
+        return NULL;
+    }
+    s = wrap(env, reply, drop_reply_stream);
+    if (!s)
+        return NULL;
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    return set(env, obj, "body", b) ? set(env, obj, "reply", s) : NULL;
+}
+
+/* consumes the reply stream */
+static napi_value reply_stream_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_reply_stream *s = take(env, argv[0], drop_reply_stream);
+    weida_reply_stream_recv_op *op = NULL;
+    if (!s)
+        return NULL;
+    int rc = weida_reply_stream_recv(s, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_reply_stream_recv_op);
+}
+
+FD(reply_stream_recv_op_fd, reply_stream_recv_op)
+WAIT1(reply_stream_recv_op_wait, reply_stream_recv_op, weida_incoming_transfer,
+      wrap_incoming_transfer)
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -1711,6 +1769,12 @@ NAPI_MODULE_INIT() {
         FN("requesterRequestWith", requester_request_with),
         FN("requesterRequestOpFd", requester_request_op_fd),
         FN("requesterRequestOpWait", requester_request_op_wait),
+        FN("requesterOpen", requester_open),
+        FN("requesterOpenOpFd", requester_open_op_fd),
+        FN("requesterOpenOpWait", requester_open_op_wait),
+        FN("replyStreamRecv", reply_stream_recv),
+        FN("replyStreamRecvOpFd", reply_stream_recv_op_fd),
+        FN("replyStreamRecvOpWait", reply_stream_recv_op_wait),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferFd", incoming_transfer_fd),
         FN("incomingTransferRead", incoming_transfer_read),

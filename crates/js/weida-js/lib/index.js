@@ -616,6 +616,47 @@ export class Requester extends Handle {
     );
     return adopt(IncomingTransfer, transfer);
   }
+
+  /** Opens one exchange with `meta` (a `TransferMeta` object, or null),
+   * copied when it starts: `body`, the request written like a socket and
+   * ended with `finish()`, and `reply`, the stream the reply is awaited on.
+   * The halves are independent, so the reply can be read while the body is
+   * still open. Aborting abandons the exchange. */
+  async open(meta, { signal } = {}) {
+    const opened = await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.requesterOpen(this[HANDLE], m)),
+      native.requesterOpenOpWait,
+      native.requesterOpenOpFd,
+      signal,
+    );
+    return Object.freeze({
+      body: adopt(OutgoingTransfer, opened.body),
+      reply: adopt(ReplyStream, opened.reply),
+    });
+  }
+}
+
+/** The reply half of an exchange `Requester.open` started. Dropping it
+ * before `recv` tells the replier nobody is listening. */
+export class ReplyStream extends Handle {
+  constructor() {
+    super();
+    noConstructor("ReplyStream", "Requester.open()");
+  }
+
+  /** The reply, as soon as its header arrives; a refused request rejects
+   * with the refusal's WeidaError. Consumes the stream. */
+  async recv({ signal } = {}) {
+    const transfer = await op(
+      this,
+      () => native.replyStreamRecv(consume(this)),
+      native.replyStreamRecvOpWait,
+      native.replyStreamRecvOpFd,
+      signal,
+    );
+    return adopt(IncomingTransfer, transfer);
+  }
 }
 
 /** The replying half of Req/Rep, serving one endpoint path. */
@@ -705,7 +746,7 @@ export class IncomingRequest extends Handle {
 export class IncomingTransfer extends Handle {
   constructor() {
     super();
-    noConstructor("IncomingTransfer", "Requester.request() or IncomingRequest.takeBody()");
+    noConstructor("IncomingTransfer", "Requester.request(), ReplyStream.recv() or IncomingRequest.takeBody()");
   }
 
   meta() {
@@ -741,7 +782,7 @@ export class IncomingTransfer extends Handle {
 export class OutgoingTransfer extends Handle {
   constructor() {
     super();
-    noConstructor("OutgoingTransfer", "IncomingRequest.reply()");
+    noConstructor("OutgoingTransfer", "IncomingRequest.reply() or Requester.open()");
   }
 
   /** Writes some of `data`; resolves with how many bytes flow control took. */

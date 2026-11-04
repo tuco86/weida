@@ -199,3 +199,39 @@ test("canceled settles once the requester gives up", UNIT, async () => {
   request.drop();
   await p.close();
 });
+
+test("an opened exchange reads its reply while the request is still open", UNIT, async () => {
+  const p = await pair();
+  const { body, reply } = await p.requester.open({ contentType: "text/plain" });
+  for (const piece of ["one", "two", "three"]) {
+    await body.writeAll(piece);
+  }
+  const request = await p.replier.accept();
+  assert.equal(request.meta().contentType, "text/plain");
+  const received = request.takeBody();
+  const answer = await request.reply(null);
+  await answer.writeAll("ack");
+  answer.finish().drop();
+  const message = await (await reply.recv()).collect(1024);
+  assert.equal(text(message.payload), "ack");
+  body.finish().drop();
+  const pieces = [];
+  for (let piece = await received.read(4); piece.length > 0; piece = await received.read(4)) {
+    pieces.push(...piece);
+  }
+  assert.equal(text(Uint8Array.from(pieces)), "onetwothree");
+  await p.close();
+});
+
+test("dropping a reply stream tells the replier nobody is listening", UNIT, async () => {
+  const p = await pair();
+  const { body, reply } = await p.requester.open(null);
+  const request = await p.replier.accept();
+  const canceled = request.canceled();
+  assert.equal(await Promise.race([canceled.then(() => "settled"), delay(50, "pending")]), "pending");
+  reply.drop();
+  await canceled;
+  request.drop();
+  body.drop();
+  await p.close();
+});

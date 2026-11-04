@@ -182,6 +182,12 @@ export interface Message {
   readonly meta: IncomingMeta;
 }
 
+/** The two halves of an exchange `Requester.open` started. */
+export interface Exchange {
+  readonly body: OutgoingTransfer;
+  readonly reply: ReplyStream;
+}
+
 /** The metadata an outgoing transfer carries. An unknown field throws a
  * TypeError. */
 export interface TransferMeta {
@@ -278,6 +284,13 @@ export class Requester extends Handle {
   request(body: Bytes, options?: WaitOptions): Promise<IncomingTransfer>;
   /** `request` with metadata, copied when the request starts. */
   requestWith(meta: TransferMeta | null, body: Bytes, options?: WaitOptions): Promise<IncomingTransfer>;
+  /** Opens one exchange: the request body to write and the reply stream, independent of each other. */
+  open(meta?: TransferMeta | null, options?: WaitOptions): Promise<Exchange>;
+}
+
+export class ReplyStream extends Handle {
+  /** The reply as soon as its header arrives; consumes the stream. */
+  recv(options?: WaitOptions): Promise<IncomingTransfer>;
 }
 
 export class Replier extends Handle {
