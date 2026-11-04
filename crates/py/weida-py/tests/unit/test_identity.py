@@ -9,6 +9,15 @@ import pytest
 
 import weida
 
+# `cryptography`, where it is installed, is imported at collection, so its
+# first import (compiling bytecode in a fresh venv) is not charged to one
+# test's second.
+try:
+    import cryptography.hazmat.primitives.serialization  # noqa: F401
+    import cryptography.x509  # noqa: F401
+except ImportError:
+    pass
+
 
 def test_to_pem_reads_back_with_the_same_fingerprint():
     identity = weida.Identity.generate()
