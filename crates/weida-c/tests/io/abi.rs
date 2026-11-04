@@ -3113,7 +3113,21 @@ fn push_to_pull_over_inproc_arrives_in_order() {
         weida_peer_events_drop(events);
     }
 
+    // The first number a connection sees sets its position, and two streams
+    // may reach the puller in either order: "one" is taken before the rest is
+    // sent, so what follows is ordered against it.
+    let expect = |n: u64, expected: &[u8], labelled: Option<&str>| {
+        let t = pull(pull_end);
+        let meta = meta_of(t);
+        assert_eq!(sequence(meta), Some(n), "arrival order");
+        assert_eq!(gap(meta), None);
+        assert_eq!(content_type(meta).as_deref(), labelled);
+        // SAFETY: dropped once.
+        unsafe { weida_incoming_meta_drop(meta) };
+        assert_eq!(body(t), expected);
+    };
     send(push, b"one");
+    expect(0, b"one", None);
     send(push, b"two");
     let mut meta = ptr::null_mut();
     let json = c("application/json");
@@ -3132,23 +3146,8 @@ fn push_to_pull_over_inproc_arrives_in_order() {
     ));
     // SAFETY: dropped once.
     unsafe { weida_transfer_meta_drop(meta) };
-    for (n, (expected, labelled)) in [
-        (&b"one"[..], None),
-        (b"two", None),
-        (b"three", Some("application/json")),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let t = pull(pull_end);
-        let meta = meta_of(t);
-        assert_eq!(sequence(meta), Some(n as u64), "arrival order");
-        assert_eq!(gap(meta), None);
-        assert_eq!(content_type(meta).as_deref(), labelled);
-        // SAFETY: dropped once.
-        unsafe { weida_incoming_meta_drop(meta) };
-        assert_eq!(body(t), expected);
-    }
+    expect(1, b"two", None);
+    expect(2, b"three", Some("application/json"));
 
     let mut meta = ptr::null_mut();
     let mut out = ptr::null_mut();
