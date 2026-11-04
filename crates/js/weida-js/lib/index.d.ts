@@ -398,6 +398,9 @@ export class Runtime extends Handle {
   pusher(clientTls: ClientTls): Pusher;
   /** Two subscribers on one runtime collide on the path: use one runtime per subscriber of a path. */
   subscriber(clientTls: ClientTls): Subscriber;
+  /** A dialling pair: one peer, dialled with `connect`. */
+  pair(clientTls: ClientTls): Paired;
+  surveyor(clientTls: ClientTls): Surveyor;
   /** Duplicates discarded inside a negotiated deduplication window. */
   suppressedDuplicates(): bigint;
   /** Outgoing transfers reset because their deadline passed. */
@@ -518,6 +521,11 @@ export class Listener extends Handle {
   replier(path: string): Replier;
   puller(path: string): Puller;
   publisher(path: string): Publisher;
+  /** A bound pair, dialled by its one peer. */
+  pair(path: string): Paired;
+  respondent(path: string): Respondent;
+  /** A bus member accepting on `path` and dialling the others on `clientTls`. */
+  bus(path: string, clientTls: ClientTls): BusMember;
   /** Serves a relay on this listener's bindings. */
   relay(): Relay;
 }
@@ -654,6 +662,59 @@ export class Subscriber extends Handle {
   grant(filter: string, limit: Count, options?: WaitOptions): Promise<void>;
   filterCount(): number;
   recv(options?: WaitOptions): Promise<IncomingTransfer>;
+}
+
+/** Either half of PAIR; a bound pair's first send or open waits until its peer has sent. */
+export class Paired extends Handle {
+  /** "" on a dialling pair. */
+  path(): string | null;
+  /** Once: a second address rejects with WEIDA_ELIMIT_EXCEEDED, a bound pair with WEIDA_EUNSUPPORTED. */
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  /** Null on a bound pair. */
+  events(): PeerEvents | null;
+  dropped(): bigint;
+  open(meta?: TransferMeta | null, options?: WaitOptions): Promise<OutgoingTransfer>;
+  send(body: Bytes, options?: WaitOptions): Promise<void>;
+  sendWith(meta: TransferMeta | null, body: Bytes, options?: WaitOptions): Promise<void>;
+  recv(options?: WaitOptions): Promise<IncomingTransfer>;
+}
+
+export class Surveyor extends Handle {
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  /** Asks every connected respondent; `deadlineMs` bounds the asking and the answers. */
+  survey(body: Bytes, deadlineMs: Count, options?: WaitOptions): Promise<SurveyRun>;
+  surveyWith(meta: TransferMeta | null, body: Bytes, deadlineMs: Count, options?: WaitOptions): Promise<SurveyRun>;
+}
+
+/** Dropping it resets every exchange not yet answered. */
+export class SurveyRun extends Handle {
+  /** The next answer, or null once the run ended; a failed answer rejects and the run goes on. */
+  next(maxBytes: Count, options?: WaitOptions): Promise<Uint8Array | null>;
+  /** Answers that arrived after the deadline. */
+  late(): bigint;
+  respondents(): number;
+}
+
+export class Respondent extends Handle {
+  path(): string | null;
+  accept(options?: WaitOptions): Promise<IncomingRequest>;
+}
+
+export class BusMember extends Handle {
+  path(): string | null;
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  /** How many members the message reached. */
+  send(body: Bytes, options?: WaitOptions): Promise<number>;
+  sendWith(meta: TransferMeta | null, body: Bytes, options?: WaitOptions): Promise<number>;
+  recv(options?: WaitOptions): Promise<IncomingTransfer>;
+  /** The copies that never reached a member. */
+  dropped(): bigint;
 }
 
 export class Relay extends Handle {

@@ -89,6 +89,18 @@ DROP(subscriber_connect_op)
 DROP(subscriber_subscribe_op)
 DROP(subscriber_unsubscribe_op)
 DROP(subscriber_grant_op)
+DROP(paired)
+DROP(paired_connect_op)
+DROP(paired_send_op)
+DROP(paired_open_op)
+DROP(surveyor)
+DROP(surveyor_connect_op)
+DROP(surveyor_survey_op)
+DROP(survey_run)
+DROP(respondent)
+DROP(bus_member)
+DROP(bus_member_connect_op)
+DROP(bus_member_send_op)
 DROP(transfer_meta)
 DROP(incoming_transfer)
 DROP(incoming_transfer_collect_op)
@@ -727,6 +739,23 @@ static napi_value msg_value(napi_env env, void *ptr) {
     return obj;
 }
 
+/* Copies a weida_survey_answer out into a Uint8Array and drops it. */
+static napi_value answer_value(napi_env env, void *ptr) {
+    weida_survey_answer *a = ptr;
+    napi_value ab, bytes = NULL;
+    void *data = NULL;
+    size_t len = weida_survey_answer_len(a);
+    if (napi_create_arraybuffer(env, len, &data, &ab) == napi_ok &&
+        napi_create_typedarray(env, napi_uint8_array, len, ab, 0, &bytes) == napi_ok) {
+        if (len)
+            memcpy(data, weida_survey_answer_data(a), len);
+    } else {
+        bytes = throw_napi(env);
+    }
+    weida_survey_answer_drop(a);
+    return bytes;
+}
+
 /* Copies a weida_drained out into `{ delivered, outstanding }` and drops it. */
 static napi_value drained_value(napi_env env, void *ptr) {
     weida_drained *d = ptr;
@@ -939,6 +968,7 @@ WRAP_AS(outgoing_transfer)
 WRAP_AS(handoff)
 WRAP_AS(relay_request)
 WRAP_AS(resolved)
+WRAP_AS(survey_run)
 
 /* `<t>_<x>(h) -> bigint`: an infallible uint64_t accessor (R2). */
 #define U64_OUT(js, t, x) \
@@ -2837,6 +2867,290 @@ static napi_value subscriber_recv(napi_env env, napi_callback_info info) {
     return outcome(env, rc, wrap_incoming_transfer, out);
 }
 
+/* pair */
+
+static napi_value runtime_pair(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_runtime *rt = live(env, argv[0], drop_runtime);
+    if (!rt)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[1], drop_client_tls);
+    weida_paired *out = NULL;
+    if (!tls)
+        return NULL;
+    int rc = weida_runtime_pair(rt, tls, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_paired);
+}
+
+static napi_value listener_pair(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_paired *out = NULL;
+    int rc = weida_listener_pair(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_paired);
+}
+
+STRING_OUT(paired_path, paired, path)
+STRING_OP(paired_connect, paired, connect)
+FD(paired_connect_op_fd, paired_connect_op)
+WAIT0(paired_connect_op_wait, paired_connect_op)
+SIZE_OUT(paired_peer_count, paired, peer_count)
+U64_OUT(paired_dropped, paired, dropped)
+CONNECTION_STATS(paired_connection_stats, paired)
+
+/* -> peer events | null; null for a bound pair */
+static napi_value paired_events(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_paired *p = live(env, argv[0], drop_paired);
+    if (!p)
+        return NULL;
+    weida_peer_events *out = NULL;
+    int rc = weida_paired_events(p, &out);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    return rc == 1 ? wrap(env, out, drop_peer_events) : js_null(env);
+}
+
+static napi_value paired_open(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_paired *p = live(env, argv[0], drop_paired);
+    void *meta = NULL;
+    weida_paired_open_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_transfer_meta, &meta))
+        return NULL;
+    int rc = weida_paired_open(p, meta, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_paired_open_op);
+}
+
+FD(paired_open_op_fd, paired_open_op)
+WAIT1(paired_open_op_wait, paired_open_op, weida_outgoing_transfer, wrap_outgoing_transfer)
+
+static napi_value paired_send(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_paired *p = live(env, argv[0], drop_paired);
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_paired_send_op *op = NULL;
+    if (!p || !get_bytes(env, argv[1], &body, &len))
+        return NULL;
+    int rc = weida_paired_send(p, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_paired_send_op);
+}
+
+static napi_value paired_send_with(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_paired *p = live(env, argv[0], drop_paired);
+    void *meta = NULL;
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_paired_send_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_transfer_meta, &meta) ||
+        !get_bytes(env, argv[2], &body, &len))
+        return NULL;
+    int rc = weida_paired_send_with(p, meta, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_paired_send_op);
+}
+
+FD(paired_send_op_fd, paired_send_op)
+WAIT0(paired_send_op_wait, paired_send_op)
+FD(paired_fd, paired)
+
+static napi_value paired_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_paired *p = live(env, argv[0], drop_paired);
+    weida_incoming_transfer *out = NULL;
+    if (!p)
+        return NULL;
+    int rc = weida_paired_recv(p, 0, &out);
+    return outcome(env, rc, wrap_incoming_transfer, out);
+}
+
+/* survey */
+
+static napi_value runtime_surveyor(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_runtime *rt = live(env, argv[0], drop_runtime);
+    if (!rt)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[1], drop_client_tls);
+    weida_surveyor *out = NULL;
+    if (!tls)
+        return NULL;
+    int rc = weida_runtime_surveyor(rt, tls, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_surveyor);
+}
+
+STRING_OP(surveyor_connect, surveyor, connect)
+FD(surveyor_connect_op_fd, surveyor_connect_op)
+WAIT0(surveyor_connect_op_wait, surveyor_connect_op)
+SIZE_OUT(surveyor_peer_count, surveyor, peer_count)
+CONNECTION_STATS(surveyor_connection_stats, surveyor)
+
+/* (surveyor, bytes, deadlineMs) -> op */
+static napi_value surveyor_survey(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_surveyor *s = live(env, argv[0], drop_surveyor);
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    uint64_t deadline_ms = 0;
+    weida_surveyor_survey_op *op = NULL;
+    if (!s || !get_bytes(env, argv[1], &body, &len) ||
+        !get_u64(env, argv[2], UINT64_MAX, &deadline_ms))
+        return NULL;
+    int rc = weida_surveyor_survey(s, body, len, deadline_ms, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_surveyor_survey_op);
+}
+
+/* (surveyor, meta | null, bytes, deadlineMs) -> op */
+static napi_value surveyor_survey_with(napi_env env, napi_callback_info info) {
+    ARGS(4);
+    const weida_surveyor *s = live(env, argv[0], drop_surveyor);
+    void *meta = NULL;
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    uint64_t deadline_ms = 0;
+    weida_surveyor_survey_op *op = NULL;
+    if (!s || !optional(env, argv[1], drop_transfer_meta, &meta) ||
+        !get_bytes(env, argv[2], &body, &len) ||
+        !get_u64(env, argv[3], UINT64_MAX, &deadline_ms))
+        return NULL;
+    int rc = weida_surveyor_survey_with(s, meta, body, len, deadline_ms, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_surveyor_survey_op);
+}
+
+FD(surveyor_survey_op_fd, surveyor_survey_op)
+WAIT1(surveyor_survey_op_wait, surveyor_survey_op, weida_survey_run, wrap_survey_run)
+FD(survey_run_fd, survey_run)
+
+/* (run, maxBytes) -> Uint8Array | null | AGAIN; null once the run ended */
+static napi_value survey_run_next(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_survey_run *r = live(env, argv[0], drop_survey_run);
+    uint64_t max = 0;
+    weida_survey_answer *a = NULL;
+    if (!r || !get_u64(env, argv[1], UINT64_MAX, &max))
+        return NULL;
+    int rc = weida_survey_run_next(r, max, 0, &a);
+    if (rc == 0 && !a)
+        return js_null(env);
+    return outcome(env, rc, answer_value, a);
+}
+
+U64_OUT(survey_run_late, survey_run, late)
+SIZE_OUT(survey_run_respondents, survey_run, respondents)
+
+static napi_value listener_respondent(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_respondent *out = NULL;
+    int rc = weida_listener_respondent(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_respondent);
+}
+
+STRING_OUT(respondent_path, respondent, path)
+FD(respondent_fd, respondent)
+
+static napi_value respondent_accept(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_respondent *r = live(env, argv[0], drop_respondent);
+    weida_incoming_request *out = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_respondent_accept(r, 0, &out);
+    return outcome(env, rc, wrap_incoming_request, out);
+}
+
+/* bus */
+
+/* (listener, path, clientTls) -> member */
+static napi_value listener_bus(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[2], drop_client_tls);
+    if (!tls)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_bus_member *out = NULL;
+    int rc = weida_listener_bus(l, path, tls, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_bus_member);
+}
+
+STRING_OUT(bus_member_path, bus_member, path)
+STRING_OP(bus_member_connect, bus_member, connect)
+FD(bus_member_connect_op_fd, bus_member_connect_op)
+WAIT0(bus_member_connect_op_wait, bus_member_connect_op)
+SIZE_OUT(bus_member_peer_count, bus_member, peer_count)
+CONNECTION_STATS(bus_member_connection_stats, bus_member)
+U64_OUT(bus_member_dropped, bus_member, dropped)
+
+static napi_value bus_member_send(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_bus_member *m = live(env, argv[0], drop_bus_member);
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_bus_member_send_op *op = NULL;
+    if (!m || !get_bytes(env, argv[1], &body, &len))
+        return NULL;
+    int rc = weida_bus_member_send(m, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_bus_member_send_op);
+}
+
+static napi_value bus_member_send_with(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_bus_member *m = live(env, argv[0], drop_bus_member);
+    void *meta = NULL;
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_bus_member_send_op *op = NULL;
+    if (!m || !optional(env, argv[1], drop_transfer_meta, &meta) ||
+        !get_bytes(env, argv[2], &body, &len))
+        return NULL;
+    int rc = weida_bus_member_send_with(m, meta, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_bus_member_send_op);
+}
+
+FD(bus_member_send_op_fd, bus_member_send_op)
+
+/* -> number | AGAIN: the members the message reached */
+static napi_value bus_member_send_op_wait(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_bus_member_send_op *p = live(env, argv[0], drop_bus_member_send_op);
+    if (!p)
+        return NULL;
+    size_t n = 0;
+    int rc = weida_bus_member_send_op_wait(p, 0, &n);
+    return rc == 0 ? js_int64(env, (int64_t)n) : outcome(env, rc, NULL, NULL);
+}
+
+FD(bus_member_fd, bus_member)
+
+static napi_value bus_member_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_bus_member *m = live(env, argv[0], drop_bus_member);
+    weida_incoming_transfer *out = NULL;
+    if (!m)
+        return NULL;
+    int rc = weida_bus_member_recv(m, 0, &out);
+    return outcome(env, rc, wrap_incoming_transfer, out);
+}
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -3356,6 +3670,57 @@ NAPI_MODULE_INIT() {
         FN("subscriberFilterCount", subscriber_filter_count),
         FN("subscriberFd", subscriber_fd),
         FN("subscriberRecv", subscriber_recv),
+        FN("runtimePair", runtime_pair),
+        FN("listenerPair", listener_pair),
+        FN("pairedPath", paired_path),
+        FN("pairedConnect", paired_connect),
+        FN("pairedConnectOpFd", paired_connect_op_fd),
+        FN("pairedConnectOpWait", paired_connect_op_wait),
+        FN("pairedPeerCount", paired_peer_count),
+        FN("pairedDropped", paired_dropped),
+        FN("pairedConnectionStats", paired_connection_stats),
+        FN("pairedEvents", paired_events),
+        FN("pairedOpen", paired_open),
+        FN("pairedOpenOpFd", paired_open_op_fd),
+        FN("pairedOpenOpWait", paired_open_op_wait),
+        FN("pairedSend", paired_send),
+        FN("pairedSendWith", paired_send_with),
+        FN("pairedSendOpFd", paired_send_op_fd),
+        FN("pairedSendOpWait", paired_send_op_wait),
+        FN("pairedFd", paired_fd),
+        FN("pairedRecv", paired_recv),
+        FN("runtimeSurveyor", runtime_surveyor),
+        FN("surveyorConnect", surveyor_connect),
+        FN("surveyorConnectOpFd", surveyor_connect_op_fd),
+        FN("surveyorConnectOpWait", surveyor_connect_op_wait),
+        FN("surveyorPeerCount", surveyor_peer_count),
+        FN("surveyorConnectionStats", surveyor_connection_stats),
+        FN("surveyorSurvey", surveyor_survey),
+        FN("surveyorSurveyWith", surveyor_survey_with),
+        FN("surveyorSurveyOpFd", surveyor_survey_op_fd),
+        FN("surveyorSurveyOpWait", surveyor_survey_op_wait),
+        FN("surveyRunFd", survey_run_fd),
+        FN("surveyRunNext", survey_run_next),
+        FN("surveyRunLate", survey_run_late),
+        FN("surveyRunRespondents", survey_run_respondents),
+        FN("listenerRespondent", listener_respondent),
+        FN("respondentPath", respondent_path),
+        FN("respondentFd", respondent_fd),
+        FN("respondentAccept", respondent_accept),
+        FN("listenerBus", listener_bus),
+        FN("busMemberPath", bus_member_path),
+        FN("busMemberConnect", bus_member_connect),
+        FN("busMemberConnectOpFd", bus_member_connect_op_fd),
+        FN("busMemberConnectOpWait", bus_member_connect_op_wait),
+        FN("busMemberPeerCount", bus_member_peer_count),
+        FN("busMemberConnectionStats", bus_member_connection_stats),
+        FN("busMemberDropped", bus_member_dropped),
+        FN("busMemberSend", bus_member_send),
+        FN("busMemberSendWith", bus_member_send_with),
+        FN("busMemberSendOpFd", bus_member_send_op_fd),
+        FN("busMemberSendOpWait", bus_member_send_op_wait),
+        FN("busMemberFd", bus_member_fd),
+        FN("busMemberRecv", bus_member_recv),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),

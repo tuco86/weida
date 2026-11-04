@@ -1,4 +1,4 @@
-// Push/Pull and Pub/Sub over the in-process transport.
+// The patterns over the in-process transport.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
@@ -185,4 +185,104 @@ test("a fan-out streams one payload to every subscriber", UNIT, async () => {
   assert.equal(copy.meta().topic, "px.frame");
   assert.equal(text((await copy.collect(1024)).payload), "abcdef");
   await p.close();
+});
+
+test("a pair exchanges in both directions", UNIT, async () => {
+  const server = weida.Runtime.owned();
+  const client = weida.Runtime.owned();
+  const at = bound(server);
+  const url = `weida+inproc://${at.bus}/link`;
+  const near = at.listener.pair("/link");
+  assert.equal(near.path(), "/link");
+  await assert.rejects(near.connect(url), { code: "WEIDA_EUNSUPPORTED" });
+  assert.equal(near.events(), null);
+  const far = client.pair(clientTls());
+  assert.equal(far.path(), "");
+  await far.connect(url);
+  await assert.rejects(far.connect(url), { code: "WEIDA_ELIMIT_EXCEEDED" });
+  assert.equal(far.peerCount(), 1);
+
+  await far.send("ping");
+  const ping = await near.recv();
+  assert.equal(text((await ping.collect(1024)).payload), "ping");
+  await near.sendWith({ contentType: "text/plain" }, "pong");
+  const pong = await far.recv();
+  assert.equal(pong.meta().contentType, "text/plain");
+  assert.equal(text((await pong.collect(1024)).payload), "pong");
+  assert.equal(far.dropped(), 0n);
+
+  for (const handle of [far, near, at.binding, at.listener]) handle.drop();
+  await client.shutdown();
+  await server.shutdown();
+});
+
+test("a survey collects two respondents' answers within its window", UNIT, async () => {
+  const server = weida.Runtime.owned();
+  const client = weida.Runtime.owned();
+  const ats = [bound(server), bound(server)];
+  const respondents = ats.map((at) => at.listener.respondent("/poll"));
+  const surveyor = client.surveyor(clientTls());
+  for (const at of ats) await surveyor.connect(`weida+inproc://${at.bus}/poll`);
+  assert.equal(surveyor.peerCount(), 2);
+
+  const answering = respondents.map(async (respondent, i) => {
+    const request = await respondent.accept();
+    assert.equal(text((await request.takeBody().collect(1024)).payload), "who is there");
+    const reply = await request.reply();
+    await reply.writeAll(["a", "b"][i]);
+    await reply.finish().delivered();
+  });
+  const run = await surveyor.survey("who is there", 60000);
+  await Promise.all(answering);
+  assert.equal(run.respondents(), 2);
+  const answers = [text(await run.next(1024)), text(await run.next(1024))].sort();
+  assert.deepEqual(answers, ["a", "b"]);
+  assert.equal(await run.next(1024), null);
+  assert.equal(run.late(), 0n);
+
+  run.drop();
+  surveyor.drop();
+  for (const respondent of respondents) respondent.drop();
+  for (const at of ats) {
+    at.binding.drop();
+    at.listener.drop();
+  }
+  await client.shutdown();
+  await server.shutdown();
+});
+
+test("a bus message reaches every other member", UNIT, async () => {
+  const runtimes = [0, 1, 2].map(() => weida.Runtime.owned());
+  const ats = runtimes.map((runtime) => bound(runtime));
+  const members = ats.map((at) => at.listener.bus("/bus", clientTls()));
+  for (const [i, member] of members.entries()) {
+    for (const [j, at] of ats.entries()) {
+      if (j !== i) await member.connect(`weida+inproc://${at.bus}/bus`);
+    }
+  }
+
+  for (const [i, member] of members.entries()) {
+    assert.equal(await member.send(`from ${i}`), 2);
+  }
+  for (const [i, member] of members.entries()) {
+    const seen = [];
+    for (let n = 0; n < 2; n += 1) {
+      seen.push(text((await (await member.recv()).collect(1024)).payload));
+    }
+    const others = [0, 1, 2].filter((j) => j !== i).map((j) => `from ${j}`);
+    assert.deepEqual(seen.sort(), others);
+  }
+  await Promise.all(
+    members.map((m) =>
+      assert.rejects(m.recv({ signal: AbortSignal.timeout(200) }), { name: "TimeoutError" }),
+    ),
+  );
+  for (const member of members) assert.equal(member.dropped(), 0n);
+
+  for (const member of members) member.drop();
+  for (const at of ats) {
+    at.binding.drop();
+    at.listener.drop();
+  }
+  await Promise.all(runtimes.map((runtime) => runtime.shutdown()));
 });

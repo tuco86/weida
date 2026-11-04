@@ -487,6 +487,16 @@ export class Runtime extends Handle {
     return adopt(Subscriber, native.runtimeSubscriber(this[HANDLE], handleOf(clientTls, ClientTls)));
   }
 
+  /** A dialling pair on `clientTls`: one peer, dialled with `connect`. */
+  pair(clientTls) {
+    return adopt(Paired, native.runtimePair(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
+  /** A surveyor dialling respondents on `clientTls`. */
+  surveyor(clientTls) {
+    return adopt(Surveyor, native.runtimeSurveyor(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
   /** Duplicates this runtime's connections discarded inside a negotiated
    * deduplication window, a BigInt; 0n without deduplication. */
   suppressedDuplicates() {
@@ -973,6 +983,22 @@ export class Listener extends Handle {
   /** The publisher serving `path` on every binding of this listener. */
   publisher(path) {
     return adopt(Publisher, native.listenerPublisher(this[HANDLE], path));
+  }
+
+  /** A bound pair serving `path` on every binding of this listener. */
+  pair(path) {
+    return adopt(Paired, native.listenerPair(this[HANDLE], path));
+  }
+
+  /** The respondent serving `path` on every binding of this listener. */
+  respondent(path) {
+    return adopt(Respondent, native.listenerRespondent(this[HANDLE], path));
+  }
+
+  /** A bus member accepting on `path` and dialling the other members on
+   * `clientTls`. */
+  bus(path, clientTls) {
+    return adopt(BusMember, native.listenerBus(this[HANDLE], path, handleOf(clientTls, ClientTls)));
   }
 }
 
@@ -1624,6 +1650,312 @@ export class Subscriber extends Handle {
   }
 }
 
+/** Either half of PAIR: one peer, one-way transfers both ways. A dialling
+ * pair (`Runtime.pair`) dials its peer; a bound one (`Listener.pair`) is
+ * dialled, and its first send or open waits until the peer has sent. */
+export class Paired extends Handle {
+  constructor() {
+    super();
+    noConstructor("Paired", "Runtime.pair() or Listener.pair()");
+  }
+
+  /** The bound pair's path; "" on a dialling pair. */
+  path() {
+    return native.pairedPath(this[HANDLE]);
+  }
+
+  /** Dials `url`, once: a second address rejects with
+   * WEIDA_ELIMIT_EXCEEDED, a bound pair with WEIDA_EUNSUPPORTED. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.pairedConnect(this[HANDLE], url),
+      native.pairedConnectOpWait,
+      native.pairedConnectOpFd,
+      signal,
+    );
+  }
+
+  /** The number of connected peers, 0 or 1; 0 on a bound pair. */
+  peerCount() {
+    return native.pairedPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`; empty on a bound pair. */
+  connectionStats() {
+    return Object.freeze(native.pairedConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** A new reader of a dialling pair's peer events, from now on; null on a
+   * bound pair. */
+  events() {
+    const handle = native.pairedEvents(this[HANDLE]);
+    return handle === null ? null : adopt(PeerEvents, handle);
+  }
+
+  /** The bodies a dialling pair's outbox discarded, a BigInt. */
+  dropped() {
+    return native.pairedDropped(this[HANDLE]);
+  }
+
+  /** Opens a one-way transfer to the peer with `meta` (a `TransferMeta`
+   * object, or null): written like a socket, and its `finish()` hands back
+   * the delivery receipt `send` discards. Aborting abandons it. */
+  async open(meta, { signal } = {}) {
+    const transfer = await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.pairedOpen(this[HANDLE], m)),
+      native.pairedOpenOpWait,
+      native.pairedOpenOpFd,
+      signal,
+    );
+    return adopt(OutgoingTransfer, transfer);
+  }
+
+  /** Sends `body` (a string is sent as UTF-8) as one message; resolves once
+   * it is written or held in the outbox. */
+  async send(body, { signal } = {}) {
+    const data = bytes(body);
+    await op(
+      this,
+      () => native.pairedSend(this[HANDLE], data),
+      native.pairedSendOpWait,
+      native.pairedSendOpFd,
+      signal,
+    );
+  }
+
+  /** `send` with metadata (a `TransferMeta` object, or null), copied when
+   * the send starts. */
+  async sendWith(meta, body, { signal } = {}) {
+    const data = bytes(body);
+    await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.pairedSendWith(this[HANDLE], m, data)),
+      native.pairedSendOpWait,
+      native.pairedSendOpFd,
+      signal,
+    );
+  }
+
+  /** The next transfer from the peer, as soon as its header arrives. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const transfer = await call(
+      this,
+      () => native.pairedRecv(handle),
+      () => native.pairedFd(handle),
+      signal,
+    );
+    return adopt(IncomingTransfer, transfer);
+  }
+}
+
+/** The asking half of SURVEY: dials respondents and asks every one of
+ * them. */
+export class Surveyor extends Handle {
+  constructor() {
+    super();
+    noConstructor("Surveyor", "Runtime.surveyor()");
+  }
+
+  /** Dials the respondent at `url`, adding it to the set every survey
+   * asks; the runtime redials it when the connection is lost. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.surveyorConnect(this[HANDLE], url),
+      native.surveyorConnectOpWait,
+      native.surveyorConnectOpFd,
+      signal,
+    );
+  }
+
+  /** The number of connected respondents. */
+  peerCount() {
+    return native.surveyorPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`. */
+  connectionStats() {
+    return Object.freeze(native.surveyorConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** Asks every connected respondent `body` (a string is sent as UTF-8)
+   * and collects their answers for `deadlineMs`, which bounds the asking
+   * too: resolves with the run once every respondent was asked. */
+  async survey(body, deadlineMs, { signal } = {}) {
+    const data = bytes(body);
+    const run = await op(
+      this,
+      () => native.surveyorSurvey(this[HANDLE], data, deadlineMs),
+      native.surveyorSurveyOpWait,
+      native.surveyorSurveyOpFd,
+      signal,
+    );
+    return adopt(SurveyRun, run);
+  }
+
+  /** `survey` with metadata (a `TransferMeta` object, or null), copied
+   * when the survey starts. */
+  async surveyWith(meta, body, deadlineMs, { signal } = {}) {
+    const data = bytes(body);
+    const run = await op(
+      this,
+      () =>
+        withTransferMeta(meta, (m) =>
+          native.surveyorSurveyWith(this[HANDLE], m, data, deadlineMs),
+        ),
+      native.surveyorSurveyOpWait,
+      native.surveyorSurveyOpFd,
+      signal,
+    );
+    return adopt(SurveyRun, run);
+  }
+}
+
+/** One survey in progress: its answers, and what the deadline cost.
+ * Dropping it resets every exchange not yet answered. */
+export class SurveyRun extends Handle {
+  constructor() {
+    super();
+    noConstructor("SurveyRun", "Surveyor.survey()");
+  }
+
+  /** The next answer's bytes, at most `maxBytes` of them, or null once the
+   * deadline passed or every respondent answered. An answer that failed
+   * rejects and the run goes on. An aborted call leaves its read in flight
+   * for the next one, which keeps the first call's `maxBytes`. */
+  async next(maxBytes, { signal } = {}) {
+    const handle = this[HANDLE];
+    return call(
+      this,
+      () => native.surveyRunNext(handle, maxBytes),
+      () => native.surveyRunFd(handle),
+      signal,
+    );
+  }
+
+  /** The answers that arrived after the deadline, a BigInt. */
+  late() {
+    return native.surveyRunLate(this[HANDLE]);
+  }
+
+  /** How many respondents were asked. */
+  respondents() {
+    return native.surveyRunRespondents(this[HANDLE]);
+  }
+}
+
+/** The answering half of SURVEY, serving one endpoint path. */
+export class Respondent extends Handle {
+  constructor() {
+    super();
+    noConstructor("Respondent", "Listener.respondent()");
+  }
+
+  path() {
+    return native.respondentPath(this[HANDLE]);
+  }
+
+  /** The next question, as soon as its header arrives: an
+   * `IncomingRequest` answered as a replier's is. */
+  async accept({ signal } = {}) {
+    const handle = this[HANDLE];
+    const request = await call(
+      this,
+      () => native.respondentAccept(handle),
+      () => native.respondentFd(handle),
+      signal,
+    );
+    return adopt(IncomingRequest, request);
+  }
+}
+
+/** One member of a BUS: accepts on its path and dials the other members;
+ * a message goes to every member it dialled, never to itself, and nothing
+ * is relayed. */
+export class BusMember extends Handle {
+  constructor() {
+    super();
+    noConstructor("BusMember", "Listener.bus()");
+  }
+
+  path() {
+    return native.busMemberPath(this[HANDLE]);
+  }
+
+  /** Joins the member at `url`; the runtime redials it when the connection
+   * is lost. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.busMemberConnect(this[HANDLE], url),
+      native.busMemberConnectOpWait,
+      native.busMemberConnectOpFd,
+      signal,
+    );
+  }
+
+  /** The number of members this one joined. */
+  peerCount() {
+    return native.busMemberPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`. */
+  connectionStats() {
+    return Object.freeze(native.busMemberConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** Sends `body` (a string is sent as UTF-8) to every member this one
+   * dialled: how many it reached. A member that cannot take a copy loses
+   * it, counted by `dropped()`. */
+  async send(body, { signal } = {}) {
+    const data = bytes(body);
+    return op(
+      this,
+      () => native.busMemberSend(this[HANDLE], data),
+      native.busMemberSendOpWait,
+      native.busMemberSendOpFd,
+      signal,
+    );
+  }
+
+  /** `send` with metadata (a `TransferMeta` object, or null), copied when
+   * the send starts. */
+  async sendWith(meta, body, { signal } = {}) {
+    const data = bytes(body);
+    return op(
+      this,
+      () => withTransferMeta(meta, (m) => native.busMemberSendWith(this[HANDLE], m, data)),
+      native.busMemberSendOpWait,
+      native.busMemberSendOpFd,
+      signal,
+    );
+  }
+
+  /** The next message from another member, as soon as its header
+   * arrives. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const transfer = await call(
+      this,
+      () => native.busMemberRecv(handle),
+      () => native.busMemberFd(handle),
+      signal,
+    );
+    return adopt(IncomingTransfer, transfer);
+  }
+
+  /** The copies that never reached a member, a BigInt. */
+  dropped() {
+    return native.busMemberDropped(this[HANDLE]);
+  }
+}
+
 /** The relay a listener serves on `/.weida/relay`. Dropping it closes every
  * registration's connection, so the hidden peers redial. */
 export class Relay extends Handle {
@@ -1695,7 +2027,7 @@ export class RelayRequest extends Handle {
 export class IncomingRequest extends Handle {
   constructor() {
     super();
-    noConstructor("IncomingRequest", "Replier.accept()");
+    noConstructor("IncomingRequest", "Replier.accept() or Respondent.accept()");
   }
 
   meta() {
