@@ -34,7 +34,8 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::shutdown` | `weida_runtime_shutdown` (op) | present; `abi::a_shutdown_finishes_with_an_exchange_abandoned` |
 | `Runtime::drain` | `weida_runtime_drain` (op, consumes; its wait yields a `weida_drained`) | present; `abi::a_drain_counts_a_reply_finished_before_it_as_delivered`, `abi::a_drain_with_nothing_pending_returns_at_once` (*drain*) |
 | `Runtime::pusher`, `subscriber` | `weida_runtime_pusher`, `weida_runtime_subscriber` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
-| `Runtime::peer`, `dish`, `pair`, `surveyor`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
+| `Runtime::pair`, `surveyor` | `weida_runtime_pair`, `weida_runtime_surveyor` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `Runtime::peer`, `dish`, `swarm` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
 | `Runtime::suppressed_duplicates`, `expired_transfers` | `weida_runtime_suppressed_duplicates`, `weida_runtime_expired_transfers` | present; `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (counts 0 then 1), `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport` (0 without deduplication) (*stats*) |
 | `Runtime::exec` | — | refused: it is the binding's own seam |
@@ -51,7 +52,8 @@ unit tests in `crates/weida-c/src/`.
 | `Drop for Relay`, `Drop for RelayRequest` (`NO_REPLY`) | `weida_relay_drop`, `weida_relay_request_drop` | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Binding::relay_events` | `weida_binding_relay_events` (a `weida_peer_events` queue; 0 for a binding not relayed) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Listener::puller`, `publisher` | `weida_listener_puller`, `weida_listener_publisher` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
-| `Listener::radio`, `acceptor`, `pair`, `respondent`, `seeder`, `bus` | — | absent: *patterns*, *raw peers*, *swarm* |
+| `Listener::pair`, `respondent`, `bus` | `weida_listener_pair`, `weida_listener_respondent`, `weida_listener_bus` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window`, `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `Listener::radio`, `acceptor`, `seeder` | — | absent: *patterns*, *raw peers*, *swarm* |
 | `Binding::local_addr` | `weida_binding_local_addr` | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Binding::close` | `weida_binding_close` (op) | present; `abi::a_closed_binding_refuses_the_next_dial` (*binding lifecycle*) |
 | `Binding::hand_over`, `Handoff::held`, `local_addr`, `into_parts` | `weida_binding_hand_over` (op, consumes; its wait yields a `weida_handoff`), `weida_handoff_held`, `_local_addr`, `_take_socket`, `_bytes` | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
@@ -206,9 +208,35 @@ unit tests in `crates/weida-c/src/`.
 | `FanOut::write_now` | `weida_fan_out_write_now` | present; `abi::a_fan_out_streams_one_payload_to_every_subscriber` (*patterns*) |
 | `FanOut::finish` | `weida_fan_out_finish` (consumes) | present; `abi::a_fan_out_streams_one_payload_to_every_subscriber` (*patterns*) |
 | `Drop for FanOut` (aborts every copy) | `weida_fan_out_drop` | present; R1 (*patterns*) |
+| `Paired::path` | `weida_paired_path` (empty on a dialling pair) | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::connect` | `weida_paired_connect` (op) | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::peer_count` | `weida_paired_peer_count` | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::connection_stats` | `weida_paired_connection_stats` (a snapshot handle) | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::events` | `weida_paired_events` (1 and a `weida_peer_events` queue, or 0 for a bound pair) | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::dropped` | `weida_paired_dropped` | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::open` | `weida_paired_open` (op; its wait yields a `weida_outgoing_transfer`) | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::send`, `send_with` | `weida_paired_send`, `_send_with` (ops) | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Paired::recv` | `weida_paired_recv` (try, R3a) | present; `abi::a_pair_exchanges_in_both_directions` (*patterns*) |
+| `Drop for Paired` | `weida_paired_drop` | present; R1 (*patterns*) |
+| `Surveyor::connect` | `weida_surveyor_connect` (op) | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `Surveyor::peer_count` | `weida_surveyor_peer_count` | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `Surveyor::connection_stats` | `weida_surveyor_connection_stats` (a snapshot handle) | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `Surveyor::survey`, `survey_with` | `weida_surveyor_survey`, `_survey_with` (ops; their wait yields a `weida_survey_run`) | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `SurveyRun::next` | `weida_survey_run_next` (try, R3a; an answer is a `weida_survey_answer`) | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `SurveyRun::late` | `weida_survey_run_late` | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `SurveyRun::respondents` | `weida_survey_run_respondents` | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `Drop for SurveyRun` (resets the unanswered exchanges) | `weida_survey_run_drop` | present; R1 (*patterns*) |
+| `Respondent::path` | `weida_respondent_path` | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `Respondent::accept` | `weida_respondent_accept` (try, R3a; a `weida_incoming_request`) | present; `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
+| `BusMember::path` | `weida_bus_member_path` | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `BusMember::connect` | `weida_bus_member_connect` (op) | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `BusMember::peer_count` | `weida_bus_member_peer_count` | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `BusMember::connection_stats` | `weida_bus_member_connection_stats` (a snapshot handle) | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `BusMember::send`, `send_with` | `weida_bus_member_send`, `_send_with` (ops; their wait writes the members reached) | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `BusMember::recv` | `weida_bus_member_recv` (try, R3a) | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
+| `BusMember::dropped` | `weida_bus_member_dropped` | present; `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
 
-PAIR (`Paired`), SURVEY (`Surveyor`, `SurveyRun`, `Respondent`), BUS (`BusMember`), RADIO/DISH
-(`Radio`, `Dish`, `Join`, `JoinTerms`, `Received`, `Segment`, `SegmentTerms`,
+RADIO/DISH (`Radio`, `Dish`, `Join`, `JoinTerms`, `Received`, `Segment`, `SegmentTerms`,
 `MAX_SEGMENT_LAYERS`), datagram flows (`Flow`, `FlowInfo`, `FlowMeta`, `FlowStats`,
 `IncomingFlow`), the raw `Peer`, `Acceptor`, `Incoming`, `Consumer`, `ConsumerId`,
 `CreditGrant`, the cursor surface (`Cursors`, `CursorSet`, `Reporter`, `CursorLevel`,
@@ -224,7 +252,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the forty-three `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the forty-six `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -286,6 +314,17 @@ way a foreign caller calls it:
   borrow rules forbid it; `finish` then consumes the handle and the copies abort when the write
   ends.
 - `Publisher::dropped_on`'s `Option` is a snapshot of 0 or 1 record.
+- `SurveyRun::next` is a try (R3a), as `PeerEvents::recv` is; a read in flight keeps the
+  `max_bytes` of the try that started it. Its `None` is a 0 return with `*out == NULL`, and an
+  answer that failed returns its code while the run goes on.
+- An answer is a `weida_survey_answer` (`_data`, `_len`), the `Vec<u8>` Rust returns; it
+  carries no metadata, as in Rust.
+- `weida_survey_run_late` during a `weida_survey_run_next` in flight is the count as of the
+  last read that ended.
+- `Paired::events`' `None` (a bound pair) is a 0 return with `out` untouched, as for
+  `Binding::relay_events`.
+- A `deadline_ms` the clock cannot add is `-WEIDA_EINVAL` at `weida_surveyor_survey`, where
+  Rust panics.
 
 ## 10. The definition of done
 
@@ -300,7 +339,8 @@ is complete when no present row lacks a test.
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
 `config.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`, `transfer.rs`,
-`requester.rs`, `push.rs`, `pubsub.rs`, `poll.rs`, `stats.rs`),
+`requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `bus.rs`, `poll.rs`,
+`stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

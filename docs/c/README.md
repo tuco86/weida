@@ -10,9 +10,10 @@ The rules below (R1 to R13) are normative for every function the library exports
 later stages. The pages beside this one document each function of the current slice:
 [runtime.md](runtime.md), [tls.md](tls.md), [identity.md](identity.md), [resolver.md](resolver.md),
 [listener.md](listener.md), [relay.md](relay.md), [requester.md](requester.md),
-[push.md](push.md), [pubsub.md](pubsub.md), [transfer.md](transfer.md), [msg.md](msg.md),
-[poll.md](poll.md), [stats.md](stats.md) and [errors.md](errors.md). What is not yet mapped is
-listed in [libraries/weida-c.md](../libraries/weida-c.md).
+[push.md](push.md), [pubsub.md](pubsub.md), [pair.md](pair.md), [survey.md](survey.md),
+[bus.md](bus.md), [transfer.md](transfer.md), [msg.md](msg.md), [poll.md](poll.md),
+[stats.md](stats.md) and [errors.md](errors.md). What is not yet mapped is listed in
+[libraries/weida-c.md](../libraries/weida-c.md).
 
 The easy tier, `crates/weida-c/include/weida_easy.h`, is not part of the ABI: it is C source
 over it, header-only helpers that run a Req/Rep step as one blocking call with one deadline.

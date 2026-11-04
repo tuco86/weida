@@ -12,12 +12,14 @@
 
 #![allow(non_camel_case_types)]
 
+mod bus;
 mod config;
 mod error;
 mod handle;
 mod identity;
 mod listener;
 mod op;
+mod pair;
 mod poll;
 mod pubsub;
 mod push;
@@ -27,16 +29,19 @@ mod requester;
 mod resolver;
 mod runtime;
 mod stats;
+mod survey;
 mod tls;
 mod transfer;
 mod try_handle;
 
 use std::ffi::c_char;
 
+pub use bus::*;
 pub use config::*;
 pub use error::*;
 pub use identity::*;
 pub use listener::*;
+pub use pair::*;
 pub use poll::*;
 pub use pubsub::*;
 pub use push::*;
@@ -45,6 +50,7 @@ pub use requester::*;
 pub use resolver::*;
 pub use runtime::*;
 pub use stats::*;
+pub use survey::*;
 pub use tls::*;
 pub use transfer::*;
 /// The library's version, e.g. `"0.1.0-alpha.11-dev"`. The string is

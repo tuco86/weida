@@ -513,6 +513,23 @@ typedef struct weida_binding_hand_over_op weida_binding_hand_over_op;
 typedef struct weida_binding_take_over_op weida_binding_take_over_op;
 
 /**
+ * One member of a BUS (`BusMember`): accepts on its path and dials the
+ * others. The recv in flight is kept across tries (R3a).
+ */
+typedef struct weida_bus_member weida_bus_member;
+
+/**
+ * The pending dial of `weida_bus_member_connect`.
+ */
+typedef struct weida_bus_member_connect_op weida_bus_member_connect_op;
+
+/**
+ * The pending send of `weida_bus_member_send` and
+ * `weida_bus_member_send_with`.
+ */
+typedef struct weida_bus_member_send_op weida_bus_member_send_op;
+
+/**
  * The TLS terms a requester dials on.
  */
 typedef struct weida_client_tls weida_client_tls;
@@ -665,6 +682,27 @@ typedef struct weida_msg weida_msg;
 typedef struct weida_outgoing_transfer weida_outgoing_transfer;
 
 /**
+ * Either half of PAIR (`Paired`): dialling (`weida_runtime_pair`) or bound
+ * (`weida_listener_pair`). The recv in flight is kept across tries (R3a).
+ */
+typedef struct weida_paired weida_paired;
+
+/**
+ * The pending dial of `weida_paired_connect`.
+ */
+typedef struct weida_paired_connect_op weida_paired_connect_op;
+
+/**
+ * The pending open of `weida_paired_open`.
+ */
+typedef struct weida_paired_open_op weida_paired_open_op;
+
+/**
+ * The pending send of `weida_paired_send` and `weida_paired_send_with`.
+ */
+typedef struct weida_paired_send_op weida_paired_send_op;
+
+/**
  * One transition of one dialled address (`PeerEvent`), read-only.
  */
 typedef struct weida_peer_event weida_peer_event;
@@ -791,6 +829,11 @@ typedef struct weida_resolved weida_resolved;
 typedef struct weida_resolver weida_resolver;
 
 /**
+ * The answering half of SURVEY, serving one endpoint path.
+ */
+typedef struct weida_respondent weida_respondent;
+
+/**
  * A weida runtime: the reactor it owns, and every endpoint made from it.
  */
 typedef struct weida_runtime weida_runtime;
@@ -841,6 +884,32 @@ typedef struct weida_subscriber_subscribe_op weida_subscriber_subscribe_op;
  * The pending withdrawal of `weida_subscriber_unsubscribe`.
  */
 typedef struct weida_subscriber_unsubscribe_op weida_subscriber_unsubscribe_op;
+
+/**
+ * One answer's bytes (the `Vec<u8>` of `SurveyRun::next`).
+ */
+typedef struct weida_survey_answer weida_survey_answer;
+
+/**
+ * One survey in progress (`SurveyRun`): its answers, read as a try.
+ */
+typedef struct weida_survey_run weida_survey_run;
+
+/**
+ * The asking half of SURVEY: dials respondents and asks every one of them.
+ */
+typedef struct weida_surveyor weida_surveyor;
+
+/**
+ * The pending dial of `weida_surveyor_connect`.
+ */
+typedef struct weida_surveyor_connect_op weida_surveyor_connect_op;
+
+/**
+ * The pending ask of `weida_surveyor_survey` and
+ * `weida_surveyor_survey_with`.
+ */
+typedef struct weida_surveyor_survey_op weida_surveyor_survey_op;
 
 /**
  * One snapshot of what a publisher dropped, one record per topic
@@ -912,6 +981,212 @@ extern "C" {
  * Always safe to call.
  */
 const char *weida_version(void);
+
+/**
+ * Registers a bus member at the endpoint path `path` that dials the other
+ * members on `tls`'s terms (`Listener::bus`). Fails with
+ * `-WEIDA_EINVALID_ENDPOINT_PATH` or `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `tls` is NULL or live client terms; `out` is NULL or writable.
+ * Release the result with `weida_bus_member_drop`.
+ */
+int weida_listener_bus(const weida_listener *l,
+                       const char *path,
+                       const weida_client_tls *tls,
+                       weida_bus_member **out);
+
+/**
+ * The endpoint path this member accepts on. Lives as long as the member.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member; `len_out` is NULL or writable.
+ */
+const char *weida_bus_member_path(const weida_bus_member *m, size_t *len_out);
+
+/**
+ * Joins the member at `url` (`BusMember::connect`). The runtime redials it
+ * when the connection is lost.
+ *
+ * Never blocks; the dial runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member; `url` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the op with
+ * `weida_bus_member_connect_op_drop`.
+ */
+int weida_bus_member_connect(const weida_bus_member *m,
+                             const char *url,
+                             weida_bus_member_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_bus_member_connect_op_fd(const weida_bus_member_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_bus_member_connect_op_wait(const weida_bus_member_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_bus_member_connect_op_drop(weida_bus_member_connect_op *op);
+
+/**
+ * The number of members this one has joined (`BusMember::peer_count`); 0
+ * for NULL.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member.
+ */
+size_t weida_bus_member_peer_count(const weida_bus_member *m);
+
+/**
+ * A snapshot of the connections to the members this one dialled
+ * (`BusMember::connection_stats`): one record per live dialled address, in
+ * dial order, read with the `weida_connection_stats_*` getters. Never
+ * blocks.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_bus_member_connection_stats(const weida_bus_member *m, weida_connection_stats **out);
+
+/**
+ * The copies that never reached a member (`BusMember::dropped`); 0 for
+ * NULL.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member.
+ */
+uint64_t weida_bus_member_dropped(const weida_bus_member *m);
+
+/**
+ * Sends `body` to every other member this one dialled
+ * (`BusMember::send`). The body is copied.
+ *
+ * Never blocks; the send runs as the op written to `out`, whose wait
+ * writes how many members it reached. A member that cannot take a copy
+ * loses it and is counted in `weida_bus_member_dropped`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member; `body` is NULL only with `len == 0`, else
+ * points to `len` readable bytes; `out` is NULL or writable. Release the
+ * op with `weida_bus_member_send_op_drop`.
+ */
+int weida_bus_member_send(const weida_bus_member *m,
+                          const uint8_t *body,
+                          size_t len,
+                          weida_bus_member_send_op **out);
+
+/**
+ * Sends `body` carrying `meta` to every other member
+ * (`BusMember::send_with`): `weida_bus_member_send` with metadata. `meta`
+ * is copied at the call; NULL is `TransferMeta::default()`. The body is
+ * copied.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member; `meta` is NULL or live metadata; `body` is
+ * NULL only with `len == 0`, else points to `len` readable bytes; `out` is
+ * NULL or writable. Release the op with `weida_bus_member_send_op_drop`.
+ */
+int weida_bus_member_send_with(const weida_bus_member *m,
+                               const weida_transfer_meta *meta,
+                               const uint8_t *body,
+                               size_t len,
+                               weida_bus_member_send_op **out);
+
+/**
+ * The readiness descriptor of a send op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op; `out` is NULL or writable.
+ */
+int weida_bus_member_send_op_fd(const weida_bus_member_send_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the send and writes how many members
+ * it reached to `out`. `-WEIDA_ELIMIT_EXCEEDED` for a body above the
+ * configured `subscriber_buffer_bytes`.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op; `out` is NULL or writable.
+ */
+int weida_bus_member_send_op_wait(const weida_bus_member_send_op *op,
+                                  int64_t timeout_ms,
+                                  size_t *out);
+
+/**
+ * Releases a send op, abandoning the send when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op, dropped at most once.
+ */
+void weida_bus_member_send_op_drop(weida_bus_member_send_op *op);
+
+/**
+ * The member's readiness descriptor (R11): readable when the next
+ * `weida_bus_member_recv` will not block.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member; `out` is NULL or writable.
+ */
+int weida_bus_member_fd(const weida_bus_member *m, int64_t *out);
+
+/**
+ * Takes the next message from another member, waiting up to `timeout_ms`
+ * (R4) for one (`BusMember::recv`). `-WEIDA_ENOT_CONNECTED` once the
+ * queue ended.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member; `out` is NULL or writable. Release the
+ * transfer with `weida_incoming_transfer_drop`.
+ */
+int weida_bus_member_recv(const weida_bus_member *m,
+                          int64_t timeout_ms,
+                          weida_incoming_transfer **out);
+
+/**
+ * Releases a member, which drops its connections; its path stays
+ * registered. A thread waiting in `weida_bus_member_recv` returns
+ * `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `m` is NULL or a live member, dropped at most once.
+ */
+void weida_bus_member_drop(weida_bus_member *m);
 
 /**
  * Creates limits holding weida's defaults (`Limits::default`).
@@ -2708,6 +2983,277 @@ void weida_incoming_request_canceled_op_drop(weida_incoming_request_canceled_op 
  * `q` is NULL or a live request, dropped at most once.
  */
 void weida_incoming_request_drop(weida_incoming_request *q);
+
+/**
+ * Creates a dialling pair that dials on `tls`'s terms (`Runtime::pair`).
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime; `tls` is NULL or live client terms;
+ * `out` is NULL or writable. Release the result with `weida_paired_drop`.
+ */
+int weida_runtime_pair(const weida_runtime *rt, const weida_client_tls *tls, weida_paired **out);
+
+/**
+ * Registers a bound pair at the endpoint path `path` (`Listener::pair`).
+ * Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
+ * `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_paired_drop`.
+ */
+int weida_listener_pair(const weida_listener *l, const char *path, weida_paired **out);
+
+/**
+ * The endpoint path this pair uses: a bound pair's path, the empty string
+ * on a dialling pair. Lives as long as the pair.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `len_out` is NULL or writable.
+ */
+const char *weida_paired_path(const weida_paired *p, size_t *len_out);
+
+/**
+ * Dials `url` (`Paired::connect`), once: a pair has one peer. The runtime
+ * redials it when the connection is lost.
+ *
+ * Never blocks; the dial runs as the op written to `out`. Its wait fails
+ * with `-WEIDA_EUNSUPPORTED` on a bound pair and `-WEIDA_ELIMIT_EXCEEDED`
+ * once an address is dialled.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `url` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the op with
+ * `weida_paired_connect_op_drop`.
+ */
+int weida_paired_connect(const weida_paired *p, const char *url, weida_paired_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_paired_connect_op_fd(const weida_paired_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_paired_connect_op_wait(const weida_paired_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_paired_connect_op_drop(weida_paired_connect_op *op);
+
+/**
+ * The number of connected peers, 0 or 1 (`Paired::peer_count`); 0 for
+ * NULL and on a bound pair.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair.
+ */
+size_t weida_paired_peer_count(const weida_paired *p);
+
+/**
+ * The bodies a dialling pair's outbox discarded (`Paired::dropped`); 0 for
+ * NULL and on a bound pair.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair.
+ */
+uint64_t weida_paired_dropped(const weida_paired *p);
+
+/**
+ * A snapshot of a dialling pair's connection (`Paired::connection_stats`):
+ * one record per live dialled address, read with the
+ * `weida_connection_stats_*` getters; no records on a bound pair. Never
+ * blocks.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_paired_connection_stats(const weida_paired *p, weida_connection_stats **out);
+
+/**
+ * A new reader of a dialling pair's peer events (`Paired::events`),
+ * written to `out`: returns 1. A bound pair dials nothing and reports
+ * nothing: returns 0 with `out` untouched. Each call is an independent
+ * reader.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_paired_events(const weida_paired *p, weida_peer_events **out);
+
+/**
+ * Opens a one-way transfer to the peer (`Paired::open`), carrying `meta`,
+ * or empty metadata when `meta` is NULL; `meta` is copied at the call. Its
+ * `weida_outgoing_transfer_finish` hands back the delivery receipt that
+ * `weida_paired_send` discards.
+ *
+ * Never blocks; the open runs as the op written to `out`. A bound pair's
+ * open waits until its peer has sent first.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `meta` is NULL or live metadata; `out` is
+ * NULL or writable. Release the op with `weida_paired_open_op_drop`.
+ */
+int weida_paired_open(const weida_paired *p,
+                      const weida_transfer_meta *meta,
+                      weida_paired_open_op **out);
+
+/**
+ * The readiness descriptor of an open op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_paired_open_op_fd(const weida_paired_open_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the open and writes the transfer to
+ * `out`, written like a socket and ended with
+ * `weida_outgoing_transfer_finish`.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_paired_open_op_wait(const weida_paired_open_op *op,
+                              int64_t timeout_ms,
+                              weida_outgoing_transfer **out);
+
+/**
+ * Releases an open op. An unfinished open is aborted; a transfer it opened
+ * that no wait took is reset `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op, dropped at most once.
+ */
+void weida_paired_open_op_drop(weida_paired_open_op *op);
+
+/**
+ * Sends `body` as one message (`Paired::send`). The body is copied.
+ *
+ * Never blocks; the send runs as the op written to `out`. A dialling pair
+ * writes it at once while its peer is live and holds it in the outbox
+ * otherwise; a bound pair writes it once its peer has sent first. The
+ * delivery receipt is discarded: use `weida_paired_open` for it.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `body` is NULL only with `len == 0`, else
+ * points to `len` readable bytes; `out` is NULL or writable. Release the
+ * op with `weida_paired_send_op_drop`.
+ */
+int weida_paired_send(const weida_paired *p,
+                      const uint8_t *body,
+                      size_t len,
+                      weida_paired_send_op **out);
+
+/**
+ * Sends `body` as one message carrying `meta` (`Paired::send_with`):
+ * `weida_paired_send` with metadata. `meta` is copied at the call; NULL is
+ * `TransferMeta::default()`. The body is copied.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `meta` is NULL or live metadata; `body` is
+ * NULL only with `len == 0`, else points to `len` readable bytes; `out` is
+ * NULL or writable. Release the op with `weida_paired_send_op_drop`.
+ */
+int weida_paired_send_with(const weida_paired *p,
+                           const weida_transfer_meta *meta,
+                           const uint8_t *body,
+                           size_t len,
+                           weida_paired_send_op **out);
+
+/**
+ * The readiness descriptor of a send op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op; `out` is NULL or writable.
+ */
+int weida_paired_send_op_fd(const weida_paired_send_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the send: 0 once the body is written
+ * or held in the outbox.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op.
+ */
+int weida_paired_send_op_wait(const weida_paired_send_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a send op, abandoning the send when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op, dropped at most once.
+ */
+void weida_paired_send_op_drop(weida_paired_send_op *op);
+
+/**
+ * The pair's readiness descriptor (R11): readable when the next
+ * `weida_paired_recv` will not block.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `out` is NULL or writable.
+ */
+int weida_paired_fd(const weida_paired *p, int64_t *out);
+
+/**
+ * Takes the next transfer from the peer, waiting up to `timeout_ms` (R4)
+ * for one (`Paired::recv`). `-WEIDA_ENOT_CONNECTED` once the queue ended.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair; `out` is NULL or writable. Release the
+ * transfer with `weida_incoming_transfer_drop`.
+ */
+int weida_paired_recv(const weida_paired *p, int64_t timeout_ms, weida_incoming_transfer **out);
+
+/**
+ * Releases a pair. A thread waiting in `weida_paired_recv` returns
+ * `-WEIDA_ECLOSED`; a dialling pair's connection and route go with the
+ * last op still holding it. A bound pair's path stays registered. NULL
+ * does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live pair, dropped at most once.
+ */
+void weida_paired_drop(weida_paired *p);
 
 /**
  * Waits until at least one of `n` descriptors in `items` is readable, or
@@ -5173,6 +5719,315 @@ int weida_peer_event_missed(const weida_peer_event *e, uint64_t *out);
  * `e` is NULL or a live event, dropped at most once.
  */
 void weida_peer_event_drop(weida_peer_event *e);
+
+/**
+ * Creates a surveyor that dials on `tls`'s terms (`Runtime::surveyor`).
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime; `tls` is NULL or live client terms;
+ * `out` is NULL or writable. Release the result with `weida_surveyor_drop`.
+ */
+int weida_runtime_surveyor(const weida_runtime *rt,
+                           const weida_client_tls *tls,
+                           weida_surveyor **out);
+
+/**
+ * Dials the respondent at `url` (`Surveyor::connect`), adding it to the
+ * set every survey asks. The runtime redials it when the connection is
+ * lost.
+ *
+ * Never blocks; the dial runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live surveyor; `url` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the op with
+ * `weida_surveyor_connect_op_drop`.
+ */
+int weida_surveyor_connect(const weida_surveyor *s,
+                           const char *url,
+                           weida_surveyor_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_surveyor_connect_op_fd(const weida_surveyor_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_surveyor_connect_op_wait(const weida_surveyor_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_surveyor_connect_op_drop(weida_surveyor_connect_op *op);
+
+/**
+ * The number of connected respondents (`Surveyor::peer_count`); 0 for
+ * NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live surveyor.
+ */
+size_t weida_surveyor_peer_count(const weida_surveyor *s);
+
+/**
+ * A snapshot of the surveyor's live connections
+ * (`Surveyor::connection_stats`): one record per live dialled address, in
+ * dial order, read with the `weida_connection_stats_*` getters. Never
+ * blocks.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live surveyor; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_surveyor_connection_stats(const weida_surveyor *s, weida_connection_stats **out);
+
+/**
+ * Asks every connected respondent `body` (`Surveyor::survey`) and collects
+ * their answers for `deadline_ms`. The body is copied.
+ *
+ * Never blocks; the asking runs as the op written to `out`, whose wait
+ * yields the run. The deadline bounds the asking and the answers alike. A
+ * survey with no respondents is an empty run, not an error. A
+ * `deadline_ms` the clock cannot add is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live surveyor; `body` is NULL only with `len == 0`,
+ * else points to `len` readable bytes; `out` is NULL or writable. Release
+ * the op with `weida_surveyor_survey_op_drop`.
+ */
+int weida_surveyor_survey(const weida_surveyor *s,
+                          const uint8_t *body,
+                          size_t len,
+                          uint64_t deadline_ms,
+                          weida_surveyor_survey_op **out);
+
+/**
+ * Asks every connected respondent `body` carrying `meta`
+ * (`Surveyor::survey_with`): `weida_surveyor_survey` with metadata. `meta`
+ * is copied at the call; NULL is `TransferMeta::default()`. The body is
+ * copied.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live surveyor; `meta` is NULL or live metadata; `body`
+ * is NULL only with `len == 0`, else points to `len` readable bytes; `out`
+ * is NULL or writable. Release the op with `weida_surveyor_survey_op_drop`.
+ */
+int weida_surveyor_survey_with(const weida_surveyor *s,
+                               const weida_transfer_meta *meta,
+                               const uint8_t *body,
+                               size_t len,
+                               uint64_t deadline_ms,
+                               weida_surveyor_survey_op **out);
+
+/**
+ * The readiness descriptor of a survey op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live survey op; `out` is NULL or writable.
+ */
+int weida_surveyor_survey_op_fd(const weida_surveyor_survey_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for every respondent to be asked and
+ * writes the run to `out`, whose answers `weida_survey_run_next` reads.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live survey op; `out` is NULL or writable. Release the
+ * run with `weida_survey_run_drop`.
+ */
+int weida_surveyor_survey_op_wait(const weida_surveyor_survey_op *op,
+                                  int64_t timeout_ms,
+                                  weida_survey_run **out);
+
+/**
+ * Releases a survey op. An unfinished survey is aborted; a run it made
+ * that no wait took is dropped, which resets its exchanges. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live survey op, dropped at most once.
+ */
+void weida_surveyor_survey_op_drop(weida_surveyor_survey_op *op);
+
+/**
+ * Releases a surveyor, which drops its connections. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live surveyor, dropped at most once.
+ */
+void weida_surveyor_drop(weida_surveyor *s);
+
+/**
+ * The run's readiness descriptor (R11): readable when the next
+ * `weida_survey_run_next` will not block.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live run; `out` is NULL or writable.
+ */
+int weida_survey_run_fd(const weida_survey_run *r, int64_t *out);
+
+/**
+ * Takes the next answer, reading at most `max_bytes` of it, waiting up to
+ * `timeout_ms` (R4) for one (`SurveyRun::next`).
+ *
+ * Writes NULL to `out` and returns 0 once the deadline passed or every
+ * respondent answered: the end of the run, and every later call returns
+ * it too. An answer that failed returns its code and the run goes on. A
+ * read in flight keeps the `max_bytes` of the try that started it.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live run; `out` is NULL or writable. Release an answer
+ * with `weida_survey_answer_drop`.
+ */
+int weida_survey_run_next(const weida_survey_run *r,
+                          uint64_t max_bytes,
+                          int64_t timeout_ms,
+                          weida_survey_answer **out);
+
+/**
+ * Answers that arrived after the deadline, dropped and counted
+ * (`SurveyRun::late`); 0 for NULL. While a `weida_survey_run_next` is in
+ * flight, the count as of the last read that ended.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live run.
+ */
+uint64_t weida_survey_run_late(const weida_survey_run *r);
+
+/**
+ * How many respondents were asked (`SurveyRun::respondents`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live run.
+ */
+size_t weida_survey_run_respondents(const weida_survey_run *r);
+
+/**
+ * Releases a run, which resets every exchange not yet answered. A thread
+ * waiting in `weida_survey_run_next` returns `-WEIDA_ECLOSED`. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live run, dropped at most once.
+ */
+void weida_survey_run_drop(weida_survey_run *r);
+
+/**
+ * The answer's bytes; `weida_survey_answer_len` of them. Valid as long as
+ * `a`.
+ *
+ * # Safety
+ *
+ * `a` is NULL or a live answer.
+ */
+const uint8_t *weida_survey_answer_data(const weida_survey_answer *a);
+
+/**
+ * The answer's length in bytes; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `a` is NULL or a live answer.
+ */
+size_t weida_survey_answer_len(const weida_survey_answer *a);
+
+/**
+ * Releases an answer and its bytes. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `a` is NULL or a live answer, dropped at most once.
+ */
+void weida_survey_answer_drop(weida_survey_answer *a);
+
+/**
+ * Registers a respondent at the endpoint path `path`
+ * (`Listener::respondent`). Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
+ * `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_respondent_drop`.
+ */
+int weida_listener_respondent(const weida_listener *l, const char *path, weida_respondent **out);
+
+/**
+ * The endpoint path this respondent serves. Lives as long as the
+ * respondent.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live respondent; `len_out` is NULL or writable.
+ */
+const char *weida_respondent_path(const weida_respondent *r, size_t *len_out);
+
+/**
+ * The respondent's readiness descriptor (R11): readable when the next
+ * `weida_respondent_accept` will not block.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live respondent; `out` is NULL or writable.
+ */
+int weida_respondent_fd(const weida_respondent *r, int64_t *out);
+
+/**
+ * Takes the next survey question, waiting up to `timeout_ms` (R4) for one
+ * (`Respondent::accept`). A question is a `weida_incoming_request`,
+ * answered as a replier's is. `-WEIDA_ENOT_CONNECTED` once the queue
+ * ended.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live respondent; `out` is NULL or writable. Release the
+ * request with `weida_incoming_request_drop` or reply to it.
+ */
+int weida_respondent_accept(const weida_respondent *r,
+                            int64_t timeout_ms,
+                            weida_incoming_request **out);
+
+/**
+ * Releases a respondent; its path stays registered, as a dropped Rust
+ * `Respondent` leaves it. A thread waiting in `weida_respondent_accept`
+ * returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live respondent, dropped at most once.
+ */
+void weida_respondent_drop(weida_respondent *r);
 
 /**
  * Creates a trust that accepts only what each dialled address names

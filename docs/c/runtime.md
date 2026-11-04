@@ -123,6 +123,8 @@ for the rest.
 | `int weida_runtime_requester(const weida_runtime *rt, const weida_client_tls *tls, weida_requester **out)` | never | 0; `-WEIDA_EINVAL` ([requester.md](requester.md)) |
 | `int weida_runtime_pusher(const weida_runtime *rt, const weida_client_tls *tls, weida_pusher **out)` | never | 0; `-WEIDA_EINVAL` ([push.md](push.md)) |
 | `int weida_runtime_subscriber(const weida_runtime *rt, const weida_client_tls *tls, weida_subscriber **out)` | never | 0; `-WEIDA_EINVAL` ([pubsub.md](pubsub.md)) |
+| `int weida_runtime_pair(const weida_runtime *rt, const weida_client_tls *tls, weida_paired **out)` | never | 0; `-WEIDA_EINVAL` ([pair.md](pair.md)) |
+| `int weida_runtime_surveyor(const weida_runtime *rt, const weida_client_tls *tls, weida_surveyor **out)` | never | 0; `-WEIDA_EINVAL` ([survey.md](survey.md)) |
 | `int weida_runtime_shutdown(weida_runtime *rt, weida_runtime_shutdown_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
 | `int weida_runtime_drain(weida_runtime *rt, uint64_t deadline_ms, weida_runtime_drain_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
 | `uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt)` | never | duplicates discarded inside a negotiated `Deduplication::Bounded` window; 0 for NULL |

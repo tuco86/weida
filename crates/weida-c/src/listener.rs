@@ -177,7 +177,7 @@ pub struct weida_pipe_binding {
     name: CText,
 }
 
-type Accepting = Pin<Box<dyn Future<Output = Result<IncomingRequest, Error>> + Send>>;
+pub(crate) type Accepting = Pin<Box<dyn Future<Output = Result<IncomingRequest, Error>> + Send>>;
 
 /// A replier's state between tries: the accept in flight is kept, never
 /// recreated, so a timeout or `EINTR` loses nothing (R3a).
@@ -1419,14 +1419,7 @@ pub unsafe extern "C" fn weida_replier_accept(
             polled
         })?;
         let request = accepted.map_err(fail)?;
-        let handle = into_handle(weida_incoming_request {
-            state: Mutex::new(Some(RequestState {
-                request,
-                body_taken: false,
-            })),
-            meta: OnceLock::new(),
-            exec: r.exec.clone(),
-        });
+        let handle = weida_incoming_request::handle(request, r.exec.clone());
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, handle) };
         Ok(0)
@@ -1450,6 +1443,18 @@ pub unsafe extern "C" fn weida_replier_drop(r: *mut weida_replier) {
 }
 
 impl weida_incoming_request {
+    /// A new handle for an accepted request, its body not yet taken.
+    pub(crate) fn handle(request: IncomingRequest, exec: Exec) -> *mut weida_incoming_request {
+        into_handle(weida_incoming_request {
+            state: Mutex::new(Some(RequestState {
+                request,
+                body_taken: false,
+            })),
+            meta: OnceLock::new(),
+            exec,
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<RequestState>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }

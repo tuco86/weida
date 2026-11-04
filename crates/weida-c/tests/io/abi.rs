@@ -3572,3 +3572,497 @@ fn a_fan_out_streams_one_payload_to_every_subscriber() {
     shutdown(client);
     shutdown(server);
 }
+
+// --- patterns: PAIR, SURVEY and BUS -----------------------------------------
+
+fn paired(rt: *mut weida_runtime) -> *mut weida_paired {
+    let tls = client_tls();
+    let mut p = ptr::null_mut();
+    // SAFETY: live handles, `tls` dropped once, and a writable out-parameter.
+    unsafe {
+        ok(weida_runtime_pair(rt, tls, &mut p));
+        weida_client_tls_drop(tls);
+    }
+    p
+}
+
+fn surveyor(rt: *mut weida_runtime) -> *mut weida_surveyor {
+    let tls = client_tls();
+    let mut s = ptr::null_mut();
+    // SAFETY: live handles, `tls` dropped once, and a writable out-parameter.
+    unsafe {
+        ok(weida_runtime_surveyor(rt, tls, &mut s));
+        weida_client_tls_drop(tls);
+    }
+    s
+}
+
+fn paired_connect(p: *mut weida_paired, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the dial",
+        // SAFETY: a live pair, a C string and a writable out-parameter.
+        |op| unsafe { weida_paired_connect(p, url.as_ptr(), op) },
+        weida_paired_connect_op_wait,
+        weida_paired_connect_op_drop,
+    )
+}
+
+fn surveyor_connect(s: *mut weida_surveyor, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the dial",
+        // SAFETY: a live surveyor, a C string and a writable out-parameter.
+        |op| unsafe { weida_surveyor_connect(s, url.as_ptr(), op) },
+        weida_surveyor_connect_op_wait,
+        weida_surveyor_connect_op_drop,
+    )
+}
+
+fn bus_connect(m: *mut weida_bus_member, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the join",
+        // SAFETY: a live member, a C string and a writable out-parameter.
+        |op| unsafe { weida_bus_member_connect(m, url.as_ptr(), op) },
+        weida_bus_member_connect_op_wait,
+        weida_bus_member_connect_op_drop,
+    )
+}
+
+fn paired_send(p: *mut weida_paired, body: &[u8]) {
+    ok(run_op(
+        "the send",
+        // SAFETY: a live pair, `body.len()` readable bytes and a writable
+        // out-parameter.
+        |op| unsafe { weida_paired_send(p, body.as_ptr(), body.len(), op) },
+        weida_paired_send_op_wait,
+        weida_paired_send_op_drop,
+    ));
+}
+
+fn paired_recv(p: *mut weida_paired) -> *mut weida_incoming_transfer {
+    let mut t = ptr::null_mut();
+    // SAFETY: a live pair and a writable out-parameter.
+    ok(settle("a transfer from the peer", |ms| unsafe {
+        weida_paired_recv(p, ms, &mut t)
+    }));
+    assert!(!t.is_null());
+    t
+}
+
+fn bus_recv(m: *mut weida_bus_member) -> *mut weida_incoming_transfer {
+    let mut t = ptr::null_mut();
+    // SAFETY: a live member and a writable out-parameter.
+    ok(settle("a message from another member", |ms| unsafe {
+        weida_bus_member_recv(m, ms, &mut t)
+    }));
+    assert!(!t.is_null());
+    t
+}
+
+/// Metadata carrying `content_type`; the caller drops it.
+fn meta_with(content_type: &str) -> *mut weida_transfer_meta {
+    let content_type = c(content_type);
+    let mut meta = ptr::null_mut();
+    // SAFETY: a writable out-parameter, a live handle and a C string.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut meta));
+        ok(weida_transfer_meta_set_content_type(
+            meta,
+            content_type.as_ptr(),
+        ));
+    }
+    meta
+}
+
+/// Sends `body` from `m` with `meta`: how many members it reached.
+fn bus_send(m: *mut weida_bus_member, meta: *const weida_transfer_meta, body: &[u8]) -> usize {
+    let mut op = ptr::null_mut();
+    let mut n = usize::MAX;
+    // SAFETY: live handles, `body.len()` readable bytes and writable
+    // out-parameters; the op is dropped once.
+    unsafe {
+        ok(weida_bus_member_send_with(
+            m,
+            meta,
+            body.as_ptr(),
+            body.len(),
+            &mut op,
+        ));
+        ok(settle("the bus send", |ms| {
+            weida_bus_member_send_op_wait(op, ms, &mut n)
+        }));
+        weida_bus_member_send_op_drop(op);
+    }
+    n
+}
+
+/// Answers the next question on `r` with `with`: the question and its
+/// content type.
+fn answer(r: *mut weida_respondent, with: &[u8]) -> (Vec<u8>, Option<String>) {
+    let mut q = ptr::null_mut();
+    // SAFETY: a live respondent and a writable out-parameter.
+    ok(settle("a survey question", |ms| unsafe {
+        weida_respondent_accept(r, ms, &mut q)
+    }));
+    let mut meta = ptr::null_mut();
+    // SAFETY: a live request and a writable out-parameter.
+    ok(unsafe { weida_incoming_request_meta(q, &mut meta) });
+    let labelled = content_type(meta);
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    let question = body(take_body(q));
+    let out = reply(q, None);
+    write_all(out, with);
+    let mut delivery = ptr::null_mut();
+    // SAFETY: a live transfer, consumed, and a writable out-parameter; the
+    // receipt is dropped once.
+    unsafe {
+        ok(weida_outgoing_transfer_finish(out, &mut delivery));
+        weida_delivery_drop(delivery);
+    }
+    (question, labelled)
+}
+
+/// The next answer of `r`: `None` once the run ended.
+fn next_answer(r: *mut weida_survey_run) -> Option<Vec<u8>> {
+    let mut a = ptr::null_mut();
+    // SAFETY: a live run and a writable out-parameter.
+    ok(settle("an answer", |ms| unsafe {
+        weida_survey_run_next(r, 1024, ms, &mut a)
+    }));
+    if a.is_null() {
+        return None;
+    }
+    // SAFETY: a live answer, dropped once.
+    unsafe {
+        let data =
+            std::slice::from_raw_parts(weida_survey_answer_data(a), weida_survey_answer_len(a))
+                .to_vec();
+        weida_survey_answer_drop(a);
+        Some(data)
+    }
+}
+
+#[test]
+fn a_pair_exchanges_in_both_directions() {
+    let server = runtime();
+    let (l, lb) = bound(server, "abi-patterns-pair");
+    let mut near = ptr::null_mut();
+    let path = c("/link");
+    let url = "weida+inproc://abi-patterns-pair/link";
+    let mut len = usize::MAX;
+    let mut events = ptr::null_mut();
+    // SAFETY: a live listener, a C string and writable out-parameters.
+    unsafe {
+        ok(weida_listener_pair(l, path.as_ptr(), &mut near));
+        let at = weida_paired_path(near, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("/link"));
+    }
+    assert_eq!(paired_connect(near, url), -WEIDA_EUNSUPPORTED);
+    // SAFETY: a live pair and a writable out-parameter.
+    unsafe {
+        assert_eq!(weida_paired_events(near, &mut events), 0);
+        assert!(events.is_null(), "a bound pair reports nothing");
+        assert_eq!(weida_paired_peer_count(near), 0);
+    }
+
+    let client = runtime();
+    let far = paired(client);
+    // SAFETY: a live pair and writable out-parameters; the reader is
+    // dropped once.
+    unsafe {
+        let at = weida_paired_path(far, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some(""));
+        assert_eq!(weida_paired_events(far, &mut events), 1);
+        assert!(!events.is_null());
+        weida_peer_events_drop(events);
+    }
+    ok(paired_connect(far, url));
+    // SAFETY: a live pair.
+    assert_eq!(unsafe { weida_paired_peer_count(far) }, 1);
+    assert_eq!(paired_connect(far, url), -WEIDA_ELIMIT_EXCEEDED);
+
+    paired_send(far, b"ping");
+    assert_eq!(body(paired_recv(near)), b"ping");
+
+    let meta = meta_with("text/plain");
+    ok(run_op(
+        "the send",
+        // SAFETY: live handles, 4 readable bytes and a writable out-parameter.
+        |op| unsafe { weida_paired_send_with(near, meta, b"pong".as_ptr(), 4, op) },
+        weida_paired_send_op_wait,
+        weida_paired_send_op_drop,
+    ));
+    // SAFETY: dropped once.
+    unsafe { weida_transfer_meta_drop(meta) };
+    let pong = paired_recv(far);
+    let pong_meta = meta_of(pong);
+    assert_eq!(content_type(pong_meta).as_deref(), Some("text/plain"));
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(pong_meta) };
+    assert_eq!(body(pong), b"pong");
+
+    let mut out = ptr::null_mut();
+    let mut delivery = ptr::null_mut();
+    // SAFETY: a live pair and writable out-parameters; the op is dropped
+    // once.
+    unsafe {
+        let mut op = ptr::null_mut();
+        ok(weida_paired_open(far, ptr::null(), &mut op));
+        ok(settle("the open", |ms| {
+            weida_paired_open_op_wait(op, ms, &mut out)
+        }));
+        weida_paired_open_op_drop(op);
+    }
+    write_all(out, b"again");
+    // SAFETY: a live transfer, consumed, and a writable out-parameter.
+    ok(unsafe { weida_outgoing_transfer_finish(out, &mut delivery) });
+    assert_eq!(body(paired_recv(near)), b"again");
+    ok(run_op(
+        "the delivery",
+        // SAFETY: a live receipt, consumed, and a writable out-parameter.
+        |op| unsafe { weida_delivery_delivered(delivery, op) },
+        weida_delivery_delivered_op_wait,
+        weida_delivery_delivered_op_drop,
+    ));
+
+    let mut stats = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; each snapshot is
+    // dropped once.
+    unsafe {
+        ok(weida_paired_connection_stats(far, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 1);
+        let at = weida_connection_stats_url(stats, 0, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some(url));
+        weida_connection_stats_drop(stats);
+        ok(weida_paired_connection_stats(near, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 0);
+        weida_connection_stats_drop(stats);
+        assert_eq!(weida_paired_dropped(far), 0);
+    }
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_paired_drop(far);
+        weida_paired_drop(near);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn a_survey_collects_two_respondents_answers_within_its_window() {
+    let server = runtime();
+    let (la, lba) = bound(server, "abi-patterns-survey-a");
+    let (lb, lbb) = bound(server, "abi-patterns-survey-b");
+    let path = c("/poll");
+    let (mut ra, mut rb, mut again) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+    let mut len = usize::MAX;
+    // SAFETY: live listeners, a C string and writable out-parameters.
+    unsafe {
+        ok(weida_listener_respondent(la, path.as_ptr(), &mut ra));
+        ok(weida_listener_respondent(lb, path.as_ptr(), &mut rb));
+        let at = weida_respondent_path(ra, &mut len);
+        assert_eq!(text(at, len).as_deref(), Some("/poll"));
+        assert_eq!(
+            weida_listener_respondent(la, path.as_ptr(), &mut again),
+            -WEIDA_EALREADY_REGISTERED
+        );
+    }
+
+    let client = runtime();
+    let s = surveyor(client);
+    let mut op = ptr::null_mut();
+    let mut run = ptr::null_mut();
+    // Nobody to ask: an empty run, not an error.
+    // SAFETY: a live surveyor, 7 readable bytes and writable
+    // out-parameters; the op and the run are dropped once.
+    unsafe {
+        ok(weida_surveyor_survey(
+            s,
+            b"anyone?".as_ptr(),
+            7,
+            5000,
+            &mut op,
+        ));
+        ok(settle("the empty survey", |ms| {
+            weida_surveyor_survey_op_wait(op, ms, &mut run)
+        }));
+        weida_surveyor_survey_op_drop(op);
+        assert_eq!(weida_survey_run_respondents(run), 0);
+    }
+    assert_eq!(next_answer(run), None);
+    // SAFETY: a live run, dropped once.
+    unsafe {
+        assert_eq!(weida_survey_run_late(run), 0);
+        weida_survey_run_drop(run);
+    }
+
+    ok(surveyor_connect(
+        s,
+        "weida+inproc://abi-patterns-survey-a/poll",
+    ));
+    ok(surveyor_connect(
+        s,
+        "weida+inproc://abi-patterns-survey-b/poll",
+    ));
+    let mut stats = ptr::null_mut();
+    // SAFETY: a live surveyor and a writable out-parameter; the snapshot is
+    // dropped once.
+    unsafe {
+        assert_eq!(weida_surveyor_peer_count(s), 2);
+        ok(weida_surveyor_connection_stats(s, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 2);
+        weida_connection_stats_drop(stats);
+    }
+
+    let meta = meta_with("text/plain");
+    // SAFETY: live handles, 12 readable bytes and a writable out-parameter;
+    // `meta` is copied by the call and dropped once.
+    unsafe {
+        ok(weida_surveyor_survey_with(
+            s,
+            meta,
+            b"who is there".as_ptr(),
+            12,
+            60_000,
+            &mut op,
+        ));
+        weida_transfer_meta_drop(meta);
+    }
+    for (r, with) in [(ra, &b"a"[..]), (rb, b"b")] {
+        let (question, labelled) = answer(r, with);
+        assert_eq!(question, b"who is there");
+        assert_eq!(labelled.as_deref(), Some("text/plain"));
+    }
+    // SAFETY: a live op, dropped once, and a writable out-parameter.
+    unsafe {
+        ok(settle("the survey", |ms| {
+            weida_surveyor_survey_op_wait(op, ms, &mut run)
+        }));
+        weida_surveyor_survey_op_drop(op);
+        assert_eq!(weida_survey_run_respondents(run), 2);
+    }
+    let mut answers = [next_answer(run), next_answer(run)].map(|a| a.expect("an answer"));
+    answers.sort();
+    assert_eq!(answers, [b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(next_answer(run), None, "the run ends once both answered");
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        assert_eq!(weida_survey_run_late(run), 0);
+        weida_survey_run_drop(run);
+        weida_surveyor_drop(s);
+        weida_respondent_drop(ra);
+        weida_respondent_drop(rb);
+        weida_local_binding_drop(lba);
+        weida_local_binding_drop(lbb);
+        weida_listener_drop(la);
+        weida_listener_drop(lb);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn a_bus_message_reaches_every_other_member() {
+    let rts = [runtime(), runtime(), runtime()];
+    let path = c("/bus");
+    let mut bindings = Vec::new();
+    let mut members = Vec::new();
+    for (i, rt) in rts.iter().enumerate() {
+        let (l, lb) = bound(*rt, &format!("abi-patterns-bus-{i}"));
+        let tls = client_tls();
+        let mut m = ptr::null_mut();
+        let mut len = usize::MAX;
+        // SAFETY: live handles, a C string and writable out-parameters;
+        // `tls` is dropped once.
+        unsafe {
+            ok(weida_listener_bus(l, path.as_ptr(), tls, &mut m));
+            let at = weida_bus_member_path(m, &mut len);
+            assert_eq!(text(at, len).as_deref(), Some("/bus"));
+            if i == 0 {
+                let mut again = ptr::null_mut();
+                assert_eq!(
+                    weida_listener_bus(l, path.as_ptr(), tls, &mut again),
+                    -WEIDA_EALREADY_REGISTERED
+                );
+            }
+            weida_client_tls_drop(tls);
+        }
+        bindings.push((l, lb));
+        members.push(m);
+    }
+    for (i, m) in members.iter().enumerate() {
+        for j in (0..members.len()).filter(|j| *j != i) {
+            ok(bus_connect(
+                *m,
+                &format!("weida+inproc://abi-patterns-bus-{j}/bus"),
+            ));
+        }
+        let mut stats = ptr::null_mut();
+        // SAFETY: a live member and a writable out-parameter; the snapshot
+        // is dropped once.
+        unsafe {
+            assert_eq!(weida_bus_member_peer_count(*m), 2);
+            ok(weida_bus_member_connection_stats(*m, &mut stats));
+            assert_eq!(weida_connection_stats_len(stats), 2);
+            weida_connection_stats_drop(stats);
+        }
+    }
+
+    let meta = meta_with("text/plain");
+    assert_eq!(bus_send(members[0], meta, b"from 0"), 2);
+    // SAFETY: dropped once.
+    unsafe { weida_transfer_meta_drop(meta) };
+    assert_eq!(bus_send(members[1], ptr::null(), b"from 1"), 2);
+    assert_eq!(bus_send(members[2], ptr::null(), b"from 2"), 2);
+
+    for (i, m) in members.iter().enumerate() {
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let t = bus_recv(*m);
+            let meta = meta_of(t);
+            let labelled = content_type(meta);
+            // SAFETY: dropped once.
+            unsafe { weida_incoming_meta_drop(meta) };
+            let data = body(t);
+            let expected = (data == b"from 0").then_some("text/plain");
+            assert_eq!(labelled.as_deref(), expected, "member {i}");
+            seen.push(data);
+        }
+        seen.sort();
+        let others: Vec<Vec<u8>> = (0..members.len())
+            .filter(|j| *j != i)
+            .map(|j| format!("from {j}").into_bytes())
+            .collect();
+        assert_eq!(seen, others, "member {i}");
+    }
+    for m in &members {
+        let mut t = ptr::null_mut();
+        // SAFETY: a live member and a writable out-parameter.
+        unsafe {
+            let rc = weida_bus_member_recv(*m, 200, &mut t);
+            assert_eq!(rc, -WEIDA_EAGAIN, "nobody gets its own message");
+            assert_eq!(weida_bus_member_dropped(*m), 0);
+        }
+    }
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        for m in members {
+            weida_bus_member_drop(m);
+        }
+        for (l, lb) in bindings {
+            weida_local_binding_drop(lb);
+            weida_listener_drop(l);
+        }
+    }
+    for rt in rts {
+        shutdown(rt);
+    }
+}
