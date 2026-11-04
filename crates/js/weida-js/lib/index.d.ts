@@ -273,6 +273,16 @@ export interface PeerEvent {
   readonly missed: bigint | null;
 }
 
+/** What one drain achieved, as counts of the transfers still
+ * unacknowledged when it started. */
+export interface Drained {
+  /** Acknowledged by the peer's transport before the deadline. */
+  readonly delivered: bigint;
+  /** Unacknowledged at the deadline, refused by the peer, or lost with
+   * their connection; not an error. */
+  readonly outstanding: bigint;
+}
+
 /** The metadata an outgoing transfer carries. An unknown field throws a
  * TypeError. */
 export interface TransferMeta {
@@ -309,6 +319,10 @@ export class Runtime extends Handle {
   /** Closes every endpoint and waits for the connections to go idle.
    * Consumes the runtime. */
   shutdown(options?: WaitOptions): Promise<void>;
+  /** Stops admitting work, waits up to `deadlineMs` for finished
+   * transfers to reach the peer's transport, then closes as `shutdown`
+   * does. Consumes the runtime. */
+  drain(deadlineMs: Count, options?: WaitOptions): Promise<Drained>;
 }
 
 export class Trust extends Handle {

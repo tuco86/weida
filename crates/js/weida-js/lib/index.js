@@ -397,6 +397,23 @@ export class Runtime extends Handle {
       signal,
     );
   }
+
+  /** Stops admitting work, gives every finished transfer whose receipt
+   * nobody holds until `deadlineMs` to reach the peer's transport, then
+   * closes as `shutdown` does within what is left of it. Resolves to a
+   * frozen `{ delivered, outstanding }` of BigInts; a non-zero
+   * `outstanding` is not an error. Aborting cancels the drain where it is.
+   * Consumes the runtime. */
+  async drain(deadlineMs, { signal } = {}) {
+    const drained = await op(
+      this,
+      () => native.runtimeDrain(consume(this), deadlineMs),
+      native.runtimeDrainOpWait,
+      native.runtimeDrainOpFd,
+      signal,
+    );
+    return Object.freeze(drained);
+  }
 }
 
 /** Whom a dialler trusts: what each address names, plus pins. */

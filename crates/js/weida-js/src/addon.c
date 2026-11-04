@@ -35,6 +35,7 @@ static const napi_type_tag WH_TAG = {0x77656964612d6a73ULL, 0x68616e646c650001UL
 DROP(runtime_config)
 DROP(runtime)
 DROP(runtime_shutdown_op)
+DROP(runtime_drain_op)
 DROP(listener)
 DROP(listener_bind_quic_op)
 DROP(binding)
@@ -631,6 +632,20 @@ static napi_value msg_value(napi_env env, void *ptr) {
     return obj;
 }
 
+/* Copies a weida_drained out into `{ delivered, outstanding }` and drops it. */
+static napi_value drained_value(napi_env env, void *ptr) {
+    weida_drained *d = ptr;
+    napi_value obj = NULL;
+    if (napi_create_object(env, &obj) != napi_ok) {
+        weida_drained_drop(d);
+        return throw_napi(env);
+    }
+    bool ok = set(env, obj, "delivered", optional_u64(env, 1, weida_drained_delivered(d)));
+    ok = ok && set(env, obj, "outstanding", optional_u64(env, 1, weida_drained_outstanding(d)));
+    weida_drained_drop(d);
+    return ok ? obj : NULL;
+}
+
 /* A connection record's numbers, each read by one getter (R2). */
 typedef int (*stat_fn)(const weida_connection_stats *, size_t, uint64_t *);
 
@@ -1150,6 +1165,23 @@ static napi_value runtime_shutdown(napi_env env, napi_callback_info info) {
 
 FD(runtime_shutdown_op_fd, runtime_shutdown_op)
 WAIT0(runtime_shutdown_op_wait, runtime_shutdown_op)
+
+/* consumes the runtime; a deadline out of range throws first and consumes nothing */
+static napi_value runtime_drain(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    uint64_t ms = 0;
+    if (!get_u64(env, argv[1], UINT64_MAX, &ms))
+        return NULL;
+    weida_runtime *rt = take(env, argv[0], drop_runtime);
+    weida_runtime_drain_op *op = NULL;
+    if (!rt)
+        return NULL;
+    int rc = weida_runtime_drain(rt, ms, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_runtime_drain_op);
+}
+
+FD(runtime_drain_op_fd, runtime_drain_op)
+WAIT1(runtime_drain_op_wait, runtime_drain_op, weida_drained, drained_value)
 U64_OUT(runtime_suppressed_duplicates, runtime, suppressed_duplicates)
 U64_OUT(runtime_expired_transfers, runtime, expired_transfers)
 
@@ -2004,6 +2036,9 @@ NAPI_MODULE_INIT() {
         FN("runtimeShutdown", runtime_shutdown),
         FN("runtimeShutdownOpFd", runtime_shutdown_op_fd),
         FN("runtimeShutdownOpWait", runtime_shutdown_op_wait),
+        FN("runtimeDrain", runtime_drain),
+        FN("runtimeDrainOpFd", runtime_drain_op_fd),
+        FN("runtimeDrainOpWait", runtime_drain_op_wait),
         FN("runtimeSuppressedDuplicates", runtime_suppressed_duplicates),
         FN("runtimeExpiredTransfers", runtime_expired_transfers),
         FN("trustNew", trust_new),
