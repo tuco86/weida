@@ -83,7 +83,10 @@ test(
     // The handler is attached first: the request rejects once the acceptor
     // drops the exchange.
     const rejected = assert.rejects(requester.request("x"), { code: "WEIDA_ENO_REPLY" });
-    assert.deepEqual(await acceptor.accept(), { kind: "WEIDA_INCOMING_EXCHANGE" });
+    const exchange = await acceptor.accept();
+    assert.equal(exchange.kind, "WEIDA_INCOMING_EXCHANGE");
+    assert.ok(exchange.request instanceof weida.IncomingRequest);
+    exchange.request.drop();
     await rejected;
 
     const peer = near.peer(new weida.ClientTls(new weida.Trust()));

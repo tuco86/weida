@@ -327,11 +327,25 @@ export type Received =
       readonly payload: Uint8Array;
     };
 
-/** What an acceptor took: a flow, or the kind of something else, whose
- * payload was dropped at once. */
+/** What an acceptor took: a payload handed over, or the values of a credit
+ * grant or an unsubscription (`filter` null when the whole connection went
+ * away). */
 export type Incoming =
-  | { readonly kind: "WEIDA_INCOMING_FLOW"; readonly flow: IncomingFlow }
-  | { readonly kind: Exclude<IncomingKind, "WEIDA_INCOMING_FLOW"> };
+  | { readonly kind: "WEIDA_INCOMING_STREAM"; readonly transfer: IncomingTransfer }
+  | { readonly kind: "WEIDA_INCOMING_EXCHANGE"; readonly request: IncomingRequest }
+  | { readonly kind: "WEIDA_INCOMING_SUBSCRIBED"; readonly consumer: Consumer }
+  | {
+      readonly kind: "WEIDA_INCOMING_CREDIT";
+      readonly id: bigint;
+      readonly filter: string;
+      readonly limit: bigint;
+    }
+  | {
+      readonly kind: "WEIDA_INCOMING_UNSUBSCRIBED";
+      readonly id: bigint;
+      readonly filter: string | null;
+    }
+  | { readonly kind: "WEIDA_INCOMING_FLOW"; readonly flow: IncomingFlow };
 
 /** What a sender attaches to a flow, once; a label is at most 256 bytes. */
 export interface FlowMeta {
@@ -751,6 +765,22 @@ export class Reporter extends Handle {
 
 export class Peer extends Handle {
   connect(url: string, options?: WaitOptions): Promise<void>;
+  /** Whether the address was dialled. */
+  disconnect(url: string): boolean;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  events(): PeerEvents;
+  /** The bodies the outbox discarded. */
+  dropped(): bigint;
+  /** A one-way stream to the next peer. */
+  open(meta?: TransferMeta | null, options?: WaitOptions): Promise<OutgoingTransfer>;
+  /** An exchange with the next peer. */
+  openBi(meta?: TransferMeta | null, options?: WaitOptions): Promise<Exchange>;
+  /** Resolves once the body is written or held in the outbox. */
+  send(meta: TransferMeta | null, body: Bytes, options?: WaitOptions): Promise<void>;
+  /** Segment n+1 on `topic`; it supersedes this peer's segment n there. */
+  segment(topic: string, terms?: SegmentTerms | null, options?: WaitOptions): Promise<Segment>;
+  segmentDrops(topic: string): TopicDrops | null;
   /** Resolves once the flow's header is written; a refusal arrives as a
    * `send` that throws. */
   openFlow(meta?: FlowMeta | null, options?: WaitOptions): Promise<Flow>;
@@ -759,6 +789,20 @@ export class Peer extends Handle {
 export class Acceptor extends Handle {
   path(): string | null;
   accept(options?: WaitOptions): Promise<Incoming>;
+}
+
+/** A consumer that subscribed on an acceptor's path; a queue delivers to it
+ * while its credit allows. */
+export class Consumer extends Handle {
+  /** The number of its connection, shared by that connection's subscriptions. */
+  id(): bigint;
+  filter(): string | null;
+  path(): string | null;
+  open(meta?: TransferMeta | null, options?: WaitOptions): Promise<OutgoingTransfer>;
+  /** Resolves once the body is written and finished. */
+  deliver(meta: TransferMeta | null, body: Bytes, options?: WaitOptions): Promise<void>;
+  /** Closes the consumer's connection, ending every subscription it holds. */
+  close(code: Count, reason: string): void;
 }
 
 /** `drop()` closes the flow with FIN. */

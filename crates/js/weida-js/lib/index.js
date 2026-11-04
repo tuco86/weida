@@ -1474,8 +1474,9 @@ export class Reporter extends Handle {
   }
 }
 
-/** The dialling side of the stream core: it opens datagram flows to the
- * peers it dialled, round-robin. */
+/** The dialling side of the stream core: it opens one-way streams,
+ * exchanges, segments and datagram flows to the peers it dialled,
+ * round-robin. */
 export class Peer extends Handle {
   constructor() {
     super();
@@ -1491,6 +1492,102 @@ export class Peer extends Handle {
       native.peerConnectOpFd,
       signal,
     );
+  }
+
+  /** Forgets a dialled address: whether it was dialled. */
+  disconnect(url) {
+    return native.peerDisconnect(this[HANDLE], url);
+  }
+
+  /** The number of connected peers. */
+  peerCount() {
+    return native.peerPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`. */
+  connectionStats() {
+    return Object.freeze(native.peerConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** A new reader of this peer's events, from now on. */
+  events() {
+    return adopt(PeerEvents, native.peerEvents(this[HANDLE]));
+  }
+
+  /** The bodies the outbox discarded, a BigInt. */
+  dropped() {
+    return native.peerDropped(this[HANDLE]);
+  }
+
+  /** Opens a one-way stream to the next peer with `meta` (a `TransferMeta`
+   * object, or null), written like a socket and ended with `finish()`. With
+   * every peer down it waits for the redial, bounded by `sendTimeout`;
+   * a peer never connected rejects with WEIDA_ENOT_CONNECTED. Aborting
+   * abandons it. */
+  async open(meta, { signal } = {}) {
+    const transfer = await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.peerOpen(this[HANDLE], m)),
+      native.peerOpenOpWait,
+      native.peerOpenOpFd,
+      signal,
+    );
+    return adopt(OutgoingTransfer, transfer);
+  }
+
+  /** Opens one exchange with the next peer, as `Requester.open`: a frozen
+   * `{ body, reply }`. */
+  async openBi(meta, { signal } = {}) {
+    const opened = await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.peerOpenBi(this[HANDLE], m)),
+      native.peerOpenBiOpWait,
+      native.peerOpenBiOpFd,
+      signal,
+    );
+    return Object.freeze({
+      body: adopt(OutgoingTransfer, opened.body),
+      reply: adopt(ReplyStream, opened.reply),
+    });
+  }
+
+  /** Sends `body` (a string is sent as UTF-8) as one message with `meta` (a
+   * `TransferMeta` object, or null); resolves once it is written or held in
+   * the outbox. */
+  async send(meta, body, { signal } = {}) {
+    const data = bytes(body);
+    await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.peerSend(this[HANDLE], m, data)),
+      native.peerSendOpWait,
+      native.peerSendOpFd,
+      signal,
+    );
+  }
+
+  /** Opens segment n+1 on `topic` to the next peer, on `terms`
+   * `{ maxAgeMs?, priority?, followsUpstream? }`: it supersedes this peer's
+   * copy of segment n there, as a radio's does. */
+  async segment(topic, terms = null, { signal } = {}) {
+    const segment = await op(
+      this,
+      () =>
+        withFields(terms, native.segmentTermsNew, SEGMENT_FIELDS, "SegmentTerms", (t) =>
+          native.peerSegment(this[HANDLE], topic, t),
+        ),
+      native.peerSegmentOpWait,
+      native.peerSegmentOpFd,
+      signal,
+    );
+    return adopt(Segment, segment);
+  }
+
+  /** What this peer's segments lost on `topic`, a frozen record as
+   * `Publisher.droppedOn`, or null when nothing was. */
+  segmentDrops(topic) {
+    const [record] = native.peerSegmentDrops(this[HANDLE], topic);
+    return record === undefined ? null : Object.freeze(record);
   }
 
   /** Registers a datagram flow to the next peer with `meta` (a
@@ -1524,10 +1621,14 @@ export class Acceptor extends Handle {
     return native.acceptorPath(this[HANDLE]);
   }
 
-  /** The next thing that arrived on the path: a frozen
-   * `{ kind: "WEIDA_INCOMING_FLOW", flow }`, or `{ kind }` for the other
-   * kinds, whose payload is dropped at once (a stream is refused
-   * `REJECTED`, an exchange answers `NO_REPLY`). */
+  /** The next thing that arrived on the path, a frozen object by `kind`:
+   * `{ kind: "WEIDA_INCOMING_STREAM", transfer }`,
+   * `{ kind: "WEIDA_INCOMING_EXCHANGE", request }`,
+   * `{ kind: "WEIDA_INCOMING_SUBSCRIBED", consumer }`,
+   * `{ kind: "WEIDA_INCOMING_CREDIT", id, filter, limit }` (BigInt id and
+   * limit), `{ kind: "WEIDA_INCOMING_UNSUBSCRIBED", id, filter }` (`filter`
+   * null when the whole connection went away), or
+   * `{ kind: "WEIDA_INCOMING_FLOW", flow }`. */
   async accept({ signal } = {}) {
     const handle = this[HANDLE];
     const r = await call(
@@ -1536,10 +1637,80 @@ export class Acceptor extends Handle {
       () => native.acceptorFd(handle),
       signal,
     );
-    if (r.kind === "WEIDA_INCOMING_FLOW") {
-      return Object.freeze({ kind: r.kind, flow: adopt(IncomingFlow, r.flow) });
+    switch (r.kind) {
+      case "WEIDA_INCOMING_STREAM":
+        return Object.freeze({ kind: r.kind, transfer: adopt(IncomingTransfer, r.transfer) });
+      case "WEIDA_INCOMING_EXCHANGE":
+        return Object.freeze({ kind: r.kind, request: adopt(IncomingRequest, r.request) });
+      case "WEIDA_INCOMING_SUBSCRIBED":
+        return Object.freeze({ kind: r.kind, consumer: adopt(Consumer, r.consumer) });
+      case "WEIDA_INCOMING_FLOW":
+        return Object.freeze({ kind: r.kind, flow: adopt(IncomingFlow, r.flow) });
+      default:
+        return Object.freeze(r);
     }
-    return Object.freeze(r);
+  }
+}
+
+/** One consumer that subscribed on an acceptor's path, and the way to
+ * deliver to it. A queue honours its credit; nothing is delivered by
+ * itself. */
+export class Consumer extends Handle {
+  constructor() {
+    super();
+    noConstructor("Consumer", "Acceptor.accept()");
+  }
+
+  /** The number of the connection it subscribed on, a BigInt shared by
+   * every subscription of that connection and never reused. */
+  id() {
+    return native.consumerId(this[HANDLE]);
+  }
+
+  /** The filter the subscription was created with. */
+  filter() {
+    return native.consumerFilter(this[HANDLE]);
+  }
+
+  /** The endpoint path it subscribed on. */
+  path() {
+    return native.consumerPath(this[HANDLE]);
+  }
+
+  /** Opens one delivery with `meta` (a `TransferMeta` object, or null; the
+   * topic the consumer filters on travels in it), addressed to the
+   * subscribed path and written like a socket. Rejects with
+   * WEIDA_ECONNECTION_LOST once the consumer's connection is gone. */
+  async open(meta, { signal } = {}) {
+    const transfer = await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.consumerOpen(this[HANDLE], m)),
+      native.consumerOpenOpWait,
+      native.consumerOpenOpFd,
+      signal,
+    );
+    return adopt(OutgoingTransfer, transfer);
+  }
+
+  /** Delivers `body` (a string is sent as UTF-8) as one whole transfer with
+   * `meta`; resolves once it is written and finished. */
+  async deliver(meta, body, { signal } = {}) {
+    const data = bytes(body);
+    await op(
+      this,
+      () => withTransferMeta(meta, (m) => native.consumerDeliver(this[HANDLE], m, data)),
+      native.consumerDeliverOpWait,
+      native.consumerDeliverOpFd,
+      signal,
+    );
+  }
+
+  /** Closes the connection the consumer subscribed on with `code` (one of
+   * PROTOCOL.md §7's, e.g. 6 `SHUTDOWN`; above 2^62-1 sent as `INTERNAL`)
+   * and `reason`, ending every subscription it holds on every path. The
+   * acceptor then reports an unsubscription with a null filter. */
+  close(code, reason) {
+    native.consumerClose(this[HANDLE], code, reason);
   }
 }
 

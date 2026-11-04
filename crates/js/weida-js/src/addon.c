@@ -116,6 +116,13 @@ DROP(reporter_finish_op)
 DROP(peer)
 DROP(peer_connect_op)
 DROP(peer_open_flow_op)
+DROP(peer_open_op)
+DROP(peer_open_bi_op)
+DROP(peer_send_op)
+DROP(peer_segment_op)
+DROP(consumer)
+DROP(consumer_open_op)
+DROP(consumer_deliver_op)
 DROP(acceptor)
 DROP(flow_meta)
 DROP(flow)
@@ -1068,6 +1075,7 @@ WRAP_AS(handoff)
 WRAP_AS(relay_request)
 WRAP_AS(resolved)
 WRAP_AS(survey_run)
+WRAP_AS(segment)
 
 /* `<t>_<x>(h) -> bigint`: an infallible uint64_t accessor (R2). */
 #define U64_OUT(js, t, x) \
@@ -3773,6 +3781,132 @@ static napi_value wrap_flow(napi_env env, void *p) { return wrap(env, p, drop_fl
 
 FD(peer_open_flow_op_fd, peer_open_flow_op)
 WAIT1(peer_open_flow_op_wait, peer_open_flow_op, weida_flow, wrap_flow)
+
+/* raw peers */
+
+/* (peer, meta | null) -> op */
+static napi_value peer_open(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_peer *p = live(env, argv[0], drop_peer);
+    void *meta = NULL;
+    weida_peer_open_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_transfer_meta, &meta))
+        return NULL;
+    int rc = weida_peer_open(p, meta, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_peer_open_op);
+}
+
+FD(peer_open_op_fd, peer_open_op)
+WAIT1(peer_open_op_wait, peer_open_op, weida_outgoing_transfer, wrap_outgoing_transfer)
+
+/* (peer, meta | null) -> op */
+static napi_value peer_open_bi(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_peer *p = live(env, argv[0], drop_peer);
+    void *meta = NULL;
+    weida_peer_open_bi_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_transfer_meta, &meta))
+        return NULL;
+    int rc = weida_peer_open_bi(p, meta, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_peer_open_bi_op);
+}
+
+FD(peer_open_bi_op_fd, peer_open_bi_op)
+
+/* `peerOpenBiOpWait(op) -> { body, reply } | AGAIN` */
+static napi_value peer_open_bi_op_wait(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_peer_open_bi_op *p = live(env, argv[0], drop_peer_open_bi_op);
+    weida_outgoing_transfer *body = NULL;
+    weida_reply_stream *reply = NULL;
+    napi_value obj, b, s;
+    if (!p)
+        return NULL;
+    int rc = weida_peer_open_bi_op_wait(p, 0, &body, &reply);
+    if (rc == -WEIDA_EAGAIN)
+        return again(env);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    b = wrap(env, body, drop_outgoing_transfer);
+    if (!b) {
+        weida_reply_stream_drop(reply);
+        return NULL;
+    }
+    s = wrap(env, reply, drop_reply_stream);
+    if (!s)
+        return NULL;
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    return set(env, obj, "body", b) ? set(env, obj, "reply", s) : NULL;
+}
+
+/* (peer, meta | null, bytes) -> op */
+static napi_value peer_send(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_peer *p = live(env, argv[0], drop_peer);
+    void *meta = NULL;
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_peer_send_op *op = NULL;
+    if (!p || !optional(env, argv[1], drop_transfer_meta, &meta) ||
+        !get_bytes(env, argv[2], &body, &len))
+        return NULL;
+    int rc = weida_peer_send(p, meta, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_peer_send_op);
+}
+
+FD(peer_send_op_fd, peer_send_op)
+WAIT0(peer_send_op_wait, peer_send_op)
+
+/* (peer, topic, terms | null) -> op */
+static napi_value peer_segment(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_peer *p = live(env, argv[0], drop_peer);
+    void *terms = NULL;
+    if (!p || !optional(env, argv[2], drop_segment_terms, &terms))
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    weida_peer_segment_op *op = NULL;
+    int rc = weida_peer_segment(p, topic, terms, &op);
+    free(topic);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_peer_segment_op);
+}
+
+FD(peer_segment_op_fd, peer_segment_op)
+WAIT1(peer_segment_op_wait, peer_segment_op, weida_segment, wrap_segment)
+
+static napi_value peer_segment_drops(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_peer *p = live(env, argv[0], drop_peer);
+    if (!p)
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    weida_topic_drops *d = NULL;
+    int rc = weida_peer_segment_drops(p, topic, &d);
+    free(topic);
+    return topic_drops_array(env, rc, d);
+}
+
+DISCONNECT(peer_disconnect, peer)
+SIZE_OUT(peer_peer_count, peer, peer_count)
+U64_OUT(peer_dropped, peer, dropped)
+CONNECTION_STATS(peer_connection_stats, peer)
+
+/* `weida_peer_events` is the reader's type, so the call is `_peer_events`. */
+static napi_value peer_events(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_peer *p = live(env, argv[0], drop_peer);
+    weida_peer_events *out = NULL;
+    if (!p)
+        return NULL;
+    int rc = weida_peer_peer_events(p, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_peer_events);
+}
+
 NEW0(flow_meta_new, flow_meta)
 SET_TEXT(flow_meta_set_content_type, flow_meta, content_type)
 SET_TEXT(flow_meta_set_trace, flow_meta, trace)
@@ -3795,8 +3929,8 @@ static napi_value listener_acceptor(napi_env env, napi_callback_info info) {
 STRING_OUT(acceptor_path, acceptor, path)
 FD(acceptor_fd, acceptor)
 
-/* Copies a weida_incoming out and drops it: `{ kind, flow }` for a flow,
- * `{ kind }` for the kinds not mapped yet, whose payload the drop drops. */
+/* Copies a weida_incoming out and drops it: { kind } plus the payload
+ * handle or the values of its variant. */
 static napi_value incoming_value(napi_env env, void *ptr) {
     weida_incoming *i = ptr;
     napi_value obj = NULL;
@@ -3806,17 +3940,75 @@ static napi_value incoming_value(napi_env env, void *ptr) {
         return throw_napi(env);
     }
     bool ok = set(env, obj, "kind", js_string(env, incoming_name(kind), NAPI_AUTO_LENGTH));
-    if (kind == WEIDA_INCOMING_FLOW) {
+    const char *s = NULL;
+    size_t len = 0;
+    uint64_t id = 0;
+    int rc = 0;
+    switch (kind) {
+    case WEIDA_INCOMING_STREAM: {
+        weida_incoming_transfer *t = NULL;
+        rc = weida_incoming_take_stream(i, &t);
+        if (rc < 0)
+            break;
+        weida_incoming_drop(i);
+        napi_value v = wrap_incoming_transfer(env, t);
+        return ok && v && set(env, obj, "transfer", v) ? obj : NULL;
+    }
+    case WEIDA_INCOMING_EXCHANGE: {
+        weida_incoming_request *q = NULL;
+        rc = weida_incoming_take_exchange(i, &q);
+        if (rc < 0)
+            break;
+        weida_incoming_drop(i);
+        napi_value v = wrap_incoming_request(env, q);
+        return ok && v && set(env, obj, "request", v) ? obj : NULL;
+    }
+    case WEIDA_INCOMING_SUBSCRIBED: {
+        weida_consumer *c = NULL;
+        rc = weida_incoming_take_subscribed(i, &c);
+        if (rc < 0)
+            break;
+        weida_incoming_drop(i);
+        napi_value v = wrap(env, c, drop_consumer);
+        return ok && v && set(env, obj, "consumer", v) ? obj : NULL;
+    }
+    case WEIDA_INCOMING_CREDIT: {
+        weida_credit_grant *g = NULL;
+        rc = weida_incoming_take_credit(i, &g);
+        if (rc < 0)
+            break;
+        weida_incoming_drop(i);
+        ok = ok && set(env, obj, "id", optional_u64(env, 1, weida_credit_grant_id(g)));
+        s = weida_credit_grant_filter(g, &len);
+        ok = ok && set(env, obj, "filter", js_string(env, s, len));
+        ok = ok && set(env, obj, "limit", optional_u64(env, 1, weida_credit_grant_limit(g)));
+        weida_credit_grant_drop(g);
+        return ok ? obj : NULL;
+    }
+    case WEIDA_INCOMING_UNSUBSCRIBED: {
+        int present = weida_incoming_unsubscribed_id(i, &id);
+        ok = ok && set(env, obj, "id", optional_u64(env, present, id));
+        s = weida_incoming_unsubscribed_filter(i, &len);
+        ok = ok && set(env, obj, "filter", js_string(env, s, len));
+        weida_incoming_drop(i);
+        return ok ? obj : NULL;
+    }
+    case WEIDA_INCOMING_FLOW: {
         weida_incoming_flow *f = NULL;
-        int rc = weida_incoming_take_flow(i, &f);
-        if (rc < 0) {
-            napi_value e = throw_rc(env, rc);
-            weida_incoming_drop(i);
-            return e;
-        }
+        rc = weida_incoming_take_flow(i, &f);
+        if (rc < 0)
+            break;
         weida_incoming_drop(i);
         napi_value flow = wrap(env, f, drop_incoming_flow);
         return ok && flow && set(env, obj, "flow", flow) ? obj : NULL;
+    }
+    default:
+        break;
+    }
+    if (rc < 0) {
+        napi_value e = throw_rc(env, rc);
+        weida_incoming_drop(i);
+        return e;
     }
     weida_incoming_drop(i);
     return ok ? obj : NULL;
@@ -3830,6 +4022,60 @@ static napi_value acceptor_accept(napi_env env, napi_callback_info info) {
         return NULL;
     int rc = weida_acceptor_accept(a, 0, &out);
     return outcome(env, rc, incoming_value, out);
+}
+
+/* consumers */
+
+U64_OUT(consumer_id, consumer, id)
+STRING_OUT(consumer_filter, consumer, filter)
+STRING_OUT(consumer_path, consumer, path)
+
+/* (consumer, meta | null) -> op */
+static napi_value consumer_open(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_consumer *c = live(env, argv[0], drop_consumer);
+    void *meta = NULL;
+    weida_consumer_open_op *op = NULL;
+    if (!c || !optional(env, argv[1], drop_transfer_meta, &meta))
+        return NULL;
+    int rc = weida_consumer_open(c, meta, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_consumer_open_op);
+}
+
+FD(consumer_open_op_fd, consumer_open_op)
+WAIT1(consumer_open_op_wait, consumer_open_op, weida_outgoing_transfer, wrap_outgoing_transfer)
+
+/* (consumer, meta | null, bytes) -> op */
+static napi_value consumer_deliver(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_consumer *c = live(env, argv[0], drop_consumer);
+    void *meta = NULL;
+    const uint8_t *body = NULL;
+    size_t len = 0;
+    weida_consumer_deliver_op *op = NULL;
+    if (!c || !optional(env, argv[1], drop_transfer_meta, &meta) ||
+        !get_bytes(env, argv[2], &body, &len))
+        return NULL;
+    int rc = weida_consumer_deliver(c, meta, body, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_consumer_deliver_op);
+}
+
+FD(consumer_deliver_op_fd, consumer_deliver_op)
+WAIT0(consumer_deliver_op_wait, consumer_deliver_op)
+
+/* (consumer, code, reason) -> undefined */
+static napi_value consumer_close(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_consumer *c = live(env, argv[0], drop_consumer);
+    uint64_t code = 0;
+    if (!c || !get_u64(env, argv[1], UINT64_MAX, &code))
+        return NULL;
+    char *reason = get_string(env, argv[2]);
+    if (!reason)
+        return NULL;
+    int rc = weida_consumer_close(c, code, reason);
+    free(reason);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
 }
 
 static napi_value flow_send(napi_env env, napi_callback_info info) {
@@ -4611,6 +4857,24 @@ NAPI_MODULE_INIT() {
         FN("peerOpenFlow", peer_open_flow),
         FN("peerOpenFlowOpFd", peer_open_flow_op_fd),
         FN("peerOpenFlowOpWait", peer_open_flow_op_wait),
+        FN("peerOpen", peer_open),
+        FN("peerOpenOpFd", peer_open_op_fd),
+        FN("peerOpenOpWait", peer_open_op_wait),
+        FN("peerOpenBi", peer_open_bi),
+        FN("peerOpenBiOpFd", peer_open_bi_op_fd),
+        FN("peerOpenBiOpWait", peer_open_bi_op_wait),
+        FN("peerSend", peer_send),
+        FN("peerSendOpFd", peer_send_op_fd),
+        FN("peerSendOpWait", peer_send_op_wait),
+        FN("peerSegment", peer_segment),
+        FN("peerSegmentOpFd", peer_segment_op_fd),
+        FN("peerSegmentOpWait", peer_segment_op_wait),
+        FN("peerSegmentDrops", peer_segment_drops),
+        FN("peerDisconnect", peer_disconnect),
+        FN("peerPeerCount", peer_peer_count),
+        FN("peerDropped", peer_dropped),
+        FN("peerConnectionStats", peer_connection_stats),
+        FN("peerEvents", peer_events),
         FN("flowMetaNew", flow_meta_new),
         FN("flowMetaSetContentType", flow_meta_set_content_type),
         FN("flowMetaSetTrace", flow_meta_set_trace),
@@ -4619,6 +4883,16 @@ NAPI_MODULE_INIT() {
         FN("acceptorPath", acceptor_path),
         FN("acceptorFd", acceptor_fd),
         FN("acceptorAccept", acceptor_accept),
+        FN("consumerId", consumer_id),
+        FN("consumerFilter", consumer_filter),
+        FN("consumerPath", consumer_path),
+        FN("consumerOpen", consumer_open),
+        FN("consumerOpenOpFd", consumer_open_op_fd),
+        FN("consumerOpenOpWait", consumer_open_op_wait),
+        FN("consumerDeliver", consumer_deliver),
+        FN("consumerDeliverOpFd", consumer_deliver_op_fd),
+        FN("consumerDeliverOpWait", consumer_deliver_op_wait),
+        FN("consumerClose", consumer_close),
         FN("flowSend", flow_send),
         FN("flowMaxPayload", flow_max_payload),
         FN("flowSent", flow_sent),
