@@ -5130,6 +5130,26 @@ fn until_end(f: *mut weida_incoming_flow) {
     assert_eq!(datagram(f, 0), Ok(None));
 }
 
+fn max_payload(flow: *mut weida_flow) -> usize {
+    let mut max = 0usize;
+    // SAFETY: a live flow and a writable out-parameter.
+    assert_eq!(unsafe { weida_flow_max_payload(flow, &mut max) }, 1);
+    max
+}
+
+/// Runs `read` while the flow's largest payload holds still: path MTU
+/// discovery moves it, up or down, at any time. Returns that payload size
+/// and what `read` saw.
+fn steady<T>(flow: *mut weida_flow, mut read: impl FnMut() -> T) -> (usize, T) {
+    loop {
+        let before = max_payload(flow);
+        let seen = read();
+        if max_payload(flow) == before {
+            return (before, seen);
+        }
+    }
+}
+
 #[test]
 fn a_flow_carries_datagrams_over_quic() {
     let cfg = datagram_config();
@@ -5189,25 +5209,24 @@ fn a_flow_carries_datagrams_over_quic() {
         weida_incoming_meta_drop(info);
     }
 
-    let mut max = 0usize;
-    // SAFETY: a live flow and a writable out-parameter.
-    assert_eq!(unsafe { weida_flow_max_payload(flow, &mut max) }, 1);
-    assert!(max > 0);
+    assert!(max_payload(flow) > 0);
     for index in 0..3 {
         deliver(flow, f, index);
     }
-    // QUIC's path MTU discovery may still raise the limit, so the payload
-    // is beyond any UDP datagram rather than one byte past `max`.
     let big = vec![0u8; 65_536];
-    // SAFETY: a live flow and `big.len()` readable bytes.
+    let mut refused = 0;
+    let (max, limit) = steady(flow, || {
+        refused += 1;
+        // SAFETY: a live flow and `big.len()` readable bytes.
+        let rc = unsafe { weida_flow_send(flow, big.as_ptr(), big.len()) };
+        assert_eq!(rc, -WEIDA_ETOO_LARGE);
+        // SAFETY: read on the thread that failed.
+        unsafe { weida_last_error_max() }
+    });
+    assert_eq!(limit, max as i64, "the error names the limit");
+    // SAFETY: live handles.
     unsafe {
-        assert_eq!(
-            weida_flow_send(flow, big.as_ptr(), big.len()),
-            -WEIDA_ETOO_LARGE
-        );
-        let limit = weida_last_error_max();
-        assert!(limit >= max as i64 && limit < 65_536, "the limit {limit}");
-        assert_eq!(weida_flow_too_large(flow), 1);
+        assert_eq!(weida_flow_too_large(flow), refused);
         assert!(weida_flow_sent(flow) >= 3);
         assert_eq!(weida_flow_not_live(flow), 0);
         assert!(weida_incoming_flow_received(f) >= 3);
@@ -5215,16 +5234,19 @@ fn a_flow_carries_datagrams_over_quic() {
     }
 
     let mut ps = ptr::null_mut();
-    let mut size = 0u64;
     // SAFETY: live handles and writable out-parameters; each snapshot is
     // dropped once.
     unsafe {
-        assert_eq!(weida_flow_path_stats(flow, &mut ps), 1);
-        assert!(weida_path_stats_rtt_us(ps) > 0);
-        assert!(weida_path_stats_current_mtu(ps) >= 1200);
-        assert_eq!(weida_path_stats_max_datagram_size(ps, &mut size), 1);
+        let (max, size) = steady(flow, || {
+            assert_eq!(weida_flow_path_stats(flow, &mut ps), 1);
+            let mut size = 0u64;
+            assert_eq!(weida_path_stats_max_datagram_size(ps, &mut size), 1);
+            assert!(weida_path_stats_rtt_us(ps) > 0);
+            assert!(weida_path_stats_current_mtu(ps) >= 1200);
+            weida_path_stats_drop(ps);
+            size
+        });
         assert!(size as usize > max, "the size includes the flow's prefix");
-        weida_path_stats_drop(ps);
         assert_eq!(weida_incoming_flow_path_stats(f, &mut ps), 1);
         weida_path_stats_drop(ps);
         weida_flow_drop(flow);

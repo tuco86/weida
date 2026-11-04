@@ -38,9 +38,15 @@ test("a flow carries datagrams over QUIC", INTEGRATION, async () => {
       break;
     }
   }
-  // The path's limit only grows, so it is read after the flow's.
-  const max = flow.maxPayload();
-  assert.ok(flow.pathStats().maxDatagramSize > BigInt(max));
+  // Path MTU discovery moves the limit at any time, so the two are compared
+  // only when the flow's limit held still across the path's read.
+  for (;;) {
+    const max = flow.maxPayload();
+    const size = flow.pathStats().maxDatagramSize;
+    if (flow.maxPayload() !== max) continue;
+    assert.ok(size > BigInt(max), "the size includes the flow's prefix");
+    break;
+  }
   assert.notEqual(incoming.pathStats(), null);
 
   flow.drop();
