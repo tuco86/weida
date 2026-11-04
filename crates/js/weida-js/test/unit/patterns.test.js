@@ -286,3 +286,121 @@ test("a bus message reaches every other member", UNIT, async () => {
   }
   await Promise.all(runtimes.map((runtime) => runtime.shutdown()));
 });
+
+/** A radio at `/r` on `server` and a dish of `topic` on `client`. */
+async function radioDish(server, client, topic, terms = null) {
+  const at = bound(server);
+  const radio = at.listener.radio("/r");
+  const dish = client.dish(clientTls());
+  await dish.join(topic, terms);
+  await dish.connect(`weida+inproc://${at.bus}/r`);
+  return { at, radio, dish };
+}
+
+/** Waits until `n` dishes joined `radio`. */
+async function awaitDishes(radio, n) {
+  while (radio.dishCount() !== n) await delay(1);
+}
+
+/** `[segment, layer, body]` of the next stream segment `dish` receives. */
+async function nextSegment(dish) {
+  const r = await dish.recv();
+  assert.equal(r.kind, "WEIDA_RECEIVED_SEGMENT");
+  const meta = r.transfer.meta();
+  return [meta.segment, meta.layer, text((await r.transfer.collect(1024)).payload)];
+}
+
+test("a dish receives the radio's segments with their numbers and layers", UNIT, async () => {
+  const server = weida.Runtime.owned();
+  const client = weida.Runtime.owned();
+  const { at, radio, dish } = await radioDish(server, client, "v", { maxLayer: 1 });
+  await awaitDishes(radio, 1);
+  assert.equal(weida.MAX_SEGMENT_LAYERS, 16);
+
+  const first = radio.segment("v");
+  assert.equal(first.number(), 0n);
+  assert.equal(first.topic(), "v");
+  assert.equal(first.writeLayer(0, "a0"), 1);
+  assert.equal(first.writeLayer(1, "a1"), 1);
+  assert.equal(first.writeLayer(2, "a2"), 0, "the copy is capped at layer 1");
+  assert.equal(first.finish(), 1);
+  const seen = [await nextSegment(dish), await nextSegment(dish)];
+
+  const second = radio.segment("v", { priority: 1 });
+  assert.equal(second.number(), 1n);
+  assert.equal(second.write("b0"), 1);
+  assert.equal(second.finish(), 1);
+  seen.push(await nextSegment(dish));
+  seen.sort((a, b) => (a[0] === b[0] ? a[1] - b[1] : a[0] < b[0] ? -1 : 1));
+  assert.deepEqual(seen, [
+    [0n, 0, "a0"],
+    [0n, 1, "a1"],
+    [1n, 0, "b0"],
+  ]);
+  assert.equal(radio.dropped(), 0n);
+  assert.equal(dish.stale(), 0n);
+  assert.equal(dish.overflow(), 0n);
+
+  for (const handle of [dish, radio, at.binding, at.listener]) handle.drop();
+  await client.shutdown();
+  await server.shutdown();
+});
+
+test("a superseded segment counts in dish drops", UNIT, async () => {
+  const server = weida.Runtime.owned();
+  const client = weida.Runtime.owned();
+  const { at, radio, dish } = await radioDish(server, client, "v");
+  await awaitDishes(radio, 1);
+
+  const first = radio.segment("v");
+  assert.equal(first.write("first"), 1);
+  const second = radio.segment("v");
+  assert.equal(second.write("second"), 1);
+  assert.equal(second.finish(), 1);
+  while (radio.dishDrops()[0]?.superseded !== 1n) await delay(1);
+  assert.equal(radio.droppedOn("v").superseded, 1n);
+  assert.equal(first.finish(), 0, "the copy was reset");
+
+  for (;;) {
+    const r = await dish.recv();
+    assert.equal(r.kind, "WEIDA_RECEIVED_SEGMENT");
+    if (r.transfer.meta().segment === 1n) {
+      assert.equal(text((await r.transfer.collect(1024)).payload), "second");
+      break;
+    }
+    await assert.rejects(r.transfer.collect(1024));
+  }
+
+  for (const handle of [dish, radio, at.binding, at.listener]) handle.drop();
+  await client.shutdown();
+  await server.shutdown();
+});
+
+test("a radio datagram reaches a dish that carries datagrams", UNIT, async () => {
+  const datagrams = { limits: { datagramReceiveBytes: 65536 } };
+  const server = weida.Runtime.owned(datagrams);
+  const near = weida.Runtime.owned(datagrams);
+  const far = weida.Runtime.owned();
+  const { at, radio, dish: carrying } = await radioDish(server, near, "voice");
+  const plain = far.dish(clientTls());
+  await plain.join("voice");
+  await plain.connect(`weida+inproc://${at.bus}/r`);
+  await awaitDishes(radio, 2);
+
+  assert.equal(radio.datagram("voice", "hello"), 1);
+  const r = await carrying.recv();
+  assert.equal(r.kind, "WEIDA_RECEIVED_DATAGRAM");
+  assert.equal(r.topic, "voice");
+  assert.equal(r.segment, 0n);
+  assert.equal(text(r.payload), "hello");
+  assert.equal(radio.droppedOn("voice").noDatagrams, 1n);
+  const counts = radio.dishDrops().map((d) => d.noDatagrams);
+  assert.deepEqual(
+    counts.sort((a, b) => (a < b ? -1 : 1)),
+    [0n, 1n],
+  );
+
+  for (const handle of [carrying, plain, radio, at.binding, at.listener]) handle.drop();
+  await Promise.all([near.shutdown(), far.shutdown()]);
+  await server.shutdown();
+});

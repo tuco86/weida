@@ -101,6 +101,14 @@ DROP(respondent)
 DROP(bus_member)
 DROP(bus_member_connect_op)
 DROP(bus_member_send_op)
+DROP(radio)
+DROP(segment)
+DROP(segment_terms)
+DROP(join_terms)
+DROP(dish)
+DROP(dish_connect_op)
+DROP(dish_join_op)
+DROP(dish_leave_op)
 DROP(transfer_meta)
 DROP(incoming_transfer)
 DROP(incoming_transfer_collect_op)
@@ -302,6 +310,19 @@ static const char *peer_event_name(int kind) {
         NAME(PEER_EVENT_RETRYING)
         NAME(PEER_EVENT_GAVE_UP)
         NAME(PEER_EVENT_MISSED)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *received_name(int kind) {
+    switch (kind) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(RECEIVED_SEGMENT)
+        NAME(RECEIVED_DATAGRAM)
 #undef NAME
     default:
         return NULL;
@@ -700,6 +721,12 @@ static napi_value meta_value(napi_env env, void *ptr) {
     present = weida_incoming_meta_sequence(m, &n);
     ok = ok && set(env, obj, "sequence", optional_u64(env, present, n));
     ok = ok && set(env, obj, "gap", gap_value(env, m));
+    present = weida_incoming_meta_segment(m, &n);
+    ok = ok && set(env, obj, "segment", optional_u64(env, present, n));
+    uint8_t layer = 0;
+    ok = ok && set(env, obj, "layer",
+                   weida_incoming_meta_layer(m, &layer) == 1 ? js_int64(env, layer)
+                                                             : js_null(env));
     s = weida_incoming_meta_trace(m, &len);
     ok = ok && set(env, obj, "trace", js_string(env, s, len));
     s = weida_incoming_meta_tracestate(m, &len);
@@ -3151,6 +3178,322 @@ static napi_value bus_member_recv(napi_env env, napi_callback_info info) {
     return outcome(env, rc, wrap_incoming_transfer, out);
 }
 
+/* radio */
+
+NEW0(join_terms_new, join_terms)
+SET_U64(join_terms_set_max_age_ms, join_terms, max_age_ms, INT64_MAX)
+SET_U64(join_terms_set_max_layer, join_terms, max_layer, INT64_MAX)
+NEW0(segment_terms_new, segment_terms)
+SET_U64(segment_terms_set_max_age_ms, segment_terms, max_age_ms, INT64_MAX)
+SET_INT(segment_terms_set_priority, segment_terms, priority)
+SET_FLAG(segment_terms_set_follows_upstream, segment_terms, follows_upstream)
+
+typedef int (*dish_drops_fn)(const weida_dish_drops *, size_t, uint64_t *);
+
+static const struct {
+    const char *key;
+    dish_drops_fn get;
+} DISH_DROPS_FIELDS[] = {
+    {"subscriberBudget", weida_dish_drops_subscriber_budget},
+    {"subscriberQueue", weida_dish_drops_subscriber_queue},
+    {"superseded", weida_dish_drops_superseded},
+    {"expired", weida_dish_drops_expired},
+    {"tooLarge", weida_dish_drops_too_large},
+    {"noDatagrams", weida_dish_drops_no_datagrams},
+    {"layersCut", weida_dish_drops_layers_cut},
+};
+
+/* `{ peerFingerprint, subscriberBudget, ... }` of record `i`, the counts as
+ * BigInts. */
+static napi_value dish_drops_record(napi_env env, const weida_dish_drops *d, size_t i) {
+    napi_value obj;
+    size_t len = 0;
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    const char *fp = weida_dish_drops_peer_fingerprint(d, i, &len);
+    if (!set(env, obj, "peerFingerprint", js_string(env, fp, len)))
+        return NULL;
+    for (size_t f = 0; f < sizeof DISH_DROPS_FIELDS / sizeof DISH_DROPS_FIELDS[0]; f++) {
+        uint64_t n = 0;
+        int present = DISH_DROPS_FIELDS[f].get(d, i, &n);
+        if (!set(env, obj, DISH_DROPS_FIELDS[f].key, optional_u64(env, present, n)))
+            return NULL;
+    }
+    return obj;
+}
+
+/* -> record[], copied out of the snapshot `weida_radio_dish_drops` wrote
+ * with status `rc`; the snapshot is dropped on every path. */
+static napi_value dish_drops_array(napi_env env, int rc, weida_dish_drops *d) {
+    napi_value arr = NULL;
+    if (rc < 0)
+        return throw_rc(env, rc);
+    size_t len = weida_dish_drops_len(d);
+    if (napi_create_array_with_length(env, len, &arr) != napi_ok) {
+        arr = throw_napi(env);
+    } else {
+        for (size_t i = 0; i < len; i++) {
+            napi_value record = dish_drops_record(env, d, i);
+            if (!record) {
+                arr = NULL;
+                break;
+            }
+            if (napi_set_element(env, arr, (uint32_t)i, record) != napi_ok) {
+                arr = throw_napi(env);
+                break;
+            }
+        }
+    }
+    weida_dish_drops_drop(d);
+    return arr;
+}
+
+/* Copies a weida_received out and drops it: `{ kind, transfer }` for a
+ * stream segment, `{ kind, topic, segment, payload }` for a datagram. */
+static napi_value received_value(napi_env env, void *ptr) {
+    weida_received *r = ptr;
+    napi_value obj = NULL;
+    size_t len = 0;
+    uint64_t n = 0;
+    int kind = weida_received_kind(r);
+    if (napi_create_object(env, &obj) != napi_ok) {
+        weida_received_drop(r);
+        return throw_napi(env);
+    }
+    bool ok = set(env, obj, "kind", js_string(env, received_name(kind), NAPI_AUTO_LENGTH));
+    if (kind == WEIDA_RECEIVED_SEGMENT) {
+        weida_incoming_transfer *t = NULL;
+        int rc = weida_received_take_segment(r, &t);
+        if (rc < 0) {
+            napi_value e = throw_rc(env, rc);
+            weida_received_drop(r);
+            return e;
+        }
+        weida_received_drop(r);
+        napi_value transfer = wrap(env, t, drop_incoming_transfer);
+        return ok && transfer && set(env, obj, "transfer", transfer) ? obj : NULL;
+    }
+    const char *s = weida_received_topic(r, &len);
+    ok = ok && set(env, obj, "topic", js_string(env, s, len));
+    int present = weida_received_segment(r, &n);
+    ok = ok && set(env, obj, "segment", optional_u64(env, present, n));
+    const uint8_t *payload = weida_received_payload(r, &len);
+    ok = ok && set(env, obj, "payload", bytes_value(env, payload, len));
+    weida_received_drop(r);
+    return ok ? obj : NULL;
+}
+
+static napi_value listener_radio(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_radio *out = NULL;
+    int rc = weida_listener_radio(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_radio);
+}
+
+STRING_OUT(radio_path, radio, path)
+
+/* (radio, topic, terms | null) -> segment */
+static napi_value radio_segment(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_radio *r = live(env, argv[0], drop_radio);
+    void *terms = NULL;
+    if (!r || !optional(env, argv[2], drop_segment_terms, &terms))
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    weida_segment *out = NULL;
+    int rc = weida_radio_segment(r, topic, terms, &out);
+    free(topic);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_segment);
+}
+
+/* (radio, topic, bytes) -> number: the dishes it was handed to */
+static napi_value radio_datagram(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_radio *r = live(env, argv[0], drop_radio);
+    const uint8_t *payload = NULL;
+    size_t len = 0, n = 0;
+    if (!r || !get_bytes(env, argv[2], &payload, &len))
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    int rc = weida_radio_datagram(r, topic, payload, len, &n);
+    free(topic);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+SIZE_OUT(radio_dish_count, radio, dish_count)
+U64_OUT(radio_dropped, radio, dropped)
+
+static napi_value radio_dropped_on(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_radio *r = live(env, argv[0], drop_radio);
+    if (!r)
+        return NULL;
+    char *topic = get_string(env, argv[1]);
+    if (!topic)
+        return NULL;
+    weida_topic_drops *d = NULL;
+    int rc = weida_radio_dropped_on(r, topic, &d);
+    free(topic);
+    return topic_drops_array(env, rc, d);
+}
+
+static napi_value radio_drops(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_radio *r = live(env, argv[0], drop_radio);
+    weida_topic_drops *d = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_radio_drops(r, &d);
+    return topic_drops_array(env, rc, d);
+}
+
+/* (radio, fingerprint, filter) -> number: the joins that went */
+static napi_value radio_evict(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_radio *r = live(env, argv[0], drop_radio);
+    if (!r)
+        return NULL;
+    char *peer = get_string(env, argv[1]);
+    if (!peer)
+        return NULL;
+    char *filter = get_string(env, argv[2]);
+    if (!filter) {
+        free(peer);
+        return NULL;
+    }
+    size_t n = 0;
+    int rc = weida_radio_evict(r, peer, filter, &n);
+    free(filter);
+    free(peer);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+static napi_value radio_dish_drops(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_radio *r = live(env, argv[0], drop_radio);
+    weida_dish_drops *d = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_radio_dish_drops(r, &d);
+    return dish_drops_array(env, rc, d);
+}
+
+U64_OUT(segment_number, segment, number)
+STRING_OUT(segment_topic, segment, topic)
+
+/* (segment, bytes) -> number: the copies that took the chunk */
+static napi_value segment_write(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_segment *s = live(env, argv[0], drop_segment);
+    const uint8_t *chunk = NULL;
+    size_t len = 0, n = 0;
+    if (!s || !get_bytes(env, argv[1], &chunk, &len))
+        return NULL;
+    int rc = weida_segment_write(s, chunk, len, &n);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+/* (segment, layer, bytes) -> number: the copies that took the chunk */
+static napi_value segment_write_layer(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_segment *s = live(env, argv[0], drop_segment);
+    uint64_t layer = 0;
+    const uint8_t *chunk = NULL;
+    size_t len = 0, n = 0;
+    if (!s || !get_u64(env, argv[1], UINT8_MAX, &layer) ||
+        !get_bytes(env, argv[2], &chunk, &len))
+        return NULL;
+    int rc = weida_segment_write_layer(s, (uint8_t)layer, chunk, len, &n);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+static napi_value segment_finish_layer(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_segment *s = live(env, argv[0], drop_segment);
+    uint64_t layer = 0;
+    if (!s || !get_u64(env, argv[1], UINT8_MAX, &layer))
+        return NULL;
+    int rc = weida_segment_finish_layer(s, (uint8_t)layer);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+/* consumes the segment -> number: the copies still holding layer 0 */
+static napi_value segment_finish(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_segment *s = take(env, argv[0], drop_segment);
+    size_t n = 0;
+    if (!s)
+        return NULL;
+    int rc = weida_segment_finish(s, &n);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+static napi_value runtime_dish(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_runtime *rt = live(env, argv[0], drop_runtime);
+    if (!rt)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[1], drop_client_tls);
+    weida_dish *out = NULL;
+    if (!tls)
+        return NULL;
+    int rc = weida_runtime_dish(rt, tls, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_dish);
+}
+
+STRING_OP(dish_connect, dish, connect)
+FD(dish_connect_op_fd, dish_connect_op)
+WAIT0(dish_connect_op_wait, dish_connect_op)
+SIZE_OUT(dish_peer_count, dish, peer_count)
+CONNECTION_STATS(dish_connection_stats, dish)
+EVENTS(dish_events, dish)
+
+/* (dish, filter, terms | null) -> op */
+static napi_value dish_join(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_dish *d = live(env, argv[0], drop_dish);
+    void *terms = NULL;
+    if (!d || !optional(env, argv[2], drop_join_terms, &terms))
+        return NULL;
+    char *filter = get_string(env, argv[1]);
+    if (!filter)
+        return NULL;
+    weida_dish_join_op *op = NULL;
+    int rc = weida_dish_join(d, filter, terms, &op);
+    free(filter);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_dish_join_op);
+}
+
+FD(dish_join_op_fd, dish_join_op)
+WAIT0(dish_join_op_wait, dish_join_op)
+STRING_OP(dish_leave, dish, leave)
+FD(dish_leave_op_fd, dish_leave_op)
+WAIT0(dish_leave_op_wait, dish_leave_op)
+FD(dish_fd, dish)
+U64_OUT(dish_stale, dish, stale)
+U64_OUT(dish_overflow, dish, overflow)
+
+static napi_value dish_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_dish *d = live(env, argv[0], drop_dish);
+    weida_received *out = NULL;
+    if (!d)
+        return NULL;
+    int rc = weida_dish_recv(d, 0, &out);
+    return outcome(env, rc, received_value, out);
+}
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -3335,6 +3678,9 @@ static napi_value constants(napi_env env) {
     CONSTANT(IDENTITY_EVENT_HANDOFF_STOLEN)
     CONSTANT(IDENTITY_EVENT_TRUST_REFRESHED)
     CONSTANT(IDENTITY_EVENT_MISSED)
+    CONSTANT(RECEIVED_SEGMENT)
+    CONSTANT(RECEIVED_DATAGRAM)
+    CONSTANT(MAX_SEGMENT_LAYERS)
 #undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
@@ -3721,6 +4067,46 @@ NAPI_MODULE_INIT() {
         FN("busMemberSendOpWait", bus_member_send_op_wait),
         FN("busMemberFd", bus_member_fd),
         FN("busMemberRecv", bus_member_recv),
+        FN("joinTermsNew", join_terms_new),
+        FN("joinTermsSetMaxAgeMs", join_terms_set_max_age_ms),
+        FN("joinTermsSetMaxLayer", join_terms_set_max_layer),
+        FN("segmentTermsNew", segment_terms_new),
+        FN("segmentTermsSetMaxAgeMs", segment_terms_set_max_age_ms),
+        FN("segmentTermsSetPriority", segment_terms_set_priority),
+        FN("segmentTermsSetFollowsUpstream", segment_terms_set_follows_upstream),
+        FN("listenerRadio", listener_radio),
+        FN("radioPath", radio_path),
+        FN("radioSegment", radio_segment),
+        FN("radioDatagram", radio_datagram),
+        FN("radioDishCount", radio_dish_count),
+        FN("radioDropped", radio_dropped),
+        FN("radioDroppedOn", radio_dropped_on),
+        FN("radioDrops", radio_drops),
+        FN("radioEvict", radio_evict),
+        FN("radioDishDrops", radio_dish_drops),
+        FN("segmentNumber", segment_number),
+        FN("segmentTopic", segment_topic),
+        FN("segmentWrite", segment_write),
+        FN("segmentWriteLayer", segment_write_layer),
+        FN("segmentFinishLayer", segment_finish_layer),
+        FN("segmentFinish", segment_finish),
+        FN("runtimeDish", runtime_dish),
+        FN("dishConnect", dish_connect),
+        FN("dishConnectOpFd", dish_connect_op_fd),
+        FN("dishConnectOpWait", dish_connect_op_wait),
+        FN("dishPeerCount", dish_peer_count),
+        FN("dishConnectionStats", dish_connection_stats),
+        FN("dishEvents", dish_events),
+        FN("dishJoin", dish_join),
+        FN("dishJoinOpFd", dish_join_op_fd),
+        FN("dishJoinOpWait", dish_join_op_wait),
+        FN("dishLeave", dish_leave),
+        FN("dishLeaveOpFd", dish_leave_op_fd),
+        FN("dishLeaveOpWait", dish_leave_op_wait),
+        FN("dishFd", dish_fd),
+        FN("dishRecv", dish_recv),
+        FN("dishStale", dish_stale),
+        FN("dishOverflow", dish_overflow),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),

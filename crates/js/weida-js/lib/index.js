@@ -288,20 +288,40 @@ const META_FIELDS = [
   ["achieved", native.transferMetaSetAchieved, "WEIDA_ACKNOWLEDGEMENT_"],
 ];
 
-/** A transfer meta `{ contentType?, contentLen?, trace?, topic?,
- * achieved? }` as a handle for one call. */
-function withTransferMeta(meta, use) {
-  if (meta == null) {
+/** A terms object as a handle for one call: `make()` the handle, set
+ * `fields` of `object`, `use` it and drop it; null `object` is `use(null)`. */
+function withFields(object, make, fields, what, use) {
+  if (object == null) {
     return use(null);
   }
-  const handle = native.transferMetaNew();
+  const handle = make();
   try {
-    applyFields(handle, meta, META_FIELDS, "TransferMeta");
+    applyFields(handle, object, fields, what);
     return use(handle);
   } finally {
     native.drop(handle);
   }
 }
+
+/** A transfer meta `{ contentType?, contentLen?, trace?, topic?,
+ * achieved? }` as a handle for one call. */
+function withTransferMeta(meta, use) {
+  return withFields(meta, native.transferMetaNew, META_FIELDS, "TransferMeta", use);
+}
+
+const JOIN_FIELDS = [
+  ["maxAgeMs", native.joinTermsSetMaxAgeMs, "value"],
+  ["maxLayer", native.joinTermsSetMaxLayer, "value"],
+];
+
+const SEGMENT_FIELDS = [
+  ["maxAgeMs", native.segmentTermsSetMaxAgeMs, "value"],
+  ["priority", native.segmentTermsSetPriority, "value"],
+  ["followsUpstream", native.segmentTermsSetFollowsUpstream, "value"],
+];
+
+/** How many layers a segment carries: 0 to 15. */
+export const MAX_SEGMENT_LAYERS = native.CONSTANTS.WEIDA_MAX_SEGMENT_LAYERS;
 
 const FILES_FIELDS = [
   ["names", native.filesOptionsSetNames, "value"],
@@ -495,6 +515,13 @@ export class Runtime extends Handle {
   /** A surveyor dialling respondents on `clientTls`. */
   surveyor(clientTls) {
     return adopt(Surveyor, native.runtimeSurveyor(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
+  /** A dish dialling radios on `clientTls`. Two dishes on one runtime
+   * share its pooled connection and collide on the path
+   * (WEIDA_EALREADY_REGISTERED): use one runtime per dish. */
+  dish(clientTls) {
+    return adopt(Dish, native.runtimeDish(this[HANDLE], handleOf(clientTls, ClientTls)));
   }
 
   /** Duplicates this runtime's connections discarded inside a negotiated
@@ -999,6 +1026,12 @@ export class Listener extends Handle {
    * `clientTls`. */
   bus(path, clientTls) {
     return adopt(BusMember, native.listenerBus(this[HANDLE], path, handleOf(clientTls, ClientTls)));
+  }
+
+  /** The radio serving `path` on every binding of this listener; dropping
+   * it releases the path. */
+  radio(path) {
+    return adopt(Radio, native.listenerRadio(this[HANDLE], path));
   }
 }
 
@@ -1953,6 +1986,203 @@ export class BusMember extends Handle {
   /** The copies that never reached a member, a BigInt. */
   dropped() {
     return native.busMemberDropped(this[HANDLE]);
+  }
+}
+
+/** The sending half of RADIO/DISH, serving one endpoint path. Dropping it
+ * releases the path. */
+export class Radio extends Handle {
+  constructor() {
+    super();
+    noConstructor("Radio", "Listener.radio()");
+  }
+
+  path() {
+    return native.radioPath(this[HANDLE]);
+  }
+
+  /** Opens the next segment on `topic` to the dishes joined now, on
+   * `terms` `{ maxAgeMs?, priority?, followsUpstream? }`. Opening it resets
+   * every unfinished layer of the topic's previous segment. */
+  segment(topic, terms = null) {
+    const handle = withFields(terms, native.segmentTermsNew, SEGMENT_FIELDS, "SegmentTerms", (t) =>
+      native.radioSegment(this[HANDLE], topic, t),
+    );
+    return adopt(Segment, handle);
+  }
+
+  /** Sends `payload` (a string is sent as UTF-8) as one datagram segment to
+   * every dish joined to `topic`: how many it was handed to. A dish that
+   * carries no datagrams counts a `noDatagrams` drop. */
+  datagram(topic, payload) {
+    return native.radioDatagram(this[HANDLE], topic, bytes(payload));
+  }
+
+  /** The dishes joined. */
+  dishCount() {
+    return native.radioDishCount(this[HANDLE]);
+  }
+
+  /** The copies dropped, over topics and causes, a BigInt. */
+  dropped() {
+    return native.radioDropped(this[HANDLE]);
+  }
+
+  /** What was dropped on `topic`, a frozen record as
+   * `Publisher.droppedOn`, or null when nothing was. */
+  droppedOn(topic) {
+    const [record] = native.radioDroppedOn(this[HANDLE], topic);
+    return record === undefined ? null : Object.freeze(record);
+  }
+
+  /** A frozen array with one frozen record per topic that lost a copy. */
+  drops() {
+    return Object.freeze(native.radioDrops(this[HANDLE]).map((r) => Object.freeze(r)));
+  }
+
+  /** Withdraws the joins on `filter` of the dishes whose key is
+   * `fingerprint` (`sha256:` text): how many went. */
+  evict(fingerprint, filter) {
+    return native.radioEvict(this[HANDLE], fingerprint, filter);
+  }
+
+  /** A frozen array with one frozen `{ peerFingerprint, subscriberBudget,
+   * subscriberQueue, superseded, expired, tooLarge, noDatagrams, layersCut }`
+   * per joined dish connection, the counts BigInts. */
+  dishDrops() {
+    return Object.freeze(native.radioDishDrops(this[HANDLE]).map((r) => Object.freeze(r)));
+  }
+}
+
+/** One open segment of a radio: layers written without waiting. Dropping it
+ * without `finish()` resets every unfinished layer. */
+export class Segment extends Handle {
+  constructor() {
+    super();
+    noConstructor("Segment", "Radio.segment()");
+  }
+
+  /** Its number on its topic, a BigInt; the first is 0n. */
+  number() {
+    return native.segmentNumber(this[HANDLE]);
+  }
+
+  topic() {
+    return native.segmentTopic(this[HANDLE]);
+  }
+
+  /** Writes `chunk` to layer 0: how many copies took it. */
+  write(chunk) {
+    return native.segmentWrite(this[HANDLE], bytes(chunk));
+  }
+
+  /** Writes `chunk` to `layer` (0 to 15) without waiting: how many copies
+   * took it. A copy without room loses this layer and every one above it;
+   * a copy capped below `layer` is skipped, which is not a drop. */
+  writeLayer(layer, chunk) {
+    return native.segmentWriteLayer(this[HANDLE], layer, bytes(chunk));
+  }
+
+  /** Finishes `layer`; a later write to it throws WEIDA_ERUNTIME. */
+  finishLayer(layer) {
+    native.segmentFinishLayer(this[HANDLE], layer);
+  }
+
+  /** Finishes every open layer: how many copies still hold layer 0.
+   * Consumes the segment. */
+  finish() {
+    return native.segmentFinish(consume(this));
+  }
+}
+
+/** The receiving half of RADIO/DISH. */
+export class Dish extends Handle {
+  constructor() {
+    super();
+    noConstructor("Dish", "Runtime.dish()");
+  }
+
+  /** Dials a radio at `url` and joins there every filter joined so far; a
+   * redial joins again, and what was sent in between is gone. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.dishConnect(this[HANDLE], url),
+      native.dishConnectOpWait,
+      native.dishConnectOpFd,
+      signal,
+    );
+  }
+
+  /** The number of connected radios. */
+  peerCount() {
+    return native.dishPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`. */
+  connectionStats() {
+    return Object.freeze(native.dishConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** A new reader of this dish's peer events, from now on. */
+  events() {
+    return adopt(PeerEvents, native.dishEvents(this[HANDLE]));
+  }
+
+  /** Joins every topic `filter` matches on `terms` `{ maxAgeMs?, maxLayer? }`.
+   * A `maxLayer` of 16 or above rejects with WEIDA_ELIMIT_EXCEEDED, a
+   * filter outside the grammar with WEIDA_EPROTOCOL. */
+  async join(filter, terms = null, { signal } = {}) {
+    await op(
+      this,
+      () =>
+        withFields(terms, native.joinTermsNew, JOIN_FIELDS, "JoinTerms", (t) =>
+          native.dishJoin(this[HANDLE], filter, t),
+        ),
+      native.dishJoinOpWait,
+      native.dishJoinOpFd,
+      signal,
+    );
+  }
+
+  /** Leaves `filter`; an unknown one is ignored. */
+  async leave(filter, { signal } = {}) {
+    await op(
+      this,
+      () => native.dishLeave(this[HANDLE], filter),
+      native.dishLeaveOpWait,
+      native.dishLeaveOpFd,
+      signal,
+    );
+  }
+
+  /** The next segment, a frozen `{ kind: "WEIDA_RECEIVED_SEGMENT", transfer }`
+   * whose topic, segment and layer are on `transfer.meta()`, or a frozen
+   * `{ kind: "WEIDA_RECEIVED_DATAGRAM", topic, segment, payload }`. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const r = await call(
+      this,
+      () => native.dishRecv(handle),
+      () => native.dishFd(handle),
+      signal,
+    );
+    if (r.kind === "WEIDA_RECEIVED_SEGMENT") {
+      return Object.freeze({ kind: r.kind, transfer: adopt(IncomingTransfer, r.transfer) });
+    }
+    return Object.freeze(r);
+  }
+
+  /** Segments discarded because a newer one on their topic was already
+   * delivered, a BigInt. */
+  stale() {
+    return native.dishStale(this[HANDLE]);
+  }
+
+  /** Segments discarded because the receive queue was full, a BigInt. */
+  overflow() {
+    return native.dishOverflow(this[HANDLE]);
   }
 }
 

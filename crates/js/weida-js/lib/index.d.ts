@@ -25,6 +25,9 @@ export function newTrace(): string;
 /** A count, a duration in milliseconds or an optional number. */
 export type Count = number | bigint;
 
+/** How many layers a segment carries: 0 to 15. */
+export const MAX_SEGMENT_LAYERS: number;
+
 // Enumerations travel as the names of the weida.h constants.
 export type Congestion = "WEIDA_CONGESTION_CUBIC" | "WEIDA_CONGESTION_NEW_RENO" | "WEIDA_CONGESTION_BBR";
 export type Discovery = "WEIDA_DISCOVERY_AWARE" | "WEIDA_DISCOVERY_SINGLE";
@@ -228,6 +231,10 @@ export interface IncomingMeta {
   readonly sequence: bigint | null;
   /** Null when nothing is missing or ordering is off. */
   readonly gap: Gap | null;
+  /** The segment number of a RADIO stream segment. */
+  readonly segment: bigint | null;
+  /** The layer of a RADIO stream segment, present exactly when `segment` is. */
+  readonly layer: number | null;
   /** The sender's trace context as `traceparent` text. */
   readonly trace: string | null;
   readonly tracestate: string | null;
@@ -247,6 +254,45 @@ export interface TopicDrops {
   readonly noDatagrams: bigint;
   readonly layersCut: bigint;
 }
+
+/** What a radio dropped toward one joined dish connection, by cause. */
+export interface DishDrops {
+  /** The key the dish proved; null when it proved none. */
+  readonly peerFingerprint: string | null;
+  readonly subscriberBudget: bigint;
+  readonly subscriberQueue: bigint;
+  readonly superseded: bigint;
+  readonly expired: bigint;
+  readonly tooLarge: bigint;
+  readonly noDatagrams: bigint;
+  readonly layersCut: bigint;
+}
+
+/** A dish's terms for a join: its latency budget and its highest layer. */
+export interface JoinTerms {
+  maxAgeMs?: Count | null;
+  /** 0 to 15; 16 to 255 reject the join with WEIDA_ELIMIT_EXCEEDED. */
+  maxLayer?: number | null;
+}
+
+/** A segment's terms: its latency budget, its priority (an int16) and
+ * whether it relays an upstream still streaming. */
+export interface SegmentTerms {
+  maxAgeMs?: Count | null;
+  priority?: number | null;
+  followsUpstream?: boolean | null;
+}
+
+/** What a dish received: a stream segment, whose topic, number and layer
+ * are on `transfer.meta()`, or a datagram segment, whole. */
+export type Received =
+  | { readonly kind: "WEIDA_RECEIVED_SEGMENT"; readonly transfer: IncomingTransfer }
+  | {
+      readonly kind: "WEIDA_RECEIVED_DATAGRAM";
+      readonly topic: string;
+      readonly segment: bigint;
+      readonly payload: Uint8Array;
+    };
 
 /** A collected payload and the metadata of its transfer. */
 export interface Message {
@@ -401,6 +447,8 @@ export class Runtime extends Handle {
   /** A dialling pair: one peer, dialled with `connect`. */
   pair(clientTls: ClientTls): Paired;
   surveyor(clientTls: ClientTls): Surveyor;
+  /** Two dishes on one runtime collide on the path: use one runtime per dish. */
+  dish(clientTls: ClientTls): Dish;
   /** Duplicates discarded inside a negotiated deduplication window. */
   suppressedDuplicates(): bigint;
   /** Outgoing transfers reset because their deadline passed. */
@@ -526,6 +574,8 @@ export class Listener extends Handle {
   respondent(path: string): Respondent;
   /** A bus member accepting on `path` and dialling the others on `clientTls`. */
   bus(path: string, clientTls: ClientTls): BusMember;
+  /** The radio serving `path`; dropping it releases the path. */
+  radio(path: string): Radio;
   /** Serves a relay on this listener's bindings. */
   relay(): Relay;
 }
@@ -715,6 +765,51 @@ export class BusMember extends Handle {
   recv(options?: WaitOptions): Promise<IncomingTransfer>;
   /** The copies that never reached a member. */
   dropped(): bigint;
+}
+
+/** The sending half of RADIO/DISH; dropping it releases its path. */
+export class Radio extends Handle {
+  path(): string | null;
+  /** The topic's next segment to the dishes joined now; resets the previous one's unfinished layers. */
+  segment(topic: string, terms?: SegmentTerms | null): Segment;
+  /** How many dishes the datagram segment was handed to. */
+  datagram(topic: string, payload: Bytes): number;
+  dishCount(): number;
+  dropped(): bigint;
+  droppedOn(topic: string): TopicDrops | null;
+  drops(): readonly TopicDrops[];
+  /** How many joins on `filter` of the dishes whose key is `fingerprint` went. */
+  evict(fingerprint: string, filter: string): number;
+  dishDrops(): readonly DishDrops[];
+}
+
+/** One open segment; dropping it without `finish()` resets every unfinished layer. */
+export class Segment extends Handle {
+  number(): bigint;
+  topic(): string | null;
+  /** How many copies took the chunk on layer 0. */
+  write(chunk: Bytes): number;
+  /** How many copies took the chunk; a copy capped below `layer` is skipped. */
+  writeLayer(layer: number, chunk: Bytes): number;
+  finishLayer(layer: number): void;
+  /** How many copies still hold layer 0; consumes the segment. */
+  finish(): number;
+}
+
+/** The receiving half of RADIO/DISH. */
+export class Dish extends Handle {
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  events(): PeerEvents;
+  /** Rejects with WEIDA_ELIMIT_EXCEEDED for a `maxLayer` of 16 or above, WEIDA_EPROTOCOL for a filter outside the grammar. */
+  join(filter: string, terms?: JoinTerms | null, options?: WaitOptions): Promise<void>;
+  leave(filter: string, options?: WaitOptions): Promise<void>;
+  recv(options?: WaitOptions): Promise<Received>;
+  /** Segments discarded because a newer one on their topic was already delivered. */
+  stale(): bigint;
+  /** Segments discarded because the receive queue was full. */
+  overflow(): bigint;
 }
 
 export class Relay extends Handle {
