@@ -598,6 +598,12 @@ typedef struct weida_peer_events weida_peer_events;
 typedef struct weida_pem weida_pem;
 
 /**
+ * A Windows named-pipe binding: the pipe name, released when this is
+ * dropped.
+ */
+typedef struct weida_pipe_binding weida_pipe_binding;
+
+/**
  * `ReconnectPolicy` under construction: one setter per field.
  */
 typedef struct weida_reconnect_policy weida_reconnect_policy;
@@ -694,6 +700,11 @@ typedef struct weida_transfer_meta weida_transfer_meta;
  * Whom a dialler trusts: pins added to what each address names.
  */
 typedef struct weida_trust weida_trust;
+
+/**
+ * An `AF_UNIX` binding: the socket file, removed when this is dropped.
+ */
+typedef struct weida_unix_binding weida_unix_binding;
 
 /**
  * One descriptor `weida_poll` waits on.
@@ -1440,6 +1451,40 @@ void weida_listener_bind_relay_op_drop(weida_listener_bind_relay_op *op);
 int weida_listener_bind_inproc(const weida_listener *l, const char *bus, weida_local_binding **out);
 
 /**
+ * Serves the listener's endpoints on the `AF_UNIX` socket `path`
+ * (`Listener::bind_unix`): a requester reaches it at
+ * `weida+unix://<percent-encoded path>/<endpoint>`. No TLS: the kernel
+ * proves the peer. `path` MUST be in a directory this process owns and no
+ * other user may write; a stale socket file is replaced. Fails with
+ * `-WEIDA_EIO` for a live listener on the path, `-WEIDA_EINVALID_ADDRESS`
+ * for a path over the `sun_path` budget or something at it that is not a
+ * socket, and `-WEIDA_EUNSUPPORTED` off Unix.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_unix_binding_drop`.
+ */
+int weida_listener_bind_unix(const weida_listener *l, const char *path, weida_unix_binding **out);
+
+/**
+ * Binds the Windows named pipe `\\.\pipe\<name>` owner-only and
+ * local-only, only if the name does not exist yet, and serves the
+ * listener's endpoints on it (`Listener::bind_pipe`): a requester reaches
+ * it at `weida+pipe://<name>/<endpoint>`. Fails with
+ * `-WEIDA_EINVALID_ADDRESS` for an invalid name or one that exists already,
+ * `-WEIDA_EIO`, and `-WEIDA_EUNSUPPORTED` off Windows.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `name` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_pipe_binding_drop`.
+ */
+int weida_listener_bind_pipe(const weida_listener *l, const char *name, weida_pipe_binding **out);
+
+/**
  * Registers a replier at the endpoint path `path` (`Listener::replier`).
  * Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
  * `-WEIDA_EALREADY_REGISTERED`.
@@ -1738,6 +1783,44 @@ const char *weida_local_binding_bus(const weida_local_binding *b, size_t *len_ou
  * `b` is NULL or a live local binding, dropped at most once.
  */
 void weida_local_binding_drop(weida_local_binding *b);
+
+/**
+ * The socket path bound. Lives as long as the binding.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live unix binding; `len_out` is NULL or writable.
+ */
+const char *weida_unix_binding_path(const weida_unix_binding *b, size_t *len_out);
+
+/**
+ * Releases a unix binding, which removes the socket file, so a new dial
+ * finds nobody. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live unix binding, dropped at most once.
+ */
+void weida_unix_binding_drop(weida_unix_binding *b);
+
+/**
+ * The pipe name bound, without `\\.\pipe\`. Lives as long as the binding.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live pipe binding; `len_out` is NULL or writable.
+ */
+const char *weida_pipe_binding_name(const weida_pipe_binding *b, size_t *len_out);
+
+/**
+ * Releases a pipe binding, which ends its accept loop and releases the
+ * name. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `b` is NULL or a live pipe binding, dropped at most once.
+ */
+void weida_pipe_binding_drop(weida_pipe_binding *b);
 
 /**
  * The endpoint path this replier serves. Lives as long as the replier.
@@ -3822,6 +3905,48 @@ const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t 
  * `m` is NULL or live metadata; `out` is NULL or writable.
  */
 int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out);
+
+/**
+ * The effective uid the kernel proved for an `AF_UNIX` peer at connect
+ * time: 1 and `*out`; 0 for any other peer.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_peer_uid(const weida_incoming_meta *m, uint32_t *out);
+
+/**
+ * The primary group id the kernel proved for an `AF_UNIX` peer at connect
+ * time: 1 and `*out`; 0 for any other peer.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_peer_gid(const weida_incoming_meta *m, uint32_t *out);
+
+/**
+ * The local peer's process id where the platform reports one (Linux
+ * `SO_PEERCRED`, a named pipe; macOS reports none): 1 and `*out`, else 0.
+ * An observation only: it MUST NOT be authorized on (decisions/0010 §4.4).
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_peer_pid(const weida_incoming_meta *m, uint32_t *out);
+
+/**
+ * The account SID (`S-1-...`) the kernel proved for a named-pipe peer;
+ * NULL for any other peer.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `len_out` is NULL or writable. The string
+ * lives as long as `m`.
+ */
+const char *weida_incoming_meta_peer_sid(const weida_incoming_meta *m, size_t *len_out);
 
 /**
  * Releases a reference to metadata. NULL does nothing.

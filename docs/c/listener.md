@@ -13,6 +13,8 @@ rest.
 | `int weida_listener_bind_relay(const weida_listener *l, const char *relay, const weida_client_tls *via, const weida_server_tls *tls, weida_listener_bind_relay_op **out)` | never (R3b) | 0 ([relay.md](relay.md)) |
 | `int weida_listener_relay(const weida_listener *l, weida_relay **out)` | never | 0; `-WEIDA_EALREADY_REGISTERED` ([relay.md](relay.md)) |
 | `int weida_listener_bind_inproc(const weida_listener *l, const char *bus, weida_local_binding **out)` | never | 0; `-WEIDA_EALREADY_REGISTERED` for a bus in use |
+| `int weida_listener_bind_unix(const weida_listener *l, const char *path, weida_unix_binding **out)` | never | 0; serves the endpoints on the `AF_UNIX` socket `path`, reached at `weida+unix://<percent-encoded path>/<endpoint>`, no TLS, the kernel proves the peer; `path` MUST be in a directory this process owns and no other user may write; a stale socket file is replaced; `-WEIDA_EIO` (a live listener on the path), `-WEIDA_EINVALID_ADDRESS` (over the `sun_path` budget, or not a socket at the path), `-WEIDA_EUNSUPPORTED` off Unix |
+| `int weida_listener_bind_pipe(const weida_listener *l, const char *name, weida_pipe_binding **out)` | never | 0; binds `\\.\pipe\<name>` owner-only and local-only, only if the name does not exist yet, reached at `weida+pipe://<name>/<endpoint>`; `-WEIDA_EINVALID_ADDRESS` (an invalid name, or one that exists already), `-WEIDA_EIO`, `-WEIDA_EUNSUPPORTED` off Windows |
 | `int weida_listener_replier(const weida_listener *l, const char *path, weida_replier **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` |
 | `void weida_listener_drop(weida_listener *l)` | never | — |
 
@@ -35,7 +37,7 @@ rest.
 A socket is its descriptor as `int64_t`: a file descriptor on Unix, a `SOCKET` on Windows.
 Ownership passes to libweida at the call; weida neither binds it nor sets options on it.
 
-## `weida_binding`, `weida_local_binding`
+## `weida_binding`, `weida_local_binding`, `weida_unix_binding`, `weida_pipe_binding`
 
 | Function | Blocks | Returns |
 | --- | --- | --- |
@@ -48,12 +50,21 @@ Ownership passes to libweida at the call; weida neither binds it nor sets option
 | `void weida_binding_drop(weida_binding *b)` | never | releases the handle; the binding keeps serving until `weida_binding_close`, a hand-over or the runtime's shutdown |
 | `const char *weida_local_binding_bus(const weida_local_binding *b, size_t *len_out)` | never | the bus name |
 | `void weida_local_binding_drop(weida_local_binding *b)` | never | frees the bus name |
+| `const char *weida_unix_binding_path(const weida_unix_binding *b, size_t *len_out)` | never | the socket path bound; lives as long as `b` |
+| `void weida_unix_binding_drop(weida_unix_binding *b)` | never | ends the binding and removes the socket file, so a new dial finds nobody |
+| `const char *weida_pipe_binding_name(const weida_pipe_binding *b, size_t *len_out)` | never | the pipe name without `\\.\pipe\`; lives as long as `b` |
+| `void weida_pipe_binding_drop(weida_pipe_binding *b)` | never | ends the accept loop and releases the name |
 
 `weida_binding_close` stops accepting and closes the binding's connections with `SHUTDOWN`. Its
 op finishes once the socket went idle, bounded by `shutdown_timeout`, and the port is free to
 bind again. A client then sees `WEIDA_LOSS_PEER_CLOSED`, and a new dial finds nobody.
 `weida_binding_disconnect` closes one peer's connections with `REJECTED`; it is not a ban, and
 the peer redials under its own policy.
+
+`weida_listener_bind_unix` and `weida_listener_bind_pipe` are plain functions (R3:
+`Listener::bind_unix` and `bind_pipe` are sync in Rust). Both exist on every platform; the
+other platform's answers `-WEIDA_EUNSUPPORTED`. Unlike `weida_binding_drop`, dropping a
+`weida_unix_binding` or `weida_pipe_binding` ends the binding, as dropping the Rust value does.
 
 A hand-over (decision 0039) closes every connection with `RESTARTING` but holds the close
 packets in the `weida_handoff` its op yields. The successor process serves the socket with

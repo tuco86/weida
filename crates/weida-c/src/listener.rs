@@ -15,7 +15,8 @@ use weida_rs::{
 
 use crate::config::wire;
 use crate::error::{
-    WEIDA_EINVAL, closed, fail, fail_abi, guard, guard_or, guard_ptr, guard_void, null_arg,
+    WEIDA_EINVAL, WEIDA_EUNSUPPORTED, closed, fail, fail_abi, guard, guard_or, guard_ptr,
+    guard_void, null_arg,
 };
 use crate::handle::{
     CText, borrow, bytes, cstr, into_handle, out_ptr, release, text_out, write_out,
@@ -159,6 +160,21 @@ pub struct weida_handoff {
 pub struct weida_local_binding {
     _binding: LocalBinding,
     bus: CText,
+}
+
+/// An `AF_UNIX` binding: the socket file, removed when this is dropped.
+pub struct weida_unix_binding {
+    #[cfg(unix)]
+    _binding: weida_rs::UnixBinding,
+    path: CText,
+}
+
+/// A Windows named-pipe binding: the pipe name, released when this is
+/// dropped.
+pub struct weida_pipe_binding {
+    #[cfg(windows)]
+    _binding: weida_rs::PipeBinding,
+    name: CText,
 }
 
 type Accepting = Pin<Box<dyn Future<Output = Result<IncomingRequest, Error>> + Send>>;
@@ -606,6 +622,104 @@ pub unsafe extern "C" fn weida_listener_bind_inproc(
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, handle) };
         Ok(0)
+    })
+}
+
+/// Serves the listener's endpoints on the `AF_UNIX` socket `path`
+/// (`Listener::bind_unix`): a requester reaches it at
+/// `weida+unix://<percent-encoded path>/<endpoint>`. No TLS: the kernel
+/// proves the peer. `path` MUST be in a directory this process owns and no
+/// other user may write; a stale socket file is replaced. Fails with
+/// `-WEIDA_EIO` for a live listener on the path, `-WEIDA_EINVALID_ADDRESS`
+/// for a path over the `sun_path` budget or something at it that is not a
+/// socket, and `-WEIDA_EUNSUPPORTED` off Unix.
+///
+/// # Safety
+///
+/// `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+/// string; `out` is NULL or writable. Release the result with
+/// `weida_unix_binding_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_unix(
+    l: *const weida_listener,
+    path: *const c_char,
+    out: *mut *mut weida_unix_binding,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let l = unsafe { borrow(l) }?;
+        // SAFETY: forwarded from this function's contract.
+        let path = unsafe { cstr(path) }?;
+        #[cfg(unix)]
+        {
+            let binding = l.listener.bind_unix(path).map_err(fail)?;
+            let text = CText::new(std::os::unix::ffi::OsStrExt::as_bytes(
+                binding.path().as_os_str(),
+            ));
+            let handle = into_handle(weida_unix_binding {
+                _binding: binding,
+                path: text,
+            });
+            // SAFETY: `out` passed `out_ptr`.
+            unsafe { write_out(out, handle) };
+            Ok(0)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (out, l, path);
+            Err(fail_abi(
+                WEIDA_EUNSUPPORTED,
+                c"AF_UNIX bindings exist on Unix only",
+            ))
+        }
+    })
+}
+
+/// Binds the Windows named pipe `\\.\pipe\<name>` owner-only and
+/// local-only, only if the name does not exist yet, and serves the
+/// listener's endpoints on it (`Listener::bind_pipe`): a requester reaches
+/// it at `weida+pipe://<name>/<endpoint>`. Fails with
+/// `-WEIDA_EINVALID_ADDRESS` for an invalid name or one that exists already,
+/// `-WEIDA_EIO`, and `-WEIDA_EUNSUPPORTED` off Windows.
+///
+/// # Safety
+///
+/// `l` is NULL or a live listener; `name` is NULL or a NUL-terminated
+/// string; `out` is NULL or writable. Release the result with
+/// `weida_pipe_binding_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_listener_bind_pipe(
+    l: *const weida_listener,
+    name: *const c_char,
+    out: *mut *mut weida_pipe_binding,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let l = unsafe { borrow(l) }?;
+        // SAFETY: forwarded from this function's contract.
+        let name = unsafe { cstr(name) }?;
+        #[cfg(windows)]
+        {
+            let binding = l.listener.bind_pipe(name).map_err(fail)?;
+            let text = CText::new(binding.name());
+            let handle = into_handle(weida_pipe_binding {
+                _binding: binding,
+                name: text,
+            });
+            // SAFETY: `out` passed `out_ptr`.
+            unsafe { write_out(out, handle) };
+            Ok(0)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (out, l, name);
+            Err(fail_abi(
+                WEIDA_EUNSUPPORTED,
+                c"named-pipe bindings exist on Windows only",
+            ))
+        }
     })
 }
 
@@ -1162,6 +1276,74 @@ pub unsafe extern "C" fn weida_local_binding_bus(
 /// `b` is NULL or a live local binding, dropped at most once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn weida_local_binding_drop(b: *mut weida_local_binding) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(b) }));
+}
+
+/// The socket path bound. Lives as long as the binding.
+///
+/// # Safety
+///
+/// `b` is NULL or a live unix binding; `len_out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_unix_binding_path(
+    b: *const weida_unix_binding,
+    len_out: *mut usize,
+) -> *const c_char {
+    guard_ptr(|| {
+        if b.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: a non-NULL `b` is a live unix binding by this function's
+        // contract; the text lives as long as it.
+        let b = unsafe { &*b };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { text_out(Some(&b.path), len_out) }
+    })
+}
+
+/// Releases a unix binding, which removes the socket file, so a new dial
+/// finds nobody. NULL does nothing.
+///
+/// # Safety
+///
+/// `b` is NULL or a live unix binding, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_unix_binding_drop(b: *mut weida_unix_binding) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(b) }));
+}
+
+/// The pipe name bound, without `\\.\pipe\`. Lives as long as the binding.
+///
+/// # Safety
+///
+/// `b` is NULL or a live pipe binding; `len_out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_pipe_binding_name(
+    b: *const weida_pipe_binding,
+    len_out: *mut usize,
+) -> *const c_char {
+    guard_ptr(|| {
+        if b.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: a non-NULL `b` is a live pipe binding by this function's
+        // contract; the text lives as long as it.
+        let b = unsafe { &*b };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { text_out(Some(&b.name), len_out) }
+    })
+}
+
+/// Releases a pipe binding, which ends its accept loop and releases the
+/// name. NULL does nothing.
+///
+/// # Safety
+///
+/// `b` is NULL or a live pipe binding, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_pipe_binding_drop(b: *mut weida_pipe_binding) {
     // SAFETY: forwarded from this function's contract.
     guard_void(|| drop(unsafe { release(b) }));
 }

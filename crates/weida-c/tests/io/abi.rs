@@ -2408,3 +2408,136 @@ fn a_dial_only_replier_answers_through_a_relay() {
     shutdown(h_rt);
     shutdown(r_rt);
 }
+
+/// One number getter of the metadata: `Some` when present.
+fn meta_u32(
+    meta: *mut weida_incoming_meta,
+    get: unsafe extern "C" fn(*const weida_incoming_meta, *mut u32) -> c_int,
+) -> Option<u32> {
+    let mut out = 0u32;
+    // SAFETY: live metadata and a writable out-parameter.
+    (unsafe { get(meta, &mut out) } == 1).then_some(out)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_round_trip_over_unix_names_the_clients_uid() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = std::env::temp_dir().join(format!("weida-c-abi-unix-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    let socket = dir.join("s.sock");
+    let socket_text = socket.to_str().expect("a UTF-8 path").to_owned();
+
+    let rt = runtime();
+    let l = listener(rt);
+    let mut ub = ptr::null_mut();
+    let mut len = 0usize;
+    // SAFETY: a live listener, a C string and a writable out-parameter; the
+    // path lives with `ub`.
+    unsafe {
+        ok(weida_listener_bind_unix(
+            l,
+            c(&socket_text).as_ptr(),
+            &mut ub,
+        ));
+        assert_eq!(
+            text(weida_unix_binding_path(ub, &mut len), len).as_deref(),
+            Some(socket_text.as_str())
+        );
+    }
+    let rep = replier(l, "/echo");
+    let trust = trust_by_address();
+    let req = requester(rt, trust);
+    let url = weida_rs::UnixAddr {
+        socket: socket_text.clone(),
+        path: "/echo".to_owned(),
+    }
+    .to_string();
+    let meta = round_trip(req, rep, &url);
+
+    // The node's owner is this process, which is the client too.
+    let owner = std::fs::metadata(&socket).expect("the socket").uid();
+    assert_eq!(meta_u32(meta, weida_incoming_meta_peer_uid), Some(owner));
+    // On macOS a new file takes its directory's group, so only presence.
+    assert!(meta_u32(meta, weida_incoming_meta_peer_gid).is_some());
+    if let Some(pid) = meta_u32(meta, weida_incoming_meta_peer_pid) {
+        assert_eq!(pid, std::process::id());
+    }
+    assert_eq!(meta_text(meta, weida_incoming_meta_peer_sid), None);
+    assert_eq!(peer_fingerprint(meta), None);
+
+    let mut pb = ptr::null_mut();
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_listener_bind_pipe(l, c("x").as_ptr(), &mut pb) },
+        -WEIDA_EUNSUPPORTED
+    );
+    assert!(pb.is_null());
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_unix_binding_drop(ub);
+    }
+    assert!(!socket.exists(), "the drop removes the socket file");
+    // SAFETY: dropped once.
+    unsafe { weida_listener_drop(l) };
+    shutdown(rt);
+    std::fs::remove_dir_all(&dir).expect("remove the directory");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_round_trip_over_a_pipe_names_the_clients_sid() {
+    let name = format!("weida-c-abi-{}", std::process::id());
+    let rt = runtime();
+    let l = listener(rt);
+    let mut pb = ptr::null_mut();
+    let mut len = 0usize;
+    // SAFETY: a live listener, a C string and a writable out-parameter; the
+    // name lives with `pb`.
+    unsafe {
+        ok(weida_listener_bind_pipe(l, c(&name).as_ptr(), &mut pb));
+        assert_eq!(
+            text(weida_pipe_binding_name(pb, &mut len), len).as_deref(),
+            Some(name.as_str())
+        );
+    }
+    let rep = replier(l, "/echo");
+    let trust = trust_by_address();
+    let req = requester(rt, trust);
+    let meta = round_trip(req, rep, &format!("weida+pipe://{name}/echo"));
+
+    let sid = meta_text(meta, weida_incoming_meta_peer_sid).expect("the SID");
+    assert!(sid.starts_with("S-1-"), "{sid}");
+    assert_eq!(
+        meta_u32(meta, weida_incoming_meta_peer_pid),
+        Some(std::process::id())
+    );
+    assert_eq!(meta_u32(meta, weida_incoming_meta_peer_uid), None);
+    assert_eq!(peer_fingerprint(meta), None);
+
+    let mut ub = ptr::null_mut();
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_listener_bind_unix(l, c("x").as_ptr(), &mut ub) },
+        -WEIDA_EUNSUPPORTED
+    );
+    assert!(ub.is_null());
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_pipe_binding_drop(pb);
+        weida_listener_drop(l);
+    }
+    shutdown(rt);
+}

@@ -228,6 +228,8 @@ typedef struct weida_peer_events weida_peer_events;
 
 typedef struct weida_pem weida_pem;
 
+typedef struct weida_pipe_binding weida_pipe_binding;
+
 typedef struct weida_reconnect_policy weida_reconnect_policy;
 
 typedef struct weida_relay weida_relay;
@@ -265,6 +267,8 @@ typedef struct weida_server_tls weida_server_tls;
 typedef struct weida_transfer_meta weida_transfer_meta;
 
 typedef struct weida_trust weida_trust;
+
+typedef struct weida_unix_binding weida_unix_binding;
 
 typedef struct {
   int64_t fd;
@@ -425,6 +429,10 @@ void weida_listener_bind_relay_op_drop(weida_listener_bind_relay_op *op);
 
 int weida_listener_bind_inproc(const weida_listener *l, const char *bus, weida_local_binding **out);
 
+int weida_listener_bind_unix(const weida_listener *l, const char *path, weida_unix_binding **out);
+
+int weida_listener_bind_pipe(const weida_listener *l, const char *name, weida_pipe_binding **out);
+
 int weida_listener_replier(const weida_listener *l, const char *path, weida_replier **out);
 
 void weida_listener_drop(weida_listener *l);
@@ -481,6 +489,14 @@ void weida_binding_drop(weida_binding *b);
 const char *weida_local_binding_bus(const weida_local_binding *b, size_t *len_out);
 
 void weida_local_binding_drop(weida_local_binding *b);
+
+const char *weida_unix_binding_path(const weida_unix_binding *b, size_t *len_out);
+
+void weida_unix_binding_drop(weida_unix_binding *b);
+
+const char *weida_pipe_binding_name(const weida_pipe_binding *b, size_t *len_out);
+
+void weida_pipe_binding_drop(weida_pipe_binding *b);
 
 const char *weida_replier_path(const weida_replier *r, size_t *len_out);
 
@@ -939,6 +955,14 @@ const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_
 const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out);
 
 int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out);
+
+int weida_incoming_meta_peer_uid(const weida_incoming_meta *m, uint32_t *out);
+
+int weida_incoming_meta_peer_gid(const weida_incoming_meta *m, uint32_t *out);
+
+int weida_incoming_meta_peer_pid(const weida_incoming_meta *m, uint32_t *out);
+
+const char *weida_incoming_meta_peer_sid(const weida_incoming_meta *m, size_t *len_out);
 
 void weida_incoming_meta_drop(weida_incoming_meta *m);
 

@@ -42,7 +42,7 @@ unit tests in `crates/weida-c/src/`.
 | `Listener::bind_inproc` | `weida_listener_bind_inproc` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Listener::replier` | `weida_listener_replier` | present; every `abi::` test |
 | `Listener::bind_quic_socket` | `weida_listener_bind_quic_socket` (op; takes ownership of the descriptor) | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
-| `Listener::bind_unix`, `bind_pipe` | — | absent: *local transports* |
+| `Listener::bind_unix`, `bind_pipe` | `weida_listener_bind_unix`, `weida_listener_bind_pipe` (plain functions, R3; `-WEIDA_EUNSUPPORTED` on the other platform) | present; `abi::a_round_trip_over_unix_names_the_clients_uid`, `abi::a_round_trip_over_a_pipe_names_the_clients_sid` (*local transports*) |
 | `Listener::bind_relay` | `weida_listener_bind_relay` (op; its wait yields a relayed `weida_binding`). Dialling a `weida+relay://` URL needs nothing more: the ABI passes URL text | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Listener::relay`, `Relay::accept` | `weida_listener_relay`, `weida_relay_accept` (try, R3a) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `RelayRequest::peer`, `target` | `weida_relay_request_peer_fingerprint`, `_target` (`sha256:` text) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
@@ -56,7 +56,8 @@ unit tests in `crates/weida-c/src/`.
 | `Binding::take_over` | `weida_binding_take_over` (op) | present; `abi::a_hand_over_keeps_a_requesters_connection` (*binding lifecycle*) |
 | `Binding::disconnect` | `weida_binding_disconnect` | present; `abi::a_binding_disconnects_a_peer_by_its_key` (*binding lifecycle*) |
 | `LocalBinding::bus` | `weida_local_binding_bus` | present; R7 getter |
-| `UnixBinding`, `PipeBinding` | — | absent: *local transports* |
+| `UnixBinding::path`, `PipeBinding::name` | `weida_unix_binding_path`, `weida_pipe_binding_name` (R7 getters) | present; `abi::a_round_trip_over_unix_names_the_clients_uid`, `abi::a_round_trip_over_a_pipe_names_the_clients_sid` (*local transports*) |
+| `Drop for UnixBinding` (removes the socket file), `Drop for PipeBinding` (releases the name) | `weida_unix_binding_drop`, `weida_pipe_binding_drop` | present; `abi::a_round_trip_over_unix_names_the_clients_uid`, `abi::a_round_trip_over_a_pipe_names_the_clients_sid` (*local transports*) |
 
 ## 3. Req/Rep, streamed
 
@@ -137,7 +138,7 @@ unit tests in `crates/weida-c/src/`.
 | `TransferMeta::with_content_len`, `with_trace`, `with_topic`, `with_achieved` | `weida_transfer_meta_set_content_len`, `_set_trace`, `_set_topic`, `_set_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
 | `TransferMeta::with_report`, `with_report_mode` | — | absent: *cursors* |
 | `IncomingMeta::endpoint`, `content_type`, `topic`, `content_len`, `sequence` | `weida_incoming_meta_*` | present; `endpoint` and `content_type` by `abi::a_streamed_round_trip_over_inproc` |
-| `IncomingMeta::peer` (a key) | `weida_incoming_meta_peer_fingerprint` | present for `PeerIdentity::Key`; a local principal is absent: *local transports* |
+| `IncomingMeta::peer` | `weida_incoming_meta_peer_fingerprint` (`PeerIdentity::Key`), `_peer_uid`, `_peer_gid`, `_peer_pid` (`Local`), `_peer_sid`, `_peer_pid` (`Windows`) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain`, `abi::a_round_trip_over_unix_names_the_clients_uid`, `abi::a_round_trip_over_a_pipe_names_the_clients_sid`, `transfer::tests::every_peer_identity_reads_back_through_its_getters` (*local transports*) |
 | `IncomingMeta::peer_chain`, `PeerChain` | `weida_incoming_meta_peer_chain_len`, `_peer_chain_cert` (DER, leaf first) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
 | `IncomingMeta::trace`, `tracestate`, `achieved` | `weida_incoming_meta_trace`, `_tracestate`, `_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
 | `IncomingMeta::gap`, `segment`, `layer` | — | absent: *patterns* |
@@ -179,7 +180,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the thirty-three `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the thirty-five `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -218,6 +219,12 @@ way a foreign caller calls it:
 - `Binding::disconnect` and `RelayRequest::peer`/`target` take and give keys as `sha256:` text.
 - `weida_binding_drop` releases the handle only; the binding serves on, as a dropped Rust
   `Binding` does, until `weida_binding_close`, a hand-over or the runtime's shutdown.
+- `bind_unix` exists in Rust only on Unix and `bind_pipe` only on Windows. The ABI exports both
+  everywhere and the other platform's returns `-WEIDA_EUNSUPPORTED`, so one `weida.h` serves
+  every platform.
+- A socket path is UTF-8 text (R7); a path that is not UTF-8 cannot be bound through the ABI.
+- `LocalPrincipal` and `WindowsPrincipal` are read through four getters on the metadata
+  (`weida_incoming_meta_peer_uid`, `_peer_gid`, `_peer_pid`, `_peer_sid`), not as values.
 
 ## 10. The definition of done
 

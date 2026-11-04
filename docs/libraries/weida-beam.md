@@ -132,6 +132,12 @@ marked (*binding lifecycle*), a binding's close, hand-over and take-over with `w
 (`weida_listener_bind_relay`, `weida_listener_relay`, `weida_relay_request`,
 `weida_binding_relay_events`). A QUIC binding still ends with its runtime's shutdown.
 
+The C ABI's *local transports* area is absent here: the rows of [weida-c.md](weida-c.md)
+marked (*local transports*), `weida_listener_bind_unix`, `weida_listener_bind_pipe` with
+`weida_unix_binding` and `weida_pipe_binding`, and the local peer principal
+(`weida_incoming_meta_peer_uid`, `_peer_gid`, `_peer_pid`, `_peer_sid`). A listener still
+serves QUIC and in-process bindings only.
+
 ## 7. Sources
 
 `crates/beam/weida/c_src/` (`weida_nif.c`, `build.sh`), `src/` (`weida.erl`, `weida_nif.erl`,

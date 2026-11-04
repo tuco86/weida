@@ -28,6 +28,7 @@ pub struct weida_incoming_meta {
     content_type: Option<CText>,
     topic: Option<CText>,
     peer_fingerprint: Option<CText>,
+    peer_sid: Option<CText>,
     trace: Option<CText>,
     tracestate: Option<CText>,
 }
@@ -41,6 +42,10 @@ impl weida_incoming_meta {
             topic: text(&meta.topic),
             peer_fingerprint: match &meta.peer {
                 Some(PeerIdentity::Key(fp)) => Some(CText::new(fp.to_string())),
+                _ => None,
+            },
+            peer_sid: match &meta.peer {
+                Some(PeerIdentity::Windows(p)) => Some(CText::new(p.sid.as_bytes())),
                 _ => None,
             },
             trace: meta.trace.map(|t| CText::new(t.to_traceparent())),
@@ -286,10 +291,10 @@ pub unsafe extern "C" fn weida_incoming_meta_peer_chain_cert(
 
 /// Reads an optional number of the metadata: 1 and `*out` when present, 0
 /// when absent (R2).
-unsafe fn meta_number(
+unsafe fn meta_number<T>(
     m: *const weida_incoming_meta,
-    out: *mut u64,
-    pick: impl FnOnce(&IncomingMeta) -> Option<u64>,
+    out: *mut T,
+    pick: impl FnOnce(&IncomingMeta) -> Option<T>,
 ) -> c_int {
     guard_or(0, || {
         if m.is_null() || out.is_null() {
@@ -396,6 +401,82 @@ pub unsafe extern "C" fn weida_incoming_meta_achieved(
             None => 0,
         }
     })
+}
+
+/// The effective uid the kernel proved for an `AF_UNIX` peer at connect
+/// time: 1 and `*out`; 0 for any other peer.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_peer_uid(
+    m: *const weida_incoming_meta,
+    out: *mut u32,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        meta_number(m, out, |m| {
+            m.peer.as_ref().and_then(PeerIdentity::local).map(|p| p.uid)
+        })
+    }
+}
+
+/// The primary group id the kernel proved for an `AF_UNIX` peer at connect
+/// time: 1 and `*out`; 0 for any other peer.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_peer_gid(
+    m: *const weida_incoming_meta,
+    out: *mut u32,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        meta_number(m, out, |m| {
+            m.peer.as_ref().and_then(PeerIdentity::local).map(|p| p.gid)
+        })
+    }
+}
+
+/// The local peer's process id where the platform reports one (Linux
+/// `SO_PEERCRED`, a named pipe; macOS reports none): 1 and `*out`, else 0.
+/// An observation only: it MUST NOT be authorized on (decisions/0010 §4.4).
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_peer_pid(
+    m: *const weida_incoming_meta,
+    out: *mut u32,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        meta_number(m, out, |m| match &m.peer {
+            Some(PeerIdentity::Local(p)) => p.pid,
+            Some(PeerIdentity::Windows(p)) => p.pid,
+            _ => None,
+        })
+    }
+}
+
+/// The account SID (`S-1-...`) the kernel proved for a named-pipe peer;
+/// NULL for any other peer.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `len_out` is NULL or writable. The string
+/// lives as long as `m`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_peer_sid(
+    m: *const weida_incoming_meta,
+    len_out: *mut usize,
+) -> *const c_char {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { meta_text(m, len_out, |m| m.peer_sid.as_ref()) }
 }
 
 /// Releases a reference to metadata. NULL does nothing.
@@ -968,4 +1049,129 @@ pub unsafe extern "C" fn weida_delivery_delivered_op_drop(op: *mut weida_deliver
 pub unsafe extern "C" fn weida_delivery_drop(d: *mut weida_delivery) {
     // SAFETY: forwarded from this function's contract.
     guard_void(|| drop(unsafe { release(d) }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weida_rs::{Fingerprint, LocalPrincipal, ReportMode, WindowsPrincipal};
+
+    /// A string a getter handed out, copied.
+    fn text(p: *const c_char, len: usize) -> Option<String> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: a non-NULL getter result points to `len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) };
+        Some(String::from_utf8(bytes.to_vec()).expect("UTF-8"))
+    }
+
+    /// Metadata with nothing but the given peer.
+    fn meta(peer: Option<PeerIdentity>) -> Arc<weida_incoming_meta> {
+        weida_incoming_meta::new(IncomingMeta {
+            endpoint: None,
+            content_len: None,
+            content_type: None,
+            trace: None,
+            tracestate: None,
+            topic: None,
+            peer,
+            peer_chain: None,
+            sequence: None,
+            gap: None,
+            achieved: None,
+            report: Vec::new(),
+            report_mode: ReportMode::default(),
+            report_id: None,
+            segment: None,
+            layer: None,
+        })
+    }
+
+    /// What the five principal getters read back: uid, gid, pid, SID and
+    /// fingerprint, each `None` where the getter reports absence.
+    type Read = (
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<String>,
+        Option<String>,
+    );
+
+    fn read(m: &Arc<weida_incoming_meta>) -> Read {
+        let m = Arc::as_ptr(m);
+        let number = |f: unsafe extern "C" fn(*const weida_incoming_meta, *mut u32) -> c_int| {
+            let mut out = u32::MAX;
+            // SAFETY: `m` is live for this call, `out` writable.
+            match unsafe { f(m, &mut out) } {
+                1 => Some(out),
+                0 => {
+                    assert_eq!(out, u32::MAX, "an absent value leaves *out untouched");
+                    None
+                }
+                other => panic!("getter returned {other}"),
+            }
+        };
+        let mut len = 0usize;
+        // SAFETY: `m` is live for these calls, `len` writable.
+        let (sid, fingerprint) = unsafe {
+            (
+                text(weida_incoming_meta_peer_sid(m, &mut len), len),
+                text(weida_incoming_meta_peer_fingerprint(m, &mut len), len),
+            )
+        };
+        (
+            number(weida_incoming_meta_peer_uid),
+            number(weida_incoming_meta_peer_gid),
+            number(weida_incoming_meta_peer_pid),
+            sid,
+            fingerprint,
+        )
+    }
+
+    #[test]
+    fn every_peer_identity_reads_back_through_its_getters() {
+        assert_eq!(read(&meta(None)), (None, None, None, None, None));
+
+        let fp = Fingerprint::from_bytes([7; 32]);
+        assert_eq!(
+            read(&meta(Some(PeerIdentity::Key(fp)))),
+            (None, None, None, None, Some(fp.to_string()))
+        );
+
+        let local = |pid| {
+            meta(Some(PeerIdentity::Local(LocalPrincipal {
+                uid: 1000,
+                gid: 100,
+                pid,
+            })))
+        };
+        assert_eq!(
+            read(&local(Some(42))),
+            (Some(1000), Some(100), Some(42), None, None)
+        );
+        assert_eq!(
+            read(&local(None)),
+            (Some(1000), Some(100), None, None, None)
+        );
+
+        let windows = meta(Some(PeerIdentity::Windows(WindowsPrincipal {
+            sid: Arc::from("S-1-5-21-1-2-3-1001"),
+            pid: Some(7),
+        })));
+        assert_eq!(
+            read(&windows),
+            (
+                None,
+                None,
+                Some(7),
+                Some("S-1-5-21-1-2-3-1001".to_owned()),
+                None
+            )
+        );
+        let mut len = 0usize;
+        // SAFETY: `windows` is live, `len` writable.
+        unsafe { weida_incoming_meta_peer_sid(Arc::as_ptr(&windows), &mut len) };
+        assert_eq!(len, 19);
+    }
 }

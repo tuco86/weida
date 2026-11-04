@@ -14,6 +14,10 @@ request or transfer it came from. None of these functions blocks.
 | `const char *weida_incoming_meta_peer_fingerprint(const weida_incoming_meta *m, size_t *len_out)` | the `sha256:` key the sender proved; NULL for an anonymous or local peer |
 | `int weida_incoming_meta_peer_chain_len(const weida_incoming_meta *m, size_t *out)` | 1 and `*out`, the number of certificates (1 to 8), when the sender presented a chain, else 0: an anonymous or local peer, or a chain over the bound weida keeps |
 | `const uint8_t *weida_incoming_meta_peer_chain_cert(const weida_incoming_meta *m, size_t index, size_t *len_out)` | the DER of certificate `index`, leaf first, its length through `len_out` (NULL allowed), valid until `m` is dropped; NULL when the chain is absent or `index` is out of range |
+| `int weida_incoming_meta_peer_uid(const weida_incoming_meta *m, uint32_t *out)` | 1 and `*out`, the effective uid the kernel proved for an `AF_UNIX` peer at connect time; 0 for any other peer |
+| `int weida_incoming_meta_peer_gid(const weida_incoming_meta *m, uint32_t *out)` | 1 and `*out`, the primary group id the kernel proved for an `AF_UNIX` peer; 0 for any other peer |
+| `int weida_incoming_meta_peer_pid(const weida_incoming_meta *m, uint32_t *out)` | 1 and `*out`, the local peer's process id where the platform reports one (Linux `SO_PEERCRED`, a named pipe; macOS reports none), else 0. An observation only: it MUST NOT be authorized on (decisions/0010 §4.4) |
+| `const char *weida_incoming_meta_peer_sid(const weida_incoming_meta *m, size_t *len_out)` | the account SID (`S-1-...`) the kernel proved for a named-pipe peer, valid until `m` is dropped; NULL for any other peer |
 | `int weida_incoming_meta_content_len(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender stated a length, else 0 |
 | `int weida_incoming_meta_sequence(const weida_incoming_meta *m, uint64_t *out)` | 1 and `*out` when the sender numbered the transfer, else 0 |
 | `const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out)` | the sender's trace context as `traceparent` text; NULL when it sent none or one that did not parse |
