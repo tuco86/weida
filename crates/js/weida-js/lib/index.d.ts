@@ -370,12 +370,39 @@ export class ServerTls extends Handle {
 
 export class Listener extends Handle {
   bindQuic(addr: string, serverTls: ServerTls, options?: WaitOptions): Promise<Binding>;
+  /** Serves QUIC on an already bound socket's descriptor, libweida's once the call reaches it. */
+  bindQuicSocket(socket: number, serverTls: ServerTls, options?: WaitOptions): Promise<Binding>;
+  /** Serves this listener's endpoints through the relay at `relay`, registered under `via`'s key. */
+  bindRelay(relay: string, via: ClientTls, serverTls: ServerTls, options?: WaitOptions): Promise<Binding>;
   bindInproc(bus: string): LocalBinding;
   replier(path: string): Replier;
+  /** Serves a relay on this listener's bindings. */
+  relay(): Relay;
 }
 
 export class Binding extends Handle {
   localAddr(): string | null;
+  /** Closes the binding's connections with SHUTDOWN; resolves once the port is free. */
+  close(options?: WaitOptions): Promise<void>;
+  /** Hands the socket over to a successor process. Consumes the binding. */
+  handOver(options?: WaitOptions): Promise<Handoff>;
+  /** Sends a predecessor's held close packets; resolves with how many were sent. */
+  takeOver(held: Uint8Array, options?: WaitOptions): Promise<number>;
+  /** Closes every connection from the peer with this key; how many it closed. */
+  disconnect(fingerprint: string): number;
+  /** A new reader of a relayed binding's registration events, or null when not relayed. */
+  relayEvents(): PeerEvents | null;
+}
+
+export class Handoff extends Handle {
+  /** How many close packets are held. */
+  held(): number;
+  /** The address the socket is bound to. */
+  localAddr(): string | null;
+  /** A copy of the held packets, for `Binding.takeOver`. */
+  bytes(): Uint8Array;
+  /** The socket's descriptor, the caller's from then on; once. */
+  takeSocket(): number;
 }
 
 export class LocalBinding extends Handle {
@@ -401,7 +428,7 @@ export class ReplyStream extends Handle {
 }
 
 export class PeerEvents extends Handle {
-  /** The next event, or null once the requester is gone. */
+  /** The next event, or null once the requester, or the relayed binding's registration, is gone. */
   recv(options?: WaitOptions): Promise<PeerEvent | null>;
   [Symbol.asyncIterator](): AsyncGenerator<PeerEvent, void, undefined>;
 }
@@ -409,6 +436,22 @@ export class PeerEvents extends Handle {
 export class Replier extends Handle {
   path(): string | null;
   accept(options?: WaitOptions): Promise<IncomingRequest>;
+}
+
+export class Relay extends Handle {
+  /** The next registration or tunnel asking to be served. */
+  accept(options?: WaitOptions): Promise<RelayRequest>;
+}
+
+export class RelayRequest extends Handle {
+  /** The key the asker proved, or null for an anonymous dialler. */
+  peerFingerprint(): string | null;
+  /** null for a registration; for a tunnel, the key of the peer it reaches. */
+  target(): string | null;
+  /** Serves it; consumes the request. */
+  admit(options?: WaitOptions): Promise<void>;
+  /** Refuses it with WEIDA_EREJECTED; consumes the request. */
+  refuse(options?: WaitOptions): Promise<void>;
 }
 
 export class IncomingRequest extends Handle {

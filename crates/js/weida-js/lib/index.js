@@ -581,6 +581,48 @@ export class Listener extends Handle {
     return adopt(Binding, binding);
   }
 
+  /** Serves QUIC on a socket that is already bound: its descriptor number
+   * (on Windows its SOCKET), e.g. a predecessor's `Handoff.takeSocket()`
+   * passed on through `child_process` `stdio`. The descriptor is libweida's
+   * once the call reaches it; weida neither binds it nor sets options on
+   * it. */
+  async bindQuicSocket(socket, serverTls, { signal } = {}) {
+    const tls = handleOf(serverTls, ServerTls);
+    const binding = await op(
+      this,
+      () => native.listenerBindQuicSocket(this[HANDLE], socket, tls),
+      native.listenerBindQuicSocketOpWait,
+      native.listenerBindQuicSocketOpFd,
+      signal,
+    );
+    return adopt(Binding, binding);
+  }
+
+  /** Serves this listener's endpoints through the relay at `relay`
+   * (`weida://[relay-key@]host:port/.weida/relay`), registered under the
+   * key `via` presents; diallers reach them as
+   * `weida+relay://<key>@[relay-key@]host:port/path`. Rejects with
+   * WEIDA_EREJECTED where the relay refused the registration. */
+  async bindRelay(relay, via, serverTls, { signal } = {}) {
+    const client = handleOf(via, ClientTls);
+    const tls = handleOf(serverTls, ServerTls);
+    const binding = await op(
+      this,
+      () => native.listenerBindRelay(this[HANDLE], relay, client, tls),
+      native.listenerBindRelayOpWait,
+      native.listenerBindRelayOpFd,
+      signal,
+    );
+    return adopt(Binding, binding);
+  }
+
+  /** Serves a relay on this listener's bindings: registrations and tunnels
+   * arrive at `Relay.accept()`. Throws WEIDA_EALREADY_REGISTERED on a
+   * second call. */
+  relay() {
+    return adopt(Relay, native.listenerRelay(this[HANDLE]));
+  }
+
   /** Answers on the in-process bus `bus`. */
   bindInproc(bus) {
     return adopt(LocalBinding, native.listenerBindInproc(this[HANDLE], bus));
@@ -592,15 +634,106 @@ export class Listener extends Handle {
   }
 }
 
-/** A QUIC binding: the socket a listener serves on. */
+/** A QUIC binding: the socket a listener serves on, directly or through a
+ * relay. Dropping it releases the handle only: the binding serves until
+ * `close()`, a hand-over or the runtime's shutdown. */
 export class Binding extends Handle {
   constructor() {
     super();
-    noConstructor("Binding", "Listener.bindQuic()");
+    noConstructor(
+      "Binding",
+      "Listener.bindQuic(), Listener.bindQuicSocket() or Listener.bindRelay()",
+    );
   }
 
   localAddr() {
     return native.bindingLocalAddr(this[HANDLE]);
+  }
+
+  /** Stops accepting and closes the binding's connections with SHUTDOWN;
+   * resolves once the port is free to bind again. A relayed binding ends
+   * its registration at the relay. */
+  async close({ signal } = {}) {
+    await op(
+      this,
+      () => native.bindingClose(this[HANDLE]),
+      native.bindingCloseOpWait,
+      native.bindingCloseOpFd,
+      signal,
+    );
+  }
+
+  /** Hands the socket over to a successor process: every connection is
+   * closed with RESTARTING, its close packet held in the `Handoff` and not
+   * sent. Consumes the binding. Rejects with WEIDA_EUNSUPPORTED for a
+   * relayed binding and WEIDA_ECLOSED for a closed one. */
+  async handOver({ signal } = {}) {
+    const handoff = await op(
+      this,
+      () => native.bindingHandOver(consume(this)),
+      native.bindingHandOverOpWait,
+      native.bindingHandOverOpFd,
+      signal,
+    );
+    return adopt(Handoff, handoff);
+  }
+
+  /** Sends the close packets a predecessor held (`Handoff.bytes()`), so its
+   * clients redial into this binding; call it once their endpoints are
+   * registered. Resolves with how many were sent. The bytes need the
+   * integrity of the channel that carries the socket. */
+  async takeOver(held, { signal } = {}) {
+    return await op(
+      this,
+      () => native.bindingTakeOver(this[HANDLE], held),
+      native.bindingTakeOverOpWait,
+      native.bindingTakeOverOpFd,
+      signal,
+    );
+  }
+
+  /** Closes every connection from the peer with this key (`sha256:` text)
+   * with REJECTED; how many it closed. Not a ban: the peer redials under
+   * its own policy. */
+  disconnect(fingerprint) {
+    return native.bindingDisconnect(this[HANDLE], fingerprint);
+  }
+
+  /** A new reader of a relayed binding's registration events, or null for
+   * a binding that is not relayed. */
+  relayEvents() {
+    const handle = native.bindingRelayEvents(this[HANDLE]);
+    return handle === null ? null : adopt(PeerEvents, handle);
+  }
+}
+
+/** What `Binding.handOver` leaves for a successor: the socket and the close
+ * packets held for its clients. Dropping it closes a socket not taken. */
+export class Handoff extends Handle {
+  constructor() {
+    super();
+    noConstructor("Handoff", "Binding.handOver()");
+  }
+
+  /** How many close packets are held. */
+  held() {
+    return native.handoffHeld(this[HANDLE]);
+  }
+
+  /** The address the socket is bound to. */
+  localAddr() {
+    return native.handoffLocalAddr(this[HANDLE]);
+  }
+
+  /** A copy of the held packets, for the successor's `Binding.takeOver`. */
+  bytes() {
+    return native.handoffBytes(this[HANDLE]);
+  }
+
+  /** The socket's descriptor (on Windows its SOCKET), the caller's from
+   * then on; once, then WEIDA_ECLOSED. */
+  takeSocket() {
+    return native.handoffTakeSocket(this[HANDLE]);
   }
 }
 
@@ -716,16 +849,18 @@ export class ReplyStream extends Handle {
   }
 }
 
-/** The peer events of one requester, read like a queue or iterated with
- * `for await`; the loop ends once the requester is gone, and leaving it
+/** The peer events of one requester, or of a relayed binding's
+ * registration, read like a queue or iterated with `for await`; the loop
+ * ends once the requester or the registration is gone, and leaving it
  * early drops the reader. */
 export class PeerEvents extends Handle {
   constructor() {
     super();
-    noConstructor("PeerEvents", "Requester.events()");
+    noConstructor("PeerEvents", "Requester.events() or Binding.relayEvents()");
   }
 
-  /** The next event as a frozen object, or null once the requester is gone. */
+  /** The next event as a frozen object, or null once the requester, or the
+   * relayed binding's registration, is gone. */
   async recv({ signal } = {}) {
     const handle = this[HANDLE];
     const event = await call(
@@ -769,6 +904,73 @@ export class Replier extends Handle {
       signal,
     );
     return adopt(IncomingRequest, request);
+  }
+}
+
+/** The relay a listener serves on `/.weida/relay`. Dropping it closes every
+ * registration's connection, so the hidden peers redial. */
+export class Relay extends Handle {
+  constructor() {
+    super();
+    noConstructor("Relay", "Listener.relay()");
+  }
+
+  /** The next registration or tunnel asking to be served. An anonymous
+   * registration and a tunnel to a key nobody registered are refused before
+   * they get here. */
+  async accept({ signal } = {}) {
+    const handle = this[HANDLE];
+    const request = await call(
+      this,
+      () => native.relayAccept(handle),
+      () => native.relayFd(handle),
+      signal,
+    );
+    return adopt(RelayRequest, request);
+  }
+}
+
+/** A registration or a tunnel asking the relay to be served. Dropped
+ * unanswered, it answers NO_REPLY. */
+export class RelayRequest extends Handle {
+  constructor() {
+    super();
+    noConstructor("RelayRequest", "Relay.accept()");
+  }
+
+  /** The key (`sha256:` text) the asker proved, null for an anonymous
+   * dialler; always a key for a registration. */
+  peerFingerprint() {
+    return native.relayRequestPeerFingerprint(this[HANDLE]);
+  }
+
+  /** null for a registration; for a tunnel, the key of the peer it reaches. */
+  target() {
+    return native.relayRequestTarget(this[HANDLE]);
+  }
+
+  /** Serves it. A registration replaces one of the same key on another
+   * connection. Consumes the request. */
+  async admit({ signal } = {}) {
+    await op(
+      this,
+      () => native.relayRequestAdmit(consume(this)),
+      native.relayRequestAdmitOpWait,
+      native.relayRequestAdmitOpFd,
+      signal,
+    );
+  }
+
+  /** Refuses it: the asker fails with WEIDA_EREJECTED. Consumes the
+   * request. */
+  async refuse({ signal } = {}) {
+    await op(
+      this,
+      () => native.relayRequestRefuse(consume(this)),
+      native.relayRequestRefuseOpWait,
+      native.relayRequestRefuseOpFd,
+      signal,
+    );
   }
 }
 

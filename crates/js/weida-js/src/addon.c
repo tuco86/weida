@@ -38,13 +38,23 @@ DROP(runtime_shutdown_op)
 DROP(runtime_drain_op)
 DROP(listener)
 DROP(listener_bind_quic_op)
+DROP(listener_bind_quic_socket_op)
+DROP(listener_bind_relay_op)
 DROP(binding)
+DROP(binding_close_op)
+DROP(binding_hand_over_op)
+DROP(binding_take_over_op)
+DROP(handoff)
 DROP(local_binding)
 DROP(replier)
 DROP(incoming_request)
 DROP(incoming_request_reply_op)
 DROP(incoming_request_refuse_op)
 DROP(incoming_request_canceled_op)
+DROP(relay)
+DROP(relay_request)
+DROP(relay_request_admit_op)
+DROP(relay_request_refuse_op)
 DROP(requester)
 DROP(requester_connect_op)
 DROP(requester_request_op)
@@ -814,6 +824,8 @@ WRAP_AS(binding)
 WRAP_AS(incoming_request)
 WRAP_AS(incoming_transfer)
 WRAP_AS(outgoing_transfer)
+WRAP_AS(handoff)
+WRAP_AS(relay_request)
 
 /* `<t>_<x>(h) -> bigint`: an infallible uint64_t accessor (R2). */
 #define U64_OUT(js, t, x) \
@@ -1454,6 +1466,61 @@ static napi_value listener_bind_quic(napi_env env, napi_callback_info info) {
 FD(listener_bind_quic_op_fd, listener_bind_quic_op)
 WAIT1(listener_bind_quic_op_wait, listener_bind_quic_op, weida_binding, wrap_binding)
 
+static napi_value listener_bind_quic_socket(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    uint64_t descriptor = 0;
+    if (!get_u64(env, argv[1], INT64_MAX, &descriptor))
+        return NULL;
+    const weida_server_tls *tls = live(env, argv[2], drop_server_tls);
+    if (!tls)
+        return NULL;
+    /* the descriptor is libweida's once the C call is made; a TypeError or
+     * RangeError before it leaves it the caller's */
+    weida_listener_bind_quic_socket_op *op = NULL;
+    int rc = weida_listener_bind_quic_socket(l, (int64_t)descriptor, tls, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_listener_bind_quic_socket_op);
+}
+
+FD(listener_bind_quic_socket_op_fd, listener_bind_quic_socket_op)
+WAIT1(listener_bind_quic_socket_op_wait, listener_bind_quic_socket_op, weida_binding,
+      wrap_binding)
+
+static napi_value listener_bind_relay(napi_env env, napi_callback_info info) {
+    ARGS(4);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    const weida_client_tls *via = live(env, argv[2], drop_client_tls);
+    if (!via)
+        return NULL;
+    const weida_server_tls *tls = live(env, argv[3], drop_server_tls);
+    if (!tls)
+        return NULL;
+    char *relay = get_string(env, argv[1]);
+    if (!relay)
+        return NULL;
+    weida_listener_bind_relay_op *op = NULL;
+    int rc = weida_listener_bind_relay(l, relay, via, tls, &op);
+    free(relay);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_listener_bind_relay_op);
+}
+
+FD(listener_bind_relay_op_fd, listener_bind_relay_op)
+WAIT1(listener_bind_relay_op_wait, listener_bind_relay_op, weida_binding, wrap_binding)
+
+static napi_value listener_relay(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    weida_relay *out = NULL;
+    int rc = weida_listener_relay(l, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_relay);
+}
+
 static napi_value listener_bind_inproc(napi_env env, napi_callback_info info) {
     ARGS(2);
     const weida_listener *l = live(env, argv[0], drop_listener);
@@ -1483,6 +1550,119 @@ static napi_value listener_replier(napi_env env, napi_callback_info info) {
 }
 
 STRING_OUT(binding_local_addr, binding, local_addr)
+
+static napi_value binding_close(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_binding *b = live(env, argv[0], drop_binding);
+    if (!b)
+        return NULL;
+    weida_binding_close_op *op = NULL;
+    int rc = weida_binding_close(b, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_binding_close_op);
+}
+
+FD(binding_close_op_fd, binding_close_op)
+WAIT0(binding_close_op_wait, binding_close_op)
+
+/* consumes the binding */
+static napi_value binding_hand_over(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_binding *b = take(env, argv[0], drop_binding);
+    if (!b)
+        return NULL;
+    weida_binding_hand_over_op *op = NULL;
+    int rc = weida_binding_hand_over(b, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_binding_hand_over_op);
+}
+
+FD(binding_hand_over_op_fd, binding_hand_over_op)
+WAIT1(binding_hand_over_op_wait, binding_hand_over_op, weida_handoff, wrap_handoff)
+
+static napi_value binding_take_over(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_binding *b = live(env, argv[0], drop_binding);
+    if (!b)
+        return NULL;
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    if (!get_bytes(env, argv[1], &data, &len))
+        return NULL;
+    weida_binding_take_over_op *op = NULL;
+    int rc = weida_binding_take_over(b, data, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_binding_take_over_op);
+}
+
+FD(binding_take_over_op_fd, binding_take_over_op)
+
+/* -> number | AGAIN: how many datagrams were sent */
+static napi_value binding_take_over_op_wait(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_binding_take_over_op *p = live(env, argv[0], drop_binding_take_over_op);
+    if (!p)
+        return NULL;
+    size_t n = 0;
+    int rc = weida_binding_take_over_op_wait(p, 0, &n);
+    return rc == 0 ? js_int64(env, (int64_t)n) : outcome(env, rc, NULL, NULL);
+}
+
+static napi_value binding_disconnect(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_binding *b = live(env, argv[0], drop_binding);
+    if (!b)
+        return NULL;
+    char *fingerprint = get_string(env, argv[1]);
+    if (!fingerprint)
+        return NULL;
+    size_t n = 0;
+    int rc = weida_binding_disconnect(b, fingerprint, &n);
+    free(fingerprint);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, (int64_t)n);
+}
+
+/* -> peer events | null; null for a binding that is not relayed */
+static napi_value binding_relay_events(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_binding *b = live(env, argv[0], drop_binding);
+    if (!b)
+        return NULL;
+    weida_peer_events *out = NULL;
+    int rc = weida_binding_relay_events(b, &out);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    return rc == 1 ? wrap(env, out, drop_peer_events) : js_null(env);
+}
+
+static napi_value handoff_held(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_handoff *h = live(env, argv[0], drop_handoff);
+    if (!h)
+        return NULL;
+    return js_int64(env, (int64_t)weida_handoff_held(h));
+}
+
+STRING_OUT(handoff_local_addr, handoff, local_addr)
+
+/* -> a copy of the held datagrams */
+static napi_value handoff_bytes(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_handoff *h = live(env, argv[0], drop_handoff);
+    if (!h)
+        return NULL;
+    size_t len = 0;
+    const uint8_t *data = weida_handoff_bytes(h, &len);
+    return bytes_value(env, data, len);
+}
+
+static napi_value handoff_take_socket(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_handoff *h = live(env, argv[0], drop_handoff);
+    if (!h)
+        return NULL;
+    int64_t descriptor = -1;
+    int rc = weida_handoff_take_socket(h, &descriptor);
+    return rc < 0 ? throw_rc(env, rc) : js_int64(env, descriptor);
+}
+
 STRING_OUT(local_binding_bus, local_binding, bus)
 
 /* replier and incoming request */
@@ -1729,6 +1909,51 @@ static napi_value peer_events_recv(napi_env env, napi_callback_info info) {
         return js_null(env);
     return outcome(env, rc, event_value, event);
 }
+
+/* relay */
+
+FD(relay_fd, relay)
+
+static napi_value relay_accept(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_relay *r = live(env, argv[0], drop_relay);
+    weida_relay_request *out = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_relay_accept(r, 0, &out);
+    return outcome(env, rc, wrap_relay_request, out);
+}
+
+STRING_OUT(relay_request_peer_fingerprint, relay_request, peer_fingerprint)
+STRING_OUT(relay_request_target, relay_request, target)
+
+/* consumes the request */
+static napi_value relay_request_admit(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_relay_request *q = take(env, argv[0], drop_relay_request);
+    if (!q)
+        return NULL;
+    weida_relay_request_admit_op *op = NULL;
+    int rc = weida_relay_request_admit(q, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_relay_request_admit_op);
+}
+
+FD(relay_request_admit_op_fd, relay_request_admit_op)
+WAIT0(relay_request_admit_op_wait, relay_request_admit_op)
+
+/* consumes the request */
+static napi_value relay_request_refuse(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_relay_request *q = take(env, argv[0], drop_relay_request);
+    if (!q)
+        return NULL;
+    weida_relay_request_refuse_op *op = NULL;
+    int rc = weida_relay_request_refuse(q, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_relay_request_refuse_op);
+}
+
+FD(relay_request_refuse_op_fd, relay_request_refuse_op)
+WAIT0(relay_request_refuse_op_wait, relay_request_refuse_op)
 
 /* incoming transfer */
 
@@ -2067,9 +2292,31 @@ NAPI_MODULE_INIT() {
         FN("listenerBindQuic", listener_bind_quic),
         FN("listenerBindQuicOpFd", listener_bind_quic_op_fd),
         FN("listenerBindQuicOpWait", listener_bind_quic_op_wait),
+        FN("listenerBindQuicSocket", listener_bind_quic_socket),
+        FN("listenerBindQuicSocketOpFd", listener_bind_quic_socket_op_fd),
+        FN("listenerBindQuicSocketOpWait", listener_bind_quic_socket_op_wait),
+        FN("listenerBindRelay", listener_bind_relay),
+        FN("listenerBindRelayOpFd", listener_bind_relay_op_fd),
+        FN("listenerBindRelayOpWait", listener_bind_relay_op_wait),
+        FN("listenerRelay", listener_relay),
         FN("listenerBindInproc", listener_bind_inproc),
         FN("listenerReplier", listener_replier),
         FN("bindingLocalAddr", binding_local_addr),
+        FN("bindingClose", binding_close),
+        FN("bindingCloseOpFd", binding_close_op_fd),
+        FN("bindingCloseOpWait", binding_close_op_wait),
+        FN("bindingHandOver", binding_hand_over),
+        FN("bindingHandOverOpFd", binding_hand_over_op_fd),
+        FN("bindingHandOverOpWait", binding_hand_over_op_wait),
+        FN("bindingTakeOver", binding_take_over),
+        FN("bindingTakeOverOpFd", binding_take_over_op_fd),
+        FN("bindingTakeOverOpWait", binding_take_over_op_wait),
+        FN("bindingDisconnect", binding_disconnect),
+        FN("bindingRelayEvents", binding_relay_events),
+        FN("handoffHeld", handoff_held),
+        FN("handoffLocalAddr", handoff_local_addr),
+        FN("handoffBytes", handoff_bytes),
+        FN("handoffTakeSocket", handoff_take_socket),
         FN("localBindingBus", local_binding_bus),
         FN("replierPath", replier_path),
         FN("replierFd", replier_fd),
@@ -2103,6 +2350,16 @@ NAPI_MODULE_INIT() {
         FN("requesterEvents", requester_events),
         FN("peerEventsFd", peer_events_fd),
         FN("peerEventsRecv", peer_events_recv),
+        FN("relayFd", relay_fd),
+        FN("relayAccept", relay_accept),
+        FN("relayRequestPeerFingerprint", relay_request_peer_fingerprint),
+        FN("relayRequestTarget", relay_request_target),
+        FN("relayRequestAdmit", relay_request_admit),
+        FN("relayRequestAdmitOpFd", relay_request_admit_op_fd),
+        FN("relayRequestAdmitOpWait", relay_request_admit_op_wait),
+        FN("relayRequestRefuse", relay_request_refuse),
+        FN("relayRequestRefuseOpFd", relay_request_refuse_op_fd),
+        FN("relayRequestRefuseOpWait", relay_request_refuse_op_wait),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),
