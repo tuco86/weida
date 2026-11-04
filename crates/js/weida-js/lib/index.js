@@ -300,6 +300,24 @@ function withTransferMeta(meta, use) {
   }
 }
 
+const FILES_FIELDS = [
+  ["names", native.filesOptionsSetNames, "value"],
+  ["pollMs", native.filesOptionsSetPollMs, "value"],
+];
+
+/** The `WEIDA_ALPN_*` value of `alpn`, or null when it is not given. */
+function tlsAlpn(alpn) {
+  return alpn == null ? null : constant("WEIDA_ALPN_", alpn);
+}
+
+/** Checks that `names` is an array of strings. */
+function checkNames(names) {
+  if (!Array.isArray(names) || !names.every((n) => typeof n === "string")) {
+    throw new TypeError("expected an array of names");
+  }
+  return names;
+}
+
 /** `RuntimeConfig`: the fields set here, weida's defaults for the rest. */
 export class RuntimeConfig {
   constructor(fields = {}) {
@@ -445,6 +463,12 @@ export class Trust extends Handle {
     native.trustAddAnchorFile(this[HANDLE], path);
     return this;
   }
+
+  /** Whether the trust holds no pin and no anchor, so it accepts only what
+   * each dialled address names. */
+  isEmpty() {
+    return native.trustIsEmpty(this[HANDLE]);
+  }
 }
 
 /** A certificate chain and its private key. Conversions from Node's key
@@ -463,10 +487,7 @@ export class Identity extends Handle {
   /** A self-signed identity whose certificate names `names` (DNS names or IP
    * literals), so a peer anchoring it can check the host it dialled. */
   static generateFor(names) {
-    if (!Array.isArray(names) || !names.every((n) => typeof n === "string")) {
-      throw new TypeError("expected an array of names");
-    }
-    return adopt(Identity, native.identityGenerateFor(names));
+    return adopt(Identity, native.identityGenerateFor(checkNames(names)));
   }
 
   /** An identity from PEM: the chain, leaf first, and the key. */
@@ -517,17 +538,34 @@ export class Identity extends Handle {
   }
 }
 
-/** The TLS terms a requester dials on, under `trust`: anonymous, or
- * presenting `identity`. */
+/** The TLS terms a requester dials on, under `trust` (a `Trust`, copied, or
+ * a `TrustSource`, shared): anonymous, or presenting `identity` (an
+ * `Identity`, copied, or an `IdentitySource`, shared). `alpn` is the
+ * `WEIDA_ALPN_*` token to ask for, `WEIDA_ALPN_WEIDA` unless given. */
 export class ClientTls extends Handle {
-  constructor(trust, { identity } = {}) {
+  constructor(trust, { identity, alpn } = {}) {
     super();
-    const trustHandle = handleOf(trust, Trust);
-    const id = identity == null ? null : handleOf(identity, Identity);
-    const handle = native.clientTlsNew(trustHandle);
+    let make;
+    if (trust instanceof TrustSource) {
+      make = () => native.clientTlsNewSource(trust[HANDLE]);
+    } else if (trust instanceof Trust) {
+      make = () => native.clientTlsNew(trust[HANDLE]);
+    } else {
+      throw new TypeError("expected a Trust or a TrustSource");
+    }
+    if (!(identity == null || identity instanceof Identity || identity instanceof IdentitySource)) {
+      throw new TypeError("identity is an Identity or an IdentitySource");
+    }
+    const token = tlsAlpn(alpn);
+    const handle = make();
     try {
-      if (id !== null) {
-        native.clientTlsSetIdentity(handle, id);
+      if (identity instanceof IdentitySource) {
+        native.clientTlsSetIdentitySource(handle, identity[HANDLE]);
+      } else if (identity != null) {
+        native.clientTlsSetIdentity(handle, identity[HANDLE]);
+      }
+      if (token !== null) {
+        native.clientTlsSetAlpn(handle, token);
       }
     } catch (error) {
       native.drop(handle);
@@ -537,28 +575,212 @@ export class ClientTls extends Handle {
   }
 }
 
-/** The TLS terms a QUIC binding serves on, presenting `identity`. With
- * `requireClient` every client must present a key: one the `Trust` accepts,
- * or with "any-key" any key it proves it holds. */
+/** The TLS terms a QUIC binding serves on, presenting `identity` (an
+ * `Identity`, copied, or an `IdentitySource`, shared, whose renewals reach
+ * the next peer with no re-bind). With `requireClient` every client must
+ * present a key: one the `Trust` or `TrustSource` accepts, or with
+ * "any-key" any key it proves it holds. `alpn` is the `WEIDA_ALPN_*` token
+ * to offer, `WEIDA_ALPN_WEIDA` unless given. */
 export class ServerTls extends Handle {
-  constructor(identity, { requireClient } = {}) {
+  constructor(identity, { requireClient, alpn } = {}) {
     super();
-    const id = handleOf(identity, Identity);
-    if (!(requireClient == null || requireClient === "any-key" || requireClient instanceof Trust)) {
-      throw new TypeError('requireClient is a Trust or "any-key"');
+    let make;
+    if (identity instanceof IdentitySource) {
+      make = () => native.serverTlsNewSource(identity[HANDLE]);
+    } else if (identity instanceof Identity) {
+      make = () => native.serverTlsNew(identity[HANDLE]);
+    } else {
+      throw new TypeError("expected an Identity or an IdentitySource");
     }
-    const handle = native.serverTlsNew(id);
+    if (
+      !(
+        requireClient == null ||
+        requireClient === "any-key" ||
+        requireClient instanceof Trust ||
+        requireClient instanceof TrustSource
+      )
+    ) {
+      throw new TypeError('requireClient is a Trust, a TrustSource or "any-key"');
+    }
+    const token = tlsAlpn(alpn);
+    const handle = make();
     try {
       if (requireClient === "any-key") {
         native.serverTlsRequireAnyKey(handle);
+      } else if (requireClient instanceof TrustSource) {
+        native.serverTlsRequireClientSource(handle, requireClient[HANDLE]);
       } else if (requireClient != null) {
         native.serverTlsRequireClient(handle, requireClient[HANDLE]);
+      }
+      if (token !== null) {
+        native.serverTlsSetAlpn(handle, token);
       }
     } catch (error) {
       native.drop(handle);
       throw error;
     }
     init(this, handle);
+  }
+}
+
+/** Where an identity comes from: a value, an ephemeral identity, one driven
+ * from outside, or a directory an agent rewrites. A source is shared by the
+ * TLS terms made from it, so an update reaches their next handshake;
+ * dropping this handle leaves the source alive wherever it is held. */
+export class IdentitySource extends Handle {
+  constructor() {
+    super();
+    noConstructor(
+      "IdentitySource",
+      "IdentitySource.fromIdentity(), .ephemeral(), .external() or .files()",
+    );
+  }
+
+  /** A source that holds `identity` and never changes; throws WEIDA_ETLS
+   * when its material does not read. */
+  static fromIdentity(identity) {
+    return adopt(IdentitySource, native.identitySourceFromIdentity(handleOf(identity, Identity)));
+  }
+
+  /** A self-signed identity generated in memory for `names`. */
+  static ephemeral(names = []) {
+    return adopt(IdentitySource, native.identitySourceEphemeral(checkNames(names)));
+  }
+
+  /** A source that starts as `identity` and changes on `update()`. */
+  static external(identity) {
+    return adopt(IdentitySource, native.identitySourceExternal(handleOf(identity, Identity)));
+  }
+
+  /** The directory `dir` holding `cert.pem` and `key.pem`, bootstrapped
+   * with a self-signed identity for `names` when empty and reloaded when
+   * the files change, checked at the next use after `pollMs`. */
+  static files(dir, options = {}) {
+    let handle;
+    nested(options ?? {}, native.filesOptionsNew, FILES_FIELDS, "FilesOptions", (h) => {
+      handle = native.identitySourceFiles(dir, h);
+    });
+    return adopt(IdentitySource, handle);
+  }
+
+  /** The identity of the moment. */
+  current() {
+    return adopt(Identity, native.identitySourceCurrent(this[HANDLE]));
+  }
+
+  /** The current key's fingerprint, `sha256:` text. */
+  fingerprint() {
+    return native.identitySourceFingerprint(this[HANDLE]);
+  }
+
+  /** Replaces the identity: RENEWED when the key is unchanged, KEY_CHANGED
+   * when it is not. */
+  update(identity) {
+    native.identitySourceUpdate(this[HANDLE], handleOf(identity, Identity));
+  }
+
+  /** Reports a renewal that failed without material (RENEWAL_FAILED). */
+  reportFailure(reason) {
+    native.identitySourceReportFailure(this[HANDLE], reason);
+  }
+
+  /** Reports that the hand-off credential had already been redeemed. */
+  reportHandoffStolen() {
+    native.identitySourceReportHandoffStolen(this[HANDLE]);
+  }
+
+  /** Reloads a file source now: true when the files changed and were
+   * loaded, false when nothing changed or this is not a file source. */
+  reload() {
+    return native.identitySourceReload(this[HANDLE]);
+  }
+
+  /** A reader of this source's events from now on. */
+  events() {
+    return adopt(IdentityEvents, native.identitySourceEvents(this[HANDLE]));
+  }
+
+  /** A handle that does not keep the source alive. */
+  downgrade() {
+    return adopt(WeakIdentitySource, native.identitySourceDowngrade(this[HANDLE]));
+  }
+}
+
+/** A handle to an `IdentitySource` that does not keep it alive. */
+export class WeakIdentitySource extends Handle {
+  constructor() {
+    super();
+    noConstructor("WeakIdentitySource", "IdentitySource.downgrade()");
+  }
+
+  /** The source while anything holds it, else null. */
+  upgrade() {
+    const handle = native.weakIdentitySourceUpgrade(this[HANDLE]);
+    return handle === null ? null : adopt(IdentitySource, handle);
+  }
+}
+
+/** Whom a peer is accepted as, as a source: a `Trust` that never changes,
+ * or one driven from outside. Shared by the TLS terms made from it, so an
+ * update reaches their next handshake. */
+export class TrustSource extends Handle {
+  constructor() {
+    super();
+    noConstructor("TrustSource", "TrustSource.fromTrust() or .external()");
+  }
+
+  /** A source that holds a copy of `trust` and never changes. */
+  static fromTrust(trust) {
+    return adopt(TrustSource, native.trustSourceFromTrust(handleOf(trust, Trust)));
+  }
+
+  /** A source that starts as a copy of `trust` and changes on `update()`. */
+  static external(trust) {
+    return adopt(TrustSource, native.trustSourceExternal(handleOf(trust, Trust)));
+  }
+
+  /** A copy of the trust of the moment. */
+  current() {
+    return adopt(Trust, native.trustSourceCurrent(this[HANDLE]));
+  }
+
+  /** Replaces the trust (TRUST_REFRESHED). */
+  update(trust) {
+    native.trustSourceUpdate(this[HANDLE], handleOf(trust, Trust));
+  }
+
+  /** Reports a refresh that failed (RENEWAL_FAILED). */
+  reportFailure(reason) {
+    native.trustSourceReportFailure(this[HANDLE], reason);
+  }
+
+  /** Whether the trust of the moment holds no pin and no anchor. */
+  isEmpty() {
+    return native.trustSourceIsEmpty(this[HANDLE]);
+  }
+
+  /** A reader of this source's events from now on. */
+  events() {
+    return adopt(IdentityEvents, native.trustSourceEvents(this[HANDLE]));
+  }
+
+  /** A handle that does not keep the source alive. */
+  downgrade() {
+    return adopt(WeakTrustSource, native.trustSourceDowngrade(this[HANDLE]));
+  }
+}
+
+/** A handle to a `TrustSource` that does not keep it alive. */
+export class WeakTrustSource extends Handle {
+  constructor() {
+    super();
+    noConstructor("WeakTrustSource", "TrustSource.downgrade()");
+  }
+
+  /** The source while anything holds it, else null. */
+  upgrade() {
+    const handle = native.weakTrustSourceUpgrade(this[HANDLE]);
+    return handle === null ? null : adopt(TrustSource, handle);
   }
 }
 
@@ -911,6 +1133,38 @@ export class PeerEvents extends Handle {
       this,
       () => native.peerEventsRecv(handle),
       () => native.peerEventsFd(handle),
+      signal,
+    );
+    return event === null ? null : Object.freeze(event);
+  }
+
+  async *[Symbol.asyncIterator]() {
+    try {
+      for (let event = await this.recv(); event !== null; event = await this.recv()) {
+        yield event;
+      }
+    } finally {
+      this.drop();
+    }
+  }
+}
+
+/** The events of one identity or trust source, read like a queue or
+ * iterated with `for await`; the loop ends once the source is gone, and
+ * leaving it early drops the reader. */
+export class IdentityEvents extends Handle {
+  constructor() {
+    super();
+    noConstructor("IdentityEvents", "IdentitySource.events() or TrustSource.events()");
+  }
+
+  /** The next event as a frozen object, or null once the source is gone. */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const event = await call(
+      this,
+      () => native.identityEventsRecv(handle),
+      () => native.identityEventsFd(handle),
       signal,
     );
     return event === null ? null : Object.freeze(event);

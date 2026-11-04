@@ -68,6 +68,12 @@ DROP(trust)
 DROP(identity)
 DROP(client_tls)
 DROP(server_tls)
+DROP(identity_source)
+DROP(weak_identity_source)
+DROP(trust_source)
+DROP(weak_trust_source)
+DROP(identity_events)
+DROP(files_options)
 DROP(transfer_meta)
 DROP(incoming_transfer)
 DROP(incoming_transfer_collect_op)
@@ -283,6 +289,24 @@ static const char *give_up_name(int why) {
         NAME(GIVE_UP_POLICY)
         NAME(GIVE_UP_PEER_CHANGED)
         NAME(GIVE_UP_FAILED)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *identity_event_name(int kind) {
+    switch (kind) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(IDENTITY_EVENT_LOADED)
+        NAME(IDENTITY_EVENT_RENEWED)
+        NAME(IDENTITY_EVENT_KEY_CHANGED)
+        NAME(IDENTITY_EVENT_RENEWAL_FAILED)
+        NAME(IDENTITY_EVENT_HANDOFF_STOLEN)
+        NAME(IDENTITY_EVENT_TRUST_REFRESHED)
+        NAME(IDENTITY_EVENT_MISSED)
 #undef NAME
     default:
         return NULL;
@@ -845,6 +869,33 @@ static napi_value event_value(napi_env env, void *ptr) {
     return ok ? obj : NULL;
 }
 
+/* Copies a weida_identity_event out into a plain object and drops it. */
+static napi_value identity_event_value(napi_env env, void *ptr) {
+    weida_identity_event *e = ptr;
+    napi_value obj = NULL;
+    size_t len = 0;
+    uint64_t n = 0;
+    if (napi_create_object(env, &obj) != napi_ok) {
+        weida_identity_event_drop(e);
+        return throw_napi(env);
+    }
+    bool ok = set(env, obj, "kind",
+                  js_string(env, identity_event_name(weida_identity_event_kind(e)),
+                            NAPI_AUTO_LENGTH));
+    const char *s = weida_identity_event_fingerprint(e, &len);
+    ok = ok && set(env, obj, "fingerprint", js_string(env, s, len));
+    s = weida_identity_event_from(e, &len);
+    ok = ok && set(env, obj, "from", js_string(env, s, len));
+    s = weida_identity_event_to(e, &len);
+    ok = ok && set(env, obj, "to", js_string(env, s, len));
+    s = weida_identity_event_message(e, &len);
+    ok = ok && set(env, obj, "message", js_string(env, s, len));
+    int present = weida_identity_event_missed(e, &n);
+    ok = ok && set(env, obj, "missed", optional_u64(env, present, n));
+    weida_identity_event_drop(e);
+    return ok ? obj : NULL;
+}
+
 /* ---- generated shapes ---- */
 
 #define WRAP_AS(t) \
@@ -1008,6 +1059,73 @@ WRAP_AS(relay_request)
             return NULL; \
         int rc = weida_##t##_set_##x(h, p); \
         return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `<t>_<f>(h, u)`: a call that takes a second handle, which it copies or
+ * shares, and answers 0. */
+#define WITH_HANDLE(js, t, f, u) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        if (!h) \
+            return NULL; \
+        const weida_##u *p = live(env, argv[1], drop_##u); \
+        if (!p) \
+            return NULL; \
+        int rc = weida_##t##_##f(h, p); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `weida_<c>(u, &out) -> handle of t`: a constructor from one handle. */
+#define FROM_HANDLE(js, c, u, t) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_##u *p = live(env, argv[0], drop_##u); \
+        weida_##t *out = NULL; \
+        if (!p) \
+            return NULL; \
+        int rc = weida_##c(p, &out); \
+        return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_##t); \
+    }
+
+/* `<t>_<f>(h) -> boolean`: a call answering 1 or 0. */
+#define BOOL_OUT(js, t, f) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        if (!h) \
+            return NULL; \
+        int rc = weida_##t##_##f(h); \
+        return rc < 0 ? throw_rc(env, rc) : js_bool(env, rc == 1); \
+    }
+
+/* `<t>_<f>(h, string)` */
+#define TEXT_ARG(js, t, f) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(2); \
+        const weida_##t *h = live(env, argv[0], drop_##t); \
+        if (!h) \
+            return NULL; \
+        char *s = get_string(env, argv[1]); \
+        if (!s) \
+            return NULL; \
+        int rc = weida_##t##_##f(h, s); \
+        free(s); \
+        return rc < 0 ? throw_rc(env, rc) : js_undefined(env); \
+    }
+
+/* `weak_<t>_upgrade(w) -> handle | null`: null once nothing holds the source. */
+#define UPGRADE(js, t) \
+    static napi_value js(napi_env env, napi_callback_info info) { \
+        ARGS(1); \
+        const weida_weak_##t *w = live(env, argv[0], drop_weak_##t); \
+        weida_##t *out = NULL; \
+        if (!w) \
+            return NULL; \
+        int rc = weida_weak_##t##_upgrade(w, &out); \
+        if (rc < 0) \
+            return throw_rc(env, rc); \
+        return rc == 1 ? wrap(env, out, drop_##t) : js_null(env); \
     }
 
 /* ---- the functions ---- */
@@ -1275,24 +1393,34 @@ static napi_value identity_generate(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_identity);
 }
 
-static napi_value identity_generate_for(napi_env env, napi_callback_info info) {
-    ARGS(1);
+static void free_strings(char **names, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        free(names[i]);
+    free(names);
+}
+
+/* The strings of an array, copied into `*out` (`*n` of them, freed with
+ * `free_strings`); on failure frees what it read and throws. */
+static bool string_array(napi_env env, napi_value v, char ***out, uint32_t *n) {
     bool is = false;
-    uint32_t n = 0, got = 0;
-    napi_value result = NULL;
-    if (napi_is_array(env, argv[0], &is) != napi_ok || !is)
-        return throw_type(env, "expected an array of strings");
-    if (napi_get_array_length(env, argv[0], &n) != napi_ok)
-        return throw_napi(env);
-    char **names = calloc(n ? n : 1, sizeof *names);
+    uint32_t len = 0, got = 0;
+    if (napi_is_array(env, v, &is) != napi_ok || !is) {
+        throw_type(env, "expected an array of strings");
+        return false;
+    }
+    if (napi_get_array_length(env, v, &len) != napi_ok) {
+        throw_napi(env);
+        return false;
+    }
+    char **names = calloc(len ? len : 1, sizeof *names);
     if (!names) {
         napi_throw_error(env, NULL, "out of memory");
-        return NULL;
+        return false;
     }
     /* `got` counts the strings to free: every one read before a throw. */
-    for (; got < n; got++) {
+    for (; got < len; got++) {
         napi_value el;
-        if (napi_get_element(env, argv[0], got, &el) != napi_ok) {
+        if (napi_get_element(env, v, got, &el) != napi_ok) {
             throw_napi(env);
             break;
         }
@@ -1300,15 +1428,25 @@ static napi_value identity_generate_for(napi_env env, napi_callback_info info) {
         if (!names[got])
             break;
     }
-    if (got == n) {
-        weida_identity *id = NULL;
-        int rc = weida_identity_generate_for((const char *const *)names, n, &id);
-        result = rc < 0 ? throw_rc(env, rc) : wrap(env, id, drop_identity);
+    if (got < len) {
+        free_strings(names, got);
+        return false;
     }
-    for (uint32_t i = 0; i < got; i++)
-        free(names[i]);
-    free(names);
-    return result;
+    *out = names;
+    *n = len;
+    return true;
+}
+
+static napi_value identity_generate_for(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    char **names = NULL;
+    uint32_t n = 0;
+    if (!string_array(env, argv[0], &names, &n))
+        return NULL;
+    weida_identity *id = NULL;
+    int rc = weida_identity_generate_for((const char *const *)names, n, &id);
+    free_strings(names, n);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, id, drop_identity);
 }
 
 static napi_value identity_from_pem_file(napi_env env, napi_callback_info info) {
@@ -1443,6 +1581,104 @@ static napi_value server_tls_require_any_key(napi_env env, napi_callback_info in
     int rc = weida_server_tls_require_any_key(tls);
     return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
 }
+
+/* identity and trust sources, ALPN */
+
+BOOL_OUT(trust_is_empty, trust, is_empty)
+FROM_HANDLE(client_tls_new_source, client_tls_new_source, trust_source, client_tls)
+WITH_HANDLE(client_tls_set_identity_source, client_tls, set_identity_source, identity_source)
+SET_INT(client_tls_set_alpn, client_tls, alpn)
+FROM_HANDLE(server_tls_new_source, server_tls_new_source, identity_source, server_tls)
+WITH_HANDLE(server_tls_require_client_source, server_tls, require_client_source, trust_source)
+SET_INT(server_tls_set_alpn, server_tls, alpn)
+
+NEW0(files_options_new, files_options)
+
+static napi_value files_options_set_names(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_files_options *o = live(env, argv[0], drop_files_options);
+    char **names = NULL;
+    uint32_t n = 0;
+    if (!o || !string_array(env, argv[1], &names, &n))
+        return NULL;
+    int rc = weida_files_options_set_names(o, (const char *const *)names, n);
+    free_strings(names, n);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+SET_U64(files_options_set_poll_ms, files_options, poll_ms, UINT64_MAX)
+
+FROM_HANDLE(identity_source_from_identity, identity_source_from_identity, identity,
+            identity_source)
+
+static napi_value identity_source_ephemeral(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    char **names = NULL;
+    uint32_t n = 0;
+    if (!string_array(env, argv[0], &names, &n))
+        return NULL;
+    weida_identity_source *out = NULL;
+    int rc = weida_identity_source_ephemeral((const char *const *)names, n, &out);
+    free_strings(names, n);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_identity_source);
+}
+
+FROM_HANDLE(identity_source_external, identity_source_external, identity, identity_source)
+
+/* (dir, options): the JS layer always passes live options. */
+static napi_value identity_source_files(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_files_options *o = live(env, argv[1], drop_files_options);
+    if (!o)
+        return NULL;
+    char *dir = get_string(env, argv[0]);
+    if (!dir)
+        return NULL;
+    weida_identity_source *out = NULL;
+    int rc = weida_identity_source_files(dir, o, &out);
+    free(dir);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_identity_source);
+}
+
+FROM_HANDLE(identity_source_current, identity_source_current, identity_source, identity)
+
+static napi_value identity_source_fingerprint(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_identity_source *src = live(env, argv[0], drop_identity_source);
+    char buf[WEIDA_FINGERPRINT_LEN + 1];
+    if (!src)
+        return NULL;
+    int rc = weida_identity_source_fingerprint(src, buf, sizeof buf);
+    return rc < 0 ? throw_rc(env, rc) : js_string(env, buf, WEIDA_FINGERPRINT_LEN);
+}
+
+WITH_HANDLE(identity_source_update, identity_source, update, identity)
+TEXT_ARG(identity_source_report_failure, identity_source, report_failure)
+
+static napi_value identity_source_report_handoff_stolen(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_identity_source *src = live(env, argv[0], drop_identity_source);
+    if (!src)
+        return NULL;
+    int rc = weida_identity_source_report_handoff_stolen(src);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+BOOL_OUT(identity_source_reload, identity_source, reload)
+FROM_HANDLE(identity_source_events, identity_source_events, identity_source, identity_events)
+FROM_HANDLE(identity_source_downgrade, identity_source_downgrade, identity_source,
+            weak_identity_source)
+UPGRADE(weak_identity_source_upgrade, identity_source)
+
+FROM_HANDLE(trust_source_from_trust, trust_source_from_trust, trust, trust_source)
+FROM_HANDLE(trust_source_external, trust_source_external, trust, trust_source)
+FROM_HANDLE(trust_source_current, trust_source_current, trust_source, trust)
+WITH_HANDLE(trust_source_update, trust_source, update, trust)
+TEXT_ARG(trust_source_report_failure, trust_source, report_failure)
+BOOL_OUT(trust_source_is_empty, trust_source, is_empty)
+FROM_HANDLE(trust_source_events, trust_source_events, trust_source, identity_events)
+FROM_HANDLE(trust_source_downgrade, trust_source_downgrade, trust_source, weak_trust_source)
+UPGRADE(weak_trust_source_upgrade, trust_source)
 
 /* transfer meta */
 
@@ -1970,6 +2206,21 @@ static napi_value peer_events_recv(napi_env env, napi_callback_info info) {
     return outcome(env, rc, event_value, event);
 }
 
+FD(identity_events_fd, identity_events)
+
+/* -> event | null | AGAIN; null once the source is gone */
+static napi_value identity_events_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_identity_events *e = live(env, argv[0], drop_identity_events);
+    weida_identity_event *event = NULL;
+    if (!e)
+        return NULL;
+    int rc = weida_identity_events_recv(e, 0, &event);
+    if (rc == 0 && !event)
+        return js_null(env);
+    return outcome(env, rc, identity_event_value, event);
+}
+
 /* relay */
 
 FD(relay_fd, relay)
@@ -2190,6 +2441,15 @@ static napi_value constants(napi_env env) {
     CONSTANT(GIVE_UP_POLICY)
     CONSTANT(GIVE_UP_PEER_CHANGED)
     CONSTANT(GIVE_UP_FAILED)
+    CONSTANT(ALPN_WEIDA)
+    CONSTANT(ALPN_RAFT)
+    CONSTANT(IDENTITY_EVENT_LOADED)
+    CONSTANT(IDENTITY_EVENT_RENEWED)
+    CONSTANT(IDENTITY_EVENT_KEY_CHANGED)
+    CONSTANT(IDENTITY_EVENT_RENEWAL_FAILED)
+    CONSTANT(IDENTITY_EVENT_HANDOFF_STOLEN)
+    CONSTANT(IDENTITY_EVENT_TRUST_REFRESHED)
+    CONSTANT(IDENTITY_EVENT_MISSED)
 #undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
@@ -2343,6 +2603,38 @@ NAPI_MODULE_INIT() {
         FN("serverTlsNew", server_tls_new),
         FN("serverTlsRequireClient", server_tls_require_client),
         FN("serverTlsRequireAnyKey", server_tls_require_any_key),
+        FN("trustIsEmpty", trust_is_empty),
+        FN("clientTlsNewSource", client_tls_new_source),
+        FN("clientTlsSetIdentitySource", client_tls_set_identity_source),
+        FN("clientTlsSetAlpn", client_tls_set_alpn),
+        FN("serverTlsNewSource", server_tls_new_source),
+        FN("serverTlsRequireClientSource", server_tls_require_client_source),
+        FN("serverTlsSetAlpn", server_tls_set_alpn),
+        FN("filesOptionsNew", files_options_new),
+        FN("filesOptionsSetNames", files_options_set_names),
+        FN("filesOptionsSetPollMs", files_options_set_poll_ms),
+        FN("identitySourceFromIdentity", identity_source_from_identity),
+        FN("identitySourceEphemeral", identity_source_ephemeral),
+        FN("identitySourceExternal", identity_source_external),
+        FN("identitySourceFiles", identity_source_files),
+        FN("identitySourceCurrent", identity_source_current),
+        FN("identitySourceFingerprint", identity_source_fingerprint),
+        FN("identitySourceUpdate", identity_source_update),
+        FN("identitySourceReportFailure", identity_source_report_failure),
+        FN("identitySourceReportHandoffStolen", identity_source_report_handoff_stolen),
+        FN("identitySourceReload", identity_source_reload),
+        FN("identitySourceEvents", identity_source_events),
+        FN("identitySourceDowngrade", identity_source_downgrade),
+        FN("weakIdentitySourceUpgrade", weak_identity_source_upgrade),
+        FN("trustSourceFromTrust", trust_source_from_trust),
+        FN("trustSourceExternal", trust_source_external),
+        FN("trustSourceCurrent", trust_source_current),
+        FN("trustSourceUpdate", trust_source_update),
+        FN("trustSourceReportFailure", trust_source_report_failure),
+        FN("trustSourceIsEmpty", trust_source_is_empty),
+        FN("trustSourceEvents", trust_source_events),
+        FN("trustSourceDowngrade", trust_source_downgrade),
+        FN("weakTrustSourceUpgrade", weak_trust_source_upgrade),
         FN("transferMetaNew", transfer_meta_new),
         FN("transferMetaSetContentType", transfer_meta_set_content_type),
         FN("transferMetaSetContentLen", transfer_meta_set_content_len),
@@ -2414,6 +2706,8 @@ NAPI_MODULE_INIT() {
         FN("requesterEvents", requester_events),
         FN("peerEventsFd", peer_events_fd),
         FN("peerEventsRecv", peer_events_recv),
+        FN("identityEventsFd", identity_events_fd),
+        FN("identityEventsRecv", identity_events_recv),
         FN("relayFd", relay_fd),
         FN("relayAccept", relay_accept),
         FN("relayRequestPeerFingerprint", relay_request_peer_fingerprint),

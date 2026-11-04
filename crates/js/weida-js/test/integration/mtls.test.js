@@ -1,5 +1,5 @@
 // Client keys over real QUIC on localhost: required clients, the chain the
-// server sees, anchors and identity files.
+// server sees, anchors, identity files, identity sources and ALPN.
 import assert from "node:assert/strict";
 import { X509Certificate } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -129,4 +129,61 @@ test("identity and anchor files read back", INTEGRATION, async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a files identity source rotates a binding's certificate and its events report it", INTEGRATION, async () => {
+  const parent = mkdtempSync(join(tmpdir(), "weida-js-"));
+  try {
+    const dir = join(parent, "identity");
+    const source = weida.IdentitySource.files(dir, { names: ["127.0.0.1"], pollMs: 0 });
+    const old = source.fingerprint();
+    const events = source.events();
+    const s = await serve(new weida.ServerTls(source));
+    const first = s.runtime.requester(new weida.ClientTls(new weida.Trust().addPin(old)));
+    await roundTrip(first, s.replier, s.url);
+
+    // An agent rewrites the files: the certificate first, the key second.
+    const fresh = weida.Identity.generate();
+    writeFileSync(join(dir, "cert.pem"), fresh.certificatePem());
+    const pem = fresh.toPem();
+    writeFileSync(join(dir, "key.pem"), pem, { mode: 0o600 });
+    pem.fill(0);
+
+    const second = s.runtime.requester(
+      new weida.ClientTls(weida.TrustSource.fromTrust(new weida.Trust().addPin(fresh.fingerprint()))),
+    );
+    await roundTrip(second, s.replier, s.url);
+    const event = await events.recv();
+    assert.ok(Object.isFrozen(event));
+    assert.equal(event.kind, "WEIDA_IDENTITY_EVENT_KEY_CHANGED");
+    assert.equal(event.from, old);
+    assert.equal(event.to, fresh.fingerprint());
+    assert.equal(source.fingerprint(), fresh.fingerprint());
+    events.drop();
+    await s.close(first, second);
+    source.drop();
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("a mismatched ALPN rejects the dial with WEIDA_ETLS", INTEGRATION, async () => {
+  const server = weida.Identity.generate();
+  const client = weida.Identity.generate();
+  const s = await serve(
+    new weida.ServerTls(server, {
+      alpn: "WEIDA_ALPN_RAFT",
+      requireClient: weida.TrustSource.fromTrust(new weida.Trust().addPin(client.fingerprint())),
+    }),
+  );
+  const id = weida.IdentitySource.fromIdentity(client);
+  const trust = new weida.Trust().addPin(server.fingerprint());
+  const plain = s.runtime.requester(new weida.ClientTls(trust, { identity: id }));
+  await refused(plain, s.url);
+  const raft = s.runtime.requester(
+    new weida.ClientTls(trust, { identity: id, alpn: "WEIDA_ALPN_RAFT" }),
+  );
+  const meta = await roundTrip(raft, s.replier, s.url);
+  assert.equal(meta.peerFingerprint, client.fingerprint());
+  await s.close(plain, raft);
 });

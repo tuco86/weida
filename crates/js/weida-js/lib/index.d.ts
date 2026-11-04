@@ -78,6 +78,15 @@ export type PeerEventKind =
   | "WEIDA_PEER_EVENT_GAVE_UP"
   | "WEIDA_PEER_EVENT_MISSED";
 export type GiveUp = "WEIDA_GIVE_UP_POLICY" | "WEIDA_GIVE_UP_PEER_CHANGED" | "WEIDA_GIVE_UP_FAILED";
+export type Alpn = "WEIDA_ALPN_WEIDA" | "WEIDA_ALPN_RAFT";
+export type IdentityEventKind =
+  | "WEIDA_IDENTITY_EVENT_LOADED"
+  | "WEIDA_IDENTITY_EVENT_RENEWED"
+  | "WEIDA_IDENTITY_EVENT_KEY_CHANGED"
+  | "WEIDA_IDENTITY_EVENT_RENEWAL_FAILED"
+  | "WEIDA_IDENTITY_EVENT_HANDOFF_STOLEN"
+  | "WEIDA_IDENTITY_EVENT_TRUST_REFRESHED"
+  | "WEIDA_IDENTITY_EVENT_MISSED";
 
 /** `weida::Limits`, the per-connection profile; unset fields keep weida's
  * defaults. */
@@ -283,6 +292,31 @@ export interface PeerEvent {
   readonly missed: bigint | null;
 }
 
+/** One transition of an identity or trust source; a field of another kind
+ * is null. */
+export interface IdentityEvent {
+  readonly kind: IdentityEventKind;
+  /** LOADED, RENEWED: the key's fingerprint. */
+  readonly fingerprint: string | null;
+  /** KEY_CHANGED: the fingerprint that was. */
+  readonly from: string | null;
+  /** KEY_CHANGED: the fingerprint that is. */
+  readonly to: string | null;
+  /** RENEWAL_FAILED: why. */
+  readonly message: string | null;
+  /** MISSED: how many events this reader lost. */
+  readonly missed: bigint | null;
+}
+
+/** How a file source watches its directory; an unknown field throws a
+ * TypeError. */
+export interface FilesOptions {
+  /** Names the bootstrapped certificate is made for, when the directory is empty. */
+  names?: string[] | null;
+  /** How often the files' modification times are checked, at the next use; 0 checks at every use. */
+  pollMs?: Count | null;
+}
+
 /** What one drain achieved, as counts of the transfers still
  * unacknowledged when it started. */
 export interface Drained {
@@ -344,6 +378,8 @@ export class Trust extends Handle {
   addAnchor(anchor: X509Certificate | Bytes): this;
   /** Trusts the certificate authorities in a PEM file, read at each dial. */
   addAnchorFile(path: string): this;
+  /** Whether the trust holds no pin and no anchor. */
+  isEmpty(): boolean;
 }
 
 export class Identity extends Handle {
@@ -368,14 +404,62 @@ export class Identity extends Handle {
 }
 
 export class ClientTls extends Handle {
-  /** Dials under `trust`, presenting `identity` when given. */
-  constructor(trust: Trust, options?: { identity?: Identity });
+  /** Dials under `trust` (a `Trust` is copied, a `TrustSource` shared),
+   * presenting `identity` when given, asking for `alpn`. */
+  constructor(trust: Trust | TrustSource, options?: { identity?: Identity | IdentitySource; alpn?: Alpn });
 }
 
 export class ServerTls extends Handle {
-  /** Serves as `identity`; `requireClient` requires every client to present
-   * a key the trust accepts, or with "any-key" any key it proves. */
-  constructor(identity: Identity, options?: { requireClient?: Trust | "any-key" });
+  /** Serves as `identity` (an `Identity` is copied, an `IdentitySource`
+   * shared); `requireClient` requires every client to present a key the
+   * trust accepts, or with "any-key" any key it proves; offers `alpn`. */
+  constructor(
+    identity: Identity | IdentitySource,
+    options?: { requireClient?: Trust | TrustSource | "any-key"; alpn?: Alpn },
+  );
+}
+
+/** Where an identity comes from; shared by the TLS terms made from it. */
+export class IdentitySource extends Handle {
+  static fromIdentity(identity: Identity): IdentitySource;
+  static ephemeral(names?: string[]): IdentitySource;
+  static external(identity: Identity): IdentitySource;
+  /** `cert.pem` and `key.pem` in `dir`, bootstrapped when empty, reloaded when changed. */
+  static files(dir: string, options?: FilesOptions | null): IdentitySource;
+  current(): Identity;
+  fingerprint(): string;
+  update(identity: Identity): void;
+  reportFailure(reason: string): void;
+  reportHandoffStolen(): void;
+  /** true when the files changed and were loaded. */
+  reload(): boolean;
+  /** A new reader of this source's events, from now on. */
+  events(): IdentityEvents;
+  downgrade(): WeakIdentitySource;
+}
+
+export class WeakIdentitySource extends Handle {
+  /** The source while anything holds it, else null. */
+  upgrade(): IdentitySource | null;
+}
+
+/** Whom a peer is accepted as, as a source; shared by the TLS terms made from it. */
+export class TrustSource extends Handle {
+  static fromTrust(trust: Trust): TrustSource;
+  static external(trust: Trust): TrustSource;
+  /** A copy of the trust of the moment. */
+  current(): Trust;
+  update(trust: Trust): void;
+  reportFailure(reason: string): void;
+  isEmpty(): boolean;
+  /** A new reader of this source's events, from now on. */
+  events(): IdentityEvents;
+  downgrade(): WeakTrustSource;
+}
+
+export class WeakTrustSource extends Handle {
+  /** The source while anything holds it, else null. */
+  upgrade(): TrustSource | null;
 }
 
 export class Listener extends Handle {
@@ -455,6 +539,12 @@ export class PeerEvents extends Handle {
   /** The next event, or null once the requester, or the relayed binding's registration, is gone. */
   recv(options?: WaitOptions): Promise<PeerEvent | null>;
   [Symbol.asyncIterator](): AsyncGenerator<PeerEvent, void, undefined>;
+}
+
+export class IdentityEvents extends Handle {
+  /** The next event, or null once the source is gone. */
+  recv(options?: WaitOptions): Promise<IdentityEvent | null>;
+  [Symbol.asyncIterator](): AsyncGenerator<IdentityEvent, void, undefined>;
 }
 
 export class Replier extends Handle {
