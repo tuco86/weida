@@ -34,6 +34,57 @@ export const CURSOR_LEVEL_APPLICATION_FLOOR: number;
 /** The `datagramReceiveBytes` a profile with flows uses. */
 export const DEFAULT_DATAGRAM_RECEIVE_BYTES: number;
 
+/** The bytes of a blob id: a BLAKE3 hash. */
+export const BLOB_ID_LEN: number;
+
+/** The most pieces a blob has. */
+export const MAX_PIECES: number;
+
+/** The smallest piece size as its base-2 logarithm: 1 KiB. */
+export const PIECE_SIZE_MIN_LOG2: number;
+
+/** The largest piece size as its base-2 logarithm: 16 MiB. */
+export const PIECE_SIZE_MAX_LOG2: number;
+
+/** The default piece size as its base-2 logarithm: 1 MiB. */
+export const PIECE_SIZE_DEFAULT_LOG2: number;
+
+/** The id of `data`: its BLAKE3 hash, `BLOB_ID_LEN` bytes. */
+export function blobIdOf(data: Bytes): Uint8Array;
+
+/** What a swarm asks a seeder about one blob. */
+export type AskKind = "WEIDA_ASK_LIST" | "WEIDA_ASK_HAVE" | "WEIDA_ASK_PIECE";
+
+/** One order of a fetch: `index` is the piece of a PIECE, 0 otherwise. */
+export interface Ask {
+  readonly kind: AskKind;
+  readonly index: number;
+}
+
+/** One verified piece: its bytes are `Blob.span(index)` of the blob. */
+export interface Piece {
+  readonly index: number;
+  readonly bytes: Uint8Array;
+}
+
+/** How a fetch orders; an unknown field is a `TypeError`. */
+export interface FetchOptions {
+  /** The piece list of an earlier fetch of the same blob, which spares the LIST order. */
+  list?: PieceList | null;
+  /** The fixed part of every answer's deadline. Default 30000. */
+  stallMs?: Count;
+  /** Bytes per second below which an answer is too slow. Default 65536; zero counts as one. */
+  minRate?: Count;
+  /** The most orders one seeder holds at once. Default 8; zero counts as one. */
+  perPeer?: Count;
+  /** Orders over all seeders at once. Default 32; zero counts as one. */
+  maxInflight?: Count;
+  /** The seeders a fetch takes pieces from. Default unbounded. */
+  maxPeers?: Count;
+  /** How long a seeder with nothing to take waits before it is asked HAVE again. Default 5000. */
+  haveRefreshMs?: Count;
+}
+
 // Enumerations travel as the names of the weida.h constants.
 export type Congestion = "WEIDA_CONGESTION_CUBIC" | "WEIDA_CONGESTION_NEW_RENO" | "WEIDA_CONGESTION_BBR";
 export type Discovery = "WEIDA_DISCOVERY_AWARE" | "WEIDA_DISCOVERY_SINGLE";
@@ -541,6 +592,8 @@ export class Runtime extends Handle {
   dish(clientTls: ClientTls): Dish;
   /** A raw peer that opens datagram flows. */
   peer(clientTls: ClientTls): Peer;
+  /** A swarm: fetches one blob from every seeder it connected at once. */
+  swarm(clientTls: ClientTls): Swarm;
   /** Duplicates discarded inside a negotiated deduplication window. */
   suppressedDuplicates(): bigint;
   /** Outgoing transfers reset because their deadline passed. */
@@ -670,6 +723,8 @@ export class Listener extends Handle {
   radio(path: string): Radio;
   /** A raw acceptor: both stream kinds and flows on `path`, tagged. */
   acceptor(path: string): Acceptor;
+  /** A seeder: hands each fetch's session to the application. */
+  seeder(path: string): Seeder;
   /** Serves a relay on this listener's bindings. */
   relay(): Relay;
 }
@@ -934,6 +989,99 @@ export class SurveyRun extends Handle {
 export class Respondent extends Handle {
   path(): string | null;
   accept(options?: WaitOptions): Promise<IncomingRequest>;
+}
+
+/** A blob: its root, size and piece size; WEIDA_EINVAL for a piece size out
+ * of range, more than `MAX_PIECES` pieces, or an empty blob whose root is
+ * not the hash of no bytes. */
+export class Blob extends Handle {
+  constructor(root: Uint8Array, size: Count, pieceLog2?: number);
+  root(): Uint8Array;
+  size(): bigint;
+  pieceLog2(): number;
+  count(): number;
+  /** The byte range of piece `index`, end exclusive; null past the last piece. */
+  span(index: number): { readonly start: bigint; readonly end: bigint } | null;
+}
+
+export class PieceList extends Handle {
+  static of(data: Bytes, pieceLog2?: number): PieceList;
+  /** WEIDA_EINVAL unless the bytes hash to the blob's root. */
+  static parse(blob: Blob, data: Uint8Array): PieceList;
+  blob(): Blob;
+  /** A copy; empty for a blob of at most one piece. */
+  toBytes(): Uint8Array;
+  check(index: number, piece: Bytes): boolean;
+}
+
+export class TreeHasher extends Handle {
+  constructor(pieceLog2?: number);
+  update(data: Bytes): this;
+  /** Consumes the hasher. */
+  finish(): PieceList;
+}
+
+export class Bits extends Handle {
+  /** `len` bits, all clear. */
+  constructor(len: number);
+  static full(len: number): Bits;
+  /** Bit `i` is bit `i % 8`, least significant first, of byte `i / 8`; padding bits clear. */
+  static fromBytes(len: number, data: Uint8Array): Bits;
+  /** A copy. */
+  asBytes(): Uint8Array;
+  len(): number;
+  get(index: number): boolean;
+  set(index: number, on: boolean): this;
+  ones(): number;
+  all(): boolean;
+}
+
+export class Swarm extends Handle {
+  connect(url: string, options?: WaitOptions): Promise<void>;
+  /** Whether the address was dialled. */
+  disconnect(url: string): boolean;
+  peerCount(): number;
+  connectionStats(): readonly ConnectionStats[];
+  events(): PeerEvents;
+  /** Nothing is ordered before the first `next`; WEIDA_EINVAL for a `have`
+   * without one bit per piece or a list of another blob. */
+  fetch(blob: Blob, have: Bits, options?: FetchOptions | null): Fetch;
+}
+
+/** Dropping it aborts every order in flight. */
+export class Fetch extends Handle {
+  blob(): Blob;
+  /** WEIDA_EINVAL while a `next` is pending. */
+  list(): PieceList | null;
+  /** WEIDA_EINVAL while a `next` is pending. */
+  delivered(): Bits;
+  /** WEIDA_EINVAL while a `next` is pending. */
+  inFlight(): Bits;
+  /** The next verified piece, or null once every piece is held; rejects
+   * with WEIDA_ENOT_CONNECTED when no seeder is left. */
+  next(options?: WaitOptions): Promise<Piece | null>;
+  /** Ends at null and leaves the fetch alive. */
+  [Symbol.asyncIterator](): AsyncGenerator<Piece, void, undefined>;
+}
+
+export class Seeder extends Handle {
+  path(): string | null;
+  accept(options?: WaitOptions): Promise<SeedSession>;
+}
+
+/** Its calls are one at a time; WEIDA_EINVAL otherwise. */
+export class SeedSession extends Handle {
+  blob(): Blob;
+  meta(): IncomingMeta;
+  /** The number of the connection this session arrived on. */
+  connection(): bigint;
+  /** The next order, or null once the fetch finished its orders. */
+  next(options?: WaitOptions): Promise<Ask | null>;
+  answerList(list: PieceList, options?: WaitOptions): Promise<void>;
+  answerHave(have: Bits, options?: WaitOptions): Promise<void>;
+  answerPiece(data: Bytes, options?: WaitOptions): Promise<void>;
+  /** Consumes the session. */
+  decline(options?: WaitOptions): Promise<void>;
 }
 
 export class BusMember extends Handle {

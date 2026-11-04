@@ -323,6 +323,16 @@ const SEGMENT_FIELDS = [
   ["followsUpstream", native.segmentTermsSetFollowsUpstream, "value"],
 ];
 
+const FETCH_FIELDS = [
+  ["list", (h, list) => native.fetchOptionsSetList(h, handleOf(list, PieceList)), "value"],
+  ["stallMs", native.fetchOptionsSetStallMs, "value"],
+  ["minRate", native.fetchOptionsSetMinRate, "value"],
+  ["perPeer", native.fetchOptionsSetPerPeer, "value"],
+  ["maxInflight", native.fetchOptionsSetMaxInflight, "value"],
+  ["maxPeers", native.fetchOptionsSetMaxPeers, "value"],
+  ["haveRefreshMs", native.fetchOptionsSetHaveRefreshMs, "value"],
+];
+
 /** How many layers a segment carries: 0 to 15. */
 export const MAX_SEGMENT_LAYERS = native.CONSTANTS.WEIDA_MAX_SEGMENT_LAYERS;
 
@@ -334,6 +344,27 @@ export const CURSOR_LEVEL_APPLICATION_FLOOR =
 /** The `datagramReceiveBytes` a profile with flows uses. */
 export const DEFAULT_DATAGRAM_RECEIVE_BYTES =
   native.CONSTANTS.WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES;
+
+/** The bytes of a blob id: a BLAKE3 hash. */
+export const BLOB_ID_LEN = native.CONSTANTS.WEIDA_BLOB_ID_LEN;
+
+/** The most pieces a blob has. */
+export const MAX_PIECES = native.CONSTANTS.WEIDA_MAX_PIECES;
+
+/** The smallest piece size as its base-2 logarithm: 1 KiB. */
+export const PIECE_SIZE_MIN_LOG2 = native.CONSTANTS.WEIDA_PIECE_SIZE_MIN_LOG2;
+
+/** The largest piece size as its base-2 logarithm: 16 MiB. */
+export const PIECE_SIZE_MAX_LOG2 = native.CONSTANTS.WEIDA_PIECE_SIZE_MAX_LOG2;
+
+/** The default piece size as its base-2 logarithm: 1 MiB. */
+export const PIECE_SIZE_DEFAULT_LOG2 = native.CONSTANTS.WEIDA_PIECE_SIZE_DEFAULT_LOG2;
+
+/** The id of `data` (a string is hashed as UTF-8): its BLAKE3 hash,
+ * `BLOB_ID_LEN` bytes. */
+export function blobIdOf(data) {
+  return native.blobIdOf(bytes(data));
+}
 
 const FLOW_META_FIELDS = [
   ["contentType", native.flowMetaSetContentType, "value"],
@@ -560,6 +591,12 @@ export class Runtime extends Handle {
   /** A raw peer dialling on `clientTls`, which opens datagram flows. */
   peer(clientTls) {
     return adopt(Peer, native.runtimePeer(this[HANDLE], handleOf(clientTls, ClientTls)));
+  }
+
+  /** A swarm dialling seeders on `clientTls`: it fetches one blob from
+   * every seeder it connected at once. */
+  swarm(clientTls) {
+    return adopt(Swarm, native.runtimeSwarm(this[HANDLE], handleOf(clientTls, ClientTls)));
   }
 
   /** Duplicates this runtime's connections discarded inside a negotiated
@@ -1076,6 +1113,12 @@ export class Listener extends Handle {
    * the path, tagged. */
   acceptor(path) {
     return adopt(Acceptor, native.listenerAcceptor(this[HANDLE], path));
+  }
+
+  /** A seeder serving `path`: it hands each fetch's session to the
+   * application, which answers its orders from its own storage. */
+  seeder(path) {
+    return adopt(Seeder, native.listenerSeeder(this[HANDLE], path));
   }
 }
 
@@ -2387,6 +2430,385 @@ export class Respondent extends Handle {
       signal,
     );
     return adopt(IncomingRequest, request);
+  }
+}
+
+/** A blob: its root (`BLOB_ID_LEN` bytes, the BLAKE3 hash of its bytes),
+ * its size in bytes and its piece size, `2 ** pieceLog2` bytes. More than
+ * `MAX_PIECES` pieces, a piece size outside `PIECE_SIZE_MIN_LOG2` to
+ * `PIECE_SIZE_MAX_LOG2`, or an empty blob whose root is not the hash of no
+ * bytes throws WEIDA_EINVAL. */
+export class Blob extends Handle {
+  constructor(root, size, pieceLog2 = PIECE_SIZE_DEFAULT_LOG2) {
+    super();
+    init(this, native.blobNew(root, size, pieceLog2));
+  }
+
+  /** The hash of the whole blob, a fresh Uint8Array. */
+  root() {
+    return native.blobRoot(this[HANDLE]);
+  }
+
+  /** The length in bytes, a BigInt. */
+  size() {
+    return native.blobSize(this[HANDLE]);
+  }
+
+  /** The piece size's base-2 logarithm. */
+  pieceLog2() {
+    return native.blobPieceLog2(this[HANDLE]);
+  }
+
+  /** The number of pieces: the size over the piece size, rounded up. */
+  count() {
+    return native.blobCount(this[HANDLE]);
+  }
+
+  /** The byte range of piece `index`, a frozen `{ start, end }` of BigInts,
+   * end exclusive; null past the last piece. */
+  span(index) {
+    const span = native.blobSpan(this[HANDLE], index);
+    return span === null ? null : Object.freeze(span);
+  }
+}
+
+/** The piece hashes of a blob, checked against its root. */
+export class PieceList extends Handle {
+  constructor() {
+    super();
+    noConstructor("PieceList", "PieceList.of(), .parse(), TreeHasher.finish() or Fetch.list()");
+  }
+
+  /** The piece list of `data` (a string is hashed as UTF-8) cut into pieces
+   * of `2 ** pieceLog2` bytes; its `blob()` holds the root. */
+  static of(data, pieceLog2 = PIECE_SIZE_DEFAULT_LOG2) {
+    return adopt(PieceList, native.pieceListOf(bytes(data), pieceLog2));
+  }
+
+  /** The piece list of `blob` from its bytes, as `toBytes()` gives them:
+   * WEIDA_EINVAL unless they hash to the blob's root. */
+  static parse(blob, data) {
+    return adopt(PieceList, native.pieceListParse(handleOf(blob, Blob), data));
+  }
+
+  /** The blob this list belongs to. */
+  blob() {
+    return adopt(Blob, native.pieceListBlob(this[HANDLE]));
+  }
+
+  /** The chaining values one after the other, 32 bytes each, a copy; empty
+   * for a blob of at most one piece. */
+  toBytes() {
+    return native.pieceListToBytes(this[HANDLE]);
+  }
+
+  /** Whether `piece` (a string is checked as UTF-8) is piece `index` of
+   * the blob; false past the last piece. */
+  check(index, piece) {
+    return native.pieceListCheck(this[HANDLE], index, bytes(piece));
+  }
+}
+
+/** Builds a piece list in one pass over a blob's bytes, fed in order. */
+export class TreeHasher extends Handle {
+  constructor(pieceLog2 = PIECE_SIZE_DEFAULT_LOG2) {
+    super();
+    init(this, native.treeHasherNew(pieceLog2));
+  }
+
+  /** Feeds the next bytes of the blob (a string as UTF-8); returns this
+   * hasher. */
+  update(data) {
+    native.treeHasherUpdate(this[HANDLE], bytes(data));
+    return this;
+  }
+
+  /** Ends the bytes: their piece list, whose `blob()` holds the root.
+   * Consumes the hasher. */
+  finish() {
+    return adopt(PieceList, native.treeHasherFinish(consume(this)));
+  }
+}
+
+/** A map of held pieces, one bit per piece. */
+export class Bits extends Handle {
+  /** `len` bits, all clear. */
+  constructor(len) {
+    super();
+    init(this, native.bitsNew(len));
+  }
+
+  /** `len` bits, all set. */
+  static full(len) {
+    return adopt(Bits, native.bitsFull(len));
+  }
+
+  /** `len` bits from the bytes they travel as: bit `i` is bit `i % 8`,
+   * least significant first, of byte `i / 8`, padding bits clear. */
+  static fromBytes(len, data) {
+    return adopt(Bits, native.bitsFromBytes(len, data));
+  }
+
+  /** The bits as they travel, a copy. */
+  asBytes() {
+    return native.bitsAsBytes(this[HANDLE]);
+  }
+
+  len() {
+    return native.bitsLen(this[HANDLE]);
+  }
+
+  /** Whether bit `index` is set; false past the end. */
+  get(index) {
+    return native.bitsGet(this[HANDLE], index);
+  }
+
+  /** Sets or clears bit `index`; past the end it does nothing. Returns
+   * this map. */
+  set(index, on) {
+    native.bitsSet(this[HANDLE], index, on);
+    return this;
+  }
+
+  /** How many bits are set. */
+  ones() {
+    return native.bitsOnes(this[HANDLE]);
+  }
+
+  /** Whether every bit is set; true for no bits at all. */
+  all() {
+    return native.bitsAll(this[HANDLE]);
+  }
+}
+
+/** The dialling half of SWARM: fetches one blob from every connected seeder
+ * at once, each piece verified against the root. */
+export class Swarm extends Handle {
+  constructor() {
+    super();
+    noConstructor("Swarm", "Runtime.swarm()");
+  }
+
+  /** Dials the seeder at `url`; the runtime redials it when the connection
+   * is lost. A seeder connected during a fetch joins it at its next read. */
+  async connect(url, { signal } = {}) {
+    await op(
+      this,
+      () => native.swarmConnect(this[HANDLE], url),
+      native.swarmConnectOpWait,
+      native.swarmConnectOpFd,
+      signal,
+    );
+  }
+
+  /** Forgets a dialled address: whether it was dialled. */
+  disconnect(url) {
+    return native.swarmDisconnect(this[HANDLE], url);
+  }
+
+  /** The number of connected seeders. */
+  peerCount() {
+    return native.swarmPeerCount(this[HANDLE]);
+  }
+
+  /** A frozen array with one frozen record per live connection, as
+   * `Requester.connectionStats`. */
+  connectionStats() {
+    return Object.freeze(native.swarmConnectionStats(this[HANDLE]).map(freezeStats));
+  }
+
+  /** A new reader of this swarm's events, from now on. */
+  events() {
+    return adopt(PeerEvents, native.swarmEvents(this[HANDLE]));
+  }
+
+  /** Starts fetching the pieces of `blob` that `have` (a `Bits` of one bit
+   * per piece) lacks, ordered as `options` says: `{ list?, stallMs?,
+   * minRate?, perPeer?, maxInflight?, maxPeers?, haveRefreshMs? }`, or the
+   * defaults. `have` and the options are copied. Nothing is ordered before
+   * the first `next`. */
+  fetch(blob, have, options = null) {
+    return withFields(options, native.fetchOptionsNew, FETCH_FIELDS, "FetchOptions", (o) =>
+      adopt(
+        Fetch,
+        native.swarmFetch(this[HANDLE], handleOf(blob, Blob), handleOf(have, Bits), o),
+      ),
+    );
+  }
+}
+
+/** One blob being fetched: its verified pieces, in any order. Dropping it
+ * aborts every order in flight. */
+export class Fetch extends Handle {
+  constructor() {
+    super();
+    noConstructor("Fetch", "Swarm.fetch()");
+  }
+
+  /** The blob being fetched. */
+  blob() {
+    return adopt(Blob, native.fetchBlob(this[HANDLE]));
+  }
+
+  /** The piece list once it is known and verified, or null: keep it to
+   * resume without asking for it (`{ list }`). WEIDA_EINVAL while a `next`
+   * is pending. */
+  list() {
+    const list = native.fetchList(this[HANDLE]);
+    return list === null ? null : adopt(PieceList, list);
+  }
+
+  /** The pieces the caller holds: those it started with and those this
+   * fetch yielded, a copy. WEIDA_EINVAL while a `next` is pending. */
+  delivered() {
+    return adopt(Bits, native.fetchDelivered(this[HANDLE]));
+  }
+
+  /** The pieces ordered and not yet taken, a copy. WEIDA_EINVAL while a
+   * `next` is pending. */
+  inFlight() {
+    return adopt(Bits, native.fetchInFlight(this[HANDLE]));
+  }
+
+  /** The next verified piece, a frozen `{ index, bytes }` copied out at
+   * once, or null once every piece is held. Rejects with
+   * WEIDA_ENOT_CONNECTED when no seeder is left that has not failed this
+   * fetch; connecting one and calling again resumes. Taking a piece frees
+   * its order's credit, so a caller that takes pieces only as fast as it
+   * stores them is the fetch's backpressure. An aborted call leaves its
+   * read in flight for the next one. */
+  async next({ signal } = {}) {
+    const handle = this[HANDLE];
+    const piece = await call(
+      this,
+      () => native.fetchNext(handle),
+      () => native.fetchFd(handle),
+      signal,
+    );
+    return piece === null ? null : Object.freeze(piece);
+  }
+
+  /** Every piece until the end; the fetch stays alive, so its list and
+   * maps can be read after the loop. */
+  async *[Symbol.asyncIterator]() {
+    for (let piece = await this.next(); piece !== null; piece = await this.next()) {
+      yield piece;
+    }
+  }
+}
+
+/** The bound half of SWARM, serving one endpoint path. */
+export class Seeder extends Handle {
+  constructor() {
+    super();
+    noConstructor("Seeder", "Listener.seeder()");
+  }
+
+  path() {
+    return native.seederPath(this[HANDLE]);
+  }
+
+  /** The next fetch's session, always with a well-formed open: admit it
+   * from its blob and metadata, or decline it. */
+  async accept({ signal } = {}) {
+    const handle = this[HANDLE];
+    const session = await call(
+      this,
+      () => native.seederAccept(handle),
+      () => native.seederFd(handle),
+      signal,
+    );
+    return adopt(SeedSession, session);
+  }
+}
+
+/** One fetch's session with this seeder, about one blob. Its calls are one
+ * at a time (WEIDA_EINVAL otherwise), and each order is answered before
+ * the next `next`. Dropping it ends the session. */
+export class SeedSession extends Handle {
+  constructor() {
+    super();
+    noConstructor("SeedSession", "Seeder.accept()");
+  }
+
+  /** The blob this session is about. */
+  blob() {
+    return adopt(Blob, native.seedSessionBlob(this[HANDLE]));
+  }
+
+  /** The exchange's metadata, frozen, as `IncomingRequest.meta`. */
+  meta() {
+    return freezeMeta(native.seedSessionMeta(this[HANDLE]));
+  }
+
+  /** The number of the connection this session arrived on, a BigInt. */
+  connection() {
+    return native.seedSessionConnection(this[HANDLE]);
+  }
+
+  /** The next order, a frozen `{ kind, index }` (`kind` one of
+   * "WEIDA_ASK_LIST", "WEIDA_ASK_HAVE", "WEIDA_ASK_PIECE", `index` the piece
+   * of a PIECE and 0 otherwise), or null once the fetch finished its
+   * orders. Waits as long as the fetch sends none. Rejects with
+   * WEIDA_EPROTOCOL while the order before is unanswered. An aborted call
+   * leaves its read in flight for the next one. */
+  async next({ signal } = {}) {
+    const handle = this[HANDLE];
+    const ask = await call(
+      this,
+      () => native.seedSessionNext(handle),
+      () => native.seedSessionFd(handle),
+      signal,
+    );
+    return ask === null ? null : Object.freeze(ask);
+  }
+
+  /** Answers LIST with the blob's piece list. */
+  async answerList(list, { signal } = {}) {
+    await op(
+      this,
+      () => native.seedSessionAnswerList(this[HANDLE], handleOf(list, PieceList)),
+      native.seedSessionAnswerListOpWait,
+      native.seedSessionAnswerListOpFd,
+      signal,
+    );
+  }
+
+  /** Answers HAVE with the pieces this seeder can serve now, a `Bits`. */
+  async answerHave(have, { signal } = {}) {
+    await op(
+      this,
+      () => native.seedSessionAnswerHave(this[HANDLE], handleOf(have, Bits)),
+      native.seedSessionAnswerHaveOpWait,
+      native.seedSessionAnswerHaveOpFd,
+      signal,
+    );
+  }
+
+  /** Answers PIECE with the piece's bytes, copied; the fetch checks them
+   * against the root. */
+  async answerPiece(data, { signal } = {}) {
+    const piece = bytes(data);
+    await op(
+      this,
+      () => native.seedSessionAnswerPiece(this[HANDLE], piece),
+      native.seedSessionAnswerPieceOpWait,
+      native.seedSessionAnswerPieceOpFd,
+      signal,
+    );
+  }
+
+  /** Ends the session: a blob this seeder does not serve or a piece it
+   * does not hold; the fetch drops this seeder for the blob. Consumes the
+   * session. */
+  async decline({ signal } = {}) {
+    await op(
+      this,
+      () => native.seedSessionDecline(consume(this)),
+      native.seedSessionDeclineOpWait,
+      native.seedSessionDeclineOpFd,
+      signal,
+    );
   }
 }
 

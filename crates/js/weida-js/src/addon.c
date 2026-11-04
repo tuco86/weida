@@ -123,6 +123,20 @@ DROP(peer_segment_op)
 DROP(consumer)
 DROP(consumer_open_op)
 DROP(consumer_deliver_op)
+DROP(blob)
+DROP(piece_list)
+DROP(tree_hasher)
+DROP(bits)
+DROP(fetch_options)
+DROP(swarm)
+DROP(swarm_connect_op)
+DROP(fetch)
+DROP(seeder)
+DROP(seed_session)
+DROP(seed_session_answer_list_op)
+DROP(seed_session_answer_have_op)
+DROP(seed_session_answer_piece_op)
+DROP(seed_session_decline_op)
 DROP(acceptor)
 DROP(flow_meta)
 DROP(flow)
@@ -420,6 +434,20 @@ static const char *incoming_name(int kind) {
         NAME(INCOMING_CREDIT)
         NAME(INCOMING_UNSUBSCRIBED)
         NAME(INCOMING_FLOW)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *ask_name(int kind) {
+    switch (kind) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(ASK_LIST)
+        NAME(ASK_HAVE)
+        NAME(ASK_PIECE)
 #undef NAME
     default:
         return NULL;
@@ -1076,6 +1104,7 @@ WRAP_AS(relay_request)
 WRAP_AS(resolved)
 WRAP_AS(survey_run)
 WRAP_AS(segment)
+WRAP_AS(seed_session)
 
 /* `<t>_<x>(h) -> bigint`: an infallible uint64_t accessor (R2). */
 #define U64_OUT(js, t, x) \
@@ -4210,6 +4239,458 @@ static napi_value incoming_flow_refuse(napi_env env, napi_callback_info info) {
     return js_undefined(env);
 }
 
+/* swarm */
+
+/* (bytes) -> Uint8Array: the BLAKE3 hash, WEIDA_BLOB_ID_LEN bytes */
+static napi_value blob_id_of(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    uint8_t id[WEIDA_BLOB_ID_LEN];
+    if (!get_bytes(env, argv[0], &data, &len))
+        return NULL;
+    int rc = weida_blob_id_of(data, len, id);
+    return rc < 0 ? throw_rc(env, rc) : bytes_value(env, id, sizeof id);
+}
+
+/* (root, size, pieceLog2) -> blob */
+static napi_value blob_new(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const uint8_t *root = NULL;
+    size_t len = 0;
+    uint64_t size = 0, log2 = 0;
+    weida_blob *out = NULL;
+    if (!get_bytes(env, argv[0], &root, &len))
+        return NULL;
+    if (len != WEIDA_BLOB_ID_LEN)
+        return throw_type(env, "a blob id is 32 bytes");
+    if (!get_u64(env, argv[1], UINT64_MAX, &size) || !get_u64(env, argv[2], 255, &log2))
+        return NULL;
+    int rc = weida_blob_new(root, size, (uint8_t)log2, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_blob);
+}
+
+static napi_value blob_root(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_blob *b = live(env, argv[0], drop_blob);
+    uint8_t id[WEIDA_BLOB_ID_LEN];
+    if (!b)
+        return NULL;
+    int rc = weida_blob_root(b, id);
+    return rc < 0 ? throw_rc(env, rc) : bytes_value(env, id, sizeof id);
+}
+
+U64_OUT(blob_size, blob, size)
+SIZE_OUT(blob_piece_log2, blob, piece_log2)
+SIZE_OUT(blob_count, blob, count)
+
+/* (blob, index) -> { start, end } of BigInts | null past the last piece */
+static napi_value blob_span(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_blob *b = live(env, argv[0], drop_blob);
+    uint64_t index = 0, start = 0, end = 0;
+    napi_value obj;
+    if (!b || !get_u64(env, argv[1], UINT32_MAX, &index))
+        return NULL;
+    if (weida_blob_span(b, (uint32_t)index, &start, &end) != 1)
+        return js_null(env);
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    if (!set(env, obj, "start", optional_u64(env, 1, start)) ||
+        !set(env, obj, "end", optional_u64(env, 1, end)))
+        return NULL;
+    return obj;
+}
+
+/* (bytes, pieceLog2) -> piece list */
+static napi_value piece_list_of(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    uint64_t log2 = 0;
+    weida_piece_list *out = NULL;
+    if (!get_bytes(env, argv[0], &data, &len) || !get_u64(env, argv[1], 255, &log2))
+        return NULL;
+    int rc = weida_piece_list_of(data, len, (uint8_t)log2, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_piece_list);
+}
+
+/* (blob, bytes) -> piece list */
+static napi_value piece_list_parse(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_blob *b = live(env, argv[0], drop_blob);
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    weida_piece_list *out = NULL;
+    if (!b || !get_bytes(env, argv[1], &data, &len))
+        return NULL;
+    int rc = weida_piece_list_parse(b, data, len, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_piece_list);
+}
+
+FROM_HANDLE(piece_list_blob, piece_list_blob, piece_list, blob)
+
+/* (list) -> Uint8Array, a copy */
+static napi_value piece_list_to_bytes(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_piece_list *l = live(env, argv[0], drop_piece_list);
+    size_t len = 0;
+    if (!l)
+        return NULL;
+    const uint8_t *p = weida_piece_list_to_bytes(l, &len);
+    return bytes_value(env, p, len);
+}
+
+/* (list, index, bytes) -> boolean */
+static napi_value piece_list_check(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_piece_list *l = live(env, argv[0], drop_piece_list);
+    uint64_t index = 0;
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    if (!l || !get_u64(env, argv[1], UINT32_MAX, &index) || !get_bytes(env, argv[2], &data, &len))
+        return NULL;
+    int rc = weida_piece_list_check(l, (uint32_t)index, data, len);
+    return rc < 0 ? throw_rc(env, rc) : js_bool(env, rc == 1);
+}
+
+/* (pieceLog2) -> tree hasher */
+static napi_value tree_hasher_new(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    uint64_t log2 = 0;
+    weida_tree_hasher *out = NULL;
+    if (!get_u64(env, argv[0], 255, &log2))
+        return NULL;
+    int rc = weida_tree_hasher_new((uint8_t)log2, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_tree_hasher);
+}
+
+static napi_value tree_hasher_update(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_tree_hasher *h = live(env, argv[0], drop_tree_hasher);
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    if (!h || !get_bytes(env, argv[1], &data, &len))
+        return NULL;
+    int rc = weida_tree_hasher_update(h, data, len);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+/* consumes the hasher */
+static napi_value tree_hasher_finish(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_tree_hasher *h = take(env, argv[0], drop_tree_hasher);
+    weida_piece_list *out = NULL;
+    if (!h)
+        return NULL;
+    int rc = weida_tree_hasher_finish(h, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_piece_list);
+}
+
+/* (len) -> bits, all clear or all set */
+static napi_value bits_make(napi_env env, napi_callback_info info,
+                            int (*make)(uint32_t, weida_bits **)) {
+    ARGS(1);
+    uint64_t len = 0;
+    weida_bits *out = NULL;
+    if (!get_u64(env, argv[0], UINT32_MAX, &len))
+        return NULL;
+    int rc = make((uint32_t)len, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_bits);
+}
+
+static napi_value bits_new(napi_env env, napi_callback_info info) {
+    return bits_make(env, info, weida_bits_new);
+}
+
+static napi_value bits_full(napi_env env, napi_callback_info info) {
+    return bits_make(env, info, weida_bits_full);
+}
+
+/* (len, bytes) -> bits */
+static napi_value bits_from_bytes(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    uint64_t len = 0;
+    const uint8_t *data = NULL;
+    size_t n = 0;
+    weida_bits *out = NULL;
+    if (!get_u64(env, argv[0], UINT32_MAX, &len) || !get_bytes(env, argv[1], &data, &n))
+        return NULL;
+    int rc = weida_bits_from_bytes((uint32_t)len, data, n, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_bits);
+}
+
+/* (bits) -> Uint8Array, a copy written by C */
+static napi_value bits_as_bytes(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_bits *b = live(env, argv[0], drop_bits);
+    napi_value ab, out;
+    void *buf = NULL;
+    size_t n = 0;
+    if (!b)
+        return NULL;
+    size_t cap = ((size_t)weida_bits_len(b) + 7) / 8;
+    if (napi_create_arraybuffer(env, cap, &buf, &ab) != napi_ok)
+        return throw_napi(env);
+    int rc = weida_bits_as_bytes(b, buf, cap, &n);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    if (napi_create_typedarray(env, napi_uint8_array, n, ab, 0, &out) != napi_ok)
+        return throw_napi(env);
+    return out;
+}
+
+SIZE_OUT(bits_len, bits, len)
+SIZE_OUT(bits_ones, bits, ones)
+
+/* (bits, index) -> boolean; false past the end */
+static napi_value bits_get(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_bits *b = live(env, argv[0], drop_bits);
+    uint64_t index = 0;
+    if (!b || !get_u64(env, argv[1], UINT32_MAX, &index))
+        return NULL;
+    return js_bool(env, weida_bits_get(b, (uint32_t)index) == 1);
+}
+
+/* (bits, index, on) */
+static napi_value bits_set(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_bits *b = live(env, argv[0], drop_bits);
+    uint64_t index = 0;
+    int on = 0;
+    if (!b || !get_u64(env, argv[1], UINT32_MAX, &index) || !get_flag(env, argv[2], &on))
+        return NULL;
+    int rc = weida_bits_set(b, (uint32_t)index, on);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+BOOL_OUT(bits_all, bits, all)
+
+NEW0(fetch_options_new, fetch_options)
+SET_HANDLE(fetch_options_set_list, fetch_options, list, piece_list)
+SET_U64(fetch_options_set_stall_ms, fetch_options, stall_ms, UINT64_MAX)
+SET_U64(fetch_options_set_min_rate, fetch_options, min_rate, UINT64_MAX)
+SET_U64(fetch_options_set_per_peer, fetch_options, per_peer, UINT64_MAX)
+SET_U64(fetch_options_set_max_inflight, fetch_options, max_inflight, UINT64_MAX)
+SET_U64(fetch_options_set_max_peers, fetch_options, max_peers, UINT64_MAX)
+SET_U64(fetch_options_set_have_refresh_ms, fetch_options, have_refresh_ms, UINT64_MAX)
+
+static napi_value runtime_swarm(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_runtime *rt = live(env, argv[0], drop_runtime);
+    if (!rt)
+        return NULL;
+    const weida_client_tls *tls = live(env, argv[1], drop_client_tls);
+    weida_swarm *out = NULL;
+    if (!tls)
+        return NULL;
+    int rc = weida_runtime_swarm(rt, tls, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_swarm);
+}
+
+STRING_OP(swarm_connect, swarm, connect)
+FD(swarm_connect_op_fd, swarm_connect_op)
+WAIT0(swarm_connect_op_wait, swarm_connect_op)
+DISCONNECT(swarm_disconnect, swarm)
+SIZE_OUT(swarm_peer_count, swarm, peer_count)
+CONNECTION_STATS(swarm_connection_stats, swarm)
+EVENTS(swarm_events, swarm)
+
+/* (swarm, blob, have, options | null) -> fetch */
+static napi_value swarm_fetch(napi_env env, napi_callback_info info) {
+    ARGS(4);
+    const weida_swarm *s = live(env, argv[0], drop_swarm);
+    if (!s)
+        return NULL;
+    const weida_blob *b = live(env, argv[1], drop_blob);
+    if (!b)
+        return NULL;
+    const weida_bits *have = live(env, argv[2], drop_bits);
+    void *options = NULL;
+    weida_fetch *out = NULL;
+    if (!have || !optional(env, argv[3], drop_fetch_options, &options))
+        return NULL;
+    int rc = weida_swarm_fetch(s, b, have, options, &out);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_fetch);
+}
+
+FD(fetch_fd, fetch)
+
+/* Copies a weida_piece out into { index, bytes } and drops it. */
+static napi_value piece_value(napi_env env, void *ptr) {
+    weida_piece *p = ptr;
+    napi_value obj = NULL;
+    size_t len = 0;
+    if (napi_create_object(env, &obj) != napi_ok) {
+        weida_piece_drop(p);
+        return throw_napi(env);
+    }
+    const uint8_t *data = weida_piece_bytes(p, &len);
+    bool ok = set(env, obj, "index", js_int64(env, weida_piece_index(p))) &&
+              set(env, obj, "bytes", bytes_value(env, data, len));
+    weida_piece_drop(p);
+    return ok ? obj : NULL;
+}
+
+/* (fetch) -> { index, bytes } | null | AGAIN; null once every piece is held */
+static napi_value fetch_next(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_fetch *f = live(env, argv[0], drop_fetch);
+    weida_piece *p = NULL;
+    if (!f)
+        return NULL;
+    int rc = weida_fetch_next(f, 0, &p);
+    if (rc == 0 && !p)
+        return js_null(env);
+    return outcome(env, rc, piece_value, p);
+}
+
+FROM_HANDLE(fetch_blob, fetch_blob, fetch, blob)
+FROM_HANDLE(fetch_delivered, fetch_delivered, fetch, bits)
+FROM_HANDLE(fetch_in_flight, fetch_in_flight, fetch, bits)
+
+/* (fetch) -> piece list | null while it is not known */
+static napi_value fetch_list(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_fetch *f = live(env, argv[0], drop_fetch);
+    weida_piece_list *out = NULL;
+    if (!f)
+        return NULL;
+    int rc = weida_fetch_list(f, &out);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    return rc == 1 ? wrap(env, out, drop_piece_list) : js_null(env);
+}
+
+static napi_value listener_seeder(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_seeder *out = NULL;
+    int rc = weida_listener_seeder(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_seeder);
+}
+
+STRING_OUT(seeder_path, seeder, path)
+FD(seeder_fd, seeder)
+
+static napi_value seeder_accept(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_seeder *s = live(env, argv[0], drop_seeder);
+    weida_seed_session *out = NULL;
+    if (!s)
+        return NULL;
+    int rc = weida_seeder_accept(s, 0, &out);
+    return outcome(env, rc, wrap_seed_session, out);
+}
+
+FD(seed_session_fd, seed_session)
+
+/* (session) -> { kind, index } | null | AGAIN; null once the fetch finished */
+static napi_value seed_session_next(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_seed_session *s = live(env, argv[0], drop_seed_session);
+    int ask = 0;
+    uint32_t index = 0;
+    napi_value obj;
+    if (!s)
+        return NULL;
+    int rc = weida_seed_session_next(s, 0, &ask, &index);
+    if (rc == -WEIDA_EAGAIN)
+        return again(env);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    if (rc == 0)
+        return js_null(env);
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    if (!set(env, obj, "kind", js_string(env, ask_name(ask), NAPI_AUTO_LENGTH)) ||
+        !set(env, obj, "index", js_int64(env, index)))
+        return NULL;
+    return obj;
+}
+
+FROM_HANDLE(seed_session_blob, seed_session_blob, seed_session, blob)
+
+static napi_value seed_session_meta(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_seed_session *s = live(env, argv[0], drop_seed_session);
+    weida_incoming_meta *m = NULL;
+    if (!s)
+        return NULL;
+    int rc = weida_seed_session_meta(s, &m);
+    return rc < 0 ? throw_rc(env, rc) : meta_value(env, m);
+}
+
+U64_OUT(seed_session_connection, seed_session, connection)
+
+/* (session, list) -> op */
+static napi_value seed_session_answer_list(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_seed_session *s = live(env, argv[0], drop_seed_session);
+    if (!s)
+        return NULL;
+    const weida_piece_list *l = live(env, argv[1], drop_piece_list);
+    weida_seed_session_answer_list_op *op = NULL;
+    if (!l)
+        return NULL;
+    int rc = weida_seed_session_answer_list(s, l, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_seed_session_answer_list_op);
+}
+
+/* (session, bits) -> op */
+static napi_value seed_session_answer_have(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_seed_session *s = live(env, argv[0], drop_seed_session);
+    if (!s)
+        return NULL;
+    const weida_bits *b = live(env, argv[1], drop_bits);
+    weida_seed_session_answer_have_op *op = NULL;
+    if (!b)
+        return NULL;
+    int rc = weida_seed_session_answer_have(s, b, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_seed_session_answer_have_op);
+}
+
+/* (session, bytes) -> op; the bytes are copied */
+static napi_value seed_session_answer_piece(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_seed_session *s = live(env, argv[0], drop_seed_session);
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    weida_seed_session_answer_piece_op *op = NULL;
+    if (!s || !get_bytes(env, argv[1], &data, &len))
+        return NULL;
+    int rc = weida_seed_session_answer_piece(s, data, len, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_seed_session_answer_piece_op);
+}
+
+/* consumes the session */
+static napi_value seed_session_decline(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_seed_session *s = take(env, argv[0], drop_seed_session);
+    weida_seed_session_decline_op *op = NULL;
+    if (!s)
+        return NULL;
+    int rc = weida_seed_session_decline(s, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_seed_session_decline_op);
+}
+
+FD(seed_session_answer_list_op_fd, seed_session_answer_list_op)
+WAIT0(seed_session_answer_list_op_wait, seed_session_answer_list_op)
+FD(seed_session_answer_have_op_fd, seed_session_answer_have_op)
+WAIT0(seed_session_answer_have_op_wait, seed_session_answer_have_op)
+FD(seed_session_answer_piece_op_fd, seed_session_answer_piece_op)
+WAIT0(seed_session_answer_piece_op_wait, seed_session_answer_piece_op)
+FD(seed_session_decline_op_fd, seed_session_decline_op)
+WAIT0(seed_session_decline_op_wait, seed_session_decline_op)
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -4409,6 +4890,17 @@ static napi_value constants(napi_env env) {
     CONSTANT(INCOMING_UNSUBSCRIBED)
     CONSTANT(INCOMING_FLOW)
     CONSTANT(DEFAULT_DATAGRAM_RECEIVE_BYTES)
+    CONSTANT(ASK_LIST)
+    CONSTANT(ASK_HAVE)
+    CONSTANT(ASK_PIECE)
+    CONSTANT(BLOB_ID_LEN)
+    CONSTANT(MAX_PIECES)
+    CONSTANT(PIECE_SIZE_MIN_LOG2)
+    CONSTANT(PIECE_SIZE_MAX_LOG2)
+    CONSTANT(PIECE_SIZE_DEFAULT_LOG2)
+    CONSTANT(MAX_PENDING_SESSIONS)
+    CONSTANT(SEED_STALL_MS)
+    CONSTANT(MIN_RATE)
 #undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
@@ -4893,6 +5385,74 @@ NAPI_MODULE_INIT() {
         FN("consumerDeliverOpFd", consumer_deliver_op_fd),
         FN("consumerDeliverOpWait", consumer_deliver_op_wait),
         FN("consumerClose", consumer_close),
+        FN("blobIdOf", blob_id_of),
+        FN("blobNew", blob_new),
+        FN("blobRoot", blob_root),
+        FN("blobSize", blob_size),
+        FN("blobPieceLog2", blob_piece_log2),
+        FN("blobCount", blob_count),
+        FN("blobSpan", blob_span),
+        FN("pieceListOf", piece_list_of),
+        FN("pieceListParse", piece_list_parse),
+        FN("pieceListBlob", piece_list_blob),
+        FN("pieceListToBytes", piece_list_to_bytes),
+        FN("pieceListCheck", piece_list_check),
+        FN("treeHasherNew", tree_hasher_new),
+        FN("treeHasherUpdate", tree_hasher_update),
+        FN("treeHasherFinish", tree_hasher_finish),
+        FN("bitsNew", bits_new),
+        FN("bitsFull", bits_full),
+        FN("bitsFromBytes", bits_from_bytes),
+        FN("bitsAsBytes", bits_as_bytes),
+        FN("bitsLen", bits_len),
+        FN("bitsOnes", bits_ones),
+        FN("bitsGet", bits_get),
+        FN("bitsSet", bits_set),
+        FN("bitsAll", bits_all),
+        FN("fetchOptionsNew", fetch_options_new),
+        FN("fetchOptionsSetList", fetch_options_set_list),
+        FN("fetchOptionsSetStallMs", fetch_options_set_stall_ms),
+        FN("fetchOptionsSetMinRate", fetch_options_set_min_rate),
+        FN("fetchOptionsSetPerPeer", fetch_options_set_per_peer),
+        FN("fetchOptionsSetMaxInflight", fetch_options_set_max_inflight),
+        FN("fetchOptionsSetMaxPeers", fetch_options_set_max_peers),
+        FN("fetchOptionsSetHaveRefreshMs", fetch_options_set_have_refresh_ms),
+        FN("runtimeSwarm", runtime_swarm),
+        FN("swarmConnect", swarm_connect),
+        FN("swarmConnectOpFd", swarm_connect_op_fd),
+        FN("swarmConnectOpWait", swarm_connect_op_wait),
+        FN("swarmDisconnect", swarm_disconnect),
+        FN("swarmPeerCount", swarm_peer_count),
+        FN("swarmConnectionStats", swarm_connection_stats),
+        FN("swarmEvents", swarm_events),
+        FN("swarmFetch", swarm_fetch),
+        FN("fetchFd", fetch_fd),
+        FN("fetchNext", fetch_next),
+        FN("fetchBlob", fetch_blob),
+        FN("fetchList", fetch_list),
+        FN("fetchDelivered", fetch_delivered),
+        FN("fetchInFlight", fetch_in_flight),
+        FN("listenerSeeder", listener_seeder),
+        FN("seederPath", seeder_path),
+        FN("seederFd", seeder_fd),
+        FN("seederAccept", seeder_accept),
+        FN("seedSessionFd", seed_session_fd),
+        FN("seedSessionNext", seed_session_next),
+        FN("seedSessionBlob", seed_session_blob),
+        FN("seedSessionMeta", seed_session_meta),
+        FN("seedSessionConnection", seed_session_connection),
+        FN("seedSessionAnswerList", seed_session_answer_list),
+        FN("seedSessionAnswerListOpFd", seed_session_answer_list_op_fd),
+        FN("seedSessionAnswerListOpWait", seed_session_answer_list_op_wait),
+        FN("seedSessionAnswerHave", seed_session_answer_have),
+        FN("seedSessionAnswerHaveOpFd", seed_session_answer_have_op_fd),
+        FN("seedSessionAnswerHaveOpWait", seed_session_answer_have_op_wait),
+        FN("seedSessionAnswerPiece", seed_session_answer_piece),
+        FN("seedSessionAnswerPieceOpFd", seed_session_answer_piece_op_fd),
+        FN("seedSessionAnswerPieceOpWait", seed_session_answer_piece_op_wait),
+        FN("seedSessionDecline", seed_session_decline),
+        FN("seedSessionDeclineOpFd", seed_session_decline_op_fd),
+        FN("seedSessionDeclineOpWait", seed_session_decline_op_wait),
         FN("flowSend", flow_send),
         FN("flowMaxPayload", flow_max_payload),
         FN("flowSent", flow_sent),
