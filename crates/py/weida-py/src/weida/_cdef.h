@@ -282,6 +282,10 @@ typedef struct weida_requester_open_op weida_requester_open_op;
 
 typedef struct weida_requester_request_op weida_requester_request_op;
 
+typedef struct weida_resolved weida_resolved;
+
+typedef struct weida_resolver weida_resolver;
+
 typedef struct weida_runtime weida_runtime;
 
 typedef struct weida_runtime_config weida_runtime_config;
@@ -767,6 +771,26 @@ int weida_requester_events(const weida_requester *r, weida_peer_events **out);
 
 void weida_requester_drop(weida_requester *r);
 
+int weida_resolver_new(weida_resolver **out);
+
+int weida_resolver_fd(const weida_resolver *r, int64_t *out);
+
+int weida_resolver_recv(const weida_resolver *r, int64_t timeout_ms, weida_resolved **out);
+
+void weida_resolver_drop(weida_resolver *r);
+
+const char *weida_resolved_name(const weida_resolved *q, size_t *len_out);
+
+int weida_resolved_port(const weida_resolved *q, uint16_t *out);
+
+uint64_t weida_resolved_max_addresses(const weida_resolved *q);
+
+int weida_resolved_answer(weida_resolved *q, const char *const *addrs, size_t n);
+
+int weida_resolved_refuse(weida_resolved *q, const char *reason);
+
+void weida_resolved_drop(weida_resolved *q);
+
 int weida_runtime_config_new(weida_runtime_config **out);
 
 int weida_runtime_config_set_worker_threads(const weida_runtime_config *cfg, uint32_t threads);
@@ -805,6 +829,8 @@ int weida_runtime_config_set_guarantees(const weida_runtime_config *cfg,
 
 int weida_runtime_config_set_reconnect(const weida_runtime_config *cfg,
                                        const weida_reconnect_policy *v);
+
+int weida_runtime_config_set_resolver(const weida_runtime_config *cfg, const weida_resolver *r);
 
 void weida_runtime_config_drop(weida_runtime_config *cfg);
 

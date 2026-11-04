@@ -4,7 +4,7 @@ use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use weida_rs::{Drained, GuaranteeSet, Runtime, RuntimeConfig};
+use weida_rs::{Drained, GuaranteeSet, Runtime, RuntimeConfig, SharedResolver};
 
 use crate::config::{
     Builder, count, discovery, ms, optional, outbox_full, weida_guarantee_set, weida_limits,
@@ -13,9 +13,10 @@ use crate::config::{
 use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_or, guard_void};
 use crate::handle::{borrow, into_handle, out_ptr, release, write_out};
 use crate::op::Op;
+use crate::resolver::weida_resolver;
 
 /// A runtime configuration under construction: one setter per field but
-/// `resolver` and `network`.
+/// `network`.
 pub struct weida_runtime_config {
     pub(crate) config: Mutex<RuntimeConfig>,
 }
@@ -474,6 +475,33 @@ pub unsafe extern "C" fn weida_runtime_config_set_reconnect(
             unsafe { borrow(v) }?.get()
         };
         cfg.set(|c| c.reconnect = value);
+        Ok(0)
+    })
+}
+
+/// Sets `RuntimeConfig::resolver`: every dial of a runtime made from this
+/// configuration reads its addresses from `r`'s queue; NULL is the system
+/// resolver (`SystemResolver`). The configuration shares `r`'s queue, it
+/// does not copy it. `-WEIDA_ECLOSED` when `r`'s queue already ended.
+///
+/// # Safety
+///
+/// `cfg` is NULL or a live configuration; `r` is NULL or a live resolver.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_runtime_config_set_resolver(
+    cfg: *const weida_runtime_config,
+    r: *const weida_resolver,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let cfg = unsafe { borrow(cfg) }?;
+        let value = if r.is_null() {
+            SharedResolver::default()
+        } else {
+            // SAFETY: forwarded from this function's contract.
+            unsafe { borrow(r) }?.shared()?
+        };
+        cfg.set(|c| c.resolver = value);
         Ok(0)
     })
 }

@@ -109,7 +109,7 @@ unit tests in `crates/weida-c/src/`.
 | --- | --- | --- |
 | `RuntimeConfig::worker_threads`, `shutdown_timeout` | `weida_runtime_config_set_worker_threads`, `_set_shutdown_timeout_ms` | present; `test_errors.py` (Python) for `worker_threads = 0` |
 | every other `RuntimeConfig` field (`limits`, `max_connections`, `max_connections_per_peer`, `endpoint_queue`, `max_resolved_addresses`, `guarantees`, `discovery`, `connect_attempt_timeout`, `reconnect`, `send_timeout`, `outbox_messages`, `outbox_bytes`, `outbox_full`, `max_handshakes`, `retry_above_handshakes`) | `weida_runtime_config_set_*` | present; `runtime::tests::every_setter_lands_on_its_field`, `abi::a_send_timeout_ends_a_request_to_a_peer_that_is_gone` for `send_timeout` (*config*) |
-| `RuntimeConfig::resolver` | — | absent: *resolver* |
+| `RuntimeConfig::resolver` | `weida_runtime_config_set_resolver` (shares the queue; NULL is the system resolver) | present; `abi::a_name_only_the_resolver_knows_is_dialled_through_it` (*resolver*) |
 | `RuntimeConfig::network`, `Network` | — | refused: a `SimNet` exists only under `test-util` |
 | `Limits`, `Congestion`, `DEFAULT_DATAGRAM_RECEIVE_BYTES` | `weida_limits` and its setters, `WEIDA_CONGESTION_*`, `WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES` | present; `runtime::tests::every_setter_lands_on_its_field`, `abi::limits_reach_the_quic_transport` (*config*) |
 | `Limits::header_slots`, `worst_case_header_memory` | — | refused: computations over the caller's own values |
@@ -156,7 +156,7 @@ unit tests in `crates/weida-c/src/`.
 | `StopReason`, `codes` | — | refused: wire vocabulary, reached through the R9 outcome codes |
 | `Address`, `EndpointAddr`, `InprocAddr`, `UnixAddr`, `PipeAddr`, `RelayAddr`, `DEFAULT_PORT`, `RELAY_PATH`, `SCHEME_RELAY` | URLs as strings | refused: the C caller passes the text, weida parses it |
 | `new_trace`, `TraceContext` | `weida_new_trace`; a trace context is its `traceparent` text (R7) | present; `tls::tests::new_trace_writes_a_traceparent_that_sets_back` (*config*) |
-| `Resolver`, `SharedResolver`, `SystemResolver`, `Resolved` | — | absent: *resolver* (a queue, decision 10) |
+| `Resolver`, `SharedResolver`, `SystemResolver`, `Resolved` | `weida_resolver` (`_new`, `_fd`, `_recv` a try (R3a), `_drop`: the lookups as a queue, decision 10), `weida_resolved` (`_name`, `_port`, `_max_addresses`, `_answer` and `_refuse` (consume), `_drop`); `SharedResolver` is the handle, shared by every configuration it is set on; `SystemResolver` is NULL in the setter; the `Exec` argument is not mapped (the binding's own seam) | present; `resolver::tests::a_lookup_reads_back_and_its_answer_reaches_the_dial`, `resolver::tests::an_answer_outside_the_contract_fails_the_dial`, `resolver::tests::a_refused_or_dropped_lookup_fails_the_dial_with_invalid_address`, `resolver::tests::the_queue_ends_once_no_configuration_holds_the_resolver`, `abi::a_name_only_the_resolver_knows_is_dialled_through_it`, `abi::a_refused_lookup_fails_the_connect_with_einvalid_address` (*resolver*) |
 | `SimNet`, `SimStats` | — | refused: a test double of the Rust test suite (`test-util`) |
 | `Result`, `Pattern`, `Endpoint` and the pattern markers | — | refused: Rust type machinery; the ABI has one handle type per role (decision 3) |
 

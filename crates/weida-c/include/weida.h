@@ -737,13 +737,24 @@ typedef struct weida_requester_open_op weida_requester_open_op;
 typedef struct weida_requester_request_op weida_requester_request_op;
 
 /**
+ * One lookup waiting for its answer (`Resolved`).
+ */
+typedef struct weida_resolved weida_resolved;
+
+/**
+ * A resolver whose lookups are read from a queue (`Resolver`, decision
+ * 10), a try handle (R3a).
+ */
+typedef struct weida_resolver weida_resolver;
+
+/**
  * A weida runtime: the reactor it owns, and every endpoint made from it.
  */
 typedef struct weida_runtime weida_runtime;
 
 /**
  * A runtime configuration under construction: one setter per field but
- * `resolver` and `network`.
+ * `network`.
  */
 typedef struct weida_runtime_config weida_runtime_config;
 
@@ -3090,6 +3101,128 @@ int weida_requester_events(const weida_requester *r, weida_peer_events **out);
 void weida_requester_drop(weida_requester *r);
 
 /**
+ * Makes a resolver whose lookups are read from a queue: set it on a
+ * configuration with `weida_runtime_config_set_resolver`, then answer
+ * each lookup `weida_resolver_recv` takes.
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_resolver_drop`.
+ */
+int weida_resolver_new(weida_resolver **out);
+
+/**
+ * The resolver's readiness descriptor (R11): readable when the next
+ * `weida_resolver_recv` will not block.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live resolver; `out` is NULL or writable.
+ */
+int weida_resolver_fd(const weida_resolver *r, int64_t *out);
+
+/**
+ * Takes the next lookup, waiting up to `timeout_ms` (R4) for one. Every
+ * dial and redial of a runtime made with this resolver asks it, IP
+ * literals included.
+ *
+ * Writes NULL to `out` and returns 0 once no configuration and no runtime
+ * holds the resolver; a resolver never set on a configuration never ends.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live resolver; `out` is NULL or writable. Answer the
+ * lookup with `weida_resolved_answer` or `_refuse`, or release it with
+ * `weida_resolved_drop`.
+ */
+int weida_resolver_recv(const weida_resolver *r, int64_t timeout_ms, weida_resolved **out);
+
+/**
+ * Releases the resolver's queue. A thread waiting in
+ * `weida_resolver_recv` returns `-WEIDA_ECLOSED`; the lookups still
+ * queued and every later one fail their dial with
+ * `-WEIDA_EINVALID_ADDRESS`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live resolver, dropped at most once.
+ */
+void weida_resolver_drop(weida_resolver *r);
+
+/**
+ * The host the URL wrote; NULL for a NULL `q`. Lives until `q` is
+ * consumed or dropped.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live lookup; `len_out` is NULL or writable.
+ */
+const char *weida_resolved_name(const weida_resolved *q, size_t *len_out);
+
+/**
+ * 1 and the port when the URL wrote one; 0 when it wrote none (the
+ * authority names a set, and the answer chooses the ports), also for a
+ * NULL `q` or `out`.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live lookup; `out` is NULL or writable.
+ */
+int weida_resolved_port(const weida_resolved *q, uint16_t *out);
+
+/**
+ * The most addresses the answer may hold (`RuntimeConfig::max_resolved_addresses`);
+ * 0 for a NULL `q`.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live lookup.
+ */
+uint64_t weida_resolved_max_addresses(const weida_resolved *q);
+
+/**
+ * Answers the lookup with `n` addresses, `ip:port` texts dialled in this
+ * order (`127.0.0.1:4433`, `[::1]:4433`). **Consumes** `q` on every
+ * return path.
+ *
+ * `-WEIDA_EINVAL` for no address, more than
+ * `weida_resolved_max_addresses`, a NULL or non-UTF-8 element, or a text
+ * that is not an IP address and port; the lookup is then refused, and its
+ * dial fails with `-WEIDA_EINVALID_ADDRESS` naming why.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live lookup, not used again; `addrs` is NULL or points
+ * to `n` readable pointers, each NULL or a NUL-terminated string.
+ */
+int weida_resolved_answer(weida_resolved *q, const char *const *addrs, size_t n);
+
+/**
+ * Refuses the lookup: its dial fails with `-WEIDA_EINVALID_ADDRESS`, the
+ * message `cannot resolve <name>: <reason>`. **Consumes** `q` on every
+ * return path; a NULL or non-UTF-8 `reason` still refuses, with a reason
+ * of its own, and returns `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live lookup, not used again; `reason` is NULL or a
+ * NUL-terminated string.
+ */
+int weida_resolved_refuse(weida_resolved *q, const char *reason);
+
+/**
+ * Releases a lookup; one not answered fails its dial with
+ * `-WEIDA_EINVALID_ADDRESS` ("the lookup was dropped unanswered"). NULL
+ * does nothing.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live lookup, dropped at most once.
+ */
+void weida_resolved_drop(weida_resolved *q);
+
+/**
  * Creates a configuration holding weida's defaults.
  *
  * # Safety
@@ -3274,6 +3407,18 @@ int weida_runtime_config_set_guarantees(const weida_runtime_config *cfg,
  */
 int weida_runtime_config_set_reconnect(const weida_runtime_config *cfg,
                                        const weida_reconnect_policy *v);
+
+/**
+ * Sets `RuntimeConfig::resolver`: every dial of a runtime made from this
+ * configuration reads its addresses from `r`'s queue; NULL is the system
+ * resolver (`SystemResolver`). The configuration shares `r`'s queue, it
+ * does not copy it. `-WEIDA_ECLOSED` when `r`'s queue already ended.
+ *
+ * # Safety
+ *
+ * `cfg` is NULL or a live configuration; `r` is NULL or a live resolver.
+ */
+int weida_runtime_config_set_resolver(const weida_runtime_config *cfg, const weida_resolver *r);
 
 /**
  * Releases a configuration. NULL does nothing.

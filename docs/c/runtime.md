@@ -6,8 +6,8 @@ network or another thread; a lock it takes is held only for the call's own bookk
 
 ## `weida_runtime_config`
 
-A builder for `weida::RuntimeConfig`, one setter per field but `resolver` (absent, *resolver*)
-and `network` (test-only). Unset fields keep weida's defaults. Values follow R7: counts are
+A builder for `weida::RuntimeConfig`, one setter per field but `network` (test-only). Unset
+fields keep weida's defaults. Values follow R7: counts are
 `uint64_t` and saturate at `SIZE_MAX`, durations are milliseconds, an optional value is
 negative for none, an enumeration is one of the constants below, and a nested configuration is
 its own builder, copied by the setter that takes it (NULL is its default).
@@ -32,6 +32,7 @@ its own builder, copied by the setter that takes it (NULL is its default).
 | `int weida_runtime_config_set_limits(const weida_runtime_config *cfg, const weida_limits *v)` | never | 0; `-WEIDA_EINVAL`. Copies `v`; NULL is `Limits::default()` |
 | `int weida_runtime_config_set_guarantees(const weida_runtime_config *cfg, const weida_guarantee_set *v)` | never | 0; `-WEIDA_EINVAL`. Copies `v`; NULL is `GuaranteeSet::CORE` |
 | `int weida_runtime_config_set_reconnect(const weida_runtime_config *cfg, const weida_reconnect_policy *v)` | never | 0; `-WEIDA_EINVAL`. Copies `v`; NULL is `ReconnectPolicy::default()` |
+| `int weida_runtime_config_set_resolver(const weida_runtime_config *cfg, const weida_resolver *r)` | never | 0; `-WEIDA_EINVAL`; `-WEIDA_ECLOSED` when `r`'s queue ended. Shares `r`; NULL is the system resolver ([resolver.md](resolver.md)) |
 | `void weida_runtime_config_drop(weida_runtime_config *cfg)` | never | — |
 
 ## `weida_limits`

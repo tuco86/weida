@@ -2737,3 +2737,135 @@ fn a_mismatched_alpn_fails_the_dial_with_etls() {
     }
     shutdown(rt);
 }
+
+/// A runtime whose dials resolve through a new resolver's queue, and that
+/// resolver.
+fn resolving_runtime() -> (*mut weida_runtime, *mut weida_resolver) {
+    let mut r = ptr::null_mut();
+    let mut cfg = ptr::null_mut();
+    // SAFETY: writable out-parameters and live handles; `cfg` is dropped once.
+    unsafe {
+        ok(weida_resolver_new(&mut r));
+        ok(weida_runtime_config_new(&mut cfg));
+        ok(weida_runtime_config_set_resolver(cfg, r));
+    }
+    let rt = runtime_with(cfg);
+    // SAFETY: dropped once; the runtime holds the queue.
+    unsafe { weida_runtime_config_drop(cfg) };
+    (rt, r)
+}
+
+/// The next lookup of `r`, waiting for it; never the end.
+fn next_lookup(r: *mut weida_resolver) -> *mut weida_resolved {
+    let mut q = ptr::null_mut();
+    // SAFETY: a live resolver and a writable out-parameter.
+    ok(settle("a lookup", |ms| unsafe {
+        weida_resolver_recv(r, ms, &mut q)
+    }));
+    assert!(!q.is_null(), "the resolver's queue ended");
+    q
+}
+
+/// Starts dialling `url`: the connect op, not waited for.
+fn start_connect(r: *mut weida_requester, url: &str) -> *mut weida_requester_connect_op {
+    let url = c(url);
+    let mut op = ptr::null_mut();
+    // SAFETY: a live requester, a C string and a writable out-parameter.
+    ok(unsafe { weida_requester_connect(r, url.as_ptr(), &mut op) });
+    op
+}
+
+/// The host and port a lookup asks for.
+fn lookup_of(q: *mut weida_resolved) -> (Option<String>, Option<u16>) {
+    let mut len = 0usize;
+    let mut port = 0u16;
+    // SAFETY: a live lookup and writable out-parameters.
+    unsafe {
+        let name = text(weida_resolved_name(q, &mut len), len);
+        let port = (weida_resolved_port(q, &mut port) == 1).then_some(port);
+        (name, port)
+    }
+}
+
+#[test]
+fn a_name_only_the_resolver_knows_is_dialled_through_it() {
+    let server = runtime();
+    let l = listener(server);
+    let (id, server_fp) = identity_for(&["svc.weida.test"]);
+    let tls = server_tls(id);
+    let (binding, local) = bind_quic(l, tls);
+    let rep = replier(l, "/echo");
+    let port = local.rsplit(':').next().expect("a port");
+
+    let (client, r) = resolving_runtime();
+    let trust = trust_pinning(&server_fp);
+    let req = requester(client, trust);
+    let op = start_connect(req, "weida://svc.weida.test/echo");
+    let q = next_lookup(r);
+    assert_eq!(lookup_of(q), (Some("svc.weida.test".to_owned()), None));
+    // SAFETY: a live lookup.
+    assert_eq!(unsafe { weida_resolved_max_addresses(q) }, 8);
+    let addr = c(&format!("127.0.0.1:{port}"));
+    let addrs = [addr.as_ptr()];
+    // SAFETY: a live lookup, consumed, and one readable pointer.
+    ok(unsafe { weida_resolved_answer(q, addrs.as_ptr(), addrs.len()) });
+    // SAFETY: a live op.
+    ok(settle("the dial", |ms| unsafe {
+        weida_requester_connect_op_wait(op, ms)
+    }));
+    let meta = exchange(req, rep);
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_meta_drop(meta);
+        weida_requester_connect_op_drop(op);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_replier_drop(rep);
+        weida_binding_drop(binding);
+        weida_server_tls_drop(tls);
+        weida_identity_drop(id);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    // SAFETY: dropped once.
+    unsafe { weida_resolver_drop(r) };
+    shutdown(server);
+}
+
+#[test]
+fn a_refused_lookup_fails_the_connect_with_einvalid_address() {
+    let (client, r) = resolving_runtime();
+    // A pin, since an empty trust refuses the dial before it resolves.
+    let trust = trust_pinning(&format!("sha256:{}", "0".repeat(64)));
+    let req = requester(client, trust);
+    let op = start_connect(req, "weida://nowhere.weida.test:7443/echo");
+    let q = next_lookup(r);
+    assert_eq!(
+        lookup_of(q),
+        (Some("nowhere.weida.test".to_owned()), Some(7443))
+    );
+    let reason = c("no such service");
+    // SAFETY: a live lookup, consumed, and a C string.
+    ok(unsafe { weida_resolved_refuse(q, reason.as_ptr()) });
+    // SAFETY: a live op.
+    let rc = settle("the dial", |ms| unsafe {
+        weida_requester_connect_op_wait(op, ms)
+    });
+    assert_eq!(rc, -WEIDA_EINVALID_ADDRESS, "{}", last_message());
+    assert!(
+        last_message().contains("no such service"),
+        "{}",
+        last_message()
+    );
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_requester_connect_op_drop(op);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+    }
+    shutdown(client);
+    // SAFETY: dropped once.
+    unsafe { weida_resolver_drop(r) };
+}
