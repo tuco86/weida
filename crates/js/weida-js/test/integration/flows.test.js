@@ -47,7 +47,7 @@ test("a flow carries datagrams over QUIC", INTEGRATION, async () => {
     assert.ok(size > BigInt(max), "the size includes the flow's prefix");
     break;
   }
-  assert.notEqual(incoming.pathStats(), null);
+  assert.ok(incoming.pathStats().currentMtu >= 1200n, "QUIC's smallest MTU is 1200");
 
   flow.drop();
   while ((await incoming.recv()) !== null) {

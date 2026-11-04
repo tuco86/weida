@@ -4158,7 +4158,10 @@ static napi_value path_stats_value(napi_env env, weida_path_stats *s) {
     return ok ? obj : NULL;
 }
 
-/* What a path_stats call returned: the error, null, or the snapshot. */
+/* What a path_stats call returned: the error, null, or the snapshot. The
+ * caller stores the call's result before passing `s`: C leaves the order in
+ * which arguments are evaluated unspecified, so `s` read in the same call
+ * could still be NULL. */
 static napi_value path_stats_outcome(napi_env env, int rc, weida_path_stats *s) {
     if (rc < 0)
         return throw_rc(env, rc);
@@ -4171,7 +4174,8 @@ static napi_value flow_path_stats(napi_env env, napi_callback_info info) {
     weida_path_stats *s = NULL;
     if (!f)
         return NULL;
-    return path_stats_outcome(env, weida_flow_path_stats(f, &s), s);
+    int rc = weida_flow_path_stats(f, &s);
+    return path_stats_outcome(env, rc, s);
 }
 
 /* consumes the flow */
@@ -4226,7 +4230,8 @@ static napi_value incoming_flow_path_stats(napi_env env, napi_callback_info info
     weida_path_stats *s = NULL;
     if (!f)
         return NULL;
-    return path_stats_outcome(env, weida_incoming_flow_path_stats(f, &s), s);
+    int rc = weida_incoming_flow_path_stats(f, &s);
+    return path_stats_outcome(env, rc, s);
 }
 
 /* consumes the incoming flow */
