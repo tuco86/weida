@@ -4997,3 +4997,350 @@ fn final_only_reports_one_record_per_level_at_the_end() {
     }
     pair.close();
 }
+
+// --- flows ------------------------------------------------------------------
+
+/// A raw peer of `rt` dialling under `trust`; the terms and the trust are
+/// dropped.
+fn peer_on(rt: *mut weida_runtime, trust: *mut weida_trust) -> *mut weida_peer {
+    let mut tls = ptr::null_mut();
+    let mut p = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    unsafe {
+        ok(weida_client_tls_new(trust, &mut tls));
+        ok(weida_runtime_peer(rt, tls, &mut p));
+        weida_client_tls_drop(tls);
+        weida_trust_drop(trust);
+    }
+    p
+}
+
+fn peer_connect(p: *mut weida_peer, url: &str) -> c_int {
+    let url = c(url);
+    run_op(
+        "the dial",
+        // SAFETY: a live peer, a C string and a writable out-parameter.
+        |op| unsafe { weida_peer_connect(p, url.as_ptr(), op) },
+        weida_peer_connect_op_wait,
+        weida_peer_connect_op_drop,
+    )
+}
+
+/// Opens a flow on `p` carrying `meta`: the flow, or the status its open
+/// ended with.
+fn open_flow(p: *mut weida_peer, meta: *const weida_flow_meta) -> Result<*mut weida_flow, c_int> {
+    let mut op = ptr::null_mut();
+    let mut flow = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; the op is dropped
+    // once.
+    unsafe {
+        ok(weida_peer_open_flow(p, meta, &mut op));
+        let rc = settle("the flow's registration", |ms| {
+            weida_peer_open_flow_op_wait(op, ms, &mut flow)
+        });
+        weida_peer_open_flow_op_drop(op);
+        if rc != 0 {
+            return Err(rc);
+        }
+    }
+    Ok(flow)
+}
+
+fn acceptor(l: *mut weida_listener, path: &str) -> *mut weida_acceptor {
+    let mut a = ptr::null_mut();
+    let path = c(path);
+    // SAFETY: a live listener, a C string and a writable out-parameter.
+    ok(unsafe { weida_listener_acceptor(l, path.as_ptr(), &mut a) });
+    a
+}
+
+fn next_incoming(a: *mut weida_acceptor) -> *mut weida_incoming {
+    let mut i = ptr::null_mut();
+    // SAFETY: a live acceptor and a writable out-parameter.
+    ok(settle("an incoming", |ms| unsafe {
+        weida_acceptor_accept(a, ms, &mut i)
+    }));
+    i
+}
+
+/// Takes the flow out of `i`, which must hold one, and drops `i`.
+fn take_flow(i: *mut weida_incoming) -> *mut weida_incoming_flow {
+    let mut f = ptr::null_mut();
+    let mut again = ptr::null_mut();
+    // SAFETY: a live incoming handle, dropped once, and writable
+    // out-parameters.
+    unsafe {
+        assert_eq!(weida_incoming_kind(i), WEIDA_INCOMING_FLOW);
+        ok(weida_incoming_take_flow(i, &mut f));
+        assert_eq!(weida_incoming_take_flow(i, &mut again), -WEIDA_ECLOSED);
+        weida_incoming_drop(i);
+    }
+    f
+}
+
+/// One recv on `f`: a datagram's bytes, `None` at the end, or the status.
+fn datagram(f: *mut weida_incoming_flow, timeout_ms: i64) -> Result<Option<Vec<u8>>, c_int> {
+    let mut d = ptr::null_mut();
+    // SAFETY: a live incoming flow and a writable out-parameter; the
+    // datagram has `weida_datagram_len` bytes and is dropped once.
+    unsafe {
+        let rc = weida_incoming_flow_recv(f, timeout_ms, &mut d);
+        if rc != 0 {
+            return Err(rc);
+        }
+        if d.is_null() {
+            return Ok(None);
+        }
+        let bytes =
+            std::slice::from_raw_parts(weida_datagram_data(d), weida_datagram_len(d)).to_vec();
+        weida_datagram_drop(d);
+        Ok(Some(bytes))
+    }
+}
+
+/// Sends `[index; 64]` until `f` reads it: a lost QUIC datagram is never
+/// retransmitted. Copies of an earlier index that arrive late are skipped.
+fn deliver(flow: *mut weida_flow, f: *mut weida_incoming_flow, index: u8) {
+    let payload = [index; 64];
+    weida_testkit::poll_until(&format!("datagram {index}"), WAIT, || {
+        // SAFETY: a live flow and 64 readable bytes.
+        ok(unsafe { weida_flow_send(flow, payload.as_ptr(), payload.len()) });
+        match datagram(f, 20) {
+            Err(rc) if rc == -WEIDA_EAGAIN => false,
+            Err(rc) => panic!("the recv failed with {rc}: {}", last_message()),
+            Ok(None) => panic!("the flow ended early"),
+            Ok(Some(d)) if d[0] < index => false,
+            Ok(Some(d)) => {
+                assert_eq!(d, payload);
+                true
+            }
+        }
+    });
+}
+
+/// Reads `f` until its end, skipping late copies, then checks that the end
+/// stays.
+fn until_end(f: *mut weida_incoming_flow) {
+    weida_testkit::poll_until("the flow's end", WAIT, || match datagram(f, 20) {
+        Err(rc) if rc == -WEIDA_EAGAIN => false,
+        Err(rc) => panic!("the recv failed with {rc}: {}", last_message()),
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+    });
+    assert_eq!(datagram(f, 0), Ok(None));
+}
+
+#[test]
+fn a_flow_carries_datagrams_over_quic() {
+    let cfg = datagram_config();
+    let server = runtime_with(cfg);
+    let client = runtime_with(cfg);
+    // SAFETY: dropped once.
+    unsafe { weida_runtime_config_drop(cfg) };
+    let l = listener(server);
+    let (id, fp) = identity();
+    let tls = server_tls(id);
+    let (binding, local) = bind_quic(l, tls);
+    let a = acceptor(l, "/v");
+    let p = peer_on(client, trust_pinning(&fp));
+    ok(peer_connect(p, &format!("weida://{local}/v")));
+
+    let mut m = ptr::null_mut();
+    let t = new_trace();
+    let (mic, opus, bad) = (c("mic"), c("audio/opus"), c("not a trace"));
+    // SAFETY: a writable out-parameter, live metadata and C strings.
+    unsafe {
+        ok(weida_flow_meta_new(&mut m));
+        ok(weida_flow_meta_set_topic(m, mic.as_ptr()));
+        ok(weida_flow_meta_set_content_type(m, opus.as_ptr()));
+        ok(weida_flow_meta_set_trace(m, t.as_ptr()));
+        assert_eq!(weida_flow_meta_set_trace(m, bad.as_ptr()), -WEIDA_EINVAL);
+    }
+    let flow = open_flow(p, m).expect("the flow");
+    // SAFETY: dropped once.
+    unsafe { weida_flow_meta_drop(m) };
+
+    let f = take_flow(next_incoming(a));
+    let mut info = ptr::null_mut();
+    let mut n = u64::MAX;
+    let mut len = 0usize;
+    // SAFETY: live handles and writable out-parameters; `info` is dropped
+    // once.
+    unsafe {
+        ok(weida_incoming_flow_info(f, &mut info));
+        assert_eq!(
+            meta_text(info, weida_incoming_meta_endpoint).as_deref(),
+            Some("/v")
+        );
+        assert_eq!(
+            meta_text(info, weida_incoming_meta_topic).as_deref(),
+            Some("mic")
+        );
+        assert_eq!(
+            meta_text(info, weida_incoming_meta_content_type).as_deref(),
+            Some("audio/opus")
+        );
+        assert_eq!(
+            meta_text(info, weida_incoming_meta_trace).as_deref(),
+            t.to_str().ok()
+        );
+        assert_eq!(weida_incoming_meta_content_len(info, &mut n), 0);
+        assert!(weida_incoming_meta_peer_fingerprint(info, &mut len).is_null());
+        weida_incoming_meta_drop(info);
+    }
+
+    let mut max = 0usize;
+    // SAFETY: a live flow and a writable out-parameter.
+    assert_eq!(unsafe { weida_flow_max_payload(flow, &mut max) }, 1);
+    assert!(max > 0);
+    for index in 0..3 {
+        deliver(flow, f, index);
+    }
+    // QUIC's path MTU discovery may still raise the limit, so the payload
+    // is beyond any UDP datagram rather than one byte past `max`.
+    let big = vec![0u8; 65_536];
+    // SAFETY: a live flow and `big.len()` readable bytes.
+    unsafe {
+        assert_eq!(
+            weida_flow_send(flow, big.as_ptr(), big.len()),
+            -WEIDA_ETOO_LARGE
+        );
+        let limit = weida_last_error_max();
+        assert!(limit >= max as i64 && limit < 65_536, "the limit {limit}");
+        assert_eq!(weida_flow_too_large(flow), 1);
+        assert!(weida_flow_sent(flow) >= 3);
+        assert_eq!(weida_flow_not_live(flow), 0);
+        assert!(weida_incoming_flow_received(f) >= 3);
+        assert_eq!(weida_incoming_flow_overflow(f), 0);
+    }
+
+    let mut ps = ptr::null_mut();
+    let mut size = 0u64;
+    // SAFETY: live handles and writable out-parameters; each snapshot is
+    // dropped once.
+    unsafe {
+        assert_eq!(weida_flow_path_stats(flow, &mut ps), 1);
+        assert!(weida_path_stats_rtt_us(ps) > 0);
+        assert!(weida_path_stats_current_mtu(ps) >= 1200);
+        assert_eq!(weida_path_stats_max_datagram_size(ps, &mut size), 1);
+        assert!(size as usize > max, "the size includes the flow's prefix");
+        weida_path_stats_drop(ps);
+        assert_eq!(weida_incoming_flow_path_stats(f, &mut ps), 1);
+        weida_path_stats_drop(ps);
+        weida_flow_drop(flow);
+    }
+    until_end(f);
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_incoming_flow_drop(f);
+        weida_acceptor_drop(a);
+        weida_peer_drop(p);
+        weida_binding_drop(binding);
+        weida_server_tls_drop(tls);
+        weida_identity_drop(id);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender() {
+    let cfg = datagram_config();
+    let server = runtime_with(cfg);
+    let near = runtime_with(cfg);
+    let far = runtime();
+    // SAFETY: dropped once.
+    unsafe { weida_runtime_config_drop(cfg) };
+    let (l, lb) = bound(server, "abi-flows-refusal");
+    let a = acceptor(l, "/v");
+    let url = "weida+inproc://abi-flows-refusal/v";
+
+    let pf = peer_on(far, trust_by_address());
+    ok(peer_connect(pf, url));
+    assert_eq!(
+        open_flow(pf, ptr::null()).err(),
+        Some(-WEIDA_EDATAGRAMS_UNAVAILABLE)
+    );
+    let mut nothing = ptr::null_mut();
+    // SAFETY: a live acceptor and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_acceptor_accept(a, 200, &mut nothing) },
+        -WEIDA_EAGAIN,
+        "no stream stands in for the flow"
+    );
+
+    let trust = trust_by_address();
+    let req = requester(near, trust);
+    ok(connect(req, url));
+    let pending = request(req, b"x");
+    let i = next_incoming(a);
+    let mut f = ptr::null_mut();
+    let mut answer = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    unsafe {
+        assert_eq!(weida_incoming_kind(i), WEIDA_INCOMING_EXCHANGE);
+        assert_eq!(weida_incoming_take_flow(i, &mut f), -WEIDA_EINVAL);
+        weida_incoming_drop(i);
+        assert_eq!(
+            settle("the unanswered request", |ms| {
+                weida_requester_request_op_wait(pending, ms, &mut answer)
+            }),
+            -WEIDA_ENO_REPLY
+        );
+        weida_requester_request_op_drop(pending);
+    }
+
+    let pn = peer_on(near, trust_by_address());
+    ok(peer_connect(pn, url));
+    let flow = open_flow(pn, ptr::null()).expect("the flow");
+    let f = take_flow(next_incoming(a));
+    let mut max = 0usize;
+    let mut ps = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters.
+    unsafe {
+        assert_eq!(weida_flow_max_payload(flow, &mut max), 1);
+        assert!(max > 0);
+        assert_eq!(weida_flow_path_stats(flow, &mut ps), 0);
+        assert!(ps.is_null(), "a local transport has no path");
+        assert_eq!(weida_incoming_flow_path_stats(f, &mut ps), 0);
+        assert!(ps.is_null());
+        ok(weida_flow_send(flow, b"before".as_ptr(), 6));
+    }
+    weida_testkit::poll_until("the datagram before the refusal", WAIT, || {
+        match datagram(f, 20) {
+            Err(rc) if rc == -WEIDA_EAGAIN => false,
+            Ok(Some(d)) => {
+                assert_eq!(d, b"before");
+                true
+            }
+            other => panic!("expected the datagram, got {other:?}"),
+        }
+    });
+    // SAFETY: consumed once.
+    unsafe { weida_incoming_flow_refuse(f) };
+    weida_testkit::poll_until("the refusal at the sender", WAIT, || {
+        // SAFETY: a live flow and one readable byte.
+        match unsafe { weida_flow_send(flow, b"x".as_ptr(), 1) } {
+            0 => false,
+            rc if rc == -WEIDA_EREJECTED => true,
+            rc => panic!("the send failed with {rc}: {}", last_message()),
+        }
+    });
+
+    // SAFETY: every handle is dropped or consumed once.
+    unsafe {
+        weida_flow_abort(flow);
+        weida_peer_drop(pf);
+        weida_peer_drop(pn);
+        weida_requester_drop(req);
+        weida_trust_drop(trust);
+        weida_acceptor_drop(a);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(far);
+    shutdown(near);
+    shutdown(server);
+}

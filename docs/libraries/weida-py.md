@@ -147,6 +147,10 @@ The C ABI's *cursors* area is absent here: `weida_transfer_meta_set_report`,
 `weida_outgoing_transfer_cursors`, `weida_cursors`, `weida_cursor_set`,
 `weida_incoming_transfer_reporter` and `weida_reporter`.
 
+The C ABI's *flows* area is absent here: `weida_runtime_peer`, `weida_peer`,
+`weida_listener_acceptor`, `weida_acceptor`, `weida_incoming`, `weida_flow_meta`, `weida_flow`,
+`weida_incoming_flow`, `weida_datagram` and `weida_path_stats`.
+
 ## 7. Sources
 
 `crates/py/weida-py/src/weida/` (`__init__.py`, `_native.py`, `_errors.py`, `_wait.py`,

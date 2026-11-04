@@ -180,6 +180,18 @@
 
 #define WEIDA_IDENTITY_EVENT_MISSED 6
 
+#define WEIDA_INCOMING_STREAM 0
+
+#define WEIDA_INCOMING_EXCHANGE 1
+
+#define WEIDA_INCOMING_SUBSCRIBED 2
+
+#define WEIDA_INCOMING_CREDIT 3
+
+#define WEIDA_INCOMING_UNSUBSCRIBED 4
+
+#define WEIDA_INCOMING_FLOW 5
+
 #define WEIDA_POLLIN 1
 
 #define WEIDA_RECEIVED_SEGMENT 0
@@ -204,6 +216,8 @@
 
 #define WEIDA_GIVE_UP_FAILED 2
 
+typedef struct weida_acceptor weida_acceptor;
+
 typedef struct weida_binding weida_binding;
 
 typedef struct weida_binding_close_op weida_binding_close_op;
@@ -225,6 +239,8 @@ typedef struct weida_connection_stats weida_connection_stats;
 typedef struct weida_cursor_set weida_cursor_set;
 
 typedef struct weida_cursors weida_cursors;
+
+typedef struct weida_datagram weida_datagram;
 
 typedef struct weida_delivery weida_delivery;
 
@@ -248,6 +264,10 @@ typedef struct weida_fan_out_write_within_op weida_fan_out_write_within_op;
 
 typedef struct weida_files_options weida_files_options;
 
+typedef struct weida_flow weida_flow;
+
+typedef struct weida_flow_meta weida_flow_meta;
+
 typedef struct weida_guarantee_set weida_guarantee_set;
 
 typedef struct weida_handoff weida_handoff;
@@ -259,6 +279,10 @@ typedef struct weida_identity_event weida_identity_event;
 typedef struct weida_identity_events weida_identity_events;
 
 typedef struct weida_identity_source weida_identity_source;
+
+typedef struct weida_incoming weida_incoming;
+
+typedef struct weida_incoming_flow weida_incoming_flow;
 
 typedef struct weida_incoming_meta weida_incoming_meta;
 
@@ -300,9 +324,17 @@ typedef struct weida_paired_open_op weida_paired_open_op;
 
 typedef struct weida_paired_send_op weida_paired_send_op;
 
+typedef struct weida_path_stats weida_path_stats;
+
+typedef struct weida_peer weida_peer;
+
+typedef struct weida_peer_connect_op weida_peer_connect_op;
+
 typedef struct weida_peer_event weida_peer_event;
 
 typedef struct weida_peer_events weida_peer_events;
+
+typedef struct weida_peer_open_flow_op weida_peer_open_flow_op;
 
 typedef struct weida_pem weida_pem;
 
@@ -586,6 +618,16 @@ int weida_segment_terms_set_priority(const weida_segment_terms *t, int32_t v);
 
 int weida_segment_terms_set_follows_upstream(const weida_segment_terms *t, int v);
 
+int weida_flow_meta_new(weida_flow_meta **out);
+
+void weida_flow_meta_drop(weida_flow_meta *m);
+
+int weida_flow_meta_set_content_type(const weida_flow_meta *m, const char *content_type);
+
+int weida_flow_meta_set_topic(const weida_flow_meta *m, const char *topic);
+
+int weida_flow_meta_set_trace(const weida_flow_meta *m, const char *traceparent);
+
 int weida_cursors_fd(const weida_cursors *c, int64_t *out);
 
 int weida_cursors_recv(const weida_cursors *c, int64_t timeout_ms, weida_cursor_set **out);
@@ -641,6 +683,48 @@ const char *weida_last_error_fingerprint(void);
 int64_t weida_last_error_max(void);
 
 int weida_last_error_os_code(void);
+
+int weida_flow_send(const weida_flow *f, const uint8_t *payload, size_t len);
+
+int weida_flow_max_payload(const weida_flow *f, size_t *out);
+
+uint64_t weida_flow_sent(const weida_flow *f);
+
+uint64_t weida_flow_too_large(const weida_flow *f);
+
+uint64_t weida_flow_discarded(const weida_flow *f);
+
+uint64_t weida_flow_not_live(const weida_flow *f);
+
+int weida_flow_path_stats(const weida_flow *f, weida_path_stats **out);
+
+void weida_flow_abort(weida_flow *f);
+
+void weida_flow_drop(weida_flow *f);
+
+int weida_incoming_flow_info(const weida_incoming_flow *f, weida_incoming_meta **out);
+
+int weida_incoming_flow_fd(const weida_incoming_flow *f, int64_t *out);
+
+int weida_incoming_flow_recv(const weida_incoming_flow *f,
+                             int64_t timeout_ms,
+                             weida_datagram **out);
+
+uint64_t weida_incoming_flow_received(const weida_incoming_flow *f);
+
+uint64_t weida_incoming_flow_overflow(const weida_incoming_flow *f);
+
+int weida_incoming_flow_path_stats(const weida_incoming_flow *f, weida_path_stats **out);
+
+void weida_incoming_flow_refuse(weida_incoming_flow *f);
+
+void weida_incoming_flow_drop(weida_incoming_flow *f);
+
+const uint8_t *weida_datagram_data(const weida_datagram *d);
+
+size_t weida_datagram_len(const weida_datagram *d);
+
+void weida_datagram_drop(weida_datagram *d);
 
 int weida_identity_source_from_identity(const weida_identity *id, weida_identity_source **out);
 
@@ -943,6 +1027,46 @@ int weida_paired_fd(const weida_paired *p, int64_t *out);
 int weida_paired_recv(const weida_paired *p, int64_t timeout_ms, weida_incoming_transfer **out);
 
 void weida_paired_drop(weida_paired *p);
+
+int weida_runtime_peer(const weida_runtime *rt, const weida_client_tls *tls, weida_peer **out);
+
+int weida_peer_connect(const weida_peer *p, const char *url, weida_peer_connect_op **out);
+
+int weida_peer_connect_op_fd(const weida_peer_connect_op *op, int64_t *out);
+
+int weida_peer_connect_op_wait(const weida_peer_connect_op *op, int64_t timeout_ms);
+
+void weida_peer_connect_op_drop(weida_peer_connect_op *op);
+
+int weida_peer_open_flow(const weida_peer *p,
+                         const weida_flow_meta *meta,
+                         weida_peer_open_flow_op **out);
+
+int weida_peer_open_flow_op_fd(const weida_peer_open_flow_op *op, int64_t *out);
+
+int weida_peer_open_flow_op_wait(const weida_peer_open_flow_op *op,
+                                 int64_t timeout_ms,
+                                 weida_flow **out);
+
+void weida_peer_open_flow_op_drop(weida_peer_open_flow_op *op);
+
+void weida_peer_drop(weida_peer *p);
+
+int weida_listener_acceptor(const weida_listener *l, const char *path, weida_acceptor **out);
+
+const char *weida_acceptor_path(const weida_acceptor *a, size_t *len_out);
+
+int weida_acceptor_fd(const weida_acceptor *a, int64_t *out);
+
+int weida_acceptor_accept(const weida_acceptor *a, int64_t timeout_ms, weida_incoming **out);
+
+void weida_acceptor_drop(weida_acceptor *a);
+
+int weida_incoming_kind(const weida_incoming *i);
+
+int weida_incoming_take_flow(const weida_incoming *i, weida_incoming_flow **out);
+
+void weida_incoming_drop(weida_incoming *i);
 
 int weida_poll(weida_poll_item *items, size_t n, int64_t timeout_ms);
 
@@ -1585,6 +1709,26 @@ int weida_connection_stats_remote_age_us(const weida_connection_stats *s,
                                          uint64_t *out);
 
 void weida_connection_stats_drop(weida_connection_stats *s);
+
+uint64_t weida_path_stats_rtt_us(const weida_path_stats *s);
+
+uint64_t weida_path_stats_min_rtt_us(const weida_path_stats *s);
+
+uint64_t weida_path_stats_cwnd(const weida_path_stats *s);
+
+uint64_t weida_path_stats_congestion_events(const weida_path_stats *s);
+
+uint64_t weida_path_stats_lost_packets(const weida_path_stats *s);
+
+uint64_t weida_path_stats_lost_bytes(const weida_path_stats *s);
+
+uint64_t weida_path_stats_sent_packets(const weida_path_stats *s);
+
+uint64_t weida_path_stats_current_mtu(const weida_path_stats *s);
+
+int weida_path_stats_max_datagram_size(const weida_path_stats *s, uint64_t *out);
+
+void weida_path_stats_drop(weida_path_stats *s);
 
 int weida_peer_events_fd(const weida_peer_events *e, int64_t *out);
 

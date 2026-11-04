@@ -7,7 +7,7 @@ use std::ptr;
 use std::task::Poll;
 use std::time::Duration;
 
-use weida_rs::{ConnectionStats, GiveUp, PeerEvent, PeerEvents, PeerIdentity};
+use weida_rs::{ConnectionStats, GiveUp, PathStats, PeerEvent, PeerEvents, PeerIdentity};
 
 use crate::error::{guard, guard_or, guard_ptr, guard_void, loss_code};
 use crate::handle::{CText, borrow, into_handle, out_ptr, release, text_out, write_out};
@@ -610,6 +610,170 @@ pub unsafe extern "C" fn weida_connection_stats_remote_age_us(
 /// `s` is NULL or a live snapshot, dropped at most once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn weida_connection_stats_drop(s: *mut weida_connection_stats) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(s) }));
+}
+
+// --- weida_path_stats ------------------------------------------------------
+
+/// One snapshot of the path under a flow (`PathStats`), read-only.
+pub struct weida_path_stats {
+    stats: PathStats,
+}
+
+impl weida_path_stats {
+    pub(crate) fn handle(stats: PathStats) -> *mut weida_path_stats {
+        into_handle(weida_path_stats { stats })
+    }
+}
+
+/// Reads one number of a path snapshot; 0 for NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+unsafe fn path_number(s: *const weida_path_stats, pick: impl FnOnce(&PathStats) -> u64) -> u64 {
+    guard_or(0, || {
+        if s.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `s` is a live snapshot by this function's
+        // contract.
+        pick(&unsafe { &*s }.stats)
+    })
+}
+
+/// `PathStats::rtt`, the smoothed round-trip time, in microseconds; 0 for
+/// NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_rtt_us(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| us(p.rtt)) }
+}
+
+/// `PathStats::min_rtt`, the smallest round-trip time seen on the path, in
+/// microseconds; 0 for NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_min_rtt_us(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| us(p.min_rtt)) }
+}
+
+/// `PathStats::cwnd`, the congestion window in bytes; 0 for NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_cwnd(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| p.cwnd) }
+}
+
+/// `PathStats::congestion_events`: the congestion events the controller
+/// reacted to; 0 for NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_congestion_events(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| p.congestion_events) }
+}
+
+/// `PathStats::lost_packets`: packets this side sent and declared lost; 0
+/// for NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_lost_packets(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| p.lost_packets) }
+}
+
+/// `PathStats::lost_bytes`: bytes this side sent and declared lost; 0 for
+/// NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_lost_bytes(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| p.lost_bytes) }
+}
+
+/// `PathStats::sent_packets`: packets this side sent; 0 for NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_sent_packets(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| p.sent_packets) }
+}
+
+/// `PathStats::current_mtu`: the largest UDP payload the path carries now;
+/// 0 for NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_current_mtu(s: *const weida_path_stats) -> u64 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { path_number(s, |p| u64::from(p.current_mtu)) }
+}
+
+/// `PathStats::max_datagram_size`: the largest datagram the connection
+/// carries now, the flow's prefix included. 1 and `*out` when present, 0
+/// when the peer accepts no datagram or an argument is NULL.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_max_datagram_size(
+    s: *const weida_path_stats,
+    out: *mut u64,
+) -> c_int {
+    guard_or(0, || {
+        if s.is_null() || out.is_null() {
+            return 0;
+        }
+        // SAFETY: a non-NULL `s` is a live snapshot by this function's
+        // contract.
+        match unsafe { &*s }.stats.max_datagram_size {
+            Some(n) => {
+                // SAFETY: a non-NULL `out` is writable by this function's
+                // contract.
+                unsafe { write_out(out, u64::try_from(n).unwrap_or(u64::MAX)) };
+                1
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Releases a path snapshot. NULL does nothing.
+///
+/// # Safety
+///
+/// `s` is NULL or a live snapshot, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_path_stats_drop(s: *mut weida_path_stats) {
     // SAFETY: forwarded from this function's contract.
     guard_void(|| drop(unsafe { release(s) }));
 }

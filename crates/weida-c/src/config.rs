@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use weida_rs::{
     Acknowledgement, Alpn, Backpressure, Congestion, Deduplication, DeliveryLevel, Discovery,
-    Durability, FilesOptions, GuaranteeSet, JoinTerms, Limits, OrderingMode, OutboxFull,
-    ProducerNaming, ReconnectPolicy, SegmentTerms,
+    Durability, FilesOptions, FlowMeta, GuaranteeSet, JoinTerms, Limits, OrderingMode, OutboxFull,
+    ProducerNaming, ReconnectPolicy, SegmentTerms, TraceContext,
 };
 
 use crate::error::{WEIDA_EINVAL, fail_abi, guard, guard_void};
-use crate::handle::{borrow, into_handle, out_ptr, release, write_out};
+use crate::handle::{borrow, cstr, into_handle, out_ptr, release, write_out};
 
 /// `Congestion::Cubic`.
 pub const WEIDA_CONGESTION_CUBIC: c_int = 0;
@@ -214,6 +214,11 @@ pub struct weida_segment_terms {
     value: Mutex<SegmentTerms>,
 }
 
+/// `FlowMeta` under construction: one setter per key.
+pub struct weida_flow_meta {
+    value: Mutex<FlowMeta>,
+}
+
 impl Builder for weida_limits {
     type Value = Limits;
     fn cell(&self) -> &Mutex<Limits> {
@@ -252,6 +257,13 @@ impl Builder for weida_join_terms {
 impl Builder for weida_segment_terms {
     type Value = SegmentTerms;
     fn cell(&self) -> &Mutex<SegmentTerms> {
+        &self.value
+    }
+}
+
+impl Builder for weida_flow_meta {
+    type Value = FlowMeta;
+    fn cell(&self) -> &Mutex<FlowMeta> {
         &self.value
     }
 }
@@ -1256,4 +1268,100 @@ pub unsafe extern "C" fn weida_segment_terms_set_follows_upstream(
 ) -> c_int {
     // SAFETY: forwarded from this function's contract.
     unsafe { update(t, |x| x.follows_upstream = v != 0) }
+}
+
+// --- weida_flow_meta -------------------------------------------------------
+
+/// Creates flow metadata with no key set (`FlowMeta::default`).
+///
+/// # Safety
+///
+/// `out` is NULL or writable. Release the result with
+/// `weida_flow_meta_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_flow_meta_new(out: *mut *mut weida_flow_meta) -> c_int {
+    create(
+        out,
+        weida_flow_meta {
+            value: Mutex::new(FlowMeta::default()),
+        },
+    )
+}
+
+/// Releases flow metadata. NULL does nothing.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_flow_meta_drop(m: *mut weida_flow_meta) {
+    // SAFETY: forwarded from this function's contract.
+    guard_void(|| drop(unsafe { release(m) }));
+}
+
+/// Sets the flow's media type label (`FlowMeta::with_content_type`). A
+/// label above 256 bytes fails the open with `-WEIDA_ELIMIT_EXCEEDED`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `content_type` is NULL or a NUL-terminated
+/// string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_flow_meta_set_content_type(
+    m: *const weida_flow_meta,
+    content_type: *const c_char,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        try_update(m, |v| {
+            let text = cstr(content_type)?;
+            *v = std::mem::take(v).with_content_type(text);
+            Ok(())
+        })
+    }
+}
+
+/// Sets the topic the flow carries (`FlowMeta::with_topic`). A topic above
+/// 256 bytes fails the open with `-WEIDA_ELIMIT_EXCEEDED`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `topic` is NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_flow_meta_set_topic(
+    m: *const weida_flow_meta,
+    topic: *const c_char,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        try_update(m, |v| {
+            let text = cstr(topic)?;
+            *v = std::mem::take(v).with_topic(text);
+            Ok(())
+        })
+    }
+}
+
+/// Propagates a trace context (`FlowMeta::with_trace`), given as its W3C
+/// version-00 `traceparent` text. Anything else is `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `traceparent` is NULL or a NUL-terminated
+/// string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_flow_meta_set_trace(
+    m: *const weida_flow_meta,
+    traceparent: *const c_char,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        try_update(m, |v| {
+            let text = cstr(traceparent)?;
+            let trace = TraceContext::parse_traceparent(text)
+                .map_err(|_| fail_abi(WEIDA_EINVAL, c"not a W3C version-00 traceparent"))?;
+            *v = std::mem::take(v).with_trace(trace);
+            Ok(())
+        })
+    }
 }

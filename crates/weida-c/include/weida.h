@@ -473,6 +473,36 @@
 #define WEIDA_IDENTITY_EVENT_MISSED 6
 
 /**
+ * `Incoming::Stream`.
+ */
+#define WEIDA_INCOMING_STREAM 0
+
+/**
+ * `Incoming::Exchange`.
+ */
+#define WEIDA_INCOMING_EXCHANGE 1
+
+/**
+ * `Incoming::Subscribed`.
+ */
+#define WEIDA_INCOMING_SUBSCRIBED 2
+
+/**
+ * `Incoming::Credit`.
+ */
+#define WEIDA_INCOMING_CREDIT 3
+
+/**
+ * `Incoming::Unsubscribed`.
+ */
+#define WEIDA_INCOMING_UNSUBSCRIBED 4
+
+/**
+ * `Incoming::Flow`.
+ */
+#define WEIDA_INCOMING_FLOW 5
+
+/**
  * The descriptor is readable: the next try or wait on its handle will not
  * block (R11).
  */
@@ -532,6 +562,12 @@
  * `GiveUp::Failed`.
  */
 #define WEIDA_GIVE_UP_FAILED 2
+
+/**
+ * The bound side of the stream core, serving one endpoint path
+ * (`Acceptor`).
+ */
+typedef struct weida_acceptor weida_acceptor;
 
 /**
  * A QUIC binding: the socket a listener serves on, directly or through a
@@ -595,6 +631,11 @@ typedef struct weida_cursor_set weida_cursor_set;
 typedef struct weida_cursors weida_cursors;
 
 /**
+ * One datagram a flow received (the `Bytes` of `IncomingFlow::recv`).
+ */
+typedef struct weida_datagram weida_datagram;
+
+/**
  * The receipt of a finished outbound transfer.
  */
 typedef struct weida_delivery weida_delivery;
@@ -655,6 +696,17 @@ typedef struct weida_fan_out_write_within_op weida_fan_out_write_within_op;
 typedef struct weida_files_options weida_files_options;
 
 /**
+ * The sending half of one datagram flow (`Flow`). Its calls take the lock
+ * in turn; `weida_flow_abort` takes the value out.
+ */
+typedef struct weida_flow weida_flow;
+
+/**
+ * `FlowMeta` under construction: one setter per key.
+ */
+typedef struct weida_flow_meta weida_flow_meta;
+
+/**
  * `GuaranteeSet` under construction: one setter per dimension.
  */
 typedef struct weida_guarantee_set weida_guarantee_set;
@@ -684,6 +736,16 @@ typedef struct weida_identity_events weida_identity_events;
  * Where an identity comes from (`IdentitySource`); shared, never copied.
  */
 typedef struct weida_identity_source weida_identity_source;
+
+/**
+ * One thing an acceptor took (`Incoming`), as a tagged handle.
+ */
+typedef struct weida_incoming weida_incoming;
+
+/**
+ * The receiving half of one datagram flow (`IncomingFlow`).
+ */
+typedef struct weida_incoming_flow weida_incoming_flow;
 
 /**
  * The metadata of an inbound transfer or request, read-only. It outlives
@@ -789,6 +851,21 @@ typedef struct weida_paired_open_op weida_paired_open_op;
 typedef struct weida_paired_send_op weida_paired_send_op;
 
 /**
+ * One snapshot of the path under a flow (`PathStats`), read-only.
+ */
+typedef struct weida_path_stats weida_path_stats;
+
+/**
+ * The dialling side of the stream core (`Peer`).
+ */
+typedef struct weida_peer weida_peer;
+
+/**
+ * The pending dial of `weida_peer_connect`.
+ */
+typedef struct weida_peer_connect_op weida_peer_connect_op;
+
+/**
  * One transition of one dialled address (`PeerEvent`), read-only.
  */
 typedef struct weida_peer_event weida_peer_event;
@@ -797,6 +874,11 @@ typedef struct weida_peer_event weida_peer_event;
  * One reader of a requester's peer events (`PeerEvents`).
  */
 typedef struct weida_peer_events weida_peer_events;
+
+/**
+ * The pending registration of `weida_peer_open_flow`.
+ */
+typedef struct weida_peer_open_flow_op weida_peer_open_flow_op;
 
 /**
  * PEM text handed out (`Identity::certificate_pem`, `Identity::to_pem`):
@@ -1911,6 +1993,57 @@ int weida_segment_terms_set_priority(const weida_segment_terms *t, int32_t v);
 int weida_segment_terms_set_follows_upstream(const weida_segment_terms *t, int v);
 
 /**
+ * Creates flow metadata with no key set (`FlowMeta::default`).
+ *
+ * # Safety
+ *
+ * `out` is NULL or writable. Release the result with
+ * `weida_flow_meta_drop`.
+ */
+int weida_flow_meta_new(weida_flow_meta **out);
+
+/**
+ * Releases flow metadata. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata, dropped at most once.
+ */
+void weida_flow_meta_drop(weida_flow_meta *m);
+
+/**
+ * Sets the flow's media type label (`FlowMeta::with_content_type`). A
+ * label above 256 bytes fails the open with `-WEIDA_ELIMIT_EXCEEDED`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `content_type` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_flow_meta_set_content_type(const weida_flow_meta *m, const char *content_type);
+
+/**
+ * Sets the topic the flow carries (`FlowMeta::with_topic`). A topic above
+ * 256 bytes fails the open with `-WEIDA_ELIMIT_EXCEEDED`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `topic` is NULL or a NUL-terminated string.
+ */
+int weida_flow_meta_set_topic(const weida_flow_meta *m, const char *topic);
+
+/**
+ * Propagates a trace context (`FlowMeta::with_trace`), given as its W3C
+ * version-00 `traceparent` text. Anything else is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `traceparent` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_flow_meta_set_trace(const weida_flow_meta *m, const char *traceparent);
+
+/**
  * The queue's readiness descriptor (R11): readable when the next
  * `weida_cursors_recv` will not block.
  *
@@ -2200,6 +2333,230 @@ int64_t weida_last_error_max(void);
  * Always safe to call.
  */
 int weida_last_error_os_code(void);
+
+/**
+ * Sends one datagram (`Flow::send`); the payload is copied. Never blocks.
+ *
+ * 0 means the datagram was handed to the connection, not that it arrived.
+ * On a dialled address with no live connection the datagram is dropped,
+ * counted `not_live`, and 0 returned. Fails with `-WEIDA_ETOO_LARGE`
+ * (`weida_last_error_max` names the limit) above `weida_flow_max_payload`,
+ * `-WEIDA_EDATAGRAMS_UNAVAILABLE` when the connection carries no
+ * datagrams, and on an ended flow with the error that ended it
+ * (`-WEIDA_EREJECTED`, `-WEIDA_EUNKNOWN_ENDPOINT`, `-WEIDA_EUNSUPPORTED`,
+ * `-WEIDA_ELIMIT_EXCEEDED`, `-WEIDA_ECANCELED`, `-WEIDA_ECONNECTION_LOST`,
+ * `-WEIDA_ENOT_CONNECTED`). `-WEIDA_ECLOSED` after `weida_flow_abort`.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow; `payload` is NULL only with `len == 0`, else
+ * points to `len` readable bytes.
+ */
+int weida_flow_send(const weida_flow *f, const uint8_t *payload, size_t len);
+
+/**
+ * The largest payload `weida_flow_send` accepts now (`Flow::max_payload`):
+ * 1 and `*out` when the connection carries datagrams, 0 when it does not,
+ * for a NULL argument and after `weida_flow_abort`.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow; `out` is NULL or writable.
+ */
+int weida_flow_max_payload(const weida_flow *f, size_t *out);
+
+/**
+ * `FlowStats::sent`: datagrams handed to the transport; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow.
+ */
+uint64_t weida_flow_sent(const weida_flow *f);
+
+/**
+ * `FlowStats::too_large`: datagrams `weida_flow_send` refused with
+ * `-WEIDA_ETOO_LARGE`; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow.
+ */
+uint64_t weida_flow_too_large(const weida_flow *f);
+
+/**
+ * `FlowStats::discarded`: queued datagrams discarded oldest-first before
+ * they were written, counted on the local transports only; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow.
+ */
+uint64_t weida_flow_discarded(const weida_flow *f);
+
+/**
+ * `FlowStats::not_live`: datagrams dropped because no connection was
+ * live; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow.
+ */
+uint64_t weida_flow_not_live(const weida_flow *f);
+
+/**
+ * A snapshot of the path under the flow (`Flow::path_stats`): 1 and the
+ * snapshot, or 0 with `*out == NULL` on a local transport, which has no
+ * path. `-WEIDA_ECLOSED` after `weida_flow_abort`.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow; `out` is NULL or writable. Release the
+ * snapshot with `weida_path_stats_drop`.
+ */
+int weida_flow_path_stats(const weida_flow *f, weida_path_stats **out);
+
+/**
+ * Abandons the flow (`Flow::abort`), which **consumes** the handle: the
+ * flow is reset `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow, consumed at most once; no other call on it
+ * follows.
+ */
+void weida_flow_abort(weida_flow *f);
+
+/**
+ * Releases a flow, which closes it with FIN (`Flow::close`): the receiver
+ * sees its end after the datagrams already delivered. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live flow, dropped at most once.
+ */
+void weida_flow_drop(weida_flow *f);
+
+/**
+ * What the sender attached to the flow (`IncomingFlow::info`): its
+ * endpoint, topic, content type, trace, peer and chain, read with the
+ * `weida_incoming_meta_*` getters (msg.md). Every other getter reads
+ * absent. Readable after the flow is gone.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow; `out` is NULL or writable. Release
+ * the metadata with `weida_incoming_meta_drop`.
+ */
+int weida_incoming_flow_info(const weida_incoming_flow *f, weida_incoming_meta **out);
+
+/**
+ * The incoming flow's readiness descriptor (R11): readable when the next
+ * `weida_incoming_flow_recv` will not block.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow; `out` is NULL or writable.
+ */
+int weida_incoming_flow_fd(const weida_incoming_flow *f, int64_t *out);
+
+/**
+ * Takes the next datagram, oldest first, waiting up to `timeout_ms` (R4)
+ * for one (`IncomingFlow::recv`). 0 with `*out == NULL` once the flow ended
+ * and every datagram that arrived before its end was taken, and on every
+ * recv after that.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow; `out` is NULL or writable. Release
+ * the datagram with `weida_datagram_drop`.
+ */
+int weida_incoming_flow_recv(const weida_incoming_flow *f,
+                             int64_t timeout_ms,
+                             weida_datagram **out);
+
+/**
+ * `FlowStats::received`: datagrams that arrived for this flow; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow.
+ */
+uint64_t weida_incoming_flow_received(const weida_incoming_flow *f);
+
+/**
+ * `FlowStats::overflow`: arrived datagrams dropped, oldest first, because
+ * `flow_queue_bytes` were unread; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow.
+ */
+uint64_t weida_incoming_flow_overflow(const weida_incoming_flow *f);
+
+/**
+ * A snapshot of the path under the flow (`IncomingFlow::path_stats`): 1
+ * and the snapshot, or 0 with `*out == NULL` on a local transport, which
+ * has no path.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow; `out` is NULL or writable. Release
+ * the snapshot with `weida_path_stats_drop`.
+ */
+int weida_incoming_flow_path_stats(const weida_incoming_flow *f, weida_path_stats **out);
+
+/**
+ * Refuses the flow (`IncomingFlow::refuse`), which **consumes** the
+ * handle: the flow is stopped `REJECTED`, which the sender's next send
+ * reports as `-WEIDA_EREJECTED`. A thread waiting in
+ * `weida_incoming_flow_recv` returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow, consumed at most once; no other
+ * call on it follows.
+ */
+void weida_incoming_flow_refuse(weida_incoming_flow *f);
+
+/**
+ * Releases an incoming flow, which stops it `CANCELED`: the sender's next
+ * send reports `-WEIDA_ECANCELED`. A thread waiting in
+ * `weida_incoming_flow_recv` returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live incoming flow, dropped at most once.
+ */
+void weida_incoming_flow_drop(weida_incoming_flow *f);
+
+/**
+ * The datagram's bytes; `weida_datagram_len` of them. Valid as long as
+ * `d`.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live datagram.
+ */
+const uint8_t *weida_datagram_data(const weida_datagram *d);
+
+/**
+ * The datagram's length in bytes; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live datagram.
+ */
+size_t weida_datagram_len(const weida_datagram *d);
+
+/**
+ * Releases a datagram and its bytes. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `d` is NULL or a live datagram, dropped at most once.
+ */
+void weida_datagram_drop(weida_datagram *d);
 
 /**
  * A source that holds `id` and never changes
@@ -3698,6 +4055,209 @@ int weida_paired_recv(const weida_paired *p, int64_t timeout_ms, weida_incoming_
  * `p` is NULL or a live pair, dropped at most once.
  */
 void weida_paired_drop(weida_paired *p);
+
+/**
+ * Creates a raw peer that dials on `tls`'s terms (`Runtime::peer`).
+ *
+ * # Safety
+ *
+ * `rt` is NULL or a live runtime; `tls` is NULL or live client terms;
+ * `out` is NULL or writable. Release the result with `weida_peer_drop`.
+ */
+int weida_runtime_peer(const weida_runtime *rt, const weida_client_tls *tls, weida_peer **out);
+
+/**
+ * Dials `url` (`Peer::connect`), e.g.
+ * `weida://sha256:…@127.0.0.1:7443/v` or `weida+inproc://bus/v`. The
+ * runtime redials it when the connection is lost.
+ *
+ * Never blocks; the dial runs as the op written to `out`. A peer whose key
+ * is not trusted fails its wait with `-WEIDA_EUNTRUSTED`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `url` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the op with
+ * `weida_peer_connect_op_drop`.
+ */
+int weida_peer_connect(const weida_peer *p, const char *url, weida_peer_connect_op **out);
+
+/**
+ * The readiness descriptor of a connect op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op; `out` is NULL or writable.
+ */
+int weida_peer_connect_op_fd(const weida_peer_connect_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the dial: 0 when connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op.
+ */
+int weida_peer_connect_op_wait(const weida_peer_connect_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a connect op, aborting the dial when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live connect op, dropped at most once.
+ */
+void weida_peer_connect_op_drop(weida_peer_connect_op *op);
+
+/**
+ * Registers a datagram flow to the next peer, round-robin
+ * (`Peer::open_flow`), carrying `meta`, or no keys when `meta` is NULL;
+ * `meta` is copied at the call.
+ *
+ * Never blocks; the open runs as the op written to `out`, whose wait
+ * returns once the header is written. A refusal arrives later, as the
+ * error of a `weida_flow_send`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `meta` is NULL or live flow metadata; `out`
+ * is NULL or writable. Release the op with `weida_peer_open_flow_op_drop`.
+ */
+int weida_peer_open_flow(const weida_peer *p,
+                         const weida_flow_meta *meta,
+                         weida_peer_open_flow_op **out);
+
+/**
+ * The readiness descriptor of an open-flow op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open-flow op; `out` is NULL or writable.
+ */
+int weida_peer_open_flow_op_fd(const weida_peer_open_flow_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the registration and writes the flow
+ * to `out`. Fails with `-WEIDA_EDATAGRAMS_UNAVAILABLE` when the connection
+ * did not agree datagrams (both runtimes need `datagram_receive_bytes`
+ * above 0), `-WEIDA_ENOT_CONNECTED` for a peer never connected, and
+ * `-WEIDA_ELIMIT_EXCEEDED` for a label above 256 bytes.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open-flow op; `out` is NULL or writable. Release
+ * the flow with `weida_flow_drop`.
+ */
+int weida_peer_open_flow_op_wait(const weida_peer_open_flow_op *op,
+                                 int64_t timeout_ms,
+                                 weida_flow **out);
+
+/**
+ * Releases an open-flow op. An unfinished open is aborted; a flow it
+ * registered that no wait took is closed. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open-flow op, dropped at most once.
+ */
+void weida_peer_open_flow_op_drop(weida_peer_open_flow_op *op);
+
+/**
+ * Releases a peer (`Drop for Peer`). NULL does nothing.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer, dropped at most once.
+ */
+void weida_peer_drop(weida_peer *p);
+
+/**
+ * Registers a raw acceptor at the endpoint path `path`
+ * (`Listener::acceptor`): it takes both stream kinds and flows on the
+ * path, tagged. Fails with `-WEIDA_EINVALID_ENDPOINT_PATH` or
+ * `-WEIDA_EALREADY_REGISTERED`.
+ *
+ * # Safety
+ *
+ * `l` is NULL or a live listener; `path` is NULL or a NUL-terminated
+ * string; `out` is NULL or writable. Release the result with
+ * `weida_acceptor_drop`.
+ */
+int weida_listener_acceptor(const weida_listener *l, const char *path, weida_acceptor **out);
+
+/**
+ * The endpoint path this acceptor serves. Lives as long as the acceptor.
+ *
+ * # Safety
+ *
+ * `a` is NULL or a live acceptor; `len_out` is NULL or writable.
+ */
+const char *weida_acceptor_path(const weida_acceptor *a, size_t *len_out);
+
+/**
+ * The acceptor's readiness descriptor (R11): readable when the next
+ * `weida_acceptor_accept` will not block.
+ *
+ * # Safety
+ *
+ * `a` is NULL or a live acceptor; `out` is NULL or writable.
+ */
+int weida_acceptor_fd(const weida_acceptor *a, int64_t *out);
+
+/**
+ * Takes the next thing that arrived on the path, waiting up to
+ * `timeout_ms` (R4) for one (`Acceptor::accept`), as a tagged handle.
+ * `-WEIDA_ENOT_CONNECTED` once the queue ended.
+ *
+ * # Safety
+ *
+ * `a` is NULL or a live acceptor; `out` is NULL or writable. Release the
+ * result with `weida_incoming_drop`.
+ */
+int weida_acceptor_accept(const weida_acceptor *a, int64_t timeout_ms, weida_incoming **out);
+
+/**
+ * Releases an acceptor; its path stays registered, as a dropped Rust
+ * `Acceptor` leaves it. A thread waiting in `weida_acceptor_accept`
+ * returns `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `a` is NULL or a live acceptor, dropped at most once.
+ */
+void weida_acceptor_drop(weida_acceptor *a);
+
+/**
+ * What the acceptor took, a `WEIDA_INCOMING_*` constant.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle.
+ */
+int weida_incoming_kind(const weida_incoming *i);
+
+/**
+ * Hands a flow over, once. A second call is `-WEIDA_ECLOSED`, another
+ * kind `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle; `out` is NULL or writable.
+ * Release the flow with `weida_incoming_flow_drop`.
+ */
+int weida_incoming_take_flow(const weida_incoming *i, weida_incoming_flow **out);
+
+/**
+ * Releases an incoming handle and drops what was not taken, as Rust does:
+ * a stream is refused `REJECTED`, an exchange answers `NO_REPLY`, and a
+ * flow is stopped `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle, dropped at most once.
+ */
+void weida_incoming_drop(weida_incoming *i);
 
 /**
  * Waits until at least one of `n` descriptors in `items` is readable, or
@@ -6632,6 +7192,104 @@ int weida_connection_stats_remote_age_us(const weida_connection_stats *s,
  * `s` is NULL or a live snapshot, dropped at most once.
  */
 void weida_connection_stats_drop(weida_connection_stats *s);
+
+/**
+ * `PathStats::rtt`, the smoothed round-trip time, in microseconds; 0 for
+ * NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_rtt_us(const weida_path_stats *s);
+
+/**
+ * `PathStats::min_rtt`, the smallest round-trip time seen on the path, in
+ * microseconds; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_min_rtt_us(const weida_path_stats *s);
+
+/**
+ * `PathStats::cwnd`, the congestion window in bytes; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_cwnd(const weida_path_stats *s);
+
+/**
+ * `PathStats::congestion_events`: the congestion events the controller
+ * reacted to; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_congestion_events(const weida_path_stats *s);
+
+/**
+ * `PathStats::lost_packets`: packets this side sent and declared lost; 0
+ * for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_lost_packets(const weida_path_stats *s);
+
+/**
+ * `PathStats::lost_bytes`: bytes this side sent and declared lost; 0 for
+ * NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_lost_bytes(const weida_path_stats *s);
+
+/**
+ * `PathStats::sent_packets`: packets this side sent; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_sent_packets(const weida_path_stats *s);
+
+/**
+ * `PathStats::current_mtu`: the largest UDP payload the path carries now;
+ * 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot.
+ */
+uint64_t weida_path_stats_current_mtu(const weida_path_stats *s);
+
+/**
+ * `PathStats::max_datagram_size`: the largest datagram the connection
+ * carries now, the flow's prefix included. 1 and `*out` when present, 0
+ * when the peer accepts no datagram or an argument is NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot; `out` is NULL or writable.
+ */
+int weida_path_stats_max_datagram_size(const weida_path_stats *s, uint64_t *out);
+
+/**
+ * Releases a path snapshot. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live snapshot, dropped at most once.
+ */
+void weida_path_stats_drop(weida_path_stats *s);
 
 /**
  * The reader's readiness descriptor (R11): readable when the next
