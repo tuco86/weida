@@ -157,6 +157,36 @@ fn request(r: *mut weida_requester, body: &[u8]) -> *mut weida_requester_request
     op
 }
 
+/// Opens an exchange on `r`, with `content_type` when given: the request
+/// body and the reply stream.
+fn open_exchange(
+    r: *mut weida_requester,
+    content_type: Option<&str>,
+) -> (*mut weida_outgoing_transfer, *mut weida_reply_stream) {
+    let mut meta = ptr::null_mut();
+    let mut op = ptr::null_mut();
+    let mut body = ptr::null_mut();
+    let mut stream = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    unsafe {
+        if let Some(content_type) = content_type {
+            let content_type = c(content_type);
+            ok(weida_transfer_meta_new(&mut meta));
+            ok(weida_transfer_meta_set_content_type(
+                meta,
+                content_type.as_ptr(),
+            ));
+        }
+        ok(weida_requester_open(r, meta, &mut op));
+        weida_transfer_meta_drop(meta);
+        ok(settle("the exchange", |ms| {
+            weida_requester_open_op_wait(op, ms, &mut body, &mut stream)
+        }));
+        weida_requester_open_op_drop(op);
+    }
+    (body, stream)
+}
+
 fn accept(r: *mut weida_replier) -> *mut weida_incoming_request {
     let mut q = ptr::null_mut();
     // SAFETY: a live replier and a writable out-parameter.
@@ -615,6 +645,79 @@ fn canceled_settles_once_the_requester_drops_its_request() {
         }));
         weida_incoming_request_canceled_op_drop(canceled);
         weida_incoming_request_drop(q);
+    }
+    pair.close();
+}
+
+#[test]
+fn an_opened_exchange_reads_its_reply_while_the_request_is_still_open() {
+    let pair = Pair::new("abi-streams-open");
+    let (out, stream) = open_exchange(pair.req, Some("text/plain"));
+    for piece in [&b"one"[..], b"two", b"three"] {
+        write_all(out, piece);
+    }
+    let q = accept(pair.rep);
+    let mut meta = ptr::null_mut();
+    // SAFETY: a live request and a writable out-parameter; dropped once.
+    unsafe {
+        ok(weida_incoming_request_meta(q, &mut meta));
+        assert_eq!(content_type(meta).as_deref(), Some("text/plain"));
+        weida_incoming_meta_drop(meta);
+    }
+    let body = take_body(q);
+    let answer = reply(q, None);
+    write_all(answer, b"ack");
+    let mut delivery = ptr::null_mut();
+    let mut op = ptr::null_mut();
+    let mut incoming = ptr::null_mut();
+    // SAFETY: live handles, each consumed or dropped once, and writable
+    // out-parameters.
+    unsafe {
+        ok(weida_outgoing_transfer_finish(answer, &mut delivery));
+        weida_delivery_drop(delivery);
+        ok(weida_reply_stream_recv(stream, &mut op));
+        ok(settle("the reply", |ms| {
+            weida_reply_stream_recv_op_wait(op, ms, &mut incoming)
+        }));
+        weida_reply_stream_recv_op_drop(op);
+    }
+    assert_eq!(read_all(incoming, 64).expect("the reply"), b"ack");
+    // SAFETY: each handle is consumed or dropped once; the request body is
+    // finished only after the reply was read to its end.
+    unsafe {
+        weida_incoming_transfer_drop(incoming);
+        ok(weida_outgoing_transfer_finish(out, &mut delivery));
+        weida_delivery_drop(delivery);
+    }
+    assert_eq!(read_all(body, 4).expect("the request body"), b"onetwothree");
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_transfer_drop(body) };
+    pair.close();
+}
+
+#[test]
+fn dropping_a_reply_stream_cancels_the_exchange() {
+    let pair = Pair::new("abi-streams-drop");
+    let (out, stream) = open_exchange(pair.req, None);
+    let q = accept(pair.rep);
+    let mut canceled = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and a writable
+    // out-parameter. `q` stays live until the wait settled: its NO_REPLY
+    // would end the reply half for another reason.
+    unsafe {
+        ok(weida_incoming_request_canceled(q, &mut canceled));
+        assert_eq!(
+            weida_incoming_request_canceled_op_wait(canceled, 0),
+            -WEIDA_EAGAIN,
+            "the requester still listens"
+        );
+        weida_reply_stream_drop(stream);
+        ok(settle("the cancellation", |ms| {
+            weida_incoming_request_canceled_op_wait(canceled, ms)
+        }));
+        weida_incoming_request_canceled_op_drop(canceled);
+        weida_incoming_request_drop(q);
+        weida_outgoing_transfer_drop(out);
     }
     pair.close();
 }

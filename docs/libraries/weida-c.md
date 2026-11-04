@@ -56,7 +56,9 @@ unit tests in `crates/weida-c/src/`.
 | `Requester::connect` | `weida_requester_connect` (op) | present; `abi::a_streamed_round_trip_over_inproc`, `smoke.c` |
 | `Requester::request` | `weida_requester_request` (op), the reply handed over at its header | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Requester::request_with` | `weida_requester_request_with` (op) | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
-| `Requester::open`, `ReplyStream` | — | absent: *streams* |
+| `Requester::open` | `weida_requester_open` (op; its wait yields the request body as a `weida_outgoing_transfer` and the `weida_reply_stream`) | present; `abi::an_opened_exchange_reads_its_reply_while_the_request_is_still_open` (*streams*) |
+| `ReplyStream::recv` | `weida_reply_stream_recv` (op, consumes) | present; `abi::an_opened_exchange_reads_its_reply_while_the_request_is_still_open` (*streams*) |
+| `Drop for ReplyStream` (`CANCELED`) | `weida_reply_stream_drop` | present; `abi::dropping_a_reply_stream_cancels_the_exchange` (*streams*) |
 | `Requester::connection_stats`, `events` | — | absent: *stats* |
 | `Replier::accept` | `weida_replier_accept` (try, R3a) | present; `abi::an_accept_with_nothing_pending_answers_eagain`, `abi::a_repliers_descriptor_follows_its_queue`, `abi::a_signal_ends_a_blocked_accept_with_eintr`, `abi::dropping_a_replier_ends_a_blocked_accept_with_eclosed` |
 | `Replier::path` | `weida_replier_path` | present; R7 getter |
@@ -165,7 +167,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the twenty-one `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the twenty-three `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).

@@ -196,9 +196,15 @@ typedef struct weida_reconnect_policy weida_reconnect_policy;
 
 typedef struct weida_replier weida_replier;
 
+typedef struct weida_reply_stream weida_reply_stream;
+
+typedef struct weida_reply_stream_recv_op weida_reply_stream_recv_op;
+
 typedef struct weida_requester weida_requester;
 
 typedef struct weida_requester_connect_op weida_requester_connect_op;
+
+typedef struct weida_requester_open_op weida_requester_open_op;
 
 typedef struct weida_requester_request_op weida_requester_request_op;
 
@@ -440,6 +446,31 @@ int weida_requester_request_op_wait(const weida_requester_request_op *op,
                                     weida_incoming_transfer **out);
 
 void weida_requester_request_op_drop(weida_requester_request_op *op);
+
+int weida_requester_open(const weida_requester *r,
+                         const weida_transfer_meta *meta,
+                         weida_requester_open_op **out);
+
+int weida_requester_open_op_fd(const weida_requester_open_op *op, int64_t *out);
+
+int weida_requester_open_op_wait(const weida_requester_open_op *op,
+                                 int64_t timeout_ms,
+                                 weida_outgoing_transfer **out_body,
+                                 weida_reply_stream **out_reply);
+
+void weida_requester_open_op_drop(weida_requester_open_op *op);
+
+int weida_reply_stream_recv(weida_reply_stream *s, weida_reply_stream_recv_op **out);
+
+int weida_reply_stream_recv_op_fd(const weida_reply_stream_recv_op *op, int64_t *out);
+
+int weida_reply_stream_recv_op_wait(const weida_reply_stream_recv_op *op,
+                                    int64_t timeout_ms,
+                                    weida_incoming_transfer **out);
+
+void weida_reply_stream_recv_op_drop(weida_reply_stream_recv_op *op);
+
+void weida_reply_stream_drop(weida_reply_stream *s);
 
 void weida_requester_drop(weida_requester *r);
 

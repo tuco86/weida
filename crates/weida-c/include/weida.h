@@ -514,6 +514,16 @@ typedef struct weida_reconnect_policy weida_reconnect_policy;
 typedef struct weida_replier weida_replier;
 
 /**
+ * The reply half of an exchange `weida_requester_open` opened.
+ */
+typedef struct weida_reply_stream weida_reply_stream;
+
+/**
+ * The pending wait of `weida_reply_stream_recv`.
+ */
+typedef struct weida_reply_stream_recv_op weida_reply_stream_recv_op;
+
+/**
  * The requesting half of Req/Rep: dials repliers and sends them requests.
  */
 typedef struct weida_requester weida_requester;
@@ -522,6 +532,11 @@ typedef struct weida_requester weida_requester;
  * The pending dial of `weida_requester_connect`.
  */
 typedef struct weida_requester_connect_op weida_requester_connect_op;
+
+/**
+ * The pending exchange of `weida_requester_open`.
+ */
+typedef struct weida_requester_open_op weida_requester_open_op;
 
 /**
  * The pending exchange of `weida_requester_request`.
@@ -1613,6 +1628,121 @@ int weida_requester_request_op_wait(const weida_requester_request_op *op,
  * `op` is NULL or a live request op, dropped at most once.
  */
 void weida_requester_request_op_drop(weida_requester_request_op *op);
+
+/**
+ * Opens one exchange (`Requester::open`) carrying `meta`, or empty
+ * metadata when `meta` is NULL; `meta` is copied at the call.
+ *
+ * Never blocks; the exchange opens as the op written to `out`. Its wait
+ * yields the request body, written like a socket and ended with
+ * `weida_outgoing_transfer_finish`, and the reply stream, whose
+ * `weida_reply_stream_recv` waits for the reply. The two halves are
+ * independent: the reply can be awaited and read while the body is still
+ * open.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live requester; `meta` is NULL or live metadata; `out`
+ * is NULL or writable. Release the op with `weida_requester_open_op_drop`.
+ */
+int weida_requester_open(const weida_requester *r,
+                         const weida_transfer_meta *meta,
+                         weida_requester_open_op **out);
+
+/**
+ * The readiness descriptor of an open op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_requester_open_op_fd(const weida_requester_open_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the exchange and writes both halves:
+ * the request body to `out_body` and the reply stream to `out_reply`.
+ * Both are written, or neither.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out_body` and `out_reply` are NULL or
+ * writable.
+ */
+int weida_requester_open_op_wait(const weida_requester_open_op *op,
+                                 int64_t timeout_ms,
+                                 weida_outgoing_transfer **out_body,
+                                 weida_reply_stream **out_reply);
+
+/**
+ * Releases an open op. An unfinished open is aborted; an exchange it
+ * opened that no wait took is abandoned: its body is reset `CANCELED` and
+ * its reply half stopped `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op, dropped at most once.
+ */
+void weida_requester_open_op_drop(weida_requester_open_op *op);
+
+/**
+ * Waits for the reply (`ReplyStream::recv`). **Consumes** `s` on every
+ * return path.
+ *
+ * Never blocks; the wait runs as the op written to `out`. Its wait yields
+ * the reply as an incoming transfer as soon as its header arrives, or the
+ * error the replier answered with (README R9's `ErrorCode` table).
+ *
+ * A NULL `out` fails with `-WEIDA_EINVAL`, and the stream is dropped all
+ * the same: the replier sees `CANCELED`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live reply stream, not used again; `out` is NULL or
+ * writable. Release the op with `weida_reply_stream_recv_op_drop`.
+ */
+int weida_reply_stream_recv(weida_reply_stream *s, weida_reply_stream_recv_op **out);
+
+/**
+ * The readiness descriptor of a recv op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live recv op; `out` is NULL or writable.
+ */
+int weida_reply_stream_recv_op_fd(const weida_reply_stream_recv_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the reply and writes it to `out`, an
+ * incoming transfer read like a socket or collected whole.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live recv op; `out` is NULL or writable.
+ */
+int weida_reply_stream_recv_op_wait(const weida_reply_stream_recv_op *op,
+                                    int64_t timeout_ms,
+                                    weida_incoming_transfer **out);
+
+/**
+ * Releases a recv op. Dropped unfinished, it aborts the wait, and the
+ * replier sees the requester gone. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live recv op, dropped at most once.
+ */
+void weida_reply_stream_recv_op_drop(weida_reply_stream_recv_op *op);
+
+/**
+ * Releases a reply stream without waiting. Its reply half is stopped with
+ * `CANCELED`, so the replier learns nobody is listening (its
+ * `weida_incoming_request_canceled` op settles). NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live reply stream, dropped at most once.
+ */
+void weida_reply_stream_drop(weida_reply_stream *s);
 
 /**
  * Releases a requester, which drops its connections. NULL does nothing.

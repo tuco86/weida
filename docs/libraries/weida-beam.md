@@ -114,6 +114,10 @@ The C ABI's *refusals* area is absent here: the rows of [weida-c.md](weida-c.md)
 `IncomingRequest::canceled`. A request is still declined only by dropping it, which answers
 `NO_REPLY`.
 
+The C ABI's *streams* area is absent here: the rows of [weida-c.md](weida-c.md) marked
+(*streams*), `Requester::open` with `weida_reply_stream` and its `recv`. A request body is still
+sent whole, as one buffer.
+
 ## 7. Sources
 
 `crates/beam/weida/c_src/` (`weida_nif.c`, `build.sh`), `src/` (`weida.erl`, `weida_nif.erl`,
