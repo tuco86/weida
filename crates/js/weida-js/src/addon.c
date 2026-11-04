@@ -109,6 +109,10 @@ DROP(dish)
 DROP(dish_connect_op)
 DROP(dish_join_op)
 DROP(dish_leave_op)
+DROP(cursors)
+DROP(reporter)
+DROP(reporter_report_op)
+DROP(reporter_finish_op)
 DROP(transfer_meta)
 DROP(incoming_transfer)
 DROP(incoming_transfer_collect_op)
@@ -372,6 +376,19 @@ static const char *acknowledgement_name(int level) {
         NAME(ACKNOWLEDGEMENT_STORED)
         NAME(ACKNOWLEDGEMENT_REPLICATED)
         NAME(ACKNOWLEDGEMENT_PROCESSED)
+#undef NAME
+    default:
+        return NULL;
+    }
+}
+
+static const char *report_mode_name(int mode) {
+    switch (mode) {
+#define NAME(c) \
+    case WEIDA_##c: \
+        return "WEIDA_" #c;
+        NAME(REPORT_MODE_PROGRESS)
+        NAME(REPORT_MODE_FINAL_ONLY)
 #undef NAME
     default:
         return NULL;
@@ -695,6 +712,29 @@ static napi_value gap_value(napi_env env, const weida_incoming_meta *m) {
     return obj;
 }
 
+/* A cursor level out: weida's own by its `WEIDA_ACKNOWLEDGEMENT_*` name, an
+ * application stage as a BigInt. */
+static napi_value level_value(napi_env env, uint64_t level) {
+    if (level < WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR)
+        return js_string(env, acknowledgement_name((int)level), NAPI_AUTO_LENGTH);
+    return optional_u64(env, 1, level);
+}
+
+/* An array of cursor levels; empty for NULL. */
+static napi_value levels_value(napi_env env, const uint64_t *p, size_t n) {
+    napi_value arr;
+    if (!p)
+        n = 0;
+    if (napi_create_array_with_length(env, n, &arr) != napi_ok)
+        return throw_napi(env);
+    for (size_t i = 0; i < n; i++) {
+        napi_value v = level_value(env, p[i]);
+        if (!v || napi_set_element(env, arr, (uint32_t)i, v) != napi_ok)
+            return throw_napi(env);
+    }
+    return arr;
+}
+
 /* Copies a weida_incoming_meta out into a plain object and drops it. */
 static napi_value meta_value(napi_env env, void *ptr) {
     weida_incoming_meta *m = ptr;
@@ -736,6 +776,14 @@ static napi_value meta_value(napi_env env, void *ptr) {
                    weida_incoming_meta_achieved(m, &level) == 1
                        ? js_string(env, acknowledgement_name(level), NAPI_AUTO_LENGTH)
                        : js_null(env));
+    size_t report_len = 0;
+    const uint64_t *report = weida_incoming_meta_report(m, &report_len);
+    ok = ok && set(env, obj, "report", levels_value(env, report, report_len));
+    ok = ok && set(env, obj, "reportMode",
+                   js_string(env, report_mode_name(weida_incoming_meta_report_mode(m)),
+                             NAPI_AUTO_LENGTH));
+    present = weida_incoming_meta_report_id(m, &n);
+    ok = ok && set(env, obj, "reportId", optional_u64(env, present, n));
     weida_incoming_meta_drop(m);
     return ok ? obj : NULL;
 }
@@ -1791,6 +1839,43 @@ SET_U64(transfer_meta_set_content_len, transfer_meta, content_len, UINT64_MAX)
 SET_TEXT(transfer_meta_set_topic, transfer_meta, topic)
 SET_TEXT(transfer_meta_set_trace, transfer_meta, trace)
 SET_INT(transfer_meta_set_achieved, transfer_meta, achieved)
+SET_INT(transfer_meta_set_report_mode, transfer_meta, report_mode)
+
+/* (meta, levels): an array of cursor levels as wire values */
+static napi_value transfer_meta_set_report(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_transfer_meta *m = live(env, argv[0], drop_transfer_meta);
+    bool is_array = false;
+    uint32_t n = 0;
+    if (!m)
+        return NULL;
+    if (napi_is_array(env, argv[1], &is_array) != napi_ok)
+        return throw_napi(env);
+    if (!is_array)
+        return throw_type(env, "expected an array of cursor levels");
+    if (napi_get_array_length(env, argv[1], &n) != napi_ok)
+        return throw_napi(env);
+    uint64_t *levels = NULL;
+    if (n) {
+        levels = malloc(n * sizeof *levels);
+        if (!levels)
+            return throw_range(env, "out of memory");
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        napi_value v;
+        if (napi_get_element(env, argv[1], i, &v) != napi_ok) {
+            free(levels);
+            return throw_napi(env);
+        }
+        if (!get_u64(env, v, UINT64_MAX, &levels[i])) {
+            free(levels);
+            return NULL;
+        }
+    }
+    int rc = weida_transfer_meta_set_report(m, levels, n);
+    free(levels);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
 
 /* `newTrace() -> string`: a fresh root traceparent. */
 static napi_value new_trace(napi_env env, napi_callback_info info) {
@@ -3494,6 +3579,141 @@ static napi_value dish_recv(napi_env env, napi_callback_info info) {
     return outcome(env, rc, received_value, out);
 }
 
+/* cursors */
+
+/* -> Cursors handle | null; null once taken and when nothing was ordered */
+static napi_value outgoing_transfer_cursors(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_outgoing_transfer *t = live(env, argv[0], drop_outgoing_transfer);
+    weida_cursors *out = NULL;
+    if (!t)
+        return NULL;
+    int rc = weida_outgoing_transfer_cursors(t, &out);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    return rc == 0 ? js_null(env) : wrap(env, out, drop_cursors);
+}
+
+/* -> Reporter handle | null; null when nothing was ordered */
+static napi_value incoming_transfer_reporter(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_incoming_transfer *t = live(env, argv[0], drop_incoming_transfer);
+    weida_reporter *out = NULL;
+    if (!t)
+        return NULL;
+    int rc = weida_incoming_transfer_reporter(t, &out);
+    if (rc < 0)
+        return throw_rc(env, rc);
+    return rc == 0 ? js_null(env) : wrap(env, out, drop_reporter);
+}
+
+FD(cursors_fd, cursors)
+
+/* Copies a weida_cursor_set out into an array of `{ level, offset }` in
+ * ascending level order and drops it. */
+static napi_value cursor_set_value(napi_env env, void *ptr) {
+    weida_cursor_set *s = ptr;
+    size_t n = weida_cursor_set_len(s);
+    napi_value arr = NULL;
+    bool ok = napi_create_array_with_length(env, n, &arr) == napi_ok;
+    if (!ok)
+        throw_napi(env);
+    for (size_t i = 0; ok && i < n; i++) {
+        uint64_t level = 0, offset = 0;
+        napi_value entry = NULL;
+        weida_cursor_set_level(s, i, &level, &offset);
+        ok = napi_create_object(env, &entry) == napi_ok;
+        if (!ok) {
+            throw_napi(env);
+            break;
+        }
+        ok = set(env, entry, "level", level_value(env, level)) &&
+             set(env, entry, "offset", optional_u64(env, 1, offset));
+        if (ok && napi_set_element(env, arr, (uint32_t)i, entry) != napi_ok) {
+            throw_napi(env);
+            ok = false;
+        }
+    }
+    weida_cursor_set_drop(s);
+    return ok ? arr : NULL;
+}
+
+/* -> set | null | AGAIN; null once no more cursors come */
+static napi_value cursors_recv(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_cursors *c = live(env, argv[0], drop_cursors);
+    weida_cursor_set *s = NULL;
+    if (!c)
+        return NULL;
+    int rc = weida_cursors_recv(c, 0, &s);
+    if (rc == 0 && !s)
+        return js_null(env);
+    return outcome(env, rc, cursor_set_value, s);
+}
+
+static napi_value reporter_levels(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_reporter *r = live(env, argv[0], drop_reporter);
+    size_t len = 0;
+    if (!r)
+        return NULL;
+    const uint64_t *levels = weida_reporter_levels(r, &len);
+    return levels_value(env, levels, len);
+}
+
+static napi_value reporter_mode(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_reporter *r = live(env, argv[0], drop_reporter);
+    if (!r)
+        return NULL;
+    int mode = weida_reporter_mode(r);
+    if (mode < 0)
+        return throw_rc(env, mode);
+    return js_string(env, report_mode_name(mode), NAPI_AUTO_LENGTH);
+}
+
+/* (reporter, bytes, intervalMs) */
+static napi_value reporter_set_granularity(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_reporter *r = live(env, argv[0], drop_reporter);
+    uint64_t bytes = 0, interval_ms = 0;
+    if (!r || !get_u64(env, argv[1], UINT64_MAX, &bytes) ||
+        !get_u64(env, argv[2], UINT64_MAX, &interval_ms))
+        return NULL;
+    int rc = weida_reporter_set_granularity(r, bytes, interval_ms);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+/* (reporter, level, offset) -> op */
+static napi_value reporter_report(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_reporter *r = live(env, argv[0], drop_reporter);
+    uint64_t level = 0, offset = 0;
+    if (!r || !get_u64(env, argv[1], UINT64_MAX, &level) ||
+        !get_u64(env, argv[2], UINT64_MAX, &offset))
+        return NULL;
+    weida_reporter_report_op *op = NULL;
+    int rc = weida_reporter_report(r, level, offset, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_reporter_report_op);
+}
+
+FD(reporter_report_op_fd, reporter_report_op)
+WAIT0(reporter_report_op_wait, reporter_report_op)
+
+/* consumes the reporter */
+static napi_value reporter_finish(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    weida_reporter *r = take(env, argv[0], drop_reporter);
+    weida_reporter_finish_op *op = NULL;
+    if (!r)
+        return NULL;
+    int rc = weida_reporter_finish(r, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_reporter_finish_op);
+}
+
+FD(reporter_finish_op_fd, reporter_finish_op)
+WAIT0(reporter_finish_op_wait, reporter_finish_op)
+
 /* incoming transfer */
 
 static napi_value incoming_transfer_meta(napi_env env, napi_callback_info info) {
@@ -3681,6 +3901,11 @@ static napi_value constants(napi_env env) {
     CONSTANT(RECEIVED_SEGMENT)
     CONSTANT(RECEIVED_DATAGRAM)
     CONSTANT(MAX_SEGMENT_LAYERS)
+    CONSTANT(CURSOR_LEVEL_APPLICATION_FLOOR)
+    CONSTANT(REPORT_MODE_PROGRESS)
+    CONSTANT(REPORT_MODE_FINAL_ONLY)
+    CONSTANT(REPORTER_DEFAULT_BYTES)
+    CONSTANT(REPORTER_DEFAULT_INTERVAL_MS)
 #undef CONSTANT
     if (napi_object_freeze(env, obj) != napi_ok)
         return throw_napi(env);
@@ -3873,6 +4098,8 @@ NAPI_MODULE_INIT() {
         FN("transferMetaSetTopic", transfer_meta_set_topic),
         FN("transferMetaSetTrace", transfer_meta_set_trace),
         FN("transferMetaSetAchieved", transfer_meta_set_achieved),
+        FN("transferMetaSetReport", transfer_meta_set_report),
+        FN("transferMetaSetReportMode", transfer_meta_set_report_mode),
         FN("listenerBindQuic", listener_bind_quic),
         FN("listenerBindQuicOpFd", listener_bind_quic_op_fd),
         FN("listenerBindQuicOpWait", listener_bind_quic_op_wait),
@@ -4107,6 +4334,19 @@ NAPI_MODULE_INIT() {
         FN("dishRecv", dish_recv),
         FN("dishStale", dish_stale),
         FN("dishOverflow", dish_overflow),
+        FN("outgoingTransferCursors", outgoing_transfer_cursors),
+        FN("incomingTransferReporter", incoming_transfer_reporter),
+        FN("cursorsFd", cursors_fd),
+        FN("cursorsRecv", cursors_recv),
+        FN("reporterLevels", reporter_levels),
+        FN("reporterMode", reporter_mode),
+        FN("reporterSetGranularity", reporter_set_granularity),
+        FN("reporterReport", reporter_report),
+        FN("reporterReportOpFd", reporter_report_op_fd),
+        FN("reporterReportOpWait", reporter_report_op_wait),
+        FN("reporterFinish", reporter_finish),
+        FN("reporterFinishOpFd", reporter_finish_op_fd),
+        FN("reporterFinishOpWait", reporter_finish_op_wait),
         FN("incomingTransferMeta", incoming_transfer_meta),
         FN("incomingTransferConnection", incoming_transfer_connection),
         FN("incomingTransferFd", incoming_transfer_fd),

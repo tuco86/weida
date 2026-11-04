@@ -28,6 +28,9 @@ export type Count = number | bigint;
 /** How many layers a segment carries: 0 to 15. */
 export const MAX_SEGMENT_LAYERS: number;
 
+/** The first cursor level an application may name. */
+export const CURSOR_LEVEL_APPLICATION_FLOOR: number;
+
 // Enumerations travel as the names of the weida.h constants.
 export type Congestion = "WEIDA_CONGESTION_CUBIC" | "WEIDA_CONGESTION_NEW_RENO" | "WEIDA_CONGESTION_BBR";
 export type Discovery = "WEIDA_DISCOVERY_AWARE" | "WEIDA_DISCOVERY_SINGLE";
@@ -61,6 +64,19 @@ export type Backpressure =
   | "WEIDA_BACKPRESSURE_SPILL"
   | "WEIDA_BACKPRESSURE_COALESCE";
 export type ProducerNaming = "WEIDA_PRODUCER_NAMING_FINGERPRINT" | "WEIDA_PRODUCER_NAMING_STABLE";
+export type ReportMode = "WEIDA_REPORT_MODE_PROGRESS" | "WEIDA_REPORT_MODE_FINAL_ONLY";
+/** A level in: a "WEIDA_ACKNOWLEDGEMENT_*" name or an application stage at
+ * or above CURSOR_LEVEL_APPLICATION_FLOOR. */
+export type CursorLevel = Acknowledgement | number | bigint;
+/** A level out: weida's own by name, an application stage as a bigint. */
+export type ReportedLevel = Acknowledgement | bigint;
+/** One reported level and how far it got. */
+export interface CursorEntry {
+  readonly level: ReportedLevel;
+  readonly offset: bigint;
+}
+/** The newest offset per reported level, ascending by level. */
+export type CursorSet = readonly CursorEntry[];
 export type ErrorCode =
   | "WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT"
   | "WEIDA_ERROR_CODE_REJECTED"
@@ -240,6 +256,12 @@ export interface IncomingMeta {
   readonly tracestate: string | null;
   /** The completion level the sender claimed for the message this answers. */
   readonly achieved: Acknowledgement | null;
+  /** The cursor levels the sender ordered reported, ascending; empty when
+   * none. */
+  readonly report: readonly ReportedLevel[];
+  readonly reportMode: ReportMode;
+  /** Present exactly when levels were ordered. */
+  readonly reportId: bigint | null;
 }
 
 /** What a publisher dropped on one topic, by cause. */
@@ -421,6 +443,9 @@ export interface TransferMeta {
   trace?: string | null;
   topic?: string | null;
   achieved?: Acknowledgement | null;
+  /** The cursor levels the receiver should report; at most 16 distinct. */
+  report?: readonly CursorLevel[] | null;
+  reportMode?: ReportMode | null;
 }
 
 /** Every class around a C handle. A dropped or consumed object throws
@@ -649,6 +674,26 @@ export class IdentityEvents extends Handle {
   [Symbol.asyncIterator](): AsyncGenerator<IdentityEvent, void, undefined>;
 }
 
+export class Cursors extends Handle {
+  /** The newest set after a change, or null once no more cursors come. */
+  recv(options?: WaitOptions): Promise<CursorSet | null>;
+  [Symbol.asyncIterator](): AsyncGenerator<CursorSet, void, undefined>;
+}
+
+/** Dropping it without `finish` flushes nothing. */
+export class Reporter extends Handle {
+  /** The levels the sender ordered, ascending. */
+  levels(): readonly ReportedLevel[];
+  mode(): ReportMode;
+  /** Progress records at `bytes` or `intervalMs`, whichever comes first;
+   * 0 and 0 write every report. */
+  setGranularity(bytes: Count, intervalMs: Count): void;
+  /** A level the sender did not order is ignored. */
+  report(level: CursorLevel, offset: Count, options?: WaitOptions): Promise<void>;
+  /** Flushes the newest offset per reported level. Consumes the reporter. */
+  finish(options?: WaitOptions): Promise<void>;
+}
+
 export class Replier extends Handle {
   path(): string | null;
   accept(options?: WaitOptions): Promise<IncomingRequest>;
@@ -845,6 +890,10 @@ export class IncomingTransfer extends Handle {
   meta(): IncomingMeta;
   /** The number of the connection this transfer arrived on. */
   connection(): bigint;
+  /** A new reporter for the levels the sender ordered on every call; null
+   * when it ordered none. Take it before `collect`, it outlives the
+   * transfer. */
+  reporter(): Reporter | null;
   /** Up to `cap` bytes (default 65536); empty at the end of the payload. */
   read(cap?: number, options?: WaitOptions): Promise<Uint8Array>;
   /** Consumes the transfer. */
@@ -863,6 +912,10 @@ export class OutgoingTransfer extends Handle {
   /** A write or finish past the deadline throws WEIDA_EEXPIRED and the
    * reader sees WEIDA_ECANCELED. */
   expireAfterMs(ms: number | bigint): void;
+  /** The queue of cursor sets the receiver reports, the first time; null
+   * after that and when nothing was ordered. Take it before `finish`, it
+   * outlives the transfer. */
+  cursors(): Cursors | null;
   /** Consumes the transfer. */
   finish(): Delivery;
 }

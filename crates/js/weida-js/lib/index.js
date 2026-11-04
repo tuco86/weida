@@ -143,6 +143,7 @@ function freezeMeta(meta) {
   }
   if (meta.peerLocal != null) Object.freeze(meta.peerLocal);
   if (meta.gap != null) Object.freeze(meta.gap);
+  Object.freeze(meta.report);
   return Object.freeze(meta);
 }
 
@@ -286,6 +287,8 @@ const META_FIELDS = [
   ["trace", native.transferMetaSetTrace, "value"],
   ["topic", native.transferMetaSetTopic, "value"],
   ["achieved", native.transferMetaSetAchieved, "WEIDA_ACKNOWLEDGEMENT_"],
+  ["report", reportLevels, "value"],
+  ["reportMode", native.transferMetaSetReportMode, "WEIDA_REPORT_MODE_"],
 ];
 
 /** A terms object as a handle for one call: `make()` the handle, set
@@ -304,7 +307,7 @@ function withFields(object, make, fields, what, use) {
 }
 
 /** A transfer meta `{ contentType?, contentLen?, trace?, topic?,
- * achieved? }` as a handle for one call. */
+ * achieved?, report?, reportMode? }` as a handle for one call. */
 function withTransferMeta(meta, use) {
   return withFields(meta, native.transferMetaNew, META_FIELDS, "TransferMeta", use);
 }
@@ -322,6 +325,26 @@ const SEGMENT_FIELDS = [
 
 /** How many layers a segment carries: 0 to 15. */
 export const MAX_SEGMENT_LAYERS = native.CONSTANTS.WEIDA_MAX_SEGMENT_LAYERS;
+
+/** The first cursor level an application may name; the levels below it are
+ * weida's own, named "WEIDA_ACKNOWLEDGEMENT_*". */
+export const CURSOR_LEVEL_APPLICATION_FLOOR =
+  native.CONSTANTS.WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR;
+
+/** A cursor level in: a "WEIDA_ACKNOWLEDGEMENT_*" name becomes its value,
+ * an application stage (a number or a BigInt) passes on; C refuses 6 to
+ * 15. */
+function cursorLevel(level) {
+  return typeof level === "string" ? constant("WEIDA_ACKNOWLEDGEMENT_", level) : level;
+}
+
+/** `TransferMeta.report`: an array of cursor levels. */
+function reportLevels(handle, levels) {
+  if (!Array.isArray(levels)) {
+    throw new TypeError("expected an array of cursor levels");
+  }
+  native.transferMetaSetReport(handle, levels.map(cursorLevel));
+}
 
 const FILES_FIELDS = [
   ["names", native.filesOptionsSetNames, "value"],
@@ -1344,6 +1367,92 @@ export class IdentityEvents extends Handle {
   }
 }
 
+/** The cursor sets one transfer's receiver reports, read like a queue or
+ * iterated with `for await`; each set is the newest offset per reported
+ * level, changes since the last read coalesced. The loop ends once no more
+ * cursors come, and leaving it early drops the reader. */
+export class Cursors extends Handle {
+  constructor() {
+    super();
+    noConstructor("Cursors", "OutgoingTransfer.cursors()");
+  }
+
+  /** The newest set after a change, a frozen array of frozen
+   * `{ level, offset }` in ascending level order, or null once no more
+   * cursors come (the reporter finished, the stream was reset or the
+   * connection is gone). */
+  async recv({ signal } = {}) {
+    const handle = this[HANDLE];
+    const set = await call(
+      this,
+      () => native.cursorsRecv(handle),
+      () => native.cursorsFd(handle),
+      signal,
+    );
+    return set === null ? null : Object.freeze(set.map((entry) => Object.freeze(entry)));
+  }
+
+  async *[Symbol.asyncIterator]() {
+    try {
+      for (let set = await this.recv(); set !== null; set = await this.recv()) {
+        yield set;
+      }
+    } finally {
+      this.drop();
+    }
+  }
+}
+
+/** The receiver's end of a report: how far each ordered level got. Dropping
+ * it without `finish()` flushes nothing. */
+export class Reporter extends Handle {
+  constructor() {
+    super();
+    noConstructor("Reporter", "IncomingTransfer.reporter()");
+  }
+
+  /** The levels the sender ordered, ascending, frozen. */
+  levels() {
+    return Object.freeze(native.reporterLevels(this[HANDLE]));
+  }
+
+  /** The `WEIDA_REPORT_MODE_*` the sender asked for. */
+  mode() {
+    return native.reporterMode(this[HANDLE]);
+  }
+
+  /** Progress records are written when a level advanced `bytes` or
+   * `intervalMs` passed, whichever comes first; 0 and 0 write every
+   * report. No effect in final-only mode. */
+  setGranularity(bytes, intervalMs) {
+    native.reporterSetGranularity(this[HANDLE], bytes, intervalMs);
+  }
+
+  /** Reports that `level` has reached `offset`; a level the sender did not
+   * order is ignored. Never rejects for a transport reason. */
+  report(level, offset, { signal } = {}) {
+    return op(
+      this,
+      () => native.reporterReport(this[HANDLE], cursorLevel(level), offset),
+      native.reporterReportOpWait,
+      native.reporterReportOpFd,
+      signal,
+    );
+  }
+
+  /** Flushes the newest offset per reported level and ends the report.
+   * Consumes the reporter. */
+  finish({ signal } = {}) {
+    return op(
+      this,
+      () => native.reporterFinish(consume(this)),
+      native.reporterFinishOpWait,
+      native.reporterFinishOpFd,
+      signal,
+    );
+  }
+}
+
 /** The replying half of Req/Rep, serving one endpoint path. */
 export class Replier extends Handle {
   constructor() {
@@ -2333,6 +2442,14 @@ export class IncomingTransfer extends Handle {
     return native.incomingTransferConnection(this[HANDLE]);
   }
 
+  /** A new reporter for the cursor levels the sender ordered, on every
+   * call, so take one; null when it ordered none. Take it before
+   * `collect()`: it outlives the transfer. */
+  reporter() {
+    const r = native.incomingTransferReporter(this[HANDLE]);
+    return r === null ? null : adopt(Reporter, r);
+  }
+
   /** Up to `cap` bytes; an empty array at the end of the payload. */
   async read(cap = 65536, { signal } = {}) {
     const handle = this[HANDLE];
@@ -2402,6 +2519,15 @@ export class OutgoingTransfer extends Handle {
    * throws WEIDA_EEXPIRED. */
   expireAfterMs(ms) {
     native.outgoingTransferExpireAfterMs(this[HANDLE], ms);
+  }
+
+  /** The queue of cursor sets the receiver reports for this transfer, the
+   * first time; null after that and when its metadata ordered no levels.
+   * Take it before `finish()`: it outlives the transfer, since Accepted
+   * arrives after the payload's end. */
+  cursors() {
+    const c = native.outgoingTransferCursors(this[HANDLE]);
+    return c === null ? null : adopt(Cursors, c);
   }
 
   /** Ends the payload and returns its delivery receipt. Consumes the
