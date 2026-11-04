@@ -23,13 +23,13 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 
 **Status:** alpha. `weida`, `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
 `weida-broker`, `weida-raft`, `weida-openbao`, `weida-http-codec` and `weida-http` are
-published on crates.io, all at `0.1.0-alpha.11`. The other eighteen members are not
+published on crates.io, all at `0.1.0-alpha.13`. The other eighteen members are not
 published: `weida-c`, `weida-py-core`, every Python binding, the other five protocol libraries with
 their codecs, and `weida-testkit`, which only tests use. The one exception on crates.io,
 `weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI.
 The JavaScript package `@tuco86/weida` is on the forge's npm registry
 (`https://git.doodleshnookie.net/api/packages/tuco86/npm/`), with prebuilt `libweida` for
-linux-x64, linux-arm64 and darwin-arm64, published by every `v*` tag. Wire protocol version
+linux-x64, linux-arm64, darwin-arm64 and win32-x64, published by every `v*` tag. Wire protocol version
 `0` is experimental and breaking changes are permitted within `0.x`. Phase status lives in
 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) §1.
 
