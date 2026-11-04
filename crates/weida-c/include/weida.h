@@ -619,6 +619,28 @@ typedef struct weida_client_tls weida_client_tls;
 typedef struct weida_connection_stats weida_connection_stats;
 
 /**
+ * One consumer that subscribed on an acceptor's path, and the way to
+ * deliver to it (`Consumer`).
+ */
+typedef struct weida_consumer weida_consumer;
+
+/**
+ * The pending delivery of `weida_consumer_deliver`.
+ */
+typedef struct weida_consumer_deliver_op weida_consumer_deliver_op;
+
+/**
+ * The pending open of `weida_consumer_open`.
+ */
+typedef struct weida_consumer_open_op weida_consumer_open_op;
+
+/**
+ * A consumer's absolute delivery limit for one subscription
+ * (`CreditGrant`), read-only.
+ */
+typedef struct weida_credit_grant weida_credit_grant;
+
+/**
  * The newest offset per reported level of one transfer (`CursorSet`),
  * read-only.
  */
@@ -876,9 +898,29 @@ typedef struct weida_peer_event weida_peer_event;
 typedef struct weida_peer_events weida_peer_events;
 
 /**
+ * The pending exchange of `weida_peer_open_bi`.
+ */
+typedef struct weida_peer_open_bi_op weida_peer_open_bi_op;
+
+/**
  * The pending registration of `weida_peer_open_flow`.
  */
 typedef struct weida_peer_open_flow_op weida_peer_open_flow_op;
+
+/**
+ * The pending open of `weida_peer_open`.
+ */
+typedef struct weida_peer_open_op weida_peer_open_op;
+
+/**
+ * The pending open of `weida_peer_segment`.
+ */
+typedef struct weida_peer_segment_op weida_peer_segment_op;
+
+/**
+ * The pending send of `weida_peer_send`.
+ */
+typedef struct weida_peer_send_op weida_peer_send_op;
 
 /**
  * PEM text handed out (`Identity::certificate_pem`, `Identity::to_pem`):
@@ -2042,6 +2084,203 @@ int weida_flow_meta_set_topic(const weida_flow_meta *m, const char *topic);
  * string.
  */
 int weida_flow_meta_set_trace(const weida_flow_meta *m, const char *traceparent);
+
+/**
+ * The consumer's number (`Consumer::id`): the number of the connection it
+ * subscribed on, shared by every subscription of that connection and equal
+ * to that connection's `ConnectionId`. Never reused while the process
+ * lives. 0 for NULL.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live consumer.
+ */
+uint64_t weida_consumer_id(const weida_consumer *c);
+
+/**
+ * The filter this subscription was created with (`Consumer::filter`).
+ * Lives as long as the consumer.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live consumer; `len_out` is NULL or writable.
+ */
+const char *weida_consumer_filter(const weida_consumer *c, size_t *len_out);
+
+/**
+ * The endpoint path it subscribed on (`Consumer::path`). Lives as long as
+ * the consumer.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live consumer; `len_out` is NULL or writable.
+ */
+const char *weida_consumer_path(const weida_consumer *c, size_t *len_out);
+
+/**
+ * Opens one delivery to this consumer (`Consumer::open`), carrying `meta`,
+ * or empty metadata when `meta` is NULL; `meta` is copied at the call.
+ * The transfer is addressed to the subscribed path and arrives at the
+ * consumer's subscriber; the topic it filters on travels in `meta`.
+ *
+ * Never blocks; the open runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live consumer; `meta` is NULL or live metadata; `out`
+ * is NULL or writable. Release the op with `weida_consumer_open_op_drop`.
+ */
+int weida_consumer_open(const weida_consumer *c,
+                        const weida_transfer_meta *meta,
+                        weida_consumer_open_op **out);
+
+/**
+ * The readiness descriptor of an open op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_consumer_open_op_fd(const weida_consumer_open_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the open and writes the transfer to
+ * `out`, written like a socket and ended with
+ * `weida_outgoing_transfer_finish`. `-WEIDA_ECONNECTION_LOST` once the
+ * consumer's connection is gone.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_consumer_open_op_wait(const weida_consumer_open_op *op,
+                                int64_t timeout_ms,
+                                weida_outgoing_transfer **out);
+
+/**
+ * Releases an open op. An unfinished open is aborted; a transfer it opened
+ * that no wait took is reset `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op, dropped at most once.
+ */
+void weida_consumer_open_op_drop(weida_consumer_open_op *op);
+
+/**
+ * Delivers `body` as one whole transfer carrying `meta`
+ * (`Consumer::deliver`); NULL `meta` is `TransferMeta::default()`. `meta`
+ * and the body are copied at the call.
+ *
+ * Never blocks; the delivery runs as the op written to `out`.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live consumer; `meta` is NULL or live metadata; `body`
+ * is NULL only with `len == 0`, else points to `len` readable bytes; `out`
+ * is NULL or writable. Release the op with `weida_consumer_deliver_op_drop`.
+ */
+int weida_consumer_deliver(const weida_consumer *c,
+                           const weida_transfer_meta *meta,
+                           const uint8_t *body,
+                           size_t len,
+                           weida_consumer_deliver_op **out);
+
+/**
+ * The readiness descriptor of a deliver op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live deliver op; `out` is NULL or writable.
+ */
+int weida_consumer_deliver_op_fd(const weida_consumer_deliver_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the delivery: 0 once the body is
+ * written and finished. `-WEIDA_ECONNECTION_LOST` once the consumer's
+ * connection is gone.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live deliver op.
+ */
+int weida_consumer_deliver_op_wait(const weida_consumer_deliver_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a deliver op, abandoning the delivery when unfinished. NULL
+ * does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live deliver op, dropped at most once.
+ */
+void weida_consumer_deliver_op_drop(weida_consumer_deliver_op *op);
+
+/**
+ * Closes the connection the consumer subscribed on with `code` and the
+ * human-readable `reason` (`Consumer::close`), ending every subscription
+ * that connection holds, on every path; the acceptor then reports
+ * `WEIDA_INCOMING_UNSUBSCRIBED` with a NULL filter. Never blocks.
+ *
+ * `code` is one of docs/PROTOCOL.md §7's (e.g. 5 `LIMIT_EXCEEDED`, 6
+ * `SHUTDOWN`); above `2^62-1` it is sent as 1 `INTERNAL`. Closing a
+ * closed connection does nothing.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live consumer; `reason` is NULL or a NUL-terminated
+ * string.
+ */
+int weida_consumer_close(const weida_consumer *c, uint64_t code, const char *reason);
+
+/**
+ * Releases a consumer handle; the subscription stays. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live consumer, dropped at most once.
+ */
+void weida_consumer_drop(weida_consumer *c);
+
+/**
+ * The number of the consumer that granted it (`CreditGrant::id`), as
+ * `weida_consumer_id` reads it; 0 for NULL.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live credit grant.
+ */
+uint64_t weida_credit_grant_id(const weida_credit_grant *g);
+
+/**
+ * The filter of the subscription it was granted for
+ * (`CreditGrant::filter`). Lives as long as the grant.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live credit grant; `len_out` is NULL or writable.
+ */
+const char *weida_credit_grant_filter(const weida_credit_grant *g, size_t *len_out);
+
+/**
+ * The messages the subscription accepts in total since its creation
+ * (`CreditGrant::limit`): absolute and cumulative, so a queue keeps the
+ * highest it has seen. 0 for NULL.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live credit grant.
+ */
+uint64_t weida_credit_grant_limit(const weida_credit_grant *g);
+
+/**
+ * Releases a credit grant. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `g` is NULL or a live credit grant, dropped at most once.
+ */
+void weida_credit_grant_drop(weida_credit_grant *g);
 
 /**
  * The queue's readiness descriptor (R11): readable when the next
@@ -4164,6 +4403,289 @@ int weida_peer_open_flow_op_wait(const weida_peer_open_flow_op *op,
 void weida_peer_open_flow_op_drop(weida_peer_open_flow_op *op);
 
 /**
+ * Forgets a dialled address (`Peer::disconnect`): 1 when `url` was
+ * dialled and is now forgotten, its connection closed and no longer
+ * redialled; 0 when it was not dialled.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `url` is NULL or a NUL-terminated string.
+ */
+int weida_peer_disconnect(const weida_peer *p, const char *url);
+
+/**
+ * The number of connected peers (`Peer::peer_count`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer.
+ */
+size_t weida_peer_peer_count(const weida_peer *p);
+
+/**
+ * The bodies the outbox discarded (`Peer::dropped`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer.
+ */
+uint64_t weida_peer_dropped(const weida_peer *p);
+
+/**
+ * A snapshot of the peer's live connections (`Peer::connection_stats`):
+ * one record per live dialled address, in dial order, read with the
+ * `weida_connection_stats_*` getters. Never blocks.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `out` is NULL or writable. Release the
+ * snapshot with `weida_connection_stats_drop`.
+ */
+int weida_peer_connection_stats(const weida_peer *p, weida_connection_stats **out);
+
+/**
+ * A new reader of the peer's events (`Peer::events`): every transition of
+ * its dialled addresses from this call on, read with
+ * `weida_peer_events_recv`. Each call is an independent reader. Named
+ * `_peer_events` because R1's `weida_peer_events` is the reader's type.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `out` is NULL or writable. Release the
+ * reader with `weida_peer_events_drop`.
+ */
+int weida_peer_peer_events(const weida_peer *p, weida_peer_events **out);
+
+/**
+ * Opens a one-way stream to the next peer, round-robin (`Peer::open`),
+ * carrying `meta`, or empty metadata when `meta` is NULL; `meta` is copied
+ * at the call.
+ *
+ * Never blocks; the open runs as the op written to `out`. With every peer
+ * down it waits for the redial, bounded by `send_timeout`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `meta` is NULL or live metadata; `out` is
+ * NULL or writable. Release the op with `weida_peer_open_op_drop`.
+ */
+int weida_peer_open(const weida_peer *p, const weida_transfer_meta *meta, weida_peer_open_op **out);
+
+/**
+ * The readiness descriptor of an open op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_peer_open_op_fd(const weida_peer_open_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the open and writes the transfer to
+ * `out`, written like a socket and ended with
+ * `weida_outgoing_transfer_finish`. Fails with `-WEIDA_ECONNECTION_LOST`
+ * when no peer came back within `send_timeout`, and
+ * `-WEIDA_ENOT_CONNECTED` for a peer never connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op; `out` is NULL or writable.
+ */
+int weida_peer_open_op_wait(const weida_peer_open_op *op,
+                            int64_t timeout_ms,
+                            weida_outgoing_transfer **out);
+
+/**
+ * Releases an open op. An unfinished open is aborted; a transfer it opened
+ * that no wait took is reset `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open op, dropped at most once.
+ */
+void weida_peer_open_op_drop(weida_peer_open_op *op);
+
+/**
+ * Opens one exchange to the next peer, round-robin (`Peer::open_bi`),
+ * carrying `meta`, or empty metadata when `meta` is NULL; `meta` is copied
+ * at the call.
+ *
+ * Never blocks; the exchange opens as the op written to `out`. Its wait
+ * yields the request body, written like a socket and ended with
+ * `weida_outgoing_transfer_finish`, and the reply stream, whose
+ * `weida_reply_stream_recv` waits for the reply. With every peer down it
+ * waits for the redial, bounded by `send_timeout`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `meta` is NULL or live metadata; `out` is
+ * NULL or writable. Release the op with `weida_peer_open_bi_op_drop`.
+ */
+int weida_peer_open_bi(const weida_peer *p,
+                       const weida_transfer_meta *meta,
+                       weida_peer_open_bi_op **out);
+
+/**
+ * The readiness descriptor of an open-bi op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open-bi op; `out` is NULL or writable.
+ */
+int weida_peer_open_bi_op_fd(const weida_peer_open_bi_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the exchange and writes both halves:
+ * the request body to `out_body` and the reply stream to `out_reply`.
+ * Both are written, or neither. Fails with `-WEIDA_ECONNECTION_LOST` when
+ * no peer came back within `send_timeout`, and `-WEIDA_ENOT_CONNECTED`
+ * for a peer never connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open-bi op; `out_body` and `out_reply` are NULL
+ * or writable.
+ */
+int weida_peer_open_bi_op_wait(const weida_peer_open_bi_op *op,
+                               int64_t timeout_ms,
+                               weida_outgoing_transfer **out_body,
+                               weida_reply_stream **out_reply);
+
+/**
+ * Releases an open-bi op. An unfinished open is aborted; an exchange it
+ * opened that no wait took is abandoned: its body is reset `CANCELED` and
+ * its reply half stopped `CANCELED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live open-bi op, dropped at most once.
+ */
+void weida_peer_open_bi_op_drop(weida_peer_open_bi_op *op);
+
+/**
+ * Sends `body` as one message carrying `meta` (`Peer::send`); NULL `meta`
+ * is `TransferMeta::default()`. `meta` and the body are copied, and the
+ * runtime owns the body from the call.
+ *
+ * Never blocks; the send runs as the op written to `out`. With a live peer
+ * and an empty outbox the body is written at once; otherwise it is held in
+ * the outbox under the configured backpressure and written once a peer is
+ * back, in order.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `meta` is NULL or live metadata; `body` is
+ * NULL only with `len == 0`, else points to `len` readable bytes; `out` is
+ * NULL or writable. Release the op with `weida_peer_send_op_drop`.
+ */
+int weida_peer_send(const weida_peer *p,
+                    const weida_transfer_meta *meta,
+                    const uint8_t *body,
+                    size_t len,
+                    weida_peer_send_op **out);
+
+/**
+ * The readiness descriptor of a send op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op; `out` is NULL or writable.
+ */
+int weida_peer_send_op_fd(const weida_peer_send_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the send: 0 once the body is written
+ * or held in the outbox. Fails with `-WEIDA_ELIMIT_EXCEEDED` under the
+ * `Reject` backpressure or for a body larger than the outbox,
+ * `-WEIDA_ECONNECTION_LOST` once every address is given up, and
+ * `-WEIDA_ENOT_CONNECTED` for a peer never connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op.
+ */
+int weida_peer_send_op_wait(const weida_peer_send_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a send op, abandoning the send when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live send op, dropped at most once.
+ */
+void weida_peer_send_op_drop(weida_peer_send_op *op);
+
+/**
+ * Opens segment n+1 on `topic` to the next peer (`Peer::segment`): it
+ * supersedes this peer's copy of segment n there as a radio does, and is
+ * written with the `weida_segment_*` calls. NULL `terms` are
+ * `SegmentTerms::default()`; `topic` and `terms` are copied at the call.
+ *
+ * Never blocks; the open runs as the op written to `out`. With every peer
+ * down it waits for the redial, bounded by `send_timeout`.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `topic` is NULL or a NUL-terminated string;
+ * `terms` is NULL or live terms; `out` is NULL or writable. Release the op
+ * with `weida_peer_segment_op_drop`.
+ */
+int weida_peer_segment(const weida_peer *p,
+                       const char *topic,
+                       const weida_segment_terms *terms,
+                       weida_peer_segment_op **out);
+
+/**
+ * The readiness descriptor of a segment op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live segment op; `out` is NULL or writable.
+ */
+int weida_peer_segment_op_fd(const weida_peer_segment_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the open and writes the segment to
+ * `out`. Fails with `-WEIDA_ELIMIT_EXCEEDED` for a topic above 256 bytes
+ * or when `max_sequence_scopes` topics all have a copy in flight,
+ * `-WEIDA_ECONNECTION_LOST` when no peer came back within `send_timeout`,
+ * and `-WEIDA_ENOT_CONNECTED` for a peer never connected.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live segment op; `out` is NULL or writable. Release
+ * the segment with `weida_segment_finish` or `weida_segment_drop`.
+ */
+int weida_peer_segment_op_wait(const weida_peer_segment_op *op,
+                               int64_t timeout_ms,
+                               weida_segment **out);
+
+/**
+ * Releases a segment op. An unfinished open is aborted; a segment it
+ * opened that no wait took is dropped, resetting its unfinished layers.
+ * NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live segment op, dropped at most once.
+ */
+void weida_peer_segment_op_drop(weida_peer_segment_op *op);
+
+/**
+ * What this peer's segments lost on `topic`, by cause
+ * (`Peer::segment_drops`): a snapshot of one record, or of none when
+ * nothing was. Never blocks.
+ *
+ * # Safety
+ *
+ * `p` is NULL or a live peer; `topic` is NULL or a NUL-terminated string;
+ * `out` is NULL or writable. Release the snapshot with
+ * `weida_topic_drops_drop`.
+ */
+int weida_peer_segment_drops(const weida_peer *p, const char *topic, weida_topic_drops **out);
+
+/**
  * Releases a peer (`Drop for Peer`). NULL does nothing.
  *
  * # Safety
@@ -4238,6 +4760,50 @@ void weida_acceptor_drop(weida_acceptor *a);
 int weida_incoming_kind(const weida_incoming *i);
 
 /**
+ * Hands a one-way stream over, once. A second call is `-WEIDA_ECLOSED`,
+ * another kind `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle; `out` is NULL or writable.
+ * Release the transfer with `weida_incoming_transfer_drop`.
+ */
+int weida_incoming_take_stream(const weida_incoming *i, weida_incoming_transfer **out);
+
+/**
+ * Hands an exchange over, once, as a request that owes a reply. A second
+ * call is `-WEIDA_ECLOSED`, another kind `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle; `out` is NULL or writable.
+ * Release the request with `weida_incoming_request_drop`.
+ */
+int weida_incoming_take_exchange(const weida_incoming *i, weida_incoming_request **out);
+
+/**
+ * Hands the consumer of a subscription over, once. A second call is
+ * `-WEIDA_ECLOSED`, another kind `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle; `out` is NULL or writable.
+ * Release the consumer with `weida_consumer_drop`.
+ */
+int weida_incoming_take_subscribed(const weida_incoming *i, weida_consumer **out);
+
+/**
+ * Hands a credit grant over, once. A second call is `-WEIDA_ECLOSED`,
+ * another kind `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle; `out` is NULL or writable.
+ * Release the grant with `weida_credit_grant_drop`.
+ */
+int weida_incoming_take_credit(const weida_incoming *i, weida_credit_grant **out);
+
+/**
  * Hands a flow over, once. A second call is `-WEIDA_ECLOSED`, another
  * kind `-WEIDA_EINVAL`.
  *
@@ -4249,9 +4815,31 @@ int weida_incoming_kind(const weida_incoming *i);
 int weida_incoming_take_flow(const weida_incoming *i, weida_incoming_flow **out);
 
 /**
+ * The consumer number of an unsubscription: 1 and `*out`; 0 for another
+ * kind. Taking nothing, it reads the same after any call.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle; `out` is NULL or writable.
+ */
+int weida_incoming_unsubscribed_id(const weida_incoming *i, uint64_t *out);
+
+/**
+ * The filter of an unsubscription; NULL when the whole connection went
+ * away (every subscription it held, on every path) and for another kind.
+ * Lives as long as `i`.
+ *
+ * # Safety
+ *
+ * `i` is NULL or a live incoming handle; `len_out` is NULL or writable.
+ */
+const char *weida_incoming_unsubscribed_filter(const weida_incoming *i, size_t *len_out);
+
+/**
  * Releases an incoming handle and drops what was not taken, as Rust does:
- * a stream is refused `REJECTED`, an exchange answers `NO_REPLY`, and a
- * flow is stopped `CANCELED`. NULL does nothing.
+ * a stream is refused `REJECTED`, an exchange answers `NO_REPLY`, a flow
+ * is stopped `CANCELED`, and a subscription, credit grant or
+ * unsubscription not taken is forgotten. NULL does nothing.
  *
  * # Safety
  *

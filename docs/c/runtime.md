@@ -126,7 +126,7 @@ for the rest.
 | `int weida_runtime_pair(const weida_runtime *rt, const weida_client_tls *tls, weida_paired **out)` | never | 0; `-WEIDA_EINVAL` ([pair.md](pair.md)) |
 | `int weida_runtime_surveyor(const weida_runtime *rt, const weida_client_tls *tls, weida_surveyor **out)` | never | 0; `-WEIDA_EINVAL` ([survey.md](survey.md)) |
 | `int weida_runtime_dish(const weida_runtime *rt, const weida_client_tls *tls, weida_dish **out)` | never | 0; `-WEIDA_EINVAL` ([radio.md](radio.md)) |
-| `int weida_runtime_peer(const weida_runtime *rt, const weida_client_tls *tls, weida_peer **out)` | never | 0; `-WEIDA_EINVAL` ([flow.md](flow.md)) |
+| `int weida_runtime_peer(const weida_runtime *rt, const weida_client_tls *tls, weida_peer **out)` | never | 0; `-WEIDA_EINVAL` ([peer.md](peer.md)) |
 | `int weida_runtime_shutdown(weida_runtime *rt, weida_runtime_shutdown_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
 | `int weida_runtime_drain(weida_runtime *rt, uint64_t deadline_ms, weida_runtime_drain_op **out)` | never; **consumes** `rt` | 0; `-WEIDA_EINVAL` |
 | `uint64_t weida_runtime_suppressed_duplicates(const weida_runtime *rt)` | never | duplicates discarded inside a negotiated `Deduplication::Bounded` window; 0 for NULL |

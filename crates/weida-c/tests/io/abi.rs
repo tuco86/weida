@@ -5366,3 +5366,494 @@ fn a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender() {
     shutdown(near);
     shutdown(server);
 }
+
+// --- raw peers --------------------------------------------------------------
+
+/// Opens a one-way stream on `p` carrying `meta`: the transfer, or the
+/// status its open ended with.
+fn peer_open(
+    p: *mut weida_peer,
+    meta: *const weida_transfer_meta,
+) -> Result<*mut weida_outgoing_transfer, c_int> {
+    let mut op = ptr::null_mut();
+    let mut out = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; the op is dropped
+    // once.
+    unsafe {
+        ok(weida_peer_open(p, meta, &mut op));
+        let rc = settle("the stream", |ms| weida_peer_open_op_wait(op, ms, &mut out));
+        weida_peer_open_op_drop(op);
+        if rc != 0 {
+            return Err(rc);
+        }
+    }
+    Ok(out)
+}
+
+/// Opens an exchange on `p` carrying `meta`: the request body and the
+/// reply stream.
+fn peer_open_bi(
+    p: *mut weida_peer,
+    meta: *const weida_transfer_meta,
+) -> (*mut weida_outgoing_transfer, *mut weida_reply_stream) {
+    let mut op = ptr::null_mut();
+    let mut body = ptr::null_mut();
+    let mut stream = ptr::null_mut();
+    // SAFETY: live handles and writable out-parameters; the op is dropped
+    // once.
+    unsafe {
+        ok(weida_peer_open_bi(p, meta, &mut op));
+        ok(settle("the exchange", |ms| {
+            weida_peer_open_bi_op_wait(op, ms, &mut body, &mut stream)
+        }));
+        weida_peer_open_bi_op_drop(op);
+    }
+    (body, stream)
+}
+
+/// Opens the next segment of `p` on `topic` under the default terms.
+fn peer_segment(p: *mut weida_peer, topic: &str) -> *mut weida_segment {
+    let topic = c(topic);
+    let mut op = ptr::null_mut();
+    let mut s = ptr::null_mut();
+    // SAFETY: live handles, a C string and writable out-parameters; the op
+    // is dropped once.
+    unsafe {
+        ok(weida_peer_segment(p, topic.as_ptr(), ptr::null(), &mut op));
+        ok(settle("the segment", |ms| {
+            weida_peer_segment_op_wait(op, ms, &mut s)
+        }));
+        weida_peer_segment_op_drop(op);
+    }
+    s
+}
+
+/// Takes the stream out of `i`, which must hold one, and drops `i`.
+fn take_stream(i: *mut weida_incoming) -> *mut weida_incoming_transfer {
+    let mut t = ptr::null_mut();
+    let mut again = ptr::null_mut();
+    let mut q = ptr::null_mut();
+    let mut id = 0u64;
+    // SAFETY: a live incoming handle, dropped once, and writable
+    // out-parameters.
+    unsafe {
+        assert_eq!(weida_incoming_kind(i), WEIDA_INCOMING_STREAM);
+        ok(weida_incoming_take_stream(i, &mut t));
+        assert_eq!(weida_incoming_take_stream(i, &mut again), -WEIDA_ECLOSED);
+        assert_eq!(weida_incoming_take_exchange(i, &mut q), -WEIDA_EINVAL);
+        assert_eq!(weida_incoming_unsubscribed_id(i, &mut id), 0);
+        weida_incoming_drop(i);
+    }
+    t
+}
+
+/// Takes the exchange out of `i`, which must hold one, and drops `i`.
+fn take_exchange(i: *mut weida_incoming) -> *mut weida_incoming_request {
+    let mut q = ptr::null_mut();
+    let mut again = ptr::null_mut();
+    // SAFETY: a live incoming handle, dropped once, and writable
+    // out-parameters.
+    unsafe {
+        assert_eq!(weida_incoming_kind(i), WEIDA_INCOMING_EXCHANGE);
+        ok(weida_incoming_take_exchange(i, &mut q));
+        assert_eq!(weida_incoming_take_exchange(i, &mut again), -WEIDA_ECLOSED);
+        weida_incoming_drop(i);
+    }
+    q
+}
+
+/// Takes the consumer out of `i`, which must hold a subscription, and drops
+/// `i`.
+fn take_subscribed(i: *mut weida_incoming) -> *mut weida_consumer {
+    let mut consumer = ptr::null_mut();
+    let mut again = ptr::null_mut();
+    // SAFETY: a live incoming handle, dropped once, and writable
+    // out-parameters.
+    unsafe {
+        assert_eq!(weida_incoming_kind(i), WEIDA_INCOMING_SUBSCRIBED);
+        ok(weida_incoming_take_subscribed(i, &mut consumer));
+        assert_eq!(
+            weida_incoming_take_subscribed(i, &mut again),
+            -WEIDA_ECLOSED
+        );
+        weida_incoming_drop(i);
+    }
+    consumer
+}
+
+/// How many of `p`'s segments on `topic` were superseded: `None` while
+/// nothing on it was dropped.
+fn superseded(p: *mut weida_peer, topic: &str) -> Option<u64> {
+    let topic = c(topic);
+    let mut d = ptr::null_mut();
+    // SAFETY: a live peer, a C string and a writable out-parameter.
+    ok(unsafe { weida_peer_segment_drops(p, topic.as_ptr(), &mut d) });
+    let n = drop_count(d, 0, weida_topic_drops_superseded);
+    // SAFETY: dropped once.
+    unsafe { weida_topic_drops_drop(d) };
+    n
+}
+
+fn grant(s: *mut weida_subscriber, filter: &str, limit: u64) -> c_int {
+    let filter = c(filter);
+    run_op(
+        "the grant",
+        // SAFETY: a live subscriber, a C string and a writable out-parameter.
+        |op| unsafe { weida_subscriber_grant(s, filter.as_ptr(), limit, op) },
+        weida_subscriber_grant_op_wait,
+        weida_subscriber_grant_op_drop,
+    )
+}
+
+/// The next thing `a` took, which must be a credit grant: its consumer,
+/// filter and limit.
+fn credit(a: *mut weida_acceptor) -> (u64, String, u64) {
+    let i = next_incoming(a);
+    let mut g = ptr::null_mut();
+    let mut len = 0usize;
+    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    unsafe {
+        assert_eq!(weida_incoming_kind(i), WEIDA_INCOMING_CREDIT);
+        ok(weida_incoming_take_credit(i, &mut g));
+        weida_incoming_drop(i);
+        let grant = (
+            weida_credit_grant_id(g),
+            text(weida_credit_grant_filter(g, &mut len), len).expect("a filter"),
+            weida_credit_grant_limit(g),
+        );
+        weida_credit_grant_drop(g);
+        grant
+    }
+}
+
+/// Metadata carrying `topic`; the caller drops it.
+fn topic_meta(topic: &str) -> *mut weida_transfer_meta {
+    let topic = c(topic);
+    let mut meta = ptr::null_mut();
+    // SAFETY: a writable out-parameter, a live handle and a C string.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut meta));
+        ok(weida_transfer_meta_set_topic(meta, topic.as_ptr()));
+    }
+    meta
+}
+
+/// Delivers `job-<n>` on the topic `jobs.a` to `consumer`, as a queue does.
+fn deliver_job(consumer: *mut weida_consumer, n: u64) {
+    let meta = topic_meta("jobs.a");
+    let body = format!("job-{n}");
+    ok(run_op(
+        "the delivery",
+        // SAFETY: a live consumer, live metadata, `body.len()` readable
+        // bytes and a writable out-parameter.
+        |op| unsafe { weida_consumer_deliver(consumer, meta, body.as_ptr(), body.len(), op) },
+        weida_consumer_deliver_op_wait,
+        weida_consumer_deliver_op_drop,
+    ));
+    // SAFETY: dropped once.
+    unsafe { weida_transfer_meta_drop(meta) };
+}
+
+/// The next `n` deliveries `s` receives, sorted (each is its own stream, so
+/// they may arrive in any order), and then nothing more.
+fn copies(s: *mut weida_subscriber, n: usize) -> Vec<String> {
+    let mut got: Vec<String> = (0..n)
+        .map(|_| String::from_utf8(body(next_copy(s))).expect("UTF-8"))
+        .collect();
+    got.sort();
+    let mut t = ptr::null_mut();
+    // SAFETY: a live subscriber and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_subscriber_recv(s, 200, &mut t) },
+        -WEIDA_EAGAIN,
+        "nothing beyond the credit arrives"
+    );
+    got
+}
+
+#[test]
+fn a_raw_peer_opens_a_stream_that_the_acceptor_reads() {
+    let server = runtime();
+    let client = runtime();
+    let (l, lb) = bound(server, "abi-raw-streams");
+    let a = acceptor(l, "/raw");
+    let p = peer_on(client, trust_by_address());
+    let url = "weida+inproc://abi-raw-streams/raw";
+    let mut ev = ptr::null_mut();
+    // SAFETY: a live peer and a writable out-parameter.
+    ok(unsafe { weida_peer_peer_events(p, &mut ev) });
+    ok(peer_connect(p, url));
+    until_connected(ev);
+    let mut stats = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and a writable out-parameter.
+    unsafe {
+        weida_peer_events_drop(ev);
+        assert_eq!(weida_peer_peer_count(p), 1);
+        assert_eq!(weida_peer_dropped(p), 0);
+        ok(weida_peer_connection_stats(p, &mut stats));
+        assert_eq!(weida_connection_stats_len(stats), 1);
+        weida_connection_stats_drop(stats);
+    }
+
+    // A one-way stream, with its metadata.
+    let m = meta_with("text/plain");
+    let out = peer_open(p, m).expect("the stream");
+    // SAFETY: dropped once.
+    unsafe { weida_transfer_meta_drop(m) };
+    write_all(out, b"one");
+    finish_body(out);
+    let t = take_stream(next_incoming(a));
+    let meta = meta_of(t);
+    assert_eq!(content_type(meta).as_deref(), Some("text/plain"));
+    assert_eq!(
+        meta_text(meta, weida_incoming_meta_endpoint).as_deref(),
+        Some("/raw")
+    );
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    assert_eq!(body(t), b"one");
+
+    // An exchange: the acceptor answers it.
+    let (out, stream) = peer_open_bi(p, ptr::null());
+    write_all(out, b"ask");
+    finish_body(out);
+    let q = take_exchange(next_incoming(a));
+    let asked = take_body(q);
+    assert_eq!(read_all(asked, 64).expect("the request"), b"ask");
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_transfer_drop(asked) };
+    let answer = reply(q, None);
+    write_all(answer, b"answer");
+    finish_body(answer);
+    let mut op = ptr::null_mut();
+    let mut answered = ptr::null_mut();
+    // SAFETY: `stream` is consumed, the op dropped once, and the
+    // out-parameters are writable.
+    unsafe {
+        ok(weida_reply_stream_recv(stream, &mut op));
+        ok(settle("the reply", |ms| {
+            weida_reply_stream_recv_op_wait(op, ms, &mut answered)
+        }));
+        weida_reply_stream_recv_op_drop(op);
+    }
+    assert_eq!(body(answered), b"answer");
+
+    // A send through the outbox.
+    let sent = b"sent";
+    ok(run_op(
+        "the send",
+        // SAFETY: a live peer, `sent.len()` readable bytes and a writable
+        // out-parameter.
+        |op| unsafe { weida_peer_send(p, ptr::null(), sent.as_ptr(), sent.len(), op) },
+        weida_peer_send_op_wait,
+        weida_peer_send_op_drop,
+    ));
+    assert_eq!(body(take_stream(next_incoming(a))), b"sent");
+
+    // Forgetting the address leaves nothing to open on.
+    let u = c(url);
+    // SAFETY: a live peer and a C string.
+    unsafe {
+        assert_eq!(weida_peer_disconnect(p, u.as_ptr()), 1);
+        assert_eq!(weida_peer_disconnect(p, u.as_ptr()), 0);
+        assert_eq!(weida_peer_peer_count(p), 0);
+    }
+    assert_eq!(peer_open(p, ptr::null()).err(), Some(-WEIDA_ENOT_CONNECTED));
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_peer_drop(p);
+        weida_acceptor_drop(a);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn a_raw_peer_segment_supersedes_its_unfinished_predecessor() {
+    let server = runtime();
+    let client = runtime();
+    let (l, lb) = bound(server, "abi-raw-segments");
+    let a = acceptor(l, "/up");
+    let p = peer_on(client, trust_by_address());
+    ok(peer_connect(p, "weida+inproc://abi-raw-segments/up"));
+
+    let s0 = peer_segment(p, "cam");
+    let mut n = usize::MAX;
+    // SAFETY: a live segment, 5 readable bytes and a writable count.
+    unsafe {
+        assert_eq!(weida_segment_number(s0), 0);
+        ok(weida_segment_write(s0, b"first".as_ptr(), 5, &mut n));
+    }
+    assert_eq!(n, 1, "one copy took the chunk");
+    let held = take_stream(next_incoming(a));
+    let meta = meta_of(held);
+    assert_eq!(segment_of(meta), (Some(0), Some(0)));
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    assert_eq!(superseded(p, "cam"), None);
+
+    let s1 = peer_segment(p, "cam");
+    // SAFETY: a live segment, 6 readable bytes and a writable count.
+    unsafe {
+        assert_eq!(weida_segment_number(s1), 1);
+        ok(weida_segment_write(s1, b"second".as_ptr(), 6, &mut n));
+    }
+    assert_eq!(finish_segment(s1), 1);
+    assert_eq!(read_all(held, 64), Err(-WEIDA_ECANCELED));
+    weida_testkit::poll_until("the supersede", WAIT, || superseded(p, "cam") == Some(1));
+    assert_eq!(finish_segment(s0), 0, "no copy holds the superseded one");
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_transfer_drop(held) };
+
+    let t = take_stream(next_incoming(a));
+    let meta = meta_of(t);
+    assert_eq!(segment_of(meta), (Some(1), Some(0)));
+    assert_eq!(
+        meta_text(meta, weida_incoming_meta_topic).as_deref(),
+        Some("cam")
+    );
+    // SAFETY: dropped once.
+    unsafe { weida_incoming_meta_drop(meta) };
+    assert_eq!(body(t), b"second");
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_peer_drop(p);
+        weida_acceptor_drop(a);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}
+
+#[test]
+fn credit_granted_in_two_steps_releases_exactly_that_many_deliveries() {
+    let server = runtime();
+    let client = runtime();
+    let (l, lb) = bound(server, "abi-raw-credit");
+    let a = acceptor(l, "/q");
+    let s = subscriber(client);
+    ok(subscriber_connect(s, "weida+inproc://abi-raw-credit/q"));
+    ok(subscribe(s, "jobs.#"));
+
+    let consumer = take_subscribed(next_incoming(a));
+    let mut len = 0usize;
+    // SAFETY: a live consumer and a writable length.
+    let id = unsafe {
+        assert_eq!(
+            text(weida_consumer_filter(consumer, &mut len), len).as_deref(),
+            Some("jobs.#")
+        );
+        assert_eq!(
+            text(weida_consumer_path(consumer, &mut len), len).as_deref(),
+            Some("/q")
+        );
+        weida_consumer_id(consumer)
+    };
+
+    // Step one: two messages. The test is the queue that honours it.
+    ok(grant(s, "jobs.#", 2));
+    assert_eq!(credit(a), (id, "jobs.#".to_owned(), 2));
+    let meta = topic_meta("jobs.a");
+    let mut op = ptr::null_mut();
+    let mut out = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    unsafe {
+        ok(weida_consumer_open(consumer, meta, &mut op));
+        ok(settle("the delivery", |ms| {
+            weida_consumer_open_op_wait(op, ms, &mut out)
+        }));
+        weida_consumer_open_op_drop(op);
+        weida_transfer_meta_drop(meta);
+    }
+    write_all(out, b"job-0");
+    finish_body(out);
+    deliver_job(consumer, 1);
+    assert_eq!(copies(s, 2), ["job-0", "job-1"]);
+
+    // Step two: the limit is absolute, so 5 releases three more.
+    ok(grant(s, "jobs.#", 5));
+    assert_eq!(credit(a), (id, "jobs.#".to_owned(), 5));
+    for n in 2..5 {
+        deliver_job(consumer, n);
+    }
+    assert_eq!(copies(s, 3), ["job-2", "job-3", "job-4"]);
+
+    // The subscription ends by name.
+    let filter = c("jobs.#");
+    ok(run_op(
+        "the unsubscription",
+        // SAFETY: a live subscriber, a C string and a writable out-parameter.
+        |op| unsafe { weida_subscriber_unsubscribe(s, filter.as_ptr(), op) },
+        weida_subscriber_unsubscribe_op_wait,
+        weida_subscriber_unsubscribe_op_drop,
+    ));
+    let i = next_incoming(a);
+    let mut n = 0u64;
+    let mut g = ptr::null_mut();
+    // SAFETY: a live incoming handle, dropped once, and writable
+    // out-parameters.
+    unsafe {
+        assert_eq!(weida_incoming_kind(i), WEIDA_INCOMING_UNSUBSCRIBED);
+        assert_eq!(weida_incoming_unsubscribed_id(i, &mut n), 1);
+        assert_eq!(n, id);
+        assert_eq!(
+            text(weida_incoming_unsubscribed_filter(i, &mut len), len).as_deref(),
+            Some("jobs.#")
+        );
+        assert_eq!(weida_incoming_take_credit(i, &mut g), -WEIDA_EINVAL);
+        weida_incoming_drop(i);
+    }
+
+    // The queue closes the consumer: its whole connection departs.
+    ok(subscribe(s, "other"));
+    let second = take_subscribed(next_incoming(a));
+    let mut ev = ptr::null_mut();
+    // SAFETY: live handles, a C string and a writable out-parameter.
+    unsafe {
+        assert_eq!(weida_consumer_id(second), id, "one connection, one id");
+        ok(weida_subscriber_events(s, &mut ev));
+        ok(weida_consumer_close(second, 6, c"done".as_ptr()));
+    }
+    assert_eq!(lost_cause(ev), WEIDA_LOSS_PEER_CLOSED);
+    loop {
+        let i = next_incoming(a);
+        // SAFETY: a live incoming handle, dropped once, and writable
+        // out-parameters.
+        unsafe {
+            match weida_incoming_kind(i) {
+                WEIDA_INCOMING_SUBSCRIBED => {
+                    // The redialled connection subscribing again.
+                    let again = take_subscribed(i);
+                    assert_ne!(weida_consumer_id(again), id, "an id is never reused");
+                    weida_consumer_drop(again);
+                }
+                WEIDA_INCOMING_UNSUBSCRIBED => {
+                    assert_eq!(weida_incoming_unsubscribed_id(i, &mut n), 1);
+                    assert_eq!(n, id);
+                    assert!(weida_incoming_unsubscribed_filter(i, &mut len).is_null());
+                    weida_incoming_drop(i);
+                    break;
+                }
+                kind => panic!("expected the departure, got kind {kind}"),
+            }
+        }
+    }
+
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_peer_events_drop(ev);
+        weida_consumer_drop(consumer);
+        weida_consumer_drop(second);
+        weida_subscriber_drop(s);
+        weida_acceptor_drop(a);
+        weida_local_binding_drop(lb);
+        weida_listener_drop(l);
+    }
+    shutdown(client);
+    shutdown(server);
+}

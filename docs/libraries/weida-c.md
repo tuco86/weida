@@ -36,7 +36,7 @@ unit tests in `crates/weida-c/src/`.
 | `Runtime::pusher`, `subscriber` | `weida_runtime_pusher`, `weida_runtime_subscriber` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
 | `Runtime::pair`, `surveyor` | `weida_runtime_pair`, `weida_runtime_surveyor` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window` (*patterns*) |
 | `Runtime::dish` | `weida_runtime_dish` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
-| `Runtime::peer` | `weida_runtime_peer` | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
+| `Runtime::peer` | `weida_runtime_peer` | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
 | `Runtime::swarm` | — | absent: *swarm* |
 | `Runtime::config` | — | refused: the configuration is the builder the caller passed to `weida_runtime_owned`, which copied it |
 | `Runtime::suppressed_duplicates`, `expired_transfers` | `weida_runtime_suppressed_duplicates`, `weida_runtime_expired_transfers` | present; `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (counts 0 then 1), `abi::an_inproc_connection_is_reported_with_its_url_and_no_transport` (0 without deduplication) (*stats*) |
@@ -56,7 +56,7 @@ unit tests in `crates/weida-c/src/`.
 | `Listener::puller`, `publisher` | `weida_listener_puller`, `weida_listener_publisher` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
 | `Listener::pair`, `respondent`, `bus` | `weida_listener_pair`, `weida_listener_respondent`, `weida_listener_bus` | present; `abi::a_pair_exchanges_in_both_directions`, `abi::a_survey_collects_two_respondents_answers_within_its_window`, `abi::a_bus_message_reaches_every_other_member` (*patterns*) |
 | `Listener::radio` | `weida_listener_radio` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
-| `Listener::acceptor` | `weida_listener_acceptor` | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
+| `Listener::acceptor` | `weida_listener_acceptor` | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
 | `Listener::seeder` | — | absent: *swarm* |
 | `Binding::local_addr` | `weida_binding_local_addr` | present; `abi::a_server_outside_the_pins_is_untrusted`, `smoke.c` |
 | `Binding::close` | `weida_binding_close` (op) | present; `abi::a_closed_binding_refuses_the_next_dial` (*binding lifecycle*) |
@@ -278,14 +278,25 @@ unit tests in `crates/weida-c/src/`.
 | `Dish::stale`, `overflow` | `weida_dish_stale`, `_overflow` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
 | `Drop for Dish` | `weida_dish_drop` | present; R1 (*patterns*) |
 | `Received` | `weida_received` (`_kind`, `_take_segment`, `_topic`, `_segment`, `_payload`; `WEIDA_RECEIVED_*`) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers`, `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams` (*patterns*) |
-| `Peer::connect` | `weida_peer_connect` (op) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
+| `Peer::connect` | `weida_peer_connect` (op) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
 | `Peer::open_flow` | `weida_peer_open_flow` (op; its wait yields a `weida_flow`) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
+| `Peer::open` | `weida_peer_open` (op; its wait yields a `weida_outgoing_transfer`) | present; `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
+| `Peer::open_bi` | `weida_peer_open_bi` (op; its wait yields a `weida_outgoing_transfer` and a `weida_reply_stream`) | present; `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
+| `Peer::send` | `weida_peer_send` (op; NULL meta is the default) | present; `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
+| `Peer::segment` | `weida_peer_segment` (op; its wait yields a `weida_segment`) | present; `abi::a_raw_peer_segment_supersedes_its_unfinished_predecessor` (*raw peers*) |
+| `Peer::segment_drops` | `weida_peer_segment_drops` (a `weida_topic_drops` of 0 or 1 record) | present; `abi::a_raw_peer_segment_supersedes_its_unfinished_predecessor` (*raw peers*) |
+| `Peer::disconnect`, `peer_count`, `dropped`, `connection_stats`, `events` | `weida_peer_disconnect`, `_peer_count`, `_dropped`, `_connection_stats` (a snapshot handle), `_peer_events` (a `weida_peer_events` queue) | present; `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
 | `Drop for Peer` | `weida_peer_drop` | present; R1 (*flows*) |
-| `Peer::open`, `open_bi`, `send`, `segment`, `segment_drops`, `disconnect`, `peer_count`, `connection_stats`, `events`, `dropped` | — | absent: *raw peers* |
-| `Acceptor::path` | `weida_acceptor_path` | present; `abi::a_flow_carries_datagrams_over_quic` (*flows*) |
-| `Acceptor::accept` | `weida_acceptor_accept` (try, R3a; a `weida_incoming`) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
-| `Incoming` | `weida_incoming` (`_kind`, `WEIDA_INCOMING_*`, `_take_flow`, `_drop`) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
-| taking `Incoming::Stream`, `Exchange`, `Subscribed`, `Credit`, `Unsubscribed`; `Consumer`, `ConsumerId`, `CreditGrant` | — | absent: *raw peers*; the kind reads, and dropping the handle drops what it holds |
+| `Acceptor::path` | `weida_acceptor_path` | present; `abi::a_flow_carries_datagrams_over_quic` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
+| `Acceptor::accept` | `weida_acceptor_accept` (try, R3a; a `weida_incoming`) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads` (*raw peers*) |
+| `Incoming` | `weida_incoming` (`_kind`, `WEIDA_INCOMING_*`, `_take_stream`, `_take_exchange`, `_take_subscribed`, `_take_credit`, `_take_flow`, `_unsubscribed_id`, `_unsubscribed_filter`, `_drop`) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*), `abi::a_raw_peer_opens_a_stream_that_the_acceptor_reads`, `abi::credit_granted_in_two_steps_releases_exactly_that_many_deliveries` (*raw peers*) |
+| `Consumer::id`, `filter`, `path` | `weida_consumer_id`, `_filter`, `_path` | present; `abi::credit_granted_in_two_steps_releases_exactly_that_many_deliveries` (*raw peers*) |
+| `Consumer::open` | `weida_consumer_open` (op; its wait yields a `weida_outgoing_transfer`) | present; `abi::credit_granted_in_two_steps_releases_exactly_that_many_deliveries` (*raw peers*) |
+| `Consumer::deliver` | `weida_consumer_deliver` (op) | present; `abi::credit_granted_in_two_steps_releases_exactly_that_many_deliveries` (*raw peers*) |
+| `Consumer::close` | `weida_consumer_close` (plain function, R3) | present; `abi::credit_granted_in_two_steps_releases_exactly_that_many_deliveries` (*raw peers*) |
+| `Clone for Consumer` | — | refused: one handle serves every thread (R5) |
+| `ConsumerId` | its number, `uint64_t` (`ConsumerId::get`) | present; `abi::credit_granted_in_two_steps_releases_exactly_that_many_deliveries` (*raw peers*) |
+| `CreditGrant` (`id`, `filter`, `limit`) | `weida_credit_grant` (`_id`, `_filter`, `_limit`, `_drop`) | present; `abi::credit_granted_in_two_steps_releases_exactly_that_many_deliveries` (*raw peers*) |
 | `FlowMeta` (`default`, `with_content_type`, `with_trace`, `with_topic`) | `weida_flow_meta_new`, `_set_content_type`, `_set_trace`, `_set_topic` (a builder; NULL is the default) | present; `abi::a_flow_carries_datagrams_over_quic` (*flows*) |
 | `Flow::send` | `weida_flow_send` (plain function, R3) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
 | `Flow::max_payload` | `weida_flow_max_payload` (1 and the size, or 0) | present; `abi::a_flow_carries_datagrams_over_quic`, `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
@@ -299,9 +310,8 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingFlow::refuse` | `weida_incoming_flow_refuse` (consumes) | present; `abi::a_flow_without_datagrams_is_unavailable_and_a_refusal_reaches_its_sender` (*flows*) |
 | `Drop for IncomingFlow` (`CANCELED`) | `weida_incoming_flow_drop` | present; R1 (*flows*) |
 
-The raw `Peer`'s and `Acceptor`'s other methods, taking the other `Incoming` variants,
-`Consumer`, `ConsumerId`, `CreditGrant`, and SWARM (`Seeder`, `Swarm`, `Fetch`, `Blob`, `BlobId`
-and the rest behind the `swarm` feature): each absent, in the areas *raw peers* and *swarm*.
+SWARM (`Seeder`, `Swarm`, `Fetch`, `Blob`, `BlobId` and the rest behind the `swarm` feature):
+each absent, in the area *swarm*.
 
 ## 8. Interop evidence
 
@@ -311,7 +321,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the fifty-four `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the fifty-seven `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -406,9 +416,18 @@ way a foreign caller calls it:
   borrow rules forbid it; `finish` then consumes the handle and the reporter is dropped,
   unflushed, when the report ends.
 - `Reporter::with_granularity`'s interval is milliseconds (`_set_granularity`, R7).
-- `Incoming` is a tagged handle, `weida_incoming`: `weida_incoming_kind` names the variant,
-  `weida_incoming_take_flow` hands a flow over once (a second call is `-WEIDA_ECLOSED`, another
-  kind `-WEIDA_EINVAL`), and dropping it drops what it holds, as Rust does.
+- `Incoming` is a tagged handle, `weida_incoming`: `weida_incoming_kind` names the variant;
+  `_take_stream`, `_take_exchange`, `_take_subscribed`, `_take_credit` and `_take_flow` hand a
+  payload over once (a second call is `-WEIDA_ECLOSED`, another kind `-WEIDA_EINVAL`);
+  `Unsubscribed`'s `id` and `filter` are getters on the handle that read absent on every other
+  kind, as a datagram's fields are on `weida_received`; dropping it drops what it holds, as Rust
+  does.
+- `ConsumerId` is its number (`ConsumerId::get`), equal to its connection's `ConnectionId`.
+- `Peer::send` takes its metadata in the one function, NULL for the default, since Rust has no
+  `send_with`.
+- `Peer::segment_drops`' `Option` is a snapshot of 0 or 1 record, as `Publisher::dropped_on`'s.
+- `Peer::events` is `weida_peer_peer_events`, because R1 gives `weida_peer_events` to the
+  reader it returns (`PeerEvents`).
 - `FlowInfo` is read through a `weida_incoming_meta` (`weida_incoming_flow_info`): its six
   fields are the metadata's of the same names, and every other getter reads absent.
 - `FlowStats` is read one counter at a time on the side that fills it, because R1 would name
@@ -435,7 +454,7 @@ is complete when no present row lacks a test.
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
 `config.rs`, `cursor.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`,
 `transfer.rs`, `requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `bus.rs`,
-`radio.rs`, `segment.rs`, `peer.rs`, `flow.rs`, `poll.rs`, `stats.rs`),
+`radio.rs`, `segment.rs`, `peer.rs`, `consumer.rs`, `flow.rs`, `poll.rs`, `stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

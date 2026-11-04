@@ -14,6 +14,7 @@
 
 mod bus;
 mod config;
+mod consumer;
 mod cursor;
 mod error;
 mod flow;
@@ -43,6 +44,7 @@ use std::ffi::c_char;
 
 pub use bus::*;
 pub use config::*;
+pub use consumer::*;
 pub use cursor::*;
 pub use error::*;
 pub use flow::*;

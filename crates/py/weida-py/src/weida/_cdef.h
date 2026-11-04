@@ -236,6 +236,14 @@ typedef struct weida_client_tls weida_client_tls;
 
 typedef struct weida_connection_stats weida_connection_stats;
 
+typedef struct weida_consumer weida_consumer;
+
+typedef struct weida_consumer_deliver_op weida_consumer_deliver_op;
+
+typedef struct weida_consumer_open_op weida_consumer_open_op;
+
+typedef struct weida_credit_grant weida_credit_grant;
+
 typedef struct weida_cursor_set weida_cursor_set;
 
 typedef struct weida_cursors weida_cursors;
@@ -334,7 +342,15 @@ typedef struct weida_peer_event weida_peer_event;
 
 typedef struct weida_peer_events weida_peer_events;
 
+typedef struct weida_peer_open_bi_op weida_peer_open_bi_op;
+
 typedef struct weida_peer_open_flow_op weida_peer_open_flow_op;
+
+typedef struct weida_peer_open_op weida_peer_open_op;
+
+typedef struct weida_peer_segment_op weida_peer_segment_op;
+
+typedef struct weida_peer_send_op weida_peer_send_op;
 
 typedef struct weida_pem weida_pem;
 
@@ -627,6 +643,48 @@ int weida_flow_meta_set_content_type(const weida_flow_meta *m, const char *conte
 int weida_flow_meta_set_topic(const weida_flow_meta *m, const char *topic);
 
 int weida_flow_meta_set_trace(const weida_flow_meta *m, const char *traceparent);
+
+uint64_t weida_consumer_id(const weida_consumer *c);
+
+const char *weida_consumer_filter(const weida_consumer *c, size_t *len_out);
+
+const char *weida_consumer_path(const weida_consumer *c, size_t *len_out);
+
+int weida_consumer_open(const weida_consumer *c,
+                        const weida_transfer_meta *meta,
+                        weida_consumer_open_op **out);
+
+int weida_consumer_open_op_fd(const weida_consumer_open_op *op, int64_t *out);
+
+int weida_consumer_open_op_wait(const weida_consumer_open_op *op,
+                                int64_t timeout_ms,
+                                weida_outgoing_transfer **out);
+
+void weida_consumer_open_op_drop(weida_consumer_open_op *op);
+
+int weida_consumer_deliver(const weida_consumer *c,
+                           const weida_transfer_meta *meta,
+                           const uint8_t *body,
+                           size_t len,
+                           weida_consumer_deliver_op **out);
+
+int weida_consumer_deliver_op_fd(const weida_consumer_deliver_op *op, int64_t *out);
+
+int weida_consumer_deliver_op_wait(const weida_consumer_deliver_op *op, int64_t timeout_ms);
+
+void weida_consumer_deliver_op_drop(weida_consumer_deliver_op *op);
+
+int weida_consumer_close(const weida_consumer *c, uint64_t code, const char *reason);
+
+void weida_consumer_drop(weida_consumer *c);
+
+uint64_t weida_credit_grant_id(const weida_credit_grant *g);
+
+const char *weida_credit_grant_filter(const weida_credit_grant *g, size_t *len_out);
+
+uint64_t weida_credit_grant_limit(const weida_credit_grant *g);
+
+void weida_credit_grant_drop(weida_credit_grant *g);
 
 int weida_cursors_fd(const weida_cursors *c, int64_t *out);
 
@@ -1050,6 +1108,66 @@ int weida_peer_open_flow_op_wait(const weida_peer_open_flow_op *op,
 
 void weida_peer_open_flow_op_drop(weida_peer_open_flow_op *op);
 
+int weida_peer_disconnect(const weida_peer *p, const char *url);
+
+size_t weida_peer_peer_count(const weida_peer *p);
+
+uint64_t weida_peer_dropped(const weida_peer *p);
+
+int weida_peer_connection_stats(const weida_peer *p, weida_connection_stats **out);
+
+int weida_peer_peer_events(const weida_peer *p, weida_peer_events **out);
+
+int weida_peer_open(const weida_peer *p, const weida_transfer_meta *meta, weida_peer_open_op **out);
+
+int weida_peer_open_op_fd(const weida_peer_open_op *op, int64_t *out);
+
+int weida_peer_open_op_wait(const weida_peer_open_op *op,
+                            int64_t timeout_ms,
+                            weida_outgoing_transfer **out);
+
+void weida_peer_open_op_drop(weida_peer_open_op *op);
+
+int weida_peer_open_bi(const weida_peer *p,
+                       const weida_transfer_meta *meta,
+                       weida_peer_open_bi_op **out);
+
+int weida_peer_open_bi_op_fd(const weida_peer_open_bi_op *op, int64_t *out);
+
+int weida_peer_open_bi_op_wait(const weida_peer_open_bi_op *op,
+                               int64_t timeout_ms,
+                               weida_outgoing_transfer **out_body,
+                               weida_reply_stream **out_reply);
+
+void weida_peer_open_bi_op_drop(weida_peer_open_bi_op *op);
+
+int weida_peer_send(const weida_peer *p,
+                    const weida_transfer_meta *meta,
+                    const uint8_t *body,
+                    size_t len,
+                    weida_peer_send_op **out);
+
+int weida_peer_send_op_fd(const weida_peer_send_op *op, int64_t *out);
+
+int weida_peer_send_op_wait(const weida_peer_send_op *op, int64_t timeout_ms);
+
+void weida_peer_send_op_drop(weida_peer_send_op *op);
+
+int weida_peer_segment(const weida_peer *p,
+                       const char *topic,
+                       const weida_segment_terms *terms,
+                       weida_peer_segment_op **out);
+
+int weida_peer_segment_op_fd(const weida_peer_segment_op *op, int64_t *out);
+
+int weida_peer_segment_op_wait(const weida_peer_segment_op *op,
+                               int64_t timeout_ms,
+                               weida_segment **out);
+
+void weida_peer_segment_op_drop(weida_peer_segment_op *op);
+
+int weida_peer_segment_drops(const weida_peer *p, const char *topic, weida_topic_drops **out);
+
 void weida_peer_drop(weida_peer *p);
 
 int weida_listener_acceptor(const weida_listener *l, const char *path, weida_acceptor **out);
@@ -1064,7 +1182,19 @@ void weida_acceptor_drop(weida_acceptor *a);
 
 int weida_incoming_kind(const weida_incoming *i);
 
+int weida_incoming_take_stream(const weida_incoming *i, weida_incoming_transfer **out);
+
+int weida_incoming_take_exchange(const weida_incoming *i, weida_incoming_request **out);
+
+int weida_incoming_take_subscribed(const weida_incoming *i, weida_consumer **out);
+
+int weida_incoming_take_credit(const weida_incoming *i, weida_credit_grant **out);
+
 int weida_incoming_take_flow(const weida_incoming *i, weida_incoming_flow **out);
+
+int weida_incoming_unsubscribed_id(const weida_incoming *i, uint64_t *out);
+
+const char *weida_incoming_unsubscribed_filter(const weida_incoming *i, size_t *len_out);
 
 void weida_incoming_drop(weida_incoming *i);
 

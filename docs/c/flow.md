@@ -4,21 +4,8 @@ A datagram flow is registered once on a stream of its own; its datagrams are the
 waiting and received as a queue. Flows need `datagram_receive_bytes` above 0 on both runtimes
 (`WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES`, [runtime.md](runtime.md)). Every function is callable
 from any thread (R5). Every `int` function can also return `-WEIDA_EINVAL` and `-WEIDA_EPANIC`.
-
-## `weida_peer`
-
-| Function | Blocks | Returns |
-| --- | --- | --- |
-| `int weida_runtime_peer(const weida_runtime *rt, const weida_client_tls *tls, weida_peer **out)` | never | 0 |
-| `int weida_peer_connect(const weida_peer *p, const char *url, weida_peer_connect_op **out)` | never (R3b) | 0; the wait returns 0 when connected, `-WEIDA_EUNTRUSTED` for a key not trusted; the runtime redials a lost address |
-| `int weida_peer_open_flow(const weida_peer *p, const weida_flow_meta *meta, weida_peer_open_flow_op **out)` | never (R3b); `meta` is copied, NULL is no keys | 0; registers a flow to the next peer, round-robin |
-| `int weida_peer_open_flow_op_wait(const weida_peer_open_flow_op *op, int64_t timeout_ms, weida_flow **out)` | up to `timeout_ms` | 0 and the flow once its header is written; `-WEIDA_EDATAGRAMS_UNAVAILABLE` when the connection did not agree datagrams, `-WEIDA_ENOT_CONNECTED` for a peer never connected, `-WEIDA_ELIMIT_EXCEEDED` for a label above 256 bytes; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
-| `void weida_peer_drop(weida_peer *p)` | never | — |
-
-Each op type, `weida_peer_connect_op` and `weida_peer_open_flow_op`, has `_op_fd(op, int64_t
-*out)` and `_op_drop(op)`; `weida_peer_connect_op_wait(op, int64_t timeout_ms)` returns 0 when
-done, `-WEIDA_EAGAIN`, `-WEIDA_EINTR` or `-WEIDA_ECLOSED`. Dropping an unfinished op aborts it;
-a flow an open registered that no wait took is closed.
+A raw peer opens a flow (`weida_peer_open_flow`) and an acceptor hands it over
+(`weida_incoming_take_flow`), both in [peer.md](peer.md).
 
 ## `weida_flow_meta`
 
@@ -29,31 +16,6 @@ a flow an open registered that no wait took is closed.
 | `int weida_flow_meta_set_topic(const weida_flow_meta *m, const char *topic)` | never | 0; above 256 bytes fails the open with `-WEIDA_ELIMIT_EXCEEDED` |
 | `int weida_flow_meta_set_trace(const weida_flow_meta *m, const char *traceparent)` | never | 0; `-WEIDA_EINVAL` for anything but a W3C version-00 traceparent |
 | `void weida_flow_meta_drop(weida_flow_meta *m)` | never | — |
-
-## `weida_acceptor` and `weida_incoming`
-
-| Function | Blocks | Returns |
-| --- | --- | --- |
-| `int weida_listener_acceptor(const weida_listener *l, const char *path, weida_acceptor **out)` | never | 0; `-WEIDA_EINVALID_ENDPOINT_PATH`, `-WEIDA_EALREADY_REGISTERED` |
-| `const char *weida_acceptor_path(const weida_acceptor *a, size_t *len_out)` | never | the path, valid as long as `a`; NULL for NULL |
-| `int weida_acceptor_fd(const weida_acceptor *a, int64_t *out)` | never | 0; `-WEIDA_EIO` |
-| `int weida_acceptor_accept(const weida_acceptor *a, int64_t timeout_ms, weida_incoming **out)` | up to `timeout_ms` | 0 and what arrived next, tagged; `-WEIDA_ENOT_CONNECTED` once the queue ended; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
-| `void weida_acceptor_drop(weida_acceptor *a)` | never | —; the path stays registered, a waiting accept returns `-WEIDA_ECLOSED` |
-| `int weida_incoming_kind(const weida_incoming *i)` | never | a `WEIDA_INCOMING_*` constant |
-| `int weida_incoming_take_flow(const weida_incoming *i, weida_incoming_flow **out)` | never | 0 and the flow, once; `-WEIDA_ECLOSED` after that, `-WEIDA_EINVAL` for another kind |
-| `void weida_incoming_drop(weida_incoming *i)` | never | —; drops what was not taken: a stream is refused `REJECTED`, an exchange answers `NO_REPLY`, a flow is stopped `CANCELED` |
-
-| Constant | Value |
-| --- | --- |
-| `WEIDA_INCOMING_STREAM` | 0, a unidirectional stream |
-| `WEIDA_INCOMING_EXCHANGE` | 1, a bidirectional stream that owes a reply |
-| `WEIDA_INCOMING_SUBSCRIBED` | 2, a consumer subscribed with one filter |
-| `WEIDA_INCOMING_CREDIT` | 3, a consumer stated a subscription's delivery limit |
-| `WEIDA_INCOMING_UNSUBSCRIBED` | 4, a subscription ended |
-| `WEIDA_INCOMING_FLOW` | 5, a datagram flow |
-
-`weida_acceptor_accept` is a try (R3a): the accept in flight is kept between tries, and
-`timeout_ms` 0 is the non-blocking read.
 
 ## `weida_flow`
 
@@ -124,6 +86,3 @@ One snapshot of the path under a flow, read-only. Each `uint64_t` getter returns
   1200 and there is no path.
 - `weida_flow_drop` closes with FIN and `weida_flow_abort` resets; dropping an incoming flow
   stops it `CANCELED` and `weida_incoming_flow_refuse` stops it `REJECTED`.
-- The rest of `weida_peer`, `weida_acceptor` and `weida_incoming` is the *raw peers* area
-  ([libraries/weida-c.md](../libraries/weida-c.md)); until it lands, the kinds other than a flow
-  can only be dropped.

@@ -57,6 +57,15 @@ pub struct weida_reply_stream {
     exec: Exec,
 }
 
+impl weida_reply_stream {
+    pub(crate) fn handle(stream: ReplyStream, exec: Exec) -> *mut weida_reply_stream {
+        into_handle(weida_reply_stream {
+            stream: Mutex::new(Some(stream)),
+            exec,
+        })
+    }
+}
+
 /// The pending wait of `weida_reply_stream_recv`.
 pub struct weida_reply_stream_recv_op {
     op: Arc<Op<IncomingTransfer>>,
@@ -398,10 +407,7 @@ pub unsafe extern "C" fn weida_requester_open_op_wait(
         let handle = unsafe { borrow(op) }?;
         let (body, reply) = handle.op.wait(timeout_ms)?;
         let body = weida_outgoing_transfer::handle(body, handle.exec.clone());
-        let reply = into_handle(weida_reply_stream {
-            stream: Mutex::new(Some(reply)),
-            exec: handle.exec.clone(),
-        });
+        let reply = weida_reply_stream::handle(reply, handle.exec.clone());
         // SAFETY: both out-parameters passed `out_ptr`.
         unsafe {
             write_out(out_body, body);
