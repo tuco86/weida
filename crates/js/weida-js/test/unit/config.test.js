@@ -53,6 +53,9 @@ test("a guarantee the dialler does not offer fails with WEIDA_ENEGOTIATION", UNI
   await requester.connect(url);
   const served = (async () => {
     const request = await replier.accept();
+    // Read whole first: a body dropped unread is refused REJECTED, which
+    // fails a request still writing it.
+    assert.equal(text((await request.takeBody().collect(64)).payload), "hello");
     const reply = await request.reply();
     await reply.writeAll("hi");
     reply.finish();
