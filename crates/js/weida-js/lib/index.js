@@ -141,6 +141,7 @@ function freezeMeta(meta) {
   if (meta.peerChain != null) {
     meta.peerChain = Object.freeze(meta.peerChain.map((der) => x509(der)));
   }
+  if (meta.peerLocal != null) Object.freeze(meta.peerLocal);
   return Object.freeze(meta);
 }
 
@@ -628,6 +629,21 @@ export class Listener extends Handle {
     return adopt(LocalBinding, native.listenerBindInproc(this[HANDLE], bus));
   }
 
+  /** Serves this listener's endpoints on the `AF_UNIX` socket `path`, reached
+   * at `weida+unix://<encodeURIComponent(path)>/<endpoint>`. No TLS: the kernel
+   * proves the peer. `path` MUST be in a directory this process owns and no
+   * other user may write. Throws WEIDA_EUNSUPPORTED on Windows. */
+  bindUnix(path) {
+    return adopt(UnixBinding, native.listenerBindUnix(this[HANDLE], path));
+  }
+
+  /** Serves this listener's endpoints on the named pipe `\\.\pipe\<name>`,
+   * owner-only and local-only, reached at `weida+pipe://<name>/<endpoint>`.
+   * Throws WEIDA_EUNSUPPORTED off Windows. */
+  bindPipe(name) {
+    return adopt(PipeBinding, native.listenerBindPipe(this[HANDLE], name));
+  }
+
   /** The replier serving `path` on every binding of this listener. */
   replier(path) {
     return adopt(Replier, native.listenerReplier(this[HANDLE], path));
@@ -746,6 +762,34 @@ export class LocalBinding extends Handle {
 
   bus() {
     return native.localBindingBus(this[HANDLE]);
+  }
+}
+
+/** An `AF_UNIX` binding; dropping it ends the binding and removes the socket
+ * file. */
+export class UnixBinding extends Handle {
+  constructor() {
+    super();
+    noConstructor("UnixBinding", "Listener.bindUnix()");
+  }
+
+  /** The socket path bound. */
+  path() {
+    return native.unixBindingPath(this[HANDLE]);
+  }
+}
+
+/** A named-pipe binding; dropping it ends the binding and releases the
+ * name. */
+export class PipeBinding extends Handle {
+  constructor() {
+    super();
+    noConstructor("PipeBinding", "Listener.bindPipe()");
+  }
+
+  /** The pipe name bound, without `\\.\pipe\`. */
+  name() {
+    return native.pipeBindingName(this[HANDLE]);
   }
 }
 

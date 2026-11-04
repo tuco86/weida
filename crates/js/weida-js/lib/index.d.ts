@@ -172,6 +172,13 @@ export class WeidaError extends Error {
   readonly osCode: number | null;
 }
 
+/** The local principal the kernel proved for the sender: its uid and gid on
+ * an `AF_UNIX` socket, its account SID on a named pipe. `pid` is null where
+ * the platform reports none, and an observation only: never authorize on it. */
+export type PeerLocal =
+  | { readonly uid: number; readonly gid: number; readonly pid: number | null }
+  | { readonly sid: string; readonly pid: number | null };
+
 /** The metadata of an inbound transfer or request, copied out at once. */
 export interface IncomingMeta {
   readonly endpoint: string | null;
@@ -181,6 +188,9 @@ export interface IncomingMeta {
   /** The chain the sender presented, leaf first; null for an anonymous or
    * local sender. */
   readonly peerChain: readonly X509Certificate[] | null;
+  /** The local principal of a sender over a unix socket or a named pipe;
+   * null for any other sender. */
+  readonly peerLocal: PeerLocal | null;
   readonly contentLen: bigint | null;
   readonly sequence: bigint | null;
   /** The sender's trace context as `traceparent` text. */
@@ -375,6 +385,10 @@ export class Listener extends Handle {
   /** Serves this listener's endpoints through the relay at `relay`, registered under `via`'s key. */
   bindRelay(relay: string, via: ClientTls, serverTls: ServerTls, options?: WaitOptions): Promise<Binding>;
   bindInproc(bus: string): LocalBinding;
+  /** Throws WEIDA_EUNSUPPORTED on Windows. */
+  bindUnix(path: string): UnixBinding;
+  /** Throws WEIDA_EUNSUPPORTED off Windows. */
+  bindPipe(name: string): PipeBinding;
   replier(path: string): Replier;
   /** Serves a relay on this listener's bindings. */
   relay(): Relay;
@@ -407,6 +421,16 @@ export class Handoff extends Handle {
 
 export class LocalBinding extends Handle {
   bus(): string | null;
+}
+
+/** Dropping it ends the binding and removes the socket file. */
+export class UnixBinding extends Handle {
+  path(): string | null;
+}
+
+/** Dropping it ends the binding and releases the name. */
+export class PipeBinding extends Handle {
+  name(): string | null;
 }
 
 export class Requester extends Handle {

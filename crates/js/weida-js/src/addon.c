@@ -46,6 +46,8 @@ DROP(binding_hand_over_op)
 DROP(binding_take_over_op)
 DROP(handoff)
 DROP(local_binding)
+DROP(unix_binding)
+DROP(pipe_binding)
 DROP(replier)
 DROP(incoming_request)
 DROP(incoming_request_reply_op)
@@ -579,6 +581,33 @@ static napi_value chain_value(napi_env env, const weida_incoming_meta *m) {
     return arr;
 }
 
+/* The local principal the kernel proved: { uid, gid, pid } for an AF_UNIX
+ * peer, { sid, pid } for a named-pipe peer, else null. */
+static napi_value local_value(napi_env env, const weida_incoming_meta *m) {
+    uint32_t uid = 0, gid = 0, pid = 0;
+    size_t len = 0;
+    napi_value obj;
+    int has_pid = weida_incoming_meta_peer_pid(m, &pid);
+    if (weida_incoming_meta_peer_uid(m, &uid) == 1) {
+        weida_incoming_meta_peer_gid(m, &gid);
+        if (napi_create_object(env, &obj) != napi_ok)
+            return throw_napi(env);
+        if (!set(env, obj, "uid", js_int64(env, uid)) || !set(env, obj, "gid", js_int64(env, gid)) ||
+            !set(env, obj, "pid", optional_u32(env, has_pid, pid)))
+            return NULL;
+        return obj;
+    }
+    const char *sid = weida_incoming_meta_peer_sid(m, &len);
+    if (!sid)
+        return js_null(env);
+    if (napi_create_object(env, &obj) != napi_ok)
+        return throw_napi(env);
+    if (!set(env, obj, "sid", js_string(env, sid, len)) ||
+        !set(env, obj, "pid", optional_u32(env, has_pid, pid)))
+        return NULL;
+    return obj;
+}
+
 /* Copies a weida_incoming_meta out into a plain object and drops it. */
 static napi_value meta_value(napi_env env, void *ptr) {
     weida_incoming_meta *m = ptr;
@@ -599,6 +628,7 @@ static napi_value meta_value(napi_env env, void *ptr) {
     s = weida_incoming_meta_peer_fingerprint(m, &len);
     ok = ok && set(env, obj, "peerFingerprint", js_string(env, s, len));
     ok = ok && set(env, obj, "peerChain", chain_value(env, m));
+    ok = ok && set(env, obj, "peerLocal", local_value(env, m));
     present = weida_incoming_meta_content_len(m, &n);
     ok = ok && set(env, obj, "contentLen", optional_u64(env, present, n));
     present = weida_incoming_meta_sequence(m, &n);
@@ -1535,6 +1565,34 @@ static napi_value listener_bind_inproc(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_local_binding);
 }
 
+static napi_value listener_bind_unix(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *path = get_string(env, argv[1]);
+    if (!path)
+        return NULL;
+    weida_unix_binding *out = NULL;
+    int rc = weida_listener_bind_unix(l, path, &out);
+    free(path);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_unix_binding);
+}
+
+static napi_value listener_bind_pipe(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_listener *l = live(env, argv[0], drop_listener);
+    if (!l)
+        return NULL;
+    char *name = get_string(env, argv[1]);
+    if (!name)
+        return NULL;
+    weida_pipe_binding *out = NULL;
+    int rc = weida_listener_bind_pipe(l, name, &out);
+    free(name);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, out, drop_pipe_binding);
+}
+
 static napi_value listener_replier(napi_env env, napi_callback_info info) {
     ARGS(2);
     const weida_listener *l = live(env, argv[0], drop_listener);
@@ -1664,6 +1722,8 @@ static napi_value handoff_take_socket(napi_env env, napi_callback_info info) {
 }
 
 STRING_OUT(local_binding_bus, local_binding, bus)
+STRING_OUT(unix_binding_path, unix_binding, path)
+STRING_OUT(pipe_binding_name, pipe_binding, name)
 
 /* replier and incoming request */
 
@@ -2300,6 +2360,8 @@ NAPI_MODULE_INIT() {
         FN("listenerBindRelayOpWait", listener_bind_relay_op_wait),
         FN("listenerRelay", listener_relay),
         FN("listenerBindInproc", listener_bind_inproc),
+        FN("listenerBindUnix", listener_bind_unix),
+        FN("listenerBindPipe", listener_bind_pipe),
         FN("listenerReplier", listener_replier),
         FN("bindingLocalAddr", binding_local_addr),
         FN("bindingClose", binding_close),
@@ -2318,6 +2380,8 @@ NAPI_MODULE_INIT() {
         FN("handoffBytes", handoff_bytes),
         FN("handoffTakeSocket", handoff_take_socket),
         FN("localBindingBus", local_binding_bus),
+        FN("unixBindingPath", unix_binding_path),
+        FN("pipeBindingName", pipe_binding_name),
         FN("replierPath", replier_path),
         FN("replierFd", replier_fd),
         FN("replierAccept", replier_accept),
