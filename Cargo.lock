@@ -3520,6 +3520,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

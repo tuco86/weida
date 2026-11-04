@@ -37,6 +37,10 @@ weida-protocol.workspace = true
 # `src/sim.rs` behind `test-util`, is named in `docs/ARCHITECTURE.md` §5.
 weida-runtime.workspace = true
 quinn.workspace = true
+# The client socket is bound by hand (`src/network.rs`, `dual_stack_socket`):
+# dual-stack on a port chosen by an IPv4 bind. Already in the graph through
+# tokio and quinn, so this adds an edge and no crate.
+socket2.workspace = true
 # For its version floor only; see the workspace entry.
 rustls.workspace = true
 tokio.workspace = true

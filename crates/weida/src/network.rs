@@ -98,12 +98,61 @@ pub(crate) fn quic_runtime() -> Result<Arc<dyn quinn::Runtime>, Error> {
 /// as it is constructed, and the caller's thread may have none.
 fn bind_os_client(exec: &Exec) -> Result<quinn::Endpoint, Error> {
     let _guard = exec.enter();
-    let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
-    match quinn::Endpoint::client(v6) {
-        Ok(endpoint) => Ok(endpoint),
-        Err(e) => {
-            tracing::debug!(error = %e, "IPv6 client socket unavailable; falling back to IPv4");
-            quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).map_err(Error::Io)
+    let socket = client_socket().map_err(Error::Io)?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        quic_runtime()?,
+    )
+    .map_err(Error::Io)
+}
+
+/// The client socket: dual-stack IPv6 where the host has it, else IPv4.
+fn client_socket() -> io::Result<std::net::UdpSocket> {
+    dual_stack_socket().or_else(|e| {
+        tracing::debug!(error = %e, "IPv6 client socket unavailable; falling back to IPv4");
+        std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+    })
+}
+
+/// Ports [`dual_stack_socket`] tries before it gives up on dual-stack.
+const PORT_ATTEMPTS: usize = 16;
+
+/// A dual-stack socket on `[::]`, on a port no IPv4 socket holds.
+///
+/// A dual-stack bind of port 0 checks only the IPv6 sockets on macOS: it
+/// can return a port an IPv4 socket holds on `127.0.0.1` or `0.0.0.0`, and
+/// every IPv4 datagram to that port then goes to the IPv4 socket, so a dial
+/// from it never hears the server and ends at the idle timeout (ticket
+/// #47). An IPv4 bind of port 0 checks both families, so the port comes
+/// from one, closed again before the dual-stack socket binds it by number.
+/// A port taken in between, or held by an IPv6-only socket, is refused
+/// with `AddrInUse`, and the next probe picks another.
+fn dual_stack_socket() -> io::Result<std::net::UdpSocket> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        // A host without IPv4 has no IPv4 socket to share a port with.
+        let port = match std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+            Ok(probe) => probe.local_addr()?.port(),
+            Err(_) => 0,
+        };
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        if let Err(e) = socket.set_only_v6(false) {
+            tracing::debug!(error = %e, "unable to make the client socket dual-stack");
+        }
+        match socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into()) {
+            Ok(()) => return Ok(socket.into()),
+            Err(e)
+                if port != 0
+                    && attempts < PORT_ATTEMPTS
+                    && e.kind() == io::ErrorKind::AddrInUse => {}
+            Err(e) => return Err(e),
         }
     }
 }
@@ -361,6 +410,32 @@ mod tests {
             let exec = Exec::current().expect("ambient runtime");
             let endpoint = Network::default().bind_client(&exec).unwrap();
             assert_ne!(endpoint.local_addr().unwrap().port(), 0);
+        }
+
+        /// A dual-stack bind of port 0 on macOS may return a port an IPv4 socket
+        /// holds, which then receives every IPv4 datagram meant for the client
+        /// (ticket #47). Against 200 held ports one such bind in about 80 hits
+        /// one, so 2000 binds find one with near certainty.
+        #[test]
+        fn the_client_socket_never_takes_a_port_an_ipv4_socket_holds() {
+            let holders: Vec<std::net::UdpSocket> = (0..200)
+                .map(|_| std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a holder"))
+                .collect();
+            let held: std::collections::HashSet<u16> = holders
+                .iter()
+                .map(|s| s.local_addr().expect("a holder's address").port())
+                .collect();
+            for _ in 0..2000 {
+                let port = client_socket()
+                    .expect("a client socket")
+                    .local_addr()
+                    .expect("its address")
+                    .port();
+                assert!(
+                    !held.contains(&port),
+                    "the client socket took port {port}, which an IPv4 socket on 127.0.0.1 holds"
+                );
+            }
         }
     }
 }
