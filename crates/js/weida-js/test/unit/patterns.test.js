@@ -57,21 +57,23 @@ test("push to pull over inproc arrives in order", UNIT, async () => {
   await pusher.connect(`weida+inproc://${at.bus}/jobs`);
   assert.equal(pusher.peerCount(), 1);
 
-  await pusher.send("one");
-  await pusher.send("two");
-  await pusher.sendWith({ contentType: "application/json" }, "three");
-  for (const [n, body, contentType] of [
-    [0n, "one", null],
-    [1n, "two", null],
-    [2n, "three", "application/json"],
-  ]) {
+  // The first number a connection sees sets its position, and two streams
+  // may reach the puller in either order: "one" is taken before the rest is
+  // sent, so what follows is ordered against it.
+  const expect = async (n, body, contentType) => {
     const transfer = await puller.recv();
     const meta = transfer.meta();
     assert.equal(meta.sequence, n);
     assert.equal(meta.gap, null);
     assert.equal(meta.contentType, contentType);
     assert.equal(text((await transfer.collect(1024)).payload), body);
-  }
+  };
+  await pusher.send("one");
+  await expect(0n, "one", null);
+  await pusher.send("two");
+  await pusher.sendWith({ contentType: "application/json" }, "three");
+  await expect(1n, "two", null);
+  await expect(2n, "three", "application/json");
 
   const out = await pusher.open({ contentType: "text/plain" });
   await out.writeAll("four");
