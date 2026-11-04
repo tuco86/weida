@@ -209,6 +209,33 @@
 #define WEIDA_FINGERPRINT_LEN 71
 
 /**
+ * The first cursor level an application may name
+ * (`CursorLevel::APPLICATION_FLOOR`); the levels below it are the
+ * `WEIDA_ACKNOWLEDGEMENT_*` values.
+ */
+#define WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR 16
+
+/**
+ * `ReportMode::Progress`.
+ */
+#define WEIDA_REPORT_MODE_PROGRESS 0
+
+/**
+ * `ReportMode::FinalOnly`.
+ */
+#define WEIDA_REPORT_MODE_FINAL_ONLY 1
+
+/**
+ * `Reporter::DEFAULT_BYTES`.
+ */
+#define WEIDA_REPORTER_DEFAULT_BYTES 1048576
+
+/**
+ * `Reporter::DEFAULT_INTERVAL`, in milliseconds.
+ */
+#define WEIDA_REPORTER_DEFAULT_INTERVAL_MS 100
+
+/**
  * `Error::Runtime`: the runtime could not be created or used.
  */
 #define WEIDA_ERUNTIME 1
@@ -556,6 +583,18 @@ typedef struct weida_client_tls weida_client_tls;
 typedef struct weida_connection_stats weida_connection_stats;
 
 /**
+ * The newest offset per reported level of one transfer (`CursorSet`),
+ * read-only.
+ */
+typedef struct weida_cursor_set weida_cursor_set;
+
+/**
+ * The cursors one transfer ordered (`Cursors`), read as a queue of cursor
+ * sets.
+ */
+typedef struct weida_cursors weida_cursors;
+
+/**
  * The receipt of a finished outbound transfer.
  */
 typedef struct weida_delivery weida_delivery;
@@ -854,6 +893,23 @@ typedef struct weida_reply_stream weida_reply_stream;
  * The pending wait of `weida_reply_stream_recv`.
  */
 typedef struct weida_reply_stream_recv_op weida_reply_stream_recv_op;
+
+/**
+ * The receiver's end of a report (`Reporter`). A running
+ * `weida_reporter_report` holds the lock; `weida_reporter_finish` takes the
+ * value out.
+ */
+typedef struct weida_reporter weida_reporter;
+
+/**
+ * The pending flush and FIN of `weida_reporter_finish`.
+ */
+typedef struct weida_reporter_finish_op weida_reporter_finish_op;
+
+/**
+ * The pending report of `weida_reporter_report`.
+ */
+typedef struct weida_reporter_report_op weida_reporter_report_op;
 
 /**
  * The requesting half of Req/Rep: dials repliers and sends them requests.
@@ -1853,6 +1909,229 @@ int weida_segment_terms_set_priority(const weida_segment_terms *t, int32_t v);
  * `t` is NULL or live terms.
  */
 int weida_segment_terms_set_follows_upstream(const weida_segment_terms *t, int v);
+
+/**
+ * The queue's readiness descriptor (R11): readable when the next
+ * `weida_cursors_recv` will not block.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live queue; `out` is NULL or writable.
+ */
+int weida_cursors_fd(const weida_cursors *c, int64_t *out);
+
+/**
+ * Takes the newest cursor set after a change, waiting up to `timeout_ms`
+ * (R4) for one (`Cursors::changed`). Changes since the last recv coalesce
+ * into one set: offsets are absolute, so the newest set loses nothing.
+ *
+ * Writes NULL to `out` and returns 0 once no more cursors come (the
+ * reporter finished, the stream was reset or the connection is gone,
+ * indistinguishably), and on every recv after that. Fails with
+ * `-WEIDA_EAGAIN` when nothing changed in time, `-WEIDA_EINTR` and
+ * `-WEIDA_ECLOSED`.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live queue; `out` is NULL or writable. Release a set
+ * with `weida_cursor_set_drop`.
+ */
+int weida_cursors_recv(const weida_cursors *c, int64_t timeout_ms, weida_cursor_set **out);
+
+/**
+ * Releases a queue and with it the report id; records arriving after are
+ * ignored. A thread waiting in `weida_cursors_recv` returns
+ * `-WEIDA_ECLOSED`. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `c` is NULL or a live queue, dropped at most once.
+ */
+void weida_cursors_drop(weida_cursors *c);
+
+/**
+ * How many levels the set carries (`CursorSet::len`); 0 for NULL.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live set.
+ */
+size_t weida_cursor_set_len(const weida_cursor_set *s);
+
+/**
+ * Reads entry `index` (`CursorSet::iter`): 1 with the level's wire value
+ * in `*out_level` and its offset in `*out_offset`; levels ascend with the
+ * index. 0 for an index past the end and for a NULL argument; the outs
+ * are then untouched.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live set; `out_level` and `out_offset` are NULL or
+ * writable.
+ */
+int weida_cursor_set_level(const weida_cursor_set *s,
+                           size_t index,
+                           uint64_t *out_level,
+                           uint64_t *out_offset);
+
+/**
+ * The offset reported for `level` (`CursorSet::offset`): 1 and `*out` when
+ * it was reported, 0 when not. A level from 6 to 15 is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live set; `out` is NULL or writable.
+ */
+int weida_cursor_set_offset(const weida_cursor_set *s, uint64_t level, uint64_t *out);
+
+/**
+ * Releases a set. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live set, dropped at most once.
+ */
+void weida_cursor_set_drop(weida_cursor_set *s);
+
+/**
+ * The levels the sender ordered (`Reporter::levels`), as ascending wire
+ * values, and their count in `*len_out`; NULL for a NULL `r`, `*len_out`
+ * then untouched.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live reporter; `len_out` is NULL or writable. The array
+ * lives as long as `r`.
+ */
+const uint64_t *weida_reporter_levels(const weida_reporter *r, size_t *len_out);
+
+/**
+ * The mode the sender asked for (`Reporter::mode`), a
+ * `WEIDA_REPORT_MODE_*` constant.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live reporter.
+ */
+int weida_reporter_mode(const weida_reporter *r);
+
+/**
+ * Sets how often progress records are written
+ * (`Reporter::with_granularity`): when a level advanced `bytes` or
+ * `interval_ms` passed since its last record, whichever comes first. 0 and
+ * 0 write every report; no effect in final-only mode. `-WEIDA_EINVAL`
+ * while a report op runs.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live reporter.
+ */
+int weida_reporter_set_granularity(const weida_reporter *r, uint64_t bytes, uint64_t interval_ms);
+
+/**
+ * Reports that `level` (a wire value) has reached `offset`
+ * (`Reporter::report`). A level the sender did not order is ignored; one
+ * from 6 to 15 is `-WEIDA_EINVAL`.
+ *
+ * Never blocks; the report runs as the op written to `out`, whose wait
+ * returns 0: a report never fails for a transport reason. Until it
+ * finished, every other call on the reporter is `-WEIDA_EINVAL`. Dropping
+ * an unfinished op aborts the report, as dropping Rust's future does.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live reporter; `out` is NULL or writable. Release the op
+ * with `weida_reporter_report_op_drop`.
+ */
+int weida_reporter_report(const weida_reporter *r,
+                          uint64_t level,
+                          uint64_t offset,
+                          weida_reporter_report_op **out);
+
+/**
+ * The readiness descriptor of a report op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live report op; `out` is NULL or writable.
+ */
+int weida_reporter_report_op_fd(const weida_reporter_report_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the report: 0 once it was recorded or
+ * written.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live report op.
+ */
+int weida_reporter_report_op_wait(const weida_reporter_report_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a report op, aborting it when unfinished. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live report op, dropped at most once.
+ */
+void weida_reporter_report_op_drop(weida_reporter_report_op *op);
+
+/**
+ * Flushes the newest offset per reported level and ends the report
+ * (`Reporter::finish`); a level never reported gets no record.
+ * **Consumes** `r` on every return path.
+ *
+ * Never blocks; the flush runs as the op written to `out`. While a report
+ * op runs it fails with `-WEIDA_EINVAL`, and the reporter is dropped,
+ * unflushed, when that report ends; a NULL `out` fails the same way and
+ * drops it at once.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live reporter, not used again; `out` is NULL or
+ * writable. Release the op with `weida_reporter_finish_op_drop`.
+ */
+int weida_reporter_finish(weida_reporter *r, weida_reporter_finish_op **out);
+
+/**
+ * The readiness descriptor of a finish op: readable once it finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live finish op; `out` is NULL or writable.
+ */
+int weida_reporter_finish_op_fd(const weida_reporter_finish_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the flush: 0 once the stream was
+ * finished, or the report was over already.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live finish op.
+ */
+int weida_reporter_finish_op_wait(const weida_reporter_finish_op *op, int64_t timeout_ms);
+
+/**
+ * Releases a finish op, aborting the flush when unfinished. NULL does
+ * nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live finish op, dropped at most once.
+ */
+void weida_reporter_finish_op_drop(weida_reporter_finish_op *op);
+
+/**
+ * Releases a reporter without finishing it: it flushes nothing, so records
+ * the granularity held back are never sent and the sender's queue ends
+ * without them. NULL does nothing.
+ *
+ * # Safety
+ *
+ * `r` is NULL or a live reporter, dropped at most once.
+ */
+void weida_reporter_drop(weida_reporter *r);
 
 /**
  * The description of a status code, positive or negative.
@@ -7252,6 +7531,36 @@ int weida_transfer_meta_set_trace(const weida_transfer_meta *m, const char *trac
 int weida_transfer_meta_set_achieved(const weida_transfer_meta *m, int level);
 
 /**
+ * Orders the cursor levels the receiver should report
+ * (`TransferMeta::with_report`), `len` wire values from `levels`: below
+ * `WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR` a `WEIDA_ACKNOWLEDGEMENT_*`
+ * value, at or above it an application stage. Replaces the order; the
+ * levels are sorted and deduplicated, and `len == 0` orders nothing. A
+ * value from 6 to 15 is `-WEIDA_EINVAL` and leaves the metadata unchanged;
+ * more than 16 distinct levels fail the send with
+ * `-WEIDA_ELIMIT_EXCEEDED`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `levels` is NULL only with `len == 0`,
+ * else points to `len` readable values.
+ */
+int weida_transfer_meta_set_report(const weida_transfer_meta *m,
+                                   const uint64_t *levels,
+                                   size_t len);
+
+/**
+ * How the receiver should report the ordered levels
+ * (`TransferMeta::with_report_mode`), a `WEIDA_REPORT_MODE_*` constant;
+ * any other value is `-WEIDA_EINVAL`.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata.
+ */
+int weida_transfer_meta_set_report_mode(const weida_transfer_meta *m, int mode);
+
+/**
  * Writes a fresh root trace context (`weida::new_trace`) to `out` as its
  * `traceparent` text: `WEIDA_TRACEPARENT_LEN` bytes and a NUL. A NULL `out`
  * or a `len` below `WEIDA_TRACEPARENT_LEN + 1` is `-WEIDA_EINVAL`.
@@ -7397,6 +7706,40 @@ int weida_incoming_meta_segment(const weida_incoming_meta *m, uint64_t *out);
 int weida_incoming_meta_layer(const weida_incoming_meta *m, uint8_t *out);
 
 /**
+ * The cursor levels the sender ordered reported (`IncomingMeta::report`),
+ * as ascending wire values, and their count in `*len_out`; NULL when it
+ * ordered none or `m` is NULL, `*len_out` then untouched.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `len_out` is NULL or writable. The array
+ * lives as long as `m`.
+ */
+const uint64_t *weida_incoming_meta_report(const weida_incoming_meta *m, size_t *len_out);
+
+/**
+ * How the sender asked the levels reported (`IncomingMeta::report_mode`),
+ * a `WEIDA_REPORT_MODE_*` constant; `WEIDA_REPORT_MODE_PROGRESS` when it
+ * stated none.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata.
+ */
+int weida_incoming_meta_report_mode(const weida_incoming_meta *m);
+
+/**
+ * The id the receiver's cursor stream names (`IncomingMeta::report_id`): 1
+ * and `*out` when present, which is exactly when levels were ordered, 0
+ * when absent.
+ *
+ * # Safety
+ *
+ * `m` is NULL or live metadata; `out` is NULL or writable.
+ */
+int weida_incoming_meta_report_id(const weida_incoming_meta *m, uint64_t *out);
+
+/**
  * The trace context the sender propagated, as its `traceparent` text; NULL
  * when it sent none or one that did not parse.
  *
@@ -7536,6 +7879,22 @@ int weida_incoming_transfer_meta(const weida_incoming_transfer *t, weida_incomin
  * `t` is NULL or a live incoming transfer; `out` is NULL or writable.
  */
 int weida_incoming_transfer_connection(const weida_incoming_transfer *t, uint64_t *out);
+
+/**
+ * A reporter for the cursor levels the sender ordered
+ * (`IncomingTransfer::reporter`): 1 and a `weida_reporter`, 0 with NULL
+ * when it ordered none. Each call hands out a new reporter on the same
+ * report, so take one. `-WEIDA_ECLOSED` once the transfer was collected,
+ * so take it before `weida_incoming_transfer_collect`; the reporter
+ * outlives the transfer.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live incoming transfer; `out` is NULL or writable.
+ * Release the reporter with `weida_reporter_finish` or
+ * `weida_reporter_drop`.
+ */
+int weida_incoming_transfer_reporter(const weida_incoming_transfer *t, weida_reporter **out);
 
 /**
  * The transfer's readiness descriptor (R11): readable when the next
@@ -7697,6 +8056,21 @@ int weida_outgoing_transfer_set_priority(const weida_outgoing_transfer *t, int32
  * `t` is NULL or a live outgoing transfer.
  */
 int weida_outgoing_transfer_expire_after_ms(const weida_outgoing_transfer *t, uint64_t ms);
+
+/**
+ * The queue of cursor sets the receiver reports for this transfer
+ * (`OutgoingTransfer::cursors`): 1 and a `weida_cursors` the first time,
+ * 0 with NULL after that and when the metadata ordered no levels.
+ * `-WEIDA_ECLOSED` once finished, so take it before
+ * `weida_outgoing_transfer_finish`; the queue outlives the transfer, which
+ * is the point: `Accepted` arrives after the payload's end.
+ *
+ * # Safety
+ *
+ * `t` is NULL or a live outgoing transfer; `out` is NULL or writable.
+ * Release the queue with `weida_cursors_drop`.
+ */
+int weida_outgoing_transfer_cursors(const weida_outgoing_transfer *t, weida_cursors **out);
 
 /**
  * Ends the payload (`OutgoingTransfer::finish`) and writes its delivery

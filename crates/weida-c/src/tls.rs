@@ -5,8 +5,8 @@ use std::ffi::{c_char, c_int};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use weida_rs::{
-    Acknowledgement, ClientTls, ClientTrust, Fingerprint, Identity, ServerTls, TraceContext,
-    TransferMeta, Trust,
+    Acknowledgement, ClientTls, ClientTrust, Fingerprint, Identity, ReportMode, ServerTls,
+    TraceContext, TransferMeta, Trust,
 };
 use zeroize::Zeroizing;
 
@@ -896,6 +896,58 @@ pub unsafe extern "C" fn weida_transfer_meta_set_achieved(
         let achieved = wire(level, Acknowledgement::from_wire)?;
         let mut meta = locked(&m.meta);
         *meta = std::mem::take(&mut *meta).with_achieved(achieved);
+        Ok(0)
+    })
+}
+
+/// Orders the cursor levels the receiver should report
+/// (`TransferMeta::with_report`), `len` wire values from `levels`: below
+/// `WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR` a `WEIDA_ACKNOWLEDGEMENT_*`
+/// value, at or above it an application stage. Replaces the order; the
+/// levels are sorted and deduplicated, and `len == 0` orders nothing. A
+/// value from 6 to 15 is `-WEIDA_EINVAL` and leaves the metadata unchanged;
+/// more than 16 distinct levels fail the send with
+/// `-WEIDA_ELIMIT_EXCEEDED`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `levels` is NULL only with `len == 0`,
+/// else points to `len` readable values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_transfer_meta_set_report(
+    m: *const weida_transfer_meta,
+    levels: *const u64,
+    len: usize,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let m = unsafe { borrow(m) }?;
+        // SAFETY: forwarded from this function's contract.
+        let levels = unsafe { crate::cursor::levels(levels, len) }?;
+        let mut meta = locked(&m.meta);
+        *meta = std::mem::take(&mut *meta).with_report(levels);
+        Ok(0)
+    })
+}
+
+/// How the receiver should report the ordered levels
+/// (`TransferMeta::with_report_mode`), a `WEIDA_REPORT_MODE_*` constant;
+/// any other value is `-WEIDA_EINVAL`.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_transfer_meta_set_report_mode(
+    m: *const weida_transfer_meta,
+    mode: c_int,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let m = unsafe { borrow(m) }?;
+        let mode = wire(mode, ReportMode::from_wire)?;
+        let mut meta = locked(&m.meta);
+        *meta = std::mem::take(&mut *meta).with_report_mode(mode);
         Ok(0)
     })
 }

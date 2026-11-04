@@ -96,7 +96,7 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingTransfer::collect` | `weida_incoming_transfer_collect` (op, consumes) | present; `abi::a_collect_over_its_ceiling_fails_with_limit_exceeded` |
 | `IncomingTransfer::read_capped` | — | refused: R3c, a loop over `read` the caller writes |
 | `IncomingTransfer::meta` | `weida_incoming_transfer_meta` | present; `abi::a_streamed_round_trip_over_inproc` (`content_type`) |
-| `IncomingTransfer::reporter` | — | absent: *cursors* |
+| `IncomingTransfer::reporter` | `weida_incoming_transfer_reporter` (1 and a `weida_reporter`, or 0 with NULL) | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
 | `IncomingTransfer::connection` | `weida_incoming_transfer_connection` | present; `abi::a_request_and_its_body_name_the_same_connection` (*stats*) |
 | `Drop for IncomingTransfer` (`REJECTED`) | `weida_incoming_transfer_drop` | present; `streams::a_refused_payload_reports_rejected_through_async_write` proves the outcome in Rust |
 | `AsyncWrite for OutgoingTransfer` | `weida_outgoing_transfer_write` (try) | present; `abi::a_streamed_round_trip_over_inproc`, `smoke.c` |
@@ -104,9 +104,20 @@ unit tests in `crates/weida-c/src/`.
 | `OutgoingTransfer::finish` | `weida_outgoing_transfer_finish` (consumes) | present; `abi::a_streamed_round_trip_over_inproc` |
 | `OutgoingTransfer::cancel` | `weida_outgoing_transfer_drop` (an unfinished transfer is reset `CANCELED`) | present; `abi::a_reply_dropped_unfinished_reads_as_canceled` |
 | `OutgoingTransfer::trace`, `set_priority`, `expire_at` | `weida_outgoing_transfer_trace`, `_set_priority`, `_expire_after_ms` | present; `abi::metadata_travels_with_a_request_and_its_reply`, `abi::an_expired_reply_fails_its_finish_and_cancels_the_reader` (*config*) |
-| `OutgoingTransfer::cursors` | — | absent: *cursors* |
+| `OutgoingTransfer::cursors` | `weida_outgoing_transfer_cursors` (1 and a `weida_cursors` queue once, or 0 with NULL) | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
 | `Delivery::delivered` | `weida_delivery_delivered` (op, consumes) | present; `abi::a_streamed_round_trip_over_inproc` |
 | `Drop for Delivery` | `weida_delivery_drop` | present |
+| `Cursors::changed` | `weida_cursors_recv` (try, R3a; a `weida_cursor_set` per change, NULL at the end), `_fd` | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
+| `Cursors::snapshot`, `offset` | — | refused: the queue yields the whole newest set on every change, coalesced, so the set `weida_cursors_recv` returned last is the snapshot until it returns another, and `timeout_ms` 0 is the non-blocking read; a recv in flight owns the reader, as Rust's `&mut self` borrow does |
+| `Drop for Cursors` (releases the report id) | `weida_cursors_drop` | present; R1 |
+| `CursorSet::offset`, `iter`, `len` | `weida_cursor_set_offset`, `_level` (by index, ascending), `_len` | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
+| `CursorSet::is_empty` | — | refused: `weida_cursor_set_len` is 0 |
+| `Reporter::levels`, `mode` | `weida_reporter_levels` (wire values), `_mode` | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
+| `Reporter::with_granularity` | `weida_reporter_set_granularity` (bytes, milliseconds) | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order` (*cursors*) |
+| `Reporter::report` | `weida_reporter_report` (op) | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
+| `Reporter::finish` | `weida_reporter_finish` (op, consumes) | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
+| `Reporter::DEFAULT_BYTES`, `DEFAULT_INTERVAL` | `WEIDA_REPORTER_DEFAULT_BYTES`, `_DEFAULT_INTERVAL_MS` (asserted at compile time) | present |
+| `Drop for Reporter` (flushes nothing) | `weida_reporter_drop` | present; R1 |
 | `ConnectionId` | its number, `uint64_t` (`ConnectionId::get`) | present; `abi::a_request_and_its_body_name_the_same_connection` (*stats*) |
 
 ## 5. Values and metadata
@@ -150,7 +161,7 @@ unit tests in `crates/weida-c/src/`.
 | `FilesOptions` (`names`, `poll`) | `weida_files_options_new`, `_set_names`, `_set_poll_ms`; NULL is the default | present; `identity::tests::files_options_setters_land_on_their_fields`, `abi::a_files_identity_source_rotates_a_bindings_certificate` (*identity*) |
 | `TransferMeta::with_content_type` | `weida_transfer_meta_set_content_type` | present; `abi::a_streamed_round_trip_over_inproc` |
 | `TransferMeta::with_content_len`, `with_trace`, `with_topic`, `with_achieved` | `weida_transfer_meta_set_content_len`, `_set_trace`, `_set_topic`, `_set_achieved` | present; `abi::metadata_travels_with_a_request_and_its_reply` (*config*) |
-| `TransferMeta::with_report`, `with_report_mode` | — | absent: *cursors* |
+| `TransferMeta::with_report`, `with_report_mode` | `weida_transfer_meta_set_report` (an array of wire values), `_set_report_mode` | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
 | `IncomingMeta::endpoint`, `content_type`, `topic`, `content_len`, `sequence` | `weida_incoming_meta_*` | present; `endpoint` and `content_type` by `abi::a_streamed_round_trip_over_inproc` |
 | `IncomingMeta::peer` | `weida_incoming_meta_peer_fingerprint` (`PeerIdentity::Key`), `_peer_uid`, `_peer_gid`, `_peer_pid` (`Local`), `_peer_sid`, `_peer_pid` (`Windows`) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain`, `abi::a_round_trip_over_unix_names_the_clients_uid`, `abi::a_round_trip_over_a_pipe_names_the_clients_sid`, `transfer::tests::every_peer_identity_reads_back_through_its_getters` (*local transports*) |
 | `IncomingMeta::peer_chain`, `PeerChain` | `weida_incoming_meta_peer_chain_len`, `_peer_chain_cert` (DER, leaf first) | present; `abi::a_binding_that_requires_any_key_exposes_the_fingerprint_and_chain` |
@@ -158,7 +169,9 @@ unit tests in `crates/weida-c/src/`.
 | `IncomingMeta::gap`, `Gap` | `weida_incoming_meta_gap` (both fields) | present; `transfer::tests::a_gap_reads_back_through_its_getter`, `abi::a_skipped_sequence_reads_as_a_gap_under_detect` (*patterns*) |
 | `Gap::missed` | — | refused: a computation over the two values the getter returns |
 | `IncomingMeta::segment`, `layer` | `weida_incoming_meta_segment`, `_layer` | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers` (*patterns*) |
-| `IncomingMeta::report`, `report_mode`, `report_id` | — | absent: *cursors* |
+| `IncomingMeta::report`, `report_mode`, `report_id` | `weida_incoming_meta_report` (wire values), `_report_mode`, `_report_id` | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
+| `CursorLevel` (`Known`, `Application`, `APPLICATION_FLOOR`, `from_wire`, `to_wire`, `application`) | its wire value as `uint64_t`, `WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR` (asserted at compile time) | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end`, `cursor::tests::a_reserved_level_is_refused_and_the_rest_read_back` (*cursors*) |
+| `ReportMode` | `WEIDA_REPORT_MODE_PROGRESS`, `_FINAL_ONLY` (R7) | present; `abi::a_request_that_orders_accepted_receives_the_reported_offsets_in_order`, `abi::final_only_reports_one_record_per_level_at_the_end` (*cursors*) |
 | `Fingerprint` | `sha256:` text everywhere | present |
 | `Error`, `LossCause` | the R9 constants and the thread-local record | present; `error::tests::every_variant_has_its_own_code_below_the_abi_codes`, `abi::a_server_outside_the_pins_is_untrusted` (`weida_last_error_fingerprint`) |
 | `StopReason`, `codes` | — | refused: wire vocabulary, reached through the R9 outcome codes |
@@ -265,10 +278,9 @@ unit tests in `crates/weida-c/src/`.
 | `Received` | `weida_received` (`_kind`, `_take_segment`, `_topic`, `_segment`, `_payload`; `WEIDA_RECEIVED_*`) | present; `abi::a_dish_receives_the_radios_segments_with_their_numbers_and_layers`, `abi::a_radio_datagram_reaches_a_dish_that_carries_datagrams` (*patterns*) |
 
 Datagram flows (`Flow`, `FlowInfo`, `FlowMeta`, `FlowStats`, `IncomingFlow`), the raw `Peer`,
-`Acceptor`, `Incoming`, `Consumer`, `ConsumerId`, `CreditGrant`, the cursor surface (`Cursors`,
-`CursorSet`, `Reporter`, `CursorLevel`, `ReportMode`), and SWARM (`Seeder`, `Swarm`, `Fetch`,
-`Blob`, `BlobId` and the rest behind the `swarm` feature): each absent, in the areas *flows*,
-*raw peers*, *cursors* and *swarm*.
+`Acceptor`, `Incoming`, `Consumer`, `ConsumerId`, `CreditGrant`, and SWARM (`Seeder`, `Swarm`,
+`Fetch`, `Blob`, `BlobId` and the rest behind the `swarm` feature): each absent, in the areas
+*flows*, *raw peers* and *swarm*.
 
 ## 8. Interop evidence
 
@@ -278,7 +290,7 @@ way a foreign caller calls it:
 - `smoke.c`, compiled from `weida.h` under `-std=c11 -Wall -Wextra -Werror`, linked with
   `-lweida`: a QUIC Req/Rep with a generated identity, a pinned trust, streamed bodies, a
   content type and a delivery receipt, every wait a timeout-0 call plus `weida_poll`;
-- the fifty `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
+- the fifty-two `abi::` tests, which call the exports as C does (raw pointers, out-parameters,
   descriptors, threads, a signal);
 - the Python package `crates/py/weida-py`, a cffi caller in ABI mode
   ([weida-py.md](weida-py.md)).
@@ -361,6 +373,18 @@ way a foreign caller calls it:
 - `JoinTerms::max_layer` is an optional value in (R7); 16 to 255 fail the join with
   `-WEIDA_ELIMIT_EXCEEDED`, as in Rust.
 - A segment's calls take its lock in turn, where Rust's `&mut self` forbids concurrent use.
+- A cursor level is its wire value, `uint64_t`, in and out; 6 to 15 are `-WEIDA_EINVAL` (R7),
+  where Rust cannot name them.
+- `TransferMeta::with_report` takes an array of levels (`levels`, `len`); more than 16 distinct
+  fail the send with `-WEIDA_ELIMIT_EXCEEDED`, as in Rust.
+- `OutgoingTransfer::cursors`' and `IncomingTransfer::reporter`'s `None` is a 0 return with
+  `*out == NULL`.
+- `Cursors::changed` is a try (R3a), as `PeerEvents::recv` is; its `None` is a 0 return with
+  `*out == NULL`, and so is every recv after it.
+- A call on a `weida_reporter` while its `report` op runs is `-WEIDA_EINVAL`, where Rust's
+  borrow rules forbid it; `finish` then consumes the handle and the reporter is dropped,
+  unflushed, when the report ends.
+- `Reporter::with_granularity`'s interval is milliseconds (`_set_granularity`, R7).
 
 ## 10. The definition of done
 
@@ -374,9 +398,9 @@ is complete when no present row lacks a test.
 ## 11. Sources
 
 `crates/weida-c/src/` (`error.rs`, `ready.rs`, `try_handle.rs`, `op.rs`, `handle.rs`,
-`config.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`, `transfer.rs`,
-`requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `bus.rs`, `radio.rs`,
-`segment.rs`, `poll.rs`, `stats.rs`),
+`config.rs`, `cursor.rs`, `runtime.rs`, `tls.rs`, `identity.rs`, `listener.rs`, `relay.rs`,
+`transfer.rs`, `requester.rs`, `push.rs`, `pubsub.rs`, `pair.rs`, `survey.rs`, `bus.rs`,
+`radio.rs`, `segment.rs`, `poll.rs`, `stats.rs`),
 `crates/weida-c/include/weida.h`, `crates/weida-c/tests/`, `crates/weida/src/lib.rs` for the
 reference column, [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md), and
 [docs/c/](../c/README.md).

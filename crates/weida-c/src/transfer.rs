@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_rs::{Delivery, Error, IncomingMeta, IncomingTransfer, OutgoingTransfer, PeerIdentity};
 use weida_runtime::Exec;
 
+use crate::cursor::{weida_cursors, weida_reporter};
 use crate::error::{WEIDA_EINVAL, closed, fail, fail_abi, guard, guard_or, guard_ptr, guard_void};
 use crate::handle::{
     CText, borrow, bytes, into_handle, out_ptr, release, share, text_out, write_out,
@@ -31,6 +32,8 @@ pub struct weida_incoming_meta {
     peer_sid: Option<CText>,
     trace: Option<CText>,
     tracestate: Option<CText>,
+    /// The ordered cursor levels' wire values, ascending.
+    report: Box<[u64]>,
 }
 
 impl weida_incoming_meta {
@@ -50,6 +53,7 @@ impl weida_incoming_meta {
             },
             trace: meta.trace.map(|t| CText::new(t.to_traceparent())),
             tracestate: text(&meta.tracestate),
+            report: meta.report.iter().map(|l| l.to_wire()).collect(),
             meta,
         })
     }
@@ -410,6 +414,70 @@ pub unsafe extern "C" fn weida_incoming_meta_layer(
     unsafe { meta_number(m, out, |m| m.layer) }
 }
 
+/// The cursor levels the sender ordered reported (`IncomingMeta::report`),
+/// as ascending wire values, and their count in `*len_out`; NULL when it
+/// ordered none or `m` is NULL, `*len_out` then untouched.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `len_out` is NULL or writable. The array
+/// lives as long as `m`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_report(
+    m: *const weida_incoming_meta,
+    len_out: *mut usize,
+) -> *const u64 {
+    guard_ptr(|| {
+        if m.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: a non-NULL `m` is live metadata by this function's
+        // contract; the array lives as long as the handle.
+        let m = unsafe { &*m };
+        if m.report.is_empty() {
+            return std::ptr::null();
+        }
+        if !len_out.is_null() {
+            // SAFETY: a non-NULL `len_out` is writable by this function's
+            // contract.
+            unsafe { len_out.write(m.report.len()) };
+        }
+        m.report.as_ptr()
+    })
+}
+
+/// How the sender asked the levels reported (`IncomingMeta::report_mode`),
+/// a `WEIDA_REPORT_MODE_*` constant; `WEIDA_REPORT_MODE_PROGRESS` when it
+/// stated none.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_report_mode(m: *const weida_incoming_meta) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let m = unsafe { borrow(m) }?;
+        Ok(crate::cursor::mode_constant(m.meta.report_mode))
+    })
+}
+
+/// The id the receiver's cursor stream names (`IncomingMeta::report_id`): 1
+/// and `*out` when present, which is exactly when levels were ordered, 0
+/// when absent.
+///
+/// # Safety
+///
+/// `m` is NULL or live metadata; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_meta_report_id(
+    m: *const weida_incoming_meta,
+    out: *mut u64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { meta_number(m, out, |m| m.report_id) }
+}
+
 /// The trace context the sender propagated, as its `traceparent` text; NULL
 /// when it sent none or one that did not parse.
 ///
@@ -667,6 +735,37 @@ pub unsafe extern "C" fn weida_incoming_transfer_connection(
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, id) };
         Ok(0)
+    })
+}
+
+/// A reporter for the cursor levels the sender ordered
+/// (`IncomingTransfer::reporter`): 1 and a `weida_reporter`, 0 with NULL
+/// when it ordered none. Each call hands out a new reporter on the same
+/// report, so take one. `-WEIDA_ECLOSED` once the transfer was collected,
+/// so take it before `weida_incoming_transfer_collect`; the reporter
+/// outlives the transfer.
+///
+/// # Safety
+///
+/// `t` is NULL or a live incoming transfer; `out` is NULL or writable.
+/// Release the reporter with `weida_reporter_finish` or
+/// `weida_reporter_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_incoming_transfer_reporter(
+    t: *const weida_incoming_transfer,
+    out: *mut *mut weida_reporter,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let t = unsafe { borrow(t) }?;
+        let (handle, rc) = match t.tried.with(|tr| tr.reporter())? {
+            Some(reporter) => (weida_reporter::handle(reporter, t.exec.clone()), 1),
+            None => (std::ptr::null_mut(), 0),
+        };
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, handle) };
+        Ok(rc)
     })
 }
 
@@ -984,6 +1083,36 @@ pub unsafe extern "C" fn weida_outgoing_transfer_expire_after_ms(
             None => t.tried.with(|_| ())?,
         }
         Ok(0)
+    })
+}
+
+/// The queue of cursor sets the receiver reports for this transfer
+/// (`OutgoingTransfer::cursors`): 1 and a `weida_cursors` the first time,
+/// 0 with NULL after that and when the metadata ordered no levels.
+/// `-WEIDA_ECLOSED` once finished, so take it before
+/// `weida_outgoing_transfer_finish`; the queue outlives the transfer, which
+/// is the point: `Accepted` arrives after the payload's end.
+///
+/// # Safety
+///
+/// `t` is NULL or a live outgoing transfer; `out` is NULL or writable.
+/// Release the queue with `weida_cursors_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_outgoing_transfer_cursors(
+    t: *const weida_outgoing_transfer,
+    out: *mut *mut weida_cursors,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let t = unsafe { borrow(t) }?;
+        let (handle, rc) = match t.tried.with(|t| t.cursors())? {
+            Some(cursors) => (weida_cursors::handle(cursors), 1),
+            None => (std::ptr::null_mut(), 0),
+        };
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, handle) };
+        Ok(rc)
     })
 }
 

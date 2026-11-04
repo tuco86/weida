@@ -141,6 +141,12 @@ here: `weida_pusher`, `weida_puller`, `weida_publisher`, `weida_subscriber`, `we
 `weida_segment`, `weida_segment_terms`, `weida_dish`, `weida_join_terms`, `weida_received`,
 `weida_dish_drops`, `weida_incoming_meta_segment` and `weida_incoming_meta_layer`.
 
+The C ABI's *cursors* area is absent here: `weida_transfer_meta_set_report`,
+`weida_transfer_meta_set_report_mode`, `weida_incoming_meta_report`,
+`weida_incoming_meta_report_mode`, `weida_incoming_meta_report_id`,
+`weida_outgoing_transfer_cursors`, `weida_cursors`, `weida_cursor_set`,
+`weida_incoming_transfer_reporter` and `weida_reporter`.
+
 ## 7. Sources
 
 `crates/py/weida-py/src/weida/` (`__init__.py`, `_native.py`, `_errors.py`, `_wait.py`,

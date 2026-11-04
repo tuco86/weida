@@ -76,6 +76,16 @@
 
 #define WEIDA_FINGERPRINT_LEN 71
 
+#define WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR 16
+
+#define WEIDA_REPORT_MODE_PROGRESS 0
+
+#define WEIDA_REPORT_MODE_FINAL_ONLY 1
+
+#define WEIDA_REPORTER_DEFAULT_BYTES 1048576
+
+#define WEIDA_REPORTER_DEFAULT_INTERVAL_MS 100
+
 #define WEIDA_ERUNTIME 1
 
 #define WEIDA_EINVALID_ADDRESS 2
@@ -212,6 +222,10 @@ typedef struct weida_client_tls weida_client_tls;
 
 typedef struct weida_connection_stats weida_connection_stats;
 
+typedef struct weida_cursor_set weida_cursor_set;
+
+typedef struct weida_cursors weida_cursors;
+
 typedef struct weida_delivery weida_delivery;
 
 typedef struct weida_delivery_delivered_op weida_delivery_delivered_op;
@@ -325,6 +339,12 @@ typedef struct weida_replier weida_replier;
 typedef struct weida_reply_stream weida_reply_stream;
 
 typedef struct weida_reply_stream_recv_op weida_reply_stream_recv_op;
+
+typedef struct weida_reporter weida_reporter;
+
+typedef struct weida_reporter_finish_op weida_reporter_finish_op;
+
+typedef struct weida_reporter_report_op weida_reporter_report_op;
 
 typedef struct weida_requester weida_requester;
 
@@ -565,6 +585,50 @@ int weida_segment_terms_set_max_age_ms(const weida_segment_terms *t, int64_t v);
 int weida_segment_terms_set_priority(const weida_segment_terms *t, int32_t v);
 
 int weida_segment_terms_set_follows_upstream(const weida_segment_terms *t, int v);
+
+int weida_cursors_fd(const weida_cursors *c, int64_t *out);
+
+int weida_cursors_recv(const weida_cursors *c, int64_t timeout_ms, weida_cursor_set **out);
+
+void weida_cursors_drop(weida_cursors *c);
+
+size_t weida_cursor_set_len(const weida_cursor_set *s);
+
+int weida_cursor_set_level(const weida_cursor_set *s,
+                           size_t index,
+                           uint64_t *out_level,
+                           uint64_t *out_offset);
+
+int weida_cursor_set_offset(const weida_cursor_set *s, uint64_t level, uint64_t *out);
+
+void weida_cursor_set_drop(weida_cursor_set *s);
+
+const uint64_t *weida_reporter_levels(const weida_reporter *r, size_t *len_out);
+
+int weida_reporter_mode(const weida_reporter *r);
+
+int weida_reporter_set_granularity(const weida_reporter *r, uint64_t bytes, uint64_t interval_ms);
+
+int weida_reporter_report(const weida_reporter *r,
+                          uint64_t level,
+                          uint64_t offset,
+                          weida_reporter_report_op **out);
+
+int weida_reporter_report_op_fd(const weida_reporter_report_op *op, int64_t *out);
+
+int weida_reporter_report_op_wait(const weida_reporter_report_op *op, int64_t timeout_ms);
+
+void weida_reporter_report_op_drop(weida_reporter_report_op *op);
+
+int weida_reporter_finish(weida_reporter *r, weida_reporter_finish_op **out);
+
+int weida_reporter_finish_op_fd(const weida_reporter_finish_op *op, int64_t *out);
+
+int weida_reporter_finish_op_wait(const weida_reporter_finish_op *op, int64_t timeout_ms);
+
+void weida_reporter_finish_op_drop(weida_reporter_finish_op *op);
+
+void weida_reporter_drop(weida_reporter *r);
 
 const char *weida_strerror(int code);
 
@@ -1704,6 +1768,12 @@ int weida_transfer_meta_set_trace(const weida_transfer_meta *m, const char *trac
 
 int weida_transfer_meta_set_achieved(const weida_transfer_meta *m, int level);
 
+int weida_transfer_meta_set_report(const weida_transfer_meta *m,
+                                   const uint64_t *levels,
+                                   size_t len);
+
+int weida_transfer_meta_set_report_mode(const weida_transfer_meta *m, int mode);
+
 int weida_new_trace(char *out, size_t len);
 
 void weida_transfer_meta_drop(weida_transfer_meta *m);
@@ -1734,6 +1804,12 @@ int weida_incoming_meta_segment(const weida_incoming_meta *m, uint64_t *out);
 
 int weida_incoming_meta_layer(const weida_incoming_meta *m, uint8_t *out);
 
+const uint64_t *weida_incoming_meta_report(const weida_incoming_meta *m, size_t *len_out);
+
+int weida_incoming_meta_report_mode(const weida_incoming_meta *m);
+
+int weida_incoming_meta_report_id(const weida_incoming_meta *m, uint64_t *out);
+
 const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out);
 
 const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out);
@@ -1761,6 +1837,8 @@ void weida_msg_drop(weida_msg *msg);
 int weida_incoming_transfer_meta(const weida_incoming_transfer *t, weida_incoming_meta **out);
 
 int weida_incoming_transfer_connection(const weida_incoming_transfer *t, uint64_t *out);
+
+int weida_incoming_transfer_reporter(const weida_incoming_transfer *t, weida_reporter **out);
 
 int weida_incoming_transfer_fd(const weida_incoming_transfer *t, int64_t *out);
 
@@ -1798,6 +1876,8 @@ const char *weida_outgoing_transfer_trace(const weida_outgoing_transfer *t, size
 int weida_outgoing_transfer_set_priority(const weida_outgoing_transfer *t, int32_t priority);
 
 int weida_outgoing_transfer_expire_after_ms(const weida_outgoing_transfer *t, uint64_t ms);
+
+int weida_outgoing_transfer_cursors(const weida_outgoing_transfer *t, weida_cursors **out);
 
 int weida_outgoing_transfer_finish(weida_outgoing_transfer *t, weida_delivery **out);
 

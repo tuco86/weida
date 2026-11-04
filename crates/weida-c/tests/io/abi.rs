@@ -4659,3 +4659,341 @@ fn a_radio_evicts_a_dish_by_its_key() {
     shutdown(client);
     shutdown(server);
 }
+
+// --- cursors ----------------------------------------------------------------
+
+const ACCEPTED: u64 = WEIDA_ACKNOWLEDGEMENT_ACCEPTED as u64;
+const STORED: u64 = WEIDA_ACKNOWLEDGEMENT_STORED as u64;
+
+/// Metadata that orders `levels` reported in `mode`; the caller drops it.
+fn report_meta(levels: &[u64], mode: c_int) -> *mut weida_transfer_meta {
+    let mut m = ptr::null_mut();
+    // SAFETY: a writable out-parameter, then live metadata and
+    // `levels.len()` readable values.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut m));
+        ok(weida_transfer_meta_set_report(
+            m,
+            levels.as_ptr(),
+            levels.len(),
+        ));
+        ok(weida_transfer_meta_set_report_mode(m, mode));
+    }
+    m
+}
+
+/// Opens an exchange on `r` with `meta`: the request body and the reply
+/// stream, or the code the open failed with.
+fn open_with(
+    r: *mut weida_requester,
+    meta: *const weida_transfer_meta,
+) -> Result<(*mut weida_outgoing_transfer, *mut weida_reply_stream), c_int> {
+    let mut op = ptr::null_mut();
+    let mut body = ptr::null_mut();
+    let mut stream = ptr::null_mut();
+    // SAFETY: live handles, the op dropped once, and writable
+    // out-parameters.
+    let rc = unsafe {
+        ok(weida_requester_open(r, meta, &mut op));
+        let rc = settle("the exchange", |ms| {
+            weida_requester_open_op_wait(op, ms, &mut body, &mut stream)
+        });
+        weida_requester_open_op_drop(op);
+        rc
+    };
+    if rc == 0 { Ok((body, stream)) } else { Err(rc) }
+}
+
+/// The cursor queue of `t`, which hands it out once.
+fn cursors_of(t: *mut weida_outgoing_transfer) -> *mut weida_cursors {
+    let mut c = ptr::null_mut();
+    let mut again = ptr::null_mut();
+    // SAFETY: a live transfer and writable out-parameters.
+    unsafe {
+        assert_eq!(weida_outgoing_transfer_cursors(t, &mut c), 1);
+        assert_eq!(weida_outgoing_transfer_cursors(t, &mut again), 0);
+    }
+    assert!(!c.is_null());
+    assert!(again.is_null(), "the queue is handed out once");
+    c
+}
+
+fn reporter_of(t: *mut weida_incoming_transfer) -> *mut weida_reporter {
+    let mut r = ptr::null_mut();
+    // SAFETY: a live transfer and a writable out-parameter.
+    assert_eq!(unsafe { weida_incoming_transfer_reporter(t, &mut r) }, 1);
+    r
+}
+
+/// The next cursor set of `c`, NULL at the end.
+fn next_set(c: *mut weida_cursors) -> *mut weida_cursor_set {
+    let mut s = ptr::null_mut();
+    // SAFETY: a live queue and a writable out-parameter.
+    ok(settle("a cursor set", |ms| unsafe {
+        weida_cursors_recv(c, ms, &mut s)
+    }));
+    s
+}
+
+/// Every `(level, offset)` of `s` in index order; drops `s`.
+fn entries(s: *mut weida_cursor_set) -> Vec<(u64, u64)> {
+    // SAFETY: a live set, dropped once, and writable out-parameters.
+    unsafe {
+        let out = (0..weida_cursor_set_len(s))
+            .map(|i| {
+                let (mut level, mut offset) = (0, 0);
+                assert_eq!(weida_cursor_set_level(s, i, &mut level, &mut offset), 1);
+                (level, offset)
+            })
+            .collect();
+        weida_cursor_set_drop(s);
+        out
+    }
+}
+
+fn report(r: *mut weida_reporter, level: u64, offset: u64) -> c_int {
+    run_op(
+        "the report",
+        // SAFETY: a live reporter and a writable out-parameter.
+        |op| unsafe { weida_reporter_report(r, level, offset, op) },
+        weida_reporter_report_op_wait,
+        weida_reporter_report_op_drop,
+    )
+}
+
+/// Finishes `r`, consuming it.
+fn finish_reporter(r: *mut weida_reporter) -> c_int {
+    run_op(
+        "the flush",
+        // SAFETY: a live reporter, consumed, and a writable out-parameter.
+        |op| unsafe { weida_reporter_finish(r, op) },
+        weida_reporter_finish_op_wait,
+        weida_reporter_finish_op_drop,
+    )
+}
+
+/// A level array a getter handed out; empty for NULL.
+fn levels_of(p: *const u64, len: usize) -> Vec<u64> {
+    if p.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: a getter's non-NULL result points to `len` values.
+    unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
+}
+
+/// The report order the replier sees on `q`: levels and mode.
+fn ordered(q: *mut weida_incoming_request) -> (Vec<u64>, c_int, c_int) {
+    let mut meta = ptr::null_mut();
+    let mut len = usize::MAX;
+    let mut id = u64::MAX;
+    // SAFETY: a live request, the metadata dropped once, and writable
+    // out-parameters.
+    unsafe {
+        ok(weida_incoming_request_meta(q, &mut meta));
+        let levels = levels_of(weida_incoming_meta_report(meta, &mut len), len);
+        let mode = weida_incoming_meta_report_mode(meta);
+        let has_id = weida_incoming_meta_report_id(meta, &mut id);
+        weida_incoming_meta_drop(meta);
+        (levels, mode, has_id)
+    }
+}
+
+fn finish_body(t: *mut weida_outgoing_transfer) {
+    let mut delivery = ptr::null_mut();
+    // SAFETY: a live transfer, consumed, and the receipt dropped once.
+    unsafe {
+        ok(weida_outgoing_transfer_finish(t, &mut delivery));
+        weida_delivery_drop(delivery);
+    }
+}
+
+#[test]
+fn a_request_that_orders_accepted_receives_the_reported_offsets_in_order() {
+    let pair = Pair::new("abi-cursors-progress");
+    let mut m = ptr::null_mut();
+    let reserved = [7u64];
+    let twice = [ACCEPTED, ACCEPTED];
+    // SAFETY: a writable out-parameter, live metadata and readable arrays.
+    unsafe {
+        ok(weida_transfer_meta_new(&mut m));
+        assert_eq!(
+            weida_transfer_meta_set_report(m, reserved.as_ptr(), 1),
+            -WEIDA_EINVAL
+        );
+        assert_eq!(
+            weida_transfer_meta_set_report(m, ptr::null(), 1),
+            -WEIDA_EINVAL
+        );
+        assert_eq!(weida_transfer_meta_set_report_mode(m, 2), -WEIDA_EINVAL);
+        ok(weida_transfer_meta_set_report(m, twice.as_ptr(), 2));
+        ok(weida_transfer_meta_set_report_mode(
+            m,
+            WEIDA_REPORT_MODE_PROGRESS,
+        ));
+    }
+    let (body, stream) = open_with(pair.req, m).expect("the exchange");
+    // SAFETY: dropped once.
+    unsafe { weida_transfer_meta_drop(m) };
+    let c = cursors_of(body);
+    let mut s = ptr::null_mut();
+    // SAFETY: a live queue and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_cursors_recv(c, 0, &mut s) },
+        -WEIDA_EAGAIN,
+        "nothing reported yet"
+    );
+    write_all(body, b"aaaabbbbcccc");
+    finish_body(body);
+
+    let q = accept(pair.rep);
+    assert_eq!(ordered(q), (vec![ACCEPTED], WEIDA_REPORT_MODE_PROGRESS, 1));
+    let t = take_body(q);
+    let rep = reporter_of(t);
+    let mut len = usize::MAX;
+    // SAFETY: a live reporter and a writable length.
+    unsafe {
+        let levels = weida_reporter_levels(rep, &mut len);
+        assert_eq!(levels_of(levels, len), [ACCEPTED]);
+        assert_eq!(weida_reporter_mode(rep), WEIDA_REPORT_MODE_PROGRESS);
+        ok(weida_reporter_set_granularity(rep, 0, 0));
+    }
+    assert_eq!(read_all(t, 64).expect("the body"), b"aaaabbbbcccc");
+    let mut op = ptr::null_mut();
+    // SAFETY: a live reporter and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_reporter_report(rep, 7, 1, &mut op) },
+        -WEIDA_EINVAL
+    );
+    assert_eq!(report(rep, STORED, 12), 0, "a level not ordered is ignored");
+
+    for offset in [4, 8] {
+        assert_eq!(report(rep, ACCEPTED, offset), 0);
+        assert_eq!(entries(next_set(c)), [(ACCEPTED, offset)]);
+    }
+    assert_eq!(report(rep, ACCEPTED, 12), 0);
+    assert_eq!(finish_reporter(rep), 0);
+    let s = next_set(c);
+    let mut offset = 0;
+    let (mut level, mut at) = (u64::MAX, u64::MAX);
+    // SAFETY: a live set and writable out-parameters.
+    unsafe {
+        assert_eq!(weida_cursor_set_offset(s, ACCEPTED, &mut offset), 1);
+        assert_eq!(weida_cursor_set_offset(s, STORED, &mut offset), 0);
+        assert_eq!(weida_cursor_set_offset(s, 7, &mut offset), -WEIDA_EINVAL);
+        assert_eq!(weida_cursor_set_level(s, 1, &mut level, &mut at), 0);
+    }
+    assert_eq!(offset, 12);
+    assert_eq!(entries(s), [(ACCEPTED, 12)]);
+    assert!(next_set(c).is_null(), "the reporter finished");
+    assert!(next_set(c).is_null(), "and the end stays the end");
+
+    let answer = reply(q, None);
+    let mut none = ptr::null_mut();
+    // SAFETY: a live transfer and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_outgoing_transfer_cursors(answer, &mut none) },
+        0
+    );
+    assert!(none.is_null(), "the reply ordered nothing");
+    write_all(answer, b"ok");
+    finish_body(answer);
+    let mut recv = ptr::null_mut();
+    let mut incoming = ptr::null_mut();
+    let mut no_reporter = ptr::null_mut();
+    // SAFETY: live handles, each dropped once, and writable out-parameters.
+    unsafe {
+        ok(weida_reply_stream_recv(stream, &mut recv));
+        ok(settle("the reply", |ms| {
+            weida_reply_stream_recv_op_wait(recv, ms, &mut incoming)
+        }));
+        weida_reply_stream_recv_op_drop(recv);
+        assert_eq!(
+            weida_incoming_transfer_reporter(incoming, &mut no_reporter),
+            0
+        );
+    }
+    assert!(no_reporter.is_null());
+    assert_eq!(read_all(incoming, 64).expect("the reply"), b"ok");
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_cursors_drop(c);
+        weida_incoming_transfer_drop(t);
+        weida_incoming_transfer_drop(incoming);
+        weida_reply_stream_drop(stream);
+    }
+    pair.close();
+}
+
+#[test]
+fn final_only_reports_one_record_per_level_at_the_end() {
+    let pair = Pair::new("abi-cursors-final-only");
+    let too_many = report_meta(&(16..=32).collect::<Vec<u64>>(), WEIDA_REPORT_MODE_PROGRESS);
+    assert_eq!(
+        open_with(pair.req, too_many).err(),
+        Some(-WEIDA_ELIMIT_EXCEEDED)
+    );
+    let stage = WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR as u64 + 1;
+    let m = report_meta(&[stage, ACCEPTED], WEIDA_REPORT_MODE_FINAL_ONLY);
+    let (body, stream) = open_with(pair.req, m).expect("the exchange");
+    // SAFETY: each metadata is dropped once.
+    unsafe {
+        weida_transfer_meta_drop(too_many);
+        weida_transfer_meta_drop(m);
+    }
+    let c = cursors_of(body);
+    write_all(body, b"0123456789");
+    finish_body(body);
+
+    let q = accept(pair.rep);
+    assert_eq!(
+        ordered(q),
+        (vec![ACCEPTED, stage], WEIDA_REPORT_MODE_FINAL_ONLY, 1)
+    );
+    let t = take_body(q);
+    let rep = reporter_of(t);
+    let mut len = usize::MAX;
+    // SAFETY: a live reporter and a writable length.
+    unsafe {
+        let levels = weida_reporter_levels(rep, &mut len);
+        assert_eq!(levels_of(levels, len), [ACCEPTED, stage]);
+        assert_eq!(weida_reporter_mode(rep), WEIDA_REPORT_MODE_FINAL_ONLY);
+    }
+    assert_eq!(read_all(t, 64).expect("the body"), b"0123456789");
+    for offset in [5, 10] {
+        for level in [ACCEPTED, stage] {
+            assert_eq!(report(rep, level, offset), 0);
+        }
+    }
+    let mut s = ptr::null_mut();
+    // SAFETY: a live queue and a writable out-parameter.
+    assert_eq!(
+        unsafe { weida_cursors_recv(c, 200, &mut s) },
+        -WEIDA_EAGAIN,
+        "final-only writes nothing before finish"
+    );
+
+    assert_eq!(finish_reporter(rep), 0);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut last = Vec::new();
+    loop {
+        let s = next_set(c);
+        if s.is_null() {
+            break;
+        }
+        last = entries(s);
+        seen.extend(last.iter().copied());
+    }
+    assert_eq!(
+        seen,
+        std::collections::BTreeSet::from([(ACCEPTED, 10), (stage, 10)])
+    );
+    assert_eq!(last, [(ACCEPTED, 10), (stage, 10)]);
+    // SAFETY: every handle is dropped once.
+    unsafe {
+        weida_reply_stream_drop(stream);
+        weida_incoming_request_drop(q);
+        weida_incoming_transfer_drop(t);
+        weida_cursors_drop(c);
+    }
+    pair.close();
+}

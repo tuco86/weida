@@ -26,11 +26,13 @@ request or transfer it came from. None of these functions blocks.
 | `const char *weida_incoming_meta_trace(const weida_incoming_meta *m, size_t *len_out)` | the sender's trace context as `traceparent` text; NULL when it sent none or one that did not parse |
 | `const char *weida_incoming_meta_tracestate(const weida_incoming_meta *m, size_t *len_out)` | the opaque `tracestate`; NULL when absent |
 | `int weida_incoming_meta_achieved(const weida_incoming_meta *m, int *out)` | 1 and the `WEIDA_ACKNOWLEDGEMENT_*` level in `*out` when the sender claimed one, else 0 |
+| `const uint64_t *weida_incoming_meta_report(const weida_incoming_meta *m, size_t *len_out)` | the cursor levels the sender ordered reported, ascending wire values, their count through `len_out` (NULL allowed), valid until `m` is dropped; NULL when nothing was ordered ([cursor.md](cursor.md)) |
+| `int weida_incoming_meta_report_mode(const weida_incoming_meta *m)` | the `WEIDA_REPORT_MODE_*` the sender asked for; `WEIDA_REPORT_MODE_PROGRESS` when it stated none |
+| `int weida_incoming_meta_report_id(const weida_incoming_meta *m, uint64_t *out)` | 1 and the report id, present exactly when levels were ordered, else 0 |
 | `void weida_incoming_meta_drop(weida_incoming_meta *m)` | — |
 
 Strings follow R7: NUL-terminated, the exact length through `len_out` (NULL allowed), valid
-until `m` is dropped. The other fields of `IncomingMeta` (`report`, `report_mode`,
-`report_id`) are not mapped yet ([libraries/weida-c.md](../libraries/weida-c.md)).
+until `m` is dropped.
 
 ## `weida_msg`
 

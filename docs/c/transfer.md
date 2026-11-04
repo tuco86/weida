@@ -12,6 +12,7 @@ can also return `-WEIDA_EINVAL` and `-WEIDA_EPANIC`.
 | --- | --- | --- |
 | `int weida_incoming_transfer_meta(const weida_incoming_transfer *t, weida_incoming_meta **out)` | never | 0 and a new metadata reference ([msg.md](msg.md)) |
 | `int weida_incoming_transfer_connection(const weida_incoming_transfer *t, uint64_t *out)` | never | 0 and the number of its connection, as `weida_incoming_request_connection`; `-WEIDA_ECLOSED` once collected |
+| `int weida_incoming_transfer_reporter(const weida_incoming_transfer *t, weida_reporter **out)` | never | 1 and a new reporter for the levels the sender ordered on every call, so take one; 0 with NULL when it ordered none; `-WEIDA_ECLOSED` once collected, so take it before collecting; the reporter outlives the transfer ([cursor.md](cursor.md)) |
 | `int weida_incoming_transfer_fd(const weida_incoming_transfer *t, int64_t *out)` | never | 0; `-WEIDA_EIO` |
 | `int weida_incoming_transfer_read(const weida_incoming_transfer *t, uint8_t *buf, size_t cap, int64_t timeout_ms, size_t *out_n)` | up to `timeout_ms` | 0 and `*out_n > 0` bytes, or `*out_n == 0` at the end of the payload; `-WEIDA_ECANCELED` (the sender canceled), `-WEIDA_EREJECTED`, `-WEIDA_ECONNECTION_LOST`, `-WEIDA_ETRANSPORT`; `-WEIDA_EINVAL` for `cap == 0`; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
 | `int weida_incoming_transfer_collect(weida_incoming_transfer *t, uint64_t max_bytes, weida_incoming_transfer_collect_op **out)` | never; **consumes** `t` | 0; `-WEIDA_ECLOSED` |
@@ -34,6 +35,7 @@ and the whole payload ([msg.md](msg.md)), `-WEIDA_ELIMIT_EXCEEDED` when it excee
 | `const char *weida_outgoing_transfer_trace(const weida_outgoing_transfer *t, size_t *len_out)` | never | the trace context propagated with the transfer, as `traceparent` text; NULL when none. A reply inherits its request's |
 | `int weida_outgoing_transfer_set_priority(const weida_outgoing_transfer *t, int32_t priority)` | never | 0; `-WEIDA_ECLOSED`, `-WEIDA_EINVAL`. Higher is sent first among the streams of one connection, the default is 0; a no-op on local transports |
 | `int weida_outgoing_transfer_expire_after_ms(const weida_outgoing_transfer *t, uint64_t ms)` | never | 0; `-WEIDA_ECLOSED`, `-WEIDA_EINVAL`. Resets the transfer with `CANCELED` unless its bytes are all acknowledged within `ms` of the call (`OutgoingTransfer::expire_at`) |
+| `int weida_outgoing_transfer_cursors(const weida_outgoing_transfer *t, weida_cursors **out)` | never | 1 and the queue of cursor sets the receiver reports, the first time; 0 with NULL after that and when the metadata ordered nothing; `-WEIDA_ECLOSED` once finished, so take it before finishing; the queue outlives the transfer ([cursor.md](cursor.md)) |
 | `int weida_outgoing_transfer_finish(weida_outgoing_transfer *t, weida_delivery **out)` | never; **consumes** `t` | 0 and the receipt; `-WEIDA_EEXPIRED` is its only weida failure |
 | `void weida_outgoing_transfer_drop(weida_outgoing_transfer *t)` | never | — |
 

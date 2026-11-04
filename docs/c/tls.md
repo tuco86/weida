@@ -95,6 +95,8 @@ What an outgoing transfer carries in its header. Where a function takes
 | `int weida_transfer_meta_set_topic(const weida_transfer_meta *m, const char *topic)` | 0; `-WEIDA_EINVAL`. A topic over 256 bytes fails the send with `-WEIDA_ELIMIT_EXCEEDED` |
 | `int weida_transfer_meta_set_trace(const weida_transfer_meta *m, const char *traceparent)` | 0; `-WEIDA_EINVAL`, also for text that is not a W3C version-00 `traceparent` |
 | `int weida_transfer_meta_set_achieved(const weida_transfer_meta *m, int level)` | 0; `-WEIDA_EINVAL`, also for a value not `WEIDA_ACKNOWLEDGEMENT_*` ([runtime.md](runtime.md#constants)) |
+| `int weida_transfer_meta_set_report(const weida_transfer_meta *m, const uint64_t *levels, size_t len)` | 0; `-WEIDA_EINVAL`, also for a level from 6 to 15, the metadata unchanged. Orders the cursor levels reported, `len` wire values, sorted and deduplicated; `len == 0` orders nothing; more than 16 distinct fail the send with `-WEIDA_ELIMIT_EXCEEDED` ([cursor.md](cursor.md)) |
+| `int weida_transfer_meta_set_report_mode(const weida_transfer_meta *m, int mode)` | 0; `-WEIDA_EINVAL`, also for a value not `WEIDA_REPORT_MODE_*` ([cursor.md](cursor.md)) |
 | `void weida_transfer_meta_drop(weida_transfer_meta *m)` | — |
 
 `int weida_new_trace(char *out, size_t len)` (`weida::new_trace`) writes a fresh root trace
