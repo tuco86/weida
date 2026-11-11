@@ -38,6 +38,19 @@ of that platform's check job, its test command switched to the integration
 tier and filtered to the tests in question (skill://zeughaus-ci, section 4);
 the next scheduled nightly covers the rest.
 
+One exception: the CI's nightly-repair rerun ticket (source
+`nightly.<n>.rerun`, title `Nightly #<n> of weida: run it again`) queues
+exactly one nightly with `ci_run` `{event: "nightly"}`, because the repair
+round is the CI's own retry. Nothing else in a repair round queues one: its
+fix tickets (source `nightly.<n>`) reproduce and verify through `run_jobs`,
+and the rerun ticket never uses `ci_rerun`. A nightly queued this way skips
+the `fuzz` round (`.zeughaus-ci/fuzz.sh`: only the scheduled nightly fuzzes),
+so its green says nothing about a `fuzz` failure. A `fuzz` fix is verified by
+the crash input as a deterministic case in the crate's `tests/fuzz_smoke.rs`
+([docs/SECURITY.md](docs/SECURITY.md), section 3), by `run_jobs` of `fuzz`
+(a few seconds per target: they build and start), and by the next scheduled
+nightly, which fuzzes from the stored corpus again.
+
 ## Version cycle
 
 The tree carries `0.1.0-alpha.N` only in the release commit and its tag. Every
