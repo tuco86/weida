@@ -1569,6 +1569,9 @@ async fn run_pipe(
         }
     };
 
+    // What the session hands over stays readable here: whether the peer sent
+    // anything is what tells a pipe from a refusal when both ended at once.
+    let arrived = pipe.clone();
     let (done, mut signal) = oneshot::channel();
     let connection = Connection {
         stream,
@@ -1587,28 +1590,44 @@ async fn run_pipe(
     let deadline = engine
         .exec()
         .sleep(options.handshake_timeout.saturating_sub(started.elapsed()));
-    // The session first: when it has ended, whether it handshook first is
-    // what decides, and its own error says more than a dropped gate does.
+    // The session first: when it has ended, whether it handshook first and
+    // then sent something is what decides, and its own error says more than
+    // a dropped gate does.
     let (peer, ended) = {
         tokio::pin!(deadline);
         tokio::select! {
             biased;
-            ended = &mut session => match signal.try_recv() {
-                // A session can read the header, a message and the close
-                // in one poll, when all three were buffered by the time it
-                // first ran. That peer handshook: it is a pipe, and what it
-                // sent is delivered when the pipe is retired below.
-                Ok(peer) => (peer, Some(ended)),
-                Err(_) => {
-                    engine.retire(id);
-                    return match ended {
-                        Ok(()) => Err(Error::ECONNRESET(
-                            "the peer closed before its protocol header arrived".into(),
-                        )),
-                        Err(error) => Err(error),
-                    };
+            ended = &mut session => {
+                let handshook = signal.try_recv().ok();
+                match handshook {
+                    // A session can read the header, a message and the close
+                    // in one poll, when all three were buffered by the time
+                    // it first ran. That peer handshook and was talking: it
+                    // is a pipe, and what it sent is delivered when the pipe
+                    // is retired below.
+                    Some(peer) if !arrived.incoming().is_empty() => (peer, Some(ended)),
+                    // A header and a close with nothing between them is what
+                    // a listener's add-pre refusal looks like from here: SP
+                    // sends the header before the hook runs and carries no
+                    // reason (§6), so the close is the whole answer. Taking
+                    // it for a pipe would report a refused dial as a success
+                    // and redial it for ever.
+                    _ => {
+                        engine.retire(id);
+                        return match ended {
+                            Ok(()) if handshook.is_some() => Err(Error::ECONNRESET(
+                                "the peer closed right after its protocol header, \
+                                 which is how a refusal looks"
+                                    .into(),
+                            )),
+                            Ok(()) => Err(Error::ECONNRESET(
+                                "the peer closed before its protocol header arrived".into(),
+                            )),
+                            Err(error) => Err(error),
+                        };
+                    }
                 }
-            },
+            }
             handshook = &mut signal => match handshook {
                 Ok(peer) => (peer, None),
                 Err(_) => {
@@ -2210,6 +2229,66 @@ mod tests {
         );
         let (_, message) = engine.take_arrived().expect("the message is delivered");
         assert_eq!(message.body(), b"last words");
+    }
+
+    /// A session that reports the peer's header and ends in the same poll,
+    /// with nothing in between: what the engine sees of a listener that sent
+    /// its header and then refused the pipe at its add-pre hook.
+    struct HeaderClose;
+
+    impl Session for HeaderClose {
+        fn start(&self, connection: Connection) -> SessionFuture {
+            Box::pin(async move {
+                let Connection { mut handshake, .. } = connection;
+                handshake.complete(EndpointType::Rep);
+                Ok(())
+            })
+        }
+    }
+
+    /// Claim: a peer whose header and close arrive together, with nothing
+    /// sent between them, was never a pipe: no event fires and the
+    /// connection is reported as reset. That is a refusal at the peer's
+    /// add-pre hook, and a synchronous dial must fail on it rather than
+    /// succeed and redial a peer that will refuse it again (nightly #421).
+    #[tokio::test]
+    async fn a_peer_that_handshakes_and_closes_at_once_was_no_pipe() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let engine = Engine::new(
+            &ctx,
+            EndpointType::Req,
+            SocketOptions::default(),
+            Arc::new(HeaderClose),
+        )
+        .expect("engine");
+        let events: Arc<Mutex<Vec<PipeEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        engine.notify(Arc::new(move |event, _: &PipeInfo| {
+            recorded.lock().unwrap().push(event);
+            Admission::Accept
+        }));
+
+        let (ours, _theirs) = tokio::io::duplex(64);
+        let outcome = run_pipe(
+            &TaskCtx {
+                engine: engine.clone(),
+                endpoint_options: EndpointOptions::default(),
+            },
+            Raw::Ready(Stream::inproc(ours)),
+            Role::Listen,
+            &Endpoint::parse("inproc://refused").unwrap(),
+            None,
+            None,
+            &mut None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Err(Error::ECONNRESET(_))),
+            "the connection was refused: {outcome:?}"
+        );
+        assert!(events.lock().unwrap().is_empty(), "no pipe, no events");
+        assert!(engine.pipe_infos().is_empty(), "and no slot is left behind");
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the
