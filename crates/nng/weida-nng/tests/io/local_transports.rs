@@ -114,17 +114,39 @@ async fn an_allow_list_at_the_hook_refuses_an_ipc_peer() {
     }));
     rep.listen(&url).await.expect("listen");
 
-    let req = ReqSocket::with_options(&ctx, options()).expect("req");
-    let refused = req.dial(&url).await.unwrap_err();
-    assert!(
-        matches!(
-            refused,
-            Error::ECONNRESET(_) | Error::ECONNABORTED(_) | Error::ETIMEDOUT(_)
-        ),
-        "{refused:?}"
-    );
+    // One connection only: once a pipe has existed the dialler redials
+    // whenever it closes (§1), and every redial is refused again.
+    let req = ReqSocket::with_options(
+        &ctx,
+        SocketOptions {
+            reconnect_min: Duration::from_secs(3600),
+            ..options()
+        },
+    )
+    .expect("req");
+    // The listener sends its header before it has read ours (§3), so the
+    // dialler has handshaken by the time the refusal reaches it: what it
+    // observes is a pipe that existed and then closed. Only if the close
+    // overtakes that does the dial itself fail, as a close.
+    let dialled = req.dial(&url).await;
+    weida_testkit::until(
+        "the refusal being counted and the dialler's pipe gone",
+        Duration::from_secs(2),
+        || refusals.load(Ordering::SeqCst) >= 1 && req.pipe_count() == 0,
+    )
+    .await;
+    if let Err(error) = dialled {
+        assert!(
+            matches!(
+                error,
+                Error::ECONNRESET(_) | Error::ECONNABORTED(_) | Error::ETIMEDOUT(_)
+            ),
+            "{error:?}"
+        );
+    }
     assert_eq!(refusals.load(Ordering::SeqCst), 1);
-    assert_eq!(rep.pipe_count(), 0);
+    assert_eq!(rep.pipe_count(), 0, "the listener admitted nothing");
+    assert_eq!(req.pipe_count(), 0, "and the dialler's pipe is gone");
 }
 /// Claim: the socket file is removed when the listener goes, so the next
 /// bind of the same path is not a stale-node race.
