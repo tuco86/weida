@@ -3,6 +3,10 @@
 //! Properties: decoding never panics; an accepted head stays inside the caps
 //! and re-encodes to octets that decode to the same method, target and fields;
 //! its framing decision never panics.
+//!
+//! The re-encoding is the canonical form (CRLF line endings, `name: value`)
+//! and may be longer than the input it came from, so it is decoded under a
+//! cap of its own length.
 
 #![no_main]
 
@@ -28,7 +32,11 @@ fuzz_target!(|data: &[u8]| {
     let mut out = Vec::new();
     h1::encode_request_head(head.method, head.target, &pairs, &mut out)
         .expect("an accepted head re-encodes");
-    let (again, _) = h1::decode_request(&out, LIMITS).expect("the re-encoding decodes");
+    let limits = Limits {
+        max_head_bytes: out.len(),
+        ..LIMITS
+    };
+    let (again, _) = h1::decode_request(&out, limits).expect("the re-encoding decodes");
     assert_eq!(again.method, head.method);
     assert_eq!(again.target, head.target);
     assert_eq!(again.fields, head.fields);

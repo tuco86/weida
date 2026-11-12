@@ -20,7 +20,7 @@
 //! the decoder fails rather than passing vacuously.
 
 use weida_http_codec::fields::Field;
-use weida_http_codec::h1::{self, Chunk, ChunkedDecoder};
+use weida_http_codec::h1::{self, Chunk, ChunkedDecoder, RequestHead, ResponseHead};
 use weida_http_codec::h2::{self, Frame};
 use weida_http_codec::h3::{self, frame};
 use weida_http_codec::hpack;
@@ -173,6 +173,45 @@ fn run_chunked(input: &[u8]) -> Result<(Vec<u8>, usize, usize), DecodeError> {
     }
 }
 
+/// Re-encodes an accepted request head and decodes it again. The re-encoding
+/// is the canonical form (CRLF line endings, `name: value`, `HTTP/1.1`) and
+/// may be longer than the input it came from, so it is decoded under a cap
+/// of its own length.
+fn roundtrip_request(head: &RequestHead<'_>) {
+    let mut out = Vec::new();
+    h1::encode_request_head(head.method, head.target, &pairs(&head.fields), &mut out)
+        .expect("an accepted head re-encodes");
+    let limits = Limits {
+        max_head_bytes: out.len(),
+        ..LIMITS
+    };
+    let (again, again_used) = h1::decode_request(&out, limits).expect("the re-encoding decodes");
+    assert_eq!(again_used, out.len());
+    assert_eq!(
+        (again.method, again.target, &again.fields),
+        (head.method, head.target, &head.fields)
+    );
+}
+
+/// As [`roundtrip_request`] for a response head.
+fn roundtrip_response(head: &ResponseHead<'_>) {
+    let mut out = Vec::new();
+    h1::encode_response_head(
+        head.minor,
+        head.status,
+        head.reason,
+        &pairs(&head.fields),
+        &mut out,
+    )
+    .expect("an accepted head re-encodes");
+    let limits = Limits {
+        max_head_bytes: out.len(),
+        ..LIMITS
+    };
+    let (again, _) = h1::decode_response(&out, limits).expect("the re-encoding decodes");
+    assert_eq!(&again, head);
+}
+
 #[test]
 fn fuzz_smoke_h1_request() {
     let mut rng = Rng::new(0x5eed_0001);
@@ -186,16 +225,7 @@ fn fuzz_smoke_h1_request() {
         accepted += 1;
         assert!(used <= input.len() && used <= LIMITS.max_head_bytes);
         assert!(head.fields.len() <= LIMITS.max_fields);
-        let mut out = Vec::new();
-        h1::encode_request_head(head.method, head.target, &pairs(&head.fields), &mut out)
-            .expect("an accepted head re-encodes");
-        let (again, again_used) =
-            h1::decode_request(&out, LIMITS).expect("the re-encoding decodes");
-        assert_eq!(again_used, out.len());
-        assert_eq!(
-            (again.method, again.target, again.fields),
-            (head.method, head.target, head.fields)
-        );
+        roundtrip_request(&head);
     }
     assert!(accepted > ITERATIONS / 5, "only {accepted} accepted");
 }
@@ -212,20 +242,40 @@ fn fuzz_smoke_h1_response() {
         };
         accepted += 1;
         assert!(used <= input.len());
-        let mut out = Vec::new();
-        h1::encode_response_head(
-            head.minor,
-            head.status,
-            head.reason,
-            &pairs(&head.fields),
-            &mut out,
-        )
-        .expect("an accepted head re-encodes");
-        let (again, _) = h1::decode_response(&out, LIMITS).expect("the re-encoding decodes");
-        assert_eq!(again, head);
+        roundtrip_response(&head);
         let _ = h1::response_framing(b"GET", head.status, &head.fields);
     }
     assert!(accepted > ITERATIONS / 5, "only {accepted} accepted");
+}
+
+/// A head of exactly [`LIMITS`]`.max_head_bytes` octets with the most fields
+/// allowed, in bare-LF lines and `name:value` form.
+fn head_at_cap(first_line: &[u8]) -> Vec<u8> {
+    let mut input = first_line.to_vec();
+    input.push(b'\n');
+    for _ in 1..LIMITS.max_fields {
+        input.extend_from_slice(b"b:1\n");
+    }
+    input.extend_from_slice(b"a:");
+    input.resize(LIMITS.max_head_bytes - 2, b'x');
+    input.extend_from_slice(b"\n\n");
+    input
+}
+
+/// Nightly #417's `h1_response` crash, reduced: a head accepted at the cap
+/// re-encodes longer than the cap (each bare LF becomes CRLF, each
+/// `name:value` becomes `name: value`), and the round trip still holds.
+#[test]
+fn fuzz_smoke_h1_canonical_form_outgrows_the_cap() {
+    let input = head_at_cap(b"HTTP/1.0 100");
+    let (head, used) = h1::decode_response(&input, LIMITS).expect("accepted at the cap");
+    assert_eq!(used, LIMITS.max_head_bytes);
+    roundtrip_response(&head);
+
+    let input = head_at_cap(b"GET / HTTP/1.0");
+    let (head, used) = h1::decode_request(&input, LIMITS).expect("accepted at the cap");
+    assert_eq!(used, LIMITS.max_head_bytes);
+    roundtrip_request(&head);
 }
 
 #[test]
