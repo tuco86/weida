@@ -1012,8 +1012,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Removes a pipe and fires `REM_POST`, whether it was ever admitted or
-    /// not.
+    /// Removes a pipe, and fires `REM_POST` if it was ever admitted.
     fn retire(&self, id: PipeId) {
         let entry = {
             let mut state = self.lock();
@@ -1570,7 +1569,7 @@ async fn run_pipe(
         }
     };
 
-    let (done, signal) = oneshot::channel();
+    let (done, mut signal) = oneshot::channel();
     let connection = Connection {
         stream,
         pipe,
@@ -1588,20 +1587,30 @@ async fn run_pipe(
     let deadline = engine
         .exec()
         .sleep(options.handshake_timeout.saturating_sub(started.elapsed()));
-    let peer = {
+    // The session first: when it has ended, whether it handshook first is
+    // what decides, and its own error says more than a dropped gate does.
+    let (peer, ended) = {
         tokio::pin!(deadline);
         tokio::select! {
-            ended = &mut session => {
-                engine.retire(id);
-                return match ended {
-                    Ok(()) => Err(Error::ECONNRESET(
-                        "the peer closed before its protocol header arrived".into(),
-                    )),
-                    Err(error) => Err(error),
-                };
-            }
-            handshook = signal => match handshook {
-                Ok(peer) => peer,
+            biased;
+            ended = &mut session => match signal.try_recv() {
+                // A session can read the header, a message and the close
+                // in one poll, when all three were buffered by the time it
+                // first ran. That peer handshook: it is a pipe, and what it
+                // sent is delivered when the pipe is retired below.
+                Ok(peer) => (peer, Some(ended)),
+                Err(_) => {
+                    engine.retire(id);
+                    return match ended {
+                        Ok(()) => Err(Error::ECONNRESET(
+                            "the peer closed before its protocol header arrived".into(),
+                        )),
+                        Err(error) => Err(error),
+                    };
+                }
+            },
+            handshook = &mut signal => match handshook {
+                Ok(peer) => (peer, None),
                 Err(_) => {
                     engine.retire(id);
                     return Err(Error::EPROTO(
@@ -1626,7 +1635,10 @@ async fn run_pipe(
         let _ = tx.send(Ok(()));
     }
 
-    let outcome = session.await;
+    let outcome = match ended {
+        Some(outcome) => outcome,
+        None => session.await,
+    };
     engine.retire(id);
     match outcome {
         Ok(()) => Ok(()),
@@ -2127,6 +2139,77 @@ mod tests {
         )
         .await;
         assert_eq!(calls, 51, "fifty failures and then the call that waits");
+    }
+
+    /// A session that lives its whole life in one poll: it reports the peer's
+    /// header, hands over one message as though it had read it, and ends. That
+    /// is what the engine sees of a peer whose header, message and close were
+    /// all buffered by the time its session first ran.
+    struct HeaderMessageClose;
+
+    impl Session for HeaderMessageClose {
+        fn start(&self, connection: Connection) -> SessionFuture {
+            Box::pin(async move {
+                let Connection {
+                    pipe,
+                    mut handshake,
+                    ..
+                } = connection;
+                handshake.complete(EndpointType::Push);
+                pipe.incoming()
+                    .send(Message::from_body(b"last words".to_vec()))
+                    .await?;
+                Ok(())
+            })
+        }
+    }
+
+    /// Claim: a peer that handshakes, sends and closes before the engine looks
+    /// again was a pipe: it is admitted and retired, with all three events,
+    /// and its message is delivered. The handshake and the session's end are
+    /// then ready together, and an engine that takes the end alone for a peer
+    /// that never sent its header drops the message and never announces the
+    /// removal (nightly #417: a PULL test waited three hours on windows-amd64
+    /// for a `REM_POST` that could not come).
+    #[tokio::test]
+    async fn a_peer_that_handshakes_sends_and_closes_at_once_was_a_pipe() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let engine = Engine::new(
+            &ctx,
+            EndpointType::Pull,
+            SocketOptions::default(),
+            Arc::new(HeaderMessageClose),
+        )
+        .expect("engine");
+        let events: Arc<Mutex<Vec<PipeEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        engine.notify(Arc::new(move |event, _: &PipeInfo| {
+            recorded.lock().unwrap().push(event);
+            Admission::Accept
+        }));
+
+        let (ours, _theirs) = tokio::io::duplex(64);
+        let outcome = run_pipe(
+            &TaskCtx {
+                engine: engine.clone(),
+                endpoint_options: EndpointOptions::default(),
+            },
+            Raw::Ready(Stream::inproc(ours)),
+            Role::Listen,
+            &Endpoint::parse("inproc://last-words").unwrap(),
+            None,
+            None,
+            &mut None,
+        )
+        .await;
+
+        assert!(outcome.is_ok(), "the connection was a pipe: {outcome:?}");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![PipeEvent::AddPre, PipeEvent::AddPost, PipeEvent::RemPost]
+        );
+        let (_, message) = engine.take_arrived().expect("the message is delivered");
+        assert_eq!(message.body(), b"last words");
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the
