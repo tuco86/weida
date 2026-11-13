@@ -964,7 +964,7 @@ them at dial.
 | --- | --- | --- |
 | Compatible peer | `Seeder`, or a `Replier` that speaks the version-1 ask below | `Swarm`, or a `Requester` that sends either wire below |
 | Direction | connects, and **accumulates** peers on purpose | binds |
-| Send/receive pattern | `connect` per seeder, then `fetch(blob, have, options)` and `Fetch::next` until `None` | `accept` → `SeedSession` → admit by `blob()` / `meta()` once → `next` → `answer_list` / `answer_have` / `answer_piece`, repeated until `next` is `None`; or `decline` |
+| Send/receive pattern | `connect` per seeder, then `fetch(blob, have, options)` and `Fetch::next` until `None` | `accept` → `SeedSession` → admit by `blob()` / `meta()` once → `next` → `answer_list` / `answer_have` / `answer_piece` (or `answer_gone` for a piece no longer held), repeated until `next` is `None`; or `decline` |
 | Incoming routing | the session's reply, answers in the order of the orders; a verified piece is yielded once, the first copy to verify | fair, bounded queue per path (`endpoint_queue`), the open read and decoded before the application sees it |
 | Outgoing routing | **one session per (fetch, seeder), on the connection of the seeder it targets** — not Req/Rep's round-robin pick; pieces are claimed per seeder from what its HAVE says it holds | the session's reply |
 | Action with no peer | `Error::NotConnected` from `Fetch::next`, immediately for a swarm that never connected; connecting a seeder and calling `next` again resumes | `accept` waits |
@@ -988,13 +988,30 @@ are already stored, `Fetch::delivered` is the running map, `Fetch::in_flight` th
 ordered and not yet taken (a progress display's third state), and `Fetch::list` hands out the
 verified list so a resumed fetch skips LIST.
 
+Claims are **rarest first**: of the free pieces a seeder holds, the one the fewest seeders hold
+by their last HAVE, ties at random. `Fetch::prioritize(range)` orders the missing pieces of
+`range` before any other, in index order, and orders a prioritized piece once more from another
+holder when it has been in flight longer than twice the running mean piece time (a streaming
+reader's next pieces); `Fetch::clear_priority` ends it. `Fetch::unavailable` names the missing
+pieces that no order fetches and no seeder holds: `next` waits for them until a seeder gains
+them.
+
+**A seeder behind NAT** binds its listener with `Listener::bind_relay(relay_url, client_tls,
+server_tls)` and its `Seeder` on that listener, as on any binding. The relay runs
+`Listener::relay()` and answers each `RelayRequest` with `admit`, `admit_with(RelayBudget {
+bytes_per_sec })` (a tunnel held to that rate, both directions together, with one second of
+burst; past it datagrams are dropped and the tunnel's QUIC backs off) or `refuse`. A swarm
+connects `weida+relay://<seeder-key>@<relay-key>@host:port/path` beside its direct seeders.
+QUIC and TLS run end to end, so `SeedSession::meta().peer` is the fetching side's key, not the
+relay's.
+
 The session, big-endian ([decisions/0041](decisions/0041-swarm-sessions.md) §4.1):
 
 | unit | bytes | layout |
 | --- | --- | --- |
 | open (start of the request body) | 48 | `u8` version = 2, `u8` piece log2 (10..=24), `[u8; 32]` root, `u64` size, 6 zero bytes |
 | order (request body, after the open) | 5 | `u8` 1 = LIST, 2 = HAVE, 3 = PIECE, `u32` index (0 for LIST and HAVE) |
-| answer head (reply body) | 9 | `u8` 0 = DECLINE, 1 = LIST, 2 = HAVE, 3 = PIECE, `u32` index (0 except PIECE), `u32` length (0 for DECLINE) |
+| answer head (reply body) | 9 | `u8` 0 = DECLINE, 1 = LIST, 2 = HAVE, 3 = PIECE, 4 = GONE, `u32` index (0 except PIECE and GONE), `u32` length (0 for DECLINE and GONE) |
 
 Each answer head is followed by exactly `length` bytes: LIST `count × 32` (the chaining
 values), HAVE `ceil(count / 8)` (bit `i` is byte `i / 8`, mask `1 << (i % 8)`, padding bits
@@ -1002,7 +1019,8 @@ zero), PIECE the piece's span (the last piece is short). An open of another vers
 non-zero padding, a piece size out of range, size 0 or a `Blob` that `Blob::new` refuses is
 refused with `Rejected` before the application sees it; an order of an unknown kind, with an
 index on LIST or HAVE, LIST for a blob of at most one piece, or PIECE past the end refuses the
-session. A DECLINE ends it.
+session. A DECLINE ends it. A GONE names the piece ordered and has no payload: the seeder no
+longer holds it, and the session goes on (a version-1 ask gets `Rejected` instead).
 
 The version-1 ask ([decisions/0040](decisions/0040-swarm-pattern.md) §4.2) is still served,
 as a session of one order, and is what a fetch falls back to toward a seeder that refuses a
@@ -1029,6 +1047,9 @@ Failure modes, from the fetching side unless the row says otherwise:
 | A seeder sends a piece that does not verify | the seeder is dropped **for this fetch**; its session is aborted, its orders given back, and the blob completes from the rest | *`a_seeder_that_sends_a_wrong_piece_is_dropped_and_the_blob_completes`* |
 | A seeder sends a list that does not merge to the root | the same; no PIECE is asked of it | *`a_list_that_does_not_hash_to_the_root_drops_the_seeder`* |
 | A seeder declines (DECLINE), answers with a head that does not match the order, or a length other than the known one | the same: the fetch reads an error or a wrong head, and does not retry the seeder | no test of its own: one path with the two rows above (`read_answer` in `swarm/gather.rs`) |
+| A seeder answers GONE for a piece | the piece leaves that seeder's map and is ordered from another holder; the seeder keeps its place and is asked HAVE at its next refresh. With no other holder the piece stays in `Fetch::unavailable` and `next` waits | *`a_seeder_that_says_gone_keeps_its_place_and_the_piece_comes_from_another`* |
+| A prioritized piece is late | once it has been in flight longer than twice the mean piece time it is ordered once more from another seeder that holds it, and the first copy to verify is yielded | *`a_stalled_prioritized_piece_comes_from_another_seeder`* |
+| A seeder reached through a relay | it serves like a direct one, beside direct seeders, and sees the fetching side's key | *`a_swarm_fetches_from_a_relayed_seeder_and_a_direct_one_together`* |
 | A seeder takes an order and never answers | the answer at the head of the line is due `stall + (9 + len) / min_rate` after its order was written or the answer before it was read, whichever is later; past that the seeder is dropped and its pieces are ordered elsewhere, so the last piece is not held up | *`a_silent_seeder_does_not_hold_up_the_last_piece`* |
 | A seeder speaks only the version-1 ask | it refuses the session open with `Rejected`; the fetch asks it one exchange per ask from then on, under the same credit | *`a_seeder_that_speaks_only_version_1_still_serves_a_fetch`* |
 | The caller stops taking pieces | after W orders per seeder nothing more is ordered; one taken piece is one more order | *`a_caller_that_stops_taking_pieces_stops_the_seeder`* |
