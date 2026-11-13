@@ -136,6 +136,7 @@ DROP(seed_session)
 DROP(seed_session_answer_list_op)
 DROP(seed_session_answer_have_op)
 DROP(seed_session_answer_piece_op)
+DROP(seed_session_answer_gone_op)
 DROP(seed_session_decline_op)
 DROP(acceptor)
 DROP(flow_meta)
@@ -2491,6 +2492,20 @@ static napi_value relay_request_admit(napi_env env, napi_callback_info info) {
     return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_relay_request_admit_op);
 }
 
+/* consumes the request; a budget out of range throws first and consumes nothing */
+static napi_value relay_request_admit_with(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    uint64_t bytes_per_sec = 0;
+    if (!get_u64(env, argv[1], UINT64_MAX, &bytes_per_sec))
+        return NULL;
+    weida_relay_request *q = take(env, argv[0], drop_relay_request);
+    if (!q)
+        return NULL;
+    weida_relay_request_admit_op *op = NULL;
+    int rc = weida_relay_request_admit_with(q, bytes_per_sec, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_relay_request_admit_op);
+}
+
 FD(relay_request_admit_op_fd, relay_request_admit_op)
 WAIT0(relay_request_admit_op_wait, relay_request_admit_op)
 
@@ -4554,6 +4569,29 @@ static napi_value fetch_next(napi_env env, napi_callback_info info) {
 FROM_HANDLE(fetch_blob, fetch_blob, fetch, blob)
 FROM_HANDLE(fetch_delivered, fetch_delivered, fetch, bits)
 FROM_HANDLE(fetch_in_flight, fetch_in_flight, fetch, bits)
+FROM_HANDLE(fetch_unavailable, fetch_unavailable, fetch, bits)
+
+/* (fetch, start, end) */
+static napi_value fetch_prioritize(napi_env env, napi_callback_info info) {
+    ARGS(3);
+    const weida_fetch *f = live(env, argv[0], drop_fetch);
+    uint64_t start = 0, end = 0;
+    if (!f || !get_u64(env, argv[1], UINT32_MAX, &start) ||
+        !get_u64(env, argv[2], UINT32_MAX, &end))
+        return NULL;
+    int rc = weida_fetch_prioritize(f, (uint32_t)start, (uint32_t)end);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
+
+/* (fetch) */
+static napi_value fetch_clear_priority(napi_env env, napi_callback_info info) {
+    ARGS(1);
+    const weida_fetch *f = live(env, argv[0], drop_fetch);
+    if (!f)
+        return NULL;
+    int rc = weida_fetch_clear_priority(f);
+    return rc < 0 ? throw_rc(env, rc) : js_undefined(env);
+}
 
 /* (fetch) -> piece list | null while it is not known */
 static napi_value fetch_list(napi_env env, napi_callback_info info) {
@@ -4676,6 +4714,18 @@ static napi_value seed_session_answer_piece(napi_env env, napi_callback_info inf
     return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_seed_session_answer_piece_op);
 }
 
+/* (session, index) -> op */
+static napi_value seed_session_answer_gone(napi_env env, napi_callback_info info) {
+    ARGS(2);
+    const weida_seed_session *s = live(env, argv[0], drop_seed_session);
+    uint64_t index = 0;
+    weida_seed_session_answer_gone_op *op = NULL;
+    if (!s || !get_u64(env, argv[1], UINT32_MAX, &index))
+        return NULL;
+    int rc = weida_seed_session_answer_gone(s, (uint32_t)index, &op);
+    return rc < 0 ? throw_rc(env, rc) : wrap(env, op, drop_seed_session_answer_gone_op);
+}
+
 /* consumes the session */
 static napi_value seed_session_decline(napi_env env, napi_callback_info info) {
     ARGS(1);
@@ -4693,6 +4743,8 @@ FD(seed_session_answer_have_op_fd, seed_session_answer_have_op)
 WAIT0(seed_session_answer_have_op_wait, seed_session_answer_have_op)
 FD(seed_session_answer_piece_op_fd, seed_session_answer_piece_op)
 WAIT0(seed_session_answer_piece_op_wait, seed_session_answer_piece_op)
+FD(seed_session_answer_gone_op_fd, seed_session_answer_gone_op)
+WAIT0(seed_session_answer_gone_op_wait, seed_session_answer_gone_op)
 FD(seed_session_decline_op_fd, seed_session_decline_op)
 WAIT0(seed_session_decline_op_wait, seed_session_decline_op)
 
@@ -5172,6 +5224,7 @@ NAPI_MODULE_INIT() {
         FN("relayRequestPeerFingerprint", relay_request_peer_fingerprint),
         FN("relayRequestTarget", relay_request_target),
         FN("relayRequestAdmit", relay_request_admit),
+        FN("relayRequestAdmitWith", relay_request_admit_with),
         FN("relayRequestAdmitOpFd", relay_request_admit_op_fd),
         FN("relayRequestAdmitOpWait", relay_request_admit_op_wait),
         FN("relayRequestRefuse", relay_request_refuse),
@@ -5437,6 +5490,9 @@ NAPI_MODULE_INIT() {
         FN("fetchList", fetch_list),
         FN("fetchDelivered", fetch_delivered),
         FN("fetchInFlight", fetch_in_flight),
+        FN("fetchUnavailable", fetch_unavailable),
+        FN("fetchPrioritize", fetch_prioritize),
+        FN("fetchClearPriority", fetch_clear_priority),
         FN("listenerSeeder", listener_seeder),
         FN("seederPath", seeder_path),
         FN("seederFd", seeder_fd),
@@ -5455,6 +5511,9 @@ NAPI_MODULE_INIT() {
         FN("seedSessionAnswerPiece", seed_session_answer_piece),
         FN("seedSessionAnswerPieceOpFd", seed_session_answer_piece_op_fd),
         FN("seedSessionAnswerPieceOpWait", seed_session_answer_piece_op_wait),
+        FN("seedSessionAnswerGone", seed_session_answer_gone),
+        FN("seedSessionAnswerGoneOpFd", seed_session_answer_gone_op_fd),
+        FN("seedSessionAnswerGoneOpWait", seed_session_answer_gone_op_wait),
         FN("seedSessionDecline", seed_session_decline),
         FN("seedSessionDeclineOpFd", seed_session_decline_op_fd),
         FN("seedSessionDeclineOpWait", seed_session_decline_op_wait),

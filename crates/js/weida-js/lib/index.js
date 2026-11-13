@@ -2651,23 +2651,42 @@ export class Fetch extends Handle {
   }
 
   /** The piece list once it is known and verified, or null: keep it to
-   * resume without asking for it (`{ list }`). WEIDA_EINVAL while a `next`
-   * is pending. */
+   * resume without asking for it (`{ list }`). A pending `next` goes on
+   * unharmed. */
   list() {
     const list = native.fetchList(this[HANDLE]);
     return list === null ? null : adopt(PieceList, list);
   }
 
   /** The pieces the caller holds: those it started with and those this
-   * fetch yielded, a copy. WEIDA_EINVAL while a `next` is pending. */
+   * fetch yielded, a copy. A pending `next` goes on unharmed. */
   delivered() {
     return adopt(Bits, native.fetchDelivered(this[HANDLE]));
   }
 
-  /** The pieces ordered and not yet taken, a copy. WEIDA_EINVAL while a
-   * `next` is pending. */
+  /** The pieces ordered and not yet taken, a copy. A pending `next` goes on
+   * unharmed. */
   inFlight() {
     return adopt(Bits, native.fetchInFlight(this[HANDLE]));
+  }
+
+  /** The missing pieces no order fetches and no seeder holds by its last
+   * HAVE: what `next` waits for until a seeder gains them, a copy. A
+   * pending `next` goes on unharmed. */
+  unavailable() {
+    return adopt(Bits, native.fetchUnavailable(this[HANDLE]));
+  }
+
+  /** Orders the missing pieces of `start..end` before any other, in index
+   * order; replaces an earlier range, and an empty one clears it. Takes
+   * effect at the next order. A pending `next` goes on unharmed. */
+  prioritize(start, end) {
+    native.fetchPrioritize(this[HANDLE], start, end);
+  }
+
+  /** Ends the priority: rarest first again. */
+  clearPriority() {
+    native.fetchClearPriority(this[HANDLE]);
   }
 
   /** The next verified piece, a frozen `{ index, bytes }` copied out at
@@ -2794,6 +2813,18 @@ export class SeedSession extends Handle {
       () => native.seedSessionAnswerPiece(this[HANDLE], piece),
       native.seedSessionAnswerPieceOpWait,
       native.seedSessionAnswerPieceOpFd,
+      signal,
+    );
+  }
+
+  /** Answers PIECE `index` with "no longer held": the fetch orders it
+   * elsewhere and keeps the session. */
+  async answerGone(index, { signal } = {}) {
+    await op(
+      this,
+      () => native.seedSessionAnswerGone(this[HANDLE], index),
+      native.seedSessionAnswerGoneOpWait,
+      native.seedSessionAnswerGoneOpFd,
       signal,
     );
   }
@@ -3139,6 +3170,19 @@ export class RelayRequest extends Handle {
     await op(
       this,
       () => native.relayRequestAdmit(consume(this)),
+      native.relayRequestAdmitOpWait,
+      native.relayRequestAdmitOpFd,
+      signal,
+    );
+  }
+
+  /** Serves it as `admit` does and holds a tunnel to `bytesPerSec`, both
+   * directions together, with one second of burst; a registration's budget
+   * is unused. Consumes the request. */
+  async admitWith(bytesPerSec, { signal } = {}) {
+    await op(
+      this,
+      () => native.relayRequestAdmitWith(consume(this), bytesPerSec),
       native.relayRequestAdmitOpWait,
       native.relayRequestAdmitOpFd,
       signal,

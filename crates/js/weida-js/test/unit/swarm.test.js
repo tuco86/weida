@@ -1,5 +1,6 @@
 // SWARM over the in-process transport: a blob seeded by one runtime and
-// fetched by two others, and a declined session.
+// fetched by two others, a declined session, and a piece a seeder says is
+// gone.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
@@ -155,7 +156,7 @@ test("a declined session leaves the fetch WEIDA_ENOT_CONNECTED", UNIT, async () 
   assert.throws(() => swarm.fetch(blob, short), { code: "WEIDA_EINVAL" });
   const fetch = swarm.fetch(blob, have);
   const ended = assert.rejects(fetch.next(), { code: "WEIDA_ENOT_CONNECTED" });
-  assert.throws(() => fetch.delivered(), { code: "WEIDA_EINVAL" });
+  assert.equal(fetch.delivered().ones(), 0, "the maps answer while a next is pending");
 
   const session = await seeder.accept();
   assert.notEqual(await session.next(), null);
@@ -167,6 +168,95 @@ test("a declined session leaves the fetch WEIDA_ENOT_CONNECTED", UNIT, async () 
   for (const handle of [fetch, short, have, blob, list, swarm, seeder, binding, listener]) {
     handle.drop();
   }
+  await client.shutdown();
+  await server.shutdown();
+});
+
+test("a piece a seeder says is gone is unavailable until another seeder serves it", UNIT, async () => {
+  const server = weida.Runtime.owned();
+  const client = weida.Runtime.owned();
+  const [busA, busB] = [`test-${randomUUID()}`, `test-${randomUUID()}`];
+  const listenerA = server.listener();
+  const bindingA = listenerA.bindInproc(busA);
+  const seederA = listenerA.seeder("/blob");
+  const listenerB = server.listener();
+  const bindingB = listenerB.bindInproc(busB);
+  const seederB = listenerB.seeder("/blob");
+  const list = weida.PieceList.of(data, weida.PIECE_SIZE_MIN_LOG2);
+  const blob = list.blob();
+
+  // Seeder A holds every piece by HAVE, then says piece 3 is gone when it
+  // is asked for it.
+  const asked = [];
+  const servingA = (async () => {
+    const session = await seederA.accept();
+    const held = weida.Bits.full(18);
+    try {
+      for (let ask = await session.next(); ask !== null; ask = await session.next()) {
+        if (ask.kind === "WEIDA_ASK_LIST") {
+          await session.answerList(list);
+        } else if (ask.kind === "WEIDA_ASK_HAVE") {
+          await session.answerHave(held);
+        } else {
+          asked.push(ask.index);
+          if (ask.index === 3) {
+            held.set(3, false);
+            await session.answerGone(3);
+          } else {
+            const span = blob.span(ask.index);
+            await session.answerPiece(data.subarray(Number(span.start), Number(span.end)));
+          }
+        }
+      }
+    } finally {
+      held.drop();
+      session.drop();
+    }
+  })();
+  const stop = new AbortController();
+  const servingB = serve(seederB, data, list, [], stop.signal);
+
+  const swarm = client.swarm(clientTls());
+  await swarm.connect(`weida+inproc://${busA}/blob`);
+  const have = new weida.Bits(18);
+  const fetch = swarm.fetch(blob, have);
+  fetch.prioritize(3, 4);
+
+  const out = new Uint8Array(LEN);
+  const keep = (piece) => out.set(piece.bytes, Number(blob.span(piece.index).start));
+  for (let i = 0; i < 17; i++) {
+    const piece = await fetch.next();
+    assert.notEqual(piece, null);
+    assert.notEqual(piece.index, 3, "piece 3 is gone at the only seeder");
+    keep(piece);
+  }
+  // Every round reads the map while `last` is pending.
+  const last = fetch.next();
+  for (;;) {
+    const unavailable = fetch.unavailable();
+    const [gone, ones] = [unavailable.get(3), unavailable.ones()];
+    unavailable.drop();
+    if (gone) {
+      assert.equal(ones, 1);
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(asked[0], 3, "the prioritized piece is ordered first");
+
+  fetch.clearPriority();
+  await swarm.connect(`weida+inproc://${busB}/blob`);
+  const piece = await last;
+  assert.equal(piece.index, 3);
+  keep(piece);
+  assert.equal(await fetch.next(), null);
+  assert.deepEqual(weida.blobIdOf(out), blob.root());
+
+  await servingA;
+  stop.abort();
+  await servingB;
+  for (const handle of [fetch, have, swarm, seederA, seederB, blob, list]) handle.drop();
+  for (const handle of [bindingA, bindingB, listenerA, listenerB]) handle.drop();
   await client.shutdown();
   await server.shutdown();
 });

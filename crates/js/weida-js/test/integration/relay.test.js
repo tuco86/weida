@@ -123,3 +123,70 @@ test("a registration the relay refuses rejects bindRelay with WEIDA_EREJECTED", 
   await hidden.shutdown();
   await r.runtime.shutdown();
 });
+
+const BULK = 256 * 1024;
+
+// QUIC backs off at the budget, so this run is longer than the others here.
+test("a tunnel admitted with a budget moves no faster than it", { timeout: 30_000 }, async () => {
+  const r = await startRelay();
+  const serving = (async () => {
+    for (;;) {
+      let ask;
+      try {
+        ask = await r.relay.accept();
+      } catch (error) {
+        if (error.code === "WEIDA_ECLOSED") {
+          return;
+        }
+        throw error;
+      }
+      // A registration's budget is unused; the tunnel moves BULK bytes a second.
+      await ask.admitWith(ask.target() === null ? 0 : BULK);
+    }
+  })();
+
+  const hiddenId = weida.Identity.generate();
+  const hidden = weida.Runtime.owned();
+  const hiddenListener = hidden.listener();
+  const hiddenBinding = await hiddenListener.bindRelay(
+    r.url,
+    new weida.ClientTls(new weida.Trust(), { identity: hiddenId }),
+    new weida.ServerTls(hiddenId, { requireClient: "any-key" }),
+  );
+  const replier = hiddenListener.replier("/bulk");
+
+  const diallerId = weida.Identity.generate();
+  const dialler = weida.Runtime.owned();
+  const requester = dialler.requester(
+    new weida.ClientTls(new weida.Trust(), { identity: diallerId }),
+  );
+  await requester.connect(
+    `weida+relay://${hiddenId.fingerprint()}@${r.relayId.fingerprint()}@${r.binding.localAddr()}/bulk`,
+  );
+
+  const served = (async () => {
+    const request = await replier.accept();
+    const { payload } = await request.takeBody().collect(4 * BULK);
+    const out = await request.reply();
+    await out.writeAll("ok");
+    await out.finish().delivered();
+    return payload.length;
+  })();
+  const started = performance.now();
+  const reply = await requester.request(new Uint8Array(3 * BULK));
+  assert.equal(text((await reply.collect(1024)).payload), "ok");
+  const elapsed = performance.now() - started;
+  assert.equal(await served, 3 * BULK);
+  assert.ok(elapsed >= 1500, `3 x ${BULK} bytes at ${BULK} B/s took ${elapsed} ms`);
+
+  r.relay.drop();
+  await serving;
+  for (const handle of [requester, replier, hiddenBinding, hiddenListener]) {
+    handle.drop();
+  }
+  r.binding.drop();
+  r.listener.drop();
+  await dialler.shutdown();
+  await hidden.shutdown();
+  await r.runtime.shutdown();
+});

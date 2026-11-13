@@ -51,13 +51,19 @@ it with `-WEIDA_ECLOSED`.
 | `const char *weida_relay_request_peer_fingerprint(const weida_relay_request *q, size_t *len_out)` | never | the `sha256:` key the asker proved; NULL for an anonymous dialler, always a key for a registration |
 | `const char *weida_relay_request_target(const weida_relay_request *q, size_t *len_out)` | never | NULL for a registration; for a tunnel, the `sha256:` key of the peer it reaches |
 | `int weida_relay_request_admit(weida_relay_request *q, weida_relay_request_admit_op **out)` | never; **consumes** `q` | 0; `-WEIDA_ECLOSED` |
+| `int weida_relay_request_admit_with(weida_relay_request *q, uint64_t bytes_per_sec, weida_relay_request_admit_op **out)` | never; **consumes** `q` | 0; `-WEIDA_ECLOSED` |
 | `int weida_relay_request_refuse(weida_relay_request *q, weida_relay_request_refuse_op **out)` | never; **consumes** `q` | 0; `-WEIDA_ECLOSED` |
 | `void weida_relay_request_drop(weida_relay_request *q)` | never | — |
 
 Admitting serves the registration or the tunnel. A registration replaces one of the same key
-on another connection, and closes that connection. Refusing fails the asker with
-`-WEIDA_EREJECTED`: a hidden peer's `weida_listener_bind_relay` op, a dialler's connect op. A
-request dropped unanswered answers `NO_REPLY`.
+on another connection, and closes that connection. `weida_relay_request_admit_with` also holds a
+tunnel to `bytes_per_sec` (`RelayBudget`): both directions together, with a burst of one second's
+bytes; a datagram past it is dropped and the tunnel's QUIC backs off. 0 counts as 1, and a budget
+below one full-size datagram per second (about 1500 bytes) carries no full-size datagram. A
+registration has no tunnel of its own, so its budget is unused. Both return the same
+`weida_relay_request_admit_op`. Refusing fails the asker with `-WEIDA_EREJECTED`: a hidden peer's
+`weida_listener_bind_relay` op, a dialler's connect op. A request dropped unanswered answers
+`NO_REPLY`.
 
 ## `weida_relay_request_admit_op`
 

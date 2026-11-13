@@ -50,7 +50,7 @@ unit tests in `crates/weida-c/src/`.
 | `Listener::bind_relay` | `weida_listener_bind_relay` (op; its wait yields a relayed `weida_binding`). Dialling a `weida+relay://` URL needs nothing more: the ABI passes URL text | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Listener::relay`, `Relay::accept` | `weida_listener_relay`, `weida_relay_accept` (try, R3a) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `RelayRequest::peer`, `target` | `weida_relay_request_peer_fingerprint`, `_target` (`sha256:` text) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
-| `RelayRequest::admit`, `refuse` | `weida_relay_request_admit`, `_refuse` (ops, consume) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
+| `RelayRequest::admit`, `admit_with` (`RelayBudget`), `refuse` | `weida_relay_request_admit`, `_admit_with` (a `bytes_per_sec`), `_refuse` (ops, consume) | present; `abi::a_dial_only_replier_answers_through_a_relay`, `abi::a_tunnel_admitted_with_a_budget_moves_no_faster_than_it` (*binding lifecycle*) |
 | `Drop for Relay`, `Drop for RelayRequest` (`NO_REPLY`) | `weida_relay_drop`, `weida_relay_request_drop` | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Binding::relay_events` | `weida_binding_relay_events` (a `weida_peer_events` queue; 0 for a binding not relayed) | present; `abi::a_dial_only_replier_answers_through_a_relay` (*binding lifecycle*) |
 | `Listener::puller`, `publisher` | `weida_listener_puller`, `weida_listener_publisher` | present; `abi::push_to_pull_over_inproc_arrives_in_order`, `abi::a_subscriber_receives_only_its_topic` (*patterns*) |
@@ -320,7 +320,8 @@ SWARM, behind weida's `swarm` feature, which `crates/weida-c` enables ([swarm.md
 | `Drop for Swarm` | `weida_swarm_drop` | present; R1 (*swarm*) |
 | `FetchOptions` (`list`, `stall`, `min_rate`, `per_peer`, `max_inflight`, `max_peers`, `have_refresh`) | `weida_fetch_options_new`, `_set_list`, `_set_stall_ms`, `_set_min_rate`, `_set_per_peer`, `_set_max_inflight`, `_set_max_peers`, `_set_have_refresh_ms`, `_drop` (a builder) | present; `swarm::tests::fetch_options_setters_land_on_their_fields`, `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
 | `Fetch::next` | `weida_fetch_next` (try, R3a; a `weida_piece`, NULL at the end), `_fd` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
-| `Fetch::blob`, `list`, `delivered`, `in_flight` | `weida_fetch_blob`, `_list` (1 and a `weida_piece_list`, or 0 with NULL), `_delivered`, `_in_flight` (`weida_bits` copies) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
+| `Fetch::blob`, `list`, `delivered`, `in_flight`, `unavailable` | `weida_fetch_blob`, `_list` (1 and a `weida_piece_list`, or 0 with NULL), `_delivered`, `_in_flight`, `_unavailable` (`weida_bits` copies) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected`, `abi::a_piece_a_seeder_says_is_gone_is_unavailable_until_another_seeder_serves_it` (*swarm*) |
+| `Fetch::prioritize`, `clear_priority` | `weida_fetch_prioritize` (`start`, `end`), `_clear_priority` | present; `abi::a_piece_a_seeder_says_is_gone_is_unavailable_until_another_seeder_serves_it` (*swarm*) |
 | `Drop for Fetch` (aborts every order) | `weida_fetch_drop` | present; R1 (*swarm*) |
 | `Piece` (`index`, `bytes`) | `weida_piece` (`_index`, `_bytes`, `_drop`) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
 | `Seeder::path` | `weida_seeder_path` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
@@ -329,6 +330,7 @@ SWARM, behind weida's `swarm` feature, which `crates/weida-c` enables ([swarm.md
 | `SeedSession::blob`, `meta`, `connection` | `weida_seed_session_blob`, `_meta`, `_connection` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
 | `SeedSession::next`, `Ask` | `weida_seed_session_next` (try, R3a; 1 with `WEIDA_ASK_*` and the piece index, 0 at the end), `_fd` | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others`, `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
 | `SeedSession::answer_list`, `answer_have`, `answer_piece` | `weida_seed_session_answer_list`, `_answer_have`, `_answer_piece` (ops) | present; `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
+| `SeedSession::answer_gone` | `weida_seed_session_answer_gone` (op) | present; `abi::a_piece_a_seeder_says_is_gone_is_unavailable_until_another_seeder_serves_it` (*swarm*) |
 | `SeedSession::decline` | `weida_seed_session_decline` (op, consumes) | present; `abi::a_declined_session_leaves_the_fetch_not_connected` (*swarm*) |
 | `Drop for SeedSession` | `weida_seed_session_drop` | present; R1 (*swarm*) |
 | `BlobId` (`from_bytes`, `as_bytes`, `of`) | its 32 bytes (`WEIDA_BLOB_ID_LEN`), `weida_blob_id_of` | present; `blob::tests::a_tree_hashers_list_checks_every_piece_and_matches_the_root`, `abi::a_blob_seeded_by_one_runtime_is_fetched_and_verified_by_two_others` (*swarm*) |
@@ -479,9 +481,11 @@ way a foreign caller calls it:
   blob; the ABI returns `-WEIDA_EINVAL`.
 - `Fetch::next` is a try (R3a); its `None` is a 0 return with `*out == NULL`, and so is every
   read after it.
-- `Fetch::list`, `delivered` and `in_flight` are copied into new handles; while a
-  `weida_fetch_next` read is in flight they are `-WEIDA_EINVAL`, where Rust's `&mut` borrow
-  forbids them. `Fetch::list`'s `None` is a 0 return with `*out == NULL`.
+- `Fetch::list`, `delivered`, `in_flight` and `unavailable` are copied into new handles. Where
+  Rust's `&mut` borrow forbids a call on the fetch while `next` runs, every fetch accessor of the
+  ABI stops a `weida_fetch_next` read in flight, takes the fetch back and wakes the reader, whose
+  next call starts the read again: `Fetch::next` is cancel-safe, so nothing is lost.
+  `Fetch::list`'s `None` is a 0 return with `*out == NULL`.
 - `Bits::as_bytes` copies into the caller's buffer, since another thread may set a bit
   meanwhile.
 - `SeedSession::next` is a try (R3a): an order is a 1 return with the `WEIDA_ASK_*` kind and the

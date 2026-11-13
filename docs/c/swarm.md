@@ -86,9 +86,12 @@ A count above `SIZE_MAX` becomes `SIZE_MAX` (R7).
 | `int weida_fetch_fd(const weida_fetch *f, int64_t *out)` | never | 0; `-WEIDA_EIO` |
 | `int weida_fetch_next(const weida_fetch *f, int64_t timeout_ms, weida_piece **out)` | up to `timeout_ms` | 0 and the next verified piece, in any order; 0 with `*out == NULL` once the caller holds every piece, and on every later call; `-WEIDA_ENOT_CONNECTED` when no order is in flight and no seeder is left that has not failed this fetch, or the swarm is gone; `-WEIDA_EAGAIN`, `-WEIDA_EINTR`, `-WEIDA_ECLOSED` |
 | `int weida_fetch_blob(const weida_fetch *f, weida_blob **out)` | never | 0 and the blob being fetched, also while a read is in flight |
-| `int weida_fetch_list(const weida_fetch *f, weida_piece_list **out)` | never | 1 and a copy of the piece list once it is known and verified; 0 with `*out == NULL` while it is not; `-WEIDA_EINVAL` while a read is in flight |
-| `int weida_fetch_delivered(const weida_fetch *f, weida_bits **out)` | never | 0 and a copy of the pieces the caller holds: those it started with and those the fetch yielded; `-WEIDA_EINVAL` while a read is in flight |
-| `int weida_fetch_in_flight(const weida_fetch *f, weida_bits **out)` | never | 0 and a copy of the pieces ordered and not yet taken, on their way or verified and waiting for `weida_fetch_next`; `-WEIDA_EINVAL` while a read is in flight |
+| `int weida_fetch_list(const weida_fetch *f, weida_piece_list **out)` | never | 1 and a copy of the piece list once it is known and verified; 0 with `*out == NULL` while it is not |
+| `int weida_fetch_delivered(const weida_fetch *f, weida_bits **out)` | never | 0 and a copy of the pieces the caller holds: those it started with and those the fetch yielded |
+| `int weida_fetch_in_flight(const weida_fetch *f, weida_bits **out)` | never | 0 and a copy of the pieces ordered and not yet taken, on their way or verified and waiting for `weida_fetch_next` |
+| `int weida_fetch_unavailable(const weida_fetch *f, weida_bits **out)` | never | 0 and a copy of the missing pieces that no order fetches and no seeder of this fetch holds by its last HAVE answer: what `weida_fetch_next` waits for until a seeder gains them; a seeder that has not answered HAVE yet holds nothing here |
+| `int weida_fetch_prioritize(const weida_fetch *f, uint32_t start, uint32_t end)` | never | 0; orders the missing pieces of `[start, end)` before any other, in index order, and orders a prioritized piece once more from another seeder that holds it when it is in flight longer than twice the running mean piece time; replaces an earlier range, ignores indices past the blob, and an empty range (`start >= end`) clears it; takes effect at the next order |
+| `int weida_fetch_clear_priority(const weida_fetch *f)` | never | 0; ends the priority: claims are rarest first again |
 | `void weida_fetch_drop(weida_fetch *f)` | never | —; aborts every order in flight, and a waiting read returns `-WEIDA_ECLOSED` |
 | `uint32_t weida_piece_index(const weida_piece *p)` | never | which piece; 0 for NULL |
 | `const uint8_t *weida_piece_bytes(const weida_piece *p, size_t *len_out)` | never | the piece's bytes, `weida_blob_span` of its index, checked against the root; valid as long as `p`; NULL for NULL |
@@ -116,6 +119,7 @@ connected, and one connected during a fetch joins it at the fetch's next read.
 | `int weida_seed_session_answer_list(const weida_seed_session *s, const weida_piece_list *list, weida_seed_session_answer_list_op **out)` | never (R3b); `list` is shared | 0; answers LIST |
 | `int weida_seed_session_answer_have(const weida_seed_session *s, const weida_bits *have, weida_seed_session_answer_have_op **out)` | never (R3b); `have` is copied | 0; answers HAVE with the pieces this seeder can serve now |
 | `int weida_seed_session_answer_piece(const weida_seed_session *s, const uint8_t *data, size_t len, weida_seed_session_answer_piece_op **out)` | never (R3b); the bytes are copied | 0; answers PIECE; the bytes are not checked here, the fetch checks them |
+| `int weida_seed_session_answer_gone(const weida_seed_session *s, uint32_t index, weida_seed_session_answer_gone_op **out)` | never (R3b) | 0; answers PIECE `index` with "no longer held": the fetch drops the piece from this seeder's map, orders it elsewhere, keeps the session and asks HAVE again at the seeder's next refresh; a version-1 ask is refused instead, as `decline` refuses it |
 | `int weida_seed_session_decline(weida_seed_session *s, weida_seed_session_decline_op **out)` | never (R3b); **consumes** `s` | 0; ends the session: a blob this seeder does not serve or a piece it does not hold, and the fetch drops this seeder for the blob |
 | `void weida_seed_session_drop(weida_seed_session *s)` | never | —; the session ends with its last holder, and the fetch drops this seeder when an answer was still due |
 
@@ -129,13 +133,14 @@ connected, and one connected during a fetch joins it at the fetch's next read.
 | `WEIDA_MIN_RATE` | 65536, bytes per second below which an answer is abandoned |
 
 Each op type, `weida_seed_session_answer_list_op`, `weida_seed_session_answer_have_op`,
-`weida_seed_session_answer_piece_op` and `weida_seed_session_decline_op`, has `_op_fd(op, int64_t
-*out)` (0; `-WEIDA_EIO`), `_op_wait(op, int64_t timeout_ms)` and `_op_drop(op)`. An answer's wait
-returns 0 once it was written and `-WEIDA_EPROTOCOL` for an answer that does not match the order:
-another kind, another blob's list, a map without one bit per piece, bytes of another length than
-the piece's span; the session is then refused. The decline's wait returns 0 once the DECLINE was
-sent or the session was gone. Every wait also returns `-WEIDA_EAGAIN`, `-WEIDA_EINTR` or
-`-WEIDA_ECLOSED`. Dropping an unfinished op aborts it.
+`weida_seed_session_answer_piece_op`, `weida_seed_session_answer_gone_op` and
+`weida_seed_session_decline_op`, has `_op_fd(op, int64_t *out)` (0; `-WEIDA_EIO`), `_op_wait(op,
+int64_t timeout_ms)` and `_op_drop(op)`. An answer's wait returns 0 once it was written and
+`-WEIDA_EPROTOCOL` for an answer that does not match the order: another kind, another blob's
+list, a map without one bit per piece, bytes of another length than the piece's span, a GONE for
+another piece than the one ordered; the session is then refused. The decline's wait returns 0
+once the DECLINE was sent or the session was gone. Every wait also returns `-WEIDA_EAGAIN`,
+`-WEIDA_EINTR` or `-WEIDA_ECLOSED`. Dropping an unfinished op aborts it.
 
 ## Rules
 
@@ -144,8 +149,11 @@ sent or the session was gone. Every wait also returns `-WEIDA_EAGAIN`, `-WEIDA_E
 - `weida_fetch_next`, `weida_seeder_accept` and `weida_seed_session_next` are tries (R3a): the read
   in flight keeps its place across timeouts and `EINTR`, and `timeout_ms` 0 is the non-blocking
   read. Taking a piece frees its order's credit, which is all the backpressure a fetch needs.
-- While a `weida_fetch_next` read is in flight, `weida_fetch_list`, `weida_fetch_delivered` and
-  `weida_fetch_in_flight` are `-WEIDA_EINVAL`; `weida_fetch_blob` always answers.
+- Every fetch accessor answers while a `weida_fetch_next` read is in flight: `weida_fetch_list`,
+  `_delivered`, `_in_flight`, `_unavailable`, `_prioritize` and `_clear_priority` stop the read,
+  take the fetch back and wake a reader waiting on the descriptor, and the next
+  `weida_fetch_next` starts the read again, losing nothing (`Fetch::next` is cancel-safe).
+  `weida_fetch_blob` never touches the read.
 - A session's calls are one at a time: while its `next` is in flight or an answer op runs, `next`,
   every answer and `decline` are `-WEIDA_EINVAL` ("a call is in flight on this seed session"); a
   `decline` refused so still consumes the handle, and the session is dropped when that answer

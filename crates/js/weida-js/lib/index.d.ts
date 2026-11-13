@@ -1051,12 +1051,14 @@ export class Swarm extends Handle {
 /** Dropping it aborts every order in flight. */
 export class Fetch extends Handle {
   blob(): Blob;
-  /** WEIDA_EINVAL while a `next` is pending. */
   list(): PieceList | null;
-  /** WEIDA_EINVAL while a `next` is pending. */
   delivered(): Bits;
-  /** WEIDA_EINVAL while a `next` is pending. */
   inFlight(): Bits;
+  /** What `next` waits for until a seeder gains it, a copy. */
+  unavailable(): Bits;
+  /** An empty range clears the priority. */
+  prioritize(start: number, end: number): void;
+  clearPriority(): void;
   /** The next verified piece, or null once every piece is held; rejects
    * with WEIDA_ENOT_CONNECTED when no seeder is left. */
   next(options?: WaitOptions): Promise<Piece | null>;
@@ -1080,6 +1082,8 @@ export class SeedSession extends Handle {
   answerList(list: PieceList, options?: WaitOptions): Promise<void>;
   answerHave(have: Bits, options?: WaitOptions): Promise<void>;
   answerPiece(data: Bytes, options?: WaitOptions): Promise<void>;
+  /** Answers PIECE `index` with "no longer held". */
+  answerGone(index: number, options?: WaitOptions): Promise<void>;
   /** Consumes the session. */
   decline(options?: WaitOptions): Promise<void>;
 }
@@ -1154,6 +1158,8 @@ export class RelayRequest extends Handle {
   target(): string | null;
   /** Serves it; consumes the request. */
   admit(options?: WaitOptions): Promise<void>;
+  /** As `admit`, holding a tunnel to `bytesPerSec`; consumes the request. */
+  admitWith(bytesPerSec: Count, options?: WaitOptions): Promise<void>;
   /** Refuses it with WEIDA_EREJECTED; consumes the request. */
   refuse(options?: WaitOptions): Promise<void>;
 }
