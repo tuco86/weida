@@ -11,8 +11,8 @@ use std::time::Duration;
 use weida::{
     Binding, ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Error, Fingerprint, Identity,
     Limits, Listener, LossCause, Network, PeerEvent, PeerEvents, PeerIdentity, RELAY_PATH,
-    ReconnectPolicy, Relay, Requester, Runtime, RuntimeConfig, ServerTls, SimNet, TransferMeta,
-    Trust,
+    ReconnectPolicy, Relay, RelayBudget, Requester, Runtime, RuntimeConfig, ServerTls, SimNet,
+    TransferMeta, Trust,
 };
 
 /// The expected time of a wait on the Tokio clock: generous, because under a paused clock it
@@ -25,7 +25,7 @@ async fn within_paused<F: Future>(f: F) -> F::Output {
 
 /// A runtime on `net` whose redial starts at 5 ms and backs off to 600 s; with `datagrams`,
 /// its connections carry QUIC datagrams.
-fn on(net: &SimNet, datagrams: bool) -> RuntimeConfig {
+pub(crate) fn on(net: &SimNet, datagrams: bool) -> RuntimeConfig {
     let limits = if datagrams {
         Limits {
             datagram_receive_bytes: DEFAULT_DATAGRAM_RECEIVE_BYTES,
@@ -46,26 +46,35 @@ fn on(net: &SimNet, datagrams: bool) -> RuntimeConfig {
     }
 }
 
-fn identity() -> (Identity, Fingerprint) {
+pub(crate) fn identity() -> (Identity, Fingerprint) {
     let identity = Identity::generate_for(["127.0.0.1"]).expect("identity");
     let fingerprint = identity.fingerprint().expect("fingerprint");
     (identity, fingerprint)
 }
 
-/// R: a relay on a QUIC binding whose application admits, or refuses, everything.
-struct RelayServer {
-    runtime: Runtime,
+/// R: a relay on a QUIC binding whose application answers everything by one [`Policy`].
+pub(crate) struct RelayServer {
+    pub(crate) runtime: Runtime,
     addr: SocketAddr,
     key: Fingerprint,
 }
 
+/// How a [`RelayServer`] answers every registration and tunnel.
+#[derive(Clone, Copy)]
+pub(crate) enum Policy {
+    Admit,
+    Refuse,
+    /// Admits, each tunnel held to this budget.
+    Budget(RelayBudget),
+}
+
 impl RelayServer {
-    async fn start(
+    pub(crate) async fn start(
         net: &SimNet,
         addr: SocketAddr,
         id: Identity,
         datagrams: bool,
-        admit: bool,
+        policy: Policy,
     ) -> RelayServer {
         let key = id.fingerprint().expect("fingerprint");
         let runtime = Runtime::new(on(net, datagrams)).expect("runtime");
@@ -76,7 +85,7 @@ impl RelayServer {
             .await
             .expect("bind");
         let relay = listener.relay().expect("relay");
-        tokio::spawn(answer(relay, admit));
+        tokio::spawn(answer(relay, policy));
         RelayServer {
             runtime,
             addr: binding.local_addr(),
@@ -94,7 +103,7 @@ impl RelayServer {
     }
 
     /// Where D reaches `path` on `target`.
-    fn relayed(&self, target: Fingerprint, path: &str) -> String {
+    pub(crate) fn relayed(&self, target: Fingerprint, path: &str) -> String {
         format!(
             "weida+relay://{target}@{}@127.0.0.1:{}{path}",
             self.key,
@@ -103,26 +112,30 @@ impl RelayServer {
     }
 }
 
-async fn answer(relay: Relay, admit: bool) {
+async fn answer(relay: Relay, policy: Policy) {
     while let Ok(request) = relay.accept().await {
-        if admit {
-            let _ = request.admit().await;
-        } else {
-            request.refuse().await;
+        match policy {
+            Policy::Admit => {
+                let _ = request.admit().await;
+            }
+            Policy::Refuse => request.refuse().await,
+            Policy::Budget(budget) => {
+                let _ = request.admit_with(budget).await;
+            }
         }
     }
 }
 
 /// H: a runtime with no binding of its own but the one through the relay, which only `d`
 /// may use. `/who` answers with the key of whoever asked.
-struct Hidden {
-    runtime: Runtime,
-    listener: Listener,
+pub(crate) struct Hidden {
+    pub(crate) runtime: Runtime,
+    pub(crate) listener: Listener,
     binding: Binding,
 }
 
 impl Hidden {
-    async fn start(
+    pub(crate) async fn start(
         net: &SimNet,
         relay: &RelayServer,
         id: Identity,
@@ -184,7 +197,7 @@ async fn next_transition(events: &mut PeerEvents) -> PeerEvent {
     .await
 }
 
-fn any_addr() -> SocketAddr {
+pub(crate) fn any_addr() -> SocketAddr {
     "127.0.0.1:0".parse().expect("addr")
 }
 
@@ -196,7 +209,7 @@ async fn a_dial_only_peer_answers_and_publishes_through_the_relay_and_sees_the_d
     let (r_id, _) = identity();
     let (h_id, h_fp) = identity();
     let (d_id, d_fp) = identity();
-    let relay = RelayServer::start(&net, any_addr(), r_id, true, true).await;
+    let relay = RelayServer::start(&net, any_addr(), r_id, true, Policy::Admit).await;
     let hidden = Hidden::start(&net, &relay, h_id, d_fp, true).await;
     let publisher = hidden.listener.publisher("/events").expect("publisher");
 
@@ -243,7 +256,7 @@ async fn the_relay_carries_a_peer_whose_runtimes_have_no_datagrams() {
     let (r_id, _) = identity();
     let (h_id, h_fp) = identity();
     let (d_id, d_fp) = identity();
-    let relay = RelayServer::start(&net, any_addr(), r_id, false, true).await;
+    let relay = RelayServer::start(&net, any_addr(), r_id, false, Policy::Admit).await;
     let hidden = Hidden::start(&net, &relay, h_id, d_fp, false).await;
 
     let dialler = Runtime::new(on(&net, false)).expect("dialler");
@@ -270,7 +283,7 @@ async fn a_relay_that_goes_away_is_lost_on_both_ends_and_both_redial_through_it(
     let (r_id, _) = identity();
     let (h_id, h_fp) = identity();
     let (d_id, d_fp) = identity();
-    let relay = RelayServer::start(&net, any_addr(), r_id.clone(), true, true).await;
+    let relay = RelayServer::start(&net, any_addr(), r_id.clone(), true, Policy::Admit).await;
     let hidden = Hidden::start(&net, &relay, h_id, d_fp, true).await;
     let mut registration = hidden.binding.relay_events().expect("a relayed binding");
 
@@ -298,7 +311,7 @@ async fn a_relay_that_goes_away_is_lost_on_both_ends_and_both_redial_through_it(
         other => panic!("expected the dialled connection lost, got {other:?}"),
     }
 
-    let again = RelayServer::start(&net, addr, r_id, true, true).await;
+    let again = RelayServer::start(&net, addr, r_id, true, Policy::Admit).await;
     assert_eq!(again.url(), url, "the same relay, at the same address");
     assert!(matches!(
         next_transition(&mut registration).await,
@@ -322,7 +335,7 @@ async fn a_refused_registration_fails_bind_relay() {
     let net = SimNet::new();
     let (r_id, _) = identity();
     let (h_id, _) = identity();
-    let relay = RelayServer::start(&net, any_addr(), r_id, true, false).await;
+    let relay = RelayServer::start(&net, any_addr(), r_id, true, Policy::Refuse).await;
 
     let runtime = Runtime::new(on(&net, true)).expect("runtime");
     let bound = within_paused(runtime.listener().bind_relay(
@@ -344,7 +357,7 @@ async fn a_peer_the_relay_does_not_know_is_unknown_to_the_dialler() {
     let (r_id, _) = identity();
     let (_, h_fp) = identity();
     let (d_id, _) = identity();
-    let relay = RelayServer::start(&net, any_addr(), r_id, true, true).await;
+    let relay = RelayServer::start(&net, any_addr(), r_id, true, Policy::Admit).await;
 
     let dialler = Runtime::new(on(&net, true)).expect("dialler");
     let requester = dialler.requester(dialler_tls(d_id));
@@ -367,7 +380,7 @@ async fn a_finished_relay_conversation_leaves_the_network_silent_after_the_linge
     let (r_id, _) = identity();
     let (h_id, h_fp) = identity();
     let (d_id, d_fp) = identity();
-    let relay = RelayServer::start(&net, any_addr(), r_id, true, true).await;
+    let relay = RelayServer::start(&net, any_addr(), r_id, true, Policy::Admit).await;
     let hidden = Hidden::start(&net, &relay, h_id, d_fp, true).await;
 
     let dialler = Runtime::new(on(&net, true)).expect("dialler");
@@ -394,4 +407,71 @@ async fn a_finished_relay_conversation_leaves_the_network_silent_after_the_linge
     dialler.shutdown().await;
     hidden.runtime.shutdown().await;
     relay.runtime.shutdown().await;
+}
+
+/// The rate of the budgeted tunnel below, in bytes per second.
+const BULK: u64 = 256 * 1024;
+
+/// Moves a reply of `3 * BULK` bytes from H to D through a relay that answers by `policy`;
+/// returns how long it took on the Tokio clock, from the request to the last byte.
+async fn bulk_through(net: &SimNet, policy: Policy) -> Duration {
+    let (r_id, _) = identity();
+    let (h_id, h_fp) = identity();
+    let (d_id, d_fp) = identity();
+    let relay = RelayServer::start(net, any_addr(), r_id, true, policy).await;
+    let hidden = Hidden::start(net, &relay, h_id, d_fp, true).await;
+    let replier = hidden.listener.replier("/bulk").expect("replier");
+    tokio::spawn(async move {
+        let payload = vec![7u8; 3 * BULK as usize];
+        while let Ok(request) = replier.accept().await {
+            let Ok(mut reply) = request.reply(TransferMeta::default()).await else {
+                continue;
+            };
+            if reply.write_all(&payload).await.is_ok() {
+                let _ = reply.finish();
+            }
+        }
+    });
+
+    let dialler = Runtime::new(on(net, true)).expect("dialler");
+    let requester = dialler.requester(dialler_tls(d_id));
+    within_paused(requester.connect(&relay.relayed(h_fp, "/bulk")))
+        .await
+        .expect("connect through the relay");
+    let started = tokio::time::Instant::now();
+    let reply = within_paused(requester.request(b"go"))
+        .await
+        .expect("request");
+    let body = within_paused(reply.collect(3 * BULK as usize))
+        .await
+        .expect("reply");
+    let elapsed = started.elapsed();
+    assert_eq!(body.len(), 3 * BULK as usize);
+
+    dialler.shutdown().await;
+    hidden.runtime.shutdown().await;
+    relay.runtime.shutdown().await;
+    elapsed
+}
+
+/// Claim: a tunnel admitted with a budget carries no more than one second of burst plus its
+/// rate, while the same transfer through a tunnel without one is not held back.
+#[tokio::test(start_paused = true)]
+async fn a_tunnel_admitted_with_a_budget_moves_no_faster_than_it() {
+    let budgeted = bulk_through(
+        &SimNet::new(),
+        Policy::Budget(RelayBudget {
+            bytes_per_sec: BULK,
+        }),
+    )
+    .await;
+    assert!(
+        budgeted >= Duration::from_secs(2),
+        "3 × {BULK} bytes at {BULK} B/s with one second of burst took {budgeted:?}"
+    );
+    let free = bulk_through(&SimNet::new(), Policy::Admit).await;
+    assert!(
+        free < Duration::from_secs(1),
+        "the same transfer without a budget took {free:?}"
+    );
 }

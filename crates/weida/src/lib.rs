@@ -115,7 +115,7 @@ pub use ordering::Gap;
 pub use pubsub::{DishDrops, FanOut, TopicDrops};
 pub use radio::{Join, JoinTerms, Received};
 pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
-pub use relay::{Relay, RelayRequest};
+pub use relay::{Relay, RelayBudget, RelayRequest};
 pub use runtime::Runtime;
 pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
 #[cfg(feature = "test-util")]

@@ -28,6 +28,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use quinn::udp::{RecvMeta, Transmit};
@@ -815,13 +816,66 @@ impl RelayHub {
 struct Forward {
     to: Weak<ConnCtx>,
     records: mpsc::Sender<Record>,
+    /// The tunnel's budget, both directions together.
+    budget: Option<Arc<Mutex<Budget>>>,
 }
 
 impl TunnelSink for Forward {
     fn deliver(&self, tunnel: u64, datagram: Bytes) {
-        if let Some(to) = self.to.upgrade() {
-            send(&to, &self.records, tunnel, &datagram);
+        let Some(to) = self.to.upgrade() else {
+            return;
+        };
+        if let Some(budget) = &self.budget
+            && !lock(budget).take(datagram.len() as u64, to.exec.now())
+        {
+            return;
         }
+        send(&to, &self.records, tunnel, &datagram);
+    }
+}
+
+/// What one tunnel may move through a [`Relay`], both directions together:
+/// `bytes_per_sec`, with a burst of one second's bytes. A datagram past it
+/// is dropped, as a link at that rate drops, and the tunnel's QUIC backs
+/// off. Zero counts as one; a budget below one full-size datagram per
+/// second (about 1500 bytes) carries no full-size datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayBudget {
+    /// The sustained rate in bytes per second, and the burst in bytes.
+    pub bytes_per_sec: u64,
+}
+
+/// The burst a [`Budget`] lets through after an idle time.
+const BUDGET_BURST: Duration = Duration::from_secs(1);
+
+/// A tunnel's budget as a GCRA bucket: `tat` is when the bytes taken so
+/// far would have passed at `rate`.
+struct Budget {
+    rate: u64,
+    tat: Instant,
+}
+
+impl Budget {
+    fn new(bytes_per_sec: u64, now: Instant) -> Budget {
+        Budget {
+            rate: bytes_per_sec.max(1),
+            tat: now,
+        }
+    }
+
+    /// Whether `len` bytes pass at `now`; taken if they do. By a time `t`
+    /// after an idle start at most `rate × (1 s + t)` bytes pass.
+    fn take(&mut self, len: u64, now: Instant) -> bool {
+        let cost = Duration::from_nanos(
+            u64::try_from(u128::from(len) * 1_000_000_000 / u128::from(self.rate))
+                .unwrap_or(u64::MAX),
+        );
+        let start = self.tat.max(now);
+        if start.saturating_duration_since(now) + cost > BUDGET_BURST {
+            return false;
+        }
+        self.tat = start + cost;
+        true
     }
 }
 
@@ -1002,7 +1056,17 @@ impl RelayRequest {
     pub async fn admit(self) -> Result<(), Error> {
         match self.target {
             None => self.register().await,
-            Some(target) => self.reach(target).await,
+            Some(target) => self.reach(target, None).await,
+        }
+    }
+
+    /// Serves it as [`RelayRequest::admit`] does, and holds a tunnel to
+    /// `budget`: both directions of it together. A registration has no
+    /// tunnel of its own, so its budget is unused.
+    pub async fn admit_with(self, budget: RelayBudget) -> Result<(), Error> {
+        match self.target {
+            None => self.register().await,
+            Some(target) => self.reach(target, Some(budget)).await,
         }
     }
 
@@ -1067,7 +1131,7 @@ impl RelayRequest {
         Ok(())
     }
 
-    async fn reach(self, target: Fingerprint) -> Result<(), Error> {
+    async fn reach(self, target: Fingerprint, budget: Option<RelayBudget>) -> Result<(), Error> {
         let RelayRequest {
             request, body, hub, ..
         } = self;
@@ -1085,11 +1149,18 @@ impl RelayRequest {
         out.write_all(&head).await?;
 
         let (tx, rx) = mpsc::channel(RECORD_QUEUE);
+        let budget = budget.map(|budget| {
+            Arc::new(Mutex::new(Budget::new(
+                budget.bytes_per_sec,
+                dialler.exec.now(),
+            )))
+        });
         dialler.relay.insert(
             id,
             Arc::new(Forward {
                 to: Arc::downgrade(&reg.conn),
                 records: reg.records.clone(),
+                budget: budget.clone(),
             }),
         );
         reg.conn.relay.insert(
@@ -1097,6 +1168,7 @@ impl RelayRequest {
             Arc::new(Forward {
                 to: Arc::downgrade(&dialler),
                 records: tx,
+                budget,
             }),
         );
         lock(&reg.tunnels).insert(id, Arc::downgrade(&dialler));
@@ -1142,6 +1214,27 @@ impl fmt::Debug for RelayRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tunnel_budget_passes_one_second_of_bytes_then_its_rate() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut budget = Budget::new(1000, t0);
+        assert!(budget.take(600, t0));
+        assert!(budget.take(400, t0));
+        assert!(!budget.take(1, t0), "one second of burst is spent");
+        assert!(budget.take(100, t0 + ms(100)));
+        assert!(!budget.take(1, t0 + ms(100)), "100 ms refill 100 bytes");
+        assert!(budget.take(1000, t0 + Duration::from_secs(10)));
+        assert!(
+            !budget.take(1, t0 + Duration::from_secs(10)),
+            "the burst is capped at one second"
+        );
+
+        let mut zero = Budget::new(0, t0);
+        assert!(zero.take(1, t0), "zero counts as one byte per second");
+        assert!(!zero.take(1, t0));
+    }
 
     #[test]
     fn a_tunnel_address_round_trips_and_no_other_address_is_one() {
