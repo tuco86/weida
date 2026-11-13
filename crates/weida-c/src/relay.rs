@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ::weida_runtime::Exec;
-use weida_rs::{Error, PeerIdentity, Relay, RelayRequest};
+use weida_rs::{Error, PeerIdentity, Relay, RelayBudget, RelayRequest};
 
 use crate::error::{closed, fail, guard, guard_ptr, guard_void, null_arg};
 use crate::handle::{CText, borrow, into_handle, out_ptr, release, text_out, write_out};
@@ -46,7 +46,8 @@ impl weida_relay_request {
     }
 }
 
-/// The pending admission of `weida_relay_request_admit`.
+/// The pending admission of `weida_relay_request_admit` or
+/// `weida_relay_request_admit_with`.
 pub struct weida_relay_request_admit_op {
     op: Arc<Op<()>>,
 }
@@ -131,8 +132,8 @@ pub unsafe extern "C" fn weida_relay_fd(r: *const weida_relay, out: *mut i64) ->
 /// # Safety
 ///
 /// `r` is NULL or a live relay; `out` is NULL or writable. Answer the
-/// request with `weida_relay_request_admit` or `_refuse`, or release it
-/// with `weida_relay_request_drop`.
+/// request with `weida_relay_request_admit`, `_admit_with` or `_refuse`, or
+/// release it with `weida_relay_request_drop`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn weida_relay_accept(
     r: *const weida_relay,
@@ -263,6 +264,42 @@ pub unsafe extern "C" fn weida_relay_request_admit(
         let out = out_ptr(out)?;
         let request = request.ok_or_else(closed)?;
         let op = Op::start(&q.exec, request.admit());
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_relay_request_admit_op { op })) };
+        Ok(0)
+    })
+}
+
+/// Serves the registration or tunnel as `weida_relay_request_admit` does,
+/// and holds a tunnel to `bytes_per_sec` (`RelayRequest::admit_with`,
+/// `RelayBudget`): both directions together, with a burst of one second's
+/// bytes; a datagram past it is dropped and the tunnel's QUIC backs off. 0
+/// counts as 1; a budget below one full-size datagram per second (about
+/// 1500 bytes) carries no full-size datagram. A registration has no tunnel
+/// of its own, so its budget is unused. **Consumes** `q` on every return
+/// path.
+///
+/// Never blocks; the admission runs as the op written to `out`, whose wait
+/// returns what `weida_relay_request_admit_op_wait` returns.
+///
+/// # Safety
+///
+/// `q` is NULL or a live request, not used again; `out` is NULL or
+/// writable. Release the op with `weida_relay_request_admit_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_relay_request_admit_with(
+    q: *mut weida_relay_request,
+    bytes_per_sec: u64,
+    out: *mut *mut weida_relay_request_admit_op,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract; the handle is
+        // consumed here whatever happens next.
+        let q = unsafe { release(q) }.ok_or_else(null_arg)?;
+        let request = q.lock().take();
+        let out = out_ptr(out)?;
+        let request = request.ok_or_else(closed)?;
+        let op = Op::start(&q.exec, request.admit_with(RelayBudget { bytes_per_sec }));
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, into_handle(weida_relay_request_admit_op { op })) };
         Ok(0)

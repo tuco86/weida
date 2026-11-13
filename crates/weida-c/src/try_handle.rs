@@ -54,6 +54,13 @@ impl<S> Tried<S> {
         state
     }
 
+    /// Raises the readiness signal without polling, so a reader waiting on
+    /// the descriptor polls again: for an accessor that took back what a
+    /// read in flight held.
+    pub(crate) fn wake(&self) {
+        self.signal.raise();
+    }
+
     /// Polls `f` until it is ready or `timeout_ms` (R4) gives up.
     ///
     /// Each round clears the signal, polls under the mutex, and raises the

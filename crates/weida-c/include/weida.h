@@ -1086,7 +1086,8 @@ typedef struct weida_relay weida_relay;
 typedef struct weida_relay_request weida_relay_request;
 
 /**
- * The pending admission of `weida_relay_request_admit`.
+ * The pending admission of `weida_relay_request_admit` or
+ * `weida_relay_request_admit_with`.
  */
 typedef struct weida_relay_request_admit_op weida_relay_request_admit_op;
 
@@ -1189,6 +1190,11 @@ typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
  * and every answer op hold the lock.
  */
 typedef struct weida_seed_session weida_seed_session;
+
+/**
+ * The pending answer of `weida_seed_session_answer_gone`.
+ */
+typedef struct weida_seed_session_answer_gone_op weida_seed_session_answer_gone_op;
 
 /**
  * The pending answer of `weida_seed_session_answer_have`.
@@ -6945,8 +6951,8 @@ int weida_relay_fd(const weida_relay *r, int64_t *out);
  * # Safety
  *
  * `r` is NULL or a live relay; `out` is NULL or writable. Answer the
- * request with `weida_relay_request_admit` or `_refuse`, or release it
- * with `weida_relay_request_drop`.
+ * request with `weida_relay_request_admit`, `_admit_with` or `_refuse`, or
+ * release it with `weida_relay_request_drop`.
  */
 int weida_relay_accept(const weida_relay *r, int64_t timeout_ms, weida_relay_request **out);
 
@@ -6999,6 +7005,28 @@ const char *weida_relay_request_target(const weida_relay_request *q, size_t *len
  * writable. Release the op with `weida_relay_request_admit_op_drop`.
  */
 int weida_relay_request_admit(weida_relay_request *q, weida_relay_request_admit_op **out);
+
+/**
+ * Serves the registration or tunnel as `weida_relay_request_admit` does,
+ * and holds a tunnel to `bytes_per_sec` (`RelayRequest::admit_with`,
+ * `RelayBudget`): both directions together, with a burst of one second's
+ * bytes; a datagram past it is dropped and the tunnel's QUIC backs off. 0
+ * counts as 1; a budget below one full-size datagram per second (about
+ * 1500 bytes) carries no full-size datagram. A registration has no tunnel
+ * of its own, so its budget is unused. **Consumes** `q` on every return
+ * path.
+ *
+ * Never blocks; the admission runs as the op written to `out`, whose wait
+ * returns what `weida_relay_request_admit_op_wait` returns.
+ *
+ * # Safety
+ *
+ * `q` is NULL or a live request, not used again; `out` is NULL or
+ * writable. Release the op with `weida_relay_request_admit_op_drop`.
+ */
+int weida_relay_request_admit_with(weida_relay_request *q,
+                                   uint64_t bytes_per_sec,
+                                   weida_relay_request_admit_op **out);
 
 /**
  * The readiness descriptor of an admit op: readable once it finished.
@@ -9038,7 +9066,8 @@ int weida_fetch_fd(const weida_fetch *f, int64_t *out);
  * that has not failed this fetch, or when the swarm is gone; connecting a
  * seeder and reading again resumes. Taking a piece frees its order's
  * credit, which is the fetch's backpressure. A read in flight keeps its
- * place across timeouts and `EINTR`.
+ * place across timeouts and `EINTR`; a fetch accessor stops it, and the
+ * next call starts it again, losing nothing.
  *
  * # Safety
  *
@@ -9061,8 +9090,9 @@ int weida_fetch_blob(const weida_fetch *f, weida_blob **out);
 /**
  * The piece list, once it is known and verified (`Fetch::list`): 1 and a
  * copy in `*out`, to resume without LIST (`weida_fetch_options_set_list`);
- * 0 with `*out == NULL` while it is not known. `-WEIDA_EINVAL` while a
- * `weida_fetch_next` read is in flight.
+ * 0 with `*out == NULL` while it is not known. Answers while a
+ * `weida_fetch_next` read is in flight too: the read is stopped and starts
+ * again at the next call, losing nothing.
  *
  * # Safety
  *
@@ -9073,8 +9103,9 @@ int weida_fetch_list(const weida_fetch *f, weida_piece_list **out);
 
 /**
  * The pieces the caller holds (`Fetch::delivered`): those it started with
- * and those this fetch yielded, copied into a new map. `-WEIDA_EINVAL`
- * while a `weida_fetch_next` read is in flight.
+ * and those this fetch yielded, copied into a new map. Answers while a
+ * `weida_fetch_next` read is in flight too: the read is stopped and starts
+ * again at the next call, losing nothing.
  *
  * # Safety
  *
@@ -9086,8 +9117,9 @@ int weida_fetch_delivered(const weida_fetch *f, weida_bits **out);
 /**
  * The pieces ordered of some seeder and not yet taken
  * (`Fetch::in_flight`): on their way, or verified and waiting for
- * `weida_fetch_next`, copied into a new map. `-WEIDA_EINVAL` while a
- * `weida_fetch_next` read is in flight.
+ * `weida_fetch_next`, copied into a new map. Answers while a
+ * `weida_fetch_next` read is in flight too: the read is stopped and starts
+ * again at the next call, losing nothing.
  *
  * # Safety
  *
@@ -9095,6 +9127,51 @@ int weida_fetch_delivered(const weida_fetch *f, weida_bits **out);
  * result with `weida_bits_drop`.
  */
 int weida_fetch_in_flight(const weida_fetch *f, weida_bits **out);
+
+/**
+ * The missing pieces that no order fetches and that no seeder of this
+ * fetch holds by its last HAVE answer (`Fetch::unavailable`): what the
+ * caller cannot get until a seeder gains them, copied into a new map.
+ * `weida_fetch_next` keeps waiting for them. A seeder that has not
+ * answered HAVE yet holds nothing here. Answers while a `weida_fetch_next`
+ * read is in flight too: the read is stopped and starts again at the next
+ * call, losing nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch; `out` is NULL or writable. Release the
+ * result with `weida_bits_drop`.
+ */
+int weida_fetch_unavailable(const weida_fetch *f, weida_bits **out);
+
+/**
+ * Orders the missing pieces in `[start, end)` before any other, in index
+ * order (`Fetch::prioritize`), and orders a prioritized piece once more
+ * from another seeder that holds it when it is in flight longer than
+ * twice the running mean piece time. Replaces an earlier range; indices
+ * past the blob are ignored, and an empty range (`start >= end`) clears
+ * the priority. Takes effect at the next order: orders already written
+ * stay. Never blocks. Answers while a `weida_fetch_next` read is in flight
+ * too: the read is stopped and starts again at the next call, losing
+ * nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch.
+ */
+int weida_fetch_prioritize(const weida_fetch *f, uint32_t start, uint32_t end);
+
+/**
+ * Ends the priority (`Fetch::clear_priority`): claims are rarest first
+ * again. Never blocks. Answers while a `weida_fetch_next` read is in
+ * flight too: the read is stopped and starts again at the next call,
+ * losing nothing.
+ *
+ * # Safety
+ *
+ * `f` is NULL or a live fetch.
+ */
+int weida_fetch_clear_priority(const weida_fetch *f);
 
 /**
  * Releases a fetch, which aborts every order it has in flight; the pieces
@@ -9238,7 +9315,8 @@ int weida_seed_session_fd(const weida_seed_session *s, int64_t *out);
  * (`SeedSession::next`): 1 with its `WEIDA_ASK_*` kind in `*out_ask` and,
  * for a PIECE, the piece index in `*out_index` (0 otherwise); 0 once the
  * fetch finished its orders, the outs untouched. Answer each order with the
- * `weida_seed_session_answer_*` that matches it before the next call.
+ * `weida_seed_session_answer_*` that matches it (a PIECE no longer held
+ * with `weida_seed_session_answer_gone`) before the next call.
  *
  * Waits as long as the fetch sends none: its idleness is its backpressure.
  * `-WEIDA_EPROTOCOL` while the order before is unanswered, for an order
@@ -9406,6 +9484,59 @@ int weida_seed_session_answer_piece_op_wait(const weida_seed_session_answer_piec
  * `op` is NULL or a live piece answer op, dropped at most once.
  */
 void weida_seed_session_answer_piece_op_drop(weida_seed_session_answer_piece_op *op);
+
+/**
+ * Answers `WEIDA_ASK_PIECE` `index` with "no longer held"
+ * (`SeedSession::answer_gone`): the piece changed or went away since this
+ * seeder said HAVE. The fetch drops the piece from this seeder's map,
+ * orders it elsewhere and keeps the session; it asks HAVE again at the
+ * seeder's next refresh. A version-1 ask has no such answer: it is refused
+ * as `weida_seed_session_decline` refuses it, and that fetch drops this
+ * seeder.
+ *
+ * Never blocks; the answer runs as the op written to `out`. `-WEIDA_EINVAL`
+ * while a `next` or another answer holds the session.
+ *
+ * # Safety
+ *
+ * `s` is NULL or a live session; `out` is NULL or writable. Release the op
+ * with `weida_seed_session_answer_gone_op_drop`.
+ */
+int weida_seed_session_answer_gone(const weida_seed_session *s,
+                                   uint32_t index,
+                                   weida_seed_session_answer_gone_op **out);
+
+/**
+ * The readiness descriptor of a gone answer op: readable once it
+ * finished.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live gone answer op; `out` is NULL or writable.
+ */
+int weida_seed_session_answer_gone_op_fd(const weida_seed_session_answer_gone_op *op, int64_t *out);
+
+/**
+ * Waits up to `timeout_ms` (R4) for the answer: 0 once it was written.
+ * `-WEIDA_EPROTOCOL` when the order was not PIECE `index`; the session is
+ * then refused.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live gone answer op.
+ */
+int weida_seed_session_answer_gone_op_wait(const weida_seed_session_answer_gone_op *op,
+                                           int64_t timeout_ms);
+
+/**
+ * Releases a gone answer op, aborting the answer when unfinished. NULL
+ * does nothing.
+ *
+ * # Safety
+ *
+ * `op` is NULL or a live gone answer op, dropped at most once.
+ */
+void weida_seed_session_answer_gone_op_drop(weida_seed_session_answer_gone_op *op);
 
 /**
  * Ends the session (`SeedSession::decline`): a blob this seeder does not

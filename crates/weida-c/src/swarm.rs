@@ -3,10 +3,12 @@
 //! answers from its own storage (docs/c/swarm.md).
 
 use std::ffi::{c_char, c_int};
-use std::pin::Pin;
+use std::future::poll_fn;
+use std::pin::{Pin, pin};
 use std::ptr;
 use std::sync::Arc;
-use std::task::Poll;
+use std::sync::atomic::{self, AtomicBool};
+use std::task::{Context, Poll, Waker};
 
 use ::weida_runtime::Exec;
 use weida_rs::{
@@ -70,14 +72,68 @@ impl AsOp for weida_swarm_connect_op {
     }
 }
 
-/// A read of the next piece in flight; it owns the fetch until it ends.
-type Gathering = Pin<Box<dyn Future<Output = (Fetch, Option<Result<Piece, Error>>)> + Send>>;
+/// How a read in flight ends: with what `Fetch::next` returned, or
+/// stopped by an accessor that took the fetch back.
+enum ReadEnd {
+    Next(Option<Result<Piece, Error>>),
+    Stopped,
+}
 
-/// A fetch between tries: the fetch itself, or the read in flight that owns
-/// it (R3a).
+/// A read of the next piece in flight; it owns the fetch until it ends.
+/// Once `stop` is set, its next poll hands the fetch back unread, which
+/// loses nothing: `Fetch::next` is cancel-safe.
+struct Gathering {
+    read: Pin<Box<dyn Future<Output = (Fetch, ReadEnd)> + Send>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Gathering {
+    fn start(mut fetch: Fetch) -> Gathering {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let read = Box::pin(async move {
+            let end = {
+                let mut next = pin!(fetch.next());
+                poll_fn(|cx| {
+                    if stopped.load(atomic::Ordering::Acquire) {
+                        return Poll::Ready(ReadEnd::Stopped);
+                    }
+                    next.as_mut().poll(cx).map(ReadEnd::Next)
+                })
+                .await
+            };
+            (fetch, end)
+        });
+        Gathering { read, stop }
+    }
+}
+
+/// A fetch between tries: the fetch itself, or the read in flight that
+/// owns it (R3a) until an accessor stops it.
 struct FetchState {
     fetch: Option<Fetch>,
     gathering: Option<Gathering>,
+}
+
+impl FetchState {
+    /// Stops the read in flight, if there is one, and takes its fetch
+    /// back: true when there was one.
+    fn stop_read(&mut self) -> bool {
+        let Some(mut gathering) = self.gathering.take() else {
+            return false;
+        };
+        gathering.stop.store(true, atomic::Ordering::Release);
+        // The no-op waker is safe: the read is dropped right after this poll.
+        let Poll::Ready((fetch, _)) = gathering
+            .read
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            unreachable!("a stopped read ends at its next poll");
+        };
+        self.fetch = Some(fetch);
+        true
+    }
 }
 
 /// One blob being fetched (`Fetch`): its pieces, read as a try.
@@ -164,6 +220,11 @@ pub struct weida_seed_session_answer_piece_op {
     op: Arc<Op<()>>,
 }
 
+/// The pending answer of `weida_seed_session_answer_gone`.
+pub struct weida_seed_session_answer_gone_op {
+    op: Arc<Op<()>>,
+}
+
 /// The pending DECLINE of `weida_seed_session_decline`.
 pub struct weida_seed_session_decline_op {
     op: Arc<Op<()>>,
@@ -190,6 +251,13 @@ impl AsOp for weida_seed_session_answer_piece_op {
     }
 }
 
+impl AsOp for weida_seed_session_answer_gone_op {
+    type Output = ();
+    fn op(&self) -> &Op<()> {
+        &self.op
+    }
+}
+
 impl AsOp for weida_seed_session_decline_op {
     type Output = ();
     fn op(&self) -> &Op<()> {
@@ -199,10 +267,6 @@ impl AsOp for weida_seed_session_decline_op {
 
 fn busy() -> c_int {
     fail_abi(WEIDA_EINVAL, c"a call is in flight on this seed session")
-}
-
-fn reading() -> c_int {
-    fail_abi(WEIDA_EINVAL, c"a read is in flight on this fetch")
 }
 
 /// An order out: its `WEIDA_ASK_*` kind and the piece index, 0 but for a
@@ -503,7 +567,8 @@ pub unsafe extern "C" fn weida_fetch_fd(f: *const weida_fetch, out: *mut i64) ->
 /// that has not failed this fetch, or when the swarm is gone; connecting a
 /// seeder and reading again resumes. Taking a piece frees its order's
 /// credit, which is the fetch's backpressure. A read in flight keeps its
-/// place across timeouts and `EINTR`.
+/// place across timeouts and `EINTR`; a fetch accessor stops it, and the
+/// next call starts it again, losing nothing.
 ///
 /// # Safety
 ///
@@ -521,20 +586,21 @@ pub unsafe extern "C" fn weida_fetch_next(
         let f = unsafe { borrow(f) }?;
         let piece = f.tried.attempt(timeout_ms, |state, cx| {
             let gathering = state.gathering.get_or_insert_with(|| {
-                let mut fetch = state
-                    .fetch
-                    .take()
-                    .expect("the fetch is held whenever no read is in flight");
-                Box::pin(async move {
-                    let piece = fetch.next().await;
-                    (fetch, piece)
-                })
+                Gathering::start(
+                    state
+                        .fetch
+                        .take()
+                        .expect("the fetch is held whenever no read is in flight"),
+                )
             });
-            match gathering.as_mut().poll(cx) {
-                Poll::Ready((fetch, piece)) => {
+            match gathering.read.as_mut().poll(cx) {
+                Poll::Ready((fetch, ReadEnd::Next(piece))) => {
                     state.gathering = None;
                     state.fetch = Some(fetch);
                     Poll::Ready(piece)
+                }
+                Poll::Ready((_, ReadEnd::Stopped)) => {
+                    unreachable!("only stop_read stops a read, and it takes the read")
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -574,8 +640,9 @@ pub unsafe extern "C" fn weida_fetch_blob(
 
 /// The piece list, once it is known and verified (`Fetch::list`): 1 and a
 /// copy in `*out`, to resume without LIST (`weida_fetch_options_set_list`);
-/// 0 with `*out == NULL` while it is not known. `-WEIDA_EINVAL` while a
-/// `weida_fetch_next` read is in flight.
+/// 0 with `*out == NULL` while it is not known. Answers while a
+/// `weida_fetch_next` read is in flight too: the read is stopped and starts
+/// again at the next call, losing nothing.
 ///
 /// # Safety
 ///
@@ -590,10 +657,7 @@ pub unsafe extern "C" fn weida_fetch_list(
         let out = out_ptr(out)?;
         // SAFETY: forwarded from this function's contract.
         let f = unsafe { borrow(f) }?;
-        let list = f
-            .tried
-            .with(|s| s.fetch.as_ref().map(|f| f.list().cloned()))?
-            .ok_or_else(reading)?;
+        let list = with_fetch(&f, |fetch| fetch.list().cloned())?;
         let (handle, rc) = match list {
             Some(list) => (weida_piece_list::handle(Arc::new(list)), 1),
             None => (ptr::null_mut(), 0),
@@ -605,8 +669,9 @@ pub unsafe extern "C" fn weida_fetch_list(
 }
 
 /// The pieces the caller holds (`Fetch::delivered`): those it started with
-/// and those this fetch yielded, copied into a new map. `-WEIDA_EINVAL`
-/// while a `weida_fetch_next` read is in flight.
+/// and those this fetch yielded, copied into a new map. Answers while a
+/// `weida_fetch_next` read is in flight too: the read is stopped and starts
+/// again at the next call, losing nothing.
 ///
 /// # Safety
 ///
@@ -623,8 +688,9 @@ pub unsafe extern "C" fn weida_fetch_delivered(
 
 /// The pieces ordered of some seeder and not yet taken
 /// (`Fetch::in_flight`): on their way, or verified and waiting for
-/// `weida_fetch_next`, copied into a new map. `-WEIDA_EINVAL` while a
-/// `weida_fetch_next` read is in flight.
+/// `weida_fetch_next`, copied into a new map. Answers while a
+/// `weida_fetch_next` read is in flight too: the read is stopped and starts
+/// again at the next call, losing nothing.
 ///
 /// # Safety
 ///
@@ -637,6 +703,72 @@ pub unsafe extern "C" fn weida_fetch_in_flight(
 ) -> c_int {
     // SAFETY: forwarded from this function's contract.
     unsafe { fetch_bits(f, out, Fetch::in_flight) }
+}
+
+/// The missing pieces that no order fetches and that no seeder of this
+/// fetch holds by its last HAVE answer (`Fetch::unavailable`): what the
+/// caller cannot get until a seeder gains them, copied into a new map.
+/// `weida_fetch_next` keeps waiting for them. A seeder that has not
+/// answered HAVE yet holds nothing here. Answers while a `weida_fetch_next`
+/// read is in flight too: the read is stopped and starts again at the next
+/// call, losing nothing.
+///
+/// # Safety
+///
+/// `f` is NULL or a live fetch; `out` is NULL or writable. Release the
+/// result with `weida_bits_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_unavailable(
+    f: *const weida_fetch,
+    out: *mut *mut weida_bits,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { fetch_bits(f, out, Fetch::unavailable) }
+}
+
+/// Orders the missing pieces in `[start, end)` before any other, in index
+/// order (`Fetch::prioritize`), and orders a prioritized piece once more
+/// from another seeder that holds it when it is in flight longer than
+/// twice the running mean piece time. Replaces an earlier range; indices
+/// past the blob are ignored, and an empty range (`start >= end`) clears
+/// the priority. Takes effect at the next order: orders already written
+/// stay. Never blocks. Answers while a `weida_fetch_next` read is in flight
+/// too: the read is stopped and starts again at the next call, losing
+/// nothing.
+///
+/// # Safety
+///
+/// `f` is NULL or a live fetch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_prioritize(
+    f: *const weida_fetch,
+    start: u32,
+    end: u32,
+) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let f = unsafe { borrow(f) }?;
+        with_fetch(&f, |fetch| fetch.prioritize(start..end))?;
+        Ok(0)
+    })
+}
+
+/// Ends the priority (`Fetch::clear_priority`): claims are rarest first
+/// again. Never blocks. Answers while a `weida_fetch_next` read is in
+/// flight too: the read is stopped and starts again at the next call,
+/// losing nothing.
+///
+/// # Safety
+///
+/// `f` is NULL or a live fetch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_fetch_clear_priority(f: *const weida_fetch) -> c_int {
+    guard(|| {
+        // SAFETY: forwarded from this function's contract.
+        let f = unsafe { borrow(f) }?;
+        with_fetch(&f, Fetch::clear_priority)?;
+        Ok(0)
+    })
 }
 
 /// A map of the fetch, written to `out`.
@@ -653,14 +785,28 @@ unsafe fn fetch_bits(
         let out = out_ptr(out)?;
         // SAFETY: forwarded from this function's contract.
         let f = unsafe { borrow(f) }?;
-        let bits = f
-            .tried
-            .with(|s| s.fetch.as_ref().map(map))?
-            .ok_or_else(reading)?;
+        let bits = with_fetch(&f, |fetch| map(fetch))?;
         // SAFETY: `out` passed `out_ptr`.
         unsafe { write_out(out, weida_bits::handle(bits)) };
         Ok(0)
     })
+}
+
+/// Runs `use_fetch` on the fetch, first stopping a `weida_fetch_next` read
+/// in flight; a reader waiting on the descriptor is woken to read again.
+fn with_fetch<R>(f: &weida_fetch, use_fetch: impl FnOnce(&mut Fetch) -> R) -> Result<R, c_int> {
+    let (out, stopped) = f.tried.with(|state| {
+        let stopped = state.stop_read();
+        let fetch = state
+            .fetch
+            .as_mut()
+            .expect("the fetch is held whenever no read is in flight");
+        (use_fetch(fetch), stopped)
+    })?;
+    if stopped {
+        f.tried.wake();
+    }
+    Ok(out)
 }
 
 /// Releases a fetch, which aborts every order it has in flight; the pieces
@@ -960,7 +1106,8 @@ pub unsafe extern "C" fn weida_seed_session_fd(
 /// (`SeedSession::next`): 1 with its `WEIDA_ASK_*` kind in `*out_ask` and,
 /// for a PIECE, the piece index in `*out_index` (0 otherwise); 0 once the
 /// fetch finished its orders, the outs untouched. Answer each order with the
-/// `weida_seed_session_answer_*` that matches it before the next call.
+/// `weida_seed_session_answer_*` that matches it (a PIECE no longer held
+/// with `weida_seed_session_answer_gone`) before the next call.
 ///
 /// Waits as long as the fetch sends none: its idleness is its backpressure.
 /// `-WEIDA_EPROTOCOL` while the order before is unanswered, for an order
@@ -1262,6 +1409,89 @@ pub unsafe extern "C" fn weida_seed_session_answer_piece_op_wait(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn weida_seed_session_answer_piece_op_drop(
     op: *mut weida_seed_session_answer_piece_op,
+) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_drop(op) }
+}
+
+/// Answers `WEIDA_ASK_PIECE` `index` with "no longer held"
+/// (`SeedSession::answer_gone`): the piece changed or went away since this
+/// seeder said HAVE. The fetch drops the piece from this seeder's map,
+/// orders it elsewhere and keeps the session; it asks HAVE again at the
+/// seeder's next refresh. A version-1 ask has no such answer: it is refused
+/// as `weida_seed_session_decline` refuses it, and that fetch drops this
+/// seeder.
+///
+/// Never blocks; the answer runs as the op written to `out`. `-WEIDA_EINVAL`
+/// while a `next` or another answer holds the session.
+///
+/// # Safety
+///
+/// `s` is NULL or a live session; `out` is NULL or writable. Release the op
+/// with `weida_seed_session_answer_gone_op_drop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_seed_session_answer_gone(
+    s: *const weida_seed_session,
+    index: u32,
+    out: *mut *mut weida_seed_session_answer_gone_op,
+) -> c_int {
+    guard(|| {
+        let out = out_ptr(out)?;
+        // SAFETY: forwarded from this function's contract.
+        let s = unsafe { borrow(s) }?;
+        let mut held = s.hold()?;
+        let op = Op::start(&s.exec, async move {
+            match held.as_mut() {
+                Some(session) => session.answer_gone(index).await,
+                None => Err(Error::Canceled),
+            }
+        });
+        // SAFETY: `out` passed `out_ptr`.
+        unsafe { write_out(out, into_handle(weida_seed_session_answer_gone_op { op })) };
+        Ok(0)
+    })
+}
+
+/// The readiness descriptor of a gone answer op: readable once it
+/// finished.
+///
+/// # Safety
+///
+/// `op` is NULL or a live gone answer op; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_seed_session_answer_gone_op_fd(
+    op: *const weida_seed_session_answer_gone_op,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { op_fd(op, out) }
+}
+
+/// Waits up to `timeout_ms` (R4) for the answer: 0 once it was written.
+/// `-WEIDA_EPROTOCOL` when the order was not PIECE `index`; the session is
+/// then refused.
+///
+/// # Safety
+///
+/// `op` is NULL or a live gone answer op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_seed_session_answer_gone_op_wait(
+    op: *const weida_seed_session_answer_gone_op,
+    timeout_ms: i64,
+) -> c_int {
+    // SAFETY: forwarded from this function's contract.
+    guard(|| unsafe { op_wait(op, timeout_ms) }.map(|()| 0))
+}
+
+/// Releases a gone answer op, aborting the answer when unfinished. NULL
+/// does nothing.
+///
+/// # Safety
+///
+/// `op` is NULL or a live gone answer op, dropped at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn weida_seed_session_answer_gone_op_drop(
+    op: *mut weida_seed_session_answer_gone_op,
 ) {
     // SAFETY: forwarded from this function's contract.
     unsafe { op_drop(op) }

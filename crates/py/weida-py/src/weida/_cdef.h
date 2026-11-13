@@ -452,6 +452,8 @@ typedef struct weida_runtime_shutdown_op weida_runtime_shutdown_op;
 
 typedef struct weida_seed_session weida_seed_session;
 
+typedef struct weida_seed_session_answer_gone_op weida_seed_session_answer_gone_op;
+
 typedef struct weida_seed_session_answer_have_op weida_seed_session_answer_have_op;
 
 typedef struct weida_seed_session_answer_list_op weida_seed_session_answer_list_op;
@@ -1666,6 +1668,10 @@ const char *weida_relay_request_target(const weida_relay_request *q, size_t *len
 
 int weida_relay_request_admit(weida_relay_request *q, weida_relay_request_admit_op **out);
 
+int weida_relay_request_admit_with(weida_relay_request *q,
+                                   uint64_t bytes_per_sec,
+                                   weida_relay_request_admit_op **out);
+
 int weida_relay_request_admit_op_fd(const weida_relay_request_admit_op *op, int64_t *out);
 
 int weida_relay_request_admit_op_wait(const weida_relay_request_admit_op *op, int64_t timeout_ms);
@@ -2135,6 +2141,12 @@ int weida_fetch_delivered(const weida_fetch *f, weida_bits **out);
 
 int weida_fetch_in_flight(const weida_fetch *f, weida_bits **out);
 
+int weida_fetch_unavailable(const weida_fetch *f, weida_bits **out);
+
+int weida_fetch_prioritize(const weida_fetch *f, uint32_t start, uint32_t end);
+
+int weida_fetch_clear_priority(const weida_fetch *f);
+
 void weida_fetch_drop(weida_fetch *f);
 
 uint32_t weida_piece_index(const weida_piece *p);
@@ -2200,6 +2212,17 @@ int weida_seed_session_answer_piece_op_wait(const weida_seed_session_answer_piec
                                             int64_t timeout_ms);
 
 void weida_seed_session_answer_piece_op_drop(weida_seed_session_answer_piece_op *op);
+
+int weida_seed_session_answer_gone(const weida_seed_session *s,
+                                   uint32_t index,
+                                   weida_seed_session_answer_gone_op **out);
+
+int weida_seed_session_answer_gone_op_fd(const weida_seed_session_answer_gone_op *op, int64_t *out);
+
+int weida_seed_session_answer_gone_op_wait(const weida_seed_session_answer_gone_op *op,
+                                           int64_t timeout_ms);
+
+void weida_seed_session_answer_gone_op_drop(weida_seed_session_answer_gone_op *op);
 
 int weida_seed_session_decline(weida_seed_session *s, weida_seed_session_decline_op **out);
 
