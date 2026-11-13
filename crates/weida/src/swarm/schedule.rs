@@ -11,6 +11,7 @@
 //! rate in pieces.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -114,8 +115,9 @@ impl Holder {
 /// seeder's credit and the fetch's `max_inflight`.
 ///
 /// Every step costs at most the orders in flight, except a claim that the
-/// free pieces' random probes miss, which reads the bit maps once: a fetch
-/// of [`super::MAX_PIECES`] pieces stays linear in its pieces rather than
+/// free pieces' random probes miss, which reads at most one bit map per
+/// availability level ([`RARE_LEVELS`]) once: a fetch of
+/// [`super::MAX_PIECES`] pieces stays linear in its pieces rather than
 /// scanning all of them for every order.
 pub(super) struct Scheduler {
     per_peer: usize,
@@ -132,6 +134,14 @@ pub(super) struct Scheduler {
     free_count: u32,
     /// Bumped whenever a piece becomes free again.
     free_gen: u64,
+    /// The free pieces by how many seeders hold them.
+    rarity: Rarity,
+    /// The pieces ordered before any other ([`Scheduler::set_priority`]).
+    priority: Option<Range<u32>>,
+    /// The lowest prioritized piece not yet delivered.
+    floor: u32,
+    /// The running mean time from a piece's order to its arrival.
+    piece_time: Option<Duration>,
     list_known: bool,
     /// A LIST is ordered.
     listing: bool,
@@ -139,8 +149,15 @@ pub(super) struct Scheduler {
     holders: HashMap<Arc<str>, Holder>,
     /// The orders of each piece.
     inflight: HashMap<u32, Vec<u64>>,
-    orders: HashMap<u64, (Arc<str>, Ask)>,
+    orders: HashMap<u64, Order>,
     next_order: u64,
+}
+
+/// One order: of which seeder, what, and when it was planned.
+struct Order {
+    url: Arc<str>,
+    ask: Ask,
+    at: Instant,
 }
 
 impl Scheduler {
@@ -166,9 +183,13 @@ impl Scheduler {
             piece: blob.piece().bytes(),
             delivered,
             missing,
+            rarity: Rarity::new(&free),
             free,
             free_count: missing,
             free_gen: 0,
+            priority: None,
+            floor: 0,
+            piece_time: None,
             list_known,
             listing: false,
             holders: HashMap::new(),
@@ -189,7 +210,13 @@ impl Scheduler {
     /// Forgets a seeder and its orders; returns the ids of those orders.
     pub(super) fn remove(&mut self, url: &str) -> Vec<u64> {
         let ids = self.release(url);
-        self.holders.remove(url);
+        if let Some(holder) = self.holders.remove(url)
+            && let Some(have) = holder.have
+        {
+            for index in set_indices(have.as_bytes().iter().copied()) {
+                self.rarity.unhold(index);
+            }
+        }
         ids
     }
 
@@ -199,7 +226,7 @@ impl Scheduler {
         let ids: Vec<u64> = self
             .orders
             .iter()
-            .filter(|(_, (owner, _))| &**owner == url)
+            .filter(|(_, order)| &*order.url == url)
             .map(|(&id, _)| id)
             .collect();
         for &id in &ids {
@@ -210,12 +237,15 @@ impl Scheduler {
 
     /// The seeder and ask of order `id`, while it holds its credit.
     pub(super) fn order(&self, id: u64) -> Option<(Arc<str>, Ask)> {
-        self.orders.get(&id).cloned()
+        self.orders
+            .get(&id)
+            .map(|order| (Arc::clone(&order.url), order.ask))
     }
 
     /// Every order there is credit for now: LIST once of any seeder, HAVE
-    /// first of each, then claims, then a HAVE again of a seeder that has
-    /// been idle for `have_refresh`. Each is recorded as ordered.
+    /// first of each, then a late prioritized piece once more, then claims,
+    /// then a HAVE again of a seeder that has been idle for `have_refresh`.
+    /// Each is recorded as ordered.
     pub(super) fn plan(&mut self, now: Instant, rng: &mut impl Rng) -> Vec<(u64, Arc<str>, Ask)> {
         let mut out = Vec::new();
         let urls: Vec<Arc<str>> = self.holders.keys().cloned().collect();
@@ -224,13 +254,13 @@ impl Scheduler {
             && !self.listing
             && let Some(url) = urls.iter().find(|url| self.room(url))
         {
-            out.push(self.record(url, Ask::List));
+            out.push(self.record(url, Ask::List, now));
         }
 
         for url in &urls {
             let holder = &self.holders[url];
             if holder.have.is_none() && !holder.asking_have && self.room(url) {
-                out.push(self.record(url, Ask::Have));
+                out.push(self.record(url, Ask::Have, now));
             }
         }
 
@@ -241,21 +271,18 @@ impl Scheduler {
                     let Some(have) = holder.have.as_ref() else {
                         break;
                     };
-                    let free = (self.free_count > 0).then_some(&self.free);
-                    if free.is_some() && holder.dry == Some(self.free_gen) {
+                    if let Some(index) = self.late(url, have, now) {
+                        out.push(self.record(url, Ask::Piece(index), now));
+                        continue;
+                    }
+                    let free = self.free_count > 0;
+                    if free && holder.dry == Some(self.free_gen) {
                         break;
                     }
-                    match claim(
-                        free,
-                        have,
-                        &self.delivered,
-                        &self.inflight,
-                        &holder.mine,
-                        rng,
-                    ) {
-                        Some(index) => out.push(self.record(url, Ask::Piece(index))),
+                    match self.claim_for(url, rng) {
+                        Some(index) => out.push(self.record(url, Ask::Piece(index), now)),
                         None => {
-                            if free.is_some() {
+                            if free {
                                 let generation = self.free_gen;
                                 if let Some(holder) = self.holders.get_mut(url) {
                                     holder.dry = Some(generation);
@@ -274,10 +301,99 @@ impl Scheduler {
                 .have_at
                 .is_some_and(|at| now >= at + self.have_refresh);
             if due && holder.busy == 0 && self.room(url) {
-                out.push(self.record(url, Ask::Have));
+                out.push(self.record(url, Ask::Have, now));
             }
         }
         out
+    }
+
+    /// The next piece `url`'s seeder should fetch, or `None`: a free
+    /// prioritized piece first, then the rarest free piece, and in the
+    /// endgame a second copy ([`claim`]).
+    fn claim_for(&self, url: &str, rng: &mut impl Rng) -> Option<u32> {
+        let holder = self.holders.get(url)?;
+        let have = holder.have.as_ref()?;
+        self.claim_priority(have).or_else(|| {
+            claim(
+                (self.free_count > 0).then_some(&self.rarity),
+                have,
+                &self.delivered,
+                &self.inflight,
+                &holder.mine,
+                rng,
+            )
+        })
+    }
+
+    /// The lowest free prioritized piece `have` holds.
+    fn claim_priority(&self, have: &Bits) -> Option<u32> {
+        let range = self.priority.as_ref()?;
+        (self.floor..range.end).find(|&index| self.free.get(index) && have.get(index))
+    }
+
+    /// The lowest prioritized piece that one order of another seeder than
+    /// `url` has fetched for at least twice the mean piece time, and that
+    /// `have` holds: it is ordered once more.
+    fn late(&self, url: &str, have: &Bits, now: Instant) -> Option<u32> {
+        let range = self.priority.as_ref()?;
+        let mean = self.piece_time?;
+        self.inflight
+            .iter()
+            .filter_map(|(&index, ids)| {
+                if !range.contains(&index) || self.delivered.get(index) || !have.get(index) {
+                    return None;
+                }
+                let [id] = ids.as_slice() else {
+                    return None;
+                };
+                let order = self.orders.get(id)?;
+                (&*order.url != url && now >= order.at + mean * 2).then_some(index)
+            })
+            .min()
+    }
+
+    /// When the next prioritized piece in flight becomes late, strictly
+    /// after `now`: a late piece that no other seeder can take now is
+    /// looked at again at the next event, not in a loop.
+    pub(super) fn next_late(&self, now: Instant) -> Option<Instant> {
+        let range = self.priority.as_ref()?;
+        let mean = self.piece_time?;
+        self.inflight
+            .iter()
+            .filter(|(index, ids)| {
+                range.contains(index) && !self.delivered.get(**index) && ids.len() == 1
+            })
+            .filter_map(|(_, ids)| self.orders.get(&ids[0]).map(|order| order.at + mean * 2))
+            .filter(|&due| due > now)
+            .min()
+    }
+
+    /// Orders the missing pieces of `pieces` first, in index order, and
+    /// lets a late one be ordered once more ([`Scheduler::plan`]). Indices
+    /// past the blob are ignored; an empty range clears the priority.
+    pub(super) fn set_priority(&mut self, pieces: Range<u32>) {
+        let end = pieces.end.min(self.delivered.len());
+        if pieces.start >= end {
+            self.priority = None;
+            return;
+        }
+        self.priority = Some(pieces.start..end);
+        self.floor = pieces.start;
+        self.advance_floor();
+    }
+
+    /// Ends the priority.
+    pub(super) fn clear_priority(&mut self) {
+        self.priority = None;
+    }
+
+    /// Moves the floor past the delivered prioritized pieces.
+    fn advance_floor(&mut self) {
+        if let Some(range) = &self.priority {
+            while self.floor < range.end && self.delivered.get(self.floor) {
+                self.floor += 1;
+            }
+        }
     }
 
     /// Whether `url`'s seeder may be given one more order.
@@ -289,8 +405,24 @@ impl Scheduler {
                 .is_some_and(|holder| holder.busy < holder.depth)
     }
 
-    /// Records one order of `url`'s seeder.
-    fn record(&mut self, url: &Arc<str>, ask: Ask) -> (u64, Arc<str>, Ask) {
+    /// Marks piece `index` free or not; whether that changed it.
+    fn set_free(&mut self, index: u32, on: bool) -> bool {
+        if index >= self.free.len() || self.free.get(index) == on {
+            return false;
+        }
+        self.free.set(index, on);
+        if on {
+            self.free_count += 1;
+            self.rarity.insert(index);
+        } else {
+            self.free_count -= 1;
+            self.rarity.remove(index);
+        }
+        true
+    }
+
+    /// Records one order of `url`'s seeder, planned at `now`.
+    fn record(&mut self, url: &Arc<str>, ask: Ask, now: Instant) -> (u64, Arc<str>, Ask) {
         let id = self.next_order;
         self.next_order += 1;
         let holder = self
@@ -304,26 +436,30 @@ impl Scheduler {
             Ask::Piece(index) => {
                 holder.mine.insert(index);
                 self.inflight.entry(index).or_default().push(id);
-                if self.free.get(index) {
-                    self.free.set(index, false);
-                    self.free_count -= 1;
-                }
+                self.set_free(index, false);
             }
         }
-        self.orders.insert(id, (Arc::clone(url), ask));
+        self.orders.insert(
+            id,
+            Order {
+                url: Arc::clone(url),
+                ask,
+                at: now,
+            },
+        );
         (id, Arc::clone(url), ask)
     }
 
     /// Ends order `id` and releases its credit: its answer was taken, or it
     /// failed. `piece` is the payload length of a piece answer and when it
-    /// arrived, which sets its seeder's depth. `None` for an order this
-    /// scheduler no longer holds.
+    /// arrived, which sets its seeder's depth and the mean piece time.
+    /// `None` for an order this scheduler no longer holds.
     pub(super) fn finish(
         &mut self,
         id: u64,
         piece: Option<(u64, Instant)>,
     ) -> Option<(Arc<str>, Ask)> {
-        let (url, ask) = self.orders.remove(&id)?;
+        let Order { url, ask, at } = self.orders.remove(&id)?;
         match ask {
             Ask::List => self.listing = false,
             Ask::Have => {}
@@ -338,11 +474,17 @@ impl Scheduler {
                 // is free again, which may give a dry seeder something.
                 if !self.inflight.contains_key(&index)
                     && !self.delivered.get(index)
-                    && !self.free.get(index)
+                    && self.set_free(index, true)
                 {
-                    self.free.set(index, true);
-                    self.free_count += 1;
                     self.free_gen += 1;
+                }
+                if let Some((_, arrived)) = piece {
+                    // RFC 6298's smoothed round-trip time, weight 1/8.
+                    let sample = arrived.saturating_duration_since(at);
+                    self.piece_time = Some(match self.piece_time {
+                        None => sample,
+                        Some(mean) => mean * 7 / 8 + sample / 8,
+                    });
                 }
             }
         }
@@ -370,10 +512,8 @@ impl Scheduler {
         }
         self.delivered.set(index, true);
         self.missing -= 1;
-        if self.free.get(index) {
-            self.free.set(index, false);
-            self.free_count -= 1;
-        }
+        self.set_free(index, false);
+        self.advance_floor();
         Some(self.inflight.get(&index).cloned().unwrap_or_default())
     }
 
@@ -384,11 +524,26 @@ impl Scheduler {
 
     /// Records what `url`'s seeder holds, as of `now`.
     pub(super) fn set_have(&mut self, url: &str, have: Bits, now: Instant) {
-        if let Some(holder) = self.holders.get_mut(url) {
-            holder.have = Some(have);
-            holder.have_at = Some(now);
-            holder.dry = None;
+        let Some(holder) = self.holders.get_mut(url) else {
+            return;
+        };
+        let old = holder.have.take().unwrap_or_else(|| Bits::new(have.len()));
+        debug_assert_eq!(old.len(), have.len(), "a HAVE has one bit per piece");
+        let changed = old
+            .as_bytes()
+            .iter()
+            .zip(have.as_bytes())
+            .map(|(old, new)| old ^ new);
+        for index in set_indices(changed) {
+            if have.get(index) {
+                self.rarity.hold(index);
+            } else {
+                self.rarity.unhold(index);
+            }
         }
+        holder.have = Some(have);
+        holder.have_at = Some(now);
+        holder.dry = None;
     }
 
     /// The piece list is known: pieces can be claimed.
@@ -412,6 +567,11 @@ impl Scheduler {
         bits
     }
 
+    /// The free pieces no seeder holds by its last HAVE.
+    pub(super) fn unavailable(&self) -> Bits {
+        self.rarity.unheld().clone()
+    }
+
     /// Whether no order holds credit.
     pub(super) fn idle(&self) -> bool {
         self.orders.is_empty()
@@ -428,21 +588,144 @@ impl Scheduler {
     }
 }
 
+/// The indices of the set bits of `bytes`, laid out as [`Bits::as_bytes`].
+fn set_indices(bytes: impl Iterator<Item = u8>) -> impl Iterator<Item = u32> {
+    (0u32..).zip(bytes).flat_map(|(at, mut byte)| {
+        std::iter::from_fn(move || {
+            (byte != 0).then(|| {
+                let bit = byte.trailing_zeros();
+                byte &= byte - 1;
+                at * 8 + bit
+            })
+        })
+    })
+}
+
+/// Levels above this share one: past this many holders a piece is common.
+const RARE_LEVELS: usize = 16;
+
+/// The free pieces by how many seeders hold them, for rarest-first claims.
+struct Rarity {
+    /// Per piece, how many seeders' last HAVE holds it.
+    avail: Vec<u32>,
+    /// `levels[l]`: the free pieces whose `avail.min(RARE_LEVELS - 1)` is
+    /// `l`; created on first use.
+    levels: Vec<Bits>,
+    /// Ones in each level.
+    counts: Vec<u32>,
+}
+
+impl Rarity {
+    /// Every piece held by none; `free` all in level 0.
+    fn new(free: &Bits) -> Rarity {
+        Rarity {
+            avail: vec![0; free.len() as usize],
+            levels: vec![free.clone()],
+            counts: vec![free.ones()],
+        }
+    }
+
+    /// The level of a piece `avail` seeders hold.
+    fn level(avail: u32) -> usize {
+        (avail as usize).min(RARE_LEVELS - 1)
+    }
+
+    /// One more seeder holds `index`.
+    fn hold(&mut self, index: u32) {
+        self.shift(index, true);
+    }
+
+    /// One seeder fewer holds `index`.
+    fn unhold(&mut self, index: u32) {
+        self.shift(index, false);
+    }
+
+    fn shift(&mut self, index: u32, up: bool) {
+        let Some(avail) = self.avail.get_mut(index as usize) else {
+            return;
+        };
+        let from = Rarity::level(*avail);
+        *avail = if up {
+            avail.saturating_add(1)
+        } else {
+            avail.saturating_sub(1)
+        };
+        let to = Rarity::level(*avail);
+        if from != to && self.clear(from, index) {
+            self.put(to, index);
+        }
+    }
+
+    /// `index` became free.
+    fn insert(&mut self, index: u32) {
+        if let Some(&avail) = self.avail.get(index as usize) {
+            self.put(Rarity::level(avail), index);
+        }
+    }
+
+    /// `index` stopped being free.
+    fn remove(&mut self, index: u32) {
+        if let Some(&avail) = self.avail.get(index as usize) {
+            self.clear(Rarity::level(avail), index);
+        }
+    }
+
+    fn put(&mut self, level: usize, index: u32) {
+        let len = self.levels[0].len();
+        while self.levels.len() <= level {
+            self.levels.push(Bits::new(len));
+            self.counts.push(0);
+        }
+        if !self.levels[level].get(index) {
+            self.levels[level].set(index, true);
+            self.counts[level] += 1;
+        }
+    }
+
+    /// Clears `index` in `level`; whether it was set.
+    fn clear(&mut self, level: usize, index: u32) -> bool {
+        match self.levels.get_mut(level) {
+            Some(bits) if bits.get(index) => {
+                bits.set(index, false);
+                self.counts[level] -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The rarest free piece `have` holds, ties uniform. Level 0 is
+    /// skipped: a piece a seeder holds is held by at least one.
+    fn claim(&self, have: &Bits, rng: &mut impl Rng) -> Option<u32> {
+        self.levels
+            .iter()
+            .zip(&self.counts)
+            .skip(1)
+            .filter(|&(_, &count)| count > 0)
+            .find_map(|(level, _)| claim_free(level, have, rng))
+    }
+
+    /// The free pieces no seeder holds.
+    fn unheld(&self) -> &Bits {
+        &self.levels[0]
+    }
+}
+
 /// Random probes of the free pieces a claim makes before it reads the bit
 /// maps whole.
 const PROBES: usize = 64;
 
 /// The next piece one seeder should fetch, or `None`.
 ///
-/// `free` is the missing pieces no one is fetching, `None` when there are
-/// none. Candidates are the pieces the caller lacks, the seeder holds and
-/// the seeder is not already fetching. A free candidate wins, chosen
-/// uniformly. Only when **no** piece is free (the endgame, every missing
-/// piece in flight somewhere) does a seeder fetch a second copy, of the
-/// candidate with the fewest copies, so a slow seeder cannot hold up the
-/// last pieces.
+/// `free` is the missing pieces no one is fetching by how many seeders hold
+/// them, `None` when there are none. Candidates are the pieces the caller
+/// lacks, the seeder holds and the seeder is not already fetching. A free
+/// candidate wins: the rarest free candidate, ties uniform. Only when
+/// **no** piece is free (the endgame, every missing piece in flight
+/// somewhere) does a seeder fetch a second copy, of the candidate with the
+/// fewest copies, so a slow seeder cannot hold up the last pieces.
 fn claim(
-    free: Option<&Bits>,
+    free: Option<&Rarity>,
     have: &Bits,
     delivered: &Bits,
     inflight: &HashMap<u32, Vec<u64>>,
@@ -450,7 +733,7 @@ fn claim(
     rng: &mut impl Rng,
 ) -> Option<u32> {
     match free {
-        Some(free) => claim_free(free, have, rng),
+        Some(rarity) => rarity.claim(have, rng),
         None => claim_copy(have, delivered, inflight, mine, rng),
     }
 }
@@ -563,7 +846,11 @@ mod tests {
             delivered.len(),
             (0..delivered.len()).filter(|&i| !delivered.get(i) && !inflight.contains_key(&i)),
         );
-        let free = (free.ones() > 0).then_some(&free);
+        let mut rarity = Rarity::new(&free);
+        for index in set_indices(have.as_bytes().iter().copied()) {
+            rarity.hold(index);
+        }
+        let free = (free.ones() > 0).then_some(&rarity);
         claim(free, have, delivered, inflight, mine, rng)
     }
 
@@ -769,16 +1056,44 @@ mod tests {
     }
 
     /// The scheduler's bookkeeping against its definition: a piece is free
-    /// exactly when the caller lacks it and no order fetches it.
+    /// exactly when the caller lacks it and no order fetches it, and each
+    /// free piece sits in the availability level of its holder count.
     fn assert_consistent(scheduler: &Scheduler) {
         let len = scheduler.delivered.len();
+        let rarity = &scheduler.rarity;
         for index in 0..len {
+            let free = scheduler.free.get(index);
             assert_eq!(
-                scheduler.free.get(index),
+                free,
                 !scheduler.delivered.get(index) && !scheduler.inflight.contains_key(&index),
                 "piece {index}"
             );
+            let holders = scheduler
+                .holders
+                .values()
+                .filter(|holder| holder.have.as_ref().is_some_and(|have| have.get(index)))
+                .count();
+            let avail = rarity.avail[index as usize];
+            assert_eq!(avail as usize, holders, "holders of piece {index}");
+            let level = Rarity::level(avail);
+            if free {
+                assert!(
+                    rarity.levels.get(level).is_some_and(|bits| bits.get(index)),
+                    "free piece {index} in level {level}"
+                );
+            }
+            for (l, bits) in rarity.levels.iter().enumerate() {
+                assert_eq!(
+                    bits.get(index),
+                    free && l == level,
+                    "piece {index} in level {l}"
+                );
+            }
         }
+        for (bits, &count) in rarity.levels.iter().zip(&rarity.counts) {
+            assert_eq!(bits.ones(), count);
+        }
+        assert_eq!(rarity.levels.len(), rarity.counts.len());
         assert_eq!(scheduler.free_count, scheduler.free.ones());
         assert_eq!(scheduler.missing, len - scheduler.delivered.ones());
     }
@@ -892,5 +1207,168 @@ mod tests {
             _ => u32::MAX,
         });
         assert_eq!(again, [Ask::Piece(0), Ask::Piece(1)]);
+    }
+
+    /// 64 pieces of [`PieceSize::MIN`], the list known, with `holders`.
+    fn with_holders(holders: &[(&str, Bits)], per_peer: usize, now: Instant) -> Scheduler {
+        let blob = Blob::new(
+            BlobId::from_bytes([7; 32]),
+            64 * PieceSize::MIN.bytes(),
+            PieceSize::MIN,
+        )
+        .expect("a valid blob");
+        let options = FetchOptions {
+            per_peer,
+            ..FetchOptions::default()
+        };
+        let mut scheduler = Scheduler::new(blob, Bits::new(64), true, &options);
+        for (url, have) in holders {
+            scheduler.add(Arc::from(*url));
+            scheduler.set_have(url, have.clone(), now);
+        }
+        scheduler
+    }
+
+    /// `a` holds every piece, `b` and `c` every piece but 5.
+    fn five_is_rare(now: Instant) -> Scheduler {
+        let all_but_5 = bits(64, (0..64).filter(|&i| i != 5));
+        with_holders(
+            &[
+                ("a", Bits::full(64)),
+                ("b", all_but_5.clone()),
+                ("c", all_but_5),
+            ],
+            8,
+            now,
+        )
+    }
+
+    #[test]
+    fn the_rarest_piece_is_claimed_first() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let scheduler = five_is_rare(Instant::now());
+        assert_consistent(&scheduler);
+        for _ in 0..20 {
+            assert_eq!(scheduler.claim_for("a", &mut rng), Some(5));
+            let index = scheduler.claim_for("b", &mut rng);
+            assert!(index.is_some_and(|i| i != 5), "{index:?}");
+        }
+    }
+
+    #[test]
+    fn prioritized_pieces_are_claimed_first_in_index_order() {
+        let mut rng = StdRng::seed_from_u64(14);
+        let t = Instant::now();
+        let mut scheduler = one_holder(PieceSize::MIN, 8, t);
+        scheduler.set_priority(10..14);
+        let mut open = Vec::new();
+        let mut asked = Vec::new();
+        while asked.len() < 4 {
+            for (id, _, ask) in scheduler.plan(t, &mut rng) {
+                open.push(id);
+                asked.push(ask);
+            }
+            take(&mut scheduler, &mut open, 1024, t, &mut rng);
+        }
+        assert_eq!(
+            asked[..4],
+            [
+                Ask::Piece(10),
+                Ask::Piece(11),
+                Ask::Piece(12),
+                Ask::Piece(13)
+            ]
+        );
+    }
+
+    #[test]
+    fn priority_wins_over_rarity() {
+        let mut rng = StdRng::seed_from_u64(15);
+        let mut scheduler = five_is_rare(Instant::now());
+        scheduler.set_priority(0..2);
+        assert_eq!(scheduler.claim_for("a", &mut rng), Some(0));
+        scheduler.clear_priority();
+        assert_eq!(scheduler.claim_for("a", &mut rng), Some(5));
+    }
+
+    #[test]
+    fn clearing_the_priority_restores_the_normal_claims() {
+        let t = Instant::now();
+        let run = |prioritized: bool| {
+            let mut rng = StdRng::seed_from_u64(16);
+            let mut scheduler = one_holder(PieceSize::MIN, 8, t);
+            if prioritized {
+                scheduler.set_priority(10..14);
+                scheduler.clear_priority();
+            }
+            let mut asked = Vec::new();
+            for _ in 0..20 {
+                for (id, _, ask) in scheduler.plan(t, &mut rng) {
+                    asked.push(ask);
+                    if let Ask::Piece(index) = ask {
+                        scheduler.deliver(index);
+                    }
+                    scheduler.finish(id, Some((1024, t)));
+                }
+            }
+            asked
+        };
+        let plain = run(false);
+        assert!(plain.len() >= 20, "{plain:?}");
+        assert_eq!(run(true), plain);
+    }
+
+    #[test]
+    fn a_late_prioritized_piece_is_ordered_once_more_from_another_seeder() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut scheduler = one_holder(PieceSize::MIN, 8, t0);
+        scheduler.set_priority(0..1);
+        let first = scheduler.plan(t0, &mut rng);
+        assert_eq!((&*first[0].1, first[0].2), ("a", Ask::Piece(0)));
+
+        scheduler.add(Arc::from("b"));
+        scheduler.set_have("b", Bits::full(64), t0);
+        let of_b = scheduler.plan(t0, &mut rng);
+        assert!(!of_b.is_empty());
+        assert!(of_b.iter().all(|&(_, _, ask)| ask != Ask::Piece(0)));
+        // `b`'s pieces arrive 10 ms after their order: the mean is 10 ms.
+        for &(id, _, ask) in &of_b {
+            let Ask::Piece(index) = ask else {
+                panic!("{ask:?}");
+            };
+            scheduler.deliver(index);
+            scheduler.finish(id, Some((1024, t0 + ms(10))));
+        }
+        assert_eq!(scheduler.piece_time, Some(ms(10)));
+        assert_eq!(scheduler.next_late(t0 + ms(15)), Some(t0 + ms(20)));
+        let early = scheduler.plan(t0 + ms(15), &mut rng);
+        assert!(early.iter().all(|&(_, _, ask)| ask != Ask::Piece(0)));
+
+        // One more of `b`'s orders taken, 10 ms after it was ordered: past
+        // twice the mean, piece 0 goes to `b` as well.
+        let (id, _, ask) = early[0];
+        assert_eq!(&*early[0].1, "b");
+        let Ask::Piece(index) = ask else {
+            panic!("{ask:?}");
+        };
+        scheduler.deliver(index);
+        scheduler.finish(id, Some((1024, t0 + ms(25))));
+        let late = scheduler.plan(t0 + ms(25), &mut rng);
+        let first_of_b = late
+            .iter()
+            .find(|(_, url, _)| &**url == "b")
+            .expect("b has room again");
+        assert_eq!(first_of_b.2, Ask::Piece(0));
+        assert_eq!(scheduler.next_late(t0 + ms(25)), None, "two copies now");
+
+        // Two copies in flight: nobody orders a third.
+        scheduler.add(Arc::from("c"));
+        scheduler.set_have("c", Bits::full(64), t0 + ms(25));
+        let of_c = scheduler.plan(t0 + ms(25), &mut rng);
+        assert!(!of_c.is_empty());
+        assert!(of_c.iter().all(|&(_, _, ask)| ask != Ask::Piece(0)));
+        assert_consistent(&scheduler);
     }
 }

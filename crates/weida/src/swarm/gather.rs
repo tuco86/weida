@@ -9,6 +9,7 @@
 //! seeder that only speaks version 1.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -335,6 +336,29 @@ impl Fetch {
         self.scheduler.in_flight()
     }
 
+    /// Orders the missing pieces in `pieces` before any other, in index
+    /// order, and orders a prioritized piece once more from another seeder
+    /// that holds it when it is in flight longer than twice the running mean
+    /// piece time. Replaces an earlier range; indices past the blob are
+    /// ignored, and an empty range clears the priority. Takes effect at the
+    /// next order: orders already written stay.
+    pub fn prioritize(&mut self, pieces: Range<u32>) {
+        self.scheduler.set_priority(pieces);
+    }
+
+    /// Ends the priority: claims are rarest first again.
+    pub fn clear_priority(&mut self) {
+        self.scheduler.clear_priority();
+    }
+
+    /// The missing pieces that no order fetches and that no seeder of this
+    /// fetch holds by its last HAVE answer: what the caller cannot get until
+    /// a seeder gains them (a seeder that has not answered HAVE yet holds
+    /// nothing here). `next` keeps waiting for them.
+    pub fn unavailable(&self) -> Bits {
+        self.scheduler.unavailable()
+    }
+
     /// The next verified piece, or `None` once the caller holds every piece.
     ///
     /// Taking a piece frees its order's credit, so this is where the next
@@ -364,7 +388,11 @@ impl Fetch {
                 {
                     return Some(Err(Error::NotConnected));
                 }
-                self.scheduler.next_refresh()
+                let now = self.exec.now();
+                [self.scheduler.next_refresh(), self.scheduler.next_late(now)]
+                    .into_iter()
+                    .flatten()
+                    .min()
             };
             let sleep = refresh.map(|at| {
                 self.exec

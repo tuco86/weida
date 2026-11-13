@@ -6,7 +6,7 @@
 
 use crate::common;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -123,6 +123,13 @@ enum Behavior {
     Slow(Duration),
     /// Whatever a fetch in progress has gathered so far.
     Relay(Arc<Mutex<Relay>>),
+    /// Honest, but the PIECE ask for `piece` is answered only after
+    /// `delay`, and `answered` set once it is.
+    StallPiece {
+        piece: u32,
+        delay: Duration,
+        answered: Arc<AtomicBool>,
+    },
 }
 
 /// What a seeder that is still fetching can serve.
@@ -252,6 +259,18 @@ async fn serve(
                         return;
                     }
                 };
+            }
+            (
+                Behavior::StallPiece {
+                    piece,
+                    delay,
+                    answered,
+                },
+                Ask::Piece(index),
+            ) if *piece == index => {
+                tokio::time::sleep(*delay).await;
+                honest(&mut session, ask, &data, &list).await;
+                answered.store(true, Ordering::SeqCst);
             }
             _ => honest(&mut session, ask, &data, &list).await,
         }
@@ -908,4 +927,86 @@ async fn a_seeder_that_is_still_fetching_serves_what_it_has() {
     let haves = b.asks().iter().filter(|ask| **ask == Ask::Have).count();
     assert!(haves >= 2, "c asked b HAVE {haves} times");
     within(filling).await.expect("b completes");
+}
+
+/// Claim: the pieces of a prioritized range are ordered before any other,
+/// over every seeder.
+#[tokio::test(start_paused = true)]
+async fn prioritized_pieces_are_ordered_before_any_other_piece() {
+    let net = SimNet::new();
+    let data = blob_bytes(LEN);
+    let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
+    let a = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let b = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
+    let swarm = client.swarm(Trust::by_address());
+    within(swarm.connect(&a.url())).await.expect("connect a");
+    within(swarm.connect(&b.url())).await.expect("connect b");
+
+    let mut fetch = swarm.fetch(blob, Bits::new(18), FetchOptions::default());
+    fetch.prioritize(10..14);
+    let mut out = vec![0; LEN];
+    gather(&mut fetch, &mut out).await;
+    assert_eq!(BlobId::of(&out), blob.root());
+    let mut first: Vec<u32> = [a.pieces_asked(), b.pieces_asked()]
+        .into_iter()
+        .flat_map(|asked| {
+            asked
+                .into_iter()
+                .take_while(|index| (10..14).contains(index))
+        })
+        .collect();
+    first.sort_unstable();
+    first.dedup();
+    assert_eq!(
+        first,
+        [10, 11, 12, 13],
+        "a: {:?}, b: {:?}",
+        a.pieces_asked(),
+        b.pieces_asked()
+    );
+}
+
+/// Claim: a prioritized piece that one seeder holds back is ordered once more
+/// from another, and the caller gets it without waiting for the first.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_prioritized_piece_comes_from_another_seeder() {
+    let net = SimNet::new();
+    let data = blob_bytes(LEN);
+    let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
+    let answered = Arc::new(AtomicBool::new(false));
+    let a = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::StallPiece {
+            piece: 5,
+            delay: Duration::from_secs(20),
+            answered: Arc::clone(&answered),
+        },
+    )
+    .await;
+    let b = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    let client = swarm_runtime(&net);
+    let swarm = client.swarm(Trust::by_address());
+    within(swarm.connect(&a.url())).await.expect("connect a");
+
+    let mut fetch = swarm.fetch(blob, Bits::new(18), FetchOptions::default());
+    fetch.prioritize(5..6);
+    let stuck = tokio::time::timeout(Duration::from_millis(100), fetch.next()).await;
+    assert!(stuck.is_err(), "a holds piece 5 back: {stuck:?}");
+
+    within(swarm.connect(&b.url())).await.expect("connect b");
+    let mut out = vec![0; LEN];
+    while let Some(piece) = within(fetch.next()).await {
+        let piece = piece.expect("a verified piece");
+        if piece.index == 5 {
+            assert!(
+                !answered.load(Ordering::SeqCst),
+                "piece 5 came before a answered it"
+            );
+        }
+        out[span(&blob, piece.index)].copy_from_slice(&piece.bytes);
+    }
+    assert!(b.pieces_asked().contains(&5), "{:?}", b.pieces_asked());
+    assert_eq!(BlobId::of(&out), blob.root());
 }
