@@ -2,7 +2,7 @@
 
 ## Context
 
-griasdi is a Discord/TeamSpeak-style chat and voice application in which every
+griasdi is a community chat and voice application in which every
 byte travels over weida: text, presence, file transfer and voice. Users are
 public keys; servers are independent nodes that relay, host communities and act
 as the selective forwarding unit (SFU) for voice. A server forwards media it
