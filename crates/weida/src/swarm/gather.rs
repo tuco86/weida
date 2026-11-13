@@ -252,6 +252,8 @@ enum Answer {
     List(PieceList),
     Have(Bits),
     Piece(Bytes),
+    /// The seeder no longer holds the piece ordered.
+    Gone,
 }
 
 /// Why an order or a session failed, which decides what happens to its
@@ -572,6 +574,11 @@ impl Fetch {
                             }
                         }
                         Some(Piece { index, bytes })
+                    }
+                    Ok(Answer::Gone) => {
+                        tracing::debug!(url = %url, blob = %self.blob.root(), ?ask, "a seeder no longer holds a piece");
+                        self.scheduler.gone(order);
+                        None
                     }
                     Err(Fault::Lost) => {
                         self.scheduler.finish(order, None);
@@ -944,6 +951,7 @@ async fn read_answer(
         .expect("read_exact_into read a whole head");
     match wire::decode_head(head) {
         Some(Head::Answer { ask, len: got }) if ask == order.ask && u64::from(got) == len => {}
+        Some(Head::Gone(index)) if order.ask == Ask::Piece(index) => return Ok(Answer::Gone),
         _ => return Err(Fault::Bad),
     }
     let size = usize::try_from(len).map_err(|_| Fault::Bad)?;

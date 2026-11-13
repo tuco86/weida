@@ -504,6 +504,24 @@ impl Scheduler {
         Some((url, ask))
     }
 
+    /// Ends order `id`, a piece its seeder no longer holds: the piece leaves
+    /// that seeder's map and is free again. The seeder keeps its place and
+    /// is asked HAVE again at its next refresh.
+    pub(super) fn gone(&mut self, id: u64) -> Option<(Arc<str>, Ask)> {
+        let order = self.orders.get(&id)?;
+        if let Ask::Piece(index) = order.ask
+            && let Some(have) = self
+                .holders
+                .get_mut(&order.url)
+                .and_then(|holder| holder.have.as_mut())
+            && have.get(index)
+        {
+            have.set(index, false);
+            self.rarity.unhold(index);
+        }
+        self.finish(id, None)
+    }
+
     /// Marks piece `index` delivered. `None` if it already was; otherwise the
     /// other orders of that piece, which are no longer needed.
     pub(super) fn deliver(&mut self, index: u32) -> Option<Vec<u64>> {
@@ -1117,7 +1135,7 @@ mod tests {
         let urls: [Arc<str>; 3] = [Arc::from("a"), Arc::from("b"), Arc::from("c")];
         let mut open: Vec<u64> = Vec::new();
         for _ in 0..3000 {
-            match rng.random_range(0..6) {
+            match rng.random_range(0..7) {
                 0 => {
                     let url = &urls[rng.random_range(0..urls.len())];
                     scheduler.add(Arc::clone(url));
@@ -1133,6 +1151,10 @@ mod tests {
                 3 if !open.is_empty() => {
                     let id = open.swap_remove(rng.random_range(0..open.len()));
                     scheduler.finish(id, None);
+                }
+                6 if !open.is_empty() => {
+                    let id = open.swap_remove(rng.random_range(0..open.len()));
+                    scheduler.gone(id);
                 }
                 _ if !open.is_empty() => {
                     let id = open.swap_remove(rng.random_range(0..open.len()));
@@ -1369,6 +1391,49 @@ mod tests {
         let of_c = scheduler.plan(t0 + ms(25), &mut rng);
         assert!(!of_c.is_empty());
         assert!(of_c.iter().all(|&(_, _, ask)| ask != Ask::Piece(0)));
+        assert_consistent(&scheduler);
+    }
+
+    #[test]
+    fn a_gone_piece_leaves_the_seeders_map_and_is_free_again() {
+        let mut rng = StdRng::seed_from_u64(18);
+        let t = Instant::now();
+        let mut scheduler = one_holder(PieceSize::MIN, 8, t);
+        let mut open: Vec<u64> = Vec::new();
+        let first = scheduler.plan(t, &mut rng);
+        let (id, _, ask) = first[0];
+        let Ask::Piece(k) = ask else {
+            panic!("{ask:?}");
+        };
+        open.extend(first[1..].iter().map(|&(id, _, _)| id));
+        assert_eq!(scheduler.gone(id), Some((Arc::from("a"), Ask::Piece(k))));
+        let have = scheduler.holders["a"].have.as_ref().expect("said HAVE");
+        assert!(!have.get(k));
+        assert!(scheduler.free.get(k));
+        assert!(scheduler.unavailable().get(k));
+        assert_eq!(scheduler.unavailable().ones(), 1);
+        assert_consistent(&scheduler);
+
+        // Every other piece is fetched; `k` is never ordered of `a`.
+        while scheduler.missing > 1 {
+            for (id, _, ask) in scheduler.plan(t, &mut rng) {
+                assert_ne!(ask, Ask::Piece(k));
+                open.push(id);
+            }
+            let id = open.remove(0);
+            if let Some((_, Ask::Piece(index))) = scheduler.order(id) {
+                scheduler.deliver(index);
+            }
+            scheduler.finish(id, Some((1024, t)));
+            assert_consistent(&scheduler);
+        }
+        assert!(scheduler.plan(t, &mut rng).is_empty());
+        assert_eq!(scheduler.claim_for("a", &mut rng), None);
+
+        // A fresh HAVE that holds it again makes it claimable.
+        scheduler.set_have("a", Bits::full(64), t);
+        assert_eq!(scheduler.claim_for("a", &mut rng), Some(k));
+        assert!(!scheduler.unavailable().get(k));
         assert_consistent(&scheduler);
     }
 }

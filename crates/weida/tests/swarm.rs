@@ -130,6 +130,15 @@ enum Behavior {
         delay: Duration,
         answered: Arc<AtomicBool>,
     },
+    /// A seeder whose pieces change: HAVE says `have`, and a PIECE ask
+    /// for a piece in `changed` is answered GONE and leaves `have`.
+    Changing(Arc<Mutex<Changing>>),
+}
+
+/// What a [`Behavior::Changing`] seeder holds.
+struct Changing {
+    have: Bits,
+    changed: Bits,
 }
 
 /// What a seeder that is still fetching can serve.
@@ -271,6 +280,16 @@ async fn serve(
                 tokio::time::sleep(*delay).await;
                 honest(&mut session, ask, &data, &list).await;
                 answered.store(true, Ordering::SeqCst);
+            }
+            (Behavior::Changing(changing), Ask::Have) => {
+                let have = changing.lock().expect("changing").have.clone();
+                let _ = session.answer_have(&have).await;
+            }
+            (Behavior::Changing(changing), Ask::Piece(index))
+                if changing.lock().expect("changing").changed.get(index) =>
+            {
+                changing.lock().expect("changing").have.set(index, false);
+                let _ = session.answer_gone(index).await;
             }
             _ => honest(&mut session, ask, &data, &list).await,
         }
@@ -1008,5 +1027,62 @@ async fn a_stalled_prioritized_piece_comes_from_another_seeder() {
         out[span(&blob, piece.index)].copy_from_slice(&piece.bytes);
     }
     assert!(b.pieces_asked().contains(&5), "{:?}", b.pieces_asked());
+    assert_eq!(BlobId::of(&out), blob.root());
+}
+
+/// Claim: a seeder that answers GONE for a piece keeps its place in the
+/// fetch and is asked HAVE again; the piece is reported unavailable until a
+/// seeder that holds it connects, which serves it.
+#[tokio::test(start_paused = true)]
+async fn a_seeder_that_says_gone_keeps_its_place_and_the_piece_comes_from_another() {
+    let net = SimNet::new();
+    let data = blob_bytes(LEN);
+    let blob = PieceList::of(&data, PieceSize::MIN).expect("list").blob();
+    let mut changed = Bits::new(18);
+    changed.set(3, true);
+    let a = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Changing(Arc::new(Mutex::new(Changing {
+            have: Bits::full(18),
+            changed: changed.clone(),
+        }))),
+    )
+    .await;
+    let client = swarm_runtime(&net);
+    let swarm = client.swarm(Trust::by_address());
+    within(swarm.connect(&a.url())).await.expect("connect a");
+
+    let options = FetchOptions {
+        have_refresh: Duration::from_millis(100),
+        ..FetchOptions::default()
+    };
+    let mut fetch = swarm.fetch(blob, Bits::new(18), options);
+    fetch.prioritize(3..4);
+    let mut out = vec![0; LEN];
+    for _ in 0..17 {
+        let piece = within(fetch.next())
+            .await
+            .expect("a piece")
+            .expect("verified");
+        assert_ne!(piece.index, 3);
+        out[span(&blob, piece.index)].copy_from_slice(&piece.bytes);
+    }
+    let stuck = tokio::time::timeout(Duration::from_millis(500), fetch.next()).await;
+    assert!(stuck.is_err(), "nobody holds piece 3: {stuck:?}");
+    assert_eq!(fetch.unavailable(), changed);
+    let asked = a.pieces_asked();
+    assert_eq!(asked.first(), Some(&3), "{asked:?}");
+    let mut each = asked.clone();
+    each.sort_unstable();
+    each.dedup();
+    assert_eq!(each, (0..18).collect::<Vec<_>>());
+    let haves = a.asks().iter().filter(|ask| **ask == Ask::Have).count();
+    assert!(haves >= 2, "a is asked HAVE again, not dropped: {haves}");
+
+    let b = seed(&net, Arc::clone(&data), Behavior::Honest).await;
+    within(swarm.connect(&b.url())).await.expect("connect b");
+    assert_eq!(gather(&mut fetch, &mut out).await, [3]);
+    assert_eq!(b.pieces_asked(), [3]);
     assert_eq!(BlobId::of(&out), blob.root());
 }

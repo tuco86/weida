@@ -31,6 +31,7 @@ const DECLINE: u8 = 0;
 const LIST: u8 = 1;
 const HAVE: u8 = 2;
 const PIECE: u8 = 3;
+const GONE: u8 = 4;
 
 /// LIST and HAVE: everything but the index.
 const SHORT: usize = 43;
@@ -121,8 +122,9 @@ pub(crate) const OPEN_BYTES: usize = 48;
 /// and HAVE).
 pub(crate) const ORDER_BYTES: usize = 5;
 
-/// The head of one answer: `u8` kind (0 DECLINE, 1 LIST, 2 HAVE, 3 PIECE),
-/// `u32` index (0 except for PIECE), `u32` payload length (0 for DECLINE).
+/// The head of one answer: `u8` kind (0 DECLINE, 1 LIST, 2 HAVE, 3 PIECE,
+/// 4 GONE), `u32` index (0 except for PIECE and GONE), `u32` payload length
+/// (0 for DECLINE and GONE).
 pub(crate) const FRAME_HEAD_BYTES: usize = 9;
 
 /// Encodes the open of a session about `blob`.
@@ -188,23 +190,32 @@ pub(crate) enum Head {
     Answer { ask: Ask, len: u32 },
     /// The seeder declines the blob or a piece; the session ends here.
     Decline,
+    /// The seeder no longer holds this piece; the session goes on.
+    Gone(u32),
 }
 
 /// Encodes an answer head.
 pub(crate) fn encode_head(head: Head) -> [u8; FRAME_HEAD_BYTES] {
     let mut out = [0; FRAME_HEAD_BYTES];
-    if let Head::Answer { ask, len } = head {
-        let (kind, index) = kind_and_index(ask);
-        out[0] = kind;
-        out[1..5].copy_from_slice(&index.to_be_bytes());
-        out[5..].copy_from_slice(&len.to_be_bytes());
+    match head {
+        Head::Answer { ask, len } => {
+            let (kind, index) = kind_and_index(ask);
+            out[0] = kind;
+            out[1..5].copy_from_slice(&index.to_be_bytes());
+            out[5..].copy_from_slice(&len.to_be_bytes());
+        }
+        Head::Gone(index) => {
+            out[0] = GONE;
+            out[1..5].copy_from_slice(&index.to_be_bytes());
+        }
+        Head::Decline => {}
     }
     out
 }
 
 /// Decodes an answer head, refusing an unknown kind, an index on DECLINE,
-/// LIST or HAVE, and a length on DECLINE. Whether the head answers the order
-/// it should is the reader's to check.
+/// LIST or HAVE, and a length on DECLINE or GONE. Whether the head answers
+/// the order it should is the reader's to check.
 pub(crate) fn decode_head(bytes: &[u8; FRAME_HEAD_BYTES]) -> Option<Head> {
     let index = u32::from_be_bytes(bytes[1..5].try_into().ok()?);
     let len = u32::from_be_bytes(bytes[5..].try_into().ok()?);
@@ -213,6 +224,7 @@ pub(crate) fn decode_head(bytes: &[u8; FRAME_HEAD_BYTES]) -> Option<Head> {
         LIST if index == 0 => Ask::List,
         HAVE if index == 0 => Ask::Have,
         PIECE => Ask::Piece(index),
+        GONE if len == 0 => return Some(Head::Gone(index)),
         _ => return None,
     };
     Some(Head::Answer { ask, len })
@@ -306,6 +318,11 @@ mod tests {
             decode_head(&encode_head(Head::Decline)),
             Some(Head::Decline)
         );
+        assert_eq!(
+            decode_head(&encode_head(Head::Gone(3))),
+            Some(Head::Gone(3))
+        );
+        assert_eq!(encode_head(Head::Gone(2)), [GONE, 0, 0, 0, 2, 0, 0, 0, 0]);
         assert_eq!(encode_order(Ask::Piece(3)), [PIECE, 0, 0, 0, 3]);
         assert_eq!(
             encode_head(Head::Answer {
@@ -361,7 +378,8 @@ mod tests {
         }
 
         let heads: Vec<(&str, [u8; FRAME_HEAD_BYTES])> = vec![
-            ("kind 4", [4, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ("kind 5", [5, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ("GONE with a length", [GONE, 0, 0, 0, 3, 0, 0, 0, 1]),
             ("DECLINE with an index", [DECLINE, 0, 0, 0, 1, 0, 0, 0, 0]),
             ("DECLINE with a length", [DECLINE, 0, 0, 0, 0, 0, 0, 0, 1]),
             ("LIST with an index", [LIST, 0, 0, 0, 1, 0, 0, 0, 32]),

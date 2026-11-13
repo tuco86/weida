@@ -234,8 +234,9 @@ enum Version {
 ///
 /// Admit it once, from [`SeedSession::blob`] and [`SeedSession::meta`], or
 /// [`SeedSession::decline`] it. Then take its orders with
-/// [`SeedSession::next`] and answer each with the method that matches it,
-/// before the next one. An order is read only when `next` is called, so a
+/// [`SeedSession::next`] and answer each with the method that matches it
+/// or, for a piece no longer held, [`SeedSession::answer_gone`], before
+/// the next one. An order is read only when `next` is called, so a
 /// seeder that is busy simply calls it later: the fetch's orders wait in the
 /// stream, and QUIC flow control holds the rest back.
 ///
@@ -386,6 +387,45 @@ impl SeedSession {
                 .await;
         }
         self.answer(owed, bytes).await
+    }
+
+    /// Answers [`Ask::Piece`] `index` with "no longer held" (BEP 6's reject):
+    /// the piece changed or went away since this seeder said HAVE. The fetch
+    /// drops the piece from this seeder's map, orders it elsewhere and keeps
+    /// the session; it asks HAVE again at the seeder's next refresh.
+    ///
+    /// A version-1 ask has no such answer: it is refused with
+    /// [`ErrorCode::Rejected`], as [`SeedSession::decline`] does, and a
+    /// version-1 fetch drops this seeder.
+    pub async fn answer_gone(&mut self, index: u32) -> Result<(), Error> {
+        let owed = self.owed()?;
+        if owed != Ask::Piece(index) {
+            return self
+                .misanswer("a gone answer names only the piece ordered")
+                .await;
+        }
+        self.owed = None;
+        if matches!(self.version, Version::V1 { .. }) {
+            if let Some(request) = self.request.take() {
+                request.refuse(ErrorCode::Rejected).await;
+            }
+            return Ok(());
+        }
+        let reply = match self.open_reply().await {
+            Ok(reply) => reply,
+            Err(e) => {
+                self.dead = true;
+                return Err(e);
+            }
+        };
+        reply.expire_at(
+            Instant::now() + deadline_for(SEED_STALL, FRAME_HEAD_BYTES as u64, MIN_RATE),
+        );
+        let written = reply.write_all(&wire::encode_head(Head::Gone(index))).await;
+        if written.is_err() {
+            self.dead = true;
+        }
+        written
     }
 
     /// Ends the session: a blob this seeder does not serve, or a piece it
