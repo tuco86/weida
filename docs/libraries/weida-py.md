@@ -64,7 +64,7 @@ right after the failing call on the same thread. Present;
 | Behaviour | Verdict |
 | --- | --- |
 | A `timeout` in seconds, `None` waiting forever, `0` only trying; a passed timeout raises `Again` | present; `test_sync.py::test_an_accept_with_nothing_pending_raises_again` |
-| Ctrl-C ends a blocked call with `KeyboardInterrupt` on Unix, with no time slices: the C wait returns `EINTR`, Python runs its handler, and the call's in-flight work stays in the handle | present; `test_sync.py::test_ctrl_c_ends_a_blocked_accept`, which sends a process-directed SIGINT as a terminal does |
+| Ctrl-C ends a blocked call with `KeyboardInterrupt` on Unix, with no time slices: the C wait returns `EINTR`, the binding runs the pending handlers itself (`signal.pthread_sigmask`, which calls `PyErr_CheckSignals`; PyPy would otherwise hand a signal another thread noticed to the main thread only after a later GIL switch, and the next wait would block), and the call's in-flight work stays in the handle | present; `test_sync.py::test_ctrl_c_ends_a_blocked_accept`, which sends a process-directed SIGINT as a terminal does |
 | Ctrl-C on Windows: each wait is cut into 100 ms slices, because Windows has no `EINTR` | present: every waiting call of the tests in `python-windows-amd64` runs in slices; Ctrl-C itself is not sent there (`test_sync.py::test_ctrl_c_ends_a_blocked_accept` is skipped on Windows) |
 | The GIL is released for every C call (cffi does it), so a blocked call holds no other Python thread | present |
 | asyncio: one `loop.add_reader` registration per object and a FIFO of waiting coroutines, each retried with a timeout-0 try when the descriptor is readable | present; `test_asyncio.py::test_two_accepts_on_one_replier_serve_two_requests` |

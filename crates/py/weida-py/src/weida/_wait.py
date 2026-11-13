@@ -8,6 +8,7 @@ or op wait with its out-parameters already bound.
 import asyncio
 import collections
 import math
+import signal
 import sys
 import time
 from typing import Callable, Deque, Optional, Tuple
@@ -22,11 +23,22 @@ _WINDOWS = sys.platform == "win32"
 _SLICE_MS = 100
 
 
+def _run_signal_handlers() -> None:
+    """Runs the Python handlers of the signals pending for this process now,
+    when this is the main thread (`PyErr_CheckSignals`, which
+    `pthread_sigmask` calls after changing nothing). CPython would run them
+    before the next attempt anyway; PyPy does not when another thread was
+    the one to notice the signal: it hands the signal to the main thread
+    only after a later switch of the GIL, so the next attempt would block
+    with a `KeyboardInterrupt` pending, until some other signal arrives."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, ())
+
+
 def call_sync(attempt: Attempt, timeout: Optional[float]) -> int:
     """Runs `attempt` until it succeeds, fails, or `timeout` seconds pass
-    (`None` waits forever). An `EINTR` continues with the time that is left,
-    after Python ran its signal handlers between two attempts, so Ctrl-C
-    raises `KeyboardInterrupt` here and loses nothing."""
+    (`None` waits forever). An `EINTR` runs the pending signal handlers and
+    continues with the time that is left, so Ctrl-C raises
+    `KeyboardInterrupt` here and loses nothing."""
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         if deadline is None:
@@ -37,6 +49,7 @@ def call_sync(attempt: Attempt, timeout: Optional[float]) -> int:
             ms = _SLICE_MS
         rc = attempt(ms)
         if rc == INTERRUPTED:
+            _run_signal_handlers()
             continue
         if (
             _WINDOWS
