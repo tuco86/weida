@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use common::Server;
 use weida::{
-    Ask, Bits, Blob, BlobId, Error, ErrorCode, Fetch, FetchOptions, Network, PieceList, PieceSize,
-    Runtime, RuntimeConfig, SeedSession, SimNet, TransferMeta, Trust,
+    Ask, Bits, Blob, BlobId, ClientTls, Error, ErrorCode, Fetch, FetchOptions, Network,
+    PeerIdentity, PieceList, PieceSize, Runtime, RuntimeConfig, SeedSession, SimNet, TransferMeta,
+    Trust,
 };
 
 /// Generous ceiling: every assertion below should settle well within it.
@@ -1085,4 +1086,95 @@ async fn a_seeder_that_says_gone_keeps_its_place_and_the_piece_comes_from_anothe
     assert_eq!(gather(&mut fetch, &mut out).await, [3]);
     assert_eq!(b.pieces_asked(), [3]);
     assert_eq!(BlobId::of(&out), blob.root());
+}
+
+/// Claim: a seeder behind NAT, bound through a relay, seeds a swarm side by
+/// side with a direct one, and sees the fetching side's own key: QUIC and TLS
+/// run end to end through the relay.
+#[tokio::test(start_paused = true)]
+async fn a_swarm_fetches_from_a_relayed_seeder_and_a_direct_one_together() {
+    use crate::relay::{Hidden, Policy, RelayServer, any_addr, identity as key_pair, on};
+
+    let net = SimNet::new();
+    let data = blob_bytes(LEN);
+    let list = Arc::new(PieceList::of(&data, PieceSize::MIN).expect("list"));
+    let blob = list.blob();
+    let (r_id, _) = key_pair();
+    let (h_id, h_fp) = key_pair();
+    let (d_id, d_fp) = key_pair();
+    let relay = RelayServer::start(&net, any_addr(), r_id, true, Policy::Admit).await;
+    let hidden = Hidden::start(&net, &relay, h_id, d_fp, true).await;
+
+    let seeder = hidden.listener.seeder("/swarm").expect("seeder");
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let relayed_asks = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (data, list) = (Arc::clone(&data), Arc::clone(&list));
+        let (peers, asks) = (Arc::clone(&peers), Arc::clone(&relayed_asks));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(async move {
+            while let Ok(session) = seeder.accept().await {
+                peers
+                    .lock()
+                    .expect("peers")
+                    .push(session.meta().peer.clone());
+                tokio::spawn(serve(
+                    session,
+                    Arc::clone(&data),
+                    Arc::clone(&list),
+                    Behavior::Holds(alternate(18, true)),
+                    Arc::clone(&held),
+                    Arc::clone(&asks),
+                ));
+            }
+        });
+    }
+    let b = seed(
+        &net,
+        Arc::clone(&data),
+        Behavior::Holds(alternate(18, false)),
+    )
+    .await;
+
+    let client = Runtime::new(on(&net, true)).expect("client runtime");
+    let swarm = client.swarm(ClientTls::new(Trust::by_address()).with_identity(d_id));
+    within(swarm.connect(&relay.relayed(h_fp, "/swarm")))
+        .await
+        .expect("connect the relayed seeder");
+    within(swarm.connect(&b.url())).await.expect("connect b");
+
+    let mut fetch = swarm.fetch(blob, Bits::new(18), FetchOptions::default());
+    let mut out = vec![0; LEN];
+    let mut indices = gather(&mut fetch, &mut out).await;
+    indices.sort_unstable();
+    assert_eq!(indices, (0..18).collect::<Vec<_>>());
+    assert_eq!(BlobId::of(&out), blob.root());
+
+    let mut relayed: Vec<u32> = relayed_asks
+        .lock()
+        .expect("asks")
+        .iter()
+        .filter_map(|ask| match ask {
+            Ask::Piece(index) => Some(*index),
+            _ => None,
+        })
+        .collect();
+    relayed.sort_unstable();
+    assert_eq!(relayed, (0..18).step_by(2).collect::<Vec<_>>());
+    let mut direct = b.pieces_asked();
+    direct.sort_unstable();
+    assert_eq!(direct, (1..18).step_by(2).collect::<Vec<_>>());
+    let peers = peers.lock().expect("peers").clone();
+    assert!(!peers.is_empty());
+    assert!(
+        peers
+            .iter()
+            .all(|peer| *peer == Some(PeerIdentity::Key(d_fp))),
+        "{peers:?}"
+    );
+
+    drop(fetch);
+    client.shutdown().await;
+    hidden.runtime.shutdown().await;
+    relay.runtime.shutdown().await;
 }
