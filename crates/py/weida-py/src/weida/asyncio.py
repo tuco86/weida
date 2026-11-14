@@ -4,7 +4,7 @@ wait goes through a readiness descriptor watched by the running loop;
 cancelling a coroutine cancels its operation. The value classes are
 `weida`'s own."""
 
-from typing import Any, Coroutine, Optional
+from typing import Any, Coroutine, Optional, Tuple
 
 from weida import _sync
 from weida._enums import ErrorCode
@@ -20,6 +20,7 @@ __all__ = [
     "Listener",
     "OutgoingTransfer",
     "Replier",
+    "ReplyStream",
     "Requester",
     "Runtime",
 ]
@@ -90,6 +91,21 @@ class Requester(_sync.Requester):
         )
         return IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
 
+    async def open(  # type: ignore[override]
+        self, meta: Optional[TransferMeta] = None
+    ) -> Tuple["OutgoingTransfer", "ReplyStream"]:
+        """Opens one exchange carrying `meta`, as `weida.Requester.open`
+        does. A cancelled open abandons the exchange."""
+        op = self._start_open(meta)
+        ptrs = await _op_async(
+            op,
+            lib.weida_requester_open_op_wait,
+            lib.weida_requester_open_op_fd,
+            lib.weida_requester_open_op_drop,
+            ("weida_outgoing_transfer **", "weida_reply_stream **"),
+        )
+        return self._opened(ptrs)
+
 
 class Replier(_sync.Replier):
     async def accept(self) -> "IncomingRequest":  # type: ignore[override]
@@ -97,6 +113,22 @@ class Replier(_sync.Replier):
         out, attempt = self._accept_attempt()
         await call_async(self._waiters(), attempt, self.drop)
         return self._request(out[0])
+
+
+class ReplyStream(_sync.ReplyStream):
+    async def recv(self) -> "IncomingTransfer":  # type: ignore[override]
+        """The reply, as soon as its header arrives, as
+        `weida.ReplyStream.recv` gives it. Consumes the stream; a cancelled
+        recv abandons the reply."""
+        op = self._start_recv()
+        ptr = await _op_async(
+            op,
+            lib.weida_reply_stream_recv_op_wait,
+            lib.weida_reply_stream_recv_op_fd,
+            lib.weida_reply_stream_recv_op_drop,
+            "weida_incoming_transfer **",
+        )
+        return self._incoming(ptr)
 
 
 class IncomingRequest(_sync.IncomingRequest):
@@ -204,3 +236,6 @@ Replier._IncomingRequest = IncomingRequest
 IncomingRequest._IncomingTransfer = IncomingTransfer
 IncomingRequest._OutgoingTransfer = OutgoingTransfer
 OutgoingTransfer._Delivery = Delivery
+Requester._OutgoingTransfer = OutgoingTransfer
+Requester._ReplyStream = ReplyStream
+ReplyStream._IncomingTransfer = IncomingTransfer

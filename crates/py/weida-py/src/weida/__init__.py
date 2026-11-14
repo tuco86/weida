@@ -63,6 +63,7 @@ from weida._sync import (
     LocalBinding,
     OutgoingTransfer,
     Replier,
+    ReplyStream,
     Requester,
     Runtime,
 )
@@ -141,6 +142,7 @@ __all__ = [
     "LocalBinding",
     "OutgoingTransfer",
     "Replier",
+    "ReplyStream",
     "Requester",
     "Runtime",
     # Errors.

@@ -4,7 +4,7 @@ takes `timeout` in seconds (`None` waits forever) and raises `Again` when
 it passes."""
 
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from weida._enums import ErrorCode
 from weida._errors import check
@@ -32,22 +32,41 @@ def _start(starter: Callable, op_type: str, *args):
     return out[0]
 
 
+def _new_outs(out_type) -> tuple:
+    """The out-parameters of an op wait: none for `None`, one for a C
+    pointer type, one per type of a tuple of them."""
+    if out_type is None:
+        return ()
+    if isinstance(out_type, tuple):
+        return tuple(ffi.new(t) for t in out_type)
+    return (ffi.new(out_type),)
+
+
+def _results(out_type, outs: tuple):
+    """What the wait wrote: `None`, the one value, or a tuple of them."""
+    if out_type is None:
+        return None
+    if isinstance(out_type, tuple):
+        return tuple(out[0] for out in outs)
+    return outs[0][0]
+
+
 def _op_sync(op, wait: Callable, drop: Callable, timeout: Optional[float], out_type=None):
     """Waits for an op's result and drops the op, which cancels it when it
-    did not finish."""
+    did not finish. `out_type` is `None`, a C pointer type, or a tuple of
+    them (one value per out-parameter)."""
     try:
-        if out_type is None:
-            call_sync(lambda ms: wait(op, ms), timeout)
-            return None
-        out = ffi.new(out_type)
-        call_sync(lambda ms: wait(op, ms, out), timeout)
-        return out[0]
+        outs = _new_outs(out_type)
+        call_sync(lambda ms: wait(op, ms, *outs), timeout)
+        return _results(out_type, outs)
     finally:
         drop(op)
 
 
 async def _op_async(op, wait: Callable, fd_of: Callable, drop: Callable, out_type=None):
-    """`_op_sync` on the running loop, through the op's descriptor."""
+    """`_op_sync` on the running loop, through the op's descriptor.
+    `out_type` is `None`, a C pointer type, or a tuple of them (one value
+    per out-parameter)."""
     dropped = []
 
     def drop_once() -> None:
@@ -62,12 +81,9 @@ async def _op_async(op, wait: Callable, fd_of: Callable, drop: Callable, out_typ
 
     waiters = Waiters(fileno)
     try:
-        if out_type is None:
-            await call_async(waiters, lambda ms: wait(op, ms), drop_once)
-            return None
-        out = ffi.new(out_type)
-        await call_async(waiters, lambda ms: wait(op, ms, out), drop_once)
-        return out[0]
+        outs = _new_outs(out_type)
+        await call_async(waiters, lambda ms: wait(op, ms, *outs), drop_once)
+        return _results(out_type, outs)
     finally:
         waiters.close()
         drop_once()
@@ -192,6 +208,19 @@ class Requester(_Handle):
             ),
         )
 
+    def _start_open(self, meta: Optional[TransferMeta]):
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(lib.weida_requester_open, "weida_requester_open_op", self._p(), h),
+        )
+
+    def _opened(self, ptrs) -> Tuple["OutgoingTransfer", "ReplyStream"]:
+        body, reply = ptrs
+        return (
+            self._OutgoingTransfer(body, lib.weida_outgoing_transfer_drop, self),
+            self._ReplyStream(reply, lib.weida_reply_stream_drop, self),
+        )
+
     def connect(self, url: str, timeout: Optional[float] = None) -> None:
         """Dials `url`; the runtime redials it when the connection is lost."""
         op = self._start_connect(url)
@@ -223,6 +252,51 @@ class Requester(_Handle):
             "weida_incoming_transfer **",
         )
         return self._IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
+
+    def open(
+        self, meta: Optional[TransferMeta] = None, timeout: Optional[float] = None
+    ) -> Tuple["OutgoingTransfer", "ReplyStream"]:
+        """Opens one exchange carrying `meta` (copied when it starts):
+        `(body, reply)`, the request body written like a socket and ended
+        with `finish()`, and the stream its reply is awaited on. The halves
+        are independent, so the reply can be read while the body is still
+        open."""
+        op = self._start_open(meta)
+        ptrs = _op_sync(
+            op,
+            lib.weida_requester_open_op_wait,
+            lib.weida_requester_open_op_drop,
+            timeout,
+            ("weida_outgoing_transfer **", "weida_reply_stream **"),
+        )
+        return self._opened(ptrs)
+
+
+class ReplyStream(_Handle):
+    """The reply half of an exchange `Requester.open` opened. Dropping it
+    before `recv` tells the replier nobody is listening: its `canceled`
+    returns and its reply fails with `Canceled`."""
+
+    def _start_recv(self):
+        return _start(lib.weida_reply_stream_recv, "weida_reply_stream_recv_op", self._consume())
+
+    def _incoming(self, ptr) -> "IncomingTransfer":
+        return self._IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self._parent)
+
+    def recv(self, timeout: Optional[float] = None) -> "IncomingTransfer":
+        """The reply, as soon as its header arrives; a refused request
+        raises the refusal's error (`Rejected`, `UnknownEndpoint`, ...).
+        Consumes the stream: a `recv` cut short by `timeout` abandons the
+        reply, and the replier sees the requester gone."""
+        op = self._start_recv()
+        ptr = _op_sync(
+            op,
+            lib.weida_reply_stream_recv_op_wait,
+            lib.weida_reply_stream_recv_op_drop,
+            timeout,
+            "weida_incoming_transfer **",
+        )
+        return self._incoming(ptr)
 
 
 class Replier(_Handle):
@@ -463,6 +537,9 @@ Replier._IncomingRequest = IncomingRequest
 IncomingRequest._IncomingTransfer = IncomingTransfer
 IncomingRequest._OutgoingTransfer = OutgoingTransfer
 OutgoingTransfer._Delivery = Delivery
+Requester._OutgoingTransfer = OutgoingTransfer
+Requester._ReplyStream = ReplyStream
+ReplyStream._IncomingTransfer = IncomingTransfer
 
 __all__ = [
     "Binding",
@@ -473,6 +550,7 @@ __all__ = [
     "LocalBinding",
     "OutgoingTransfer",
     "Replier",
+    "ReplyStream",
     "Requester",
     "Runtime",
 ]

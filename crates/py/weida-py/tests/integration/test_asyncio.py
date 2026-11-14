@@ -144,3 +144,43 @@ def test_canceled_starts_at_the_call_and_returns_once_the_requester_gives_up(bus
         await runtime.shutdown()
 
     asyncio.run(main())
+
+
+def test_an_opened_exchange_and_a_dropped_reply_stream_on_the_loop(bus):
+    async def main() -> None:
+        runtime = wa.Runtime.owned()
+        listener = runtime.listener()
+        binding = listener.bind_inproc(bus)
+        replier = listener.replier("/echo")
+        requester = runtime.requester(weida.ClientTls(weida.Trust()))
+        await requester.connect(f"weida+inproc://{bus}/echo")
+
+        # The reply is read while the request body is still open.
+        body, reply = await requester.open(weida.TransferMeta("text/plain"))
+        await body.write_all(b"onetwothree")
+        request = await replier.accept()
+        assert request.meta().content_type == "text/plain"
+        received = request.take_body()
+        answer = await request.reply()
+        await answer.write_all(b"ack")
+        answer.finish()
+        assert (await (await reply.recv()).collect(64)).payload == b"ack"
+        body.finish()
+        assert (await received.collect(64)).payload == b"onetwothree"
+
+        # Dropping the reply stream ends the replier's watch.
+        body, reply = await requester.open()
+        request = await replier.accept()
+        watching = asyncio.ensure_future(request.canceled())
+        done, _ = await asyncio.wait({watching}, timeout=0.05)
+        assert not done, "the requester still listens"
+        reply.drop()
+        await watching
+        request.drop()
+        body.drop()
+
+        for handle in (requester, replier, binding, listener):
+            handle.drop()
+        await runtime.shutdown()
+
+    asyncio.run(main())
