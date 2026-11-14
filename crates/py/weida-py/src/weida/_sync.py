@@ -6,6 +6,7 @@ it passes."""
 import time
 from typing import Callable, Optional
 
+from weida._enums import ErrorCode
 from weida._errors import check
 from weida._native import ffi, lib
 from weida._values import (
@@ -16,6 +17,7 @@ from weida._values import (
     ServerTls,
     TransferMeta,
     _Handle,
+    _enum,
     _millis,
     _text,
     _with_transfer_meta,
@@ -285,6 +287,55 @@ class IncomingRequest(_Handle):
             "weida_outgoing_transfer **",
         )
         return self._outgoing(ptr)
+
+    def _start_refuse(self, code: ErrorCode):
+        # Checked before the request is consumed: C consumes it even for a
+        # code it refuses.
+        value = _enum(ErrorCode)("code", code)
+        return _start(
+            lib.weida_incoming_request_refuse,
+            "weida_incoming_request_refuse_op",
+            self._consume(),
+            value,
+        )
+
+    def refuse(self, code: ErrorCode, timeout: Optional[float] = None) -> None:
+        """Refuses the exchange with `code` instead of a reply: the
+        requester's request raises the code's error (`REJECTED` `Rejected`,
+        `UNKNOWN_ENDPOINT` `UnknownEndpoint`, `UNSUPPORTED` `Unsupported`,
+        `INTERNAL` `Transport`, `NO_REPLY` `NoReply`). Waits until the
+        refusal is written; one the connection could not carry returns all
+        the same, and one cut short by `timeout` may reach the requester as
+        `NO_REPLY`. Consumes the request; a `code` that is not an
+        `ErrorCode` is a `TypeError` and consumes nothing."""
+        op = self._start_refuse(code)
+        _op_sync(
+            op,
+            lib.weida_incoming_request_refuse_op_wait,
+            lib.weida_incoming_request_refuse_op_drop,
+            timeout,
+        )
+
+    def _start_canceled(self):
+        return _start(
+            lib.weida_incoming_request_canceled,
+            "weida_incoming_request_canceled_op",
+            self._p(),
+        )
+
+    def canceled(self, timeout: Optional[float] = None) -> None:
+        """Waits until the requester stops wanting a reply: it gave up its
+        request or dropped the reply, a finished reply was read whole, or
+        the connection is gone. The watch starts at the call and outlives
+        the request, so another thread may reply to, refuse or drop the
+        request meanwhile (a finished reply half also ends the watch)."""
+        op = self._start_canceled()
+        _op_sync(
+            op,
+            lib.weida_incoming_request_canceled_op_wait,
+            lib.weida_incoming_request_canceled_op_drop,
+            timeout,
+        )
 
 
 class IncomingTransfer(_Handle):

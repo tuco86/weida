@@ -89,6 +89,17 @@ class ProducerNaming(enum.IntEnum):
     STABLE = lib.WEIDA_PRODUCER_NAMING_STABLE
 
 
+class ErrorCode(enum.IntEnum):
+    """`ErrorCode`: the code a refusal carries to the requester
+    (`IncomingRequest.refuse`)."""
+
+    UNKNOWN_ENDPOINT = lib.WEIDA_ERROR_CODE_UNKNOWN_ENDPOINT
+    REJECTED = lib.WEIDA_ERROR_CODE_REJECTED
+    UNSUPPORTED = lib.WEIDA_ERROR_CODE_UNSUPPORTED
+    INTERNAL = lib.WEIDA_ERROR_CODE_INTERNAL
+    NO_REPLY = lib.WEIDA_ERROR_CODE_NO_REPLY
+
+
 __all__ = [
     "Acknowledgement",
     "Backpressure",
@@ -97,6 +108,7 @@ __all__ = [
     "DeliveryLevel",
     "Discovery",
     "Durability",
+    "ErrorCode",
     "OrderingMode",
     "OutboxFull",
     "ProducerNaming",

@@ -4,10 +4,11 @@ wait goes through a readiness descriptor watched by the running loop;
 cancelling a coroutine cancels its operation. The value classes are
 `weida`'s own."""
 
-from typing import Optional
+from typing import Any, Coroutine, Optional
 
 from weida import _sync
-from weida._native import lib
+from weida._enums import ErrorCode
+from weida._native import ffi, lib
 from weida._sync import _op_async
 from weida._values import Message, ServerTls, TransferMeta
 from weida._wait import call_async
@@ -110,6 +111,33 @@ class IncomingRequest(_sync.IncomingRequest):
             "weida_outgoing_transfer **",
         )
         return self._outgoing(ptr)
+
+    async def refuse(self, code: ErrorCode) -> None:  # type: ignore[override]
+        """Refuses the exchange with `code` instead of a reply, as
+        `weida.IncomingRequest.refuse` does. Consumes the request; a `code`
+        that is not an `ErrorCode` is a `TypeError` and consumes nothing."""
+        op = self._start_refuse(code)
+        await _op_async(
+            op,
+            lib.weida_incoming_request_refuse_op_wait,
+            lib.weida_incoming_request_refuse_op_fd,
+            lib.weida_incoming_request_refuse_op_drop,
+        )
+
+    def canceled(self) -> Coroutine[Any, Any, None]:  # type: ignore[override]
+        """An awaitable that finishes once the requester stops wanting a
+        reply, as `weida.IncomingRequest.canceled` does. A plain method: the
+        watch starts here, not at the first await, so take it before `reply`
+        or `refuse` consumes the request; it outlives the request.
+        Cancelling the await ends the watch, and an awaitable that is never
+        awaited ends it when it is collected."""
+        op = ffi.gc(self._start_canceled(), lib.weida_incoming_request_canceled_op_drop)
+        return _op_async(
+            op,
+            lib.weida_incoming_request_canceled_op_wait,
+            lib.weida_incoming_request_canceled_op_fd,
+            ffi.release,
+        )
 
 
 class IncomingTransfer(_sync.IncomingTransfer):

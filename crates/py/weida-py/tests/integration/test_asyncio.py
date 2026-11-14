@@ -106,3 +106,41 @@ def test_request_with_carries_metadata_on_the_loop(bus):
         await runtime.shutdown()
 
     asyncio.run(main())
+
+
+def test_canceled_starts_at_the_call_and_returns_once_the_requester_gives_up(bus):
+    async def main() -> None:
+        runtime = wa.Runtime.owned()
+        listener = runtime.listener()
+        binding = listener.bind_inproc(bus)
+        replier = listener.replier("/echo")
+        requester = runtime.requester(weida.ClientTls(weida.Trust()))
+        await requester.connect(f"weida+inproc://{bus}/echo")
+
+        # The requester gives up: cancelling its request drops its op.
+        pending = asyncio.ensure_future(requester.request(b"wait"))
+        request = await replier.accept()
+        watching = asyncio.ensure_future(request.canceled())
+        done, _ = await asyncio.wait({watching}, timeout=0.05)
+        assert not done, "the requester still waits"
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await watching
+        request.drop()
+
+        # The watch starts at the call, so it outlives the request the
+        # refusal consumes; the finished reply half ends it.
+        asking = asyncio.ensure_future(requester.request(b"ask"))
+        request = await replier.accept()
+        watch = request.canceled()
+        await request.refuse(weida.ErrorCode.REJECTED)
+        with pytest.raises(weida.Rejected):
+            await asking
+        await watch
+
+        for handle in (requester, replier, binding, listener):
+            handle.drop()
+        await runtime.shutdown()
+
+    asyncio.run(main())
