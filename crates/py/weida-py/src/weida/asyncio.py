@@ -11,7 +11,7 @@ from weida._enums import ErrorCode
 from weida._native import ffi, lib
 from weida._stats import PeerEvent
 from weida._sync import _op_async
-from weida._values import Message, ServerTls, TransferMeta
+from weida._values import Drained, Message, ServerTls, TransferMeta
 from weida._wait import call_async
 
 __all__ = [
@@ -39,6 +39,21 @@ class Runtime(_sync.Runtime):
             lib.weida_runtime_shutdown_op_fd,
             lib.weida_runtime_shutdown_op_drop,
         )
+
+    async def drain(self, deadline: float) -> Drained:  # type: ignore[override]
+        """Stops admitting work, gives every finished transfer whose receipt
+        nobody holds until `deadline` seconds to reach the peer's transport,
+        then closes as `shutdown` does within what is left of it. Cancelling
+        aborts the drain where it is. Consumes the runtime."""
+        op = self._start_drain(deadline)
+        ptr = await _op_async(
+            op,
+            lib.weida_runtime_drain_op_wait,
+            lib.weida_runtime_drain_op_fd,
+            lib.weida_runtime_drain_op_drop,
+            "weida_drained **",
+        )
+        return Drained._take(ptr)
 
 
 class Listener(_sync.Listener):

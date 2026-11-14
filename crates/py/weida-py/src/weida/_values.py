@@ -675,3 +675,25 @@ class Message:
             return cls(payload=payload, meta=IncomingMeta._take(out[0]))
         finally:
             lib.weida_msg_drop(ptr)
+
+
+@dataclass(frozen=True)
+class Drained:
+    """What one drain achieved, counted over the transfers still
+    unacknowledged when it started. `delivered`: acknowledged by the peer's
+    transport before the deadline. `outstanding`: unacknowledged at the
+    deadline, refused, or lost with their connection; not an error."""
+
+    delivered: int
+    outstanding: int
+
+    @classmethod
+    def _take(cls, ptr) -> "Drained":
+        """Copies a `weida_drained` out and drops it."""
+        try:
+            return cls(
+                delivered=lib.weida_drained_delivered(ptr),
+                outstanding=lib.weida_drained_outstanding(ptr),
+            )
+        finally:
+            lib.weida_drained_drop(ptr)

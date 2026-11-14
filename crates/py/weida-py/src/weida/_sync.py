@@ -12,6 +12,7 @@ from weida._native import ffi, lib
 from weida._stats import ConnectionStats, PeerEvent, _take_connection_stats
 from weida._values import (
     ClientTls,
+    Drained,
     IncomingMeta,
     Message,
     RuntimeConfig,
@@ -24,6 +25,8 @@ from weida._values import (
     _with_transfer_meta,
 )
 from weida._wait import Waiters, call_async, call_sync
+
+_U64_MAX = 2**64 - 1
 
 
 def _start(starter: Callable, op_type: str, *args):
@@ -137,6 +140,31 @@ class Runtime(_Handle):
         Consumes the runtime."""
         op = self._start_shutdown()
         _op_sync(op, lib.weida_runtime_shutdown_op_wait, lib.weida_runtime_shutdown_op_drop, timeout)
+
+    def _start_drain(self, deadline: float):
+        # Converted before the runtime is consumed: a deadline out of range
+        # raises here and leaves the runtime usable.
+        ms = _millis("deadline", deadline)
+        if ms > _U64_MAX:
+            raise ValueError("deadline must be below 2**64 milliseconds")
+        return _start(lib.weida_runtime_drain, "weida_runtime_drain_op", self._consume(), ms)
+
+    def drain(self, deadline: float, timeout: Optional[float] = None) -> Drained:
+        """Stops admitting work, gives every finished transfer whose receipt
+        nobody holds until `deadline` seconds to reach the peer's transport,
+        then closes as `shutdown` does within what is left of it. A non-zero
+        `Drained.outstanding` is not an error. A wait cut short by `timeout`
+        raises `Again` and aborts the drain where it is: admission stays
+        stopped and no close runs. Consumes the runtime."""
+        op = self._start_drain(deadline)
+        ptr = _op_sync(
+            op,
+            lib.weida_runtime_drain_op_wait,
+            lib.weida_runtime_drain_op_drop,
+            timeout,
+            "weida_drained **",
+        )
+        return Drained._take(ptr)
 
 
 class Listener(_Handle):

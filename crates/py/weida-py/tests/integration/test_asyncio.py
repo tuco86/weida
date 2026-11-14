@@ -213,3 +213,30 @@ def test_peer_events_iterate_with_async_for(bus):
         await client.shutdown()
 
     asyncio.run(main())
+
+
+def test_a_drain_on_the_loop_counts_a_reply_finished_before_it(bus):
+    async def main() -> None:
+        server = wa.Runtime.owned()
+        listener = server.listener()
+        binding = listener.bind_inproc(bus)
+        replier = listener.replier("/echo")
+        client = wa.Runtime.owned()
+        requester = client.requester(weida.ClientTls(weida.Trust()))
+        await requester.connect(f"weida+inproc://{bus}/echo")
+
+        async def serve() -> None:
+            request = await replier.accept()
+            out = await request.reply()
+            await out.write_all(b"pong")
+            out.finish().drop()
+
+        served = asyncio.ensure_future(serve())
+        assert (await (await requester.request(b"ping")).collect(64)).payload == b"pong"
+        await served
+        assert await server.drain(3600) == weida.Drained(delivered=1, outstanding=0)
+        for handle in (requester, replier, binding, listener):
+            handle.drop()
+        await client.shutdown()
+
+    asyncio.run(main())

@@ -82,6 +82,7 @@ from weida._sync import (
 from weida._values import (
     ANY_KEY,
     ClientTls,
+    Drained,
     GuaranteeSet,
     Identity,
     IncomingMeta,
@@ -123,6 +124,7 @@ __all__ = [
     "ANY_KEY",
     "ClientTls",
     "ConnectionStats",
+    "Drained",
     "GuaranteeSet",
     "Identity",
     "IncomingMeta",
