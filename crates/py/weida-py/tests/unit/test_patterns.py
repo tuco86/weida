@@ -294,3 +294,121 @@ def test_a_bus_message_reaches_every_other_member():
         listener.drop()
     for runtime in runtimes:
         runtime.shutdown(WAIT)
+
+
+def radio_dish(server, client, topic: str, **terms):
+    """A radio at `/r` on `server` and a dish of `topic` on `client`, joined
+    on `terms`: `(listener, binding, url, radio, dish)`."""
+    name, listener, binding = bound(server)
+    radio = listener.radio("/r")
+    dish = client.dish(client_tls())
+    dish.join(topic, WAIT, **terms)
+    url = f"weida+inproc://{name}/r"
+    dish.connect(url, WAIT)
+    return listener, binding, url, radio, dish
+
+
+def await_dishes(radio, n: int) -> None:
+    """Waits until `n` dishes joined `radio`."""
+    while radio.dish_count() != n:
+        time.sleep(0.001)
+
+
+def next_segment(dish):
+    """`(segment, layer, body)` of the next stream segment `dish` receives."""
+    r = dish.recv(WAIT)
+    assert r.kind == weida.ReceivedKind.SEGMENT
+    meta = r.transfer.meta()
+    return (meta.segment, meta.layer, r.transfer.collect(1024, WAIT).payload)
+
+
+def test_a_dish_receives_the_radios_segments_with_their_numbers_and_layers():
+    server = weida.Runtime.owned()
+    client = weida.Runtime.owned()
+    listener, binding, _, radio, dish = radio_dish(server, client, "v", max_layer=1)
+    await_dishes(radio, 1)
+    assert weida.MAX_SEGMENT_LAYERS == 16
+
+    first = radio.segment("v")
+    assert first.number() == 0
+    assert first.topic() == "v"
+    assert first.write_layer(0, b"a0") == 1
+    assert first.write_layer(1, b"a1") == 1
+    assert first.write_layer(2, b"a2") == 0, "the copy is capped at layer 1"
+    assert first.finish() == 1
+    seen = [next_segment(dish), next_segment(dish)]
+
+    second = radio.segment("v", priority=1)
+    assert second.number() == 1
+    assert second.write(b"b0") == 1
+    assert second.finish() == 1
+    seen.append(next_segment(dish))
+    assert sorted(seen) == [(0, 0, b"a0"), (0, 1, b"a1"), (1, 0, b"b0")]
+    assert radio.dropped() == 0
+    assert dish.stale() == 0
+    assert dish.overflow() == 0
+
+    for handle in (dish, radio, binding, listener):
+        handle.drop()
+    client.shutdown(WAIT)
+    server.shutdown(WAIT)
+
+
+def test_a_superseded_segment_counts_in_dish_drops():
+    server = weida.Runtime.owned()
+    client = weida.Runtime.owned()
+    listener, binding, _, radio, dish = radio_dish(server, client, "v")
+    await_dishes(radio, 1)
+
+    first = radio.segment("v")
+    assert first.write(b"first") == 1
+    second = radio.segment("v")
+    assert second.write(b"second") == 1
+    assert second.finish() == 1
+    while not (drops := radio.dish_drops()) or drops[0].superseded != 1:
+        time.sleep(0.001)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        drops[0].superseded = 0
+    assert radio.dropped_on("v").superseded == 1
+    assert first.finish() == 0, "the copy was reset"
+
+    while True:
+        r = dish.recv(WAIT)
+        assert r.kind == weida.ReceivedKind.SEGMENT
+        if r.transfer.meta().segment == 1:
+            assert r.transfer.collect(1024, WAIT).payload == b"second"
+            break
+        with pytest.raises(weida.WeidaError):
+            r.transfer.collect(1024, WAIT)
+
+    for handle in (dish, radio, binding, listener):
+        handle.drop()
+    client.shutdown(WAIT)
+    server.shutdown(WAIT)
+
+
+def test_a_radio_datagram_reaches_a_dish_that_carries_datagrams():
+    datagrams = weida.RuntimeConfig(limits=weida.Limits(datagram_receive_bytes=65536))
+    server = weida.Runtime.owned(datagrams)
+    near = weida.Runtime.owned(datagrams)
+    far = weida.Runtime.owned()
+    listener, binding, url, radio, carrying = radio_dish(server, near, "voice")
+    plain = far.dish(client_tls())
+    plain.join("voice", WAIT)
+    plain.connect(url, WAIT)
+    await_dishes(radio, 2)
+
+    assert radio.datagram("voice", b"hello") == 1
+    r = carrying.recv(WAIT)
+    assert r.kind == weida.ReceivedKind.DATAGRAM
+    assert (r.topic, r.segment, r.payload, r.transfer) == ("voice", 0, b"hello", None)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        r.payload = b""
+    assert radio.dropped_on("voice").no_datagrams == 1
+    assert sorted(d.no_datagrams for d in radio.dish_drops()) == [0, 1]
+
+    for handle in (carrying, plain, radio, binding, listener):
+        handle.drop()
+    near.shutdown(WAIT)
+    far.shutdown(WAIT)
+    server.shutdown(WAIT)

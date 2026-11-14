@@ -150,6 +150,14 @@ class IdentityEventKind(enum.IntEnum):
     MISSED = lib.WEIDA_IDENTITY_EVENT_MISSED
 
 
+class ReceivedKind(enum.IntEnum):
+    """The kind of a `Received`: a stream segment or a datagram segment
+    (named after the C constants: the Rust `Received` is the record)."""
+
+    SEGMENT = lib.WEIDA_RECEIVED_SEGMENT
+    DATAGRAM = lib.WEIDA_RECEIVED_DATAGRAM
+
+
 __all__ = [
     "Acknowledgement",
     "Alpn",
@@ -167,4 +175,5 @@ __all__ = [
     "OutboxFull",
     "PeerEventKind",
     "ProducerNaming",
+    "ReceivedKind",
 ]

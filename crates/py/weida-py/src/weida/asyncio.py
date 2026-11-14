@@ -12,7 +12,7 @@ from weida import _sync, _values
 from weida._enums import ErrorCode
 from weida._native import ffi, lib
 from weida._stats import PeerEvent
-from weida._sync import Handoff, _op_async
+from weida._sync import Handoff, Received, _op_async
 from weida._values import ClientTls, Drained, IdentityEvent, Message, ServerTls, TransferMeta
 from weida._wait import call_async
 
@@ -20,6 +20,7 @@ __all__ = [
     "Binding",
     "BusMember",
     "Delivery",
+    "Dish",
     "FanOut",
     "IdentityEvents",
     "IdentitySource",
@@ -504,6 +505,46 @@ class BusMember(_sync.BusMember):
         return self._incoming(out[0])
 
 
+class Dish(_sync.Dish):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Dials the radio at `url` and joins there every filter joined so
+        far, as `weida.Dish.connect` does."""
+        await _op_async(
+            self._start_connect(url),
+            lib.weida_dish_connect_op_wait,
+            lib.weida_dish_connect_op_fd,
+            lib.weida_dish_connect_op_drop,
+        )
+
+    async def join(  # type: ignore[override]
+        self, filter: str, *, max_age: Optional[float] = None, max_layer: Optional[int] = None
+    ) -> None:
+        """Joins every topic `filter` matches, as `weida.Dish.join` does."""
+        await _op_async(
+            self._start_join(filter, max_age, max_layer),
+            lib.weida_dish_join_op_wait,
+            lib.weida_dish_join_op_fd,
+            lib.weida_dish_join_op_drop,
+        )
+
+    async def leave(self, filter: str) -> None:  # type: ignore[override]
+        """Leaves `filter`; an unknown one is ignored."""
+        await _op_async(
+            self._start_leave(filter),
+            lib.weida_dish_leave_op_wait,
+            lib.weida_dish_leave_op_fd,
+            lib.weida_dish_leave_op_drop,
+        )
+
+    async def recv(self) -> Received:  # type: ignore[override]
+        """The next segment, a frozen `Received` whose stream segment
+        transfer is a `weida.asyncio.IncomingTransfer`. A cancelled `recv`
+        loses nothing. Raises `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._received(out[0])
+
+
 class Relay(_sync.Relay):
     async def accept(self) -> "RelayRequest":  # type: ignore[override]
         """The next registration or tunnel asking to be served. An anonymous
@@ -750,6 +791,9 @@ Paired._PeerEvents = PeerEvents
 Surveyor._SurveyRun = SurveyRun
 Respondent._IncomingRequest = IncomingRequest
 BusMember._IncomingTransfer = IncomingTransfer
+Runtime._Dish = Dish
+Dish._IncomingTransfer = IncomingTransfer
+Dish._PeerEvents = PeerEvents
 IdentitySource._Weak = WeakIdentitySource
 WeakIdentitySource._Strong = IdentitySource
 TrustSource._Weak = WeakTrustSource

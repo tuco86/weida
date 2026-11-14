@@ -4,16 +4,18 @@ takes `timeout` in seconds (`None` waits forever) and raises `Again` when
 it passes."""
 
 import time
+from dataclasses import dataclass
 from typing import Callable, Iterator, Optional, Tuple
 
 from weida import _resolver
 from weida._crypto import path as _fspath
-from weida._enums import ErrorCode
+from weida._enums import ErrorCode, ReceivedKind
 from weida._errors import check
 from weida._native import ffi, lib
 from weida._stats import ConnectionStats, PeerEvent, _take_connection_stats
 from weida._values import (
     ClientTls,
+    DishDrops,
     Drained,
     IdentityEvent,
     IdentitySource,
@@ -25,11 +27,15 @@ from weida._values import (
     TransferMeta,
     TrustSource,
     _Handle,
+    _JoinTerms,
+    _SegmentTerms,
     _count,
     _enum,
     _millis,
+    _take_dish_drops,
     _take_topic_drops,
     _text,
+    _with_terms,
     _with_transfer_meta,
 )
 from weida._wait import Waiters, call_async, call_sync
@@ -187,6 +193,12 @@ class Runtime(_Handle):
         check(lib.weida_runtime_surveyor(self._p(), tls._p(), out))
         return self._Surveyor(out[0], lib.weida_surveyor_drop, self)
 
+    def dish(self, tls: ClientTls) -> "Dish":
+        """A dish: it dials radios on `tls`'s terms."""
+        out = ffi.new("weida_dish **")
+        check(lib.weida_runtime_dish(self._p(), tls._p(), out))
+        return self._Dish(out[0], lib.weida_dish_drop, self)
+
     def suppressed_duplicates(self) -> int:
         """Duplicates discarded inside a negotiated deduplication window; 0
         without deduplication."""
@@ -328,6 +340,13 @@ class Listener(_Handle):
         out = ffi.new("weida_bus_member **")
         check(lib.weida_listener_bus(self._p(), path.encode(), tls._p(), out))
         return self._BusMember(out[0], lib.weida_bus_member_drop, self)
+
+    def radio(self, path: str) -> "Radio":
+        """Registers a radio at the endpoint path `path`; dropping the radio
+        releases the path."""
+        out = ffi.new("weida_radio **")
+        check(lib.weida_listener_radio(self._p(), path.encode(), out))
+        return Radio(out[0], lib.weida_radio_drop, self)
 
     def _start_bind_quic_socket(self, socket: int, tls: ServerTls):
         # Checked before C takes the descriptor: a range error leaves it the
@@ -1328,6 +1347,261 @@ class BusMember(_Handle):
         return self._incoming(out[0])
 
 
+class Radio(_Handle):
+    """The sending half of RADIO/DISH, serving one endpoint path: each
+    segment goes to every dish joined to its topic when it opens, written in
+    layers and never waiting. Dropping it releases the path."""
+
+    def path(self) -> str:
+        return _text(lib.weida_radio_path, self._p())
+
+    def segment(
+        self,
+        topic: str,
+        *,
+        max_age: Optional[float] = None,
+        priority: int = 0,
+        follows_upstream: bool = False,
+    ) -> "Segment":
+        """Opens the topic's next segment to the dishes joined now; opening
+        it resets every unfinished layer of the topic's previous segment,
+        counted `superseded`. `max_age` (seconds, `None` for no budget)
+        resets every copy still unfinished that long after the open;
+        `priority` puts this topic's copies before other topics' of the same
+        layer on one connection (outside -32768..32767 `InvalidArgument`);
+        `follows_upstream` marks a segment relayed while its upstream still
+        streams it. A topic above 256 bytes, or every one of
+        `Limits.max_sequence_scopes` topics with a copy in flight, raises
+        `LimitExceeded`."""
+        out = ffi.new("weida_segment **")
+        terms = _SegmentTerms(max_age=max_age, priority=priority, follows_upstream=follows_upstream)
+        _with_terms(terms, lambda t: check(lib.weida_radio_segment(self._p(), topic.encode(), t, out)))
+        return Segment(out[0], lib.weida_segment_drop, self)
+
+    def datagram(self, topic: str, payload) -> int:
+        """Sends `payload` (any bytes-like, copied) as one datagram segment
+        to every dish joined to `topic`; returns how many it was handed to. A
+        dish that carries no datagrams counts a `no_datagrams` drop."""
+        data = ffi.from_buffer("uint8_t[]", payload)
+        out = ffi.new("size_t *")
+        check(lib.weida_radio_datagram(self._p(), topic.encode(), data, len(data), out))
+        return out[0]
+
+    def dish_count(self) -> int:
+        """The dishes joined."""
+        return lib.weida_radio_dish_count(self._p())
+
+    def dropped(self) -> int:
+        """The copies dropped, over every topic and cause."""
+        return lib.weida_radio_dropped(self._p())
+
+    def dropped_on(self, topic: str) -> Optional[TopicDrops]:
+        """What was dropped on `topic`, a frozen record, or `None` when
+        nothing was."""
+        out = ffi.new("weida_topic_drops **")
+        check(lib.weida_radio_dropped_on(self._p(), topic.encode(), out))
+        records = _take_topic_drops(out[0])
+        return records[0] if records else None
+
+    def drops(self) -> Tuple[TopicDrops, ...]:
+        """One frozen record per topic that lost a copy."""
+        out = ffi.new("weida_topic_drops **")
+        check(lib.weida_radio_drops(self._p(), out))
+        return _take_topic_drops(out[0])
+
+    def evict(self, fingerprint: str, filter: str) -> int:
+        """Withdraws the joins on `filter` of the dishes whose key is
+        `fingerprint` (`sha256:` text) and frees their subscription slots;
+        returns how many went. Malformed text raises `InvalidFingerprint`."""
+        out = ffi.new("size_t *")
+        check(lib.weida_radio_evict(self._p(), fingerprint.encode(), filter.encode(), out))
+        return out[0]
+
+    def dish_drops(self) -> Tuple[DishDrops, ...]:
+        """One frozen record per joined dish connection; a record goes when
+        its connection closes."""
+        out = ffi.new("weida_dish_drops **")
+        check(lib.weida_radio_dish_drops(self._p(), out))
+        return _take_dish_drops(out[0])
+
+
+class Segment(_Handle):
+    """One open segment of a radio: layers written without waiting. Dropping
+    it without `finish()` resets every unfinished layer on every copy."""
+
+    def number(self) -> int:
+        """Its number on its topic; the first is 0."""
+        return lib.weida_segment_number(self._p())
+
+    def topic(self) -> str:
+        return _text(lib.weida_segment_topic, self._p())
+
+    def write(self, chunk) -> int:
+        """`write_layer(0, chunk)`."""
+        data = ffi.from_buffer("uint8_t[]", chunk)
+        out = ffi.new("size_t *")
+        check(lib.weida_segment_write(self._p(), data, len(data), out))
+        return out[0]
+
+    def write_layer(self, layer: int, chunk) -> int:
+        """Writes `chunk` (any bytes-like, copied) to `layer` without
+        waiting; returns how many copies took it. A copy without room loses
+        this layer and every one above it (the whole segment for layer 0); a
+        copy whose dish caps below `layer` is skipped, which is not a drop. A
+        layer of `MAX_SEGMENT_LAYERS` or above raises `LimitExceeded`, a
+        finished one `RuntimeFailure`."""
+        n = _count("layer", layer)
+        data = ffi.from_buffer("uint8_t[]", chunk)
+        out = ffi.new("size_t *")
+        check(lib.weida_segment_write_layer(self._p(), n, data, len(data), out))
+        return out[0]
+
+    def finish_layer(self, layer: int) -> None:
+        """Finishes `layer`; a layer of `MAX_SEGMENT_LAYERS` or above is
+        ignored."""
+        check(lib.weida_segment_finish_layer(self._p(), _count("layer", layer)))
+
+    def finish(self) -> int:
+        """Finishes every open layer; returns how many copies still hold
+        layer 0. Consumes the segment."""
+        out = ffi.new("size_t *")
+        check(lib.weida_segment_finish(self._consume(), out))
+        return out[0]
+
+
+@dataclass(frozen=True)
+class Received:
+    """One thing a dish received, copied out at once. A stream segment
+    (`ReceivedKind.SEGMENT`) carries its `transfer`, whose `meta()` holds
+    its topic, segment number and layer; a datagram segment
+    (`ReceivedKind.DATAGRAM`) carries its `topic`, `segment` number and
+    `payload`. A field the kind does not carry is `None`."""
+
+    kind: ReceivedKind
+    transfer: Optional["IncomingTransfer"]
+    topic: Optional[str]
+    segment: Optional[int]
+    payload: Optional[bytes]
+
+
+class Dish(_Handle):
+    """The receiving half of RADIO/DISH: dials radios, joins topics and
+    receives their segments. Two dishes on one runtime collide on the path:
+    use one runtime per dish."""
+
+    _fd_of = lib.weida_dish_fd
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_dish_connect, "weida_dish_connect_op", self._p(), url.encode())
+
+    def _start_join(self, filter: str, max_age: Optional[float], max_layer: Optional[int]):
+        terms = _JoinTerms(max_age=max_age, max_layer=max_layer)
+        return _with_terms(
+            terms,
+            lambda t: _start(lib.weida_dish_join, "weida_dish_join_op", self._p(), filter.encode(), t),
+        )
+
+    def _start_leave(self, filter: str):
+        return _start(lib.weida_dish_leave, "weida_dish_leave_op", self._p(), filter.encode())
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Dials the radio at `url` and joins there every filter joined so
+        far; a redial joins again, and what was sent in between is gone."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_dish_connect_op_wait, lib.weida_dish_connect_op_drop, timeout)
+
+    def peer_count(self) -> int:
+        """The connected radios."""
+        return lib.weida_dish_peer_count(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_dish_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def events(self) -> "PeerEvents":
+        """A new reader of this dish's peer events, from now on; each call
+        is an independent reader."""
+        out = ffi.new("weida_peer_events **")
+        check(lib.weida_dish_events(self._p(), out))
+        # No parent, as Pusher.events: the events end once the dish is gone,
+        # which holding it would prevent.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
+    def join(
+        self,
+        filter: str,
+        timeout: Optional[float] = None,
+        *,
+        max_age: Optional[float] = None,
+        max_layer: Optional[int] = None,
+    ) -> None:
+        """Joins every topic `filter` matches (the grammar of
+        `Subscriber.subscribe`) at every radio, now and on each dial.
+        `max_age` (seconds, `None` for no budget): a copy still unfinished
+        that long after its segment opened is reset at the radio. `max_layer`
+        (`None` for every layer): the highest layer this dish takes; 16 to
+        255 raise `LimitExceeded`, above 255 `InvalidArgument`. A filter
+        outside the grammar raises `Protocol`."""
+        op = self._start_join(filter, max_age, max_layer)
+        _op_sync(op, lib.weida_dish_join_op_wait, lib.weida_dish_join_op_drop, timeout)
+
+    def leave(self, filter: str, timeout: Optional[float] = None) -> None:
+        """Leaves `filter`; an unknown one is ignored."""
+        op = self._start_leave(filter)
+        _op_sync(op, lib.weida_dish_leave_op_wait, lib.weida_dish_leave_op_drop, timeout)
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_received **")
+        return out, lambda ms: lib.weida_dish_recv(handle, ms, out)
+
+    def _received(self, ptr) -> Received:
+        """Copies a `weida_received` out, taking a stream segment's
+        transfer, and drops it."""
+        try:
+            kind = ReceivedKind(lib.weida_received_kind(ptr))
+            if kind == ReceivedKind.SEGMENT:
+                out = ffi.new("weida_incoming_transfer **")
+                check(lib.weida_received_take_segment(ptr, out))
+                transfer = self._IncomingTransfer(out[0], lib.weida_incoming_transfer_drop, self)
+                return Received(kind=kind, transfer=transfer, topic=None, segment=None, payload=None)
+            number = ffi.new("uint64_t *")
+            lib.weida_received_segment(ptr, number)  # 1 on a datagram
+            length = ffi.new("size_t *")
+            data = lib.weida_received_payload(ptr, length)
+            payload = b"" if length[0] == 0 else ffi.buffer(data, length[0])[:]
+            return Received(
+                kind=kind,
+                transfer=None,
+                topic=_text(lib.weida_received_topic, ptr),
+                segment=number[0],
+                payload=payload,
+            )
+        finally:
+            lib.weida_received_drop(ptr)
+
+    def recv(self, timeout: Optional[float] = None) -> Received:
+        """The next segment, a frozen `Received`; a stream segment's
+        transfer arrives as soon as its header does. A `recv` cut short
+        loses nothing: the take in flight stays in the dish. Raises
+        `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._received(out[0])
+
+    def stale(self) -> int:
+        """Segments discarded because a newer one on their topic was already
+        delivered."""
+        return lib.weida_dish_stale(self._p())
+
+    def overflow(self) -> int:
+        """Segments discarded because the receive queue was full."""
+        return lib.weida_dish_overflow(self._p())
+
+
 class ReplyStream(_Handle):
     """The reply half of an exchange `Requester.open` opened. Dropping it
     before `recv` tells the replier nobody is listening: its `canceled`
@@ -1679,8 +1953,8 @@ class Delivery(_Handle):
 
 
 class PeerEvents(_Handle):
-    """A reader of a dialler's peer events (a requester, pusher, subscriber
-    or dialling pair), a queue (docs/libraries/weida-py.md §1): `recv`
+    """A reader of a dialler's peer events (a requester, pusher, subscriber,
+    dialling pair or dish), a queue (docs/libraries/weida-py.md §1): `recv`
     returns the next `PeerEvent`, or `None` once the dialler, or the relayed
     binding's registration, is gone. A reader that fell more than 64 events
     behind gets one `MISSED` event carrying how many it lost."""
@@ -1782,11 +2056,15 @@ Paired._PeerEvents = PeerEvents
 Surveyor._SurveyRun = SurveyRun
 Respondent._IncomingRequest = IncomingRequest
 BusMember._IncomingTransfer = IncomingTransfer
+Runtime._Dish = Dish
+Dish._IncomingTransfer = IncomingTransfer
+Dish._PeerEvents = PeerEvents
 
 __all__ = [
     "Binding",
     "BusMember",
     "Delivery",
+    "Dish",
     "FanOut",
     "Handoff",
     "IdentityEvents",
@@ -1801,6 +2079,8 @@ __all__ = [
     "Publisher",
     "Puller",
     "Pusher",
+    "Radio",
+    "Received",
     "Relay",
     "RelayRequest",
     "Replier",
@@ -1808,6 +2088,7 @@ __all__ = [
     "Requester",
     "Respondent",
     "Runtime",
+    "Segment",
     "Subscriber",
     "SurveyRun",
     "Surveyor",

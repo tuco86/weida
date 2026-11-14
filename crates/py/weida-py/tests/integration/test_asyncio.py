@@ -362,3 +362,35 @@ def test_pair_survey_and_bus_on_the_loop(bus):
         await server.shutdown()
 
     asyncio.run(main())
+
+
+def test_radio_and_dish_on_the_loop(bus):
+    async def main() -> None:
+        server = wa.Runtime.owned()
+        client = wa.Runtime.owned()
+        listener = server.listener()
+        binding = listener.bind_inproc(bus)
+        radio = listener.radio("/r")
+        dish = client.dish(weida.ClientTls(weida.Trust()))
+        assert isinstance(dish, wa.Dish)
+        await dish.join("v", max_layer=0)
+        await dish.connect(f"weida+inproc://{bus}/r")
+        while radio.dish_count() != 1:
+            await asyncio.sleep(0.001)
+
+        segment = radio.segment("v", max_age=60.0)
+        assert segment.write(b"seg") == 1
+        assert segment.write_layer(1, b"cut") == 0, "the copy is capped at layer 0"
+        assert segment.finish() == 1
+        received = await dish.recv()
+        assert received.kind == weida.ReceivedKind.SEGMENT
+        assert isinstance(received.transfer, wa.IncomingTransfer)
+        assert (await received.transfer.collect(64)).payload == b"seg"
+        await dish.leave("v")
+
+        for handle in (dish, radio, binding, listener):
+            handle.drop()
+        await client.shutdown()
+        await server.shutdown()
+
+    asyncio.run(main())

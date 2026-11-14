@@ -23,6 +23,7 @@ from weida._enums import (
     OutboxFull,
     PeerEventKind,
     ProducerNaming,
+    ReceivedKind,
 )
 from weida._errors import (
     AlreadyRegistered,
@@ -72,6 +73,7 @@ from weida._sync import (
     Binding,
     BusMember,
     Delivery,
+    Dish,
     FanOut,
     Handoff,
     IdentityEvents,
@@ -86,6 +88,8 @@ from weida._sync import (
     Publisher,
     Puller,
     Pusher,
+    Radio,
+    Received,
     Relay,
     RelayRequest,
     Replier,
@@ -93,6 +97,7 @@ from weida._sync import (
     Requester,
     Respondent,
     Runtime,
+    Segment,
     Subscriber,
     SurveyRun,
     Surveyor,
@@ -101,6 +106,7 @@ from weida._sync import (
 from weida._values import (
     ANY_KEY,
     ClientTls,
+    DishDrops,
     Drained,
     Gap,
     GuaranteeSet,
@@ -146,12 +152,16 @@ def new_trace() -> str:
 # The `Limits.datagram_receive_bytes` a profile with flows uses.
 DEFAULT_DATAGRAM_RECEIVE_BYTES: int = _lib.WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES
 
+# How many layers a segment carries: 0 to MAX_SEGMENT_LAYERS - 1.
+MAX_SEGMENT_LAYERS: int = _lib.WEIDA_MAX_SEGMENT_LAYERS
+
 
 __all__ = [
     # Values.
     "ANY_KEY",
     "ClientTls",
     "ConnectionStats",
+    "DishDrops",
     "Drained",
     "Gap",
     "GuaranteeSet",
@@ -165,6 +175,7 @@ __all__ = [
     "Message",
     "PathStats",
     "PeerEvent",
+    "Received",
     "ReconnectPolicy",
     "RemoteStats",
     "RuntimeConfig",
@@ -195,11 +206,14 @@ __all__ = [
     "OutboxFull",
     "PeerEventKind",
     "ProducerNaming",
+    "ReceivedKind",
     "DEFAULT_DATAGRAM_RECEIVE_BYTES",
+    "MAX_SEGMENT_LAYERS",
     # Handles.
     "Binding",
     "BusMember",
     "Delivery",
+    "Dish",
     "FanOut",
     "Handoff",
     "IdentityEvents",
@@ -214,6 +228,7 @@ __all__ = [
     "Publisher",
     "Puller",
     "Pusher",
+    "Radio",
     "Relay",
     "RelayRequest",
     "Replier",
@@ -221,6 +236,7 @@ __all__ = [
     "Requester",
     "Respondent",
     "Runtime",
+    "Segment",
     "Subscriber",
     "SurveyRun",
     "Surveyor",

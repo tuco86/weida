@@ -80,6 +80,14 @@ def _optional_millis(name: str, value) -> int:
     return -1 if value is None else _millis(name, value)
 
 
+def _int(name: str, value) -> int:
+    """A signed integer field; outside the C type's range it is cffi's
+    `OverflowError` at the setter call."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} is an int")
+    return value
+
+
 def _flag(name: str, value) -> int:
     return 1 if value else 0
 
@@ -377,6 +385,44 @@ class RuntimeConfig(_Fields):
             finally:
                 cls._DROP(nested)
 
+
+class _JoinTerms(_Fields):
+    """`JoinTerms`, the keyword arguments of `Dish.join`: `max_age` seconds
+    or `None` (no budget), `max_layer` an `int` or `None` (every layer)."""
+
+    _OUT = "weida_join_terms **"
+    _NEW = lib.weida_join_terms_new
+    _DROP = lib.weida_join_terms_drop
+    _FIELDS = (
+        ("max_age", lib.weida_join_terms_set_max_age_ms, _optional_millis),
+        ("max_layer", lib.weida_join_terms_set_max_layer, _optional_count),
+    )
+
+
+class _SegmentTerms(_Fields):
+    """`SegmentTerms`, the keyword arguments of `Radio.segment`: `max_age`
+    seconds or `None` (no budget), `priority` an `int`, `follows_upstream`
+    a flag."""
+
+    _OUT = "weida_segment_terms **"
+    _NEW = lib.weida_segment_terms_new
+    _DROP = lib.weida_segment_terms_drop
+    _FIELDS = (
+        ("max_age", lib.weida_segment_terms_set_max_age_ms, _optional_millis),
+        ("priority", lib.weida_segment_terms_set_priority, _int),
+        ("follows_upstream", lib.weida_segment_terms_set_follows_upstream, _flag),
+    )
+
+
+def _with_terms(terms: _Fields, use: Callable):
+    """Calls `use` with `terms` as a fresh handle and drops the handle
+    afterwards; the C call copies it. A conversion error raises before
+    `use` runs."""
+    handle = terms._handle()
+    try:
+        return use(handle)
+    finally:
+        type(terms)._DROP(handle)
 
 
 class Trust(_Handle):
@@ -970,7 +1016,9 @@ class IncomingMeta:
     named-pipe peer, `None` for any other.
     `gap`: a `Gap` when the connection negotiated
     `OrderingMode.PER_PRODUCER_DETECT` and a sequence number was skipped,
-    else `None`."""
+    else `None`.
+    `segment` and `layer`: the segment number and the layer (0 to 15) of a
+    RADIO stream segment, both or neither; `None` for any other transfer."""
 
     endpoint: Optional[str]
     content_type: Optional[str]
@@ -979,6 +1027,8 @@ class IncomingMeta:
     content_len: Optional[int]
     sequence: Optional[int]
     gap: Optional[Gap]
+    segment: Optional[int]
+    layer: Optional[int]
     peer_chain: Optional[Tuple[bytes, ...]]
     peer_local: Optional[Union[LocalPrincipal, WindowsPrincipal]]
     trace: Optional[str]
@@ -1015,6 +1065,9 @@ class IncomingMeta:
                 else None
             )
 
+            layer_out = ffi.new("uint8_t *")
+            layer = layer_out[0] if lib.weida_incoming_meta_layer(ptr, layer_out) == 1 else None
+
             return cls(
                 endpoint=_text(lib.weida_incoming_meta_endpoint, ptr),
                 content_type=_text(lib.weida_incoming_meta_content_type, ptr),
@@ -1023,6 +1076,8 @@ class IncomingMeta:
                 content_len=optional(lib.weida_incoming_meta_content_len),
                 sequence=optional(lib.weida_incoming_meta_sequence),
                 gap=gap,
+                segment=optional(lib.weida_incoming_meta_segment),
+                layer=layer,
                 peer_chain=peer_chain,
                 peer_local=_peer_local(ptr),
                 trace=_text(lib.weida_incoming_meta_trace, ptr),
@@ -1118,3 +1173,49 @@ def _take_topic_drops(ptr) -> Tuple[TopicDrops, ...]:
         return tuple(records)
     finally:
         lib.weida_topic_drops_drop(ptr)
+
+
+@dataclass(frozen=True)
+class DishDrops:
+    """What a radio dropped toward one joined dish connection, by cause,
+    copied out at once. `peer_fingerprint` is the `sha256:` key the dish
+    proved, `None` for one that proved none."""
+
+    peer_fingerprint: Optional[str]
+    subscriber_budget: int
+    subscriber_queue: int
+    superseded: int
+    expired: int
+    too_large: int
+    no_datagrams: int
+    layers_cut: int
+
+
+_DISH_DROPS_COUNTS = (
+    ("subscriber_budget", lib.weida_dish_drops_subscriber_budget),
+    ("subscriber_queue", lib.weida_dish_drops_subscriber_queue),
+    ("superseded", lib.weida_dish_drops_superseded),
+    ("expired", lib.weida_dish_drops_expired),
+    ("too_large", lib.weida_dish_drops_too_large),
+    ("no_datagrams", lib.weida_dish_drops_no_datagrams),
+    ("layers_cut", lib.weida_dish_drops_layers_cut),
+)
+
+
+def _take_dish_drops(ptr) -> Tuple[DishDrops, ...]:
+    """Copies every record of a `weida_dish_drops` snapshot out and drops it."""
+    try:
+        number = ffi.new("uint64_t *")
+        length = ffi.new("size_t *")
+        records = []
+        for i in range(lib.weida_dish_drops_len(ptr)):
+            counts = {}
+            for name, getter in _DISH_DROPS_COUNTS:
+                getter(ptr, i, number)  # 1 for every index below len
+                counts[name] = number[0]
+            key = lib.weida_dish_drops_peer_fingerprint(ptr, i, length)
+            fingerprint = None if key == ffi.NULL else ffi.unpack(key, length[0]).decode("utf-8")
+            records.append(DishDrops(peer_fingerprint=fingerprint, **counts))
+        return tuple(records)
+    finally:
+        lib.weida_dish_drops_drop(ptr)
