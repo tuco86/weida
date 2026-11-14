@@ -19,6 +19,7 @@ from weida._values import (
     ServerTls,
     TransferMeta,
     _Handle,
+    _count,
     _enum,
     _millis,
     _text,
@@ -27,6 +28,7 @@ from weida._values import (
 from weida._wait import Waiters, call_async, call_sync
 
 _U64_MAX = 2**64 - 1
+_I64_MAX = 2**63 - 1
 
 
 def _start(starter: Callable, op_type: str, *args):
@@ -180,7 +182,7 @@ class Listener(_Handle):
         )
 
     def _binding(self, ptr) -> "Binding":
-        return Binding(ptr, lib.weida_binding_drop, self)
+        return self._Binding(ptr, lib.weida_binding_drop, self)
 
     def bind_quic(self, addr: str, tls: ServerTls, timeout: Optional[float] = None) -> "Binding":
         """Serves QUIC on `addr`, e.g. `"127.0.0.1:0"`."""
@@ -206,12 +208,158 @@ class Listener(_Handle):
         check(lib.weida_listener_replier(self._p(), path.encode(), out))
         return self._Replier(out[0], lib.weida_replier_drop, self)
 
+    def _start_bind_quic_socket(self, socket: int, tls: ServerTls):
+        # Checked before C takes the descriptor: a range error leaves it the
+        # caller's, as a dropped listener or TLS term (Closed) does.
+        if isinstance(socket, bool) or not isinstance(socket, int):
+            raise TypeError("socket is a descriptor number (an int)")
+        if socket < 0 or socket > _I64_MAX:
+            raise ValueError("socket must be a descriptor number from 0 to 2**63 - 1")
+        return _start(
+            lib.weida_listener_bind_quic_socket,
+            "weida_listener_bind_quic_socket_op",
+            self._p(),
+            socket,
+            tls._p(),
+        )
+
+    def bind_quic_socket(self, socket: int, tls: ServerTls, timeout: Optional[float] = None) -> "Binding":
+        """Serves QUIC on a UDP socket that is already bound: its descriptor
+        (on Windows its SOCKET), e.g. `socket.socket.detach()` or a
+        predecessor's `Handoff.take_socket()`. The descriptor is libweida's
+        once the call reaches C; weida neither binds it nor sets options on
+        it. A socket that is not UDP raises `Io`."""
+        op = self._start_bind_quic_socket(socket, tls)
+        ptr = _op_sync(
+            op,
+            lib.weida_listener_bind_quic_socket_op_wait,
+            lib.weida_listener_bind_quic_socket_op_drop,
+            timeout,
+            "weida_binding **",
+        )
+        return self._binding(ptr)
+
+    def _start_bind_relay(self, relay: str, via: ClientTls, tls: ServerTls):
+        return _start(
+            lib.weida_listener_bind_relay,
+            "weida_listener_bind_relay_op",
+            self._p(),
+            relay.encode(),
+            via._p(),
+            tls._p(),
+        )
+
+    def bind_relay(
+        self, relay: str, via: ClientTls, tls: ServerTls, timeout: Optional[float] = None
+    ) -> "Binding":
+        """Serves this listener's endpoints through the relay at `relay`
+        (`weida://[relay-key@]host:port/.weida/relay`), registered under the
+        key `via` presents; diallers reach them as
+        `weida+relay://<key>@[relay-key@]host:port/path`. `tls` is the
+        server identity and client trust, as for `bind_quic`. Raises
+        `Rejected` where the relay refused the registration. A lost relay is
+        redialled under the runtime's reconnect policy, reported on
+        `Binding.relay_events()`."""
+        op = self._start_bind_relay(relay, via, tls)
+        ptr = _op_sync(
+            op,
+            lib.weida_listener_bind_relay_op_wait,
+            lib.weida_listener_bind_relay_op_drop,
+            timeout,
+            "weida_binding **",
+        )
+        return self._binding(ptr)
+
+    def relay(self) -> "Relay":
+        """Serves a relay at `/.weida/relay` on this listener's bindings:
+        registrations and tunnels arrive at `Relay.accept()`. Raises
+        `AlreadyRegistered` on a second call."""
+        out = ffi.new("weida_relay **")
+        check(lib.weida_listener_relay(self._p(), out))
+        return self._Relay(out[0], lib.weida_relay_drop, self)
+
 
 class Binding(_Handle):
-    """A QUIC binding; dropping it stops serving."""
+    """A QUIC binding, served directly or through a relay. Dropping it
+    releases the handle only: the binding serves until `close`, a hand-over
+    or the runtime's shutdown."""
 
     def local_addr(self) -> str:
         return _text(lib.weida_binding_local_addr, self._p())
+
+    def _start_close(self):
+        return _start(lib.weida_binding_close, "weida_binding_close_op", self._p())
+
+    def close(self, timeout: Optional[float] = None) -> None:
+        """Stops accepting and closes the binding's connections with
+        SHUTDOWN; returns once the port is free to bind again, within the
+        runtime's `shutdown_timeout`. A relayed binding ends its registration.
+        A wait cut short by `timeout` raises `Again` and aborts the close
+        where it is: the port is then freed only by the runtime's shutdown."""
+        op = self._start_close()
+        _op_sync(op, lib.weida_binding_close_op_wait, lib.weida_binding_close_op_drop, timeout)
+
+    def _start_hand_over(self):
+        return _start(lib.weida_binding_hand_over, "weida_binding_hand_over_op", self._consume())
+
+    def _handoff(self, ptr) -> "Handoff":
+        return Handoff(ptr, lib.weida_handoff_drop, self._parent)
+
+    def hand_over(self, timeout: Optional[float] = None) -> "Handoff":
+        """Hands the socket over to a successor: every connection is closed
+        with RESTARTING, its close packet held in the `Handoff` and not
+        sent. Raises `Unsupported` for a relayed binding and `Closed` once
+        a close was started. Consumes the binding."""
+        op = self._start_hand_over()
+        ptr = _op_sync(
+            op,
+            lib.weida_binding_hand_over_op_wait,
+            lib.weida_binding_hand_over_op_drop,
+            timeout,
+            "weida_handoff **",
+        )
+        return self._handoff(ptr)
+
+    def _start_take_over(self, held):
+        data = ffi.from_buffer("uint8_t[]", held)
+        return _start(
+            lib.weida_binding_take_over, "weida_binding_take_over_op", self._p(), data, len(data)
+        )
+
+    def take_over(self, held, timeout: Optional[float] = None) -> int:
+        """Sends the close packets a predecessor held (`Handoff.bytes()`, any
+        bytes-like), so its clients redial into this binding; call it once
+        their endpoints are registered. Returns how many were sent. Bytes
+        that are not a handoff, or are another address's, raise `Io`. The
+        bytes need the integrity of the channel that carries the socket."""
+        op = self._start_take_over(held)
+        return _op_sync(
+            op,
+            lib.weida_binding_take_over_op_wait,
+            lib.weida_binding_take_over_op_drop,
+            timeout,
+            "size_t *",
+        )
+
+    def disconnect(self, fingerprint: str) -> int:
+        """Closes every connection from the peer with this key (`sha256:`
+        text) with REJECTED and returns how many it closed. Not a ban: the
+        peer redials under its own policy. Malformed text raises
+        `InvalidFingerprint`."""
+        out = ffi.new("size_t *")
+        check(lib.weida_binding_disconnect(self._p(), fingerprint.encode(), out))
+        return out[0]
+
+    def relay_events(self) -> Optional["PeerEvents"]:
+        """A new reader of a relayed binding's registration events, or
+        `None` for a binding that is not relayed or whose registration
+        ended."""
+        out = ffi.new("weida_peer_events **")
+        if check(lib.weida_binding_relay_events(self._p(), out)) == 0:
+            return None
+        # No parent, as Requester.events: the queue ends with the
+        # registration, not with this handle.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
 
 
 class LocalBinding(_Handle):
@@ -219,6 +367,38 @@ class LocalBinding(_Handle):
 
     def bus(self) -> str:
         return _text(lib.weida_local_binding_bus, self._p())
+
+
+class Handoff(_Handle):
+    """What `Binding.hand_over` leaves for a successor: the socket and the
+    close packets held for its clients. Dropping it closes a socket not
+    taken."""
+
+    def held(self) -> int:
+        """How many close packets are held."""
+        return lib.weida_handoff_held(self._p())
+
+    def local_addr(self) -> str:
+        """The address the socket is bound to."""
+        return _text(lib.weida_handoff_local_addr, self._p())
+
+    def take_socket(self) -> int:
+        """The socket's descriptor (on Windows its SOCKET), the caller's from
+        then on, e.g. for `socket.socket(fileno=...)` or a successor's
+        `Listener.bind_quic_socket`. Once; a second call raises `Closed`."""
+        out = ffi.new("int64_t *")
+        check(lib.weida_handoff_take_socket(self._p(), out))
+        return out[0]
+
+    # Last: a `bytes` annotation below this line would name the method.
+    def bytes(self) -> bytes:
+        """A copy of the held packets, for the successor's
+        `Binding.take_over`."""
+        length = ffi.new("size_t *")
+        ptr = lib.weida_handoff_bytes(self._p(), length)
+        if length[0] == 0:
+            return b""
+        return ffi.buffer(ptr, length[0])[:]
 
 
 class Requester(_Handle):
@@ -375,6 +555,85 @@ class Replier(_Handle):
         out, attempt = self._accept_attempt()
         call_sync(attempt, timeout)
         return self._request(out[0])
+
+
+class Relay(_Handle):
+    """The relay a listener serves at `/.weida/relay`. Dropping it
+    unregisters the path and closes every registration's connection with
+    SHUTDOWN, so the hidden peers redial."""
+
+    _fd_of = lib.weida_relay_fd
+
+    def _accept_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_relay_request **")
+        return out, lambda ms: lib.weida_relay_accept(handle, ms, out)
+
+    def _request(self, ptr) -> "RelayRequest":
+        return self._RelayRequest(ptr, lib.weida_relay_request_drop, self)
+
+    def accept(self, timeout: Optional[float] = None) -> "RelayRequest":
+        """The next registration or tunnel asking to be served. An anonymous
+        registration, a tunnel to a key nobody registered and an unknown
+        preamble are refused before they get here."""
+        out, attempt = self._accept_attempt()
+        call_sync(attempt, timeout)
+        return self._request(out[0])
+
+
+class RelayRequest(_Handle):
+    """A registration or a tunnel asking the relay to be served. Dropped
+    unanswered, it answers NO_REPLY."""
+
+    def peer_fingerprint(self) -> Optional[str]:
+        """The key (`sha256:` text) the asker proved; `None` for an
+        anonymous dialler, always a key for a registration."""
+        return _text(lib.weida_relay_request_peer_fingerprint, self._p())
+
+    def target(self) -> Optional[str]:
+        """`None` for a registration; for a tunnel, the key of the peer it
+        reaches."""
+        return _text(lib.weida_relay_request_target, self._p())
+
+    def _start_admit(self):
+        return _start(lib.weida_relay_request_admit, "weida_relay_request_admit_op", self._consume())
+
+    def _start_admit_with(self, bytes_per_sec: int):
+        # Converted before the request is consumed: a budget out of range
+        # raises here and leaves the request usable.
+        budget = _count("bytes_per_sec", bytes_per_sec)
+        if budget > _U64_MAX:
+            raise ValueError("bytes_per_sec must be below 2**64")
+        return _start(
+            lib.weida_relay_request_admit_with,
+            "weida_relay_request_admit_op",
+            self._consume(),
+            budget,
+        )
+
+    def _start_refuse(self):
+        return _start(lib.weida_relay_request_refuse, "weida_relay_request_refuse_op", self._consume())
+
+    def admit(self, timeout: Optional[float] = None) -> None:
+        """Serves it. A registration replaces one of the same key on another
+        connection and closes that connection. Consumes the request."""
+        op = self._start_admit()
+        _op_sync(op, lib.weida_relay_request_admit_op_wait, lib.weida_relay_request_admit_op_drop, timeout)
+
+    def admit_with(self, bytes_per_sec: int, timeout: Optional[float] = None) -> None:
+        """Serves it as `admit` does and holds a tunnel to `bytes_per_sec`,
+        both directions together, with one second of burst (0 counts as 1);
+        a registration's budget is unused. Consumes the request; a budget
+        that is not an `int` is a `TypeError`, a negative one or one above
+        2**64 - 1 a `ValueError`, and neither consumes it."""
+        op = self._start_admit_with(bytes_per_sec)
+        _op_sync(op, lib.weida_relay_request_admit_op_wait, lib.weida_relay_request_admit_op_drop, timeout)
+
+    def refuse(self, timeout: Optional[float] = None) -> None:
+        """Refuses it: the asker fails with `Rejected`. Consumes the
+        request."""
+        op = self._start_refuse()
+        _op_sync(op, lib.weida_relay_request_refuse_op_wait, lib.weida_relay_request_refuse_op_drop, timeout)
 
 
 class IncomingRequest(_Handle):
@@ -600,9 +859,9 @@ class Delivery(_Handle):
 
 class PeerEvents(_Handle):
     """A reader of a requester's peer events, a queue (docs/libraries/weida-py.md
-    §1): `recv` returns the next `PeerEvent`, or `None` once the requester is
-    gone. A reader that fell more than 64 events behind gets one `MISSED`
-    event carrying how many it lost."""
+§1): `recv` returns the next `PeerEvent`, or `None` once the requester, or
+    the relayed binding's registration, is gone. A reader that fell more
+    than 64 events behind gets one `MISSED` event carrying how many it lost."""
 
     _fd_of = lib.weida_peer_events_fd
 
@@ -616,7 +875,8 @@ class PeerEvents(_Handle):
         return None if ptr == ffi.NULL else PeerEvent._take(ptr)
 
     def recv(self, timeout: Optional[float] = None) -> Optional[PeerEvent]:
-        """The next event, or `None` once the requester is gone."""
+        """The next event, or `None` once the requester, or the relayed
+        binding's registration, is gone."""
         out, attempt = self._recv_attempt()
         call_sync(attempt, timeout)
         return self._event(out[0])
@@ -642,16 +902,23 @@ Requester._OutgoingTransfer = OutgoingTransfer
 Requester._ReplyStream = ReplyStream
 ReplyStream._IncomingTransfer = IncomingTransfer
 Requester._PeerEvents = PeerEvents
+Listener._Binding = Binding
+Listener._Relay = Relay
+Relay._RelayRequest = RelayRequest
+Binding._PeerEvents = PeerEvents
 
 __all__ = [
     "Binding",
     "Delivery",
+    "Handoff",
     "IncomingRequest",
     "IncomingTransfer",
     "Listener",
     "LocalBinding",
     "OutgoingTransfer",
     "PeerEvents",
+    "Relay",
+    "RelayRequest",
     "Replier",
     "ReplyStream",
     "Requester",

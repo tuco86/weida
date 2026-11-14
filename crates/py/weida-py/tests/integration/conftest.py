@@ -1,4 +1,5 @@
-"""The integration tier: real sockets on localhost, ten seconds per test."""
+"""The integration tier: real sockets on localhost, ten seconds per test
+unless it names its own timeout."""
 
 import itertools
 import pathlib
@@ -13,7 +14,7 @@ _BUSES = itertools.count()
 
 def pytest_collection_modifyitems(config, items):
     for item in items:
-        if HERE in pathlib.Path(str(item.fspath)).parents:
+        if HERE in pathlib.Path(str(item.fspath)).parents and item.get_closest_marker("timeout") is None:
             item.add_marker(pytest.mark.timeout(10))
 
 
