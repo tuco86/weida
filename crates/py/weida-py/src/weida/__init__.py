@@ -59,6 +59,7 @@ from weida._errors import (
 from weida._errors import check as _check
 from weida._native import ffi as _ffi
 from weida._native import lib as _lib
+from weida._resolver import Lookup
 from weida._stats import (
     ConnectionStats,
     PathStats,
@@ -146,6 +147,7 @@ __all__ = [
     "IdentitySource",
     "IncomingMeta",
     "Limits",
+    "Lookup",
     "LocalPrincipal",
     "Message",
     "PathStats",

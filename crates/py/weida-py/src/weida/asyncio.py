@@ -38,6 +38,8 @@ __all__ = [
 
 
 class Runtime(_sync.Runtime):
+    _LOOP_RESOLVER = True
+
     async def shutdown(self) -> None:  # type: ignore[override]
         """Closes every endpoint and waits for the connections to go idle.
         Consumes the runtime."""

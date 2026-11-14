@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import weida
+import weida.asyncio as wa
 
 WAIT = 5.0
 
@@ -226,6 +227,16 @@ def test_configuration_input_errors_raise_at_once():
         weida.Runtime.owned(weida.RuntimeConfig(send_timeout=-1.0))
     with pytest.raises(TypeError, match="limits is a weida.Limits"):
         weida.Runtime.owned(weida.RuntimeConfig(limits={"idle_timeout": 1.0}))
+    with pytest.raises(TypeError, match=r"resolver is a callable \(lookup\) -> addresses"):
+        weida.Runtime.owned(weida.RuntimeConfig(resolver="dns"))
+
+    async def resolve(lookup):
+        return []
+
+    with pytest.raises(TypeError, match="needs weida.asyncio.Runtime"):
+        weida.Runtime.owned(weida.RuntimeConfig(resolver=resolve))
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        wa.Runtime.owned(weida.RuntimeConfig(resolver=resolve))
 
 
 def test_new_trace_is_a_sampled_traceparent():

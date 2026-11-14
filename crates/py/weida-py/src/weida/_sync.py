@@ -6,6 +6,7 @@ it passes."""
 import time
 from typing import Callable, Iterator, Optional, Tuple
 
+from weida import _resolver
 from weida._crypto import path as _fspath
 from weida._enums import ErrorCode
 from weida._errors import check
@@ -102,20 +103,45 @@ async def _op_async(op, wait: Callable, fd_of: Callable, drop: Callable, out_typ
 class Runtime(_Handle):
     """A weida runtime on a reactor of its own."""
 
+    # Whether a coroutine function resolver runs on the running loop
+    # (weida.asyncio.Runtime); here it is a TypeError.
+    _LOOP_RESOLVER = False
+
     @classmethod
     def owned(cls, config: Optional[RuntimeConfig] = None) -> "Runtime":
-        """`weida_runtime_owned`: weida's defaults when `config` is `None`."""
-        out = ffi.new("weida_runtime **")
-        if config is None:
-            check(lib.weida_runtime_owned(ffi.NULL, out))
-        else:
-            cfg = config._handle()
-            try:
-                check(lib.weida_runtime_owned(cfg, out))
-            finally:
-                lib.weida_runtime_config_drop(cfg)
-        runtime = cls.__new__(cls)
-        _Handle.__init__(runtime, out[0], lib.weida_runtime_drop)
+        """`weida_runtime_owned`: weida's defaults when `config` is `None`.
+        A `resolver` in `config` answers each lookup of this runtime's
+        dials. It is called with a frozen `Lookup` and returns `"ip:port"`
+        strings in dial order. A plain callable runs on a daemon thread of
+        its own, one lookup at a time. A coroutine function needs a
+        `weida.asyncio.Runtime` made on the running loop, and runs there. A
+        raise, or an answer that is not a list of `str`, refuses the lookup,
+        and the dial raises `InvalidAddress` carrying why. The resolver is
+        served until the runtime and everything made from it are gone, and
+        never keeps the process alive."""
+        resolve = None if config is None else config._fields.get("resolver")
+        loop = None if resolve is None else _resolver.loop_for(resolve, cls._LOOP_RESOLVER)
+        resolver = None if resolve is None else _resolver.new()
+        try:
+            out = ffi.new("weida_runtime **")
+            if config is None:
+                check(lib.weida_runtime_owned(ffi.NULL, out))
+            else:
+                cfg = config._handle()
+                try:
+                    if resolver is not None:
+                        check(lib.weida_runtime_config_set_resolver(cfg, resolver))
+                    check(lib.weida_runtime_owned(cfg, out))
+                finally:
+                    lib.weida_runtime_config_drop(cfg)
+            runtime = cls.__new__(cls)
+            _Handle.__init__(runtime, out[0], lib.weida_runtime_drop)
+            if resolver is not None:
+                _resolver.serve(resolver, resolve, loop)
+        except BaseException:
+            if resolver is not None:
+                lib.weida_resolver_drop(resolver)
+            raise
         return runtime
 
     def listener(self) -> "Listener":

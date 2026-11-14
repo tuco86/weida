@@ -332,7 +332,9 @@ class RuntimeConfig(_Fields):
     seconds, `send_timeout` seconds or `None` (no bound); `outbox_full` an
     `OutboxFull`, `discovery` a `Discovery`; `limits` a `Limits`,
     `guarantees` a `GuaranteeSet`, `reconnect` a `ReconnectPolicy`, each
-    copied when `Runtime.owned` builds the runtime."""
+    copied when `Runtime.owned` builds the runtime; `resolver` a callable
+    `(Lookup) -> list[str]`, or `None` for the system resolver
+    (`Runtime.owned` says how it is called)."""
 
     _OUT = "weida_runtime_config **"
     _NEW = lib.weida_runtime_config_new
@@ -360,7 +362,7 @@ class RuntimeConfig(_Fields):
     )
 
     def _known(self) -> set:
-        return super()._known() | {name for name, _, _ in self._NESTED}
+        return super()._known() | {name for name, _, _ in self._NESTED} | {"resolver"}
 
     def _extra(self, handle) -> None:
         for name, cls, setter in self._NESTED:
