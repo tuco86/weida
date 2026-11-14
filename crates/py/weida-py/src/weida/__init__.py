@@ -24,6 +24,7 @@ from weida._enums import (
     PeerEventKind,
     ProducerNaming,
     ReceivedKind,
+    ReportMode,
 )
 from weida._errors import (
     AlreadyRegistered,
@@ -72,6 +73,7 @@ from weida._stats import (
 from weida._sync import (
     Binding,
     BusMember,
+    Cursors,
     Delivery,
     Dish,
     FanOut,
@@ -94,6 +96,7 @@ from weida._sync import (
     RelayRequest,
     Replier,
     ReplyStream,
+    Reporter,
     Requester,
     Respondent,
     Runtime,
@@ -106,6 +109,8 @@ from weida._sync import (
 from weida._values import (
     ANY_KEY,
     ClientTls,
+    CursorEntry,
+    CursorSet,
     DishDrops,
     Drained,
     Gap,
@@ -155,12 +160,18 @@ DEFAULT_DATAGRAM_RECEIVE_BYTES: int = _lib.WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES
 # How many layers a segment carries: 0 to MAX_SEGMENT_LAYERS - 1.
 MAX_SEGMENT_LAYERS: int = _lib.WEIDA_MAX_SEGMENT_LAYERS
 
+# The first cursor level an application may name; the levels below it are
+# weida's own, the `Acknowledgement` members.
+CURSOR_LEVEL_APPLICATION_FLOOR: int = _lib.WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR
+
 
 __all__ = [
     # Values.
     "ANY_KEY",
     "ClientTls",
     "ConnectionStats",
+    "CursorEntry",
+    "CursorSet",
     "DishDrops",
     "Drained",
     "Gap",
@@ -207,11 +218,14 @@ __all__ = [
     "PeerEventKind",
     "ProducerNaming",
     "ReceivedKind",
+    "ReportMode",
+    "CURSOR_LEVEL_APPLICATION_FLOOR",
     "DEFAULT_DATAGRAM_RECEIVE_BYTES",
     "MAX_SEGMENT_LAYERS",
     # Handles.
     "Binding",
     "BusMember",
+    "Cursors",
     "Delivery",
     "Dish",
     "FanOut",
@@ -233,6 +247,7 @@ __all__ = [
     "RelayRequest",
     "Replier",
     "ReplyStream",
+    "Reporter",
     "Requester",
     "Respondent",
     "Runtime",

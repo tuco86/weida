@@ -13,12 +13,13 @@ from weida._enums import ErrorCode
 from weida._native import ffi, lib
 from weida._stats import PeerEvent
 from weida._sync import Handoff, Received, _op_async
-from weida._values import ClientTls, Drained, IdentityEvent, Message, ServerTls, TransferMeta
+from weida._values import ClientTls, CursorSet, Drained, IdentityEvent, Message, ServerTls, TransferMeta
 from weida._wait import call_async
 
 __all__ = [
     "Binding",
     "BusMember",
+    "Cursors",
     "Delivery",
     "Dish",
     "FanOut",
@@ -37,6 +38,7 @@ __all__ = [
     "RelayRequest",
     "Replier",
     "ReplyStream",
+    "Reporter",
     "Requester",
     "Respondent",
     "Runtime",
@@ -704,6 +706,46 @@ class Delivery(_sync.Delivery):
         )
 
 
+class Cursors(_sync.Cursors):
+    __iter__ = None  # type: ignore[assignment]  # `async for` only
+
+    async def recv(self) -> Optional[CursorSet]:  # type: ignore[override]
+        """The newest set after a change, or `None` once no more cursors
+        come."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._set(out[0])
+
+    async def __aiter__(self) -> AsyncIterator[CursorSet]:
+        """Every set until no more cursors come."""
+        while (s := await self.recv()) is not None:
+            yield s
+
+
+class Reporter(_sync.Reporter):
+    async def report(self, level, offset: int) -> None:  # type: ignore[override]
+        """Reports that `level` has reached `offset`, as
+        `weida.Reporter.report` does; a cancelled report is aborted."""
+        op = self._start_report(level, offset)
+        await _op_async(
+            op,
+            lib.weida_reporter_report_op_wait,
+            lib.weida_reporter_report_op_fd,
+            lib.weida_reporter_report_op_drop,
+        )
+
+    async def finish(self) -> None:  # type: ignore[override]
+        """Flushes the newest offset per reported level and ends the
+        report. Consumes the reporter."""
+        op = self._start_finish()
+        await _op_async(
+            op,
+            lib.weida_reporter_finish_op_wait,
+            lib.weida_reporter_finish_op_fd,
+            lib.weida_reporter_finish_op_drop,
+        )
+
+
 class PeerEvents(_sync.PeerEvents):
     __iter__ = None  # type: ignore[assignment]  # `async for` only
 
@@ -794,6 +836,8 @@ BusMember._IncomingTransfer = IncomingTransfer
 Runtime._Dish = Dish
 Dish._IncomingTransfer = IncomingTransfer
 Dish._PeerEvents = PeerEvents
+OutgoingTransfer._Cursors = Cursors
+IncomingTransfer._Reporter = Reporter
 IdentitySource._Weak = WeakIdentitySource
 WeakIdentitySource._Strong = IdentitySource
 TrustSource._Weak = WeakTrustSource

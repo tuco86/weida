@@ -47,6 +47,13 @@ class Acknowledgement(enum.IntEnum):
     PROCESSED = lib.WEIDA_ACKNOWLEDGEMENT_PROCESSED
 
 
+class ReportMode(enum.IntEnum):
+    """`ReportMode`: how the receiver reports the ordered cursor levels."""
+
+    PROGRESS = lib.WEIDA_REPORT_MODE_PROGRESS
+    FINAL_ONLY = lib.WEIDA_REPORT_MODE_FINAL_ONLY
+
+
 class Durability(enum.IntEnum):
     """`Durability`: what a stored message survives."""
 
@@ -176,4 +183,5 @@ __all__ = [
     "PeerEventKind",
     "ProducerNaming",
     "ReceivedKind",
+    "ReportMode",
 ]

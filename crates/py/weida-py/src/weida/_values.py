@@ -2,6 +2,7 @@
 metadata and messages, and the handle base every object stands on."""
 
 import base64
+import enum
 import math
 import os
 import re
@@ -22,6 +23,7 @@ from weida._enums import (
     OrderingMode,
     OutboxFull,
     ProducerNaming,
+    ReportMode,
 )
 from weida._errors import Closed, check
 from weida._native import ffi, lib
@@ -902,10 +904,46 @@ class ServerTls(_Handle):
             raise
 
 
+def _cursor_level(name: str, value) -> int:
+    """A cursor level in: an `Acknowledgement` member or an application
+    stage as an `int`, passed on as its wire value; C refuses 6 to 15 with
+    `InvalidArgument`, and above `u64` it is cffi's `OverflowError`."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or (isinstance(value, enum.IntEnum) and not isinstance(value, Acknowledgement))
+    ):
+        raise TypeError(f"{name} is a weida.Acknowledgement or an int")
+    if value < 0:
+        raise ValueError(f"{name} must not be negative")
+    return int(value)
+
+
+def _level(wire: int) -> Union[Acknowledgement, int]:
+    """A cursor level out: weida's own as an `Acknowledgement`, an
+    application stage as an `int`."""
+    return Acknowledgement(wire) if wire < lib.WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR else wire
+
+
+def _levels(getter: Callable, handle) -> Tuple[Union[Acknowledgement, int], ...]:
+    """An array of cursor levels a getter returns (R7), ascending; `()` for
+    NULL."""
+    length = ffi.new("size_t *")
+    ptr = getter(handle, length)
+    if ptr == ffi.NULL:
+        return ()
+    return tuple(_level(ptr[i]) for i in range(length[0]))
+
+
 class TransferMeta:
     """The metadata an outgoing transfer carries: `content_type`,
     `content_len` (an `int`), `trace` (a W3C traceparent; a malformed one is
-    `InvalidArgument`), `topic`, and `achieved` (an `Acknowledgement`)."""
+    `InvalidArgument`), `topic`, `achieved` (an `Acknowledgement`), `report`
+    (a sequence of cursor levels: `Acknowledgement` members, or application
+    stages as `int`s at or above `CURSOR_LEVEL_APPLICATION_FLOOR`; 6 to 15
+    is `InvalidArgument`, more than 16 distinct ones fail the send with
+    `LimitExceeded`; an empty sequence orders nothing) and `report_mode` (a
+    `ReportMode`)."""
 
     def __init__(
         self,
@@ -915,12 +953,16 @@ class TransferMeta:
         trace: Optional[str] = None,
         topic: Optional[str] = None,
         achieved: Optional[Acknowledgement] = None,
+        report: Optional[Sequence[Union[Acknowledgement, int]]] = None,
+        report_mode: Optional[ReportMode] = None,
     ) -> None:
         self.content_type = content_type
         self.content_len = content_len
         self.trace = trace
         self.topic = topic
         self.achieved = achieved
+        self.report = report
+        self.report_mode = report_mode
 
     def _handle(self):
         out = ffi.new("weida_transfer_meta **")
@@ -938,6 +980,15 @@ class TransferMeta:
             if self.achieved is not None:
                 level = _enum(Acknowledgement)("achieved", self.achieved)
                 check(lib.weida_transfer_meta_set_achieved(meta, level))
+            if self.report is not None:
+                if isinstance(self.report, (str, bytes)) or not isinstance(self.report, Sequence):
+                    raise TypeError("report is a sequence of cursor levels")
+                levels = [_cursor_level(f"report[{i}]", level) for i, level in enumerate(self.report)]
+                array = ffi.new("uint64_t[]", levels) if levels else ffi.NULL
+                check(lib.weida_transfer_meta_set_report(meta, array, len(levels)))
+            if self.report_mode is not None:
+                mode = _enum(ReportMode)("report_mode", self.report_mode)
+                check(lib.weida_transfer_meta_set_report_mode(meta, mode))
         except BaseException:
             lib.weida_transfer_meta_drop(meta)
             raise
@@ -1018,7 +1069,13 @@ class IncomingMeta:
     `OrderingMode.PER_PRODUCER_DETECT` and a sequence number was skipped,
     else `None`.
     `segment` and `layer`: the segment number and the layer (0 to 15) of a
-    RADIO stream segment, both or neither; `None` for any other transfer."""
+    RADIO stream segment, both or neither; `None` for any other transfer.
+    `report`: the cursor levels the sender ordered, ascending,
+    `Acknowledgement` members below `CURSOR_LEVEL_APPLICATION_FLOOR` and
+    `int`s at or above it; `()` when it ordered none. `report_mode`: the
+    `ReportMode` it asked for (`PROGRESS` when it stated none). `report_id`:
+    the id of the receiver's cursor stream, an `int` exactly when levels
+    were ordered, else `None`."""
 
     endpoint: Optional[str]
     content_type: Optional[str]
@@ -1034,6 +1091,9 @@ class IncomingMeta:
     trace: Optional[str]
     tracestate: Optional[str]
     achieved: Optional[Acknowledgement]
+    report: Tuple[Union[Acknowledgement, int], ...]
+    report_mode: ReportMode
+    report_id: Optional[int]
 
     @classmethod
     def _take(cls, ptr) -> "IncomingMeta":
@@ -1083,6 +1143,9 @@ class IncomingMeta:
                 trace=_text(lib.weida_incoming_meta_trace, ptr),
                 tracestate=_text(lib.weida_incoming_meta_tracestate, ptr),
                 achieved=achieved,
+                report=_levels(lib.weida_incoming_meta_report, ptr),
+                report_mode=ReportMode(check(lib.weida_incoming_meta_report_mode(ptr))),
+                report_id=optional(lib.weida_incoming_meta_report_id),
             )
         finally:
             lib.weida_incoming_meta_drop(ptr)
@@ -1219,3 +1282,31 @@ def _take_dish_drops(ptr) -> Tuple[DishDrops, ...]:
         return tuple(records)
     finally:
         lib.weida_dish_drops_drop(ptr)
+
+
+@dataclass(frozen=True)
+class CursorEntry:
+    """One level of a cursor set and how far it got: `level` an
+    `Acknowledgement` below `CURSOR_LEVEL_APPLICATION_FLOOR`, else an
+    application stage as an `int`; `offset` an `int`."""
+
+    level: Union[Acknowledgement, int]
+    offset: int
+
+
+# The newest offset per reported level, ascending by level.
+CursorSet = Tuple[CursorEntry, ...]
+
+
+def _take_cursor_set(ptr) -> CursorSet:
+    """Copies a `weida_cursor_set` out and drops it."""
+    try:
+        level = ffi.new("uint64_t *")
+        offset = ffi.new("uint64_t *")
+        entries = []
+        for i in range(lib.weida_cursor_set_len(ptr)):
+            lib.weida_cursor_set_level(ptr, i, level, offset)
+            entries.append(CursorEntry(level=_level(level[0]), offset=offset[0]))
+        return tuple(entries)
+    finally:
+        lib.weida_cursor_set_drop(ptr)

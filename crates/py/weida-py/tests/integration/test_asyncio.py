@@ -394,3 +394,38 @@ def test_radio_and_dish_on_the_loop(bus):
         await server.shutdown()
 
     asyncio.run(main())
+
+
+def test_cursors_on_the_loop(bus):
+    async def main() -> None:
+        accepted = weida.Acknowledgement.ACCEPTED
+        runtime = wa.Runtime.owned()
+        listener = runtime.listener()
+        binding = listener.bind_inproc(bus)
+        replier = listener.replier("/echo")
+        requester = runtime.requester(weida.ClientTls(weida.Trust()))
+        await requester.connect(f"weida+inproc://{bus}/echo")
+
+        body, reply = await requester.open(weida.TransferMeta(report=[accepted]))
+        cursors = body.cursors()
+        assert isinstance(cursors, wa.Cursors)
+        await body.write_all(b"abcd")
+        body.finish().drop()
+        request = await replier.accept()
+        received = request.take_body()
+        reporter = received.reporter()
+        assert isinstance(reporter, wa.Reporter)
+        reporter.set_granularity(0, 0)
+        assert (await received.collect(64)).payload == b"abcd"
+        await reporter.report(accepted, 2)
+        assert await cursors.recv() == (weida.CursorEntry(accepted, 2),)
+        await reporter.report(accepted, 4)
+        await reporter.finish()
+        sets = [s async for s in cursors]
+        assert sets[-1] == (weida.CursorEntry(accepted, 4),)
+
+        for handle in (cursors, reply, request, requester, replier, binding, listener):
+            handle.drop()
+        await runtime.shutdown()
+
+    asyncio.run(main())

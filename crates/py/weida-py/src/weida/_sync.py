@@ -5,16 +5,17 @@ it passes."""
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator, Optional, Tuple
+from typing import Callable, Iterator, Optional, Tuple, Union
 
 from weida import _resolver
 from weida._crypto import path as _fspath
-from weida._enums import ErrorCode, ReceivedKind
+from weida._enums import Acknowledgement, ErrorCode, ReceivedKind, ReportMode
 from weida._errors import check
 from weida._native import ffi, lib
 from weida._stats import ConnectionStats, PeerEvent, _take_connection_stats
 from weida._values import (
     ClientTls,
+    CursorSet,
     DishDrops,
     Drained,
     IdentityEvent,
@@ -30,8 +31,11 @@ from weida._values import (
     _JoinTerms,
     _SegmentTerms,
     _count,
+    _cursor_level,
     _enum,
+    _levels,
     _millis,
+    _take_cursor_set,
     _take_dish_drops,
     _take_topic_drops,
     _text,
@@ -1847,6 +1851,16 @@ class IncomingTransfer(_Handle):
         check(lib.weida_incoming_transfer_connection(self._p(), out))
         return out[0]
 
+    def reporter(self) -> Optional["Reporter"]:
+        """A reporter for the cursor levels the sender ordered, or `None`
+        when it ordered none. Each call hands out a new reporter on the same
+        report, so take one, and take it before `collect`, which raises
+        `Closed` for it afterwards; the reporter outlives the transfer."""
+        out = ffi.new("weida_reporter **")
+        if check(lib.weida_incoming_transfer_reporter(self._p(), out)) == 0:
+            return None
+        return self._Reporter(out[0], lib.weida_reporter_drop, self._parent)
+
     def _read_attempt(self, buffer):
         handle = self._p()
         view = ffi.from_buffer("uint8_t[]", buffer, require_writable=True)
@@ -1932,6 +1946,18 @@ class OutgoingTransfer(_Handle):
         `finish`."""
         check(lib.weida_outgoing_transfer_expire_after_ms(self._p(), _millis("seconds", seconds)))
 
+    def cursors(self) -> Optional["Cursors"]:
+        """The queue of cursor sets the receiver reports for this transfer:
+        a `Cursors` the first time, `None` after that and when the metadata
+        ordered no levels. Take it before `finish`, which raises `Closed` for
+        it afterwards; the queue outlives the transfer."""
+        out = ffi.new("weida_cursors **")
+        if check(lib.weida_outgoing_transfer_cursors(self._p(), out)) == 0:
+            return None
+        # No parent: the queue ends once the connection is gone, which
+        # holding the dialler would prevent.
+        return self._Cursors(out[0], lib.weida_cursors_drop)
+
     def finish(self) -> "Delivery":
         """Ends the payload. Consumes the transfer."""
         out = ffi.new("weida_delivery **")
@@ -1950,6 +1976,90 @@ class Delivery(_Handle):
         Consumes the receipt."""
         op = self._start_delivered()
         _op_sync(op, lib.weida_delivery_delivered_op_wait, lib.weida_delivery_delivered_op_drop, timeout)
+
+
+class Cursors(_Handle):
+    """The cursor sets one transfer's receiver reports, a queue
+    (docs/libraries/weida-py.md §1): `recv` returns the newest `CursorSet`
+    after a change (a tuple of frozen `CursorEntry`, ascending by level;
+    changes since the last `recv` coalesce, offsets are absolute), or `None`
+    once no more cursors come (the reporter finished, the stream was reset
+    or the connection is gone)."""
+
+    _fd_of = lib.weida_cursors_fd
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_cursor_set **")
+        return out, lambda ms: lib.weida_cursors_recv(handle, ms, out)
+
+    @staticmethod
+    def _set(ptr) -> Optional[CursorSet]:
+        return None if ptr == ffi.NULL else _take_cursor_set(ptr)
+
+    def recv(self, timeout: Optional[float] = None) -> Optional[CursorSet]:
+        """The newest set after a change, or `None` once no more cursors
+        come."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._set(out[0])
+
+    def __iter__(self) -> Iterator[CursorSet]:
+        """Every set until no more cursors come, each `recv` without a
+        timeout."""
+        while (s := self.recv()) is not None:
+            yield s
+
+
+class Reporter(_Handle):
+    """The receiver's end of a report: how far each ordered level got.
+    Dropping it without `finish` flushes nothing."""
+
+    def levels(self) -> Tuple[Union[Acknowledgement, int], ...]:
+        """The levels the sender ordered, ascending."""
+        return _levels(lib.weida_reporter_levels, self._p())
+
+    def mode(self) -> ReportMode:
+        """The `ReportMode` the sender asked for."""
+        return ReportMode(check(lib.weida_reporter_mode(self._p())))
+
+    def set_granularity(self, bytes: int, interval: float) -> None:
+        """Progress records are written when a level advanced `bytes` or
+        `interval` seconds passed since its last record, whichever comes
+        first; 0 and 0 write every report. No effect in final-only mode;
+        `InvalidArgument` while a report runs."""
+        check(
+            lib.weida_reporter_set_granularity(
+                self._p(), _count("bytes", bytes), _millis("interval", interval)
+            )
+        )
+
+    def _start_report(self, level, offset):
+        return _start(
+            lib.weida_reporter_report,
+            "weida_reporter_report_op",
+            self._p(),
+            _cursor_level("level", level),
+            _count("offset", offset),
+        )
+
+    def report(self, level, offset: int, timeout: Optional[float] = None) -> None:
+        """Reports that `level` (an `Acknowledgement` or an application
+        stage) has reached `offset`; a level the sender did not order is
+        ignored. Never raises for a transport reason; a wait cut short by
+        `timeout` aborts the report."""
+        op = self._start_report(level, offset)
+        _op_sync(op, lib.weida_reporter_report_op_wait, lib.weida_reporter_report_op_drop, timeout)
+
+    def _start_finish(self):
+        return _start(lib.weida_reporter_finish, "weida_reporter_finish_op", self._consume())
+
+    def finish(self, timeout: Optional[float] = None) -> None:
+        """Flushes the newest offset per reported level and ends the
+        report. Consumes the reporter (also when C refuses it because a
+        report is in flight)."""
+        op = self._start_finish()
+        _op_sync(op, lib.weida_reporter_finish_op_wait, lib.weida_reporter_finish_op_drop, timeout)
 
 
 class PeerEvents(_Handle):
@@ -2059,10 +2169,13 @@ BusMember._IncomingTransfer = IncomingTransfer
 Runtime._Dish = Dish
 Dish._IncomingTransfer = IncomingTransfer
 Dish._PeerEvents = PeerEvents
+OutgoingTransfer._Cursors = Cursors
+IncomingTransfer._Reporter = Reporter
 
 __all__ = [
     "Binding",
     "BusMember",
+    "Cursors",
     "Delivery",
     "Dish",
     "FanOut",
@@ -2085,6 +2198,7 @@ __all__ = [
     "RelayRequest",
     "Replier",
     "ReplyStream",
+    "Reporter",
     "Requester",
     "Respondent",
     "Runtime",
