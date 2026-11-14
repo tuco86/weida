@@ -2,17 +2,28 @@
 metadata and messages, and the handle base every object stands on."""
 
 import base64
+import math
 import os
 import re
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from weida._crypto import certificate_pem, key_pem, path
+from weida._enums import (
+    Acknowledgement,
+    Backpressure,
+    Congestion,
+    Deduplication,
+    DeliveryLevel,
+    Discovery,
+    Durability,
+    OrderingMode,
+    OutboxFull,
+    ProducerNaming,
+)
 from weida._errors import Closed, check
 from weida._native import ffi, lib
 from weida._wait import Waiters
-
-_UNSET = object()
 
 
 def _closed() -> Closed:
@@ -36,6 +47,58 @@ def _pem_take(ptr, wipeable: bool):
         return bytearray(buffer) if wipeable else buffer[:]
     finally:
         lib.weida_pem_drop(ptr)
+
+
+def _count(name: str, value) -> int:
+    """A non-negative integer field; above the C type's range it is cffi's
+    `OverflowError` at the setter call."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} is an int")
+    if value < 0:
+        raise ValueError(f"{name} must not be negative")
+    return value
+
+
+def _optional_count(name: str, value) -> int:
+    """`_count`, with `None` as the C ABI's `None` (-1, R7)."""
+    return -1 if value is None else _count(name, value)
+
+
+def _millis(name: str, value) -> int:
+    """A duration in seconds, as the C ABI's milliseconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} is a number of seconds")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite, non-negative number of seconds")
+    return round(value * 1000)
+
+
+def _optional_millis(name: str, value) -> int:
+    """`_millis`, with `None` as the C ABI's `None` (-1, R7)."""
+    return -1 if value is None else _millis(name, value)
+
+
+def _flag(name: str, value) -> int:
+    return 1 if value else 0
+
+
+def _enum(cls) -> Callable:
+    """A converter that takes only members of `cls`: an `IntEnum` compares
+    equal to plain ints, so a laxer check would turn `Backpressure.DROP`
+    into `OutboxFull.REJECT` without a word."""
+
+    def convert(name: str, value) -> int:
+        if not isinstance(value, cls):
+            raise TypeError(f"{name} is a weida.{cls.__name__}")
+        return int(value)
+
+    return convert
+
+
+def _optional_enum(cls) -> Callable:
+    """`_enum(cls)`, with `None` as the C ABI's `None` (-1, R7)."""
+    convert = _enum(cls)
+    return lambda name, value: -1 if value is None else convert(name, value)
 
 
 class _Handle:
@@ -94,28 +157,196 @@ class _Handle:
         self.drop()
 
 
-class RuntimeConfig:
-    """`RuntimeConfig`: the fields set here, weida's defaults for the rest.
-    `shutdown_timeout` is in seconds."""
+class _Fields:
+    """A configuration value: keyword fields checked against _FIELDS, turned
+    into a fresh handle per call by _handle()."""
 
-    def __init__(self, worker_threads=_UNSET, shutdown_timeout=_UNSET) -> None:
-        self.worker_threads = worker_threads
-        self.shutdown_timeout = shutdown_timeout
+    # (name, setter, convert) triples.
+    _FIELDS: tuple = ()
+    _OUT: str
+    _NEW: Callable
+    _DROP: Callable
+
+    def _known(self) -> set:
+        return {name for name, _, _ in self._FIELDS}
+
+    def __init__(self, **fields) -> None:
+        known = self._known()
+        for key in fields:
+            if key not in known:
+                raise TypeError(f"unknown {type(self).__name__} field: {key}")
+        self._fields = dict(fields)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({', '.join(f'{k}={v!r}' for k, v in self._fields.items())})"
+
+    def _new_handle(self):
+        out = ffi.new(self._OUT)
+        check(type(self)._NEW(out))
+        return out[0]
+
+    def _extra(self, handle) -> None:
+        pass
 
     def _handle(self):
-        out = ffi.new("weida_runtime_config **")
-        check(lib.weida_runtime_config_new(out))
-        cfg = out[0]
+        handle = self._new_handle()
         try:
-            if self.worker_threads is not _UNSET:
-                check(lib.weida_runtime_config_set_worker_threads(cfg, self.worker_threads))
-            if self.shutdown_timeout is not _UNSET:
-                ms = round(self.shutdown_timeout * 1000)
-                check(lib.weida_runtime_config_set_shutdown_timeout_ms(cfg, ms))
+            for name, setter, convert in self._FIELDS:
+                if name in self._fields:
+                    check(setter(handle, convert(name, self._fields[name])))
+            self._extra(handle)
         except BaseException:
-            lib.weida_runtime_config_drop(cfg)
+            type(self)._DROP(handle)
             raise
-        return cfg
+        return handle
+
+
+class Limits(_Fields):
+    """`Limits`: the fields set here, weida's defaults for the rest. Byte,
+    stream and entry counts are `int`s; `keep_alive`, `idle_timeout`,
+    `hello_timeout`, `flow_early_hold` and `header_timeout` are seconds;
+    `path_report` a flag; `congestion` a `Congestion`."""
+
+    _OUT = "weida_limits **"
+    _NEW = lib.weida_limits_new
+    _DROP = lib.weida_limits_drop
+    _FIELDS = (
+        ("max_header_bytes", lib.weida_limits_set_max_header_bytes, _count),
+        ("max_concurrent_uni_streams", lib.weida_limits_set_max_concurrent_uni_streams, _count),
+        ("max_concurrent_bidi_streams", lib.weida_limits_set_max_concurrent_bidi_streams, _count),
+        ("stream_receive_window", lib.weida_limits_set_stream_receive_window, _count),
+        ("connection_receive_window", lib.weida_limits_set_connection_receive_window, _count),
+        ("keep_alive", lib.weida_limits_set_keep_alive_ms, _millis),
+        ("idle_timeout", lib.weida_limits_set_idle_timeout_ms, _millis),
+        ("hello_timeout", lib.weida_limits_set_hello_timeout_ms, _millis),
+        ("max_subscriptions", lib.weida_limits_set_max_subscriptions, _count),
+        ("subscriber_buffer_bytes", lib.weida_limits_set_subscriber_buffer_bytes, _count),
+        ("max_sequence_scopes", lib.weida_limits_set_max_sequence_scopes, _count),
+        ("max_reorder_hold", lib.weida_limits_set_max_reorder_hold, _count),
+        ("max_local_streams", lib.weida_limits_set_max_local_streams, _count),
+        ("max_parked_reverse", lib.weida_limits_set_max_parked_reverse, _count),
+        ("max_dedup_entries", lib.weida_limits_set_max_dedup_entries, _count),
+        ("datagram_receive_bytes", lib.weida_limits_set_datagram_receive_bytes, _count),
+        ("datagram_send_bytes", lib.weida_limits_set_datagram_send_bytes, _count),
+        ("path_report", lib.weida_limits_set_path_report, _flag),
+        ("max_flows", lib.weida_limits_set_max_flows, _count),
+        ("flow_queue_bytes", lib.weida_limits_set_flow_queue_bytes, _count),
+        ("flow_early_bytes", lib.weida_limits_set_flow_early_bytes, _count),
+        ("flow_early_hold", lib.weida_limits_set_flow_early_hold_ms, _millis),
+        ("congestion", lib.weida_limits_set_congestion, _enum(Congestion)),
+        ("header_timeout", lib.weida_limits_set_header_timeout_ms, _millis),
+        ("max_header_streams", lib.weida_limits_set_max_header_streams, _count),
+    )
+
+
+class GuaranteeSet(_Fields):
+    """`GuaranteeSet`, starting from `CORE`: `delivery` a `DeliveryLevel`,
+    `acknowledgement` an `Acknowledgement`, `durability` a `Durability` or
+    `None`, `replicas` an `int` or `None`, `ordering` an `OrderingMode`,
+    `deduplication` a `Deduplication`, `dedup_window` seconds or `None`,
+    `backpressure` a `Backpressure`, `producer_naming` a `ProducerNaming`,
+    `control_isolated` a flag. No combination is checked here, as in the C
+    ABI: a set a peer cannot meet fails the connect or the first request
+    with `Negotiation`."""
+
+    _OUT = "weida_guarantee_set **"
+    _NEW = lib.weida_guarantee_set_new
+    _DROP = lib.weida_guarantee_set_drop
+    _FIELDS = (
+        ("delivery", lib.weida_guarantee_set_set_delivery, _enum(DeliveryLevel)),
+        ("acknowledgement", lib.weida_guarantee_set_set_acknowledgement, _enum(Acknowledgement)),
+        ("durability", lib.weida_guarantee_set_set_durability, _optional_enum(Durability)),
+        ("replicas", lib.weida_guarantee_set_set_replicas, _optional_count),
+        ("ordering", lib.weida_guarantee_set_set_ordering, _enum(OrderingMode)),
+        ("deduplication", lib.weida_guarantee_set_set_deduplication, _enum(Deduplication)),
+        ("dedup_window", lib.weida_guarantee_set_set_dedup_window_ms, _optional_millis),
+        ("backpressure", lib.weida_guarantee_set_set_backpressure, _enum(Backpressure)),
+        ("producer_naming", lib.weida_guarantee_set_set_producer_naming, _enum(ProducerNaming)),
+        ("control_isolated", lib.weida_guarantee_set_set_control_isolated, _flag),
+    )
+
+
+class ReconnectPolicy(_Fields):
+    """`ReconnectPolicy`: `initial` and `max` backoff in seconds, `jitter` a
+    flag, `max_attempts` an `int` or `None` (unbounded; above `u32::MAX` it
+    is `InvalidArgument`), `stop_on_peer_closed` a flag."""
+
+    _OUT = "weida_reconnect_policy **"
+    _NEW = lib.weida_reconnect_policy_new
+    _DROP = lib.weida_reconnect_policy_drop
+    _FIELDS = (
+        ("initial", lib.weida_reconnect_policy_set_initial_ms, _millis),
+        ("max", lib.weida_reconnect_policy_set_max_ms, _millis),
+        ("jitter", lib.weida_reconnect_policy_set_jitter, _flag),
+        ("max_attempts", lib.weida_reconnect_policy_set_max_attempts, _optional_count),
+        ("stop_on_peer_closed", lib.weida_reconnect_policy_set_stop_on_peer_closed, _flag),
+    )
+    _never = False
+
+    @classmethod
+    def never(cls, **fields) -> "ReconnectPolicy":
+        """`ReconnectPolicy::never()`: no redial; the fields given override it."""
+        policy = cls(**fields)
+        policy._never = True
+        return policy
+
+    def _new_handle(self):
+        if not self._never:
+            return super()._new_handle()
+        out = ffi.new(self._OUT)
+        check(lib.weida_reconnect_policy_never(out))
+        return out[0]
+
+
+class RuntimeConfig(_Fields):
+    """`RuntimeConfig`: the fields set here, weida's defaults for the rest.
+    Counts are `int`s; `shutdown_timeout` and `connect_attempt_timeout` are
+    seconds, `send_timeout` seconds or `None` (no bound); `outbox_full` an
+    `OutboxFull`, `discovery` a `Discovery`; `limits` a `Limits`,
+    `guarantees` a `GuaranteeSet`, `reconnect` a `ReconnectPolicy`, each
+    copied when `Runtime.owned` builds the runtime."""
+
+    _OUT = "weida_runtime_config **"
+    _NEW = lib.weida_runtime_config_new
+    _DROP = lib.weida_runtime_config_drop
+    _FIELDS = (
+        ("worker_threads", lib.weida_runtime_config_set_worker_threads, _count),
+        ("shutdown_timeout", lib.weida_runtime_config_set_shutdown_timeout_ms, _millis),
+        ("max_connections", lib.weida_runtime_config_set_max_connections, _count),
+        ("max_connections_per_peer", lib.weida_runtime_config_set_max_connections_per_peer, _count),
+        ("endpoint_queue", lib.weida_runtime_config_set_endpoint_queue, _count),
+        ("max_resolved_addresses", lib.weida_runtime_config_set_max_resolved_addresses, _count),
+        ("connect_attempt_timeout", lib.weida_runtime_config_set_connect_attempt_timeout_ms, _millis),
+        ("send_timeout", lib.weida_runtime_config_set_send_timeout_ms, _optional_millis),
+        ("outbox_messages", lib.weida_runtime_config_set_outbox_messages, _count),
+        ("outbox_bytes", lib.weida_runtime_config_set_outbox_bytes, _count),
+        ("outbox_full", lib.weida_runtime_config_set_outbox_full, _enum(OutboxFull)),
+        ("max_handshakes", lib.weida_runtime_config_set_max_handshakes, _count),
+        ("retry_above_handshakes", lib.weida_runtime_config_set_retry_above_handshakes, _count),
+        ("discovery", lib.weida_runtime_config_set_discovery, _enum(Discovery)),
+    )
+    _NESTED = (
+        ("limits", Limits, lib.weida_runtime_config_set_limits),
+        ("guarantees", GuaranteeSet, lib.weida_runtime_config_set_guarantees),
+        ("reconnect", ReconnectPolicy, lib.weida_runtime_config_set_reconnect),
+    )
+
+    def _known(self) -> set:
+        return super()._known() | {name for name, _, _ in self._NESTED}
+
+    def _extra(self, handle) -> None:
+        for name, cls, setter in self._NESTED:
+            if name not in self._fields:
+                continue
+            value = self._fields[name]
+            if not isinstance(value, cls):
+                raise TypeError(f"{name} is a weida.{cls.__name__}")
+            nested = value._handle()
+            try:
+                check(setter(handle, nested))
+            finally:
+                cls._DROP(nested)
+
 
 
 class Trust(_Handle):
@@ -314,10 +545,24 @@ class ServerTls(_Handle):
 
 
 class TransferMeta:
-    """The metadata an outgoing transfer carries."""
+    """The metadata an outgoing transfer carries: `content_type`,
+    `content_len` (an `int`), `trace` (a W3C traceparent; a malformed one is
+    `InvalidArgument`), `topic`, and `achieved` (an `Acknowledgement`)."""
 
-    def __init__(self, content_type: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        content_type: Optional[str] = None,
+        *,
+        content_len: Optional[int] = None,
+        trace: Optional[str] = None,
+        topic: Optional[str] = None,
+        achieved: Optional[Acknowledgement] = None,
+    ) -> None:
         self.content_type = content_type
+        self.content_len = content_len
+        self.trace = trace
+        self.topic = topic
+        self.achieved = achieved
 
     def _handle(self):
         out = ffi.new("weida_transfer_meta **")
@@ -326,10 +571,32 @@ class TransferMeta:
         try:
             if self.content_type is not None:
                 check(lib.weida_transfer_meta_set_content_type(meta, self.content_type.encode()))
+            if self.content_len is not None:
+                check(lib.weida_transfer_meta_set_content_len(meta, _count("content_len", self.content_len)))
+            if self.topic is not None:
+                check(lib.weida_transfer_meta_set_topic(meta, self.topic.encode()))
+            if self.trace is not None:
+                check(lib.weida_transfer_meta_set_trace(meta, self.trace.encode()))
+            if self.achieved is not None:
+                level = _enum(Acknowledgement)("achieved", self.achieved)
+                check(lib.weida_transfer_meta_set_achieved(meta, level))
         except BaseException:
             lib.weida_transfer_meta_drop(meta)
             raise
         return meta
+
+
+def _with_transfer_meta(meta: Optional[TransferMeta], use: Callable):
+    """Calls `use` with `meta` as a fresh handle (`NULL` for `None`) and
+    drops the handle afterwards; the C call copies it."""
+    if not (meta is None or isinstance(meta, TransferMeta)):
+        raise TypeError("meta is a weida.TransferMeta or None")
+    handle = ffi.NULL if meta is None else meta._handle()
+    try:
+        return use(handle)
+    finally:
+        if handle != ffi.NULL:
+            lib.weida_transfer_meta_drop(handle)
 
 
 @dataclass(frozen=True)
@@ -337,7 +604,10 @@ class IncomingMeta:
     """The metadata of an inbound transfer or request.
 
     `peer_chain`: the DER certificates the peer presented, leaf first; `None`
-    for an anonymous or local peer, or a chain over the bound weida keeps."""
+    for an anonymous or local peer, or a chain over the bound weida keeps.
+    `trace`: the W3C traceparent the transfer carries, or `None`.
+    `tracestate`: the W3C tracestate beside it, or `None`.
+    `achieved`: the `Acknowledgement` the sender reports, or `None`."""
 
     endpoint: Optional[str]
     content_type: Optional[str]
@@ -346,6 +616,9 @@ class IncomingMeta:
     content_len: Optional[int]
     sequence: Optional[int]
     peer_chain: Optional[Tuple[bytes, ...]]
+    trace: Optional[str]
+    tracestate: Optional[str]
+    achieved: Optional[Acknowledgement]
 
     @classmethod
     def _take(cls, ptr) -> "IncomingMeta":
@@ -366,6 +639,9 @@ class IncomingMeta:
                     certs.append(ffi.buffer(cert, length[0])[:])
                 peer_chain = tuple(certs)
 
+            level = ffi.new("int *")
+            achieved = Acknowledgement(level[0]) if lib.weida_incoming_meta_achieved(ptr, level) == 1 else None
+
             return cls(
                 endpoint=_text(lib.weida_incoming_meta_endpoint, ptr),
                 content_type=_text(lib.weida_incoming_meta_content_type, ptr),
@@ -374,6 +650,9 @@ class IncomingMeta:
                 content_len=optional(lib.weida_incoming_meta_content_len),
                 sequence=optional(lib.weida_incoming_meta_sequence),
                 peer_chain=peer_chain,
+                trace=_text(lib.weida_incoming_meta_trace, ptr),
+                tracestate=_text(lib.weida_incoming_meta_tracestate, ptr),
+                achieved=achieved,
             )
         finally:
             lib.weida_incoming_meta_drop(ptr)

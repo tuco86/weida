@@ -30,3 +30,8 @@ def test_a_malformed_pin_is_an_invalid_fingerprint():
 def test_a_runtime_with_no_worker_threads_is_a_runtime_failure():
     with pytest.raises(weida.RuntimeFailure):
         weida.Runtime.owned(weida.RuntimeConfig(worker_threads=0))
+
+
+def test_strerror_of_an_unknown_code_is_unknown_error():
+    assert weida.strerror(9999) == "unknown error"
+    assert weida.strerror(-9999) == "unknown error"

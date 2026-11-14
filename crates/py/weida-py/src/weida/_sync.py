@@ -16,7 +16,9 @@ from weida._values import (
     ServerTls,
     TransferMeta,
     _Handle,
+    _millis,
     _text,
+    _with_transfer_meta,
 )
 from weida._wait import Waiters, call_async, call_sync
 
@@ -174,6 +176,20 @@ class Requester(_Handle):
             lib.weida_requester_request, "weida_requester_request_op", self._p(), data, len(data)
         )
 
+    def _start_request_with(self, meta: Optional[TransferMeta], body: bytes):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(
+                lib.weida_requester_request_with,
+                "weida_requester_request_op",
+                self._p(),
+                h,
+                data,
+                len(data),
+            ),
+        )
+
     def connect(self, url: str, timeout: Optional[float] = None) -> None:
         """Dials `url`; the runtime redials it when the connection is lost."""
         op = self._start_connect(url)
@@ -182,6 +198,21 @@ class Requester(_Handle):
     def request(self, body: bytes, timeout: Optional[float] = None) -> "IncomingTransfer":
         """Sends `body` and returns the reply as soon as its header arrives."""
         op = self._start_request(body)
+        ptr = _op_sync(
+            op,
+            lib.weida_requester_request_op_wait,
+            lib.weida_requester_request_op_drop,
+            timeout,
+            "weida_incoming_transfer **",
+        )
+        return self._IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
+
+    def request_with(
+        self, meta: Optional[TransferMeta], body: bytes, timeout: Optional[float] = None
+    ) -> "IncomingTransfer":
+        """Sends `body` with `meta` (copied when the request starts) and
+        returns the reply as soon as its header arrives."""
+        op = self._start_request_with(meta, body)
         ptr = _op_sync(
             op,
             lib.weida_requester_request_op_wait,
@@ -231,14 +262,12 @@ class IncomingRequest(_Handle):
 
     def _start_reply(self, meta: Optional[TransferMeta]):
         request = self._consume()
-        handle = ffi.NULL if meta is None else meta._handle()
-        try:
-            return _start(
-                lib.weida_incoming_request_reply, "weida_incoming_request_reply_op", request, handle
-            )
-        finally:
-            if handle != ffi.NULL:
-                lib.weida_transfer_meta_drop(handle)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(
+                lib.weida_incoming_request_reply, "weida_incoming_request_reply_op", request, h
+            ),
+        )
 
     def _outgoing(self, ptr) -> "OutgoingTransfer":
         return self._OutgoingTransfer(ptr, lib.weida_outgoing_transfer_drop, self._parent)
@@ -337,6 +366,21 @@ class OutgoingTransfer(_Handle):
         while len(view):
             left = None if deadline is None else max(0.0, deadline - time.monotonic())
             view = view[self.write(view, left) :]
+
+    def trace(self) -> Optional[str]:
+        """The W3C traceparent this transfer carries; a reply inherits its
+        request's."""
+        return _text(lib.weida_outgoing_transfer_trace, self._p())
+
+    def set_priority(self, priority: int) -> None:
+        """Higher is sent first; 0 by default, a no-op on local transports."""
+        check(lib.weida_outgoing_transfer_set_priority(self._p(), priority))
+
+    def expire_after(self, seconds: float) -> None:
+        """Past the deadline, `write` and `finish` raise `Expired` and the
+        reader sees `Canceled`; on QUIC the deadline also holds after
+        `finish`."""
+        check(lib.weida_outgoing_transfer_expire_after_ms(self._p(), _millis("seconds", seconds)))
 
     def finish(self) -> "Delivery":
         """Ends the payload. Consumes the transfer."""

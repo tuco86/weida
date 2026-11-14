@@ -76,3 +76,33 @@ def test_a_cancelled_request_ends_and_the_runtime_still_shuts_down(bus):
         await runtime.shutdown()
 
     asyncio.run(main())
+
+
+def test_request_with_carries_metadata_on_the_loop(bus):
+    async def main() -> None:
+        runtime = wa.Runtime.owned()
+        listener = runtime.listener()
+        binding = listener.bind_inproc(bus)
+        replier = listener.replier("/echo")
+        requester = runtime.requester(weida.ClientTls(weida.Trust()))
+        await requester.connect(f"weida+inproc://{bus}/echo")
+        t = weida.new_trace()
+
+        async def serve() -> None:
+            request = await replier.accept()
+            assert request.meta().trace == t
+            out = await request.reply(weida.TransferMeta(achieved=weida.Acknowledgement.ACCEPTED))
+            await out.write_all(b"pong")
+            out.finish()
+
+        served = asyncio.ensure_future(serve())
+        reply = await requester.request_with(weida.TransferMeta(trace=t), b"ping")
+        assert reply.meta().trace == t
+        assert reply.meta().achieved is weida.Acknowledgement.ACCEPTED
+        assert (await reply.collect(64)).payload == b"pong"
+        await served
+        for handle in (requester, replier, binding, listener):
+            handle.drop()
+        await runtime.shutdown()
+
+    asyncio.run(main())

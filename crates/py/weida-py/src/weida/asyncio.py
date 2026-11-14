@@ -75,6 +75,20 @@ class Requester(_sync.Requester):
         )
         return IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
 
+    async def request_with(self, meta: Optional[TransferMeta], body: bytes) -> "IncomingTransfer":  # type: ignore[override]
+        """Sends `body` with `meta` (copied when the request starts) and
+        returns the reply as soon as its header arrives. A cancelled request
+        abandons the exchange."""
+        op = self._start_request_with(meta, body)
+        ptr = await _op_async(
+            op,
+            lib.weida_requester_request_op_wait,
+            lib.weida_requester_request_op_fd,
+            lib.weida_requester_request_op_drop,
+            "weida_incoming_transfer **",
+        )
+        return IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
+
 
 class Replier(_sync.Replier):
     async def accept(self) -> "IncomingRequest":  # type: ignore[override]

@@ -11,34 +11,45 @@ reason. This document lists what the Python surface adds or changes. Verdicts ar
 (with the test), **refused** (with the reason) or **absent** (with the reason); there is no
 "partial".
 
-The tests are `crates/py/weida-py/tests/unit/` (no sockets, one second each) and
-`tests/integration/` (localhost, ten seconds each); `smoke.py` runs from a fresh virtualenv
-against the built wheel. Measured on CPython 3.13 on linux-amd64.
+Python shapes. A duration is seconds as an `int` or `float` and its name drops `_ms`
+(`shutdown_timeout`, `expire_after`); an optional one takes `None`. An enumeration is an
+`enum.IntEnum` in `weida`, named after weida's Rust type, its members the suffixes of the
+`WEIDA_<TYPE>_*` constants (`weida.Congestion.BBR`); an argument must be a member of that class,
+anything else is a `TypeError`, and a getter returns a member. A configuration value
+(`RuntimeConfig`, `Limits`, `GuaranteeSet`, `ReconnectPolicy`) takes keyword fields only; an
+unknown one is a `TypeError` naming it, and the values are converted when the call that takes it
+builds the handle (`Runtime.owned`), where a wrong type is a `TypeError` and a negative or
+non-finite number a `ValueError`. A value the C ABI copies out at once is a frozen dataclass.
+
+The tests are `crates/py/weida-py/tests/unit/` (no sockets: the in-process transport only, one
+second each) and `tests/integration/` (localhost, ten seconds each); `smoke.py` runs from a fresh
+virtualenv against the built wheel. Measured on CPython 3.13 on linux-amd64.
 
 ## 2. Classes
 
 | C ABI | Python (`weida`, and `weida.asyncio` for the waiting ones) | Verdict |
 | --- | --- | --- |
-| `weida_runtime_config` | `RuntimeConfig(worker_threads, shutdown_timeout)`, seconds as floats | present; `test_errors.py::test_a_runtime_with_no_worker_threads_is_a_runtime_failure` |
+| `weida_runtime_config`, `weida_limits`, `weida_guarantee_set`, `weida_reconnect_policy` | `RuntimeConfig(**fields)` with every field of `weida_runtime_config` but the resolver (`worker_threads`, `shutdown_timeout`, `max_connections`, `max_connections_per_peer`, `endpoint_queue`, `max_resolved_addresses`, `connect_attempt_timeout`, `send_timeout`, `outbox_messages`, `outbox_bytes`, `outbox_full`, `max_handshakes`, `retry_above_handshakes`, `discovery`) and the nested `limits=Limits(**fields)` (every `Limits` field), `guarantees=GuaranteeSet(**fields)` (every dimension) and `reconnect=ReconnectPolicy(**fields)` or `ReconnectPolicy.never(**fields)`; converted when `Runtime.owned` builds the handles (§1) | present; `test_config.py::test_a_full_configuration_builds_a_runtime`, `test_config.py::test_configuration_input_errors_raise_at_once`, `test_config.py::test_a_guarantee_the_dialler_does_not_offer_raises_negotiation`, `test_errors.py::test_a_runtime_with_no_worker_threads_is_a_runtime_failure` |
 | `weida_runtime` | `Runtime.owned(config)`, `.listener()`, `.requester(tls)`, `.shutdown(timeout)` (consumes), `.drop()` | present; every integration test |
 | `weida_trust` | `Trust()`, `.add_pin(fp)`, `.add_anchor(pem \| x509.Certificate)`, `.add_anchor_file(path)`, each returning the trust | present; `test_errors.py::test_a_malformed_pin_is_an_invalid_fingerprint`, `test_sync.py::test_a_wrong_pin_raises_untrusted`, `test_mtls.py::test_an_anchor_accepts_the_dialled_name_and_refuses_another`, `test_mtls.py::test_identity_and_anchor_files_read_back` |
 | `weida_identity` | `Identity.generate()`, `.generate_for(names)`, `.from_pem(cert, key)` (any bytes-like), `.from_pem_file(path)`, `.from_pem_files(cert_chain, key)` (`str`, `bytes` or `os.PathLike`, as `ssl` takes them), `.from_cryptography(cert, key)`, `.fingerprint()`, `.certificate_pem() -> bytes`, `.to_pem() -> bytearray` (holds the key; the caller wipes it), `.certificates() -> list[bytes]` (DER, leaf first) | present; the `test_identity.py` tests, `test_mtls.py::test_identity_and_anchor_files_read_back` |
 | `weida_pem` | not exposed: copied out at once into `bytes` (`certificate_pem`) or a `bytearray` (`to_pem`) and dropped, which wipes it | refused: a Python caller needs the bytes, not the handle |
 | `weida_client_tls`, `weida_server_tls` | `ClientTls(trust, identity=None)`, `ServerTls(identity, require_client=None \| Trust \| ANY_KEY)` | present; `test_mtls.py::test_a_pinned_client_key_is_accepted_and_each_side_sees_the_others_chain`, `test_mtls.py::test_an_anonymous_or_unknown_client_is_refused_with_tls_and_nothing_reaches_the_server`, `test_mtls.py::test_a_binding_that_requires_clients_from_an_empty_trust_does_not_bind`, `test_mtls.py::test_any_key_exposes_the_fingerprint_and_the_chain` |
-| `weida_transfer_meta` | `TransferMeta(content_type=None)`, a plain value turned into a handle per call | present; `test_sync.py::test_a_streamed_round_trip` |
+| `weida_transfer_meta` | `TransferMeta(content_type=None, *, content_len=None, trace=None, topic=None, achieved=None)`, a plain value turned into a handle per call; `trace` a traceparent (a malformed one raises `InvalidArgument`), `achieved` an `Acknowledgement` | present; `test_sync.py::test_a_streamed_round_trip`, `test_config.py::test_metadata_travels_with_a_request_and_its_reply` |
 | `weida_listener` | `Listener.bind_quic(addr, tls, timeout)`, `.bind_inproc(bus)`, `.replier(path)` | present |
 | `weida_binding`, `weida_local_binding` | `Binding.local_addr()`, `LocalBinding.bus()` | present |
-| `weida_requester` | `Requester.connect(url, timeout)`, `.request(body, timeout) -> IncomingTransfer` | present; `test_sync.py::test_a_streamed_round_trip`, `test_asyncio.py::test_a_round_trip_over_quic` |
+| `weida_requester` | `Requester.connect(url, timeout)`, `.request(body, timeout) -> IncomingTransfer`, `.request_with(meta, body, timeout) -> IncomingTransfer` | present; `test_sync.py::test_a_streamed_round_trip`, `test_asyncio.py::test_a_round_trip_over_quic`, `test_config.py::test_metadata_travels_with_a_request_and_its_reply`, `test_asyncio.py::test_request_with_carries_metadata_on_the_loop` |
 | `weida_replier` | `Replier.path()`, `.fileno()`, `.accept(timeout)` | present; `test_sync.py::test_an_accept_with_nothing_pending_raises_again`, `test_asyncio.py::test_two_accepts_on_one_replier_serve_two_requests` |
 | `weida_incoming_request` | `IncomingRequest.meta()`, `.take_body()`, `.reply(meta, timeout)` (consumes) | present; `test_sync.py::test_a_second_reply_raises_closed` |
 | `weida_incoming_transfer` | `IncomingTransfer.meta()`, `.fileno()`, `.readinto(buffer, timeout)`, `.read(n, timeout)` (`b""` at the end), `.collect(max_bytes, timeout) -> Message` (consumes) | present; `test_sync.py::test_small_reads_reassemble_the_body`, `test_sync.py::test_a_collect_over_its_ceiling_raises_limit_exceeded`, `test_sync.py::test_a_reply_dropped_unfinished_reads_as_canceled` |
-| `weida_outgoing_transfer` | `OutgoingTransfer.fileno()`, `.write(data, timeout)`, `.write_all(data, timeout)`, `.finish()` (consumes) | present; `write_all` is the Python loop R3c leaves to the caller, its timeout bounding the whole call |
+| `weida_outgoing_transfer` | `OutgoingTransfer.fileno()`, `.write(data, timeout)`, `.write_all(data, timeout)`, `.trace()`, `.set_priority(n)`, `.expire_after(seconds)` (`weida_outgoing_transfer_expire_after_ms` in seconds, §1), `.finish()` (consumes) | present; `write_all` is the Python loop R3c leaves to the caller, its timeout bounding the whole call; `test_config.py::test_metadata_travels_with_a_request_and_its_reply`, `test_config.py::test_an_expired_reply_fails_its_finish_with_expired` |
 | `weida_delivery` | `Delivery.delivered(timeout)` (consumes) | present |
-| `weida_incoming_meta` | `IncomingMeta`, a frozen dataclass copied out at once; `peer_chain` is a tuple of DER `bytes`, leaf first, or `None` | present; `test_mtls.py::test_any_key_exposes_the_fingerprint_and_the_chain` |
+| `weida_incoming_meta` | `IncomingMeta`, a frozen dataclass copied out at once; `peer_chain` is a tuple of DER `bytes`, leaf first, or `None`; `trace` and `tracestate` a `str` or `None`; `achieved` an `Acknowledgement` or `None` | present; `test_mtls.py::test_any_key_exposes_the_fingerprint_and_the_chain`, `test_config.py::test_metadata_travels_with_a_request_and_its_reply` |
 | `weida_msg` | `Message(payload: bytes, meta: IncomingMeta)`, copied out at once | present |
 | the ops (`*_op`) | not exposed: a waiting method starts its op, waits, and drops it in `finally`, which cancels it only when it did not finish | refused: an op is the C caller's way to wait, not a value a Python caller needs |
 | `weida_poll` | not exposed | refused: `select`, `selectors` and the event loop take the `fileno()` descriptors directly |
-| `weida_version` | `weida.version()` | present; `smoke.py` |
+| `weida_version`, `weida_strerror`, `weida_new_trace` | `weida.version()`, `weida.strerror(code)`, `weida.new_trace()` | present; `smoke.py`, `test_errors.py::test_strerror_of_an_unknown_code_is_unknown_error`, `test_config.py::test_new_trace_is_a_sampled_traceparent` |
+| the enumeration constants `WEIDA_CONGESTION_*`, `WEIDA_DISCOVERY_*`, `WEIDA_OUTBOX_FULL_*` and the six guarantee dimensions, `WEIDA_DEFAULT_DATAGRAM_RECEIVE_BYTES` | the `IntEnum`s `Congestion`, `Discovery`, `OutboxFull`, `DeliveryLevel`, `Acknowledgement`, `Durability`, `OrderingMode`, `Deduplication`, `Backpressure`, `ProducerNaming` (§1), and `weida.DEFAULT_DATAGRAM_RECEIVE_BYTES` | present; `test_config.py::test_a_full_configuration_builds_a_runtime`, `test_config.py::test_configuration_input_errors_raise_at_once` |
 
 The conversions between `cryptography`'s certificates and private keys, paths and bytes and
 the ABI's PEM and DER follow
@@ -94,12 +105,6 @@ surface and connection statistics. Each of those is absent here exactly as it is
 the C ABI ([weida-c.md](weida-c.md) §5 to §7), and returns when the ABI maps it. The new
 package is not compatible with the old module's API (0045 decision 6).
 
-The C ABI's *config* area is absent here: every row of [weida-c.md](weida-c.md) marked
-(*config*), that is the rest of `RuntimeConfig`, `Limits`, `GuaranteeSet`, `ReconnectPolicy`,
-the `TransferMeta` setters beyond the content type, `Requester::request_with`, the trace and
-achieved getters and `OutgoingTransfer::trace`, `set_priority` and `expire_at`. This package
-keeps its two configuration fields and the content type.
-
 The C ABI's *refusals* area is absent here: the rows of [weida-c.md](weida-c.md) marked
 (*refusals*), `IncomingRequest::refuse` with the `WEIDA_ERROR_CODE_*` constants and
 `IncomingRequest::canceled`. A request is still declined only by dropping it, which answers
@@ -135,6 +140,9 @@ of the TLS terms, `weida_identity_source`, `weida_trust_source`, their weak form
 `weida_files_options`, and the event queue `weida_identity_events` with `weida_identity_event`.
 TLS terms still take an identity and a trust as values, under `weida/0`.
 
+The C ABI's *resolver* area is absent here: `weida_runtime_config_set_resolver`, `weida_resolver`
+and `weida_resolved`. A name still resolves through the system resolver.
+
 Push/Pull, Pub/Sub, PAIR, SURVEY, BUS and RADIO/DISH of the C ABI's *patterns* area are absent
 here: `weida_pusher`, `weida_puller`, `weida_publisher`, `weida_subscriber`, `weida_fan_out`,
 `weida_topic_drops`, `weida_incoming_meta_gap`, `weida_paired`, `weida_surveyor`,
@@ -161,6 +169,6 @@ The C ABI's *swarm* area is absent here: `weida_runtime_swarm`, `weida_swarm`,
 ## 7. Sources
 
 `crates/py/weida-py/src/weida/` (`__init__.py`, `_native.py`, `_errors.py`, `_wait.py`,
-`_values.py`, `_crypto.py`, `_sync.py`, `asyncio.py`, `_cdef.h`), `hatch_build.py`, `pyproject.toml`,
-`develop.sh`, `package.sh`, `smoke.py`, `tests/`; [weida-c.md](weida-c.md);
+`_enums.py`, `_values.py`, `_crypto.py`, `_sync.py`, `asyncio.py`, `_cdef.h`), `hatch_build.py`,
+`pyproject.toml`, `develop.sh`, `package.sh`, `smoke.py`, `tests/`; [weida-c.md](weida-c.md);
 [docs/c/](../c/README.md); [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md).
