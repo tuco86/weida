@@ -2,21 +2,24 @@
 those methods as coroutines (the same arguments minus `timeout`). Every
 wait goes through a readiness descriptor watched by the running loop;
 cancelling a coroutine cancels its operation. The value classes are
-`weida`'s own."""
+`weida`'s own, except the identity and trust sources, whose `events()`
+hands out a `weida.asyncio.IdentityEvents`."""
 
 from typing import Any, AsyncIterator, Coroutine, Optional, Tuple
 
-from weida import _sync
+from weida import _sync, _values
 from weida._enums import ErrorCode
 from weida._native import ffi, lib
 from weida._stats import PeerEvent
 from weida._sync import Handoff, _op_async
-from weida._values import ClientTls, Drained, Message, ServerTls, TransferMeta
+from weida._values import ClientTls, Drained, IdentityEvent, Message, ServerTls, TransferMeta
 from weida._wait import call_async
 
 __all__ = [
     "Binding",
     "Delivery",
+    "IdentityEvents",
+    "IdentitySource",
     "IncomingRequest",
     "IncomingTransfer",
     "Listener",
@@ -28,6 +31,9 @@ __all__ = [
     "ReplyStream",
     "Requester",
     "Runtime",
+    "TrustSource",
+    "WeakIdentitySource",
+    "WeakTrustSource",
 ]
 
 
@@ -390,6 +396,37 @@ class PeerEvents(_sync.PeerEvents):
             yield event
 
 
+class IdentityEvents(_sync.IdentityEvents):
+    __iter__ = None  # type: ignore[assignment]  # `async for` only
+
+    async def recv(self) -> Optional[IdentityEvent]:  # type: ignore[override]
+        """The next event, or `None` once the source is gone."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._event(out[0])
+
+    async def __aiter__(self) -> AsyncIterator[IdentityEvent]:
+        """Every event until the source is gone."""
+        while (event := await self.recv()) is not None:
+            yield event
+
+
+class IdentitySource(_values.IdentitySource):
+    """`weida.IdentitySource` whose `events()` is a `weida.asyncio.IdentityEvents`."""
+
+
+class WeakIdentitySource(_values.WeakIdentitySource):
+    """`weida.WeakIdentitySource` whose `upgrade()` is a `weida.asyncio.IdentitySource`."""
+
+
+class TrustSource(_values.TrustSource):
+    """`weida.TrustSource` whose `events()` is a `weida.asyncio.IdentityEvents`."""
+
+
+class WeakTrustSource(_values.WeakTrustSource):
+    """`weida.WeakTrustSource` whose `upgrade()` is a `weida.asyncio.TrustSource`."""
+
+
 Runtime._Listener = Listener
 Runtime._Requester = Requester
 Listener._Replier = Replier
@@ -406,3 +443,9 @@ Listener._Binding = Binding
 Listener._Relay = Relay
 Relay._RelayRequest = RelayRequest
 Binding._PeerEvents = PeerEvents
+IdentitySource._IdentityEvents = IdentityEvents
+TrustSource._IdentityEvents = IdentityEvents
+IdentitySource._Weak = WeakIdentitySource
+WeakIdentitySource._Strong = IdentitySource
+TrustSource._Weak = WeakTrustSource
+WeakTrustSource._Strong = TrustSource

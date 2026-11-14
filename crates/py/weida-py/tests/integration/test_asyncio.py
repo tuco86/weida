@@ -215,6 +215,28 @@ def test_peer_events_iterate_with_async_for(bus):
     asyncio.run(main())
 
 
+def test_identity_events_iterate_with_async_for():
+    async def main() -> None:
+        src = wa.IdentitySource.external(weida.Identity.generate())
+        weak = src.downgrade()
+        assert isinstance(weak, wa.WeakIdentitySource)
+        strong = weak.upgrade()
+        assert isinstance(strong, wa.IdentitySource)
+        strong.drop()
+        events = src.events()
+        assert isinstance(events, wa.IdentityEvents)
+        src.report_handoff_stolen()
+        assert (await events.recv()).kind is weida.IdentityEventKind.HANDOFF_STOLEN
+        src.drop()
+        # The loop ends because the dropped source ends the queue.
+        assert [event async for event in events] == []
+        assert weak.upgrade() is None
+        events.drop()
+        weak.drop()
+
+    asyncio.run(main())
+
+
 def test_a_drain_on_the_loop_counts_a_reply_finished_before_it(bus):
     async def main() -> None:
         server = wa.Runtime.owned()

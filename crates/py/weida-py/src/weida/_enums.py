@@ -129,8 +129,30 @@ class GiveUp(enum.IntEnum):
     FAILED = lib.WEIDA_GIVE_UP_FAILED
 
 
+class Alpn(enum.IntEnum):
+    """`Alpn`: the ALPN token a TLS term asks for or offers."""
+
+    WEIDA = lib.WEIDA_ALPN_WEIDA
+    RAFT = lib.WEIDA_ALPN_RAFT
+
+
+class IdentityEventKind(enum.IntEnum):
+    """The kind of an `IdentityEvent`: which change of an identity or trust
+    source (named after the C constants: the Rust `IdentityEvent` is the
+    record)."""
+
+    LOADED = lib.WEIDA_IDENTITY_EVENT_LOADED
+    RENEWED = lib.WEIDA_IDENTITY_EVENT_RENEWED
+    KEY_CHANGED = lib.WEIDA_IDENTITY_EVENT_KEY_CHANGED
+    RENEWAL_FAILED = lib.WEIDA_IDENTITY_EVENT_RENEWAL_FAILED
+    HANDOFF_STOLEN = lib.WEIDA_IDENTITY_EVENT_HANDOFF_STOLEN
+    TRUST_REFRESHED = lib.WEIDA_IDENTITY_EVENT_TRUST_REFRESHED
+    MISSED = lib.WEIDA_IDENTITY_EVENT_MISSED
+
+
 __all__ = [
     "Acknowledgement",
+    "Alpn",
     "Backpressure",
     "Congestion",
     "Deduplication",
@@ -139,6 +161,7 @@ __all__ = [
     "Durability",
     "ErrorCode",
     "GiveUp",
+    "IdentityEventKind",
     "LossCause",
     "OrderingMode",
     "OutboxFull",

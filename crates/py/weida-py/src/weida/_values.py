@@ -11,12 +11,14 @@ from typing import Callable, List, Optional, Sequence, Tuple, Union
 from weida._crypto import certificate_pem, key_pem, path
 from weida._enums import (
     Acknowledgement,
+    Alpn,
     Backpressure,
     Congestion,
     Deduplication,
     DeliveryLevel,
     Discovery,
     Durability,
+    IdentityEventKind,
     OrderingMode,
     OutboxFull,
     ProducerNaming,
@@ -99,6 +101,32 @@ def _optional_enum(cls) -> Callable:
     """`_enum(cls)`, with `None` as the C ABI's `None` (-1, R7)."""
     convert = _enum(cls)
     return lambda name, value: -1 if value is None else convert(name, value)
+
+
+def _c_string(name: str, value) -> bytes:
+    """A `str` argument as the C string the ABI takes."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} is a str")
+    if "\0" in value:
+        raise ValueError("embedded null byte")
+    return value.encode()
+
+
+def _c_names(caller: str, names) -> Tuple[list, object]:
+    """`names`, a sequence of `str`, as a C `const char *[]` (NULL when
+    empty) and the buffers it points into, which the caller keeps alive
+    across the C call."""
+    if isinstance(names, (str, bytes, bytearray)):
+        raise TypeError(f"{caller} takes a list of names, not one string")
+    encoded = [ffi.new("char[]", _c_string("every name", name)) for name in names]
+    return encoded, (ffi.new("const char *[]", encoded) if encoded else ffi.NULL)
+
+
+def _of(name: str, value, cls):
+    """The handle of `value`, which must be a `cls`."""
+    if not isinstance(value, cls):
+        raise TypeError(f"{name} is a weida.{cls.__name__}")
+    return value._p()
 
 
 class _Handle:
@@ -383,6 +411,17 @@ class Trust(_Handle):
         check(lib.weida_trust_add_anchor_file(self._p(), path(file)))
         return self
 
+    def is_empty(self) -> bool:
+        """Whether this trust holds no pin and no anchor, so it accepts only
+        what each dialled address names."""
+        return check(lib.weida_trust_is_empty(self._p())) == 1
+
+    @classmethod
+    def _wrap(cls, ptr) -> "Trust":
+        trust = cls.__new__(cls)
+        _Handle.__init__(trust, ptr, lib.weida_trust_drop)
+        return trust
+
 
 class Identity(_Handle):
     """A certificate chain and its private key."""
@@ -400,16 +439,7 @@ class Identity(_Handle):
         IP literals), so a peer anchoring it can check the dialled host. An
         empty list is `generate()`; a name the certificate cannot carry raises
         `Tls`."""
-        if isinstance(names, (str, bytes, bytearray)):
-            raise TypeError("generate_for takes a list of names, not one string")
-        names = list(names)
-        for name in names:
-            if not isinstance(name, str):
-                raise TypeError("every name is a str")
-            if "\0" in name:
-                raise ValueError("embedded null byte")
-        encoded = [ffi.new("char[]", name.encode()) for name in names]
-        array = ffi.new("const char *[]", encoded) if encoded else ffi.NULL
+        encoded, array = _c_names("generate_for", names)
         out = ffi.new("weida_identity **")
         check(lib.weida_identity_generate_for(array, len(encoded), out))
         return cls._wrap(out[0])
@@ -490,6 +520,255 @@ class Identity(_Handle):
         return [base64.b64decode(block) for block in blocks]
 
 
+@dataclass(frozen=True)
+class IdentityEvent:
+    """One change of an identity or trust source; a field another kind does
+    not carry is `None`: `fingerprint` for LOADED and RENEWED, `from_` and
+    `to` for KEY_CHANGED, `message` for RENEWAL_FAILED, `missed` for MISSED."""
+
+    kind: IdentityEventKind
+    fingerprint: Optional[str]
+    from_: Optional[str]
+    to: Optional[str]
+    message: Optional[str]
+    missed: Optional[int]
+
+    @classmethod
+    def _take(cls, ptr) -> "IdentityEvent":
+        """Copies a `weida_identity_event` out and drops it."""
+        try:
+            count = ffi.new("uint64_t *")
+            missed = count[0] if lib.weida_identity_event_missed(ptr, count) == 1 else None
+            return cls(
+                kind=IdentityEventKind(lib.weida_identity_event_kind(ptr)),
+                fingerprint=_text(lib.weida_identity_event_fingerprint, ptr),
+                from_=_text(lib.weida_identity_event_from, ptr),
+                to=_text(lib.weida_identity_event_to, ptr),
+                message=_text(lib.weida_identity_event_message, ptr),
+                missed=missed,
+            )
+        finally:
+            lib.weida_identity_event_drop(ptr)
+
+
+class _Made(_Handle):
+    """A handle only its factories make: calling the class is a TypeError."""
+
+    _DROP: Callable
+    _MADE_BY: str
+
+    def __init__(self, *args, **kwargs) -> None:
+        raise TypeError(f"{type(self).__name__} is made by {self._MADE_BY}")
+
+    @classmethod
+    def _wrap(cls, ptr):
+        made = cls.__new__(cls)
+        _Handle.__init__(made, ptr, cls._DROP)
+        return made
+
+
+class IdentitySource(_Made):
+    """A source of the identity a TLS term presents. `ClientTls` and
+    `ServerTls` share it, so an update reaches the next handshake with no
+    re-bind; dropping this handle leaves the source alive wherever it is
+    held."""
+
+    _DROP = lib.weida_identity_source_drop
+    _MADE_BY = "IdentitySource.from_identity, .ephemeral, .external or .files"
+
+    @classmethod
+    def from_identity(cls, identity: Identity) -> "IdentitySource":
+        """A source that holds `identity` (copied) for good; `Tls` when its
+        material does not read."""
+        out = ffi.new("weida_identity_source **")
+        check(lib.weida_identity_source_from_identity(_of("identity", identity, Identity), out))
+        return cls._wrap(out[0])
+
+    @classmethod
+    def ephemeral(cls, names: Sequence[str]) -> "IdentitySource":
+        """A source of a fresh self-signed identity for `names` (DNS names or
+        IP literals), held in memory only."""
+        encoded, array = _c_names("ephemeral", names)
+        out = ffi.new("weida_identity_source **")
+        check(lib.weida_identity_source_ephemeral(array, len(encoded), out))
+        return cls._wrap(out[0])
+
+    @classmethod
+    def external(cls, identity: Identity) -> "IdentitySource":
+        """A source starting at `identity` that the application renews with
+        `update`, `report_failure` and `report_handoff_stolen`."""
+        out = ffi.new("weida_identity_source **")
+        check(lib.weida_identity_source_external(_of("identity", identity, Identity), out))
+        return cls._wrap(out[0])
+
+    @classmethod
+    def files(cls, dir, names: Optional[Sequence[str]] = None, poll: Optional[float] = None) -> "IdentitySource":
+        """A source reading `cert.pem` and `key.pem` from the directory `dir`
+        (`str`, `bytes` or `os.PathLike`). When neither exists a self-signed
+        identity for `names` is written there first (directory 0700, files
+        0600 on Unix). Replace the files atomically, or the certificate first
+        and the key second; they are checked at the next use after `poll`
+        seconds (default 10, `0` checks at every use). `Tls` when one file
+        exists without the other or does not parse, `Io` when the bootstrap
+        cannot write."""
+        # Every argument is converted before C, so a wrong one touches
+        # nothing on disk.
+        if names is not None:
+            encoded, array = _c_names("files", names)
+        if poll is not None:
+            poll_ms = _millis("poll", poll)
+        directory = path(dir)
+        opts = ffi.new("weida_files_options **")
+        check(lib.weida_files_options_new(opts))
+        try:
+            if names is not None:
+                check(lib.weida_files_options_set_names(opts[0], array, len(encoded)))
+            if poll is not None:
+                check(lib.weida_files_options_set_poll_ms(opts[0], poll_ms))
+            out = ffi.new("weida_identity_source **")
+            check(lib.weida_identity_source_files(directory, opts[0], out))
+        finally:
+            lib.weida_files_options_drop(opts[0])
+        return cls._wrap(out[0])
+
+    def current(self) -> Identity:
+        """The identity the source holds now, a copy."""
+        out = ffi.new("weida_identity **")
+        check(lib.weida_identity_source_current(self._p(), out))
+        return Identity._wrap(out[0])
+
+    def fingerprint(self) -> str:
+        """The fingerprint of the current identity, `sha256:` text."""
+        buffer = ffi.new("char[]", lib.WEIDA_FINGERPRINT_LEN + 1)
+        check(lib.weida_identity_source_fingerprint(self._p(), buffer, len(buffer)))
+        return ffi.string(buffer).decode()
+
+    def update(self, identity: Identity) -> None:
+        """Replaces the identity (copied); the next handshake presents it."""
+        check(lib.weida_identity_source_update(self._p(), _of("identity", identity, Identity)))
+
+    def report_failure(self, reason: str) -> None:
+        """Reports a failed renewal: a `RENEWAL_FAILED` event with `reason`."""
+        check(lib.weida_identity_source_report_failure(self._p(), _c_string("reason", reason)))
+
+    def report_handoff_stolen(self) -> None:
+        """Reports that another holder took the identity over: a
+        `HANDOFF_STOLEN` event."""
+        check(lib.weida_identity_source_report_handoff_stolen(self._p()))
+
+    def reload(self) -> bool:
+        """Checks a `files` source's files now; whether the identity changed.
+        Always `False` for the other sources."""
+        return check(lib.weida_identity_source_reload(self._p())) == 1
+
+    def events(self) -> "IdentityEvents":
+        """A new reader of this source's events, from now on; each call is an
+        independent reader."""
+        out = ffi.new("weida_identity_events **")
+        check(lib.weida_identity_source_events(self._p(), out))
+        # No parent: the events end once the source is gone, which holding
+        # it would prevent.
+        return self._IdentityEvents(out[0], lib.weida_identity_events_drop)
+
+    def downgrade(self) -> "WeakIdentitySource":
+        """A weak handle, which does not keep the source alive."""
+        out = ffi.new("weida_weak_identity_source **")
+        check(lib.weida_identity_source_downgrade(self._p(), out))
+        return self._Weak._wrap(out[0])
+
+
+class WeakIdentitySource(_Made):
+    """A weak handle of an `IdentitySource`."""
+
+    _DROP = lib.weida_weak_identity_source_drop
+    _MADE_BY = "IdentitySource.downgrade()"
+
+    def upgrade(self) -> Optional[IdentitySource]:
+        """A strong handle, or `None` once the last strong handle is gone."""
+        out = ffi.new("weida_identity_source **")
+        if check(lib.weida_weak_identity_source_upgrade(self._p(), out)) == 0:
+            return None
+        return self._Strong._wrap(out[0])
+
+
+class TrustSource(_Made):
+    """A source of the `Trust` a TLS term checks peers against, shared like
+    an `IdentitySource`: an update reaches the next handshake."""
+
+    _DROP = lib.weida_trust_source_drop
+    _MADE_BY = "TrustSource.from_trust or .external"
+
+    @classmethod
+    def from_trust(cls, trust: Trust) -> "TrustSource":
+        """A source that holds `trust` (copied) for good."""
+        out = ffi.new("weida_trust_source **")
+        check(lib.weida_trust_source_from_trust(_of("trust", trust, Trust), out))
+        return cls._wrap(out[0])
+
+    @classmethod
+    def external(cls, trust: Trust) -> "TrustSource":
+        """A source starting at `trust` that the application refreshes with
+        `update` and `report_failure`."""
+        out = ffi.new("weida_trust_source **")
+        check(lib.weida_trust_source_external(_of("trust", trust, Trust), out))
+        return cls._wrap(out[0])
+
+    def current(self) -> Trust:
+        """The trust the source holds now, a copy."""
+        out = ffi.new("weida_trust **")
+        check(lib.weida_trust_source_current(self._p(), out))
+        return Trust._wrap(out[0])
+
+    def update(self, trust: Trust) -> None:
+        """Replaces the trust (copied): a `TRUST_REFRESHED` event."""
+        check(lib.weida_trust_source_update(self._p(), _of("trust", trust, Trust)))
+
+    def report_failure(self, reason: str) -> None:
+        """Reports a failed refresh: a `RENEWAL_FAILED` event with `reason`."""
+        check(lib.weida_trust_source_report_failure(self._p(), _c_string("reason", reason)))
+
+    def is_empty(self) -> bool:
+        """Whether the current trust holds no pin and no anchor."""
+        return check(lib.weida_trust_source_is_empty(self._p())) == 1
+
+    def events(self) -> "IdentityEvents":
+        """A new reader of this source's events, from now on; each call is an
+        independent reader."""
+        out = ffi.new("weida_identity_events **")
+        check(lib.weida_trust_source_events(self._p(), out))
+        # No parent: the events end once the source is gone, which holding
+        # it would prevent.
+        return self._IdentityEvents(out[0], lib.weida_identity_events_drop)
+
+    def downgrade(self) -> "WeakTrustSource":
+        """A weak handle, which does not keep the source alive."""
+        out = ffi.new("weida_weak_trust_source **")
+        check(lib.weida_trust_source_downgrade(self._p(), out))
+        return self._Weak._wrap(out[0])
+
+
+class WeakTrustSource(_Made):
+    """A weak handle of a `TrustSource`."""
+
+    _DROP = lib.weida_weak_trust_source_drop
+    _MADE_BY = "TrustSource.downgrade()"
+
+    def upgrade(self) -> Optional[TrustSource]:
+        """A strong handle, or `None` once the last strong handle is gone."""
+        out = ffi.new("weida_trust_source **")
+        if check(lib.weida_weak_trust_source_upgrade(self._p(), out)) == 0:
+            return None
+        return self._Strong._wrap(out[0])
+
+
+# The classes a factory method hands out; `weida.asyncio` replaces them with
+# its own.
+IdentitySource._Weak = WeakIdentitySource
+WeakIdentitySource._Strong = IdentitySource
+TrustSource._Weak = WeakTrustSource
+WeakTrustSource._Strong = TrustSource
+
+
 class _AnyKey:
     """`ClientTrust::AnyKey`: any client key the client proves it holds."""
 
@@ -502,43 +781,74 @@ ANY_KEY = _AnyKey()
 
 class ClientTls(_Handle):
     """The TLS terms a requester dials on, under `trust`: anonymous, or
-    presenting `identity`."""
+    presenting `identity`.
 
-    def __init__(self, trust: Trust, identity: Optional[Identity] = None) -> None:
-        if identity is not None and not isinstance(identity, Identity):
-            raise TypeError("identity is a weida.Identity")
+    `trust` is a `Trust` or a `TrustSource`, `identity` an `Identity` or an
+    `IdentitySource`: a value is copied, a source shared, so its update
+    reaches the next connection. `alpn` is the token asked for (`None` is
+    `Alpn.WEIDA`); a server offering another fails the dial with `Tls`."""
+
+    def __init__(self, trust, identity=None, *, alpn: Optional[Alpn] = None) -> None:
+        if not isinstance(trust, (Trust, TrustSource)):
+            raise TypeError("trust is a weida.Trust or weida.TrustSource")
+        if not (identity is None or isinstance(identity, (Identity, IdentitySource))):
+            raise TypeError("identity is a weida.Identity or weida.IdentitySource")
+        token = None if alpn is None else _enum(Alpn)("alpn", alpn)
         out = ffi.new("weida_client_tls **")
-        check(lib.weida_client_tls_new(trust._p(), out))
+        if isinstance(trust, TrustSource):
+            check(lib.weida_client_tls_new_source(trust._p(), out))
+        else:
+            check(lib.weida_client_tls_new(trust._p(), out))
         super().__init__(out[0], lib.weida_client_tls_drop)
-        if identity is not None:
-            try:
+        try:
+            if isinstance(identity, IdentitySource):
+                check(lib.weida_client_tls_set_identity_source(self._p(), identity._p()))
+            elif identity is not None:
                 check(lib.weida_client_tls_set_identity(self._p(), identity._p()))
-            except BaseException:
-                self.drop()
-                raise
+            if token is not None:
+                check(lib.weida_client_tls_set_alpn(self._p(), token))
+        except BaseException:
+            self.drop()
+            raise
 
 
 class ServerTls(_Handle):
-    """The TLS terms a QUIC binding serves on, presenting `identity`.
+    """The TLS terms a QUIC binding serves on, presenting `identity`, an
+    `Identity` or an `IdentitySource`: a value is copied, a source shared, so
+    its update reaches the next handshake.
 
     With `require_client` every client must present a key: one the `Trust`
-    accepts (pinned or chaining to an anchor), or with `ANY_KEY` any key it
-    proves it holds. A refused client raises `Tls` on its side, and nothing
-    reaches the replier. An empty `Trust` makes the bind raise `Tls`."""
+    or `TrustSource` accepts (pinned or chaining to an anchor), or with
+    `ANY_KEY` any key it proves it holds. A refused client raises `Tls` on
+    its side, and nothing reaches the replier. An empty `Trust` or
+    `TrustSource` makes the bind raise `Tls`. `alpn` is the token offered
+    (`None` is `Alpn.WEIDA`); a client asking for another fails with `Tls`."""
 
-    def __init__(self, identity: Identity, require_client=None) -> None:
-        if not (require_client is None or require_client is ANY_KEY or isinstance(require_client, Trust)):
-            raise TypeError("require_client is a weida.Trust or weida.ANY_KEY")
+    def __init__(self, identity, require_client=None, *, alpn: Optional[Alpn] = None) -> None:
+        if not isinstance(identity, (Identity, IdentitySource)):
+            raise TypeError("identity is a weida.Identity or weida.IdentitySource")
+        if not (
+            require_client is None
+            or require_client is ANY_KEY
+            or isinstance(require_client, (Trust, TrustSource))
+        ):
+            raise TypeError("require_client is a weida.Trust, a weida.TrustSource or weida.ANY_KEY")
+        token = None if alpn is None else _enum(Alpn)("alpn", alpn)
         out = ffi.new("weida_server_tls **")
-        check(lib.weida_server_tls_new(identity._p(), out))
+        if isinstance(identity, IdentitySource):
+            check(lib.weida_server_tls_new_source(identity._p(), out))
+        else:
+            check(lib.weida_server_tls_new(identity._p(), out))
         super().__init__(out[0], lib.weida_server_tls_drop)
-        if require_client is None:
-            return
         try:
             if require_client is ANY_KEY:
                 check(lib.weida_server_tls_require_any_key(self._p()))
-            else:
+            elif isinstance(require_client, TrustSource):
+                check(lib.weida_server_tls_require_client_source(self._p(), require_client._p()))
+            elif require_client is not None:
                 check(lib.weida_server_tls_require_client(self._p(), require_client._p()))
+            if token is not None:
+                check(lib.weida_server_tls_set_alpn(self._p(), token))
         except BaseException:
             self.drop()
             raise

@@ -1,6 +1,7 @@
 """Client keys over real QUIC on localhost: required clients, the chain each
-side sees, anchors and identity files."""
+side sees, anchors, identity files, identity sources and ALPN."""
 
+import dataclasses
 import os
 import threading
 
@@ -23,8 +24,8 @@ class Server:
         self.url = f"weida://{self.binding.local_addr()}/echo"
         self.requesters = []
 
-    def requester(self, trust: weida.Trust, identity=None) -> weida.Requester:
-        requester = self.runtime.requester(weida.ClientTls(trust, identity=identity))
+    def requester(self, trust, identity=None, alpn=None) -> weida.Requester:
+        requester = self.runtime.requester(weida.ClientTls(trust, identity=identity, alpn=alpn))
         self.requesters.append(requester)
         return requester
 
@@ -193,3 +194,55 @@ def test_identity_and_anchor_files_read_back(tmp_path):
     missing = weida.Identity.from_pem_file(tmp_path / "missing.pem")
     with pytest.raises(weida.Tls):
         missing.fingerprint()
+
+
+def test_a_files_identity_source_rotates_a_bindings_certificate_and_its_events_report_it(tmp_path):
+    directory = tmp_path / "identity"
+    source = weida.IdentitySource.files(directory, names=["127.0.0.1"], poll=0)
+    old = source.fingerprint()
+    events = source.events()
+    server = Server(weida.ServerTls(source))
+    try:
+        round_trip(server, server.requester(weida.Trust().add_pin(old)))
+
+        # An agent rewrites the files: the certificate first, the key second.
+        fresh = weida.Identity.generate()
+        (directory / "cert.pem").write_bytes(fresh.certificate_pem())
+        pem = fresh.to_pem()
+        # The bootstrap made the file 0600, and truncating it keeps the mode.
+        (directory / "key.pem").write_bytes(pem)
+        pem[:] = bytes(len(pem))
+
+        round_trip(
+            server,
+            server.requester(weida.TrustSource.from_trust(weida.Trust().add_pin(fresh.fingerprint()))),
+        )
+        event = events.recv(WAIT)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            event.kind = None
+        assert event.kind is weida.IdentityEventKind.KEY_CHANGED
+        assert event.from_ == old
+        assert event.to == fresh.fingerprint()
+        assert source.fingerprint() == fresh.fingerprint()
+    finally:
+        events.drop()
+        server.close()
+        source.drop()
+
+
+def test_a_mismatched_alpn_rejects_the_dial_with_tls(server_identity, client):
+    server = Server(
+        weida.ServerTls(
+            server_identity,
+            require_client=weida.TrustSource.from_trust(weida.Trust().add_pin(client.fingerprint())),
+            alpn=weida.Alpn.RAFT,
+        )
+    )
+    try:
+        source = weida.IdentitySource.from_identity(client)
+        trust = weida.Trust().add_pin(server_identity.fingerprint())
+        refused(server, server.requester(trust, identity=source))
+        seen, _ = round_trip(server, server.requester(trust, identity=source, alpn=weida.Alpn.RAFT))
+        assert seen.peer_fingerprint == client.fingerprint()
+    finally:
+        server.close()

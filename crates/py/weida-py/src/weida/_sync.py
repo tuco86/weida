@@ -14,11 +14,14 @@ from weida._stats import ConnectionStats, PeerEvent, _take_connection_stats
 from weida._values import (
     ClientTls,
     Drained,
+    IdentityEvent,
+    IdentitySource,
     IncomingMeta,
     Message,
     RuntimeConfig,
     ServerTls,
     TransferMeta,
+    TrustSource,
     _Handle,
     _count,
     _enum,
@@ -929,6 +932,37 @@ class PeerEvents(_Handle):
             yield event
 
 
+class IdentityEvents(_Handle):
+    """A reader of an identity or trust source's events, a queue
+    (docs/libraries/weida-py.md §1): `recv` returns the next `IdentityEvent`,
+    or `None` once the source is gone (its last strong handle, here or in a
+    terms, binding or requester, was dropped). A reader that fell more than
+    64 events behind gets one `MISSED` event carrying how many it lost."""
+
+    _fd_of = lib.weida_identity_events_fd
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_identity_event **")
+        return out, lambda ms: lib.weida_identity_events_recv(handle, ms, out)
+
+    @staticmethod
+    def _event(ptr) -> Optional[IdentityEvent]:
+        return None if ptr == ffi.NULL else IdentityEvent._take(ptr)
+
+    def recv(self, timeout: Optional[float] = None) -> Optional[IdentityEvent]:
+        """The next event, or `None` once the source is gone."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._event(out[0])
+
+    def __iter__(self) -> Iterator[IdentityEvent]:
+        """Every event until the source is gone, each `recv` without a
+        timeout."""
+        while (event := self.recv()) is not None:
+            yield event
+
+
 # The classes a factory method hands out; `weida.asyncio` replaces them with
 # its own.
 Runtime._Listener = Listener
@@ -947,11 +981,14 @@ Listener._Binding = Binding
 Listener._Relay = Relay
 Relay._RelayRequest = RelayRequest
 Binding._PeerEvents = PeerEvents
+IdentitySource._IdentityEvents = IdentityEvents
+TrustSource._IdentityEvents = IdentityEvents
 
 __all__ = [
     "Binding",
     "Delivery",
     "Handoff",
+    "IdentityEvents",
     "IncomingRequest",
     "IncomingTransfer",
     "Listener",
