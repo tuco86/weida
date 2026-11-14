@@ -1635,9 +1635,9 @@ class Dish(_Handle):
 
 
 class Peer(_Handle):
-    """The dialling side of the stream core: dials peers and opens datagram
-    flows to them, round-robin. The rest of the C ABI's `weida_peer` arrives
-    with the raw peers area."""
+    """The dialling side of the stream core: dials peers and opens one-way
+    streams, exchanges, sends, segments and datagram flows to them,
+    round-robin."""
 
     def _start_connect(self, url: str):
         return _start(lib.weida_peer_connect, "weida_peer_connect_op", self._p(), url.encode())
@@ -1648,13 +1648,159 @@ class Peer(_Handle):
             lambda m: _start(lib.weida_peer_open_flow, "weida_peer_open_flow_op", self._p(), m),
         )
 
+    def _start_open(self, meta: Optional[TransferMeta]):
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(lib.weida_peer_open, "weida_peer_open_op", self._p(), h),
+        )
+
+    def _start_open_bi(self, meta: Optional[TransferMeta]):
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(lib.weida_peer_open_bi, "weida_peer_open_bi_op", self._p(), h),
+        )
+
+    def _start_send(self, meta: Optional[TransferMeta], body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(lib.weida_peer_send, "weida_peer_send_op", self._p(), h, data, len(data)),
+        )
+
+    def _start_segment(self, topic: str, max_age: Optional[float], priority: int, follows_upstream: bool):
+        terms = _SegmentTerms(max_age=max_age, priority=priority, follows_upstream=follows_upstream)
+        return _with_terms(
+            terms,
+            lambda t: _start(lib.weida_peer_segment, "weida_peer_segment_op", self._p(), topic.encode(), t),
+        )
+
     def _flow(self, ptr) -> "Flow":
         return Flow(ptr, lib.weida_flow_drop, self)
+
+    def _outgoing(self, ptr) -> "OutgoingTransfer":
+        return self._OutgoingTransfer(ptr, lib.weida_outgoing_transfer_drop, self)
+
+    def _opened(self, ptrs) -> Tuple["OutgoingTransfer", "ReplyStream"]:
+        body, reply = ptrs
+        return (
+            self._OutgoingTransfer(body, lib.weida_outgoing_transfer_drop, self),
+            self._ReplyStream(reply, lib.weida_reply_stream_drop, self),
+        )
+
+    def _segment(self, ptr) -> "Segment":
+        return Segment(ptr, lib.weida_segment_drop, self)
 
     def connect(self, url: str, timeout: Optional[float] = None) -> None:
         """Dials `url`; the runtime redials it when the connection is lost."""
         op = self._start_connect(url)
         _op_sync(op, lib.weida_peer_connect_op_wait, lib.weida_peer_connect_op_drop, timeout)
+
+    def disconnect(self, url: str) -> bool:
+        """Forgets a dialled address, closing its connection: whether it was
+        dialled."""
+        return check(lib.weida_peer_disconnect(self._p(), url.encode())) == 1
+
+    def peer_count(self) -> int:
+        return lib.weida_peer_peer_count(self._p())
+
+    def dropped(self) -> int:
+        """The bodies the outbox discarded."""
+        return lib.weida_peer_dropped(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_peer_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def events(self) -> "PeerEvents":
+        """A new reader of this peer's peer events, from now on; each call
+        is an independent reader."""
+        out = ffi.new("weida_peer_events **")
+        check(lib.weida_peer_peer_events(self._p(), out))
+        # No parent: the events end once the peer is gone, which holding it
+        # would prevent.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
+    def open(self, meta: Optional[TransferMeta] = None, timeout: Optional[float] = None) -> "OutgoingTransfer":
+        """Opens a one-way stream to the next peer carrying `meta` (copied
+        when it starts), written like a socket; its `finish()` hands back the
+        delivery receipt. With every peer down it waits for a redial up to
+        `send_timeout`; raises `NotConnected` for a peer never connected or
+        disconnected, `ConnectionLost` when no peer came back,
+        `LimitExceeded` for a topic over 256 bytes; a wait cut short resets
+        the transfer `CANCELED`."""
+        op = self._start_open(meta)
+        ptr = _op_sync(
+            op,
+            lib.weida_peer_open_op_wait,
+            lib.weida_peer_open_op_drop,
+            timeout,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    def open_bi(
+        self, meta: Optional[TransferMeta] = None, timeout: Optional[float] = None
+    ) -> Tuple["OutgoingTransfer", "ReplyStream"]:
+        """Opens one exchange to the next peer carrying `meta` (copied when
+        it starts): `(body, reply)`, the request body written like a socket
+        and ended with `finish()`, and the stream its reply is awaited on.
+        With every peer down it waits for a redial up to `send_timeout`;
+        raises `NotConnected` for a peer never connected or disconnected,
+        `ConnectionLost` when no peer came back, `LimitExceeded` for a topic
+        over 256 bytes; a wait cut short abandons the exchange."""
+        op = self._start_open_bi(meta)
+        ptrs = _op_sync(
+            op,
+            lib.weida_peer_open_bi_op_wait,
+            lib.weida_peer_open_bi_op_drop,
+            timeout,
+            ("weida_outgoing_transfer **", "weida_reply_stream **"),
+        )
+        return self._opened(ptrs)
+
+    def send(self, meta: Optional[TransferMeta], body, timeout: Optional[float] = None) -> None:
+        """Sends `body` (any bytes-like, copied) as one one-way stream
+        carrying `meta` (a `TransferMeta` or `None`) to the next peer;
+        returns once the body is written or held in the outbox
+        (`RuntimeConfig.outbox_full`). Raises `LimitExceeded` for a full
+        outbox under `OutboxFull.REJECT`, a body larger than the outbox or a
+        topic over 256 bytes."""
+        op = self._start_send(meta, body)
+        _op_sync(op, lib.weida_peer_send_op_wait, lib.weida_peer_send_op_drop, timeout)
+
+    def segment(
+        self,
+        topic: str,
+        timeout: Optional[float] = None,
+        *,
+        max_age: Optional[float] = None,
+        priority: int = 0,
+        follows_upstream: bool = False,
+    ) -> "Segment":
+        """Opens the next segment on `topic` to the next peer, written in
+        layers without waiting. Opening segment n+1 on `topic` resets the
+        unfinished layers of segment n, counted `superseded` in
+        `segment_drops`; the terms are `Radio.segment`'s."""
+        op = self._start_segment(topic, max_age, priority, follows_upstream)
+        ptr = _op_sync(
+            op,
+            lib.weida_peer_segment_op_wait,
+            lib.weida_peer_segment_op_drop,
+            timeout,
+            "weida_segment **",
+        )
+        return self._segment(ptr)
+
+    def segment_drops(self, topic: str) -> Optional[TopicDrops]:
+        """What the segments on `topic` lost, a frozen record, or `None`
+        when nothing was."""
+        out = ffi.new("weida_topic_drops **")
+        check(lib.weida_peer_segment_drops(self._p(), topic.encode(), out))
+        records = _take_topic_drops(out[0])
+        return records[0] if records else None
 
     def open_flow(self, meta: Optional[FlowMeta] = None, timeout: Optional[float] = None) -> "Flow":
         """Registers a datagram flow to the next peer carrying `meta` (a
@@ -1675,19 +1821,29 @@ class Peer(_Handle):
 
 @dataclass(frozen=True)
 class Incoming:
-    """What an acceptor took, copied out at once. A flow
-    (`IncomingKind.FLOW`) carries its `IncomingFlow`, taken at once; every
-    other kind carries only its `kind`, `flow` `None`, and what it brought
-    was dropped at once (a stream is refused `REJECTED`, an exchange
-    answers `NO_REPLY`)."""
+    """What an acceptor took, copied out at once, tagged by `kind`: a
+    one-way stream (`STREAM`) carries its `transfer`, an exchange
+    (`EXCHANGE`) its `request`, which owes a reply, a subscription
+    (`SUBSCRIBED`) its `consumer`, a flow (`FLOW`) its `flow`, each taken
+    at once; a credit grant (`CREDIT`) carries the consumer number `id`,
+    the subscription's `filter` and its absolute `limit`, an unsubscription
+    (`UNSUBSCRIBED`) `id` and `filter`, which is `None` when the whole
+    connection went away. A field the kind does not carry is `None`."""
 
     kind: IncomingKind
+    transfer: Optional["IncomingTransfer"]
+    request: Optional["IncomingRequest"]
+    consumer: Optional["Consumer"]
     flow: Optional["IncomingFlow"]
+    id: Optional[int]
+    filter: Optional[str]
+    limit: Optional[int]
 
 
 class Acceptor(_Handle):
-    """The bound side of the stream core, serving one endpoint path: both
-    stream kinds and flows on the path arrive at `accept`, tagged."""
+    """The bound side of the stream core, serving one endpoint path: one-way
+    streams, exchanges, flows, and a queue's subscriptions, credit and
+    unsubscriptions on the path arrive at `accept`, tagged."""
 
     _fd_of = lib.weida_acceptor_fd
 
@@ -1700,15 +1856,43 @@ class Acceptor(_Handle):
         return out, lambda ms: lib.weida_acceptor_accept(handle, ms, out)
 
     def _incoming(self, ptr) -> Incoming:
-        """Copies a `weida_incoming` out, taking a flow, and drops it, which
-        drops whatever another kind brought."""
+        """Copies a `weida_incoming` out, taking what it carries, and drops
+        it."""
         try:
             kind = IncomingKind(lib.weida_incoming_kind(ptr))
-            if kind != IncomingKind.FLOW:
-                return Incoming(kind=kind, flow=None)
-            out = ffi.new("weida_incoming_flow **")
-            check(lib.weida_incoming_take_flow(ptr, out))
-            return Incoming(kind=kind, flow=self._IncomingFlow(out[0], lib.weida_incoming_flow_drop, self))
+            fields = dict(transfer=None, request=None, consumer=None, flow=None, id=None, filter=None, limit=None)
+            if kind == IncomingKind.STREAM:
+                out = ffi.new("weida_incoming_transfer **")
+                check(lib.weida_incoming_take_stream(ptr, out))
+                fields["transfer"] = self._IncomingTransfer(out[0], lib.weida_incoming_transfer_drop, self)
+            elif kind == IncomingKind.EXCHANGE:
+                out = ffi.new("weida_incoming_request **")
+                check(lib.weida_incoming_take_exchange(ptr, out))
+                fields["request"] = self._IncomingRequest(out[0], lib.weida_incoming_request_drop, self)
+            elif kind == IncomingKind.SUBSCRIBED:
+                out = ffi.new("weida_consumer **")
+                check(lib.weida_incoming_take_subscribed(ptr, out))
+                fields["consumer"] = self._Consumer(out[0], lib.weida_consumer_drop, self)
+            elif kind == IncomingKind.CREDIT:
+                out = ffi.new("weida_credit_grant **")
+                check(lib.weida_incoming_take_credit(ptr, out))
+                grant = out[0]
+                try:
+                    fields["id"] = lib.weida_credit_grant_id(grant)
+                    fields["filter"] = _text(lib.weida_credit_grant_filter, grant)
+                    fields["limit"] = lib.weida_credit_grant_limit(grant)
+                finally:
+                    lib.weida_credit_grant_drop(grant)
+            elif kind == IncomingKind.UNSUBSCRIBED:
+                number = ffi.new("uint64_t *")
+                lib.weida_incoming_unsubscribed_id(ptr, number)  # 1 for this kind
+                fields["id"] = number[0]
+                fields["filter"] = _text(lib.weida_incoming_unsubscribed_filter, ptr)
+            elif kind == IncomingKind.FLOW:
+                out = ffi.new("weida_incoming_flow **")
+                check(lib.weida_incoming_take_flow(ptr, out))
+                fields["flow"] = self._IncomingFlow(out[0], lib.weida_incoming_flow_drop, self)
+            return Incoming(kind=kind, **fields)
         finally:
             lib.weida_incoming_drop(ptr)
 
@@ -1719,6 +1903,81 @@ class Acceptor(_Handle):
         out, attempt = self._accept_attempt()
         call_sync(attempt, timeout)
         return self._incoming(out[0])
+
+
+class Consumer(_Handle):
+    """One subscription a queue serving a path learned of through its
+    acceptor: deliveries go to the consumer's subscriber, and the queue
+    honours the credit the acceptor reports. Dropping it leaves the
+    subscription in place."""
+
+    def _start_open(self, meta: Optional[TransferMeta]):
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(lib.weida_consumer_open, "weida_consumer_open_op", self._p(), h),
+        )
+
+    def _start_deliver(self, meta: Optional[TransferMeta], body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(
+                lib.weida_consumer_deliver, "weida_consumer_deliver_op", self._p(), h, data, len(data)
+            ),
+        )
+
+    def _outgoing(self, ptr) -> "OutgoingTransfer":
+        return self._OutgoingTransfer(ptr, lib.weida_outgoing_transfer_drop, self)
+
+    def id(self) -> int:
+        """The number of the connection it subscribed on, shared by every
+        subscription of that connection, never reused while the process
+        lives; a credit grant and an unsubscription name it as
+        `Incoming.id`."""
+        return lib.weida_consumer_id(self._p())
+
+    def filter(self) -> str:
+        return _text(lib.weida_consumer_filter, self._p())
+
+    def path(self) -> str:
+        return _text(lib.weida_consumer_path, self._p())
+
+    def open(self, meta: Optional[TransferMeta] = None, timeout: Optional[float] = None) -> "OutgoingTransfer":
+        """One delivery addressed to the subscribed path, written like a
+        socket; the topic the subscriber filters on travels in `meta.topic`.
+        Raises `ConnectionLost` once its connection is gone; a wait cut
+        short resets the transfer `CANCELED`."""
+        op = self._start_open(meta)
+        ptr = _op_sync(
+            op,
+            lib.weida_consumer_open_op_wait,
+            lib.weida_consumer_open_op_drop,
+            timeout,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    def deliver(self, meta: Optional[TransferMeta], body, timeout: Optional[float] = None) -> None:
+        """One whole delivery of `body` (any bytes-like, copied); returns
+        once it is written and finished. Raises `ConnectionLost` once its
+        connection is gone."""
+        op = self._start_deliver(meta, body)
+        _op_sync(op, lib.weida_consumer_deliver_op_wait, lib.weida_consumer_deliver_op_drop, timeout)
+
+    def close(self, code: int, reason: str) -> None:
+        """Closes the connection the consumer subscribed on, ending every
+        subscription it holds on every path; the acceptor then reports
+        `UNSUBSCRIBED` with `filter` `None`. `code` is a PROTOCOL.md §7 code
+        (e.g. 5 `LIMIT_EXCEEDED`, 6 `SHUTDOWN`; an `ErrorCode` member
+        works), sent as 1 `INTERNAL` above 2**62 - 1; a `bool` or non-`int`
+        is a `TypeError`, a negative one or one above 2**64 - 1 a
+        `ValueError`. Closing a closed connection does nothing."""
+        n = _count("code", code)
+        if n > _U64_MAX:
+            raise ValueError("code must be below 2**64")
+        if not isinstance(reason, str):
+            raise TypeError("reason is a str")
+        check(lib.weida_consumer_close(self._p(), n, reason.encode()))
 
 
 class Flow(_Handle):
@@ -2285,10 +2544,11 @@ class Reporter(_Handle):
 
 class PeerEvents(_Handle):
     """A reader of a dialler's peer events (a requester, pusher, subscriber,
-    dialling pair or dish), a queue (docs/libraries/weida-py.md §1): `recv`
-    returns the next `PeerEvent`, or `None` once the dialler, or the relayed
-    binding's registration, is gone. A reader that fell more than 64 events
-    behind gets one `MISSED` event carrying how many it lost."""
+    dialling pair, dish or raw peer), a queue (docs/libraries/weida-py.md
+    §1): `recv` returns the next `PeerEvent`, or `None` once the dialler, or
+    the relayed binding's registration, is gone. A reader that fell more
+    than 64 events behind gets one `MISSED` event carrying how many it
+    lost."""
 
     _fd_of = lib.weida_peer_events_fd
 
@@ -2395,11 +2655,19 @@ IncomingTransfer._Reporter = Reporter
 Runtime._Peer = Peer
 Listener._Acceptor = Acceptor
 Acceptor._IncomingFlow = IncomingFlow
+Peer._OutgoingTransfer = OutgoingTransfer
+Peer._ReplyStream = ReplyStream
+Peer._PeerEvents = PeerEvents
+Acceptor._IncomingTransfer = IncomingTransfer
+Acceptor._IncomingRequest = IncomingRequest
+Acceptor._Consumer = Consumer
+Consumer._OutgoingTransfer = OutgoingTransfer
 
 __all__ = [
     "Acceptor",
     "Binding",
     "BusMember",
+    "Consumer",
     "Cursors",
     "Delivery",
     "Dish",

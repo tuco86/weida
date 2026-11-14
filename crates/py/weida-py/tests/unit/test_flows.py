@@ -89,7 +89,10 @@ def test_a_flow_without_datagrams_is_unavailable_other_kinds_are_tagged_and_a_re
     requester.connect(url, WAIT)
     with ThreadPoolExecutor(max_workers=1) as pool:
         asking = pool.submit(requester.request, b"x", WAIT)
-        assert acceptor.accept(WAIT) == weida.Incoming(kind=weida.IncomingKind.EXCHANGE, flow=None)
+        exchange = acceptor.accept(WAIT)
+        assert exchange.kind is weida.IncomingKind.EXCHANGE
+        assert isinstance(exchange.request, weida.IncomingRequest)
+        exchange.request.drop()
         with pytest.raises(weida.NoReply):
             asking.result(WAIT)
 

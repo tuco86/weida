@@ -457,3 +457,66 @@ def test_flows_on_the_loop(bus):
         await runtime.shutdown()
 
     asyncio.run(main())
+
+
+def test_raw_peers_on_the_loop(bus):
+    async def main() -> None:
+        server = wa.Runtime.owned()
+        client = wa.Runtime.owned()
+        listener = server.listener()
+        binding = listener.bind_inproc(bus)
+        raw = listener.acceptor("/raw")
+        queue = listener.acceptor("/q")
+        peer = client.peer(weida.ClientTls(weida.Trust()))
+        await peer.connect(f"weida+inproc://{bus}/raw")
+
+        out = await peer.open()
+        assert isinstance(out, wa.OutgoingTransfer)
+        await out.write_all(b"one")
+        out.finish().drop()
+        stream = await raw.accept()
+        assert isinstance(stream.transfer, wa.IncomingTransfer)
+        assert (await stream.transfer.collect(64)).payload == b"one"
+
+        body, reply = await peer.open_bi()
+        await body.write_all(b"ask")
+        body.finish().drop()
+        exchange = await raw.accept()
+        assert isinstance(exchange.request, wa.IncomingRequest)
+        assert (await exchange.request.take_body().collect(64)).payload == b"ask"
+        answer = await exchange.request.reply()
+        await answer.write_all(b"answer")
+        answer.finish().drop()
+        assert (await (await reply.recv()).collect(64)).payload == b"answer"
+
+        await peer.send(None, b"sent")
+        assert (await (await raw.accept()).transfer.collect(64)).payload == b"sent"
+
+        segment = await peer.segment("cam")
+        assert isinstance(segment, weida.Segment)
+        segment.write(b"frame")
+        segment.finish()
+        frame = await raw.accept()
+        assert frame.transfer.meta().topic == "cam"
+        assert (await frame.transfer.collect(64)).payload == b"frame"
+
+        subscriber = client.subscriber(weida.ClientTls(weida.Trust()))
+        await subscriber.connect(f"weida+inproc://{bus}/q")
+        await subscriber.subscribe("jobs.#")
+        consumer = (await queue.accept()).consumer
+        assert isinstance(consumer, wa.Consumer)
+        await subscriber.grant("jobs.#", 2)
+        assert (await queue.accept()).limit == 2
+        out = await consumer.open(weida.TransferMeta(topic="jobs.a"))
+        await out.write_all(b"job-0")
+        out.finish().drop()
+        await consumer.deliver(weida.TransferMeta(topic="jobs.a"), b"job-1")
+        got = [(await (await subscriber.recv()).collect(64)).payload for _ in range(2)]
+        assert sorted(got) == [b"job-0", b"job-1"]
+
+        for handle in (consumer, subscriber, peer, queue, raw, binding, listener):
+            handle.drop()
+        await client.shutdown()
+        await server.shutdown()
+
+    asyncio.run(main())

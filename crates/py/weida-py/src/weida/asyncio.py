@@ -20,6 +20,7 @@ __all__ = [
     "Acceptor",
     "Binding",
     "BusMember",
+    "Consumer",
     "Cursors",
     "Delivery",
     "Dish",
@@ -574,16 +575,105 @@ class Peer(_sync.Peer):
         )
         return self._flow(ptr)
 
+    async def open(self, meta: Optional[TransferMeta] = None) -> "OutgoingTransfer":  # type: ignore[override]
+        """Opens a one-way stream to the next peer carrying `meta`, as
+        `weida.Peer.open` does; a cancelled open resets the transfer
+        `CANCELED`."""
+        op = self._start_open(meta)
+        ptr = await _op_async(
+            op,
+            lib.weida_peer_open_op_wait,
+            lib.weida_peer_open_op_fd,
+            lib.weida_peer_open_op_drop,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    async def open_bi(  # type: ignore[override]
+        self, meta: Optional[TransferMeta] = None
+    ) -> Tuple["OutgoingTransfer", "ReplyStream"]:
+        """Opens one exchange to the next peer carrying `meta`, as
+        `weida.Peer.open_bi` does; a cancelled open_bi abandons the
+        exchange."""
+        op = self._start_open_bi(meta)
+        ptrs = await _op_async(
+            op,
+            lib.weida_peer_open_bi_op_wait,
+            lib.weida_peer_open_bi_op_fd,
+            lib.weida_peer_open_bi_op_drop,
+            ("weida_outgoing_transfer **", "weida_reply_stream **"),
+        )
+        return self._opened(ptrs)
+
+    async def send(self, meta: Optional[TransferMeta], body) -> None:  # type: ignore[override]
+        """Sends `body` carrying `meta` to the next peer, as
+        `weida.Peer.send` does; a cancelled send drops its op."""
+        op = self._start_send(meta, body)
+        await _op_async(
+            op,
+            lib.weida_peer_send_op_wait,
+            lib.weida_peer_send_op_fd,
+            lib.weida_peer_send_op_drop,
+        )
+
+    async def segment(  # type: ignore[override]
+        self,
+        topic: str,
+        *,
+        max_age: Optional[float] = None,
+        priority: int = 0,
+        follows_upstream: bool = False,
+    ) -> "_sync.Segment":
+        """Opens the next segment on `topic`, as `weida.Peer.segment` does;
+        a cancelled segment drops its op. The segment is a `weida.Segment`,
+        which never waits."""
+        op = self._start_segment(topic, max_age, priority, follows_upstream)
+        ptr = await _op_async(
+            op,
+            lib.weida_peer_segment_op_wait,
+            lib.weida_peer_segment_op_fd,
+            lib.weida_peer_segment_op_drop,
+            "weida_segment **",
+        )
+        return self._segment(ptr)
+
 
 class Acceptor(_sync.Acceptor):
     async def accept(self) -> Incoming:  # type: ignore[override]
         """The next thing that arrived on the path, as
-        `weida.Acceptor.accept` gives it, a flow as a
-        `weida.asyncio.IncomingFlow`. A cancelled `accept` loses nothing.
-        Raises `NotConnected` once the queue ended."""
+        `weida.Acceptor.accept` gives it, the handles it carries as
+        `weida.asyncio` classes. A cancelled `accept` loses nothing. Raises
+        `NotConnected` once the queue ended."""
         out, attempt = self._accept_attempt()
         await call_async(self._waiters(), attempt, self.drop)
         return self._incoming(out[0])
+
+
+class Consumer(_sync.Consumer):
+    async def open(self, meta: Optional[TransferMeta] = None) -> "OutgoingTransfer":  # type: ignore[override]
+        """One delivery addressed to the subscribed path, as
+        `weida.Consumer.open` does; a cancelled open resets the transfer
+        `CANCELED`."""
+        op = self._start_open(meta)
+        ptr = await _op_async(
+            op,
+            lib.weida_consumer_open_op_wait,
+            lib.weida_consumer_open_op_fd,
+            lib.weida_consumer_open_op_drop,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    async def deliver(self, meta: Optional[TransferMeta], body) -> None:  # type: ignore[override]
+        """One whole delivery of `body`, as `weida.Consumer.deliver` does;
+        a cancelled deliver drops its op."""
+        op = self._start_deliver(meta, body)
+        await _op_async(
+            op,
+            lib.weida_consumer_deliver_op_wait,
+            lib.weida_consumer_deliver_op_fd,
+            lib.weida_consumer_deliver_op_drop,
+        )
 
 
 class IncomingFlow(_sync.IncomingFlow):
@@ -896,6 +986,13 @@ IncomingTransfer._Reporter = Reporter
 Runtime._Peer = Peer
 Listener._Acceptor = Acceptor
 Acceptor._IncomingFlow = IncomingFlow
+Peer._OutgoingTransfer = OutgoingTransfer
+Peer._ReplyStream = ReplyStream
+Peer._PeerEvents = PeerEvents
+Acceptor._IncomingTransfer = IncomingTransfer
+Acceptor._IncomingRequest = IncomingRequest
+Acceptor._Consumer = Consumer
+Consumer._OutgoingTransfer = OutgoingTransfer
 IdentitySource._Weak = WeakIdentitySource
 WeakIdentitySource._Strong = IdentitySource
 TrustSource._Weak = WeakTrustSource
