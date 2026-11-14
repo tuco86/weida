@@ -24,8 +24,8 @@ class UdpCounts:
 
 @dataclass(frozen=True)
 class PathStats:
-    """The path under one QUIC connection. `max_datagram_size` is `None`
-    when the peer accepts no datagram."""
+    """The path under one QUIC connection or flow. `max_datagram_size` is
+    `None` when the peer accepts no datagram."""
 
     rtt: float
     min_rtt: float
@@ -149,6 +149,25 @@ def _take_connection_stats(ptr) -> Tuple[ConnectionStats, ...]:
         return tuple(_record(ptr, i) for i in range(lib.weida_connection_stats_len(ptr)))
     finally:
         lib.weida_connection_stats_drop(ptr)
+
+
+def _take_path_stats(ptr) -> PathStats:
+    """Copies a `weida_path_stats` snapshot out and drops it."""
+    try:
+        size = ffi.new("uint64_t *")
+        return PathStats(
+            rtt=_seconds(lib.weida_path_stats_rtt_us(ptr)),
+            min_rtt=_seconds(lib.weida_path_stats_min_rtt_us(ptr)),
+            cwnd=lib.weida_path_stats_cwnd(ptr),
+            congestion_events=lib.weida_path_stats_congestion_events(ptr),
+            lost_packets=lib.weida_path_stats_lost_packets(ptr),
+            lost_bytes=lib.weida_path_stats_lost_bytes(ptr),
+            sent_packets=lib.weida_path_stats_sent_packets(ptr),
+            current_mtu=lib.weida_path_stats_current_mtu(ptr),
+            max_datagram_size=size[0] if lib.weida_path_stats_max_datagram_size(ptr, size) == 1 else None,
+        )
+    finally:
+        lib.weida_path_stats_drop(ptr)
 
 
 @dataclass(frozen=True)

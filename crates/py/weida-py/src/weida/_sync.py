@@ -9,17 +9,20 @@ from typing import Callable, Iterator, Optional, Tuple, Union
 
 from weida import _resolver
 from weida._crypto import path as _fspath
-from weida._enums import Acknowledgement, ErrorCode, ReceivedKind, ReportMode
+from weida._enums import Acknowledgement, ErrorCode, IncomingKind, ReceivedKind, ReportMode
 from weida._errors import check
 from weida._native import ffi, lib
-from weida._stats import ConnectionStats, PeerEvent, _take_connection_stats
+from weida._stats import ConnectionStats, PathStats, PeerEvent, _take_connection_stats, _take_path_stats
 from weida._values import (
     ClientTls,
     CursorSet,
     DishDrops,
     Drained,
+    FlowMeta,
+    FlowStats,
     IdentityEvent,
     IdentitySource,
+    IncomingFlowStats,
     IncomingMeta,
     Message,
     RuntimeConfig,
@@ -39,6 +42,7 @@ from weida._values import (
     _take_dish_drops,
     _take_topic_drops,
     _text,
+    _with_flow_meta,
     _with_terms,
     _with_transfer_meta,
 )
@@ -119,6 +123,15 @@ def _deadline_ms(deadline) -> int:
     if ms > _U64_MAX:
         raise ValueError("deadline must be below 2**64 milliseconds")
     return ms
+
+
+def _path_stats(getter: Callable, handle) -> Optional[PathStats]:
+    """A flow's path snapshot (`weida_flow_path_stats`,
+    `weida_incoming_flow_path_stats`), or `None` on a local transport."""
+    out = ffi.new("weida_path_stats **")
+    if check(getter(handle, out)) == 0:
+        return None
+    return _take_path_stats(out[0])
 
 
 class Runtime(_Handle):
@@ -202,6 +215,13 @@ class Runtime(_Handle):
         out = ffi.new("weida_dish **")
         check(lib.weida_runtime_dish(self._p(), tls._p(), out))
         return self._Dish(out[0], lib.weida_dish_drop, self)
+
+    def peer(self, tls: ClientTls) -> "Peer":
+        """A raw peer: it dials on `tls`'s terms and opens datagram flows to
+        the peers it dialled, round-robin."""
+        out = ffi.new("weida_peer **")
+        check(lib.weida_runtime_peer(self._p(), tls._p(), out))
+        return self._Peer(out[0], lib.weida_peer_drop, self)
 
     def suppressed_duplicates(self) -> int:
         """Duplicates discarded inside a negotiated deduplication window; 0
@@ -351,6 +371,14 @@ class Listener(_Handle):
         out = ffi.new("weida_radio **")
         check(lib.weida_listener_radio(self._p(), path.encode(), out))
         return Radio(out[0], lib.weida_radio_drop, self)
+
+    def acceptor(self, path: str) -> "Acceptor":
+        """Registers a raw acceptor at the endpoint path `path`: it takes
+        both stream kinds and flows on the path, tagged. A dropped acceptor
+        leaves its path registered."""
+        out = ffi.new("weida_acceptor **")
+        check(lib.weida_listener_acceptor(self._p(), path.encode(), out))
+        return self._Acceptor(out[0], lib.weida_acceptor_drop, self)
 
     def _start_bind_quic_socket(self, socket: int, tls: ServerTls):
         # Checked before C takes the descriptor: a range error leaves it the
@@ -1606,6 +1634,199 @@ class Dish(_Handle):
         return lib.weida_dish_overflow(self._p())
 
 
+class Peer(_Handle):
+    """The dialling side of the stream core: dials peers and opens datagram
+    flows to them, round-robin. The rest of the C ABI's `weida_peer` arrives
+    with the raw peers area."""
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_peer_connect, "weida_peer_connect_op", self._p(), url.encode())
+
+    def _start_open_flow(self, meta: Optional[FlowMeta]):
+        return _with_flow_meta(
+            meta,
+            lambda m: _start(lib.weida_peer_open_flow, "weida_peer_open_flow_op", self._p(), m),
+        )
+
+    def _flow(self, ptr) -> "Flow":
+        return Flow(ptr, lib.weida_flow_drop, self)
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Dials `url`; the runtime redials it when the connection is lost."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_peer_connect_op_wait, lib.weida_peer_connect_op_drop, timeout)
+
+    def open_flow(self, meta: Optional[FlowMeta] = None, timeout: Optional[float] = None) -> "Flow":
+        """Registers a datagram flow to the next peer carrying `meta` (a
+        `FlowMeta`, copied when it starts) and returns once its header is
+        written; a refusal arrives later, as a `send` that raises. Raises
+        `DatagramsUnavailable` unless both runtimes carry datagrams
+        (`Limits.datagram_receive_bytes` above 0)."""
+        op = self._start_open_flow(meta)
+        ptr = _op_sync(
+            op,
+            lib.weida_peer_open_flow_op_wait,
+            lib.weida_peer_open_flow_op_drop,
+            timeout,
+            "weida_flow **",
+        )
+        return self._flow(ptr)
+
+
+@dataclass(frozen=True)
+class Incoming:
+    """What an acceptor took, copied out at once. A flow
+    (`IncomingKind.FLOW`) carries its `IncomingFlow`, taken at once; every
+    other kind carries only its `kind`, `flow` `None`, and what it brought
+    was dropped at once (a stream is refused `REJECTED`, an exchange
+    answers `NO_REPLY`)."""
+
+    kind: IncomingKind
+    flow: Optional["IncomingFlow"]
+
+
+class Acceptor(_Handle):
+    """The bound side of the stream core, serving one endpoint path: both
+    stream kinds and flows on the path arrive at `accept`, tagged."""
+
+    _fd_of = lib.weida_acceptor_fd
+
+    def path(self) -> str:
+        return _text(lib.weida_acceptor_path, self._p())
+
+    def _accept_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_incoming **")
+        return out, lambda ms: lib.weida_acceptor_accept(handle, ms, out)
+
+    def _incoming(self, ptr) -> Incoming:
+        """Copies a `weida_incoming` out, taking a flow, and drops it, which
+        drops whatever another kind brought."""
+        try:
+            kind = IncomingKind(lib.weida_incoming_kind(ptr))
+            if kind != IncomingKind.FLOW:
+                return Incoming(kind=kind, flow=None)
+            out = ffi.new("weida_incoming_flow **")
+            check(lib.weida_incoming_take_flow(ptr, out))
+            return Incoming(kind=kind, flow=self._IncomingFlow(out[0], lib.weida_incoming_flow_drop, self))
+        finally:
+            lib.weida_incoming_drop(ptr)
+
+    def accept(self, timeout: Optional[float] = None) -> Incoming:
+        """The next thing that arrived on the path, a frozen `Incoming`. An
+        `accept` cut short loses nothing: the take in flight stays in the
+        acceptor. Raises `NotConnected` once the queue ended."""
+        out, attempt = self._accept_attempt()
+        call_sync(attempt, timeout)
+        return self._incoming(out[0])
+
+
+class Flow(_Handle):
+    """The sending half of one datagram flow. It never waits, so
+    `weida.asyncio` hands out this class too. Dropping it closes the flow
+    with FIN: the receiver sees its end after the datagrams already
+    delivered."""
+
+    def send(self, payload) -> None:
+        """Sends `payload` (any bytes-like, copied) as one datagram, handed
+        to the connection, not known to arrive. Raises `TooLarge` (its `max`
+        names the limit) above `max_payload()`, and on an ended flow the
+        error that ended it, e.g. `Rejected` once the receiver refused it."""
+        data = ffi.from_buffer("uint8_t[]", payload)
+        check(lib.weida_flow_send(self._p(), data, len(data)))
+
+    def max_payload(self) -> Optional[int]:
+        """The largest payload `send` takes now, or `None` when the
+        connection carries no datagrams."""
+        out = ffi.new("size_t *")
+        return out[0] if lib.weida_flow_max_payload(self._p(), out) == 1 else None
+
+    def stats(self) -> FlowStats:
+        """The sender's counters, a frozen `FlowStats`."""
+        handle = self._p()
+        return FlowStats(
+            sent=lib.weida_flow_sent(handle),
+            too_large=lib.weida_flow_too_large(handle),
+            discarded=lib.weida_flow_discarded(handle),
+            not_live=lib.weida_flow_not_live(handle),
+        )
+
+    def path_stats(self) -> Optional[PathStats]:
+        """The path under the flow, a frozen `PathStats`, or `None` on a
+        local transport."""
+        return _path_stats(lib.weida_flow_path_stats, self._p())
+
+    def abort(self) -> None:
+        """Resets the flow `CANCELED`. Consumes the flow."""
+        lib.weida_flow_abort(self._consume())
+
+
+class IncomingFlow(_Handle):
+    """The receiving half of one datagram flow, a queue
+    (docs/libraries/weida-py.md §1): `recv` returns the next datagram as
+    `bytes`, oldest first, or `None` once the flow ended and every datagram
+    that arrived before its end was taken. Dropping it stops the flow
+    `CANCELED`, which the sender's next `send` raises as `Canceled`."""
+
+    _fd_of = lib.weida_incoming_flow_fd
+
+    def info(self) -> IncomingMeta:
+        """What the sender attached, a frozen `IncomingMeta`: `endpoint`,
+        `topic`, `content_type`, `trace`, `peer_fingerprint`, `peer_chain`
+        and `peer_local`; every other field reads absent."""
+        out = ffi.new("weida_incoming_meta **")
+        check(lib.weida_incoming_flow_info(self._p(), out))
+        return IncomingMeta._take(out[0])
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_datagram **")
+        return out, lambda ms: lib.weida_incoming_flow_recv(handle, ms, out)
+
+    @staticmethod
+    def _datagram(ptr) -> Optional[bytes]:
+        """Copies a `weida_datagram` out and drops it; `None` for NULL,
+        which is the end."""
+        if ptr == ffi.NULL:
+            return None
+        try:
+            length = lib.weida_datagram_len(ptr)
+            return b"" if length == 0 else ffi.buffer(lib.weida_datagram_data(ptr), length)[:]
+        finally:
+            lib.weida_datagram_drop(ptr)
+
+    def recv(self, timeout: Optional[float] = None) -> Optional[bytes]:
+        """The next datagram, or `None` once the flow ended. A `recv` cut
+        short loses nothing: the take in flight stays in the flow."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._datagram(out[0])
+
+    def __iter__(self) -> Iterator[bytes]:
+        """Every datagram until the flow ended, each `recv` without a
+        timeout."""
+        while (d := self.recv()) is not None:
+            yield d
+
+    def stats(self) -> IncomingFlowStats:
+        """The receiver's counters, a frozen `IncomingFlowStats`."""
+        handle = self._p()
+        return IncomingFlowStats(
+            received=lib.weida_incoming_flow_received(handle),
+            overflow=lib.weida_incoming_flow_overflow(handle),
+        )
+
+    def path_stats(self) -> Optional[PathStats]:
+        """The path under the flow, a frozen `PathStats`, or `None` on a
+        local transport."""
+        return _path_stats(lib.weida_incoming_flow_path_stats, self._p())
+
+    def refuse(self) -> None:
+        """Stops the flow `REJECTED`, which the sender's next `send` raises
+        as `Rejected`. Consumes the flow."""
+        lib.weida_incoming_flow_refuse(self._consume())
+
+
 class ReplyStream(_Handle):
     """The reply half of an exchange `Requester.open` opened. Dropping it
     before `recv` tells the replier nobody is listening: its `canceled`
@@ -2171,22 +2392,30 @@ Dish._IncomingTransfer = IncomingTransfer
 Dish._PeerEvents = PeerEvents
 OutgoingTransfer._Cursors = Cursors
 IncomingTransfer._Reporter = Reporter
+Runtime._Peer = Peer
+Listener._Acceptor = Acceptor
+Acceptor._IncomingFlow = IncomingFlow
 
 __all__ = [
+    "Acceptor",
     "Binding",
     "BusMember",
     "Cursors",
     "Delivery",
     "Dish",
     "FanOut",
+    "Flow",
     "Handoff",
     "IdentityEvents",
+    "Incoming",
+    "IncomingFlow",
     "IncomingRequest",
     "IncomingTransfer",
     "Listener",
     "LocalBinding",
     "OutgoingTransfer",
     "Paired",
+    "Peer",
     "PeerEvents",
     "PipeBinding",
     "Publisher",

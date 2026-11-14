@@ -12,11 +12,12 @@ from weida import _sync, _values
 from weida._enums import ErrorCode
 from weida._native import ffi, lib
 from weida._stats import PeerEvent
-from weida._sync import Handoff, Received, _op_async
-from weida._values import ClientTls, CursorSet, Drained, IdentityEvent, Message, ServerTls, TransferMeta
+from weida._sync import Handoff, Incoming, Received, _op_async
+from weida._values import ClientTls, CursorSet, Drained, FlowMeta, IdentityEvent, Message, ServerTls, TransferMeta
 from weida._wait import call_async
 
 __all__ = [
+    "Acceptor",
     "Binding",
     "BusMember",
     "Cursors",
@@ -25,11 +26,13 @@ __all__ = [
     "FanOut",
     "IdentityEvents",
     "IdentitySource",
+    "IncomingFlow",
     "IncomingRequest",
     "IncomingTransfer",
     "Listener",
     "OutgoingTransfer",
     "Paired",
+    "Peer",
     "PeerEvents",
     "Publisher",
     "Puller",
@@ -547,6 +550,58 @@ class Dish(_sync.Dish):
         return self._received(out[0])
 
 
+class Peer(_sync.Peer):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Dials `url`; the runtime redials it when the connection is lost."""
+        await _op_async(
+            self._start_connect(url),
+            lib.weida_peer_connect_op_wait,
+            lib.weida_peer_connect_op_fd,
+            lib.weida_peer_connect_op_drop,
+        )
+
+    async def open_flow(self, meta: Optional[FlowMeta] = None) -> "_sync.Flow":  # type: ignore[override]
+        """Registers a datagram flow, as `weida.Peer.open_flow` does; a
+        cancelled open drops its op. The flow is a `weida.Flow`, which never
+        waits."""
+        op = self._start_open_flow(meta)
+        ptr = await _op_async(
+            op,
+            lib.weida_peer_open_flow_op_wait,
+            lib.weida_peer_open_flow_op_fd,
+            lib.weida_peer_open_flow_op_drop,
+            "weida_flow **",
+        )
+        return self._flow(ptr)
+
+
+class Acceptor(_sync.Acceptor):
+    async def accept(self) -> Incoming:  # type: ignore[override]
+        """The next thing that arrived on the path, as
+        `weida.Acceptor.accept` gives it, a flow as a
+        `weida.asyncio.IncomingFlow`. A cancelled `accept` loses nothing.
+        Raises `NotConnected` once the queue ended."""
+        out, attempt = self._accept_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._incoming(out[0])
+
+
+class IncomingFlow(_sync.IncomingFlow):
+    __iter__ = None  # type: ignore[assignment]  # `async for` only
+
+    async def recv(self) -> Optional[bytes]:  # type: ignore[override]
+        """The next datagram, or `None` once the flow ended. A cancelled
+        `recv` loses nothing."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._datagram(out[0])
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        """Every datagram until the flow ended."""
+        while (d := await self.recv()) is not None:
+            yield d
+
+
 class Relay(_sync.Relay):
     async def accept(self) -> "RelayRequest":  # type: ignore[override]
         """The next registration or tunnel asking to be served. An anonymous
@@ -838,6 +893,9 @@ Dish._IncomingTransfer = IncomingTransfer
 Dish._PeerEvents = PeerEvents
 OutgoingTransfer._Cursors = Cursors
 IncomingTransfer._Reporter = Reporter
+Runtime._Peer = Peer
+Listener._Acceptor = Acceptor
+Acceptor._IncomingFlow = IncomingFlow
 IdentitySource._Weak = WeakIdentitySource
 WeakIdentitySource._Strong = IdentitySource
 TrustSource._Weak = WeakTrustSource

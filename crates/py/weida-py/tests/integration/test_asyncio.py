@@ -429,3 +429,31 @@ def test_cursors_on_the_loop(bus):
         await runtime.shutdown()
 
     asyncio.run(main())
+
+
+def test_flows_on_the_loop(bus):
+    async def main() -> None:
+        flows = weida.RuntimeConfig(limits=weida.Limits(datagram_receive_bytes=weida.DEFAULT_DATAGRAM_RECEIVE_BYTES))
+        runtime = wa.Runtime.owned(flows)
+        listener = runtime.listener()
+        binding = listener.bind_inproc(bus)
+        acceptor = listener.acceptor("/v")
+        assert isinstance(acceptor, wa.Acceptor)
+        peer = runtime.peer(weida.ClientTls(weida.Trust()))
+        assert isinstance(peer, wa.Peer)
+        await peer.connect(f"weida+inproc://{bus}/v")
+        flow = await peer.open_flow(weida.FlowMeta(topic="mic"))
+        assert isinstance(flow, weida.Flow)
+        flow.send(b"a")
+        flow.send(b"b")
+        incoming = await acceptor.accept()
+        assert isinstance(incoming.flow, wa.IncomingFlow)
+        assert await incoming.flow.recv() == b"a"
+        flow.drop()
+        assert [d async for d in incoming.flow] == [b"b"]
+
+        for handle in (incoming.flow, peer, acceptor, binding, listener):
+            handle.drop()
+        await runtime.shutdown()
+
+    asyncio.run(main())

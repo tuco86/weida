@@ -427,6 +427,39 @@ def _with_terms(terms: _Fields, use: Callable):
         type(terms)._DROP(handle)
 
 
+class FlowMeta(_Fields):
+    """`FlowMeta`, what a sender attaches to a flow once: `content_type`,
+    `trace` (a W3C version-00 traceparent; a malformed one is
+    `InvalidArgument`) and `topic`, each a `str`; `None` leaves a field
+    unset, another type is a `TypeError`. A label above 256 bytes fails the
+    open with `LimitExceeded`."""
+
+    _OUT = "weida_flow_meta **"
+    _NEW = lib.weida_flow_meta_new
+    _DROP = lib.weida_flow_meta_drop
+    _FIELDS = (
+        ("content_type", lib.weida_flow_meta_set_content_type, _c_string),
+        ("trace", lib.weida_flow_meta_set_trace, _c_string),
+        ("topic", lib.weida_flow_meta_set_topic, _c_string),
+    )
+
+    def __init__(self, **fields) -> None:
+        super().__init__(**fields)
+        # None leaves a field unset, as TransferMeta's fields do.
+        self._fields = {k: v for k, v in self._fields.items() if v is not None}
+
+
+def _with_flow_meta(meta: Optional[FlowMeta], use: Callable):
+    """Calls `use` with `meta` as a fresh handle (`NULL` for `None`) and
+    drops the handle afterwards; the C call copies it. A conversion error
+    raises before `use` runs."""
+    if meta is None:
+        return use(ffi.NULL)
+    if not isinstance(meta, FlowMeta):
+        raise TypeError("meta is a weida.FlowMeta or None")
+    return _with_terms(meta, use)
+
+
 class Trust(_Handle):
     """Whom a dialler trusts: what each address names, plus pins and anchors."""
 
@@ -1310,3 +1343,26 @@ def _take_cursor_set(ptr) -> CursorSet:
         return tuple(entries)
     finally:
         lib.weida_cursor_set_drop(ptr)
+
+
+@dataclass(frozen=True)
+class FlowStats:
+    """The sender's counters of one flow: `sent` (handed to the transport),
+    `too_large` (sends refused with `TooLarge`), `discarded` (queued
+    datagrams discarded oldest-first, local transports only) and `not_live`
+    (dropped while no connection was live)."""
+
+    sent: int
+    too_large: int
+    discarded: int
+    not_live: int
+
+
+@dataclass(frozen=True)
+class IncomingFlowStats:
+    """The receiver's counters of one flow: `received` (datagrams that
+    arrived) and `overflow` (dropped oldest-first because
+    `Limits.flow_queue_bytes` were unread)."""
+
+    received: int
+    overflow: int

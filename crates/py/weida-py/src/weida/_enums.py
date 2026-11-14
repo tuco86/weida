@@ -165,6 +165,18 @@ class ReceivedKind(enum.IntEnum):
     DATAGRAM = lib.WEIDA_RECEIVED_DATAGRAM
 
 
+class IncomingKind(enum.IntEnum):
+    """The kind of an `Incoming`: what an acceptor took (named after the C
+    constants: the Rust `Incoming` is the record)."""
+
+    STREAM = lib.WEIDA_INCOMING_STREAM
+    EXCHANGE = lib.WEIDA_INCOMING_EXCHANGE
+    SUBSCRIBED = lib.WEIDA_INCOMING_SUBSCRIBED
+    CREDIT = lib.WEIDA_INCOMING_CREDIT
+    UNSUBSCRIBED = lib.WEIDA_INCOMING_UNSUBSCRIBED
+    FLOW = lib.WEIDA_INCOMING_FLOW
+
+
 __all__ = [
     "Acknowledgement",
     "Alpn",
@@ -177,6 +189,7 @@ __all__ = [
     "ErrorCode",
     "GiveUp",
     "IdentityEventKind",
+    "IncomingKind",
     "LossCause",
     "OrderingMode",
     "OutboxFull",
