@@ -100,6 +100,35 @@ class ErrorCode(enum.IntEnum):
     NO_REPLY = lib.WEIDA_ERROR_CODE_NO_REPLY
 
 
+class PeerEventKind(enum.IntEnum):
+    """The kind of a `PeerEvent`: which transition of a dialled address."""
+
+    CONNECTED = lib.WEIDA_PEER_EVENT_CONNECTED
+    LOST = lib.WEIDA_PEER_EVENT_LOST
+    RETRYING = lib.WEIDA_PEER_EVENT_RETRYING
+    GAVE_UP = lib.WEIDA_PEER_EVENT_GAVE_UP
+    MISSED = lib.WEIDA_PEER_EVENT_MISSED
+
+
+class LossCause(enum.IntEnum):
+    """`LossCause`: why a connection was lost."""
+
+    IDLE_TIMEOUT = lib.WEIDA_LOSS_IDLE_TIMEOUT
+    PEER_CLOSED = lib.WEIDA_LOSS_PEER_CLOSED
+    PEER_RESTARTING = lib.WEIDA_LOSS_PEER_RESTARTING
+    LOCALLY_CLOSED = lib.WEIDA_LOSS_LOCALLY_CLOSED
+    RESET = lib.WEIDA_LOSS_RESET
+    TRANSPORT_ERROR = lib.WEIDA_LOSS_TRANSPORT_ERROR
+
+
+class GiveUp(enum.IntEnum):
+    """`GiveUp`: why the runtime stopped redialling an address."""
+
+    POLICY = lib.WEIDA_GIVE_UP_POLICY
+    PEER_CHANGED = lib.WEIDA_GIVE_UP_PEER_CHANGED
+    FAILED = lib.WEIDA_GIVE_UP_FAILED
+
+
 __all__ = [
     "Acknowledgement",
     "Backpressure",
@@ -109,7 +138,10 @@ __all__ = [
     "Discovery",
     "Durability",
     "ErrorCode",
+    "GiveUp",
+    "LossCause",
     "OrderingMode",
     "OutboxFull",
+    "PeerEventKind",
     "ProducerNaming",
 ]

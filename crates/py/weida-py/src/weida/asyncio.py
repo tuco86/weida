@@ -4,11 +4,12 @@ wait goes through a readiness descriptor watched by the running loop;
 cancelling a coroutine cancels its operation. The value classes are
 `weida`'s own."""
 
-from typing import Any, Coroutine, Optional, Tuple
+from typing import Any, AsyncIterator, Coroutine, Optional, Tuple
 
 from weida import _sync
 from weida._enums import ErrorCode
 from weida._native import ffi, lib
+from weida._stats import PeerEvent
 from weida._sync import _op_async
 from weida._values import Message, ServerTls, TransferMeta
 from weida._wait import call_async
@@ -19,6 +20,7 @@ __all__ = [
     "IncomingTransfer",
     "Listener",
     "OutgoingTransfer",
+    "PeerEvents",
     "Replier",
     "ReplyStream",
     "Requester",
@@ -228,6 +230,21 @@ class Delivery(_sync.Delivery):
         )
 
 
+class PeerEvents(_sync.PeerEvents):
+    __iter__ = None  # type: ignore[assignment]  # `async for` only
+
+    async def recv(self) -> Optional[PeerEvent]:  # type: ignore[override]
+        """The next event, or `None` once the requester is gone."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._event(out[0])
+
+    async def __aiter__(self) -> AsyncIterator[PeerEvent]:
+        """Every event until the requester is gone."""
+        while (event := await self.recv()) is not None:
+            yield event
+
+
 Runtime._Listener = Listener
 Runtime._Requester = Requester
 Listener._Replier = Replier
@@ -239,3 +256,4 @@ OutgoingTransfer._Delivery = Delivery
 Requester._OutgoingTransfer = OutgoingTransfer
 Requester._ReplyStream = ReplyStream
 ReplyStream._IncomingTransfer = IncomingTransfer
+Requester._PeerEvents = PeerEvents

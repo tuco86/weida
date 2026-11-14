@@ -175,3 +175,18 @@ def test_ctrl_c_ends_a_blocked_accept(inproc):
         timer.cancel()
     with pytest.raises(weida.Again):
         inproc.replier.accept(timeout=0)
+
+
+def test_a_quic_connection_reports_its_transport(bus, server_identity):
+    pair = Pair("quic", bus, server_identity)
+    try:
+        server = serve(pair.replier, lambda body: b"pong")
+        pair.requester.request(b"ping", WAIT).collect(64, WAIT)
+        server.join(WAIT)
+        (record,) = pair.requester.connection_stats()
+        assert record.transport is not None
+        assert record.transport.path.sent_packets > 0
+        assert record.transport.tx.datagrams > 0
+        assert record.transport.path.current_mtu >= 1200
+    finally:
+        pair.close()

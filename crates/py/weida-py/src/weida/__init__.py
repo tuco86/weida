@@ -15,8 +15,11 @@ from weida._enums import (
     Discovery,
     Durability,
     ErrorCode,
+    GiveUp,
+    LossCause,
     OrderingMode,
     OutboxFull,
+    PeerEventKind,
     ProducerNaming,
 )
 from weida._errors import (
@@ -54,6 +57,14 @@ from weida._errors import (
 from weida._errors import check as _check
 from weida._native import ffi as _ffi
 from weida._native import lib as _lib
+from weida._stats import (
+    ConnectionStats,
+    PathStats,
+    PeerEvent,
+    RemoteStats,
+    TransportStats,
+    UdpCounts,
+)
 from weida._sync import (
     Binding,
     Delivery,
@@ -62,6 +73,7 @@ from weida._sync import (
     Listener,
     LocalBinding,
     OutgoingTransfer,
+    PeerEvents,
     Replier,
     ReplyStream,
     Requester,
@@ -110,16 +122,22 @@ __all__ = [
     # Values.
     "ANY_KEY",
     "ClientTls",
+    "ConnectionStats",
     "GuaranteeSet",
     "Identity",
     "IncomingMeta",
     "Limits",
     "Message",
+    "PathStats",
+    "PeerEvent",
     "ReconnectPolicy",
+    "RemoteStats",
     "RuntimeConfig",
     "ServerTls",
     "TransferMeta",
+    "TransportStats",
     "Trust",
+    "UdpCounts",
     # Enumerations.
     "Acknowledgement",
     "Backpressure",
@@ -129,8 +147,11 @@ __all__ = [
     "Discovery",
     "Durability",
     "ErrorCode",
+    "GiveUp",
+    "LossCause",
     "OrderingMode",
     "OutboxFull",
+    "PeerEventKind",
     "ProducerNaming",
     "DEFAULT_DATAGRAM_RECEIVE_BYTES",
     # Handles.
@@ -141,6 +162,7 @@ __all__ = [
     "Listener",
     "LocalBinding",
     "OutgoingTransfer",
+    "PeerEvents",
     "Replier",
     "ReplyStream",
     "Requester",

@@ -4,11 +4,12 @@ takes `timeout` in seconds (`None` waits forever) and raises `Again` when
 it passes."""
 
 import time
-from typing import Callable, Optional, Tuple
+from typing import Callable, Iterator, Optional, Tuple
 
 from weida._enums import ErrorCode
 from weida._errors import check
 from weida._native import ffi, lib
+from weida._stats import ConnectionStats, PeerEvent, _take_connection_stats
 from weida._values import (
     ClientTls,
     IncomingMeta,
@@ -117,6 +118,16 @@ class Runtime(_Handle):
         out = ffi.new("weida_requester **")
         check(lib.weida_runtime_requester(self._p(), tls._p(), out))
         return self._Requester(out[0], lib.weida_requester_drop, self)
+
+    def suppressed_duplicates(self) -> int:
+        """Duplicates discarded inside a negotiated deduplication window; 0
+        without deduplication."""
+        return lib.weida_runtime_suppressed_duplicates(self._p())
+
+    def expired_transfers(self) -> int:
+        """Outgoing transfers reset because their deadline passed, counted
+        apart from a cancel."""
+        return lib.weida_runtime_expired_transfers(self._p())
 
     def _start_shutdown(self):
         return _start(lib.weida_runtime_shutdown, "weida_runtime_shutdown_op", self._consume())
@@ -271,6 +282,22 @@ class Requester(_Handle):
         )
         return self._opened(ptrs)
 
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_requester_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def events(self) -> "PeerEvents":
+        """A new reader of this requester's peer events, from now on; each
+        call is an independent reader."""
+        out = ffi.new("weida_peer_events **")
+        check(lib.weida_requester_events(self._p(), out))
+        # No parent: the events end once the requester is gone, which
+        # holding it would prevent.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
 
 class ReplyStream(_Handle):
     """The reply half of an exchange `Requester.open` opened. Dropping it
@@ -335,6 +362,14 @@ class IncomingRequest(_Handle):
         out = ffi.new("weida_incoming_transfer **")
         check(lib.weida_incoming_request_take_body(self._p(), out))
         return self._IncomingTransfer(out[0], lib.weida_incoming_transfer_drop, self)
+
+    def connection(self) -> int:
+        """The number of the connection this request arrived on: equal for
+        one connection, never shared by two in this process. Not an
+        address."""
+        out = ffi.new("uint64_t *")
+        check(lib.weida_incoming_request_connection(self._p(), out))
+        return out[0]
 
     def _start_reply(self, meta: Optional[TransferMeta]):
         request = self._consume()
@@ -421,6 +456,14 @@ class IncomingTransfer(_Handle):
         out = ffi.new("weida_incoming_meta **")
         check(lib.weida_incoming_transfer_meta(self._p(), out))
         return IncomingMeta._take(out[0])
+
+    def connection(self) -> int:
+        """The number of the connection this transfer arrived on: equal for
+        one connection, never shared by two in this process. Not an
+        address."""
+        out = ffi.new("uint64_t *")
+        check(lib.weida_incoming_transfer_connection(self._p(), out))
+        return out[0]
 
     def _read_attempt(self, buffer):
         handle = self._p()
@@ -527,6 +570,36 @@ class Delivery(_Handle):
         _op_sync(op, lib.weida_delivery_delivered_op_wait, lib.weida_delivery_delivered_op_drop, timeout)
 
 
+class PeerEvents(_Handle):
+    """A reader of a requester's peer events, a queue (docs/libraries/weida-py.md
+    §1): `recv` returns the next `PeerEvent`, or `None` once the requester is
+    gone. A reader that fell more than 64 events behind gets one `MISSED`
+    event carrying how many it lost."""
+
+    _fd_of = lib.weida_peer_events_fd
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_peer_event **")
+        return out, lambda ms: lib.weida_peer_events_recv(handle, ms, out)
+
+    @staticmethod
+    def _event(ptr) -> Optional[PeerEvent]:
+        return None if ptr == ffi.NULL else PeerEvent._take(ptr)
+
+    def recv(self, timeout: Optional[float] = None) -> Optional[PeerEvent]:
+        """The next event, or `None` once the requester is gone."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._event(out[0])
+
+    def __iter__(self) -> Iterator[PeerEvent]:
+        """Every event until the requester is gone, each `recv` without a
+        timeout."""
+        while (event := self.recv()) is not None:
+            yield event
+
+
 # The classes a factory method hands out; `weida.asyncio` replaces them with
 # its own.
 Runtime._Listener = Listener
@@ -540,6 +613,7 @@ OutgoingTransfer._Delivery = Delivery
 Requester._OutgoingTransfer = OutgoingTransfer
 Requester._ReplyStream = ReplyStream
 ReplyStream._IncomingTransfer = IncomingTransfer
+Requester._PeerEvents = PeerEvents
 
 __all__ = [
     "Binding",
@@ -549,6 +623,7 @@ __all__ = [
     "Listener",
     "LocalBinding",
     "OutgoingTransfer",
+    "PeerEvents",
     "Replier",
     "ReplyStream",
     "Requester",

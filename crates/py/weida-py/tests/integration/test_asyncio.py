@@ -184,3 +184,32 @@ def test_an_opened_exchange_and_a_dropped_reply_stream_on_the_loop(bus):
         await runtime.shutdown()
 
     asyncio.run(main())
+
+
+def test_peer_events_iterate_with_async_for(bus):
+    async def main() -> None:
+        url = f"weida+inproc://{bus}/echo"
+        server = wa.Runtime.owned()
+        listener = server.listener()
+        binding = listener.bind_inproc(bus)
+        replier = listener.replier("/echo")
+        client = wa.Runtime.owned()
+        requester = client.requester(weida.ClientTls(weida.Trust()))
+        await requester.connect(url)
+        events = requester.events()
+        assert isinstance(events, wa.PeerEvents)
+        for handle in (replier, binding, listener):
+            handle.drop()
+        await server.shutdown()
+        kinds = []
+        async for event in events:
+            kinds.append(event.kind)
+            assert event.url == url
+            if event.kind is weida.PeerEventKind.RETRYING:
+                requester.drop()
+        # The loop ends because the dropped requester ends the queue.
+        assert kinds[:2] == [weida.PeerEventKind.LOST, weida.PeerEventKind.RETRYING]
+        events.drop()
+        await client.shutdown()
+
+    asyncio.run(main())
