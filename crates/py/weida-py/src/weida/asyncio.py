@@ -18,6 +18,7 @@ from weida._wait import call_async
 
 __all__ = [
     "Binding",
+    "BusMember",
     "Delivery",
     "FanOut",
     "IdentityEvents",
@@ -26,6 +27,7 @@ __all__ = [
     "IncomingTransfer",
     "Listener",
     "OutgoingTransfer",
+    "Paired",
     "PeerEvents",
     "Publisher",
     "Puller",
@@ -35,8 +37,11 @@ __all__ = [
     "Replier",
     "ReplyStream",
     "Requester",
+    "Respondent",
     "Runtime",
     "Subscriber",
+    "SurveyRun",
+    "Surveyor",
     "TrustSource",
     "WeakIdentitySource",
     "WeakTrustSource",
@@ -351,6 +356,154 @@ class Subscriber(_sync.Subscriber):
         return self._incoming(out[0])
 
 
+class Paired(_sync.Paired):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Dials `url`, once, as `weida.Paired.connect` does."""
+        await _op_async(
+            self._start_connect(url),
+            lib.weida_paired_connect_op_wait,
+            lib.weida_paired_connect_op_fd,
+            lib.weida_paired_connect_op_drop,
+        )
+
+    async def open(self, meta: Optional[TransferMeta] = None) -> "OutgoingTransfer":  # type: ignore[override]
+        """Opens a one-way transfer to the peer carrying `meta`, as
+        `weida.Paired.open` does. A cancelled open resets the transfer
+        `CANCELED`."""
+        ptr = await _op_async(
+            self._start_open(meta),
+            lib.weida_paired_open_op_wait,
+            lib.weida_paired_open_op_fd,
+            lib.weida_paired_open_op_drop,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    async def send(self, body) -> None:  # type: ignore[override]
+        """Sends `body` (any bytes-like) as one message; returns once it is
+        written or held in the outbox. A cancelled send drops its op."""
+        await _op_async(
+            self._start_send(body),
+            lib.weida_paired_send_op_wait,
+            lib.weida_paired_send_op_fd,
+            lib.weida_paired_send_op_drop,
+        )
+
+    async def send_with(self, meta: Optional[TransferMeta], body) -> None:  # type: ignore[override]
+        """`send` with `meta`, copied when the send starts."""
+        await _op_async(
+            self._start_send_with(meta, body),
+            lib.weida_paired_send_op_wait,
+            lib.weida_paired_send_op_fd,
+            lib.weida_paired_send_op_drop,
+        )
+
+    async def recv(self) -> "IncomingTransfer":  # type: ignore[override]
+        """The next transfer from the peer, as soon as its header arrives.
+        Raises `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._incoming(out[0])
+
+
+class Surveyor(_sync.Surveyor):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Dials the respondent at `url`, adding it to the set every survey
+        asks; the runtime redials it when the connection is lost."""
+        await _op_async(
+            self._start_connect(url),
+            lib.weida_surveyor_connect_op_wait,
+            lib.weida_surveyor_connect_op_fd,
+            lib.weida_surveyor_connect_op_drop,
+        )
+
+    async def survey(self, body, deadline: float) -> "SurveyRun":  # type: ignore[override]
+        """Asks every connected respondent `body`, as
+        `weida.Surveyor.survey` does. A cancelled survey aborts it."""
+        ptr = await _op_async(
+            self._start_survey(body, deadline),
+            lib.weida_surveyor_survey_op_wait,
+            lib.weida_surveyor_survey_op_fd,
+            lib.weida_surveyor_survey_op_drop,
+            "weida_survey_run **",
+        )
+        return self._run(ptr)
+
+    async def survey_with(  # type: ignore[override]
+        self, meta: Optional[TransferMeta], body, deadline: float
+    ) -> "SurveyRun":
+        """`survey` with `meta`, copied when the survey starts."""
+        ptr = await _op_async(
+            self._start_survey_with(meta, body, deadline),
+            lib.weida_surveyor_survey_op_wait,
+            lib.weida_surveyor_survey_op_fd,
+            lib.weida_surveyor_survey_op_drop,
+            "weida_survey_run **",
+        )
+        return self._run(ptr)
+
+
+class SurveyRun(_sync.SurveyRun):
+    async def next(self, max_bytes: int) -> Optional[bytes]:  # type: ignore[override]
+        """The next answer's bytes, or `None` once the run ended, as
+        `weida.SurveyRun.next` does; a cancelled `next` leaves its read in
+        flight for the next call (on the Windows Proactor loop it drops the
+        run, §4)."""
+        out, attempt = self._next_attempt(max_bytes)
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._answer(out[0])
+
+
+class Respondent(_sync.Respondent):
+    async def accept(self) -> "IncomingRequest":  # type: ignore[override]
+        """The next question, as soon as its header arrives: an
+        `IncomingRequest`, answered as a replier's is. Raises `NotConnected`
+        once the queue ended."""
+        out, attempt = self._accept_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._request(out[0])
+
+
+class BusMember(_sync.BusMember):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Joins the member at `url`; the runtime redials it when the
+        connection is lost."""
+        await _op_async(
+            self._start_connect(url),
+            lib.weida_bus_member_connect_op_wait,
+            lib.weida_bus_member_connect_op_fd,
+            lib.weida_bus_member_connect_op_drop,
+        )
+
+    async def send(self, body) -> int:  # type: ignore[override]
+        """Sends `body` to every member this one dialled, as
+        `weida.BusMember.send` does; returns how many it reached."""
+        return await _op_async(
+            self._start_send(body),
+            lib.weida_bus_member_send_op_wait,
+            lib.weida_bus_member_send_op_fd,
+            lib.weida_bus_member_send_op_drop,
+            "size_t *",
+        )
+
+    async def send_with(self, meta: Optional[TransferMeta], body) -> int:  # type: ignore[override]
+        """`send` with `meta`, copied when the send starts."""
+        return await _op_async(
+            self._start_send_with(meta, body),
+            lib.weida_bus_member_send_op_wait,
+            lib.weida_bus_member_send_op_fd,
+            lib.weida_bus_member_send_op_drop,
+            "size_t *",
+        )
+
+    async def recv(self) -> "IncomingTransfer":  # type: ignore[override]
+        """The next message from another member, as soon as its header
+        arrives. Raises `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._incoming(out[0])
+
+
 class Relay(_sync.Relay):
     async def accept(self) -> "RelayRequest":  # type: ignore[override]
         """The next registration or tunnel asking to be served. An anonymous
@@ -586,6 +739,17 @@ Puller._IncomingTransfer = IncomingTransfer
 Publisher._FanOut = FanOut
 Subscriber._IncomingTransfer = IncomingTransfer
 Subscriber._PeerEvents = PeerEvents
+Runtime._Paired = Paired
+Runtime._Surveyor = Surveyor
+Listener._Paired = Paired
+Listener._Respondent = Respondent
+Listener._BusMember = BusMember
+Paired._OutgoingTransfer = OutgoingTransfer
+Paired._IncomingTransfer = IncomingTransfer
+Paired._PeerEvents = PeerEvents
+Surveyor._SurveyRun = SurveyRun
+Respondent._IncomingRequest = IncomingRequest
+BusMember._IncomingTransfer = IncomingTransfer
 IdentitySource._Weak = WeakIdentitySource
 WeakIdentitySource._Strong = IdentitySource
 TrustSource._Weak = WeakTrustSource

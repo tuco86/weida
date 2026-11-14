@@ -203,3 +203,94 @@ def test_a_fan_out_streams_one_payload_to_every_subscriber():
     assert copy.meta().topic == "px.frame"
     assert copy.collect(1024, WAIT).payload == b"abcdef"
     p.close()
+
+
+def test_a_pair_exchanges_in_both_directions():
+    server = weida.Runtime.owned()
+    client = weida.Runtime.owned()
+    name, listener, binding = bound(server)
+    url = f"weida+inproc://{name}/link"
+    near = listener.pair("/link")
+    assert near.path() == "/link"
+    with pytest.raises(weida.Unsupported):
+        near.connect(url, WAIT)
+    assert near.events() is None
+    far = client.pair(client_tls())
+    assert far.path() == ""
+    far.connect(url, WAIT)
+    with pytest.raises(weida.LimitExceeded):
+        far.connect(url, WAIT)
+    assert far.peer_count() == 1
+
+    far.send(b"ping", WAIT)
+    assert near.recv(WAIT).collect(1024, WAIT).payload == b"ping"
+    near.send_with(weida.TransferMeta("text/plain"), b"pong", WAIT)
+    pong = far.recv(WAIT)
+    assert pong.meta().content_type == "text/plain"
+    assert pong.collect(1024, WAIT).payload == b"pong"
+    assert far.dropped() == 0
+
+    for handle in (far, near, binding, listener):
+        handle.drop()
+    client.shutdown(WAIT)
+    server.shutdown(WAIT)
+
+
+def test_a_survey_collects_two_respondents_answers_within_its_window():
+    server = weida.Runtime.owned()
+    client = weida.Runtime.owned()
+    ats = [bound(server), bound(server)]
+    respondents = [listener.respondent("/poll") for _, listener, _ in ats]
+    surveyor = client.surveyor(client_tls())
+    for name, _, _ in ats:
+        surveyor.connect(f"weida+inproc://{name}/poll", WAIT)
+    assert surveyor.peer_count() == 2
+
+    # The survey returns once both are asked; the answers wait in the run.
+    run = surveyor.survey(b"who is there", 60.0, WAIT)
+    for respondent, answer in zip(respondents, (b"a", b"b")):
+        request = respondent.accept(WAIT)
+        assert request.take_body().collect(1024, WAIT).payload == b"who is there"
+        reply = request.reply(None, WAIT)
+        reply.write_all(answer, WAIT)
+        reply.finish().delivered(WAIT)
+    assert run.respondents() == 2
+    assert sorted([run.next(1024, WAIT), run.next(1024, WAIT)]) == [b"a", b"b"]
+    assert run.next(1024, WAIT) is None
+    assert run.late() == 0
+
+    for handle in (run, surveyor, *respondents):
+        handle.drop()
+    for _, listener, binding in ats:
+        binding.drop()
+        listener.drop()
+    client.shutdown(WAIT)
+    server.shutdown(WAIT)
+
+
+def test_a_bus_message_reaches_every_other_member():
+    runtimes = [weida.Runtime.owned() for _ in range(3)]
+    ats = [bound(runtime) for runtime in runtimes]
+    members = [listener.bus("/bus", client_tls()) for _, listener, _ in ats]
+    for i, member in enumerate(members):
+        for j, (name, _, _) in enumerate(ats):
+            if j != i:
+                member.connect(f"weida+inproc://{name}/bus", WAIT)
+
+    for i, member in enumerate(members):
+        assert member.send(f"from {i}".encode(), WAIT) == 2
+    for i, member in enumerate(members):
+        seen = sorted(member.recv(WAIT).collect(1024, WAIT).payload for _ in range(2))
+        assert seen == [f"from {j}".encode() for j in range(3) if j != i]
+    for member in members:
+        with pytest.raises(weida.Again):
+            member.recv(0.1)
+        assert member.dropped() == 0
+
+    for member in members:
+        member.drop()
+    for _, listener, binding in ats:
+        binding.drop()
+        listener.drop()
+    for runtime in runtimes:
+        runtime.shutdown(WAIT)

@@ -70,6 +70,7 @@ from weida._stats import (
 )
 from weida._sync import (
     Binding,
+    BusMember,
     Delivery,
     FanOut,
     Handoff,
@@ -79,6 +80,7 @@ from weida._sync import (
     Listener,
     LocalBinding,
     OutgoingTransfer,
+    Paired,
     PeerEvents,
     PipeBinding,
     Publisher,
@@ -89,8 +91,11 @@ from weida._sync import (
     Replier,
     ReplyStream,
     Requester,
+    Respondent,
     Runtime,
     Subscriber,
+    SurveyRun,
+    Surveyor,
     UnixBinding,
 )
 from weida._values import (
@@ -193,6 +198,7 @@ __all__ = [
     "DEFAULT_DATAGRAM_RECEIVE_BYTES",
     # Handles.
     "Binding",
+    "BusMember",
     "Delivery",
     "FanOut",
     "Handoff",
@@ -202,6 +208,7 @@ __all__ = [
     "Listener",
     "LocalBinding",
     "OutgoingTransfer",
+    "Paired",
     "PeerEvents",
     "PipeBinding",
     "Publisher",
@@ -212,8 +219,11 @@ __all__ = [
     "Replier",
     "ReplyStream",
     "Requester",
+    "Respondent",
     "Runtime",
     "Subscriber",
+    "SurveyRun",
+    "Surveyor",
     "UnixBinding",
     # Errors.
     "WeidaError",

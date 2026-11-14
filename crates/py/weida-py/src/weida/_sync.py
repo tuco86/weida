@@ -102,6 +102,15 @@ async def _op_async(op, wait: Callable, fd_of: Callable, drop: Callable, out_typ
         drop_once()
 
 
+def _deadline_ms(deadline) -> int:
+    """`deadline` seconds as C's `uint64_t` milliseconds, converted before
+    anything starts so a bad one raises first."""
+    ms = _millis("deadline", deadline)
+    if ms > _U64_MAX:
+        raise ValueError("deadline must be below 2**64 milliseconds")
+    return ms
+
+
 class Runtime(_Handle):
     """A weida runtime on a reactor of its own."""
 
@@ -166,6 +175,18 @@ class Runtime(_Handle):
         check(lib.weida_runtime_subscriber(self._p(), tls._p(), out))
         return self._Subscriber(out[0], lib.weida_subscriber_drop, self)
 
+    def pair(self, tls: ClientTls) -> "Paired":
+        """A dialling pair: it dials its one peer on `tls`'s terms."""
+        out = ffi.new("weida_paired **")
+        check(lib.weida_runtime_pair(self._p(), tls._p(), out))
+        return self._Paired(out[0], lib.weida_paired_drop, self)
+
+    def surveyor(self, tls: ClientTls) -> "Surveyor":
+        """A surveyor: it dials respondents on `tls`'s terms."""
+        out = ffi.new("weida_surveyor **")
+        check(lib.weida_runtime_surveyor(self._p(), tls._p(), out))
+        return self._Surveyor(out[0], lib.weida_surveyor_drop, self)
+
     def suppressed_duplicates(self) -> int:
         """Duplicates discarded inside a negotiated deduplication window; 0
         without deduplication."""
@@ -188,9 +209,7 @@ class Runtime(_Handle):
     def _start_drain(self, deadline: float):
         # Converted before the runtime is consumed: a deadline out of range
         # raises here and leaves the runtime usable.
-        ms = _millis("deadline", deadline)
-        if ms > _U64_MAX:
-            raise ValueError("deadline must be below 2**64 milliseconds")
+        ms = _deadline_ms(deadline)
         return _start(lib.weida_runtime_drain, "weida_runtime_drain_op", self._consume(), ms)
 
     def drain(self, deadline: float, timeout: Optional[float] = None) -> Drained:
@@ -286,6 +305,29 @@ class Listener(_Handle):
         out = ffi.new("weida_publisher **")
         check(lib.weida_listener_publisher(self._p(), path.encode(), out))
         return self._Publisher(out[0], lib.weida_publisher_drop, self)
+
+    def pair(self, path: str) -> "Paired":
+        """Registers a bound pair at the endpoint path `path`: it is
+        dialled, and its first send or open waits until its peer has sent. A
+        dropped pair leaves its path registered."""
+        out = ffi.new("weida_paired **")
+        check(lib.weida_listener_pair(self._p(), path.encode(), out))
+        return self._Paired(out[0], lib.weida_paired_drop, self)
+
+    def respondent(self, path: str) -> "Respondent":
+        """Registers a respondent at the endpoint path `path`; a dropped
+        respondent leaves its path registered."""
+        out = ffi.new("weida_respondent **")
+        check(lib.weida_listener_respondent(self._p(), path.encode(), out))
+        return self._Respondent(out[0], lib.weida_respondent_drop, self)
+
+    def bus(self, path: str, tls: ClientTls) -> "BusMember":
+        """Registers a bus member at the endpoint path `path` that dials the
+        other members on `tls`'s terms; a dropped member leaves its path
+        registered."""
+        out = ffi.new("weida_bus_member **")
+        check(lib.weida_listener_bus(self._p(), path.encode(), tls._p(), out))
+        return self._BusMember(out[0], lib.weida_bus_member_drop, self)
 
     def _start_bind_quic_socket(self, socket: int, tls: ServerTls):
         # Checked before C takes the descriptor: a range error leaves it the
@@ -950,6 +992,342 @@ class Subscriber(_Handle):
         return self._incoming(out[0])
 
 
+class Paired(_Handle):
+    """Either half of PAIR: one peer, one-way transfers both ways. A
+    dialling pair (`Runtime.pair`) dials its peer; a bound one
+    (`Listener.pair`) is dialled, and its first send or open waits until the
+    peer has sent."""
+
+    _fd_of = lib.weida_paired_fd
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_paired_connect, "weida_paired_connect_op", self._p(), url.encode())
+
+    def _start_open(self, meta: Optional[TransferMeta]):
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(lib.weida_paired_open, "weida_paired_open_op", self._p(), h),
+        )
+
+    def _start_send(self, body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _start(lib.weida_paired_send, "weida_paired_send_op", self._p(), data, len(data))
+
+    def _start_send_with(self, meta: Optional[TransferMeta], body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(
+                lib.weida_paired_send_with, "weida_paired_send_op", self._p(), h, data, len(data)
+            ),
+        )
+
+    def _outgoing(self, ptr) -> "OutgoingTransfer":
+        return self._OutgoingTransfer(ptr, lib.weida_outgoing_transfer_drop, self)
+
+    def path(self) -> str:
+        """The bound pair's path; `""` on a dialling pair."""
+        return _text(lib.weida_paired_path, self._p())
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Dials `url`, once: a pair has one peer, and the runtime redials it
+        when the connection is lost. A second address raises
+        `LimitExceeded`, and a bound pair raises `Unsupported`."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_paired_connect_op_wait, lib.weida_paired_connect_op_drop, timeout)
+
+    def peer_count(self) -> int:
+        """The connected peers, 0 or 1; 0 on a bound pair."""
+        return lib.weida_paired_peer_count(self._p())
+
+    def dropped(self) -> int:
+        """The bodies a dialling pair's outbox discarded."""
+        return lib.weida_paired_dropped(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none, and so has a bound pair. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_paired_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def events(self) -> Optional["PeerEvents"]:
+        """A new reader of a dialling pair's peer events, from now on, or
+        `None` on a bound pair, which dials nothing; each call is an
+        independent reader."""
+        out = ffi.new("weida_peer_events **")
+        if check(lib.weida_paired_events(self._p(), out)) == 0:
+            return None
+        # No parent, as Pusher.events: the events end once the pair is gone,
+        # which holding it would prevent.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
+    def open(self, meta: Optional[TransferMeta] = None, timeout: Optional[float] = None) -> "OutgoingTransfer":
+        """Opens a one-way transfer to the peer carrying `meta` (copied when
+        it starts), written like a socket; its `finish()` hands back the
+        delivery receipt `send` discards. A wait cut short resets the
+        transfer `CANCELED`."""
+        op = self._start_open(meta)
+        ptr = _op_sync(
+            op,
+            lib.weida_paired_open_op_wait,
+            lib.weida_paired_open_op_drop,
+            timeout,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    def send(self, body, timeout: Optional[float] = None) -> None:
+        """Sends `body` (any bytes-like) as one message; returns once it is
+        written or held in the outbox."""
+        op = self._start_send(body)
+        _op_sync(op, lib.weida_paired_send_op_wait, lib.weida_paired_send_op_drop, timeout)
+
+    def send_with(self, meta: Optional[TransferMeta], body, timeout: Optional[float] = None) -> None:
+        """`send` with `meta`, copied when the send starts."""
+        op = self._start_send_with(meta, body)
+        _op_sync(op, lib.weida_paired_send_op_wait, lib.weida_paired_send_op_drop, timeout)
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_incoming_transfer **")
+        return out, lambda ms: lib.weida_paired_recv(handle, ms, out)
+
+    def _incoming(self, ptr) -> "IncomingTransfer":
+        return self._IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
+
+    def recv(self, timeout: Optional[float] = None) -> "IncomingTransfer":
+        """The next transfer from the peer, as soon as its header arrives.
+        Raises `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._incoming(out[0])
+
+
+class Surveyor(_Handle):
+    """The asking half of SURVEY: dials respondents and asks every one of
+    them."""
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_surveyor_connect, "weida_surveyor_connect_op", self._p(), url.encode())
+
+    def _start_survey(self, body, deadline: float):
+        ms = _deadline_ms(deadline)
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _start(lib.weida_surveyor_survey, "weida_surveyor_survey_op", self._p(), data, len(data), ms)
+
+    def _start_survey_with(self, meta: Optional[TransferMeta], body, deadline: float):
+        ms = _deadline_ms(deadline)
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(
+                lib.weida_surveyor_survey_with, "weida_surveyor_survey_op", self._p(), h, data, len(data), ms
+            ),
+        )
+
+    def _run(self, ptr) -> "SurveyRun":
+        return self._SurveyRun(ptr, lib.weida_survey_run_drop, self)
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Dials the respondent at `url`, adding it to the set every survey
+        asks; the runtime redials it when the connection is lost."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_surveyor_connect_op_wait, lib.weida_surveyor_connect_op_drop, timeout)
+
+    def peer_count(self) -> int:
+        """The connected respondents."""
+        return lib.weida_surveyor_peer_count(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_surveyor_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def survey(self, body, deadline: float, timeout: Optional[float] = None) -> "SurveyRun":
+        """Asks every connected respondent `body` (any bytes-like) and
+        collects their answers for `deadline` seconds, which bounds the
+        asking too; returns the run once every respondent was asked. A
+        survey with no respondents is an empty run. A `deadline` that is not
+        a number is a `TypeError`, a negative or non-finite one a
+        `ValueError`, and one the clock cannot add `InvalidArgument`. A wait
+        cut short by `timeout` aborts the survey."""
+        op = self._start_survey(body, deadline)
+        ptr = _op_sync(
+            op,
+            lib.weida_surveyor_survey_op_wait,
+            lib.weida_surveyor_survey_op_drop,
+            timeout,
+            "weida_survey_run **",
+        )
+        return self._run(ptr)
+
+    def survey_with(
+        self, meta: Optional[TransferMeta], body, deadline: float, timeout: Optional[float] = None
+    ) -> "SurveyRun":
+        """`survey` with `meta`, copied when the survey starts."""
+        op = self._start_survey_with(meta, body, deadline)
+        ptr = _op_sync(
+            op,
+            lib.weida_surveyor_survey_op_wait,
+            lib.weida_surveyor_survey_op_drop,
+            timeout,
+            "weida_survey_run **",
+        )
+        return self._run(ptr)
+
+
+class SurveyRun(_Handle):
+    """One survey in progress: its answers, and what the deadline cost.
+    Dropping it resets every exchange not yet answered."""
+
+    _fd_of = lib.weida_survey_run_fd
+
+    def _next_attempt(self, max_bytes: int):
+        handle = self._p()
+        out = ffi.new("weida_survey_answer **")
+        return out, lambda ms: lib.weida_survey_run_next(handle, max_bytes, ms, out)
+
+    @staticmethod
+    def _answer(ptr) -> Optional[bytes]:
+        if ptr == ffi.NULL:
+            return None
+        try:
+            length = lib.weida_survey_answer_len(ptr)
+            if length == 0:
+                return b""
+            return ffi.buffer(lib.weida_survey_answer_data(ptr), length)[:]
+        finally:
+            lib.weida_survey_answer_drop(ptr)
+
+    def next(self, max_bytes: int, timeout: Optional[float] = None) -> Optional[bytes]:
+        """The next answer's bytes, at most `max_bytes` of them (a longer one
+        raises `TooLarge`), or `None` once the deadline passed or every
+        respondent answered; every later call returns `None` too. An answer
+        that failed raises its error and the run goes on. A `next` cut short
+        by `timeout` leaves its read in flight for the next call, which keeps
+        the first call's `max_bytes`."""
+        out, attempt = self._next_attempt(max_bytes)
+        call_sync(attempt, timeout)
+        return self._answer(out[0])
+
+    def late(self) -> int:
+        """The answers that arrived after the deadline, dropped and
+        counted."""
+        return lib.weida_survey_run_late(self._p())
+
+    def respondents(self) -> int:
+        """How many respondents were asked."""
+        return lib.weida_survey_run_respondents(self._p())
+
+
+class Respondent(_Handle):
+    """The answering half of SURVEY, serving one endpoint path."""
+
+    _fd_of = lib.weida_respondent_fd
+
+    def path(self) -> str:
+        return _text(lib.weida_respondent_path, self._p())
+
+    def _accept_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_incoming_request **")
+        return out, lambda ms: lib.weida_respondent_accept(handle, ms, out)
+
+    def _request(self, ptr) -> "IncomingRequest":
+        return self._IncomingRequest(ptr, lib.weida_incoming_request_drop, self)
+
+    def accept(self, timeout: Optional[float] = None) -> "IncomingRequest":
+        """The next question, as soon as its header arrives: an
+        `IncomingRequest`, answered as a replier's is. Raises `NotConnected`
+        once the queue ended."""
+        out, attempt = self._accept_attempt()
+        call_sync(attempt, timeout)
+        return self._request(out[0])
+
+
+class BusMember(_Handle):
+    """One member of a BUS: accepts on its path and dials the other members;
+    a message goes to every member it dialled, never to itself, and nothing
+    is relayed."""
+
+    _fd_of = lib.weida_bus_member_fd
+
+    def path(self) -> str:
+        return _text(lib.weida_bus_member_path, self._p())
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_bus_member_connect, "weida_bus_member_connect_op", self._p(), url.encode())
+
+    def _start_send(self, body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _start(lib.weida_bus_member_send, "weida_bus_member_send_op", self._p(), data, len(data))
+
+    def _start_send_with(self, meta: Optional[TransferMeta], body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(
+                lib.weida_bus_member_send_with, "weida_bus_member_send_op", self._p(), h, data, len(data)
+            ),
+        )
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Joins the member at `url`; the runtime redials it when the
+        connection is lost."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_bus_member_connect_op_wait, lib.weida_bus_member_connect_op_drop, timeout)
+
+    def peer_count(self) -> int:
+        """The members this one joined."""
+        return lib.weida_bus_member_peer_count(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_bus_member_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def dropped(self) -> int:
+        """The copies that never reached a member."""
+        return lib.weida_bus_member_dropped(self._p())
+
+    def send(self, body, timeout: Optional[float] = None) -> int:
+        """Sends `body` (any bytes-like) to every member this one dialled;
+        returns how many it reached. A member that cannot take a copy loses
+        it, counted by `dropped()`. A body above
+        `Limits.subscriber_buffer_bytes` raises `LimitExceeded`."""
+        op = self._start_send(body)
+        return _op_sync(
+            op, lib.weida_bus_member_send_op_wait, lib.weida_bus_member_send_op_drop, timeout, "size_t *"
+        )
+
+    def send_with(self, meta: Optional[TransferMeta], body, timeout: Optional[float] = None) -> int:
+        """`send` with `meta`, copied when the send starts."""
+        op = self._start_send_with(meta, body)
+        return _op_sync(
+            op, lib.weida_bus_member_send_op_wait, lib.weida_bus_member_send_op_drop, timeout, "size_t *"
+        )
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_incoming_transfer **")
+        return out, lambda ms: lib.weida_bus_member_recv(handle, ms, out)
+
+    def _incoming(self, ptr) -> "IncomingTransfer":
+        return self._IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
+
+    def recv(self, timeout: Optional[float] = None) -> "IncomingTransfer":
+        """The next message from another member, as soon as its header
+        arrives. Raises `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._incoming(out[0])
+
+
 class ReplyStream(_Handle):
     """The reply half of an exchange `Requester.open` opened. Dropping it
     before `recv` tells the replier nobody is listening: its `canceled`
@@ -1301,11 +1679,11 @@ class Delivery(_Handle):
 
 
 class PeerEvents(_Handle):
-    """A reader of a dialler's peer events (a requester, pusher or
-    subscriber), a queue (docs/libraries/weida-py.md §1): `recv` returns the
-    next `PeerEvent`, or `None` once the dialler, or the relayed binding's
-    registration, is gone. A reader that fell more than 64 events behind
-    gets one `MISSED` event carrying how many it lost."""
+    """A reader of a dialler's peer events (a requester, pusher, subscriber
+    or dialling pair), a queue (docs/libraries/weida-py.md §1): `recv`
+    returns the next `PeerEvent`, or `None` once the dialler, or the relayed
+    binding's registration, is gone. A reader that fell more than 64 events
+    behind gets one `MISSED` event carrying how many it lost."""
 
     _fd_of = lib.weida_peer_events_fd
 
@@ -1393,9 +1771,21 @@ Puller._IncomingTransfer = IncomingTransfer
 Publisher._FanOut = FanOut
 Subscriber._IncomingTransfer = IncomingTransfer
 Subscriber._PeerEvents = PeerEvents
+Runtime._Paired = Paired
+Runtime._Surveyor = Surveyor
+Listener._Paired = Paired
+Listener._Respondent = Respondent
+Listener._BusMember = BusMember
+Paired._OutgoingTransfer = OutgoingTransfer
+Paired._IncomingTransfer = IncomingTransfer
+Paired._PeerEvents = PeerEvents
+Surveyor._SurveyRun = SurveyRun
+Respondent._IncomingRequest = IncomingRequest
+BusMember._IncomingTransfer = IncomingTransfer
 
 __all__ = [
     "Binding",
+    "BusMember",
     "Delivery",
     "FanOut",
     "Handoff",
@@ -1405,6 +1795,7 @@ __all__ = [
     "Listener",
     "LocalBinding",
     "OutgoingTransfer",
+    "Paired",
     "PeerEvents",
     "PipeBinding",
     "Publisher",
@@ -1415,7 +1806,10 @@ __all__ = [
     "Replier",
     "ReplyStream",
     "Requester",
+    "Respondent",
     "Runtime",
     "Subscriber",
+    "SurveyRun",
+    "Surveyor",
     "UnixBinding",
 ]

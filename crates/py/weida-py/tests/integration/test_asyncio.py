@@ -307,3 +307,58 @@ def test_push_pull_and_a_fan_out_on_the_loop(bus):
         await server.shutdown()
 
     asyncio.run(main())
+
+
+def test_pair_survey_and_bus_on_the_loop(bus):
+    async def main() -> None:
+        server = wa.Runtime.owned()
+        client = wa.Runtime.owned()
+        listener = server.listener()
+        binding = listener.bind_inproc(bus)
+        tls = weida.ClientTls(weida.Trust())
+
+        near = listener.pair("/link")
+        far = client.pair(tls)
+        assert isinstance(far, wa.Paired)
+        await far.connect(f"weida+inproc://{bus}/link")
+        await far.send(b"ping")
+        assert (await (await near.recv()).collect(64)).payload == b"ping"
+        out = await near.open(weida.TransferMeta("text/plain"))
+        await out.write_all(b"pong")
+        delivery = out.finish()
+        pong = await (await far.recv()).collect(64)
+        assert pong.payload == b"pong"
+        assert pong.meta.content_type == "text/plain"
+        await delivery.delivered()
+
+        respondent = listener.respondent("/poll")
+        surveyor = client.surveyor(tls)
+        await surveyor.connect(f"weida+inproc://{bus}/poll")
+
+        async def answer() -> None:
+            request = await respondent.accept()
+            assert (await request.take_body().collect(64)).payload == b"who is there"
+            reply = await request.reply()
+            await reply.write_all(b"here")
+            await reply.finish().delivered()
+
+        answering = asyncio.ensure_future(answer())
+        run = await surveyor.survey(b"who is there", 60.0)
+        assert isinstance(run, wa.SurveyRun)
+        await answering
+        assert await run.next(64) == b"here"
+        assert await run.next(64) is None
+
+        member = listener.bus("/bus", tls)
+        other_listener = client.listener()
+        other = other_listener.bus("/bus", tls)
+        await other.connect(f"weida+inproc://{bus}/bus")
+        assert await other.send(b"hello") == 1
+        assert (await (await member.recv()).collect(64)).payload == b"hello"
+
+        for handle in (other, other_listener, member, run, surveyor, respondent, far, near, binding, listener):
+            handle.drop()
+        await client.shutdown()
+        await server.shutdown()
+
+    asyncio.run(main())
