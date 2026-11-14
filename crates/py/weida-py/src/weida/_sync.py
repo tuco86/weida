@@ -21,12 +21,14 @@ from weida._values import (
     Message,
     RuntimeConfig,
     ServerTls,
+    TopicDrops,
     TransferMeta,
     TrustSource,
     _Handle,
     _count,
     _enum,
     _millis,
+    _take_topic_drops,
     _text,
     _with_transfer_meta,
 )
@@ -154,6 +156,16 @@ class Runtime(_Handle):
         check(lib.weida_runtime_requester(self._p(), tls._p(), out))
         return self._Requester(out[0], lib.weida_requester_drop, self)
 
+    def pusher(self, tls: ClientTls) -> "Pusher":
+        out = ffi.new("weida_pusher **")
+        check(lib.weida_runtime_pusher(self._p(), tls._p(), out))
+        return self._Pusher(out[0], lib.weida_pusher_drop, self)
+
+    def subscriber(self, tls: ClientTls) -> "Subscriber":
+        out = ffi.new("weida_subscriber **")
+        check(lib.weida_runtime_subscriber(self._p(), tls._p(), out))
+        return self._Subscriber(out[0], lib.weida_subscriber_drop, self)
+
     def suppressed_duplicates(self) -> int:
         """Duplicates discarded inside a negotiated deduplication window; 0
         without deduplication."""
@@ -261,6 +273,19 @@ class Listener(_Handle):
         out = ffi.new("weida_replier **")
         check(lib.weida_listener_replier(self._p(), path.encode(), out))
         return self._Replier(out[0], lib.weida_replier_drop, self)
+
+    def puller(self, path: str) -> "Puller":
+        """Registers a puller at the endpoint path `path`."""
+        out = ffi.new("weida_puller **")
+        check(lib.weida_listener_puller(self._p(), path.encode(), out))
+        return self._Puller(out[0], lib.weida_puller_drop, self)
+
+    def publisher(self, path: str) -> "Publisher":
+        """Registers a publisher at the endpoint path `path`; a dropped
+        publisher leaves its path registered."""
+        out = ffi.new("weida_publisher **")
+        check(lib.weida_listener_publisher(self._p(), path.encode(), out))
+        return self._Publisher(out[0], lib.weida_publisher_drop, self)
 
     def _start_bind_quic_socket(self, socket: int, tls: ServerTls):
         # Checked before C takes the descriptor: a range error leaves it the
@@ -575,6 +600,354 @@ class Requester(_Handle):
         # No parent: the events end once the requester is gone, which
         # holding it would prevent.
         return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
+
+class Pusher(_Handle):
+    """The sending half of Push/Pull: dials pullers and sends each message
+    to the next one, round-robin."""
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_pusher_connect, "weida_pusher_connect_op", self._p(), url.encode())
+
+    def _start_open(self, meta: Optional[TransferMeta]):
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(lib.weida_pusher_open, "weida_pusher_open_op", self._p(), h),
+        )
+
+    def _start_send(self, body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _start(lib.weida_pusher_send, "weida_pusher_send_op", self._p(), data, len(data))
+
+    def _start_send_with(self, meta: Optional[TransferMeta], body):
+        data = ffi.from_buffer("uint8_t[]", body)
+        return _with_transfer_meta(
+            meta,
+            lambda h: _start(
+                lib.weida_pusher_send_with, "weida_pusher_send_op", self._p(), h, data, len(data)
+            ),
+        )
+
+    def _outgoing(self, ptr) -> "OutgoingTransfer":
+        return self._OutgoingTransfer(ptr, lib.weida_outgoing_transfer_drop, self)
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Dials `url`; the runtime redials it when the connection is lost."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_pusher_connect_op_wait, lib.weida_pusher_connect_op_drop, timeout)
+
+    def disconnect(self, url: str) -> bool:
+        """Forgets a dialled address, closing its connection: whether it was
+        dialled."""
+        return check(lib.weida_pusher_disconnect(self._p(), url.encode())) == 1
+
+    def peer_count(self) -> int:
+        return lib.weida_pusher_peer_count(self._p())
+
+    def dropped(self) -> int:
+        """The bodies the outbox discarded."""
+        return lib.weida_pusher_dropped(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_pusher_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def events(self) -> "PeerEvents":
+        """A new reader of this pusher's peer events, from now on; each call
+        is an independent reader."""
+        out = ffi.new("weida_peer_events **")
+        check(lib.weida_pusher_events(self._p(), out))
+        # No parent: the events end once the pusher is gone, which holding
+        # it would prevent.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
+    def open(self, meta: Optional[TransferMeta] = None, timeout: Optional[float] = None) -> "OutgoingTransfer":
+        """Opens a one-way transfer to the next peer carrying `meta` (copied
+        when it starts), written like a socket; its `finish()` hands back the
+        delivery receipt `send` discards. With every peer down it waits for
+        the redial."""
+        op = self._start_open(meta)
+        ptr = _op_sync(
+            op,
+            lib.weida_pusher_open_op_wait,
+            lib.weida_pusher_open_op_drop,
+            timeout,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    def send(self, body, timeout: Optional[float] = None) -> None:
+        """Sends `body` (any bytes-like) as one message; returns once it is
+        written or held in the outbox (a full outbox applies
+        `RuntimeConfig.outbox_full`)."""
+        op = self._start_send(body)
+        _op_sync(op, lib.weida_pusher_send_op_wait, lib.weida_pusher_send_op_drop, timeout)
+
+    def send_with(self, meta: Optional[TransferMeta], body, timeout: Optional[float] = None) -> None:
+        """`send` with `meta`, copied when the send starts."""
+        op = self._start_send_with(meta, body)
+        _op_sync(op, lib.weida_pusher_send_op_wait, lib.weida_pusher_send_op_drop, timeout)
+
+
+class Puller(_Handle):
+    """The receiving half of Push/Pull, serving one endpoint path."""
+
+    _fd_of = lib.weida_puller_fd
+
+    def path(self) -> str:
+        return _text(lib.weida_puller_path, self._p())
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_incoming_transfer **")
+        return out, lambda ms: lib.weida_puller_recv(handle, ms, out)
+
+    def _incoming(self, ptr) -> "IncomingTransfer":
+        return self._IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
+
+    def recv(self, timeout: Optional[float] = None) -> "IncomingTransfer":
+        """The next pushed transfer, as soon as its header arrives. A `recv`
+        cut short loses nothing: the take in flight stays in the puller.
+        Raises `NotConnected` once the runtime closed the endpoint."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._incoming(out[0])
+
+
+class Publisher(_Handle):
+    """The publishing half of Pub/Sub, serving one endpoint path: each
+    message goes to every subscriber whose filter matches its topic."""
+
+    def path(self) -> str:
+        return _text(lib.weida_publisher_path, self._p())
+
+    def publish(self, topic: str, payload) -> int:
+        """Fans `payload` (any bytes-like) out to every matching subscriber
+        without waiting on any; returns how many it was enqueued to. One
+        whose byte budget is exhausted loses this copy, counted by
+        `dropped()`. Raises `LimitExceeded` for a payload above
+        `Limits.subscriber_buffer_bytes` or a topic above 256 bytes."""
+        data = ffi.from_buffer("uint8_t[]", payload)
+        out = ffi.new("size_t *")
+        check(lib.weida_publisher_publish(self._p(), topic.encode(), data, len(data), out))
+        return out[0]
+
+    def publish_with_trace(self, topic: str, payload, trace: str) -> int:
+        """`publish` carrying the W3C traceparent `trace`; a malformed one
+        raises `InvalidArgument`."""
+        data = ffi.from_buffer("uint8_t[]", payload)
+        out = ffi.new("size_t *")
+        check(
+            lib.weida_publisher_publish_with_trace(
+                self._p(), topic.encode(), data, len(data), trace.encode(), out
+            )
+        )
+        return out[0]
+
+    def _fan_out(self, ptr) -> "FanOut":
+        return self._FanOut(ptr, lib.weida_fan_out_drop, self)
+
+    def open(self, topic: str) -> "FanOut":
+        """A streamed publish on `topic` to the subscribers matched now."""
+        out = ffi.new("weida_fan_out **")
+        check(lib.weida_publisher_open(self._p(), topic.encode(), out))
+        return self._fan_out(out[0])
+
+    def open_with_trace(self, topic: str, trace: str) -> "FanOut":
+        """`open` carrying the W3C traceparent `trace`; a malformed one
+        raises `InvalidArgument`."""
+        out = ffi.new("weida_fan_out **")
+        check(lib.weida_publisher_open_with_trace(self._p(), topic.encode(), trace.encode(), out))
+        return self._fan_out(out[0])
+
+    def subscriber_count(self) -> int:
+        return lib.weida_publisher_subscriber_count(self._p())
+
+    def filter_count(self) -> int:
+        return lib.weida_publisher_filter_count(self._p())
+
+    def dropped(self) -> int:
+        """The copies lost over every topic and cause."""
+        return lib.weida_publisher_dropped(self._p())
+
+    def dropped_on(self, topic: str) -> Optional[TopicDrops]:
+        """What was dropped on `topic`, a frozen record, or `None` when
+        nothing was."""
+        out = ffi.new("weida_topic_drops **")
+        check(lib.weida_publisher_dropped_on(self._p(), topic.encode(), out))
+        records = _take_topic_drops(out[0])
+        return records[0] if records else None
+
+    def drops(self) -> Tuple[TopicDrops, ...]:
+        """One frozen record per topic that lost a copy, at most
+        `Limits.max_sequence_scopes` topics."""
+        out = ffi.new("weida_topic_drops **")
+        check(lib.weida_publisher_drops(self._p(), out))
+        return _take_topic_drops(out[0])
+
+
+class FanOut(_Handle):
+    """A publish in progress: one payload written chunk by chunk, one stream
+    per subscriber matched at the open. Dropping it without `finish()`
+    aborts every copy, so no subscriber mistakes a partial payload for a
+    whole one."""
+
+    def topic(self) -> str:
+        return _text(lib.weida_fan_out_topic, self._p())
+
+    def subscribers(self) -> int:
+        """The subscribers still receiving."""
+        out = ffi.new("size_t *")
+        check(lib.weida_fan_out_subscribers(self._p(), out))
+        return out[0]
+
+    def _start_write_within(self, chunk, limit: float):
+        ms = _millis("limit", limit)
+        if ms > _U64_MAX:
+            raise ValueError("limit must be below 2**64 milliseconds")
+        data = ffi.from_buffer("uint8_t[]", chunk)
+        return _start(
+            lib.weida_fan_out_write_within,
+            "weida_fan_out_write_within_op",
+            self._p(),
+            data,
+            len(data),
+            ms,
+        )
+
+    def write_within(self, chunk, limit: float, timeout: Optional[float] = None) -> int:
+        """Writes `chunk` to every subscriber still receiving, waiting up to
+        `limit` seconds for all of those with no room together; one that
+        frees none in time loses the transfer. Returns the subscribers left.
+        While it runs, every other call on the fan-out raises
+        `InvalidArgument`. A wait cut short by `timeout` abandons the
+        transfer: later writes raise `Canceled` and `finish()` returns 0,
+        aborting every copy."""
+        op = self._start_write_within(chunk, limit)
+        return _op_sync(
+            op,
+            lib.weida_fan_out_write_within_op_wait,
+            lib.weida_fan_out_write_within_op_drop,
+            timeout,
+            "size_t *",
+        )
+
+    def write_now(self, chunk) -> int:
+        """Writes `chunk` without waiting: a subscriber with no room right
+        now loses the transfer. Returns the subscribers left."""
+        data = ffi.from_buffer("uint8_t[]", chunk)
+        out = ffi.new("size_t *")
+        check(lib.weida_fan_out_write_now(self._p(), data, len(data), out))
+        return out[0]
+
+    def finish(self) -> int:
+        """Ends the payload: the subscribers that received all of it.
+        Consumes the fan-out."""
+        out = ffi.new("size_t *")
+        check(lib.weida_fan_out_finish(self._consume(), out))
+        return out[0]
+
+
+class Subscriber(_Handle):
+    """The subscribing half of Pub/Sub: dials publishers and receives the
+    copies whose topic its filters match. Two subscribers of one path on one
+    runtime collide (`AlreadyRegistered`): use one runtime per subscriber of
+    a path."""
+
+    _fd_of = lib.weida_subscriber_fd
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_subscriber_connect, "weida_subscriber_connect_op", self._p(), url.encode())
+
+    def _start_subscribe(self, filter: str):
+        return _start(
+            lib.weida_subscriber_subscribe, "weida_subscriber_subscribe_op", self._p(), filter.encode()
+        )
+
+    def _start_unsubscribe(self, filter: str):
+        return _start(
+            lib.weida_subscriber_unsubscribe, "weida_subscriber_unsubscribe_op", self._p(), filter.encode()
+        )
+
+    def _start_grant(self, filter: str, limit: int):
+        n = _count("limit", limit)
+        if n > _U64_MAX:
+            raise ValueError("limit must be below 2**64")
+        return _start(lib.weida_subscriber_grant, "weida_subscriber_grant_op", self._p(), filter.encode(), n)
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Dials `url` and subscribes there to every filter registered so
+        far; the runtime redials it, filters included."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_subscriber_connect_op_wait, lib.weida_subscriber_connect_op_drop, timeout)
+
+    def subscribe(self, filter: str, timeout: Optional[float] = None) -> None:
+        """Registers interest in every topic `filter` matches (PROTOCOL.md
+        §6.4: segments split on `.`, `*` one whole segment, a trailing `#`
+        any number; `""` and `#` match everything). Subscribing twice is
+        idempotent. A filter outside the grammar raises `Protocol`."""
+        op = self._start_subscribe(filter)
+        _op_sync(op, lib.weida_subscriber_subscribe_op_wait, lib.weida_subscriber_subscribe_op_drop, timeout)
+
+    def unsubscribe(self, filter: str, timeout: Optional[float] = None) -> None:
+        """Withdraws `filter`; an unknown one is ignored."""
+        op = self._start_unsubscribe(filter)
+        _op_sync(
+            op, lib.weida_subscriber_unsubscribe_op_wait, lib.weida_subscriber_unsubscribe_op_drop, timeout
+        )
+
+    def grant(self, filter: str, limit: int, timeout: Optional[float] = None) -> None:
+        """States how many messages this subscriber accepts in total on
+        `filter`, the credit a queue serving the path consults (absolute,
+        cumulative, never lowered). A `limit` that is not an `int` is a
+        `TypeError`, a negative one or one above 2**64 - 1 a `ValueError`."""
+        op = self._start_grant(filter, limit)
+        _op_sync(op, lib.weida_subscriber_grant_op_wait, lib.weida_subscriber_grant_op_drop, timeout)
+
+    def disconnect(self, url: str) -> bool:
+        """Forgets a dialled address, closing its connection: whether it was
+        dialled."""
+        return check(lib.weida_subscriber_disconnect(self._p(), url.encode())) == 1
+
+    def peer_count(self) -> int:
+        return lib.weida_subscriber_peer_count(self._p())
+
+    def filter_count(self) -> int:
+        return lib.weida_subscriber_filter_count(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_subscriber_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def events(self) -> "PeerEvents":
+        """A new reader of this subscriber's peer events, from now on; each
+        call is an independent reader."""
+        out = ffi.new("weida_peer_events **")
+        check(lib.weida_subscriber_events(self._p(), out))
+        # No parent: the events end once the subscriber is gone, which
+        # holding it would prevent.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
+    def _recv_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_incoming_transfer **")
+        return out, lambda ms: lib.weida_subscriber_recv(handle, ms, out)
+
+    def _incoming(self, ptr) -> "IncomingTransfer":
+        return self._IncomingTransfer(ptr, lib.weida_incoming_transfer_drop, self)
+
+    def recv(self, timeout: Optional[float] = None) -> "IncomingTransfer":
+        """The next published copy, as soon as its header arrives; its topic
+        is `meta().topic`. Raises `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        call_sync(attempt, timeout)
+        return self._incoming(out[0])
 
 
 class ReplyStream(_Handle):
@@ -928,10 +1301,11 @@ class Delivery(_Handle):
 
 
 class PeerEvents(_Handle):
-    """A reader of a requester's peer events, a queue (docs/libraries/weida-py.md
-§1): `recv` returns the next `PeerEvent`, or `None` once the requester, or
-    the relayed binding's registration, is gone. A reader that fell more
-    than 64 events behind gets one `MISSED` event carrying how many it lost."""
+    """A reader of a dialler's peer events (a requester, pusher or
+    subscriber), a queue (docs/libraries/weida-py.md §1): `recv` returns the
+    next `PeerEvent`, or `None` once the dialler, or the relayed binding's
+    registration, is gone. A reader that fell more than 64 events behind
+    gets one `MISSED` event carrying how many it lost."""
 
     _fd_of = lib.weida_peer_events_fd
 
@@ -945,14 +1319,14 @@ class PeerEvents(_Handle):
         return None if ptr == ffi.NULL else PeerEvent._take(ptr)
 
     def recv(self, timeout: Optional[float] = None) -> Optional[PeerEvent]:
-        """The next event, or `None` once the requester, or the relayed
+        """The next event, or `None` once the dialler, or the relayed
         binding's registration, is gone."""
         out, attempt = self._recv_attempt()
         call_sync(attempt, timeout)
         return self._event(out[0])
 
     def __iter__(self) -> Iterator[PeerEvent]:
-        """Every event until the requester is gone, each `recv` without a
+        """Every event until the dialler is gone, each `recv` without a
         timeout."""
         while (event := self.recv()) is not None:
             yield event
@@ -1009,10 +1383,21 @@ Relay._RelayRequest = RelayRequest
 Binding._PeerEvents = PeerEvents
 IdentitySource._IdentityEvents = IdentityEvents
 TrustSource._IdentityEvents = IdentityEvents
+Runtime._Pusher = Pusher
+Runtime._Subscriber = Subscriber
+Listener._Puller = Puller
+Listener._Publisher = Publisher
+Pusher._OutgoingTransfer = OutgoingTransfer
+Pusher._PeerEvents = PeerEvents
+Puller._IncomingTransfer = IncomingTransfer
+Publisher._FanOut = FanOut
+Subscriber._IncomingTransfer = IncomingTransfer
+Subscriber._PeerEvents = PeerEvents
 
 __all__ = [
     "Binding",
     "Delivery",
+    "FanOut",
     "Handoff",
     "IdentityEvents",
     "IncomingRequest",
@@ -1022,11 +1407,15 @@ __all__ = [
     "OutgoingTransfer",
     "PeerEvents",
     "PipeBinding",
+    "Publisher",
+    "Puller",
+    "Pusher",
     "Relay",
     "RelayRequest",
     "Replier",
     "ReplyStream",
     "Requester",
     "Runtime",
+    "Subscriber",
     "UnixBinding",
 ]

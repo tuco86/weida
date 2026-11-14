@@ -3,7 +3,8 @@ those methods as coroutines (the same arguments minus `timeout`). Every
 wait goes through a readiness descriptor watched by the running loop;
 cancelling a coroutine cancels its operation. The value classes are
 `weida`'s own, except the identity and trust sources, whose `events()`
-hands out a `weida.asyncio.IdentityEvents`."""
+hands out a `weida.asyncio.IdentityEvents`, and the publisher, whose
+`open()` hands out a `weida.asyncio.FanOut`."""
 
 from typing import Any, AsyncIterator, Coroutine, Optional, Tuple
 
@@ -18,6 +19,7 @@ from weida._wait import call_async
 __all__ = [
     "Binding",
     "Delivery",
+    "FanOut",
     "IdentityEvents",
     "IdentitySource",
     "IncomingRequest",
@@ -25,12 +27,16 @@ __all__ = [
     "Listener",
     "OutgoingTransfer",
     "PeerEvents",
+    "Publisher",
+    "Puller",
+    "Pusher",
     "Relay",
     "RelayRequest",
     "Replier",
     "ReplyStream",
     "Requester",
     "Runtime",
+    "Subscriber",
     "TrustSource",
     "WeakIdentitySource",
     "WeakTrustSource",
@@ -220,6 +226,129 @@ class Replier(_sync.Replier):
         out, attempt = self._accept_attempt()
         await call_async(self._waiters(), attempt, self.drop)
         return self._request(out[0])
+
+
+class Pusher(_sync.Pusher):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Dials `url`; the runtime redials it when the connection is lost."""
+        op = self._start_connect(url)
+        await _op_async(
+            op,
+            lib.weida_pusher_connect_op_wait,
+            lib.weida_pusher_connect_op_fd,
+            lib.weida_pusher_connect_op_drop,
+        )
+
+    async def open(self, meta: Optional[TransferMeta] = None) -> "OutgoingTransfer":  # type: ignore[override]
+        """Opens a one-way transfer to the next peer carrying `meta`, as
+        `weida.Pusher.open` does. A cancelled open resets the transfer
+        `CANCELED`."""
+        op = self._start_open(meta)
+        ptr = await _op_async(
+            op,
+            lib.weida_pusher_open_op_wait,
+            lib.weida_pusher_open_op_fd,
+            lib.weida_pusher_open_op_drop,
+            "weida_outgoing_transfer **",
+        )
+        return self._outgoing(ptr)
+
+    async def send(self, body) -> None:  # type: ignore[override]
+        """Sends `body` (any bytes-like) as one message; returns once it is
+        written or held in the outbox (a full outbox applies
+        `RuntimeConfig.outbox_full`). A cancelled send drops its op."""
+        op = self._start_send(body)
+        await _op_async(
+            op,
+            lib.weida_pusher_send_op_wait,
+            lib.weida_pusher_send_op_fd,
+            lib.weida_pusher_send_op_drop,
+        )
+
+    async def send_with(self, meta: Optional[TransferMeta], body) -> None:  # type: ignore[override]
+        """`send` with `meta`, copied when the send starts."""
+        op = self._start_send_with(meta, body)
+        await _op_async(
+            op,
+            lib.weida_pusher_send_op_wait,
+            lib.weida_pusher_send_op_fd,
+            lib.weida_pusher_send_op_drop,
+        )
+
+
+class Puller(_sync.Puller):
+    async def recv(self) -> "IncomingTransfer":  # type: ignore[override]
+        """The next pushed transfer, as soon as its header arrives. A `recv`
+        cancelled loses nothing: the take in flight stays in the puller."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._incoming(out[0])
+
+
+class Publisher(_sync.Publisher):
+    """`weida.Publisher` whose `open()` hands out a `weida.asyncio.FanOut`."""
+
+
+class FanOut(_sync.FanOut):
+    async def write_within(self, chunk, limit: float) -> int:  # type: ignore[override]
+        """Writes `chunk` to every subscriber still receiving, as
+        `weida.FanOut.write_within` does; cancelling it abandons the
+        transfer."""
+        return await _op_async(
+            self._start_write_within(chunk, limit),
+            lib.weida_fan_out_write_within_op_wait,
+            lib.weida_fan_out_write_within_op_fd,
+            lib.weida_fan_out_write_within_op_drop,
+            "size_t *",
+        )
+
+
+class Subscriber(_sync.Subscriber):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Dials `url` and subscribes there to every filter registered so
+        far; the runtime redials it, filters included."""
+        await _op_async(
+            self._start_connect(url),
+            lib.weida_subscriber_connect_op_wait,
+            lib.weida_subscriber_connect_op_fd,
+            lib.weida_subscriber_connect_op_drop,
+        )
+
+    async def subscribe(self, filter: str) -> None:  # type: ignore[override]
+        """Registers interest in every topic `filter` matches, as
+        `weida.Subscriber.subscribe` does."""
+        await _op_async(
+            self._start_subscribe(filter),
+            lib.weida_subscriber_subscribe_op_wait,
+            lib.weida_subscriber_subscribe_op_fd,
+            lib.weida_subscriber_subscribe_op_drop,
+        )
+
+    async def unsubscribe(self, filter: str) -> None:  # type: ignore[override]
+        """Withdraws `filter`; an unknown one is ignored."""
+        await _op_async(
+            self._start_unsubscribe(filter),
+            lib.weida_subscriber_unsubscribe_op_wait,
+            lib.weida_subscriber_unsubscribe_op_fd,
+            lib.weida_subscriber_unsubscribe_op_drop,
+        )
+
+    async def grant(self, filter: str, limit: int) -> None:  # type: ignore[override]
+        """States how many messages this subscriber accepts in total on
+        `filter`, as `weida.Subscriber.grant` does."""
+        await _op_async(
+            self._start_grant(filter, limit),
+            lib.weida_subscriber_grant_op_wait,
+            lib.weida_subscriber_grant_op_fd,
+            lib.weida_subscriber_grant_op_drop,
+        )
+
+    async def recv(self) -> "IncomingTransfer":  # type: ignore[override]
+        """The next published copy, as soon as its header arrives; its topic
+        is `meta().topic`. Raises `NotConnected` once the queue ended."""
+        out, attempt = self._recv_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._incoming(out[0])
 
 
 class Relay(_sync.Relay):
@@ -447,6 +576,16 @@ Relay._RelayRequest = RelayRequest
 Binding._PeerEvents = PeerEvents
 IdentitySource._IdentityEvents = IdentityEvents
 TrustSource._IdentityEvents = IdentityEvents
+Runtime._Pusher = Pusher
+Runtime._Subscriber = Subscriber
+Listener._Puller = Puller
+Listener._Publisher = Publisher
+Pusher._OutgoingTransfer = OutgoingTransfer
+Pusher._PeerEvents = PeerEvents
+Puller._IncomingTransfer = IncomingTransfer
+Publisher._FanOut = FanOut
+Subscriber._IncomingTransfer = IncomingTransfer
+Subscriber._PeerEvents = PeerEvents
 IdentitySource._Weak = WeakIdentitySource
 WeakIdentitySource._Strong = IdentitySource
 TrustSource._Weak = WeakTrustSource

@@ -262,3 +262,48 @@ def test_a_drain_on_the_loop_counts_a_reply_finished_before_it(bus):
         await client.shutdown()
 
     asyncio.run(main())
+
+
+def test_push_pull_and_a_fan_out_on_the_loop(bus):
+    async def main() -> None:
+        server = wa.Runtime.owned()
+        listener = server.listener()
+        binding = listener.bind_inproc(bus)
+        puller = listener.puller("/jobs")
+        publisher = listener.publisher("/md")
+        client = wa.Runtime.owned()
+        pusher = client.pusher(weida.ClientTls(weida.Trust()))
+        assert isinstance(pusher, wa.Pusher)
+        await pusher.connect(f"weida+inproc://{bus}/jobs")
+
+        await pusher.send(b"one")
+        assert (await (await puller.recv()).collect(64)).payload == b"one"
+        out = await pusher.open(weida.TransferMeta("text/plain"))
+        await out.write_all(b"two")
+        delivery = out.finish()
+        two = await (await puller.recv()).collect(64)
+        assert two.payload == b"two"
+        assert two.meta.content_type == "text/plain"
+        await delivery.delivered()
+
+        listening = wa.Runtime.owned()
+        subscriber = listening.subscriber(weida.ClientTls(weida.Trust()))
+        await subscriber.connect(f"weida+inproc://{bus}/md")
+        await subscriber.subscribe("px.#")
+        while publisher.filter_count() != 1:
+            await asyncio.sleep(0.001)
+        fan = publisher.open("px.frame")
+        assert isinstance(fan, wa.FanOut)
+        assert await fan.write_within(b"abc", 1.0) == 1
+        assert fan.finish() == 1
+        copy = await subscriber.recv()
+        assert copy.meta().topic == "px.frame"
+        assert (await copy.collect(64)).payload == b"abc"
+
+        for handle in (subscriber, pusher, puller, publisher, binding, listener):
+            handle.drop()
+        await listening.shutdown()
+        await client.shutdown()
+        await server.shutdown()
+
+    asyncio.run(main())

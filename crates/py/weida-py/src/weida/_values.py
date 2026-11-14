@@ -947,6 +947,16 @@ def _peer_local(ptr) -> Optional[Union[LocalPrincipal, WindowsPrincipal]]:
 
 
 @dataclass(frozen=True)
+class Gap:
+    """What went missing before a transfer under `PER_PRODUCER_DETECT`
+    (weida's `Gap`): `expected` is the sequence number expected next,
+    `seen` the one that arrived; `seen - expected` transfers are missing."""
+
+    expected: int
+    seen: int
+
+
+@dataclass(frozen=True)
 class IncomingMeta:
     """The metadata of an inbound transfer or request.
 
@@ -957,7 +967,10 @@ class IncomingMeta:
     `achieved`: the `Acknowledgement` the sender reports, or `None`.
     `peer_local`: the principal the kernel proved for a local peer, a
     `LocalPrincipal` for an `AF_UNIX` peer, a `WindowsPrincipal` for a
-    named-pipe peer, `None` for any other."""
+    named-pipe peer, `None` for any other.
+    `gap`: a `Gap` when the connection negotiated
+    `OrderingMode.PER_PRODUCER_DETECT` and a sequence number was skipped,
+    else `None`."""
 
     endpoint: Optional[str]
     content_type: Optional[str]
@@ -965,6 +978,7 @@ class IncomingMeta:
     peer_fingerprint: Optional[str]
     content_len: Optional[int]
     sequence: Optional[int]
+    gap: Optional[Gap]
     peer_chain: Optional[Tuple[bytes, ...]]
     peer_local: Optional[Union[LocalPrincipal, WindowsPrincipal]]
     trace: Optional[str]
@@ -993,6 +1007,14 @@ class IncomingMeta:
             level = ffi.new("int *")
             achieved = Acknowledgement(level[0]) if lib.weida_incoming_meta_achieved(ptr, level) == 1 else None
 
+            expected = ffi.new("uint64_t *")
+            seen = ffi.new("uint64_t *")
+            gap = (
+                Gap(expected=expected[0], seen=seen[0])
+                if lib.weida_incoming_meta_gap(ptr, expected, seen) == 1
+                else None
+            )
+
             return cls(
                 endpoint=_text(lib.weida_incoming_meta_endpoint, ptr),
                 content_type=_text(lib.weida_incoming_meta_content_type, ptr),
@@ -1000,6 +1022,7 @@ class IncomingMeta:
                 peer_fingerprint=_text(lib.weida_incoming_meta_peer_fingerprint, ptr),
                 content_len=optional(lib.weida_incoming_meta_content_len),
                 sequence=optional(lib.weida_incoming_meta_sequence),
+                gap=gap,
                 peer_chain=peer_chain,
                 peer_local=_peer_local(ptr),
                 trace=_text(lib.weida_incoming_meta_trace, ptr),
@@ -1049,3 +1072,49 @@ class Drained:
             )
         finally:
             lib.weida_drained_drop(ptr)
+
+
+@dataclass(frozen=True)
+class TopicDrops:
+    """What a publisher (or a radio) dropped on one topic, by cause, copied
+    out at once. `TopicDrops::total` is not mapped: sum the counts."""
+
+    topic: str
+    subscriber_budget: int
+    subscriber_queue: int
+    no_parked_connection: int
+    superseded: int
+    expired: int
+    too_large: int
+    no_datagrams: int
+    layers_cut: int
+
+
+_DROPS_COUNTS = (
+    ("subscriber_budget", lib.weida_topic_drops_subscriber_budget),
+    ("subscriber_queue", lib.weida_topic_drops_subscriber_queue),
+    ("no_parked_connection", lib.weida_topic_drops_no_parked_connection),
+    ("superseded", lib.weida_topic_drops_superseded),
+    ("expired", lib.weida_topic_drops_expired),
+    ("too_large", lib.weida_topic_drops_too_large),
+    ("no_datagrams", lib.weida_topic_drops_no_datagrams),
+    ("layers_cut", lib.weida_topic_drops_layers_cut),
+)
+
+
+def _take_topic_drops(ptr) -> Tuple[TopicDrops, ...]:
+    """Copies every record of a `weida_topic_drops` snapshot out and drops it."""
+    try:
+        number = ffi.new("uint64_t *")
+        length = ffi.new("size_t *")
+        records = []
+        for i in range(lib.weida_topic_drops_len(ptr)):
+            counts = {}
+            for name, getter in _DROPS_COUNTS:
+                getter(ptr, i, number)  # 1 for every index below len
+                counts[name] = number[0]
+            topic = lib.weida_topic_drops_topic(ptr, i, length)
+            records.append(TopicDrops(topic=ffi.unpack(topic, length[0]).decode("utf-8"), **counts))
+        return tuple(records)
+    finally:
+        lib.weida_topic_drops_drop(ptr)
