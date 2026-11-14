@@ -6,6 +6,7 @@ it passes."""
 import time
 from typing import Callable, Iterator, Optional, Tuple
 
+from weida._crypto import path as _fspath
 from weida._enums import ErrorCode
 from weida._errors import check
 from weida._native import ffi, lib
@@ -202,6 +203,30 @@ class Listener(_Handle):
         check(lib.weida_listener_bind_inproc(self._p(), bus.encode(), out))
         return LocalBinding(out[0], lib.weida_local_binding_drop, self)
 
+    def bind_unix(self, path) -> "UnixBinding":
+        """Serves the listener's endpoints on the `AF_UNIX` socket `path`
+        (`str`, `bytes` or `os.PathLike`; UTF-8), reached at
+        `weida+unix://<percent-encoded path>/<endpoint>`. No TLS: the kernel
+        proves the peer (`IncomingMeta.peer_local`). `path` must be in a
+        directory this process owns and no other user may write; a stale
+        socket file is replaced. Raises `Io` for a live listener on the path,
+        `InvalidAddress` for a path over the `sun_path` budget or something
+        at it that is not a socket, `InvalidArgument` for a path that is not
+        UTF-8, and `Unsupported` on Windows."""
+        out = ffi.new("weida_unix_binding **")
+        check(lib.weida_listener_bind_unix(self._p(), _fspath(path), out))
+        return UnixBinding(out[0], lib.weida_unix_binding_drop, self)
+
+    def bind_pipe(self, name: str) -> "PipeBinding":
+        r"""Binds the named pipe `\\.\pipe\<name>` owner-only and local-only,
+        only if the name does not exist yet, and serves the listener's
+        endpoints on it, reached at `weida+pipe://<name>/<endpoint>`. Raises
+        `InvalidAddress` for an invalid name or one that exists already, `Io`,
+        and `Unsupported` off Windows."""
+        out = ffi.new("weida_pipe_binding **")
+        check(lib.weida_listener_bind_pipe(self._p(), name.encode(), out))
+        return PipeBinding(out[0], lib.weida_pipe_binding_drop, self)
+
     def replier(self, path: str) -> "Replier":
         """Registers a replier at the endpoint path `path`."""
         out = ffi.new("weida_replier **")
@@ -367,6 +392,22 @@ class LocalBinding(_Handle):
 
     def bus(self) -> str:
         return _text(lib.weida_local_binding_bus, self._p())
+
+
+class UnixBinding(_Handle):
+    """An `AF_UNIX` binding. Dropping it ends the binding and removes the
+    socket file."""
+
+    def path(self) -> str:
+        return _text(lib.weida_unix_binding_path, self._p())
+
+
+class PipeBinding(_Handle):
+    """A named-pipe binding. Dropping it ends the binding and releases
+    the name."""
+
+    def name(self) -> str:
+        return _text(lib.weida_pipe_binding_name, self._p())
 
 
 class Handoff(_Handle):
@@ -917,10 +958,12 @@ __all__ = [
     "LocalBinding",
     "OutgoingTransfer",
     "PeerEvents",
+    "PipeBinding",
     "Relay",
     "RelayRequest",
     "Replier",
     "ReplyStream",
     "Requester",
     "Runtime",
+    "UnixBinding",
 ]

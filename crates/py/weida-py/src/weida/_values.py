@@ -6,7 +6,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 from weida._crypto import certificate_pem, key_pem, path
 from weida._enums import (
@@ -600,6 +600,41 @@ def _with_transfer_meta(meta: Optional[TransferMeta], use: Callable):
 
 
 @dataclass(frozen=True)
+class LocalPrincipal:
+    """The principal the kernel proved for an `AF_UNIX` peer at connect
+    time. `pid` is `None` where the platform reports none (macOS once the
+    peer closed); it is an observation only, never authorize on it."""
+
+    uid: int
+    gid: int
+    pid: Optional[int]
+
+
+@dataclass(frozen=True)
+class WindowsPrincipal:
+    """The account the kernel proved for a named-pipe peer: `sid` in its
+    string form (`S-1-...`). `pid` is `None` where the pipe reports none;
+    it is an observation only, never authorize on it."""
+
+    sid: str
+    pid: Optional[int]
+
+
+def _peer_local(ptr) -> Optional[Union[LocalPrincipal, WindowsPrincipal]]:
+    """The local principal of a live `weida_incoming_meta`, or `None` for
+    a peer that is not local (QUIC, in-process)."""
+    number = ffi.new("uint32_t *")
+    pid = number[0] if lib.weida_incoming_meta_peer_pid(ptr, number) == 1 else None
+    if lib.weida_incoming_meta_peer_uid(ptr, number) == 1:
+        uid = number[0]
+        # Set whenever the uid is: both come from one PeerIdentity::Local.
+        lib.weida_incoming_meta_peer_gid(ptr, number)
+        return LocalPrincipal(uid=uid, gid=number[0], pid=pid)
+    sid = _text(lib.weida_incoming_meta_peer_sid, ptr)
+    return None if sid is None else WindowsPrincipal(sid=sid, pid=pid)
+
+
+@dataclass(frozen=True)
 class IncomingMeta:
     """The metadata of an inbound transfer or request.
 
@@ -607,7 +642,10 @@ class IncomingMeta:
     for an anonymous or local peer, or a chain over the bound weida keeps.
     `trace`: the W3C traceparent the transfer carries, or `None`.
     `tracestate`: the W3C tracestate beside it, or `None`.
-    `achieved`: the `Acknowledgement` the sender reports, or `None`."""
+    `achieved`: the `Acknowledgement` the sender reports, or `None`.
+    `peer_local`: the principal the kernel proved for a local peer, a
+    `LocalPrincipal` for an `AF_UNIX` peer, a `WindowsPrincipal` for a
+    named-pipe peer, `None` for any other."""
 
     endpoint: Optional[str]
     content_type: Optional[str]
@@ -616,6 +654,7 @@ class IncomingMeta:
     content_len: Optional[int]
     sequence: Optional[int]
     peer_chain: Optional[Tuple[bytes, ...]]
+    peer_local: Optional[Union[LocalPrincipal, WindowsPrincipal]]
     trace: Optional[str]
     tracestate: Optional[str]
     achieved: Optional[Acknowledgement]
@@ -650,6 +689,7 @@ class IncomingMeta:
                 content_len=optional(lib.weida_incoming_meta_content_len),
                 sequence=optional(lib.weida_incoming_meta_sequence),
                 peer_chain=peer_chain,
+                peer_local=_peer_local(ptr),
                 trace=_text(lib.weida_incoming_meta_trace, ptr),
                 tracestate=_text(lib.weida_incoming_meta_tracestate, ptr),
                 achieved=achieved,

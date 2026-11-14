@@ -75,12 +75,14 @@ from weida._sync import (
     LocalBinding,
     OutgoingTransfer,
     PeerEvents,
+    PipeBinding,
     Relay,
     RelayRequest,
     Replier,
     ReplyStream,
     Requester,
     Runtime,
+    UnixBinding,
 )
 from weida._values import (
     ANY_KEY,
@@ -90,12 +92,14 @@ from weida._values import (
     Identity,
     IncomingMeta,
     Limits,
+    LocalPrincipal,
     Message,
     ReconnectPolicy,
     RuntimeConfig,
     ServerTls,
     TransferMeta,
     Trust,
+    WindowsPrincipal,
 )
 
 
@@ -132,6 +136,7 @@ __all__ = [
     "Identity",
     "IncomingMeta",
     "Limits",
+    "LocalPrincipal",
     "Message",
     "PathStats",
     "PeerEvent",
@@ -143,6 +148,7 @@ __all__ = [
     "TransportStats",
     "Trust",
     "UdpCounts",
+    "WindowsPrincipal",
     # Enumerations.
     "Acknowledgement",
     "Backpressure",
@@ -169,12 +175,14 @@ __all__ = [
     "LocalBinding",
     "OutgoingTransfer",
     "PeerEvents",
+    "PipeBinding",
     "Relay",
     "RelayRequest",
     "Replier",
     "ReplyStream",
     "Requester",
     "Runtime",
+    "UnixBinding",
     # Errors.
     "WeidaError",
     "AlreadyRegistered",

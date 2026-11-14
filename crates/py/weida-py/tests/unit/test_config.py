@@ -103,6 +103,7 @@ def test_metadata_travels_with_a_request_and_its_reply(pair, pool):
         assert meta.topic == "jobs"
         assert meta.trace == t
         assert meta.tracestate is None
+        assert meta.peer_local is None
         out = request.reply(weida.TransferMeta(achieved=weida.Acknowledgement.ACCEPTED), WAIT)
         out.set_priority(5)
         assert out.trace() == t, "a reply inherits the request's trace"
