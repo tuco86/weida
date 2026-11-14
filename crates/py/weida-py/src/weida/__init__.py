@@ -9,6 +9,7 @@ waits, and both share the value classes defined here.
 from weida._enums import (
     Acknowledgement,
     Alpn,
+    Ask,
     Backpressure,
     Congestion,
     Deduplication,
@@ -27,6 +28,7 @@ from weida._enums import (
     ReceivedKind,
     ReportMode,
 )
+from weida._blob import Bits, Blob, PieceList, TreeHasher, blob_id_of
 from weida._errors import (
     AlreadyRegistered,
     Again,
@@ -80,6 +82,7 @@ from weida._sync import (
     Delivery,
     Dish,
     FanOut,
+    Fetch,
     Flow,
     Handoff,
     IdentityEvents,
@@ -89,10 +92,12 @@ from weida._sync import (
     IncomingTransfer,
     Listener,
     LocalBinding,
+    Order,
     OutgoingTransfer,
     Paired,
     Peer,
     PeerEvents,
+    Piece,
     PipeBinding,
     Publisher,
     Puller,
@@ -107,10 +112,13 @@ from weida._sync import (
     Requester,
     Respondent,
     Runtime,
+    SeedSession,
+    Seeder,
     Segment,
     Subscriber,
     SurveyRun,
     Surveyor,
+    Swarm,
     UnixBinding,
 )
 from weida._values import (
@@ -174,10 +182,23 @@ MAX_SEGMENT_LAYERS: int = _lib.WEIDA_MAX_SEGMENT_LAYERS
 # weida's own, the `Acknowledgement` members.
 CURSOR_LEVEL_APPLICATION_FLOOR: int = _lib.WEIDA_CURSOR_LEVEL_APPLICATION_FLOOR
 
+# The bytes of a blob's root, its BLAKE3 hash.
+BLOB_ID_LEN: int = _lib.WEIDA_BLOB_ID_LEN
+
+# The most pieces a blob may have.
+MAX_PIECES: int = _lib.WEIDA_MAX_PIECES
+
+# The smallest, the largest and the default piece size, as a power of two.
+PIECE_SIZE_MIN_LOG2: int = _lib.WEIDA_PIECE_SIZE_MIN_LOG2
+PIECE_SIZE_MAX_LOG2: int = _lib.WEIDA_PIECE_SIZE_MAX_LOG2
+PIECE_SIZE_DEFAULT_LOG2: int = _lib.WEIDA_PIECE_SIZE_DEFAULT_LOG2
+
 
 __all__ = [
     # Values.
     "ANY_KEY",
+    "Bits",
+    "Blob",
     "ClientTls",
     "ConnectionStats",
     "CursorEntry",
@@ -198,8 +219,11 @@ __all__ = [
     "Lookup",
     "LocalPrincipal",
     "Message",
+    "Order",
     "PathStats",
     "PeerEvent",
+    "Piece",
+    "PieceList",
     "Received",
     "ReconnectPolicy",
     "RemoteStats",
@@ -209,6 +233,7 @@ __all__ = [
     "TransferMeta",
     "TransportStats",
     "Trust",
+    "TreeHasher",
     "TrustSource",
     "UdpCounts",
     "WeakIdentitySource",
@@ -217,6 +242,7 @@ __all__ = [
     # Enumerations.
     "Acknowledgement",
     "Alpn",
+    "Ask",
     "Backpressure",
     "Congestion",
     "Deduplication",
@@ -234,9 +260,14 @@ __all__ = [
     "ProducerNaming",
     "ReceivedKind",
     "ReportMode",
+    "BLOB_ID_LEN",
     "CURSOR_LEVEL_APPLICATION_FLOOR",
     "DEFAULT_DATAGRAM_RECEIVE_BYTES",
+    "MAX_PIECES",
     "MAX_SEGMENT_LAYERS",
+    "PIECE_SIZE_DEFAULT_LOG2",
+    "PIECE_SIZE_MAX_LOG2",
+    "PIECE_SIZE_MIN_LOG2",
     # Handles.
     "Acceptor",
     "Binding",
@@ -246,6 +277,7 @@ __all__ = [
     "Delivery",
     "Dish",
     "FanOut",
+    "Fetch",
     "Flow",
     "Handoff",
     "IdentityEvents",
@@ -271,10 +303,13 @@ __all__ = [
     "Requester",
     "Respondent",
     "Runtime",
+    "SeedSession",
+    "Seeder",
     "Segment",
     "Subscriber",
     "SurveyRun",
     "Surveyor",
+    "Swarm",
     "UnixBinding",
     # Errors.
     "WeidaError",
@@ -307,6 +342,7 @@ __all__ = [
     "UnknownEndpoint",
     "Unsupported",
     "Untrusted",
+    "blob_id_of",
     "new_trace",
     "strerror",
     "version",

@@ -177,9 +177,18 @@ class IncomingKind(enum.IntEnum):
     FLOW = lib.WEIDA_INCOMING_FLOW
 
 
+class Ask(enum.IntEnum):
+    """`Ask`: what a fetch orders of a seeder, the kind of an `Order`."""
+
+    LIST = lib.WEIDA_ASK_LIST
+    HAVE = lib.WEIDA_ASK_HAVE
+    PIECE = lib.WEIDA_ASK_PIECE
+
+
 __all__ = [
     "Acknowledgement",
     "Alpn",
+    "Ask",
     "Backpressure",
     "Congestion",
     "Deduplication",

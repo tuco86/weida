@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, Optional, Tuple, Union
 
 from weida import _resolver
+from weida._blob import _U32_MAX, Bits, Blob, PieceList, _bounded, _FetchOptions
 from weida._crypto import path as _fspath
-from weida._enums import Acknowledgement, ErrorCode, IncomingKind, ReceivedKind, ReportMode
+from weida._enums import Acknowledgement, Ask, ErrorCode, IncomingKind, ReceivedKind, ReportMode
 from weida._errors import check
 from weida._native import ffi, lib
 from weida._stats import ConnectionStats, PathStats, PeerEvent, _take_connection_stats, _take_path_stats
@@ -38,6 +39,7 @@ from weida._values import (
     _enum,
     _levels,
     _millis,
+    _of,
     _take_cursor_set,
     _take_dish_drops,
     _take_topic_drops,
@@ -223,6 +225,13 @@ class Runtime(_Handle):
         check(lib.weida_runtime_peer(self._p(), tls._p(), out))
         return self._Peer(out[0], lib.weida_peer_drop, self)
 
+    def swarm(self, tls: ClientTls) -> "Swarm":
+        """A swarm: it dials seeders on `tls`'s terms and fetches blobs from
+        every seeder it connected."""
+        out = ffi.new("weida_swarm **")
+        check(lib.weida_runtime_swarm(self._p(), tls._p(), out))
+        return self._Swarm(out[0], lib.weida_swarm_drop, self)
+
     def suppressed_duplicates(self) -> int:
         """Duplicates discarded inside a negotiated deduplication window; 0
         without deduplication."""
@@ -379,6 +388,14 @@ class Listener(_Handle):
         out = ffi.new("weida_acceptor **")
         check(lib.weida_listener_acceptor(self._p(), path.encode(), out))
         return self._Acceptor(out[0], lib.weida_acceptor_drop, self)
+
+    def seeder(self, path: str) -> "Seeder":
+        """Registers a seeder at the endpoint path `path`: each fetch of a
+        blob arrives at `accept` as a `SeedSession`. Raises
+        `InvalidEndpointPath` or `AlreadyRegistered`."""
+        out = ffi.new("weida_seeder **")
+        check(lib.weida_listener_seeder(self._p(), path.encode(), out))
+        return self._Seeder(out[0], lib.weida_seeder_drop, self)
 
     def _start_bind_quic_socket(self, socket: int, tls: ServerTls):
         # Checked before C takes the descriptor: a range error leaves it the
@@ -2086,6 +2103,372 @@ class IncomingFlow(_Handle):
         lib.weida_incoming_flow_refuse(self._consume())
 
 
+@dataclass(frozen=True)
+class Piece:
+    """One verified piece a fetch yielded, copied out at once: `index` and
+    its `bytes`, the span `Blob.span(index)` names."""
+
+    index: int
+    bytes: bytes
+
+
+@dataclass(frozen=True)
+class Order:
+    """One order of a fetch, from `SeedSession.next`: `kind` an `Ask`;
+    `index` the piece a `PIECE` order names, `None` for `LIST` and `HAVE`."""
+
+    kind: Ask
+    index: Optional[int]
+
+
+class Swarm(_Handle):
+    """The fetching side of SWARM: dials seeders and fetches blobs from
+    every seeder it connected, each piece verified against the blob's root."""
+
+    def _start_connect(self, url: str):
+        return _start(lib.weida_swarm_connect, "weida_swarm_connect_op", self._p(), url.encode())
+
+    def connect(self, url: str, timeout: Optional[float] = None) -> None:
+        """Dials the seeder at `url`; a seeder connected during a fetch joins
+        it at its next read. The runtime redials it when the connection is
+        lost."""
+        op = self._start_connect(url)
+        _op_sync(op, lib.weida_swarm_connect_op_wait, lib.weida_swarm_connect_op_drop, timeout)
+
+    def disconnect(self, url: str) -> bool:
+        """Forgets a dialled address, closing its connection: whether it was
+        dialled."""
+        return check(lib.weida_swarm_disconnect(self._p(), url.encode())) == 1
+
+    def peer_count(self) -> int:
+        return lib.weida_swarm_peer_count(self._p())
+
+    def connection_stats(self) -> Tuple[ConnectionStats, ...]:
+        """One frozen record per live connection, in dial order; an address
+        being redialled has none. Never blocks."""
+        out = ffi.new("weida_connection_stats **")
+        check(lib.weida_swarm_connection_stats(self._p(), out))
+        return _take_connection_stats(out[0])
+
+    def events(self) -> "PeerEvents":
+        """A new reader of this swarm's peer events, from now on; each call
+        is an independent reader."""
+        out = ffi.new("weida_peer_events **")
+        check(lib.weida_swarm_events(self._p(), out))
+        # No parent: the events end once the swarm is gone, which holding it
+        # would prevent.
+        return self._PeerEvents(out[0], lib.weida_peer_events_drop)
+
+    def fetch(
+        self,
+        blob: Blob,
+        have: Bits,
+        *,
+        list: Optional[PieceList] = None,
+        stall: Optional[float] = None,
+        min_rate: Optional[int] = None,
+        per_peer: Optional[int] = None,
+        max_inflight: Optional[int] = None,
+        max_peers: Optional[int] = None,
+        have_refresh: Optional[float] = None,
+    ) -> "Fetch":
+        """Starts fetching the pieces of `blob` that `have` lacks; never
+        waits, nothing is ordered until the first `next`. `have` (one bit per
+        piece) and the options are copied. `None` leaves an option at weida's
+        default:
+
+        - `list`, a `PieceList` from an earlier fetch's `Fetch.list()`, which
+          spares the LIST order;
+        - `stall`, seconds, default 30;
+        - `min_rate`, bytes per second, default 64 KiB;
+        - `per_peer`, default 8; `max_inflight`, default 32;
+        - `max_peers`, default every seeder;
+        - `have_refresh`, seconds, default 5.
+
+        A `have` without one bit per piece, or a list of another blob, raises
+        `InvalidArgument`. A wrong type is a `TypeError` and a negative number
+        a `ValueError`, both before anything starts."""
+        b, h = _of("blob", blob, Blob), _of("have", have, Bits)
+        given = {
+            k: v
+            for k, v in (
+                ("list", list),
+                ("stall", stall),
+                ("min_rate", min_rate),
+                ("per_peer", per_peer),
+                ("max_inflight", max_inflight),
+                ("max_peers", max_peers),
+                ("have_refresh", have_refresh),
+            )
+            if v is not None
+        }
+        out = ffi.new("weida_fetch **")
+
+        def start(options) -> None:
+            check(lib.weida_swarm_fetch(self._p(), b, h, options, out))
+
+        if given:
+            _with_terms(_FetchOptions(**given), start)
+        else:
+            start(ffi.NULL)
+        return self._Fetch(out[0], lib.weida_fetch_drop, self)
+
+
+class Fetch(_Handle):
+    """One blob being fetched, a queue (docs/libraries/weida-py.md §1):
+    `next` returns the next verified `Piece`, in any order, or `None` once
+    every piece is held. Taking a piece frees its order's credit, which is
+    the fetch's backpressure. Dropping it aborts every order in flight."""
+
+    _fd_of = lib.weida_fetch_fd
+
+    def blob(self) -> Blob:
+        """The blob being fetched. Answers while a `next` is in flight; that
+        read is stopped and starts again at the next call, losing nothing."""
+        out = ffi.new("weida_blob **")
+        check(lib.weida_fetch_blob(self._p(), out))
+        return Blob._wrap(out[0])
+
+    def list(self) -> Optional[PieceList]:
+        """The blob's piece list once a seeder sent it (or the one given),
+        for a later fetch's `list`; `None` before. Answers while a `next` is
+        in flight; that read is stopped and starts again at the next call,
+        losing nothing."""
+        out = ffi.new("weida_piece_list **")
+        if check(lib.weida_fetch_list(self._p(), out)) == 0:
+            return None
+        return PieceList._wrap(out[0])
+
+    def _bits(self, getter: Callable) -> Bits:
+        out = ffi.new("weida_bits **")
+        check(getter(self._p(), out))
+        return Bits._wrap(out[0])
+
+    def delivered(self) -> Bits:
+        """The pieces held, a copy. Answers while a `next` is in flight; that
+        read is stopped and starts again at the next call, losing nothing."""
+        return self._bits(lib.weida_fetch_delivered)
+
+    def in_flight(self) -> Bits:
+        """The pieces ordered and not yet taken, a copy. Answers while a
+        `next` is in flight; that read is stopped and starts again at the
+        next call, losing nothing."""
+        return self._bits(lib.weida_fetch_in_flight)
+
+    def unavailable(self) -> Bits:
+        """The missing pieces no connected seeder can serve now, a copy.
+        Answers while a `next` is in flight; that read is stopped and starts
+        again at the next call, losing nothing."""
+        return self._bits(lib.weida_fetch_unavailable)
+
+    def prioritize(self, start: int, end: int) -> None:
+        """Orders the missing pieces in `[start, end)` first; an empty range
+        clears the priority. It takes effect at the next order. Answers while
+        a `next` is in flight; that read is stopped and starts again at the
+        next call, losing nothing."""
+        check(
+            lib.weida_fetch_prioritize(
+                self._p(), _bounded("start", start, _U32_MAX), _bounded("end", end, _U32_MAX)
+            )
+        )
+
+    def clear_priority(self) -> None:
+        """Drops the priority `prioritize` set. Answers while a `next` is in
+        flight; that read is stopped and starts again at the next call,
+        losing nothing."""
+        check(lib.weida_fetch_clear_priority(self._p()))
+
+    def _next_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_piece **")
+        return out, lambda ms: lib.weida_fetch_next(handle, ms, out)
+
+    @staticmethod
+    def _piece(ptr) -> Optional[Piece]:
+        """Copies a `weida_piece` out and drops it; `None` for NULL, which
+        is the end."""
+        if ptr == ffi.NULL:
+            return None
+        try:
+            length = ffi.new("size_t *")
+            data = lib.weida_piece_bytes(ptr, length)
+            return Piece(index=lib.weida_piece_index(ptr), bytes=ffi.buffer(data, length[0])[:])
+        finally:
+            lib.weida_piece_drop(ptr)
+
+    def next(self, timeout: Optional[float] = None) -> Optional[Piece]:
+        """The next verified piece, or `None` once every piece is held, and
+        at every later call. Raises `NotConnected` when no order is in flight
+        and no seeder is left that has not failed this fetch, or when the
+        swarm is gone; connecting a seeder and reading again resumes. A
+        `next` cut short loses nothing: the read in flight keeps its place."""
+        out, attempt = self._next_attempt()
+        call_sync(attempt, timeout)
+        return self._piece(out[0])
+
+    def __iter__(self) -> Iterator[Piece]:
+        """Every piece until the fetch ended; the fetch stays alive."""
+        while (piece := self.next()) is not None:
+            yield piece
+
+
+class Seeder(_Handle):
+    """The seeding side of SWARM, serving one endpoint path: each fetch of a
+    blob arrives at `accept` as a `SeedSession`."""
+
+    _fd_of = lib.weida_seeder_fd
+
+    def path(self) -> str:
+        return _text(lib.weida_seeder_path, self._p())
+
+    def _accept_attempt(self):
+        handle = self._p()
+        out = ffi.new("weida_seed_session **")
+        return out, lambda ms: lib.weida_seeder_accept(handle, ms, out)
+
+    def _session(self, ptr) -> "SeedSession":
+        return self._SeedSession(ptr, lib.weida_seed_session_drop, self)
+
+    def accept(self, timeout: Optional[float] = None) -> "SeedSession":
+        """The next fetch's session, with a well-formed open; admit it from
+        its blob and metadata, or decline it. An `accept` cut short loses
+        nothing. Raises `NotConnected` once the queue ended."""
+        out, attempt = self._accept_attempt()
+        call_sync(attempt, timeout)
+        return self._session(out[0])
+
+
+class SeedSession(_Handle):
+    """One fetch's session at a seeder: read its orders one at a time with
+    `next` and answer each from your own storage before the next one. A call
+    while `next` or an answer is in flight on another thread raises
+    `InvalidArgument`. Dropping it ends the session; the fetch drops this
+    seeder when an answer was still due."""
+
+    _fd_of = lib.weida_seed_session_fd
+
+    def blob(self) -> Blob:
+        """The blob the fetch asks for."""
+        out = ffi.new("weida_blob **")
+        check(lib.weida_seed_session_blob(self._p(), out))
+        return Blob._wrap(out[0])
+
+    def meta(self) -> IncomingMeta:
+        """The session's metadata, a frozen `IncomingMeta`; its
+        `peer_fingerprint` names the fetching side where its connection
+        proved a key."""
+        out = ffi.new("weida_incoming_meta **")
+        check(lib.weida_seed_session_meta(self._p(), out))
+        return IncomingMeta._take(out[0])
+
+    def connection(self) -> int:
+        """The id of the connection the session runs on."""
+        return lib.weida_seed_session_connection(self._p())
+
+    def _next_attempt(self):
+        handle = self._p()
+        ask, index = ffi.new("int *"), ffi.new("uint32_t *")
+        return (ask, index), lambda ms: lib.weida_seed_session_next(handle, ms, ask, index)
+
+    @staticmethod
+    def _order(rc: int, outs) -> Optional[Order]:
+        if rc == 0:
+            return None
+        kind = Ask(outs[0][0])
+        return Order(kind=kind, index=outs[1][0] if kind is Ask.PIECE else None)
+
+    def next(self, timeout: Optional[float] = None) -> Optional[Order]:
+        """The next order, or `None` once the fetch finished its orders. It
+        waits as long as the fetch sends none. Raises `Protocol` while the
+        order before is unanswered, for an order this blob cannot have (the
+        session is then refused), and after the session failed. A `next` cut
+        short keeps its read in flight for the next call."""
+        outs, attempt = self._next_attempt()
+        rc = call_sync(attempt, timeout)
+        return self._order(rc, outs)
+
+    def _start_answer_list(self, list: PieceList):
+        return _start(
+            lib.weida_seed_session_answer_list,
+            "weida_seed_session_answer_list_op",
+            self._p(),
+            _of("list", list, PieceList),
+        )
+
+    def _start_answer_have(self, have: Bits):
+        return _start(
+            lib.weida_seed_session_answer_have,
+            "weida_seed_session_answer_have_op",
+            self._p(),
+            _of("have", have, Bits),
+        )
+
+    def _start_answer_piece(self, data):
+        src = ffi.from_buffer("uint8_t[]", data)
+        return _start(
+            lib.weida_seed_session_answer_piece,
+            "weida_seed_session_answer_piece_op",
+            self._p(),
+            src,
+            len(src),
+        )
+
+    def _start_answer_gone(self, index: int):
+        return _start(
+            lib.weida_seed_session_answer_gone,
+            "weida_seed_session_answer_gone_op",
+            self._p(),
+            _bounded("index", index, _U32_MAX),
+        )
+
+    def _start_decline(self):
+        return _start(lib.weida_seed_session_decline, "weida_seed_session_decline_op", self._consume())
+
+    def answer_list(self, list: PieceList, timeout: Optional[float] = None) -> None:
+        """Answers `LIST` with the piece list of the session's blob; raises
+        `Protocol` when the order was not LIST or the list is of another blob
+        (the session is refused). A wait cut short aborts the answer."""
+        op = self._start_answer_list(list)
+        _op_sync(
+            op, lib.weida_seed_session_answer_list_op_wait, lib.weida_seed_session_answer_list_op_drop, timeout
+        )
+
+    def answer_have(self, have: Bits, timeout: Optional[float] = None) -> None:
+        """Answers `HAVE` with the pieces this seeder can serve now (copied);
+        `Protocol` when the order was not HAVE or the map lacks one bit per
+        piece. A wait cut short aborts the answer."""
+        op = self._start_answer_have(have)
+        _op_sync(
+            op, lib.weida_seed_session_answer_have_op_wait, lib.weida_seed_session_answer_have_op_drop, timeout
+        )
+
+    def answer_piece(self, data, timeout: Optional[float] = None) -> None:
+        """Answers `PIECE` with its bytes (any bytes-like, copied; checked by
+        the fetch, not here); `Protocol` when the order was not PIECE or the
+        length is not its span's. A wait cut short aborts the answer."""
+        op = self._start_answer_piece(data)
+        _op_sync(
+            op, lib.weida_seed_session_answer_piece_op_wait, lib.weida_seed_session_answer_piece_op_drop, timeout
+        )
+
+    def answer_gone(self, index: int, timeout: Optional[float] = None) -> None:
+        """Answers `PIECE` `index` with 'no longer held': the fetch orders it
+        elsewhere and keeps the session; `Protocol` when the order was not
+        PIECE `index`. A wait cut short aborts the answer."""
+        op = self._start_answer_gone(index)
+        _op_sync(
+            op, lib.weida_seed_session_answer_gone_op_wait, lib.weida_seed_session_answer_gone_op_drop, timeout
+        )
+
+    def decline(self, timeout: Optional[float] = None) -> None:
+        """Ends the session: the fetch drops this seeder for the blob.
+        Consumes the session on every path; while an answer runs it raises
+        `InvalidArgument` and the session ends when that answer does. A wait
+        cut short aborts the decline."""
+        op = self._start_decline()
+        _op_sync(op, lib.weida_seed_session_decline_op_wait, lib.weida_seed_session_decline_op_drop, timeout)
+
+
 class ReplyStream(_Handle):
     """The reply half of an exchange `Requester.open` opened. Dropping it
     before `recv` tells the replier nobody is listening: its `canceled`
@@ -2544,7 +2927,7 @@ class Reporter(_Handle):
 
 class PeerEvents(_Handle):
     """A reader of a dialler's peer events (a requester, pusher, subscriber,
-    dialling pair, dish or raw peer), a queue (docs/libraries/weida-py.md
+    dialling pair, dish, raw peer or swarm), a queue (docs/libraries/weida-py.md
     §1): `recv` returns the next `PeerEvent`, or `None` once the dialler, or
     the relayed binding's registration, is gone. A reader that fell more
     than 64 events behind gets one `MISSED` event carrying how many it
@@ -2662,6 +3045,11 @@ Acceptor._IncomingTransfer = IncomingTransfer
 Acceptor._IncomingRequest = IncomingRequest
 Acceptor._Consumer = Consumer
 Consumer._OutgoingTransfer = OutgoingTransfer
+Runtime._Swarm = Swarm
+Swarm._Fetch = Fetch
+Swarm._PeerEvents = PeerEvents
+Listener._Seeder = Seeder
+Seeder._SeedSession = SeedSession
 
 __all__ = [
     "Acceptor",
@@ -2672,6 +3060,7 @@ __all__ = [
     "Delivery",
     "Dish",
     "FanOut",
+    "Fetch",
     "Flow",
     "Handoff",
     "IdentityEvents",
@@ -2681,10 +3070,12 @@ __all__ = [
     "IncomingTransfer",
     "Listener",
     "LocalBinding",
+    "Order",
     "OutgoingTransfer",
     "Paired",
     "Peer",
     "PeerEvents",
+    "Piece",
     "PipeBinding",
     "Publisher",
     "Puller",
@@ -2699,9 +3090,12 @@ __all__ = [
     "Requester",
     "Respondent",
     "Runtime",
+    "SeedSession",
+    "Seeder",
     "Segment",
     "Subscriber",
     "SurveyRun",
     "Surveyor",
+    "Swarm",
     "UnixBinding",
 ]

@@ -12,7 +12,7 @@ from weida import _sync, _values
 from weida._enums import ErrorCode
 from weida._native import ffi, lib
 from weida._stats import PeerEvent
-from weida._sync import Handoff, Incoming, Received, _op_async
+from weida._sync import Handoff, Incoming, Order, Piece, Received, _op_async
 from weida._values import ClientTls, CursorSet, Drained, FlowMeta, IdentityEvent, Message, ServerTls, TransferMeta
 from weida._wait import call_async
 
@@ -25,6 +25,7 @@ __all__ = [
     "Delivery",
     "Dish",
     "FanOut",
+    "Fetch",
     "IdentityEvents",
     "IdentitySource",
     "IncomingFlow",
@@ -46,9 +47,12 @@ __all__ = [
     "Requester",
     "Respondent",
     "Runtime",
+    "SeedSession",
+    "Seeder",
     "Subscriber",
     "SurveyRun",
     "Surveyor",
+    "Swarm",
     "TrustSource",
     "WeakIdentitySource",
     "WeakTrustSource",
@@ -692,6 +696,108 @@ class IncomingFlow(_sync.IncomingFlow):
             yield d
 
 
+class Swarm(_sync.Swarm):
+    async def connect(self, url: str) -> None:  # type: ignore[override]
+        """Dials the seeder at `url`, as `weida.Swarm.connect` does; the
+        runtime redials it when the connection is lost."""
+        await _op_async(
+            self._start_connect(url),
+            lib.weida_swarm_connect_op_wait,
+            lib.weida_swarm_connect_op_fd,
+            lib.weida_swarm_connect_op_drop,
+        )
+
+
+class Fetch(_sync.Fetch):
+    __iter__ = None  # type: ignore[assignment]  # `async for` only
+
+    async def next(self) -> Optional[Piece]:  # type: ignore[override]
+        """The next verified piece, or `None` once every piece is held, as
+        `weida.Fetch.next` does; a cancelled `next` leaves its read in
+        flight for the next call (on the Windows Proactor loop it drops the
+        fetch, §4)."""
+        out, attempt = self._next_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._piece(out[0])
+
+    async def __aiter__(self) -> AsyncIterator[Piece]:
+        """Every piece until the fetch ended; the fetch stays alive."""
+        while (piece := await self.next()) is not None:
+            yield piece
+
+
+class Seeder(_sync.Seeder):
+    async def accept(self) -> "SeedSession":  # type: ignore[override]
+        """The next fetch's session, as `weida.Seeder.accept` gives it. A
+        cancelled `accept` loses nothing. Raises `NotConnected` once the
+        queue ended."""
+        out, attempt = self._accept_attempt()
+        await call_async(self._waiters(), attempt, self.drop)
+        return self._session(out[0])
+
+
+class SeedSession(_sync.SeedSession):
+    async def next(self) -> Optional[Order]:  # type: ignore[override]
+        """The next order, or `None` once the fetch finished its orders, as
+        `weida.SeedSession.next` does; a cancelled `next` keeps its read in
+        flight for the next call (on the Windows Proactor loop it drops the
+        session, §4)."""
+        outs, attempt = self._next_attempt()
+        rc = await call_async(self._waiters(), attempt, self.drop)
+        return self._order(rc, outs)
+
+    async def answer_list(self, list) -> None:  # type: ignore[override]
+        """Answers `LIST`, as `weida.SeedSession.answer_list` does; a
+        cancelled answer_list aborts the answer."""
+        await _op_async(
+            self._start_answer_list(list),
+            lib.weida_seed_session_answer_list_op_wait,
+            lib.weida_seed_session_answer_list_op_fd,
+            lib.weida_seed_session_answer_list_op_drop,
+        )
+
+    async def answer_have(self, have) -> None:  # type: ignore[override]
+        """Answers `HAVE`, as `weida.SeedSession.answer_have` does; a
+        cancelled answer_have aborts the answer."""
+        await _op_async(
+            self._start_answer_have(have),
+            lib.weida_seed_session_answer_have_op_wait,
+            lib.weida_seed_session_answer_have_op_fd,
+            lib.weida_seed_session_answer_have_op_drop,
+        )
+
+    async def answer_piece(self, data) -> None:  # type: ignore[override]
+        """Answers `PIECE` with its bytes, as `weida.SeedSession.answer_piece`
+        does; a cancelled answer_piece aborts the answer."""
+        await _op_async(
+            self._start_answer_piece(data),
+            lib.weida_seed_session_answer_piece_op_wait,
+            lib.weida_seed_session_answer_piece_op_fd,
+            lib.weida_seed_session_answer_piece_op_drop,
+        )
+
+    async def answer_gone(self, index: int) -> None:  # type: ignore[override]
+        """Answers `PIECE` `index` with 'no longer held', as
+        `weida.SeedSession.answer_gone` does; a cancelled answer_gone aborts
+        the answer."""
+        await _op_async(
+            self._start_answer_gone(index),
+            lib.weida_seed_session_answer_gone_op_wait,
+            lib.weida_seed_session_answer_gone_op_fd,
+            lib.weida_seed_session_answer_gone_op_drop,
+        )
+
+    async def decline(self) -> None:  # type: ignore[override]
+        """Ends the session, as `weida.SeedSession.decline` does; a cancelled
+        decline aborts it. Consumes the session."""
+        await _op_async(
+            self._start_decline(),
+            lib.weida_seed_session_decline_op_wait,
+            lib.weida_seed_session_decline_op_fd,
+            lib.weida_seed_session_decline_op_drop,
+        )
+
+
 class Relay(_sync.Relay):
     async def accept(self) -> "RelayRequest":  # type: ignore[override]
         """The next registration or tunnel asking to be served. An anonymous
@@ -993,6 +1099,11 @@ Acceptor._IncomingTransfer = IncomingTransfer
 Acceptor._IncomingRequest = IncomingRequest
 Acceptor._Consumer = Consumer
 Consumer._OutgoingTransfer = OutgoingTransfer
+Runtime._Swarm = Swarm
+Swarm._Fetch = Fetch
+Swarm._PeerEvents = PeerEvents
+Listener._Seeder = Seeder
+Seeder._SeedSession = SeedSession
 IdentitySource._Weak = WeakIdentitySource
 WeakIdentitySource._Strong = IdentitySource
 TrustSource._Weak = WeakTrustSource

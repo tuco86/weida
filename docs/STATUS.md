@@ -222,9 +222,8 @@ listed in [libraries/README.md](libraries/README.md).
 
 What is **not** a follow-up: SWARM's edges are the application's by decision. A tracker or
 announcer, a blob store, one identity per connection and following a Raft leader stay out of
-weida ([0040](decisions/0040-swarm-pattern.md) §6), and mirrors of SWARM in Python are filed
-when a caller needs them. griasdi moves its seeder onto sessions on its
-side (`PROPOSAL-weida-swarm-sessions.md` in its checkout).
+weida ([0040](decisions/0040-swarm-pattern.md) §6). griasdi moves its seeder onto sessions on
+its side (`PROPOSAL-weida-swarm-sessions.md` in its checkout).
 
 ## 5. What needs a human
 

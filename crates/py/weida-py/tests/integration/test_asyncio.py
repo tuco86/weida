@@ -520,3 +520,51 @@ def test_raw_peers_on_the_loop(bus):
         await server.shutdown()
 
     asyncio.run(main())
+
+
+def test_swarm_on_the_loop(bus):
+    async def main() -> None:
+        server = wa.Runtime.owned()
+        client = wa.Runtime.owned()
+        listener = server.listener()
+        binding = listener.bind_inproc(bus)
+        seeder = listener.seeder("/blob")
+        data = bytes(((i * 0x9E3779B1) & 0xFFFFFFFF) >> 24 for i in range(17 * 1024 + 100))
+        piece_list = weida.PieceList.of(data, weida.PIECE_SIZE_MIN_LOG2)
+        blob = piece_list.blob()
+
+        async def seed() -> None:
+            session = await seeder.accept()
+            assert isinstance(session, wa.SeedSession)
+            while (order := await session.next()) is not None:
+                if order.kind is weida.Ask.LIST:
+                    await session.answer_list(piece_list)
+                elif order.kind is weida.Ask.HAVE:
+                    with weida.Bits.full(blob.count()) as have:
+                        await session.answer_have(have)
+                else:
+                    start, end = blob.span(order.index)
+                    await session.answer_piece(data[start:end])
+            session.drop()
+
+        seeding = asyncio.ensure_future(seed())
+        swarm = client.swarm(weida.ClientTls(weida.Trust()))
+        await swarm.connect(f"weida+inproc://{bus}/blob")
+        fetch = swarm.fetch(blob, weida.Bits(18))
+        assert isinstance(fetch, wa.Fetch)
+        out = bytearray(len(data))
+        indices = []
+        async for piece in fetch:
+            start, end = blob.span(piece.index)
+            out[start:end] = piece.bytes
+            indices.append(piece.index)
+        assert sorted(indices) == list(range(18))
+        assert weida.blob_id_of(out) == blob.root()
+        await seeding
+
+        for handle in (fetch, swarm, seeder, blob, piece_list, binding, listener):
+            handle.drop()
+        await client.shutdown()
+        await server.shutdown()
+
+    asyncio.run(main())
