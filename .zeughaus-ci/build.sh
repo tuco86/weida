@@ -1,6 +1,6 @@
 # Sourced by the platform check jobs, the c-abi jobs, the language jobs
 # (python-, js-, jvm-, beam-, go-linux-*, js-darwin-arm64, python-darwin-arm64,
-# swift-darwin-arm64, android-libweida), publish.sh, publish-npm.sh, audit.sh
+# swift-darwin-arm64, android-libweida), publish.sh, publish-npm.sh, publish-pypi.sh, audit.sh
 # and fuzz.sh; no header, so not a job.
 # Run from the workspace root, with CI_PLATFORM set by the job's `platform`.
 

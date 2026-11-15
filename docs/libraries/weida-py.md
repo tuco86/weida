@@ -149,7 +149,7 @@ right after the failing call on the same thread. Present;
 | `cryptography` | optional: imported per call, never a dependency; installed for the CPython test runs, absent on 3.14t and PyPy | present; `test_identity.py::test_without_cryptography_bytes_convert_and_objects_are_type_errors` |
 | macOS | present: `python-darwin-arm64` builds `libweida` and the `macosx_11_0_arm64` wheel on atik with uv's CPython (not the Xcode one) and runs the tests against it |
 | Windows | present: `python-windows-amd64` builds `libweida`, statically linked to the C runtime, and the `win_amd64` wheel on wohnzimmer with uv's CPython and runs the tests against it |
-| PyPI | absent: nothing of this repository is on PyPI |
+| PyPI | present: a `v*` tag publishes the four wheels to pypi.org as `weida` (`publish-pypi`, after crates.io), the first being `0.1.0-alpha.16`; wheels only, no sdist, because building one needs a Rust toolchain; a wheel whose file PyPI already has is skipped, so a rerun is safe |
 
 ## 6. What is not mapped
 
@@ -163,6 +163,7 @@ The new package is not compatible with the old module's API (0045 decision 6).
 `crates/py/weida-py/src/weida/` (`__init__.py`, `_native.py`, `_errors.py`, `_wait.py`,
 `_enums.py`, `_values.py`, `_blob.py`, `_stats.py`, `_crypto.py`, `_sync.py`, `_resolver.py`,
 `asyncio.py`, `_cdef.h`),
-`hatch_build.py`, `pyproject.toml`, `develop.sh`, `package.sh`, `smoke.py`, `tests/`;
+`hatch_build.py`, `pyproject.toml`, `README.md`, `develop.sh`, `package.sh`, `smoke.py`, `tests/`,
+`.zeughaus-ci/publish-pypi.sh`;
 [weida-c.md](weida-c.md);
 [docs/c/](../c/README.md); [decisions/0045](../decisions/0045-the-c-abi-is-the-boundary.md).

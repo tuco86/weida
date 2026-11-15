@@ -26,7 +26,9 @@ got rather than only whether it finished, and no pattern changes shape to gain a
 published on crates.io, all at `0.1.0-alpha.14`. The other eighteen members are not
 published: `weida-c`, `weida-py-core`, every Python binding, the other five protocol libraries with
 their codecs, and `weida-testkit`, which only tests use. The one exception on crates.io,
-`weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. Nothing is on PyPI.
+`weida-zmtp` `0.1.0-alpha.2`, is an old release that receives no updates. The Python package
+`weida` goes to pypi.org with every `v*` tag from `0.1.0-alpha.16` on, as wheels for manylinux
+x86_64 and aarch64, macOS 11 arm64 and win_amd64 and with no sdist.
 The JavaScript package `weida` goes to npmjs.org with every `v*` tag from `0.1.0-alpha.14` on,
 with prebuilt `libweida` for linux-x64, linux-arm64, darwin-arm64 and win32-x64; up to
 `0.1.0-alpha.13` it was `@tuco86/weida` on the forge's npm registry. Wire protocol version

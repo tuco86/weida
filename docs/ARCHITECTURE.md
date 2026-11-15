@@ -488,7 +488,7 @@ crates/
     http/weida-http-codec/     →  weida-http-codec  HTTP/1.1, HPACK, h2 and h3 framing, QPACK, no I/O
     http/weida-http/           →  weida-http        the HTTP client and server (h1, h2, h3)
     py/weida-py-core/          →  weida-py-core     the shared PyO3 foundation
-    py/weida-py/               →  weida (Python)    weida for Python, cffi over libweida;
+    py/weida-py/               →  weida (PyPI)      weida for Python, cffi over libweida;
                                                     not a Cargo member
     js/weida-js/               →  weida (npm)       weida for JavaScript, a Node-API addon
                                                     over libweida; not a Cargo member
