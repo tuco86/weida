@@ -6,7 +6,9 @@ all-features = true
 
 [advisories]
 # Each entry is { id = "RUSTSEC-...", reason = "why weida is not affected" }.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono (unmaintained, no vulnerability) is reached only through openraft 0.9, which formats its own Instants for log and Debug output with it (display_ext::DisplayInstant), and openraft-macros, which checks `#[since(date = ..)]` literals at compile time; no peer input reaches chrono, and openraft 0.10.0 still depends on it unconditionally" },
+]
 
 [sources]
 unknown-registry = "deny"
