@@ -125,6 +125,7 @@ def test_metadata_travels_with_a_request_and_its_reply(pair, pool):
 def test_an_expired_reply_fails_its_finish_with_expired(pair, pool):
     def serve() -> None:
         request = pair.replier.accept(WAIT)
+        assert request.take_body().collect(64, WAIT).payload == b"go"
         out = request.reply(None, WAIT)
         out.expire_after(0)
         with pytest.raises(weida.Expired):

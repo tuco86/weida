@@ -88,6 +88,7 @@ def test_expired_transfers_counts_a_reply_expired_with_expire_after_0(pair, pool
 
     def serve() -> None:
         request = pair.replier.accept(WAIT)
+        assert request.take_body().collect(64, WAIT).payload == b"go"
         out = request.reply(None, WAIT)
         out.expire_after(0)
         with pytest.raises(weida.Expired):

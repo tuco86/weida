@@ -123,6 +123,7 @@ def _request_quietly(requester: weida.Requester, body: bytes) -> None:
 def test_a_reply_dropped_unfinished_reads_as_canceled(inproc):
     def run() -> None:
         request = inproc.replier.accept(WAIT)
+        assert request.take_body().collect(64, WAIT).payload == b"go"
         reply = request.reply(None, WAIT)
         reply.write_all(b"ha", WAIT)
         reply.drop()

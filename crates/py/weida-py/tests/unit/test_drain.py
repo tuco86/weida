@@ -26,6 +26,9 @@ def test_a_drain_counts_a_reply_finished_before_it_as_delivered():
 
     def serve() -> None:
         request = replier.accept(WAIT)
+        # Read whole first: a body dropped unread is refused REJECTED, which
+        # fails a request still writing it.
+        assert request.take_body().collect(64, WAIT).payload == b"ping"
         out = request.reply(None, WAIT)
         out.write_all(b"pong", WAIT)
         out.finish().drop()

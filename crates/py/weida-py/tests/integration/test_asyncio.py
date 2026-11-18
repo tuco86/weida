@@ -91,6 +91,9 @@ def test_request_with_carries_metadata_on_the_loop(bus):
         async def serve() -> None:
             request = await replier.accept()
             assert request.meta().trace == t
+            # Read whole first: a body dropped unread is refused REJECTED,
+            # which fails a request still writing it.
+            assert (await request.take_body().collect(64)).payload == b"ping"
             out = await request.reply(weida.TransferMeta(achieved=weida.Acknowledgement.ACCEPTED))
             await out.write_all(b"pong")
             out.finish()
@@ -249,6 +252,7 @@ def test_a_drain_on_the_loop_counts_a_reply_finished_before_it(bus):
 
         async def serve() -> None:
             request = await replier.accept()
+            assert (await request.take_body().collect(64)).payload == b"ping"
             out = await request.reply()
             await out.write_all(b"pong")
             out.finish().drop()

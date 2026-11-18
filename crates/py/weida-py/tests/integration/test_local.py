@@ -22,6 +22,7 @@ async def round_trip(requester, replier, url: str) -> weida.IncomingMeta:
     async def serve() -> weida.IncomingMeta:
         request = await replier.accept()
         meta = request.meta()
+        assert (await request.take_body().collect(64)).payload == b"hello"
         out = await request.reply()
         await out.write_all(b"hi")
         await out.finish().delivered()
