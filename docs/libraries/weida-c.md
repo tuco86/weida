@@ -390,8 +390,9 @@ way a foreign caller calls it:
   `-WEIDA_EUNSUPPORTED` for a relayed binding and `-WEIDA_ECLOSED` for one a
   `weida_binding_close` was started on, and consumes the binding either way (R6).
 - `Binding::disconnect` and `RelayRequest::peer`/`target` take and give keys as `sha256:` text.
-- `weida_binding_drop` releases the handle only; the binding serves on, as a dropped Rust
-  `Binding` does, until `weida_binding_close`, a hand-over or the runtime's shutdown.
+- `weida_binding_drop` releases the handle. As a dropped Rust `Binding` does, a relayed binding
+  ends with it: its registration at the relay ends without waiting for its connections. Any
+  other binding serves on until `weida_binding_close`, a hand-over or the runtime's shutdown.
 - `bind_unix` exists in Rust only on Unix and `bind_pipe` only on Windows. The ABI exports both
   everywhere and the other platform's returns `-WEIDA_EUNSUPPORTED`, so one `weida.h` serves
   every platform.

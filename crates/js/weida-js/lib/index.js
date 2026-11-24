@@ -1123,8 +1123,9 @@ export class Listener extends Handle {
 }
 
 /** A QUIC binding: the socket a listener serves on, directly or through a
- * relay. Dropping it releases the handle only: the binding serves until
- * `close()`, a hand-over or the runtime's shutdown. */
+ * relay. Dropping a relayed binding ends its registration, as `close()`
+ * does without waiting; any other binding serves on until `close()`, a
+ * hand-over or the runtime's shutdown. */
 export class Binding extends Handle {
   constructor() {
     super();

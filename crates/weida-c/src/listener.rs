@@ -558,7 +558,8 @@ pub unsafe extern "C" fn weida_listener_bind_relay_op_fd(
 }
 
 /// Waits up to `timeout_ms` (R4) for the first registration and writes the
-/// relayed binding to `out`. Release it with `weida_binding_drop`.
+/// relayed binding to `out`. Release it with `weida_binding_drop`, which
+/// ends the registration.
 ///
 /// # Safety
 ///
@@ -878,8 +879,9 @@ pub unsafe extern "C" fn weida_binding_close_op_drop(op: *mut weida_binding_clos
 /// `-WEIDA_EUNSUPPORTED` for a relayed binding, which has no socket;
 /// `-WEIDA_ECLOSED` for one a `weida_binding_close` was started on;
 /// `-WEIDA_EINVAL` while a `weida_binding_take_over` op of it is
-/// unfinished. A binding consumed by one of these failures keeps serving
-/// until its runtime shuts down. After the runtime's shutdown the op ends
+/// unfinished. A QUIC binding consumed by one of these failures keeps
+/// serving until its runtime shuts down; a relayed one ends as
+/// `weida_binding_drop` ends it. After the runtime's shutdown the op ends
 /// with `-WEIDA_ERUNTIME`.
 ///
 /// # Safety
@@ -1234,9 +1236,11 @@ pub unsafe extern "C" fn weida_handoff_drop(h: *mut weida_handoff) {
     guard_void(|| drop(unsafe { release(h) }));
 }
 
-/// Releases a binding handle. The binding keeps serving, as a dropped Rust
-/// `Binding` does, until `weida_binding_close`, a hand-over or the
-/// runtime's shutdown. NULL does nothing.
+/// Releases a binding handle. A relayed binding ends once no op of it is
+/// unfinished, as a dropped Rust `Binding` does: its registration at the
+/// relay ends without waiting for its connections. Any other binding keeps
+/// serving until `weida_binding_close`, a hand-over or the runtime's
+/// shutdown. NULL does nothing.
 ///
 /// # Safety
 ///

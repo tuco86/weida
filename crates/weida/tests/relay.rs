@@ -409,6 +409,83 @@ async fn a_finished_relay_conversation_leaves_the_network_silent_after_the_linge
     relay.runtime.shutdown().await;
 }
 
+/// Claim: dropping a relayed binding ends its registration, so the same listener binds through
+/// the relay again at once, on the same pooled connection, and a dialler reaches the new
+/// binding.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_relayed_binding_frees_its_key_for_the_next_bind_relay() {
+    let net = SimNet::new();
+    let (r_id, _) = identity();
+    let (h_id, h_fp) = identity();
+    let (d_id, d_fp) = identity();
+    let relay = RelayServer::start(&net, any_addr(), r_id, true, Policy::Admit).await;
+    let Hidden {
+        runtime,
+        listener,
+        binding,
+    } = Hidden::start(&net, &relay, h_id.clone(), d_fp, true).await;
+    drop(binding);
+
+    // The same `ClientTls` is the same pool key: the new registration reuses the connection.
+    let again = within_paused(listener.bind_relay(
+        &relay.url(),
+        ClientTls::new(Trust::by_address()).with_identity(h_id.clone()),
+        ServerTls::new(h_id).require_client(Trust::pin(d_fp)),
+    ))
+    .await
+    .expect("the key is free for the next bind_relay");
+
+    let dialler = Runtime::new(on(&net, true)).expect("dialler");
+    let requester = dialler.requester(dialler_tls(d_id));
+    within_paused(requester.connect(&relay.relayed(h_fp, "/who")))
+        .await
+        .expect("connect through the relay to the new binding");
+    assert_eq!(
+        who(&requester).await,
+        format!("{:?}", Some(PeerIdentity::Key(d_fp)))
+    );
+
+    drop(again);
+    dialler.shutdown().await;
+    runtime.shutdown().await;
+    relay.runtime.shutdown().await;
+}
+
+/// Claim: a dropped relayed binding stays gone when its relay restarts: nothing redials its
+/// registration, so the new relay does not know its key.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_relayed_binding_does_not_register_again_after_the_relay_restarts() {
+    let net = SimNet::new();
+    let (r_id, _) = identity();
+    let (h_id, h_fp) = identity();
+    let (d_id, d_fp) = identity();
+    let relay = RelayServer::start(&net, any_addr(), r_id.clone(), true, Policy::Admit).await;
+    let Hidden {
+        runtime,
+        listener: _listener,
+        binding,
+    } = Hidden::start(&net, &relay, h_id, d_fp, true).await;
+    drop(binding);
+
+    let addr = relay.addr;
+    relay.runtime.shutdown().await;
+    let again = RelayServer::start(&net, addr, r_id, true, Policy::Admit).await;
+    // Far past the 5 ms redial schedule of `on`: a registration that still redials is back.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let dialler = Runtime::new(on(&net, true)).expect("dialler");
+    let requester = dialler.requester(dialler_tls(d_id));
+    let dialled = within_paused(requester.connect(&again.relayed(h_fp, "/who"))).await;
+    assert!(
+        matches!(dialled, Err(Error::UnknownEndpoint)),
+        "{dialled:?}"
+    );
+
+    dialler.shutdown().await;
+    runtime.shutdown().await;
+    again.runtime.shutdown().await;
+}
+
 /// The rate of the budgeted tunnel below, in bytes per second.
 const BULK: u64 = 256 * 1024;
 

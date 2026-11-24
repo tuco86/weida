@@ -469,9 +469,10 @@ class Listener(_Handle):
 
 
 class Binding(_Handle):
-    """A QUIC binding, served directly or through a relay. Dropping it
-    releases the handle only: the binding serves until `close`, a hand-over
-    or the runtime's shutdown."""
+    """A QUIC binding, served directly or through a relay. Dropping a
+    relayed binding ends its registration, as `close` does without waiting;
+    any other binding serves on until `close`, a hand-over or the runtime's
+    shutdown."""
 
     def local_addr(self) -> str:
         return _text(lib.weida_binding_local_addr, self._p())

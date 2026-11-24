@@ -42,6 +42,7 @@ use crate::conn::{ConnCtx, ConnHandle};
 use crate::flow::{Flow, FlowMeta, IncomingFlow, open_flow_on};
 use crate::listener::{ListenerInner, Route};
 use crate::reconnect::PeerEvents;
+use crate::runtime::Exec;
 use crate::stream::{Attach, Incoming, Peer, open_exchange_on};
 use crate::transfer::{IncomingRequest, IncomingTransfer, OutgoingTransfer, TransferMeta};
 
@@ -229,6 +230,11 @@ pub(crate) struct RelayLink {
     state: Mutex<LinkState>,
     /// Serializes opening the outgoing flow.
     opening: tokio::sync::Mutex<()>,
+    /// The hidden side's latest registration on this connection. A released
+    /// registration stays on the relay's books until the relay ends its
+    /// exchange, and until then the relay refuses a second REGISTER on the
+    /// connection.
+    registration: Mutex<Option<Arc<HiddenRegistration>>>,
 }
 
 #[derive(Default)]
@@ -259,6 +265,7 @@ impl RelayLink {
             route: Mutex::new(false),
             state: Mutex::new(LinkState::default()),
             opening: tokio::sync::Mutex::new(()),
+            registration: Mutex::new(None),
         }
     }
 
@@ -301,6 +308,63 @@ impl RelayLink {
             (old, state.take_unused())
         };
         drop((old, out));
+    }
+
+    /// Clears the catch-all if it is `socket`'s, never a later
+    /// registration's.
+    fn clear_catch_all_of(&self, socket: &Weak<RelaySocket>) {
+        let (old, out) = {
+            let mut state = lock(&self.state);
+            let old = if state
+                .catch_all
+                .as_ref()
+                .is_some_and(|sink| std::ptr::addr_eq(Arc::as_ptr(sink), socket.as_ptr()))
+            {
+                state.catch_all.take()
+            } else {
+                None
+            };
+            (old, state.take_unused())
+        };
+        drop((old, out));
+    }
+
+    /// Waits, at most `limit`, until the relay ended the previous
+    /// registration on this connection, if its binding let it go. A live
+    /// registration is not waited for: the relay refuses the new REGISTER.
+    async fn wait_released(&self, exec: &Exec, limit: Duration) {
+        let previous = lock(&self.registration).clone();
+        let Some(previous) = previous else { return };
+        if !previous.released() {
+            return;
+        }
+        let mut ended = previous.ended.subscribe();
+        if exec.within(limit, ended.wait_for(|e| *e)).await.is_none() {
+            tracing::debug!(
+                timeout_ms = limit.as_millis(),
+                "a released relay registration did not end in time"
+            );
+        }
+    }
+
+    fn begin_registration(&self, registration: Arc<HiddenRegistration>) {
+        *lock(&self.registration) = Some(registration);
+    }
+
+    /// The relay ended `registration`'s exchange: this connection serves
+    /// none of its tunnels any more.
+    fn end_registration(&self, registration: &Arc<HiddenRegistration>) {
+        {
+            let mut slot = lock(&self.registration);
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, registration))
+            {
+                *slot = None;
+            }
+        }
+        self.clear_catch_all_of(&registration.socket);
+        registration.ended.send_replace(true);
     }
 
     fn hold(&self) {
@@ -582,6 +646,44 @@ impl fmt::Debug for RelaySocket {
     }
 }
 
+/// One REGISTER exchange of a hidden peer as its connection sees it: from
+/// the relay's reply until the relay ended the exchange.
+struct HiddenRegistration {
+    socket: Weak<RelaySocket>,
+    /// `true` once the relay ended the exchange.
+    ended: tokio::sync::watch::Sender<bool>,
+}
+
+impl HiddenRegistration {
+    /// Whether its binding let it go (dropped, closed, or never installed).
+    fn released(&self) -> bool {
+        self.socket
+            .upgrade()
+            .is_none_or(|s| s.released.load(Ordering::Acquire))
+    }
+}
+
+/// Reads the relay's half of a registration until the relay ends it, then
+/// marks the registration ended on its connection.
+fn spawn_registration_reader(
+    conn: &ConnHandle,
+    reply: IncomingTransfer,
+    registration: Arc<HiddenRegistration>,
+) {
+    let weak = Arc::downgrade(conn);
+    conn.exec.spawn(async move {
+        read_records(reply, weak.clone(), None).await;
+        // The registration ended with its connection, or the relay ended it:
+        // this connection serves none of its tunnels any more.
+        match weak.upgrade() {
+            Some(conn) => conn.relay.end_registration(&registration),
+            None => {
+                registration.ended.send_replace(true);
+            }
+        }
+    });
+}
+
 /// What a hidden peer does on every connection to its relay, first dial and
 /// redial alike: register, and serve the tunnels the relay hands it.
 pub(crate) struct RegisterAttach {
@@ -604,14 +706,29 @@ impl Attach for RegisterAttach {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
         Box::pin(async move {
             ensure_route(conn)?;
+            // A registration released on this connection is still on the
+            // relay's books until the relay ends it, and the relay refuses
+            // this one until then.
+            conn.relay
+                .wait_released(&conn.exec, conn.limits.idle_timeout)
+                .await;
             let (mut up, down) = open_exchange_on(conn, path, TransferMeta::default()).await?;
             up.write_all(&[REGISTER]).await?;
             // A refusal is the ERROR frame: `Rejected`, which the first
             // `connect` returns and a redial tries again.
             let reply = down.recv().await?;
+            let (ended, _) = tokio::sync::watch::channel(false);
+            let registration = Arc::new(HiddenRegistration {
+                socket: Weak::clone(&self.socket),
+                ended,
+            });
+            conn.relay.begin_registration(Arc::clone(&registration));
             let socket = match self.socket.upgrade() {
                 Some(socket) if !socket.released.load(Ordering::Acquire) => socket,
                 _ => {
+                    // The binding went away during a redial: end the
+                    // registration, and let a following one wait for that.
+                    spawn_registration_reader(conn, reply, registration);
                     up.cancel();
                     return Err(Error::NotConnected);
                 }
@@ -624,22 +741,14 @@ impl Attach for RegisterAttach {
                 records: tx,
             });
             conn.exec.spawn(write_records(up, rx));
-            let weak = Arc::downgrade(conn);
-            conn.exec.spawn(async move {
-                read_records(reply, weak.clone(), None).await;
-                // The registration ended with its connection, or the relay
-                // ended it: this connection serves no tunnel any more.
-                if let Some(conn) = weak.upgrade() {
-                    conn.relay.set_catch_all(None);
-                }
-            });
+            spawn_registration_reader(conn, reply, registration);
             conn.relay.open_out(conn).await;
             Ok(())
         })
     }
 
     fn detach(&self, conn: &ConnHandle, _path: &Arc<str>) {
-        conn.relay.set_catch_all(None);
+        conn.relay.clear_catch_all_of(&self.socket);
         // Dropping the sender cancels the registration's request half, and
         // the relay ends the registration.
         if let Some(socket) = self.socket.upgrade() {

@@ -422,6 +422,11 @@ impl Listener {
     /// [`crate::ReconnectPolicy`], reported on [`Binding::relay_events`]. The
     /// first registration's failure is returned, and nothing is served then:
     /// [`Error::Rejected`] where the relay refused it.
+    ///
+    /// The registration lasts as long as the returned [`Binding`]; closing
+    /// or dropping it ends the registration, and a following `bind_relay` on
+    /// the same relay connection waits, at most [`Limits::idle_timeout`],
+    /// until the relay has ended it.
     pub async fn bind_relay(
         &self,
         relay: &str,
@@ -876,6 +881,13 @@ impl ServedEndpoint {
 }
 
 /// One concrete transport binding of a [`Listener`].
+///
+/// Dropping a binding made by [`Listener::bind_relay`] ends it as
+/// [`Binding::close`] does, without waiting for its connections: the
+/// registration at the relay ends, is never redialled, and the key is free
+/// for the next `bind_relay`. Every other binding serves on after it is
+/// dropped, until [`Binding::close`], [`Binding::hand_over`] or the
+/// runtime's shutdown.
 pub struct Binding {
     served: Arc<ServedEndpoint>,
     local_addr: SocketAddr,
@@ -1071,6 +1083,20 @@ impl Binding {
     /// cannot be named, so it cannot be disconnected here.
     pub fn disconnect(&self, peer: Fingerprint) -> usize {
         self.peers.disconnect(&peer)
+    }
+}
+
+impl Drop for Binding {
+    fn drop(&mut self) {
+        // A relayed binding's registration would otherwise live on in the
+        // runtime's endpoint list and be redialled for ever.
+        if self.relay.is_some() {
+            if !self.served.is_closed() {
+                self.served
+                    .close(VarInt::from_u32(codes::SHUTDOWN as u32), b"binding dropped");
+            }
+            self.served.release();
+        }
     }
 }
 

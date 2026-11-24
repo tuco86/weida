@@ -55,7 +55,7 @@ Ownership passes to libweida at the call; weida neither binds it nor sets option
 | `int weida_binding_take_over(const weida_binding *b, const uint8_t *held, size_t len, weida_binding_take_over_op **out)` | never (R3b) | 0; `-WEIDA_ECLOSED` |
 | `int weida_binding_disconnect(const weida_binding *b, const char *peer, size_t *out)` | never | 0 and how many connections it closed; `-WEIDA_EINVALID_FINGERPRINT`, `-WEIDA_ECLOSED` |
 | `int weida_binding_relay_events(const weida_binding *b, weida_peer_events **out)` | never | 1 and a new reader ([stats.md](stats.md)) for a relayed binding; 0 for any other or once its registration ended; `-WEIDA_ECLOSED` |
-| `void weida_binding_drop(weida_binding *b)` | never | releases the handle; the binding keeps serving until `weida_binding_close`, a hand-over or the runtime's shutdown |
+| `void weida_binding_drop(weida_binding *b)` | never | releases the handle; a relayed binding ends once no op of it is unfinished, its registration at the relay ended without waiting for its connections; any other binding keeps serving until `weida_binding_close`, a hand-over or the runtime's shutdown |
 | `const char *weida_local_binding_bus(const weida_local_binding *b, size_t *len_out)` | never | the bus name |
 | `void weida_local_binding_drop(weida_local_binding *b)` | never | frees the bus name |
 | `const char *weida_unix_binding_path(const weida_unix_binding *b, size_t *len_out)` | never | the socket path bound; lives as long as `b` |
@@ -71,8 +71,9 @@ the peer redials under its own policy.
 
 `weida_listener_bind_unix` and `weida_listener_bind_pipe` are plain functions (R3:
 `Listener::bind_unix` and `bind_pipe` are sync in Rust). Both exist on every platform; the
-other platform's answers `-WEIDA_EUNSUPPORTED`. Unlike `weida_binding_drop`, dropping a
-`weida_unix_binding` or `weida_pipe_binding` ends the binding, as dropping the Rust value does.
+other platform's answers `-WEIDA_EUNSUPPORTED`. Unlike `weida_binding_drop` of a QUIC binding,
+dropping a `weida_unix_binding` or `weida_pipe_binding` ends the binding, as dropping the Rust
+value does; a relayed `weida_binding` ends on drop too.
 
 A hand-over (decision 0039) closes every connection with `RESTARTING` but holds the close
 packets in the `weida_handoff` its op yields. The successor process serves the socket with
