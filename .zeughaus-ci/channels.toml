@@ -1,10 +1,10 @@
 # Release channels of weida. The first channel whose `on` matches an event
 # names the pipeline's channel: a push to main is `dev`, a nightly build
-# `nightly` and a tagged one `release`. `release` is `clean`: what it checks
-# is built from empty workspaces, not from warm caches. `nightly` is not,
-# because `ci_run` queues nightlies on demand to run both test tiers, and
-# those stay warm; the scheduled round (CI_ACTOR `nightly`) wipes each
-# workspace itself, once a day (build.sh, windows.ps1).
+# `nightly` and a tagged one `release`. `nightly` has `daily_cleanup`: the
+# pipeline the CI's nightly round starts begins each place's workspace
+# from nothing, once a day, so caches and target directories cannot grow
+# across days. A nightly queued by hand (`ci_run`), a rerun and a release
+# tag build on what the workspace holds.
 [[channel]]
 name = "dev"
 on = ["push main"]
@@ -12,8 +12,8 @@ on = ["push main"]
 [[channel]]
 name = "nightly"
 on = ["nightly"]
+daily_cleanup = true
 
 [[channel]]
 name = "release"
 on = ["tag v*"]
-clean = true

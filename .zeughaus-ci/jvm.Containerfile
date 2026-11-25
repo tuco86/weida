@@ -4,8 +4,7 @@
 # - debian:trixie-slim rather than Temurin's Ubuntu base: the same glibc
 #   libweida is built against.
 # - build-essential: the C compiler the JNI glue and build.sh's
-#   smoke_libweida need; curl downloads the JUnit jar below; git wipes the
-#   workspace on the scheduled nightly (build.sh).
+#   smoke_libweida need; curl downloads the JUnit jar below.
 # - Temurin 25: the JDK, copied from its official image.
 # - the JUnit Platform Console Standalone jar, which runs the tests of
 #   crates/jvm/weida-jvm (test.sh).
@@ -13,7 +12,7 @@
 FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates build-essential curl git \
+    && apt-get install -y --no-install-recommends ca-certificates build-essential curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=docker.io/library/eclipse-temurin:25-jdk /opt/java/openjdk /opt/java/openjdk
