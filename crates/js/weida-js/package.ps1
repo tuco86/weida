@@ -57,7 +57,7 @@ $oldPath = $env:PATH
 try {
     $package = Join-Path $fresh 'package'
     New-Item -ItemType Directory -Force -Path $package | Out-Null
-    foreach ($item in @('package.json', 'lib', 'prebuilds')) {
+    foreach ($item in @('package.json', 'README.md', 'lib', 'prebuilds')) {
         Copy-Item -Recurse -Force -LiteralPath (Join-Path $dir $item) -Destination $package
     }
     Push-Location $package

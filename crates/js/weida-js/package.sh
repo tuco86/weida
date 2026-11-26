@@ -35,7 +35,7 @@ fresh=$(mktemp -d)
 trap 'rm -rf "$fresh"' EXIT
 
 mkdir "$fresh/package"
-cp -R "$dir/package.json" "$dir/lib" "$dir/prebuilds" "$fresh/package/"
+cp -R "$dir/package.json" "$dir/README.md" "$dir/lib" "$dir/prebuilds" "$fresh/package/"
 (cd "$fresh/package" && npm pkg set "version=$version")
 tarball=$(cd "$fresh/package" && npm pack --silent --pack-destination "$out")
 echo "packed $out/$tarball"

@@ -21,6 +21,8 @@ classifiers = [
 ]
 
 [project.urls]
+Homepage = "https://weida.doodleshnookie.net"
+Documentation = "https://weida.doodleshnookie.net/libraries/weida-py/"
 Repository = "https://github.com/tuco86/weida"
 
 # Both hooks live in hatch_build.py: the version, and the build of libweida
