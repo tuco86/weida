@@ -88,7 +88,7 @@ argument with a NUL in it is `.inval`, where C would see it cut short. Present;
 | The native libraries the static library needs (Security, CoreFoundation, iconv) are `linkerSettings` in `Package.swift`, read with `--print native-static-libs` | present; macOS links and runs |
 | macOS 13 and up | present; the tests run on darwin-arm64 |
 | iOS 16 and up, devices and the simulator | present for building and linking: the nightly and tags build the test bundle with `xcodebuild build-for-testing` for `generic/platform=iOS` and `generic/platform=iOS Simulator`, which links `libweida.a` into it; absent for running: no test runs on a device or a simulator |
-| The iOS slices build with libc held at 0.2.189 in `Cargo.lock`: libc 0.2.190 put `SYSPROTO_CONTROL` behind `target_os = "macos"`, which nix's `socket` feature names for every Apple target (nix-rust/nix#2830) | present; the comment on `nix` in the workspace `Cargo.toml` says so |
+| The iOS slices build with nix 0.32 or later: libc 0.2.190 put `SYSPROTO_CONTROL` behind `target_os = "macos"`, and nix 0.30 and 0.31 name it in their `socket` feature for every Apple target (nix-rust/nix#2830) | present; the comment on `nix` in the workspace `Cargo.toml` says so |
 | The XCFramework is published (a release asset, a remote `binaryTarget`) | absent: it is built, not published; the package refers to `build/CWeida.xcframework` by path |
 | Linux, Windows | absent: the package waits on `DispatchSource` read sources over POSIX descriptors and imports Security; no job builds it there |
 
