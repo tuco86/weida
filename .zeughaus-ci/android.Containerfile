@@ -1,14 +1,14 @@
 # The image the android-libweida job runs in: libweida cross-built for the
 # four Android ABIs with the NDK (docs/decisions/0046). linux-amd64 only,
 # because Google ships the NDK for linux-x86_64 hosts only.
-# - rust:1.99.1-trixie: equal to trixie.Containerfile's base; change both
+# - rust:1.100.0-trixie: equal to trixie.Containerfile's base; change both
 #   together, as its comment says for the toolchain.
 # - unzip: unpacks the command-line tools.
 # - Temurin 25: sdkmanager is a Java program; the same JDK jvm.Containerfile
 #   carries.
 # - the NDK and two platforms, through sdkmanager; the Rust targets of the
 #   four ABIs; cargo-ndk, which points cargo at the NDK's linkers.
-FROM docker.io/library/rust:1.99.1-trixie
+FROM docker.io/library/rust:1.100.0-trixie
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends unzip \

@@ -1,13 +1,22 @@
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::ReqSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -31,18 +40,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::RepSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -66,18 +83,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::DealerSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -101,18 +126,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::RouterSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -136,18 +169,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::PubSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -171,18 +212,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::SubSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -206,18 +255,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::XPubSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -241,18 +298,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::XSubSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -276,18 +341,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::PushSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -311,18 +384,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::PullSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -346,18 +427,26 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Cell<()>` cannot be shared between threads safely
   --> tests/thread_rule/sharing_a_socket_is_rejected.rs:16:50
    |
-16 |                     crate::share_between_threads(socket);
-   |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
-   |                     |
-   |                     required by a bound introduced by this call
-...
-23 | weida_zmq::for_each_socket_type!(share_every_socket_type);
-   | --------------------------------------------------------- in this macro invocation
+10 | / macro_rules! share_every_socket_type {
+11 | |     ($($socket:ident),+ $(,)?) => {
+12 | |         $(
+13 | |             #[allow(non_snake_case)]
+...  |
+16 | |                     crate::share_between_threads(socket);
+   | |                     ---------------------------- ^^^^^^ `Cell<()>` cannot be shared between threads safely
+   | |                     |
+   | |                     required by a bound introduced by this call
+...  |
+20 | |     };
+21 | | }
+   | |_- this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type`
+22 |
+23 |   weida_zmq::for_each_socket_type!(share_every_socket_type);
+   |   --------------------------------------------------------- in this macro invocation
    |
    = help: within `weida_zmq::PairSocket`, the trait `Sync` is not implemented for `Cell<()>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
@@ -381,4 +470,3 @@ note: required by a bound in `share_between_threads`
    |
  8 | fn share_between_threads<T: Sync>(_socket: &T) {}
    |                             ^^^^ required by this bound in `share_between_threads`
-   = note: this error originates in the macro `share_every_socket_type` which comes from the expansion of the macro `weida_zmq::for_each_socket_type` (in Nightly builds, run with -Z macro-backtrace for more info)
