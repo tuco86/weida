@@ -265,15 +265,32 @@ impl Requester {
     }
 
     /// Like [`Requester::request`], with explicit metadata.
+    ///
+    /// A replier that stops reading the request answers on the reply half as
+    /// well: the ERROR frame of a refusal or of a request dropped unanswered,
+    /// or a reply. That answer takes precedence over the request half's
+    /// refusal (`docs/FAILURE_MODEL.md` §4, Precedence), so a peer's
+    /// `Rejected`, `UnknownEndpoint` or `Unsupported` from the write is
+    /// returned only through the reply half, which says the same or more.
     pub async fn request_with(
         &self,
         meta: TransferMeta,
         body: &[u8],
     ) -> Result<IncomingTransfer, Error> {
         let (mut transfer, reply) = self.open(meta).await?;
-        transfer.write_all(body).await?;
-        transfer.finish()?;
-        reply.recv().await
+        let sent = match transfer.write_all(body).await {
+            Ok(()) => transfer.finish().map(drop),
+            Err(e) => {
+                drop(transfer);
+                Err(e)
+            }
+        };
+        match sent {
+            Ok(()) | Err(Error::Rejected | Error::UnknownEndpoint | Error::Unsupported) => {
+                reply.recv().await
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

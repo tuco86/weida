@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{Certs, Server, Xorshift};
 use tokio::io::AsyncReadExt;
-use weida::{Error, RuntimeConfig, SimNet, TraceContext, TransferMeta};
+use weida::{Error, Limits, RuntimeConfig, SimNet, TraceContext, TransferMeta};
 
 /// Serves one request with an uppercasing echo handler.
 ///
@@ -540,6 +540,53 @@ async fn dropping_a_request_without_replying_reports_no_reply() {
     // The ERROR arrives on this exchange's own reply half: no transfer id, no
     // control stream, nothing to correlate.
     let err = reply.recv().await.expect_err("reply must fail");
+    assert!(
+        matches!(err, Error::NoReply),
+        "expected NoReply, got {err:?}"
+    );
+
+    handler.await.expect("handler");
+    client.shutdown().await;
+}
+
+/// A request dropped unread is refused twice: its body stops the request half
+/// with `REJECTED`, and its reply half answers `NO_REPLY`. A requester still
+/// writing sees the stop first, which a body past the stream window makes
+/// certain. The reply half's answer wins all the same
+/// (`docs/FAILURE_MODEL.md` §4, Precedence): the request fails with
+/// `NoReply`, as it does when the stop arrives after the last byte.
+#[tokio::test(start_paused = true)]
+async fn a_request_dropped_unread_reports_no_reply_to_a_requester_still_writing() {
+    const WINDOW: usize = 64 * 1024;
+
+    let server = Server::start_with(Limits {
+        stream_receive_window: WINDOW as u64,
+        connection_receive_window: 1024 * 1024,
+        ..Limits::default()
+    })
+    .await;
+    let replier = server.listener.replier("/unread").expect("replier");
+    let handler = tokio::spawn(async move {
+        drop(replier.accept().await.expect("accept"));
+    });
+
+    let client = server.client_runtime();
+    let requester = client.requester(server.trust());
+    weida_testkit::within(
+        "the connect",
+        Duration::from_secs(10),
+        requester.connect(&server.url("/unread")),
+    )
+    .await
+    .expect("connect");
+
+    let err = weida_testkit::within(
+        "the request",
+        Duration::from_secs(10),
+        requester.request(&vec![0u8; 4 * WINDOW]),
+    )
+    .await
+    .expect_err("nobody replies");
     assert!(
         matches!(err, Error::NoReply),
         "expected NoReply, got {err:?}"
