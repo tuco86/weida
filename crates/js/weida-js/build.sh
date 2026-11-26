@@ -24,6 +24,13 @@ case $(uname -s) in
     Darwin)
         lib=libweida.dylib
         link="-undefined dynamic_lookup -Wl,-rpath,@loader_path"
+        # The macOS SDK of the selected developer directory, as rustc picks it:
+        # without it cc takes xcrun's default SDK, which can be a newer
+        # CommandLineTools SDK whose .tbd files that toolchain's ld cannot read.
+        if [ -z "${SDKROOT:-}" ]; then
+            SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+            export SDKROOT
+        fi
         ;;
     *)
         lib=libweida.so
